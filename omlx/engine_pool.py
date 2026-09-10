@@ -51,6 +51,11 @@ from .exceptions import (
     describe_ceiling_binding,
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_settings import (
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
+)
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -201,6 +206,7 @@ class EngineEntry:
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     runtime_estimated_size: int | None = None  # Includes active load-time variants
+    runtime_settle_size: int | None = None  # Excludes K2 ANE admission headroom
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -347,8 +353,9 @@ class EnginePool:
         runtime_settings: object | None,
         *,
         base_size: int | None = None,
+        include_ane_reservation: bool = True,
     ) -> int:
-        """Include eager CPU-share storage in load and prefill accounting."""
+        """Include runtime storage and optional K2 ANE admission headroom."""
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
@@ -374,6 +381,23 @@ class EnginePool:
                 "Qwen CPU sharing adds %s to the projected memory for %s",
                 format_size(extra),
                 entry.model_id,
+            )
+        if (
+            include_ane_reservation
+            and getattr(runtime_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(entry.config_model_type) == "k2"
+        ):
+            from .patches.k2_horizon.ane_prefill import prefill_memory_reservation
+
+            config = json.loads((Path(entry.model_path) / "config.json").read_text())
+            extra += prefill_memory_reservation(
+                config,
+                fraction=ane_prefill_fraction(
+                    runtime_settings.qwen35_ane_prefill_fraction,
+                    entry.config_model_type,
+                ),
+                shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
+                width=runtime_settings.qwen35_ane_prefill_sequence_length,
             )
         return base + extra
 
@@ -645,18 +669,33 @@ class EnginePool:
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
-        qwen_ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
-        add("qwen35_ane_prefill_enabled", qwen_ane_active)
-        if qwen_ane_active:
+        ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
+        model_type = entry.config_model_type if entry else None
+        backend = ane_prefill_backend(model_type)
+        add("qwen35_ane_prefill_enabled", ane_active)
+        if ane_active:
+            add("ane_prefill_backend", backend)
             add(
                 "qwen35_ane_prefill_sequence_length",
                 data.get("qwen35_ane_prefill_sequence_length", 2048),
             )
             add(
+                "qwen35_ane_prefill_fraction",
+                ane_prefill_fraction(
+                    data.get("qwen35_ane_prefill_fraction"),
+                    model_type,
+                ),
+            )
+            if backend == "k2":
+                add(
+                    "qwen35_ane_prefill_shared_fraction",
+                    data.get("qwen35_ane_prefill_shared_fraction", 1.0),
+                )
+        if ane_active and backend != "k2":
+            add(
                 "qwen35_ane_prefill_tail_padding_min_tokens",
                 data.get("qwen35_ane_prefill_tail_padding_min_tokens", 0),
             )
-            add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.53))
             add(
                 "qwen35_ane_prefill_fused_down",
                 data.get("qwen35_ane_prefill_fused_down", False),
@@ -2340,6 +2379,11 @@ class EnginePool:
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
         resident_size = self._entry_resident_size(entry)
+        settle_size = (
+            entry.runtime_settle_size
+            if entry.runtime_settle_size is not None
+            else resident_size
+        )
         pre_unload_active = 0 if distributed else mx.get_active_memory()
 
         try:
@@ -2405,6 +2449,7 @@ class EnginePool:
         entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
         entry.runtime_estimated_size = None
+        entry.runtime_settle_size = None
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -2440,8 +2485,12 @@ class EnginePool:
         # Scale tolerance with model size: estimated_size includes a 5%
         # overhead factor (model_discovery.py) that may not be reflected in
         # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(resident_size * 0.05))
-        min_expected_freed = max(0, resident_size - settle_tolerance)
+        # K2 retains its original GPU weights for decode/tails, but its extra
+        # ANE admission allowance includes private storage and staging that
+        # cannot be reclaimed through the MLX allocator. Check the weights;
+        # release the full admission charge only after this barrier.
+        settle_tolerance = max(2 * 1024**3, int(settle_size * 0.05))
+        min_expected_freed = max(0, settle_size - settle_tolerance)
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
@@ -2637,6 +2686,8 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
+                validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)
@@ -2652,6 +2703,12 @@ class EnginePool:
                 base_size=base_resident_size,
             )
             entry.runtime_estimated_size = resident_size
+            entry.runtime_settle_size = self._entry_runtime_resident_size(
+                entry,
+                model_settings,
+                base_size=base_resident_size,
+                include_ane_reservation=False,
+            )
 
             # Wire the correct model_id / model_path into the shared scheduler
             # config so every engine (Batched/VLM/DFlash/Embedding) sees the
@@ -3121,6 +3178,7 @@ class EnginePool:
             entry.abort_loading = False
             if not load_completed:
                 entry.runtime_estimated_size = None
+                entry.runtime_settle_size = None
             self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:

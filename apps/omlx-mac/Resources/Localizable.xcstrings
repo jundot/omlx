@@ -1,6 +1,115 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "settings.experimental.k2_ane.label" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2 ANE Prompt Processing"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка промпта K2 на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.sub" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использует ANE для предзаполнения плотных MLP и общих экспертов. Внимание и декодирование остаются на GPU. Применяется после перезагрузки модели."
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.dense" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dense MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Плотные MLP на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.shared" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Shared MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Общие MLP на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.tuner.sub": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLP 重みが 8 ビット以下のモデルで長いプロンプトの処理を任意で調整します。結果はバッチ処理性能を予測するものではありません。目安は 3 分ですが、読み込みや後処理で長くなる場合があります。テストなしで ANE を有効にできます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLP 가중치가 8비트 이하인 모델의 긴 프롬프트 처리를 선택적으로 조정합니다. 결과는 배치 처리 성능을 예측하지 않습니다. 약 3분이 목표이며 로딩과 정리에 더 걸릴 수 있습니다. 테스트 없이 ANE를 켤 수 있습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Необязательная настройка обработки длинных промптов с весами MLP до восьми бит включительно. Результаты не предсказывают производительность пакетной обработки. Около трёх минут; загрузка и очистка могут занять больше времени. ANE можно включить без теста."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选调优：针对 MLP 权重为 8 位及以下的模型处理长提示词。结果不代表批处理性能。目标约三分钟，加载和清理可能需要更久。无需测试即可启用 ANE。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "選用調校：針對 MLP 權重為 8 位元及以下的模型處理長提示詞。結果不代表批次處理效能。目標約三分鐘，載入和清理可能需要更久。無需測試即可啟用 ANE。"
+          }
+        }
+      }
+    },
     "" : {
       "localizations" : {
         "ru" : {
@@ -23671,6 +23780,47 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Top P 必须在 (0, 1] 范围内。"
+          }
+        }
+      }
+    },
+    "settings.k2.thinking_hint" : {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 uses reasoning effort. Use Thinking Budget to limit reasoning."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 は推論の強度を使用します。「Thinking Budget」で推論を制限できます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2는 추론 강도를 사용합니다. Thinking Budget으로 추론을 제한하세요."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 использует уровень рассуждения. Используйте «Бюджет thinking», чтобы ограничить рассуждение."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 使用推理强度。可通过“思考预算”限制推理。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 使用推理強度。可透過「Thinking Budget」限制推理。"
           }
         }
       }

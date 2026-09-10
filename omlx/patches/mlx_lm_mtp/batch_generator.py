@@ -1247,7 +1247,13 @@ def _set_singleton_mrope_delta(gen_batch: Any) -> None:
         import mlx.core as mx
 
         delta = model._uid_rope_deltas.get(uids[0], 0.0)
-        model.set_batch_rope_deltas(mx.array([delta]))
+        # uid-aware seam keeps a text-proven request on Qwen4's rank-two
+        # positions for the verify window (gathered-QSA eligibility).
+        step_setter = getattr(type(model), "set_step_rope_deltas", None)
+        if callable(step_setter):
+            step_setter(model, mx.array([delta]), list(uids))
+        else:
+            model.set_batch_rope_deltas(mx.array([delta]))
 
 
 def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:

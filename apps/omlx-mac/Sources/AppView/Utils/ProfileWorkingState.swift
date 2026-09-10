@@ -142,6 +142,7 @@ enum ProfileSettingsKey {
     static let trustRemoteCode = "trust_remote_code"
     static let turboquantKvEnabled = "turboquant_kv_enabled"
     static let turboquantKvBits = "turboquant_kv_bits"
+    static let qwen35AnePrefillSharedFraction = "qwen35_ane_prefill_shared_fraction"
     static let qwen35AnePrefillEnabled = "qwen35_ane_prefill_enabled"
     static let qwen35AnePrefillSequenceLength = "qwen35_ane_prefill_sequence_length"
     static let qwen35AnePrefillTailPaddingMinTokens = "qwen35_ane_prefill_tail_padding_min_tokens"

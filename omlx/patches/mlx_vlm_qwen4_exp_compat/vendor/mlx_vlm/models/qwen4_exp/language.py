@@ -77,6 +77,20 @@ def _broadcast_text_mrope_position_ids(
     return same
 
 
+def _rank_two_text_position_ids(
+    position_ids: Optional[mx.array],
+    length: int,
+) -> bool:
+    """True for missing or ``(1, length)`` text ids only; no plane comparison."""
+    if position_ids is None:
+        return True
+    return (
+        isinstance(position_ids, mx.array)
+        and position_ids.ndim == 2
+        and tuple(position_ids.shape) == (1, length)
+    )
+
+
 def _gathered_min_query_tokens() -> int:
     """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
     raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
@@ -1025,6 +1039,10 @@ _EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower
     "off",
 }
 _EAGER_DISPATCH_MAX_ROWS = 64
+# Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
+_GATHERED_VERIFY_DISABLED = os.environ.get(
+    "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
+).strip().lower() in {"0", "false", "no", "off"}
 
 
 class Qwen4ExpRMSNorm(nn.Module):
@@ -1334,11 +1352,48 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         prospective_blocks = (cache.offset + 1) // self.indexer.compress_ratio
         return prospective_blocks > self.indexer.block_topk
 
+    def _gathered_text_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Lightning MTP verify rows (batch-one text, rank-two positions, aligned
+        indexer) attend only the selected blocks; rollback is unaffected."""
+
+        if _GATHERED_VERIFY_DISABLED or not target_verify:
+            return False
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] > 1
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and _rank_two_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+        return cache.offset + x.shape[1] > self.indexer.token_budget
+
     def _gathered_text_prefill(
         self,
         x: mx.array,
         cache: QSAKVCache,
         position_ids: Optional[mx.array] = None,
+        target_verify: bool = False,
     ) -> mx.array:
         """Project once, append both caches, and attend only to selected K/V."""
 
@@ -1346,7 +1401,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         q_proj_output, keys, values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj),
             x,
-            False,
+            target_verify,
         )
         queries, gate = mx.split(
             q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
@@ -1374,7 +1429,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         keys, values = cache.update_and_fetch(keys, values)
 
-        projected = self.indexer.index_qk_proj(x).reshape(
+        projected = _target_verify_linear(
+            self.indexer.index_qk_proj, x, target_verify
+        ).reshape(
             batch,
             length,
             self.indexer.n_heads + self.indexer.kv_heads,
@@ -1417,7 +1474,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             pooled_index_keys=pooled_index_keys,
         )
         output = output.reshape(batch, length, -1)
-        return self.o_proj(output * mx.sigmoid(gate))
+        return _target_verify_linear(
+            self.o_proj, output * mx.sigmoid(gate), target_verify
+        )
 
     def _gathered_text_decode(
         self,
@@ -1534,6 +1593,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ):
             cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
+
+        if self._gathered_text_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            cache._omlx_last_prefill_gathered = True
+            return self._gathered_text_prefill(
+                x, cache, position_ids, target_verify=True
+            )
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False

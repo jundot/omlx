@@ -207,6 +207,8 @@ class Request:
     # Reasoning model support (for models with <think> tags)
     needs_think_prefix: bool = False  # True if prompt ends with <think> token
     think_prefix_sent: bool = False  # Track if prefix already sent
+    # Close-think token matched to the prompt's opener for multi-marker parsers
+    think_end_token_id: int | None = None
 
     # Harmony model support (gpt-oss models)
     is_harmony_model: bool = False  # True if model uses Harmony format

@@ -699,10 +699,14 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.enable_thinking.label",
                                   defaultValue: "Enable Thinking",
                                   comment: "Row label for the enable-thinking toggle"),
-                    sublabel: String(localized: "settings.advanced.enable_thinking.sub",
+                    sublabel: vm.thinkingForced ? String(
+                        localized: "settings.k2.thinking_hint",
+                        defaultValue: "K2 uses reasoning effort. Use Thinking Budget to limit reasoning.")
+                        : String(localized: "settings.advanced.enable_thinking.sub",
                                      defaultValue: "Enable reasoning/thinking mode for this model",
                                      comment: "Sublabel for the enable-thinking toggle")) {
-                    RowSwitch(isOn: vm.bindProfile($vm.enableThinking))
+                    RowSwitch(isOn: vm.thinkingForced ? .constant(true) : vm.bindProfile($vm.enableThinking))
+                        .disabled(vm.thinkingForced)
                 }
                 if vm.isQwen4Exp && vm.qwen4PleSsdOffloadSupported {
                     Row(label: String(localized: "settings.advanced.qwen4_ssd_offload.label",
@@ -889,7 +893,7 @@ private struct ChatTemplateKwargsEditor: View {
             // `enable_thinking` and `reasoning_effort` are server-side
             // singletons — once added, the menu hides them so the user
             // can't push duplicate keys into `chat_template_kwargs`.
-            if !vm.isDiffusionModel,
+            if !vm.isDiffusionModel, !vm.thinkingForced,
                !vm.chatTemplateEntries.contains(where: { $0.kind == .enableThinking }) {
                 Button("enable_thinking") {
                     vm.addKwarg(.enableThinking)
@@ -1046,6 +1050,7 @@ private struct EntryEditor: View {
             .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
+        .disabled(vm.model?.reasoningEffortCustom != true && !entry.usesCustomReasoningEffort)
     }
 
     @ViewBuilder
@@ -1061,7 +1066,7 @@ private struct EntryEditor: View {
             Popup(
                 selection: vm.bindProfile(binding.value),
                 width: Self.reasoningEffortValueWidth,
-                options: ChatTemplateKwargsCodec.reasoningEffortPresets.map {
+                options: vm.reasoningEffortPresets.map {
                     ($0, $0)
                 }
             )
@@ -1138,23 +1143,42 @@ private struct ExperimentalSection: View {
         // edits. Applying a profile persists the load-time settings and the
         // engine picks them up when it reloads.
         ListGroup {
-            if vm.isQwen35AnePrefillModel {
-                Row(label: String(localized: "settings.experimental.qwen_ane.label",
-                                  defaultValue: "Qwen ANE Prefill",
-                                  comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
-                    sublabel: String(localized: "settings.experimental.qwen_ane.sub",
-                                     defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
-                                     comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
-                    RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+            if vm.model?.anePrefillBackend != nil {
+                if (vm.model?.anePrefillBackend == "k2") {
+                    Row(label: String(localized: "settings.experimental.k2_ane.label", defaultValue: "K2 ANE Prompt Processing"),
+                        sublabel: String(localized: "settings.experimental.k2_ane.sub", defaultValue: "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload.")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                    }
+                    if vm.qwen35AnePrefillEnabled {
+                        Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label", defaultValue: "ANE Prompt Block")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillSequenceLength), placeholder: "2048", mono: true,
+                                      isNumeric: true, range: 1024...262_144, step: 64, width: .controlCompact)
+                        }
+                        Row(label: String(localized: "settings.experimental.k2_ane.dense", defaultValue: "Dense MLP on ANE")) {
+                            Popup(selection: vm.bindProfile($vm.qwen35AnePrefillFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillFraction, presets: vm.model?.anePrefillMlpFractions ?? []))
+                        }
+                        Row(label: String(localized: "settings.experimental.k2_ane.shared", defaultValue: "Shared MLP on ANE")) {
+                            Popup(selection: vm.bindProfile($vm.qwen35AnePrefillSharedFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillSharedFraction, presets: vm.model?.anePrefillSharedFractions ?? []))
+                        }
+                    }
+                }
+                if vm.isQwen35AnePrefillModel {
+                    Row(label: String(localized: "settings.experimental.qwen_ane.label",
+                                      defaultValue: "Qwen ANE Prefill",
+                                      comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.sub",
+                                         defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                                         comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                    }
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
-                                  comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
-                                     defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
-                                     comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
+                                  comment: "Row label for the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
-                        if !vm.aneTuningIsRunning {
+                        if !vm.aneTuningIsRunning && vm.model?.anePrefillBackend != "k2" {
                             Menu("Tuner overrides") {
                                 Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
                                 Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
@@ -1178,7 +1202,8 @@ private struct ExperimentalSection: View {
                                 Text(status.message)
                                     .font(.omlxText(11))
                                     .foregroundStyle(theme.textSecondary)
-                                    .lineLimit(1)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.trailing)
                                 ProgressView(
                                     value: Double(status.current),
                                     total: Double(max(status.total, 1))
@@ -1196,7 +1221,7 @@ private struct ExperimentalSection: View {
                             Text(aneRecommendationText(recommendation))
                                 .font(.omlxText(11))
                                 .foregroundStyle(theme.textSecondary)
-                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .multilineTextAlignment(.trailing)
                             Button("Use result") {
                                 vm.applyANETuningRecommendation()
@@ -1213,7 +1238,7 @@ private struct ExperimentalSection: View {
                             .buttonStyle(.omlx(.normal, size: .small))
                         }
 
-                        if let status = vm.aneTuningStatus {
+                        if !vm.aneTuningIsRunning, let status = vm.aneTuningStatus {
                             if let reason = status.terminationReason,
                                !reason.isEmpty {
                                 Text(reason)
@@ -1226,44 +1251,11 @@ private struct ExperimentalSection: View {
                                     .fixedSize(horizontal: false, vertical: true)
                                     .multilineTextAlignment(.trailing)
                             }
-
-                            if !status.results.isEmpty {
-                                VStack(spacing: 3) {
-                                    HStack(spacing: 8) {
-                                        Text("Test")
-                                        Spacer(minLength: 8)
-                                        Text("Prompt tok/s")
-                                    }
-                                    .font(.omlxText(9, weight: .semibold))
-                                    .foregroundStyle(theme.textSecondary)
-
-                                    Divider()
-
-                                    ForEach(status.results) { result in
-                                        HStack(spacing: 8) {
-                                            Text(result.detail ?? result.label)
-                                                .lineLimit(1)
-                                                .foregroundStyle(
-                                                    result.state == "failed"
-                                                        ? Color.red
-                                                        : theme.textSecondary
-                                                )
-                                            Spacer(minLength: 8)
-                                            Text(aneCandidateResultText(result))
-                                                .monospacedDigit()
-                                                .foregroundStyle(theme.text)
-                                                .frame(minWidth: 78, alignment: .trailing)
-                                        }
-                                        .font(.omlxText(10))
-                                    }
-                                }
-                                .frame(width: 285)
-                            }
                         }
                     }
                     .frame(minWidth: 285, alignment: .trailing)
                 }
-                if vm.qwen35AnePrefillEnabled {
+                if vm.qwen35AnePrefillEnabled && vm.isQwen35AnePrefillModel {
                     Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label",
                                       defaultValue: "ANE Prompt Block",
                                       comment: "Row label for the fixed Qwen ANE prompt block size"),
@@ -1758,9 +1750,14 @@ private struct ExperimentalSection: View {
     ) -> String {
         if !recommendation.enabled {
             guard let tps = recommendation.processingTps else {
-                return "GPU-only recommended"
+                return "Winner: GPU only"
             }
-            return String(format: "GPU-only recommended (%.1f tok/s)", tps)
+            return String(format: "Winner: GPU only · %.1f prompt tok/s", tps)
+        }
+        if recommendation.backend == "k2" {
+            return String(format: "Winner: ANE dense %.0f%% · shared expert %.0f%% · %.1f prompt tok/s",
+                          (recommendation.mlpFraction ?? 0) * 100,
+                          (recommendation.sharedFraction ?? 0) * 100, recommendation.processingTps ?? 0)
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
         var parts = [
@@ -1783,29 +1780,11 @@ private struct ExperimentalSection: View {
         if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
             parts.append("Pad tails ≥\(threshold)")
         }
-        let summary = parts.joined(separator: " · ")
-        guard let tps = recommendation.processingTps,
-              let speedup = recommendation.speedupPercent else {
+        let summary = "Winner: " + parts.joined(separator: " · ")
+        guard let tps = recommendation.processingTps else {
             return summary
         }
-        return String(format: "%@ · %.1f tok/s (%+.1f%%)", summary, tps, speedup)
-    }
-
-    private func aneCandidateResultText(
-        _ result: ANETuningCandidateDTO
-    ) -> String {
-        guard let processingTps = result.processingTps else {
-            if let latencyMs = result.latencyMs {
-                return String(format: "%.2f ms", latencyMs)
-            }
-            // Deliberately blank: the row remains visible so an interrupted
-            // run shows which tests did not complete.
-            return ""
-        }
-        if let speedup = result.speedupPercent {
-            return String(format: "%.1f (%+.1f%%)", processingTps, speedup)
-        }
-        return String(format: "%.1f", processingTps)
+        return String(format: "%@ · %.1f prompt tok/s", summary, tps)
     }
 }
 

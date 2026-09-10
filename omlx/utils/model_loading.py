@@ -119,7 +119,11 @@ def preflight_text_remote_code(
 
 
 def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
-    """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    """Forward the configured trust setting to the model and tokenizer loaders."""
+    kwargs["tokenizer_config"] = {
+        **(kwargs.get("tokenizer_config") or {}),
+        "trust_remote_code": trust_remote_code,
+    }
     preflight_text_remote_code(
         path_or_repo,
         tokenizer_config=kwargs.get("tokenizer_config"),
@@ -540,6 +544,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_laguna_patch():
             logger.info("Laguna pre-load patch applied for %s", model_name)
+
+    if model_type == "k2_horizon":
+        from ..patches.k2_horizon import apply_k2_horizon_patch
+
+        if apply_k2_horizon_patch():
+            logger.info("K2 Horizon pre-load patch applied for %s", model_name)
 
     if model_type == "hy_v3":
         from ..patches.hy_v3 import apply_hy_v3_patch
