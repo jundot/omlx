@@ -562,6 +562,7 @@ def contiguous_causal_gathered_qsa(
     if num_query_heads % num_key_value_heads:
         raise ValueError("QSA query heads must divide evenly over K/V heads")
 
+    native_prefill_retry_chunk = None
     if query_chunk is None:
         query_chunk = contiguous_causal_query_chunk(key_tokens)
         # The direct-index main-attention kernel carries no per-query gathered
@@ -581,6 +582,50 @@ def contiguous_causal_gathered_qsa(
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     query_chunk = max(query_chunk, 256)
+                    # Once all three native stages have executed successfully,
+                    # batch more independent prefill queries per dispatch.
+                    # A single FP32 score sheet is capped at 128 MiB; this is
+                    # not a cap on all attention intermediates or model memory.
+                    # Decode/verify and first-use ABI probes keep their tiles.
+                    if (
+                        query_tokens >= 1024
+                        and keys.dtype == values.dtype == queries.dtype
+                        and index_queries.shape[2:] == (4, 128)
+                        and index_queries.dtype == queries.dtype
+                        and index_keys.dtype == queries.dtype
+                        and (
+                            pooled_index_keys is None
+                            or pooled_index_keys.dtype == queries.dtype
+                        )
+                        and indexer_head_dim == 128
+                        and compress_ratio == 4
+                        and token_budget == 2048
+                        and key_tokens > token_budget
+                        and _NATIVE_QSA_MAIN_PROVEN
+                        and _NATIVE_QSA_SCORE_PROVEN
+                        and _NATIVE_QSA_TOPK_PROVEN
+                        and not _NATIVE_QSA_SCORE_DISABLED
+                        and not _NATIVE_QSA_TOPK_DISABLED
+                        and max(
+                            _native_score_min_rows(),
+                            _native_topk_min_rows(),
+                            _native_main_min_rows(),
+                        ) <= 256
+                    ):
+                        score_rows = (128 * 1024 * 1024) // (
+                            4 * (key_tokens // compress_ratio)
+                        )
+                        if score_rows >= 256:
+                            query_chunk = min(1024, (score_rows // 256) * 256)
+                        else:
+                            query_chunk = max(
+                                1,
+                                min(contiguous_causal_query_chunk(key_tokens), score_rows),
+                            )
+                        if query_chunk > 256:
+                            native_prefill_retry_chunk = contiguous_causal_query_chunk(
+                                key_tokens
+                            )
             except Exception:
                 pass
     if query_chunk <= 0:
@@ -690,6 +735,32 @@ def contiguous_causal_gathered_qsa(
             if native_output is not None:
                 outputs.append(native_output)
                 continue
+            if (
+                native_prefill_retry_chunk is not None
+                and chunk_tokens > native_prefill_retry_chunk
+            ):
+                # A native rejection must not turn a wide direct-index tile
+                # into a much larger portable per-query K/V gather. Retry
+                # with an explicit portable width, which cannot re-enter this
+                # automatic widening branch; native failure latches remain.
+                return contiguous_causal_gathered_qsa(
+                    queries,
+                    keys,
+                    values,
+                    index_queries,
+                    index_keys,
+                    index_position_ids,
+                    num_query_heads=num_query_heads,
+                    num_key_value_heads=num_key_value_heads,
+                    head_dim=head_dim,
+                    indexer_head_dim=indexer_head_dim,
+                    compress_ratio=compress_ratio,
+                    token_budget=token_budget,
+                    index_key_norm=index_key_norm,
+                    apply_index_rope=apply_index_rope,
+                    pooled_index_keys=pooled_index_keys,
+                    query_chunk=native_prefill_retry_chunk,
+                )
 
             selected_indices = (
                 selected_block_rows[..., None] * ratio
