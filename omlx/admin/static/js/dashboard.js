@@ -7838,16 +7838,14 @@
                 const measured = recommendation.processing_tps !== null
                     && recommendation.processing_tps !== undefined;
                 const speed = Number(recommendation.processing_tps || 0).toFixed(1);
-                const speedup = Number(recommendation.speedup_percent || 0);
-                const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
                 const speedSuffix = measured
-                    ? ` · ${speed} prompt tok/s · ${speedupText}`
+                    ? ` · ${speed} prompt tok/s`
                     : '';
                 if (!recommendation.enabled) {
-                    return `GPU only${speedSuffix}`;
+                    return `Winner: GPU only${speedSuffix}`;
                 }
                 if (recommendation.backend === 'k2') {
-                    return `MLP ${Math.round(recommendation.mlp_fraction * 100)}% · shared ${Math.round(recommendation.shared_fraction * 100)}%${speedSuffix}`;
+                    return `Winner: ANE dense ${Math.round(recommendation.mlp_fraction * 100)}% · shared expert ${Math.round(recommendation.shared_fraction * 100)}%${speedSuffix}`;
                 }
                 const parts = [
                     `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
@@ -7871,27 +7869,7 @@
                         `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
                     );
                 }
-                return `${parts.join(' · ')}${speedSuffix}`;
-            },
-
-            aneTuningResultText(result) {
-                if (result?.processing_tps === null
-                    || result?.processing_tps === undefined) {
-                    if (result?.latency_ms !== null
-                        && result?.latency_ms !== undefined) {
-                        return `${Number(result.latency_ms).toFixed(2)} ms`;
-                    }
-                    // Keep unfinished rows visible but leave their result cell
-                    // blank, including the candidate that stopped the run.
-                    return '';
-                }
-                const speed = Number(result.processing_tps).toFixed(1);
-                if (result.speedup_percent === null
-                    || result.speedup_percent === undefined) {
-                    return speed;
-                }
-                const speedup = Number(result.speedup_percent);
-                return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
+                return `Winner: ${parts.join(' · ')}${speedSuffix}`;
             },
 
             _scheduleANETuningPoll() {

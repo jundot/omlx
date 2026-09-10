@@ -2456,11 +2456,7 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
     except _K2BudgetExpired:
         run.status = run.phase = "completed"
         run.recommendation = None
-        run.message = "Inconclusive: the three-minute test budget was reached"
-        run.termination_reason = (
-            "The comparisons did not finish. Settings are unchanged. "
-            "You can still enable ANE directly."
-        )
+        run.message = run.termination_reason = "Run interrupted at 3 minutes"
     except asyncio.CancelledError:
         run.status = run.phase = "cancelled"
         run.message = run.termination_reason = "Tuning cancelled"

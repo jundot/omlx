@@ -140,7 +140,7 @@ async def test_k2_cleanup_keeps_run_active(
     if cleanup_fails:
         assert "cleanup failed" in run.error_message
     elif outcome == "budget":
-        assert "Inconclusive" in run.message and "unchanged" in run.termination_reason
+        assert run.message == run.termination_reason == "Run interrupted at 3 minutes"
     engine.stream_generate.assert_not_called()
 
 

@@ -1176,10 +1176,7 @@ private struct ExperimentalSection: View {
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
-                                  comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: (vm.model?.anePrefillBackend == "k2") ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
-                                     defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
-                                     comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
+                                  comment: "Row label for the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
                         if !vm.aneTuningIsRunning && vm.model?.anePrefillBackend != "k2" {
                             Menu("Tuner overrides") {
@@ -1205,7 +1202,8 @@ private struct ExperimentalSection: View {
                                 Text(status.message)
                                     .font(.omlxText(11))
                                     .foregroundStyle(theme.textSecondary)
-                                    .lineLimit(1)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.trailing)
                                 ProgressView(
                                     value: Double(status.current),
                                     total: Double(max(status.total, 1))
@@ -1240,7 +1238,7 @@ private struct ExperimentalSection: View {
                             .buttonStyle(.omlx(.normal, size: .small))
                         }
 
-                        if let status = vm.aneTuningStatus {
+                        if !vm.aneTuningIsRunning, let status = vm.aneTuningStatus {
                             if let reason = status.terminationReason,
                                !reason.isEmpty {
                                 Text(reason)
@@ -1252,10 +1250,6 @@ private struct ExperimentalSection: View {
                                     )
                                     .fixedSize(horizontal: false, vertical: true)
                                     .multilineTextAlignment(.trailing)
-                            }
-
-                            if !status.results.isEmpty {
-                                aneCandidateResults(status)
                             }
                         }
                     }
@@ -1751,50 +1745,17 @@ private struct ExperimentalSection: View {
                       comment: "Default sublabel for the VLM MTP toggle")
     }
 
-    private func aneCandidateResults(_ status: ANETuningStatusResponse) -> some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 8) {
-                Text("Test")
-                Spacer(minLength: 8)
-                Text("Prompt tok/s")
-            }
-            .font(.omlxText(9, weight: .semibold))
-            .foregroundStyle(theme.textSecondary)
-
-            Divider()
-
-            ForEach(status.results) { result in
-                HStack(spacing: 8) {
-                    Text(result.detail ?? result.label)
-                        .lineLimit(1)
-                        .foregroundStyle(
-                            result.state == "failed"
-                                ? Color.red
-                                : theme.textSecondary
-                        )
-                    Spacer(minLength: 8)
-                    Text(aneCandidateResultText(result))
-                        .monospacedDigit()
-                        .foregroundStyle(theme.text)
-                        .frame(minWidth: 78, alignment: .trailing)
-                }
-                .font(.omlxText(10))
-            }
-        }
-        .frame(width: 285)
-    }
-
     private func aneRecommendationText(
         _ recommendation: ANETuningRecommendationDTO
     ) -> String {
         if !recommendation.enabled {
             guard let tps = recommendation.processingTps else {
-                return "GPU-only recommended"
+                return "Winner: GPU only"
             }
-            return String(format: "GPU-only recommended (%.1f tok/s)", tps)
+            return String(format: "Winner: GPU only · %.1f prompt tok/s", tps)
         }
         if recommendation.backend == "k2" {
-            return String(format: "Dense %.0f%% · shared %.0f%% · %.1f tok/s",
+            return String(format: "Winner: ANE dense %.0f%% · shared expert %.0f%% · %.1f prompt tok/s",
                           (recommendation.mlpFraction ?? 0) * 100,
                           (recommendation.sharedFraction ?? 0) * 100, recommendation.processingTps ?? 0)
         }
@@ -1819,29 +1780,11 @@ private struct ExperimentalSection: View {
         if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
             parts.append("Pad tails ≥\(threshold)")
         }
-        let summary = parts.joined(separator: " · ")
-        guard let tps = recommendation.processingTps,
-              let speedup = recommendation.speedupPercent else {
+        let summary = "Winner: " + parts.joined(separator: " · ")
+        guard let tps = recommendation.processingTps else {
             return summary
         }
-        return String(format: "%@ · %.1f tok/s (%+.1f%%)", summary, tps, speedup)
-    }
-
-    private func aneCandidateResultText(
-        _ result: ANETuningCandidateDTO
-    ) -> String {
-        guard let processingTps = result.processingTps else {
-            if let latencyMs = result.latencyMs {
-                return String(format: "%.2f ms", latencyMs)
-            }
-            // Deliberately blank: the row remains visible so an interrupted
-            // run shows which tests did not complete.
-            return ""
-        }
-        if let speedup = result.speedupPercent {
-            return String(format: "%.1f (%+.1f%%)", processingTps, speedup)
-        }
-        return String(format: "%.1f", processingTps)
+        return String(format: "%@ · %.1f prompt tok/s", summary, tps)
     }
 }
 
