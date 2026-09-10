@@ -44,7 +44,7 @@ def test_uno_handoff_preserves_eight_greedy_sequences(late_join, compiled, const
     grammars = []
     expected_text = ["read_file:" + chr(65 + i) * 14 for i in range(8)]
     if constrained:
-        import xgrammar as xgr
+        xgr = pytest.importorskip("xgrammar")
 
         info = xgr.TokenizerInfo(
             [bytes([i]) for i in range(128)], xgr.VocabType.RAW, stop_token_ids=[0]
