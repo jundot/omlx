@@ -1095,3 +1095,72 @@ def test_responses_reasoning_cache_policy(
         )
     assert response.status_code == 418, response.text
     assert engine.preflight_chat.call_args.kwargs["preserve_reasoning"] is expected
+
+
+@pytest.mark.parametrize(
+    "template, request_kwargs, expected",
+    [
+        ("{% if preserve_thinking %}keep{% endif %}", {}, True),
+        ("{% for message in messages %}{{ message.content }}{% endfor %}", {}, False),
+        (
+            "{% if preserve_thinking %}keep{% endif %}",
+            {"preserve_thinking": False},
+            False,
+        ),
+    ],
+    ids=["preserved-template", "stripping-template", "explicitly-disabled"],
+)
+def test_chat_reasoning_cache_policy_uses_detected_template_behavior(
+    monkeypatch, tmp_path, template, request_kwargs, expected
+):
+    """Chat completions derive cacheability from the discovered template contract."""
+    from omlx.model_discovery import detect_preserve_thinking
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import _output_tokens_cacheable
+
+    (tmp_path / "chat_template.jinja").write_text(template)
+    detected_preserve_thinking = detect_preserve_thinking(tmp_path)
+
+    engine = MagicMock()
+    engine.model_type = "llama"
+    engine.is_diffusion_model = False
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Policy captured")
+    )
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type="llama",
+        preserve_thinking_default=detected_preserve_thinking,
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: ModelSettings())
+    monkeypatch.setitem(srv.app.dependency_overrides, srv.verify_api_key, lambda: True)
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "chat_template_kwargs": request_kwargs,
+            },
+        )
+
+    assert response.status_code == 418, response.text
+    preserve_reasoning = engine.preflight_chat.call_args.kwargs["preserve_reasoning"]
+    assert preserve_reasoning is expected
+    request = Request(
+        request_id="cache-policy",
+        prompt="Hello",
+        sampling_params=SamplingParams(),
+        needs_think_prefix=True,
+        preserve_reasoning=preserve_reasoning,
+    )
+    assert _output_tokens_cacheable(request) is expected
