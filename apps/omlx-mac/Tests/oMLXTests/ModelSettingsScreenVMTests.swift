@@ -445,7 +445,46 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
     }
 
-    private func makeModel(id: String, configModelType: String?) -> ModelDTO {
+    func testMtplxImportIsOfferedOnlyForTheServerSideSidecarMarker() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(
+            id: "Qwen3.8-27B-MTPLX-Optimized-Speed",
+            configModelType: "qwen3_5",
+            mtpCompatible: false,
+            mtpCompatibilityReason: "MTPLX side-car detected but not imported. Import it to merge the MTP head into the checkpoint index."
+        )
+        XCTAssertTrue(vm.canImportMtplxSidecar)
+
+        vm.model = makeModel(
+            id: "missing-mtp",
+            configModelType: "qwen3_5",
+            mtpCompatible: false,
+            mtpCompatibilityReason: "Config declares MTP layers but the weight files contain neither mtp.* tensors nor native nextn layers."
+        )
+        XCTAssertFalse(vm.canImportMtplxSidecar)
+
+        vm.model = makeModel(
+            id: "already-compatible",
+            configModelType: "qwen3_5",
+            mtpCompatible: true,
+            mtpCompatibilityReason: "MTPLX side-car detected but not imported."
+        )
+        XCTAssertFalse(vm.canImportMtplxSidecar)
+    }
+
+    func testMtplxImportEndpointUsesModelScopedAdminRoute() {
+        XCTAssertEqual(
+            AdminAPI.importMtplx("Qwen3.8-27B-MTPLX-Optimized-Speed"),
+            "/admin/api/models/Qwen3.8-27B-MTPLX-Optimized-Speed/import-mtplx"
+        )
+    }
+
+    private func makeModel(
+        id: String,
+        configModelType: String?,
+        mtpCompatible: Bool? = nil,
+        mtpCompatibilityReason: String? = nil
+    ) -> ModelDTO {
         var model = ModelDTO(
             id: id,
             displayName: nil,
@@ -467,8 +506,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             dflashCompatible: nil,
             dflashCompatibilityReason: nil,
             dflashSsdCacheAvailable: nil,
-            mtpCompatible: nil,
-            mtpCompatibilityReason: nil,
+            mtpCompatible: mtpCompatible,
+            mtpCompatibilityReason: mtpCompatibilityReason,
             qwen4PleSsdOffloadSupported: nil,
             qwen4PleSsdOffloadForced: nil,
             qwen4PleResidentBytes: nil,
