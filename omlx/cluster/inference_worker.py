@@ -510,6 +510,9 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         pipeline_microbatch_size=args.pipeline_microbatch_size,
         cache_affinity=args.cache_affinity,
         prompt_cache_ssd=args.prompt_cache_ssd,
+        prompt_cache_ssd_max_bytes=getattr(
+            args, "prompt_cache_ssd_max_bytes", 20 * 1024**3
+        ),
         sampling_rank_only=args.sampling_rank_only,
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
@@ -1486,6 +1489,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         assignment=assignment,
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
                         ssd_cache_persistent=bool(args.prompt_cache_ssd),
+                        ssd_cache_max_bytes=execution.prompt_cache_ssd_max_bytes,
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
@@ -1602,6 +1606,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-tune", action="store_true")
     parser.add_argument("--cache-affinity", action="store_true")
     parser.add_argument("--prompt-cache-ssd", action="store_true")
+    parser.add_argument("--prompt-cache-ssd-max-bytes", type=int, default=20 * 1024**3)
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)

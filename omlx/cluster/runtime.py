@@ -16,7 +16,18 @@ from .performance import ExecutionSettings, NodePerformanceProfile
 _MAX_MARKERS = 64
 _MAX_MARKER_BYTES = 64 * 1024
 _PHASES = {"loading", "ready", "peer_lost", "launcher_lost", "failed"}
-_LOAD_STAGES = {"initializing", "loading_weights", "validating", "ready"}
+_LOAD_STAGES = {
+    "initializing",
+    "initializing_full_replica",
+    "loading_weights",
+    "materializing_fixed",
+    "materializing_layers",
+    "tensor_ready",
+    "weights_resident",
+    "validating",
+    "warming_prefill_shape",
+    "ready",
+}
 _BACKENDS = {"ring", "jaccl", "jaccl-ring"}
 _REQUEST_STATES = {"running", "completed", "failed", "cancelled"}
 _MAX_COUNTER = 2**63 - 1
@@ -312,13 +323,38 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             )
         result["stage"] = validated_stage
 
+    active = value.get("active_request_metrics")
+    if active is not None:
+        if not isinstance(active, list) or len(active) > 64:
+            raise ValueError("invalid active request metrics")
+        requests = [_validated_request_metrics(item) for item in active]
+        ids = [item.get("request_id") for item in requests]
+        if (
+            None in ids
+            or len(set(ids)) != len(ids)
+            or any(item["status"] != "running" for item in requests)
+        ):
+            raise ValueError("invalid active request identities or states")
+        truncated = _nonnegative_int(
+            value.get("active_request_metrics_truncated", 0), "truncated requests"
+        )
+        if len(requests) + truncated != result["active_requests"]:
+            raise ValueError("active request count mismatch")
+        result["active_request_metrics"] = requests
+        result["active_request_metrics_truncated"] = truncated
     current = value.get("last_request")
-    if current is None:
-        result["last_request"] = None
-        return result
+    result["last_request"] = (
+        None if current is None else _validated_request_metrics(current)
+    )
+    return result
+
+
+def _validated_request_metrics(current: Any) -> dict[str, Any]:
     if not isinstance(current, dict) or current.get("status") not in _REQUEST_STATES:
         raise ValueError("runtime last-request metrics are invalid")
     request = {"status": current["status"]}
+    if "request_id" in current:
+        request["request_id"] = _nonnegative_int(current["request_id"], "request ID")
     for key in ("prompt_tokens", "cached_tokens", "completion_tokens"):
         request[key] = _nonnegative_int(current.get(key), f"metrics {key}")
     if request["cached_tokens"] > request["prompt_tokens"]:
@@ -376,8 +412,7 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
         if validated_progress["processed"] > validated_progress["total"]:
             raise ValueError("runtime prefill progress exceeds its total")
         request["prefill_progress"] = validated_progress
-    result["last_request"] = request
-    return result
+    return request
 
 
 def _validated_marker(payload: Any) -> dict[str, Any]:

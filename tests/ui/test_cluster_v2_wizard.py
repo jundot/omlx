@@ -406,8 +406,7 @@ component.apiFetch = async (url, options = {}) => {
 
 
 def test_active_card_load_and_unload_keep_the_signed_deployment():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 global.setTimeout = () => 0;
 const deployment = { deployment_id: 'pool-a', model: '/models/m' };
 component.deploymentsPayload = [deployment];
@@ -437,11 +436,10 @@ component.apiFetch = async (url, options = {}) => {
     calls,
   }));
 })();
-"""
-    )
+""")
 
     assert result["armed"] == "pool-a"
-    assert result["deploymentAfterUnload"] is None
+    assert result["deploymentAfterUnload"] == "pool-a"
     assert result["lifecycleBusy"] is False
     assert {
         "url": "/admin/api/cluster/deployments/pool-a/unload",
@@ -465,8 +463,7 @@ def test_runtime_residency_separates_configuration_from_observed_workers():
             "runtime_failed.json",
         )
     }
-    result = _run_wizard(
-        f"""
+    result = _run_wizard(f"""
 component.deploymentsPayload = {json.dumps(deployment)};
 component.deploymentsLoaded = true;
 const savedDeployment = component.deploymentsPayload[0];
@@ -519,13 +516,12 @@ samples.launcherOnly = {{
   label: component.deploymentStatus(savedDeployment).label,
 }};
 process.stdout.write(JSON.stringify(samples));
-"""
-    )
+""")
 
     detached = result["runtime_detached.json"]
     assert detached["runtimeState"] == "configured"
-    assert detached["wizardState"] != "active"
-    assert detached["configured"] is None
+    assert detached["wizardState"] == "active"  # management remains accessible
+    assert detached["configured"] is not None
     assert detached["active"] is None, "a detached marker is not residency"
     assert detached["modelName"] == "minimax-m3"
     assert detached["label"] == "Not loaded"
@@ -879,9 +875,8 @@ process.stdout.write(JSON.stringify({ opened, closed }));
     }
 
 
-def test_cold_saved_setups_open_one_model_picker_instead_of_a_fake_active_card():
-    result = _run_wizard(
-        """
+def test_cold_saved_setups_keep_management_without_claiming_residency():
+    result = _run_wizard("""
 component.devicesPayload = {
   self: { node_id: 'node-a', friendly_name: 'Node A', caps: {}, addrs: [] },
   paired: [{ node_id: 'node-b', friendly_name: 'Node B', caps: {}, addrs: [], paired: true }],
@@ -902,10 +897,11 @@ process.stdout.write(JSON.stringify({
   stage: component.stage,
   wizard: component.wizardState(),
 }));
-"""
-    )
+""")
 
-    assert result == {"configured": None, "stage": "plan", "wizard": "plan"}
+    assert result["configured"]["deployment_id"] == "ds4-cold"
+    assert result["stage"] is None
+    assert result["wizard"] == "active"
 
     template = _read(TEMPLATE)
     assert 'x-for="deployment in deploymentsPayload"' not in template
@@ -1014,15 +1010,14 @@ process.stdout.write(JSON.stringify({
 
 
 def test_serving_profile_drives_the_server_owned_signed_plan():
-    result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+    result = _run_wizard(_WIZARD_TWO_MACS + """
 component.setExecutionProfile('throughput');
 component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
 component.selectedModelPath = '/models/m';
 component.targetContextTokens = 262144;
 let posted = null;
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   if (url.endsWith('/autoconfigure')) {
     posted = JSON.parse(options.body);
     return {
@@ -1048,8 +1043,7 @@ component.apiFetch = async (url, options) => {
     })),
   }));
 })();
-"""
-    )
+""")
 
     assert result["selected"] == "throughput"
     assert result["posted"] == "throughput"
@@ -1619,10 +1613,10 @@ def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
     assert "512 MiB pending limit" in template
 
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 const posted = [];
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   const body = options && options.body ? JSON.parse(options.body) : null;
   if (url.endsWith('/autoconfigure')) {
     posted.push(body.prompt_cache_ssd);
@@ -1664,8 +1658,7 @@ component.selectedModelPath = '/models/m';
 
 def test_every_strategy_uses_server_autoconfigure_and_its_tp_choice():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 const bodies = [];
 function proposalFor(strategy) {
   const tp = strategy === 'pipeline' ? 1 : 2;
@@ -1681,6 +1674,7 @@ function proposalFor(strategy) {
     { node_id: 'node-b', ssh: 'worker', ips: ['10.0.0.2'], rdma: [] },
   ];
   return {
+    ready_to_activate: true,
     backend: strategy === 'pipeline' ? 'ring' : 'jaccl',
     performance_probe: { ok: true, status: 'applied_before_staging' },
     plan: { assignments: [], tensor_parallel_size: tp, placement_signature: signature },
@@ -1692,6 +1686,7 @@ function proposalFor(strategy) {
   };
 }
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   const body = options && options.body ? JSON.parse(options.body) : null;
   bodies.push({
     url,
@@ -1724,18 +1719,16 @@ component.selectedModelPath = '/models/m';
 """,
     )
 
-    proposals = [
-        b for b in result["bodies"] if b["url"].endswith("/autoconfigure")
-    ]
+    proposals = [b for b in result["bodies"] if b["url"].endswith("/autoconfigure")]
     deploys = [
         b
         for b in result["bodies"]
         if b["url"].endswith("/deployments") and b["marker"] is not None
     ]
     assert [item["strategy"] for item in proposals] == ["tensor", "auto", "pipeline"]
-    assert all(item.get("tp") is None for item in proposals), (
-        "the browser must not choose a TP degree"
-    )
+    assert all(
+        item.get("tp") is None for item in proposals
+    ), "the browser must not choose a TP degree"
     assert len(deploys) == 1
     assert deploys[0]["url"] == "/admin/api/cluster/deployments"
     assert deploys[0].get("strategy") is None
@@ -1866,8 +1859,7 @@ slow.selectedModelPath = '/models/m';
 
 def test_calibration_requires_a_real_model_and_performance_probe_success():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 const proposal = JSON.parse(
   require('fs').readFileSync(
     %s,
@@ -1877,6 +1869,7 @@ const proposal = JSON.parse(
 const bodies = [];
 let probeOk = false;
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   if (url.endsWith('/autoconfigure')) {
     bodies.push(JSON.parse(options.body));
     return {
@@ -2279,13 +2272,11 @@ component.apiFetch = async (url, options) => {
 
 def test_stage_409_replans_like_activation_409():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + _WIZARD_TIMER_STUBS
-        + _WIZARD_PARTIAL_MODEL
-        + """
+        _WIZARD_TWO_MACS + _WIZARD_TIMER_STUBS + _WIZARD_PARTIAL_MODEL + """
 const calls = [];
 component.apiFetch = async (url, options) => {
   calls.push(url);
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   if (url.endsWith('/stage')) {
     const error = new Error(
       'The staging request no longer matches the approved plan.',
@@ -2320,6 +2311,7 @@ component.apiFetch = async (url, options) => {
     # warning toast, then a fresh signed plan.
     assert result["calls"] == [
         "/admin/api/cluster/stage",
+        "/admin/api/cluster/node-budgets",
         "/admin/api/cluster/autoconfigure",
     ]
     assert result["signature"] == "c" * 16

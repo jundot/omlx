@@ -3,7 +3,7 @@
      the parent dashboard component.
      States: empty / discovering / device_card / pairing / checks / plan /
      active / error. Feedback is toasts and banners, never modals. -->
-<div x-data="clusterV2Wizard()" x-init="init()"
+<div x-data="clusterV2Wizard()"
      x-show="mainTab === 'cluster'" x-cloak
      data-cluster-v2-wizard>
     <div class="animate-fade-in-up">
@@ -940,7 +940,7 @@
                                 </div>
                             </div>
                             <button type="button" @click="activatePlan()"
-                                    :disabled="activateBusy"
+                                    :disabled="activateBusy || !proposalCanProceed(planProposal)"
                                     class="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                                     data-cluster-v2-activate>
                                 <svg x-show="activateBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
@@ -1258,7 +1258,7 @@
                             <div class="px-3 py-3 border-t border-neutral-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                                 <div class="text-[10px] text-neutral-600">Applying waits for active requests, syncs missing model files, replaces the signed rank map, reloads, and runs readiness again.</div>
                                 <button type="button" @click="applyMembershipExpansion()"
-                                        :disabled="membershipBusy || activateBusy || !membershipProposal?.ready_to_activate"
+                                        :disabled="membershipBusy || activateBusy || !proposalCanProceed(membershipProposal)"
                                         class="px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                                         data-cluster-v2-membership-apply>
                                     Add Mac &amp; re-shard
@@ -1288,8 +1288,15 @@
 
                 <div class="mt-4 flex flex-wrap items-center gap-2"
                      data-cluster-v2-model-lifecycle>
+                    <select x-show="deploymentsPayload.length > 1" x-model="selectedDeploymentId"
+                            aria-label="Saved cluster setup" class="rounded-lg border px-3 py-2 text-xs">
+                        <option value="">Current cluster setup</option>
+                        <template x-for="saved in deploymentsPayload" :key="saved.deployment_id">
+                            <option :value="saved.deployment_id" x-text="displayModelName(saved)"></option>
+                        </template>
+                    </select>
                     <button type="button"
-                            x-show="deploymentRuntimeState(configuredDeployment()) === 'ready'"
+                            x-show="['ready', 'configured', 'failed'].includes(deploymentRuntimeState(configuredDeployment()))"
                             @click="beginModelChange(configuredDeployment())"
                             :disabled="clusterLifecycleBusy"
                             class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
@@ -1310,13 +1317,13 @@
                         <span x-text="confirmUnloadFor === configuredDeployment()?.deployment_id ? 'Confirm unload weights' : 'Unload weights'"></span>
                     </button>
                     <button type="button"
-                            x-show="deploymentRuntimeState(configuredDeployment()) === 'failed'"
+                            x-show="['failed', 'configured'].includes(deploymentRuntimeState(configuredDeployment()))"
                             @click="loadDeploymentWeights(configuredDeployment())"
                             :disabled="clusterLifecycleBusy"
                             class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
                             data-cluster-v2-load-weights>
                         <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                        Retry load
+                        <span x-text="deploymentRuntimeState() === 'failed' ? 'Retry load' : 'Load weights'"></span>
                     </button>
                     <button type="button" @click="deactivateDeployment(configuredDeployment())"
                             :disabled="clusterLifecycleBusy"

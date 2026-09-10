@@ -321,12 +321,19 @@ function clusterV2Wizard() {
         installCommandCopied: false,
 
         pollTimer: null,
+        tickBusy: false,
+        stagingGeneration: 0,
+        stagingPollBusy: false,
+        stagingClaimed: false,
+        selectedDeploymentId: '',
+        measuredNodeBudgets: {},
         tickCount: 0,
 
         // =====================================================================
         // Lifecycle
         // =====================================================================
         init() {
+            if (this.pollTimer !== null) return;
             this.tick();
             this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
         },
@@ -336,17 +343,28 @@ function clusterV2Wizard() {
         },
 
         async tick() {
-            if (!this.wizardVisible()) return;
-            await this.refreshDevices();
-            await this.refreshJoinState();
-            await this.refreshRuntime();
-            this.tickCount += 1;
-            if (
-                !this.deploymentsLoaded ||
-                this.tickCount % CLUSTER_V2_DEPLOYMENTS_EVERY_TICKS === 0
-            ) {
-                await this.refreshDeployments();
+            if (!this.wizardVisible() || this.tickBusy) return;
+            this.tickBusy = true;
+            try {
+                await this.refreshDevices();
+                await this.refreshJoinState();
+                await this.refreshRuntime();
+                this.tickCount += 1;
+                if (
+                    !this.deploymentsLoaded ||
+                    this.tickCount % CLUSTER_V2_DEPLOYMENTS_EVERY_TICKS === 0
+                ) {
+                    await this.refreshDeployments();
+                }
+            } finally {
+                this.tickBusy = false;
             }
+        },
+
+        destroy() {
+            if (this.pollTimer !== null) clearInterval(this.pollTimer);
+            this.pollTimer = null;
+            this.dismissStaging();
         },
 
         // =====================================================================
@@ -549,6 +567,8 @@ function clusterV2Wizard() {
                 ? this.deploymentsPayload
                 : [];
             if (!deployments.length) return null;
+            const selected = deployments.find((item) => item.deployment_id === this.selectedDeploymentId);
+            if (selected) return selected;
 
             // A registry may retain several signed setups (for example, a
             // cold DS4 TP plan plus the currently loaded Qwen phase plan).
@@ -588,26 +608,18 @@ function clusterV2Wizard() {
                         ? deploymentForId(launcher.deployment_id)
                         : null;
                 })();
-            // Once runtime ownership is known, a durable-but-cold setup is not
-            // an active deployment. Present the model picker instead of
-            // arbitrarily choosing the first registry row (which may be an old
-            // DS4 plan while Qwen was the model the user just unloaded).
-            return loading || (this.runtimeLoaded ? null : deployments[0]);
+            // Keep saved setups manageable after unload/failure. Residency is
+            // reported separately by deploymentRuntimeState/activeDeployment.
+            return loading || deployments[0];
         },
 
         ensureColdModelSelection() {
             if (
-                !this.runtimeLoaded ||
-                !this.deploymentsLoaded ||
-                !this.deploymentsPayload.length ||
-                this.configuredDeployment() ||
-                this.stage === 'plan' ||
-                !this.pairedDevices().length
+                this.deploymentsLoaded && this.selectedDeploymentId &&
+                !this.deploymentsPayload.some((item) => item.deployment_id === this.selectedDeploymentId)
             ) {
-                return;
+                this.selectedDeploymentId = '';
             }
-            this.resetModelPicker();
-            this.enterPlan();
         },
 
         deploymentRuntimeJobs(deployment = this.configuredDeployment()) {
@@ -1227,7 +1239,7 @@ function clusterV2Wizard() {
         versionMismatches() {
             const self = this.selfDevice();
             if (!self || !self.version) return [];
-            return this.allDevices()
+            return this.pairedDevices()
                 .filter(
                     (device) =>
                         !device.is_self &&
@@ -1985,7 +1997,8 @@ function clusterV2Wizard() {
         },
 
         usableGbLabel(device) {
-            const capacity = (this.deviceRamGb(device) || 0) * 1024 ** 3;
+            const measured = this.measuredNodeBudgets[device.node_id];
+            const capacity = Number(measured?.capacity_bytes) || (this.deviceRamGb(device) || 0) * 1024 ** 3;
             if (!capacity) return '';
             const role = this.nodeRole(device.node_id, !!device.is_self);
             const usable = Math.max(
@@ -2427,7 +2440,12 @@ function clusterV2Wizard() {
                     accelerator: 'metal',
                 });
             }
-            return nodes.filter((node) => node.capacity_bytes > 0);
+            return nodes.map((node) => {
+                const measured = this.measuredNodeBudgets[node.node_id];
+                return measured && measured.role === node.role
+                    ? {...node, capacity_bytes: measured.capacity_bytes, reserve_bytes: measured.reserve_bytes}
+                    : node;
+            }).filter((node) => node.capacity_bytes > 0);
         },
 
         async runPlan() {
@@ -2446,7 +2464,10 @@ function clusterV2Wizard() {
                         .filter((node) => node?.node_id && node?.performance)
                         .map((node) => [node.node_id, node.performance]),
                 );
-                const nodes = this.planNodes().map((node) => ({
+                const hosts = this.deploymentHosts();
+                const measured = await this.measurePlanNodes(hosts, this.planNodes());
+                if (revision !== this.planRequestRevision) return null;
+                const nodes = measured.map((node) => ({
                     ...node,
                     ...(priorPerformance.has(node.node_id)
                         ? { performance: priorPerformance.get(node.node_id) }
@@ -2455,7 +2476,10 @@ function clusterV2Wizard() {
                 const body = {
                     model_path: this.selectedModelPath,
                     nodes,
-                    hosts: this.deploymentHosts(),
+                    hosts,
+                    path_map: Object.fromEntries((model?.locations || [])
+                        .filter((loc) => loc.node_id && loc.model_path)
+                        .map((loc) => [loc.node_id, loc.model_path])),
                     execution_profile: this.executionProfile,
                     prompt_cache_ssd: this.promptCacheSsd,
                     prompt_cache_ssd_max_bytes:
@@ -2669,9 +2693,35 @@ function clusterV2Wizard() {
             return this.nodesMissingModel().length > 0;
         },
 
+        proposalCanProceed(proposal) {
+            return proposal?.ready_to_activate === true || proposal?.ready_to_stage === true;
+        },
+
+        async measurePlanNodes(hosts, nodes) {
+            const roles = Object.fromEntries(nodes.map((node) => [node.node_id, node.role]));
+            const result = await this.apiFetch(CLUSTER_V2_API.nodeBudgets, {
+                method: 'POST',
+                body: JSON.stringify({hosts: hosts.map(({node_id, ssh, python_executable}) => ({node_id, ssh, python_executable})), roles}),
+            });
+            const measured = result?.nodes;
+            if (!Array.isArray(measured) || measured.length !== nodes.length ||
+                new Set(measured.map((node) => node.node_id)).size !== nodes.length) {
+                throw new Error('The memory probe did not return every selected Mac.');
+            }
+            const resolved = nodes.map((node) => {
+                const budget = measured.find((item) => item.node_id === node.node_id);
+                if (!budget || budget.unusable || !(Number(budget.capacity_bytes) > 0)) {
+                    throw new Error(`Memory budget unavailable for ${node.node_id}.`);
+                }
+                return {...node, capacity_bytes: Number(budget.capacity_bytes), reserve_bytes: Number(budget.reserve_bytes || 0)};
+            });
+            this.measuredNodeBudgets = Object.fromEntries(resolved.map((node) => [node.node_id, node]));
+            return resolved;
+        },
+
         async activatePlan() {
             const activation = this.activationRequestBody();
-            if (!this.plan || !activation || this.activateBusy) return;
+            if (!this.plan || !activation || this.activateBusy || !this.proposalCanProceed(this.planProposal)) return;
             this.activateBusy = true;
             if (this.needsStaging()) {
                 // Phase 1 returns after the POST; the 1 Hz poller owns the
@@ -2684,6 +2734,10 @@ function clusterV2Wizard() {
         },
 
         async stageModelToPeers(activation) {
+            this.stopStagingPoll();
+            const generation = ++this.stagingGeneration;
+            this.stagingClaimed = false;
+            this.stagingJob = null;
             this.stagingError = '';
             this.stagingActivation = activation;
             let job;
@@ -2696,6 +2750,7 @@ function clusterV2Wizard() {
                     }),
                 });
             } catch (error) {
+                if (generation !== this.stagingGeneration) return;
                 this.stopStagingPoll();
                 if (error?.status === 409) {
                     // Signature drift between plan and stage — identical
@@ -2722,6 +2777,7 @@ function clusterV2Wizard() {
                 }
                 return;
             }
+            if (generation !== this.stagingGeneration) return;
             this.stagingJob = job;
             this.stagingTimer = setInterval(
                 () => this.pollStagingJob(),
@@ -2730,17 +2786,21 @@ function clusterV2Wizard() {
         },
 
         async pollStagingJob() {
+            if (this.stagingPollBusy || this.stagingClaimed) return;
+            const generation = this.stagingGeneration;
             const jobId = this.stagingJob?.job_id;
             if (!jobId) {
                 this.stopStagingPoll();
                 return;
             }
             let snapshot;
+            this.stagingPollBusy = true;
             try {
                 snapshot = await this.apiFetch(
                     CLUSTER_V2_API.stageJob(jobId),
                 );
             } catch (error) {
+                if (generation !== this.stagingGeneration) return;
                 // 404 = the coordinator restarted and the in-memory job is
                 // gone. Re-POSTing /stage is safe (verified files skip), so
                 // pressing Activate again is the resume.
@@ -2752,11 +2812,23 @@ function clusterV2Wizard() {
                 );
                 this.activateBusy = false;
                 return;
+            } finally {
+                this.stagingPollBusy = false;
             }
+            if (generation !== this.stagingGeneration || jobId !== this.stagingJob?.job_id || this.stagingClaimed) return;
             this.stagingJob = snapshot;
             if (snapshot.status === 'completed') {
+                if (snapshot.ready !== true) {
+                    this.stopStagingPoll();
+                    this.failStaging('Staging completed without confirming model readiness.');
+                    this.activateBusy = false;
+                    return;
+                }
+                this.stagingClaimed = true;
                 this.stopStagingPoll();
-                await this.postActivation(this.stagingActivation); // phase 2
+                const activation = this.stagingActivation;
+                this.stagingActivation = null;
+                await this.postActivation(activation); // phase 2, exactly once
             } else if (snapshot.status === 'failed') {
                 // Other nodes may still have completed; per-node errors stay
                 // visible in stagingJob.nodes next to the banner. Pressing
@@ -2785,6 +2857,7 @@ function clusterV2Wizard() {
         // finishes server-side regardless, harmlessly: the next attempt
         // size-verifies and skips whatever already landed.
         dismissStaging() {
+            this.stagingGeneration += 1;
             this.stopStagingPoll();
             this.stagingJob = null;
             this.stagingActivation = null;
@@ -2843,6 +2916,7 @@ function clusterV2Wizard() {
 
         // Phase 2 — the pre-staging activation path, unchanged.
         async postActivation(activation = this.activationRequestBody()) {
+            const generation = this.stagingGeneration;
             if (!activation) {
                 this.activateBusy = false;
                 this.notify('error', 'The signed activation proposal is missing.');
@@ -2853,6 +2927,7 @@ function clusterV2Wizard() {
                     method: 'POST',
                     body: JSON.stringify(activation),
                 });
+                if (generation !== this.stagingGeneration) return;
                 this.notify(
                     'success',
                     'Cluster activated. The distributed readiness check passed.',
@@ -2868,6 +2943,7 @@ function clusterV2Wizard() {
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
+                if (generation !== this.stagingGeneration) return;
                 if (error?.status === 409) {
                     this.notify(
                         'warning',
@@ -2882,8 +2958,10 @@ function clusterV2Wizard() {
                     );
                 }
             } finally {
-                this.stopStagingPoll();
-                this.activateBusy = false;
+                if (generation === this.stagingGeneration) {
+                    this.stopStagingPoll();
+                    this.activateBusy = false;
+                }
             }
         },
 
@@ -2910,14 +2988,6 @@ function clusterV2Wizard() {
             if (Number(execution.ring_connections_per_ip) > 0) {
                 body.ring_connections_per_ip = Number(
                     execution.ring_connections_per_ip,
-                );
-            }
-            if (typeof deployment.mtp_enabled === 'boolean') {
-                body.mtp_enabled = deployment.mtp_enabled;
-            }
-            if (Number(deployment.mtp_num_draft_tokens) > 0) {
-                body.mtp_num_draft_tokens = Number(
-                    deployment.mtp_num_draft_tokens,
                 );
             }
             return body;
@@ -3116,6 +3186,7 @@ function clusterV2Wizard() {
                         method: 'POST',
                         body: JSON.stringify({
                             deployment_id: deployment.deployment_id,
+                            path_map: deployment.path_map || {},
                             model_path: deployment.model,
                             nodes,
                             hosts,
@@ -3142,14 +3213,11 @@ function clusterV2Wizard() {
                                 undefined,
                             target_context_tokens:
                                 Number(deployment.target_context_tokens) || 8192,
-                            mtp_enabled: deployment.mtp_enabled === true,
-                            mtp_num_draft_tokens:
-                                Number(deployment.mtp_num_draft_tokens) || null,
                         }),
                     },
                 );
                 this.membershipProposal = proposal;
-                if (!proposal?.ready_to_activate) {
+                if (!this.proposalCanProceed(proposal)) {
                     this.membershipError =
                         proposal?.fabric_blocker ||
                         proposal?.preflight ||
@@ -3189,7 +3257,7 @@ function clusterV2Wizard() {
             const proposal = this.membershipProposal;
             const activation = proposal?.activation;
             if (
-                !proposal?.ready_to_activate ||
+                !this.proposalCanProceed(proposal) ||
                 !activation ||
                 this.membershipBusy ||
                 this.activateBusy

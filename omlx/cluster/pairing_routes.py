@@ -22,7 +22,7 @@ import asyncio
 import ipaddress
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from .discovery_routes import ProbeRateLimiter
@@ -85,6 +85,35 @@ class PairDenyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     node_id: str = Field(min_length=1, max_length=255)
+
+
+class PairJoinBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    coordinator_addr: str = Field(min_length=1, max_length=255)
+
+
+@pair_admin_router.post("/pair/join")
+async def cluster_pair_join(body: PairJoinBody, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await asyncio.to_thread(
+            _manager().ui_session.begin, body.coordinator_addr
+        )
+    except PairingStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+
+
+@pair_admin_router.get("/pair/join")
+async def cluster_pair_join_state(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return await asyncio.to_thread(_manager().ui_session.poll)
+
+
+@pair_admin_router.post("/pair/join/cancel")
+async def cluster_pair_join_cancel():
+    return await asyncio.to_thread(_manager().ui_session.cancel)
 
 
 def _pairing_http_error(exc: PairingError) -> HTTPException:

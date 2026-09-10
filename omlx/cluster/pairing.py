@@ -871,6 +871,9 @@ class PairingManager:
         self._pending: dict[str, _PendingRequest] = {}
         self._denied: dict[str, float] = {}
         self._local_code: dict[str, Any] | None = None
+        from .pairing_session import PairingSession
+
+        self.ui_session = PairingSession(self)
 
     # -- helpers ------------------------------------------------------------
 

@@ -487,6 +487,7 @@ def stage_manifest(
     *,
     source_host: str = "127.0.0.1",
     source_python_executable: str = DEFAULT_REMOTE_PYTHON,
+    path_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """What must move before this plan can run, per node.
 
@@ -532,13 +533,18 @@ def stage_manifest(
         if not ssh_target:
             continue
         if is_local_host(ssh_target):
+            destination = Path(
+                (path_map or {}).get(assignment.node_id, remote_dir)
+            ).expanduser()
             present_by_node[assignment.node_id] = {
                 path.name: path.stat().st_size
-                for path in Path(remote_dir).iterdir()
+                for path in (destination.iterdir() if destination.is_dir() else ())
                 if path.is_file()
             }
         else:
-            peer_dir = remote_model_dir(ssh_target, portable)
+            peer_dir = remote_model_dir(
+                ssh_target, (path_map or {}).get(assignment.node_id, portable)
+            )
             present_by_node[assignment.node_id] = remote_file_sizes(
                 ssh_target, peer_dir
             )
