@@ -91,7 +91,7 @@ def test_nax_shim_reexports_fast_impl():
 
 def test_qmm_nax_kwargs_empty_for_pre_nax_ext(monkeypatch):
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", False)
-    assert fast._qmm_nax_kwargs() == {}
+    assert fast._qmm_nax_kwargs(4) == {}
 
 
 def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
@@ -101,7 +101,7 @@ def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    kwargs = fast._qmm_nax_kwargs()
+    kwargs = fast._qmm_nax_kwargs(4)
     assert kwargs["use_nax"] is True
     assert kwargs["nax_variant"] == fast.QMM_NAX_VARIANT
 
@@ -114,7 +114,7 @@ def test_qmm_nax_env_kill_switch(monkeypatch):
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
     monkeypatch.setenv("OMLX_QWEN35_QMM_NAX", "0")
-    assert fast._qmm_nax_kwargs()["use_nax"] is False
+    assert fast._qmm_nax_kwargs(4)["use_nax"] is False
 
 
 def test_qmm_nax_disabled_without_kernels(monkeypatch):
@@ -124,7 +124,33 @@ def test_qmm_nax_disabled_without_kernels(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    assert fast._qmm_nax_kwargs()["use_nax"] is False
+    assert fast._qmm_nax_kwargs(4)["use_nax"] is False
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_qmm_nax_kwargs_supported_bits_use_nax(monkeypatch, bits):
+    fake_ext = types.SimpleNamespace(
+        is_nax_available=lambda: True,
+        nax_qmm_kernels_built=lambda: True,
+    )
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    assert fast._qmm_nax_kwargs(bits)["use_nax"] is True
+
+
+def test_qmm_nax_kwargs_never_requests_nax_for_bits2(monkeypatch):
+    # qwen35_qmm_nax.metal only defines kernels for bits 4/5/6/8. Routing a
+    # q2 call through NAX anyway fails the kernel lookup and latches
+    # nax_qmm_runtime_ok=false process-wide, permanently demoting every
+    # q4/q5/q6/q8 layer for the rest of the process — bits==2 must never
+    # even attempt NAX, regardless of hardware/build availability.
+    fake_ext = types.SimpleNamespace(
+        is_nax_available=lambda: True,
+        nax_qmm_kernels_built=lambda: True,
+    )
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    assert fast._qmm_nax_kwargs(2) == {}
 
 
 def test_ane_hybrid_nax_capability_reports_native_state(monkeypatch):
