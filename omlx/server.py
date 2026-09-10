@@ -55,6 +55,7 @@ from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -893,7 +894,7 @@ async def validation_exception_handler(
         param = errors[0].get("loc", [None])[-1] if errors else None
         content = _openai_error_body(detail_str, 422, param=param)
     else:
-        content = {"detail": exc.errors()}
+        content = {"detail": jsonable_encoder(exc.errors())}
     return JSONResponse(status_code=422, content=content)
 
 
