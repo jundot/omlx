@@ -954,6 +954,88 @@ class TestRuntimeCacheObservability:
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
         manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
 
+    def test_runtime_cache_surfaces_embedded_gdn_codec_counters(self):
+        """The embedded-layout codec counters reach the admin row, typed.
+
+        The scheduler publishes them under gdn_embedded_state only when an
+        embedded cache manager exists; the route must pass them through with
+        the same normalization gdn_staging gets, and omit the key entirely for
+        schedulers that never report it.
+        """
+        cache_dir = Path("/tmp/omlx-cache")
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
+
+        def _entry(model_id: str, runtime_stats: dict):
+            manager = MagicMock()
+            manager.get_stats_for_model.return_value = {
+                "num_files": 1,
+                "total_size_bytes": 1024,
+                "hot_cache_max_bytes": 0,
+                "hot_cache_size_bytes": 0,
+                "hot_cache_entries": 0,
+            }
+            scheduler = MagicMock()
+            scheduler.config.model_name = f"/models/{model_id}"
+            scheduler.paged_ssd_cache_manager = manager
+            scheduler.get_ssd_cache_stats.return_value = {
+                "block_size": 2048,
+                "indexed_blocks": 1,
+                "ssd_cache": {
+                    "num_files": 1,
+                    "total_size_bytes": 1024,
+                    "hot_cache_max_bytes": 0,
+                    "hot_cache_size_bytes": 0,
+                    "hot_cache_entries": 0,
+                },
+                **runtime_stats,
+            }
+            return SimpleNamespace(
+                engine=SimpleNamespace(
+                    _engine=SimpleNamespace(
+                        engine=SimpleNamespace(scheduler=scheduler)
+                    )
+                )
+            )
+
+        encoded = {
+            "state_dtype": "rht_int16",
+            "state_encodes": "7",
+            "state_dequantizations": 2,
+            "encode_failures": None,
+            "decode_failures": 0,
+            "capability_fallbacks": 0,
+            "unexpected_key": "must not leak through",
+        }
+        entry_a = _entry("model-a", {"gdn_embedded_state": encoded})
+        entry_b = _entry("model-b", {})
+
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [
+                {"id": "model-a", "loaded": True},
+                {"id": "model-b", "loaded": True},
+            ]
+        }
+        engine_pool._entries = {"model-a": entry_a, "model-b": entry_b}
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        rows = {row["id"]: row for row in payload["models"]}
+        assert rows["model-b"].get("gdn_embedded_state") is None
+        assert rows["model-a"]["gdn_embedded_state"] == {
+            "state_dtype": "rht_int16",
+            "state_encodes": 7,
+            "state_dequantizations": 2,
+            "encode_failures": 0,
+            "decode_failures": 0,
+            "capability_fallbacks": 0,
+        }
+
     def test_runtime_cache_uses_global_hot_cache_cap_not_sum(self):
         """Aggregate hot cache max is a shared cap, not per-loaded-model sum."""
         cache_dir = Path("/tmp/omlx-cache")
