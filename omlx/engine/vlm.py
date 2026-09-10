@@ -64,6 +64,24 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+
+def _output_tokens(output: Any) -> list[int]:
+    """Token IDs from an engine output; [] when absent/non-iterable (K8).
+
+    Production outputs carry output_token_ids (cumulative). Test doubles
+    and exotic engines may not, and a mocked attribute is not iterable;
+    degrade to [] instead of breaking the call. The bench's --gate-tokens
+    fail-high still catches a REAL path that never populates the list.
+    """
+    try:
+        oid = getattr(output, "output_token_ids", None)
+        if oid is None:
+            return []
+        return [int(t) for t in oid]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
 # unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
@@ -764,112 +782,6 @@ def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
     except Exception:
         return False
     return isinstance(metadata, dict) and metadata.get("format") == "mlx"
-
-
-def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
-    """Derive Gemma4's legacy full-attention head fields from ``per_layer_config``.
-
-    Newer Gemma4 checkpoints (Transformers >= 5.15) record the ``head_dim`` /
-    ``num_key_value_heads`` overrides of the full-attention layers under
-    ``text_config.per_layer_config`` instead of the legacy global
-    ``global_head_dim`` / ``num_global_key_value_heads`` fields. The pinned
-    mlx-vlm Gemma4 loader reads only the legacy fields, so it sizes the
-    full-attention K/V projections with the sliding-window head count and
-    ``load_weights`` fails with a shape mismatch (#3537).
-
-    Returns the legacy fields that are absent from ``text_config`` and can be
-    derived unambiguously (every overridden full-attention layer agrees), or
-    an empty dict.
-    """
-    text_config = config.get("text_config")
-    if not isinstance(text_config, dict):
-        return {}
-    model_type = str(text_config.get("model_type") or config.get("model_type") or "")
-    if not model_type.startswith("gemma4"):
-        return {}
-    per_layer = text_config.get("per_layer_config")
-    if not isinstance(per_layer, dict) or not per_layer:
-        return {}
-    layer_types = text_config.get("layer_types")
-    if not isinstance(layer_types, list):
-        layer_types = None
-
-    derived: dict[str, int] = {}
-    for legacy_key, layer_key in (
-        ("global_head_dim", "head_dim"),
-        ("num_global_key_value_heads", "num_key_value_heads"),
-    ):
-        if text_config.get(legacy_key) is not None:
-            continue
-        values: set[int] = set()
-        for layer_id, overrides in per_layer.items():
-            if not isinstance(overrides, dict) or overrides.get(layer_key) is None:
-                continue
-            if layer_types is not None:
-                try:
-                    layer_idx = int(layer_id)
-                except (TypeError, ValueError):
-                    continue
-                if not 0 <= layer_idx < len(layer_types):
-                    continue
-                if layer_types[layer_idx] != "full_attention":
-                    continue
-            try:
-                values.add(int(overrides[layer_key]))
-            except (TypeError, ValueError):
-                continue
-        if len(values) == 1:
-            derived[legacy_key] = values.pop()
-    return derived
-
-
-@contextlib.contextmanager
-def _derive_gemma4_global_kv_on_load(model_dir: Path):
-    """Feed ``per_layer_config``-only Gemma4 head overrides to the mlx-vlm loader.
-
-    Wraps ``mlx_vlm.utils.load_config`` for one ``vlm_load(...)`` so the
-    config handed to the Gemma4 ``TextConfig`` carries ``global_head_dim`` /
-    ``num_global_key_value_heads`` derived from ``per_layer_config`` when the
-    checkpoint does not spell them out (#3537). Checkpoints that already
-    carry the legacy fields, and non-Gemma4 models, are untouched.
-    """
-    config_path = model_dir / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-    except Exception:
-        yield
-        return
-    derived = (
-        _gemma4_global_kv_from_per_layer_config(config)
-        if isinstance(config, dict)
-        else {}
-    )
-    if not derived:
-        yield
-        return
-
-    import mlx_vlm.utils as _vu
-
-    original_load_config = _vu.load_config
-
-    def _patched_load_config(model_path, **kwargs):
-        loaded = original_load_config(model_path, **kwargs)
-        text_config = loaded.get("text_config") if isinstance(loaded, dict) else None
-        if isinstance(text_config, dict):
-            for key, value in derived.items():
-                if text_config.get(key) is None:
-                    text_config[key] = value
-        return loaded
-
-    logger.info(
-        "derive_gemma4_global_kv_on_load: per_layer_config -> %s",
-        ", ".join(f"{k}={v}" for k, v in derived.items()),
-    )
-    _vu.load_config = _patched_load_config
-    try:
-        yield
-    finally:
-        _vu.load_config = original_load_config
 
 
 @contextlib.contextmanager
@@ -1802,7 +1714,6 @@ class VLMBatchedEngine(BaseEngine):
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
-                _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
@@ -1830,7 +1741,35 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                    # Single predicate shared with EnginePool and the
+                    # converter (engine/batched.py carries the same call).
+                    #
+                    # The old two-element tuple left every supported MoE VLM
+                    # except these two (glm_moe_dsa, deepseek_v4, ...) fully
+                    # materializing its banks at load — with expert streaming
+                    # enabled that is the OOM path, since the converter only
+                    # reaches the banks on a lazy model.
+                    #
+                    # Still not gated on expert_streaming_enabled: lazy
+                    # loading is a peak-memory win on its own for these
+                    # checkpoints, and dropping it would regress loads with
+                    # the feature turned off. Because that makes this run on
+                    # EVERY VLM load, the cheap allowlist test short-circuits
+                    # the header scan for everything else — the estimate would
+                    # reject those anyway (it requires the same allowlist), so
+                    # this is an optimization, not a second opinion.
+                    from ..patches.expert_streaming import is_supported_model_type
+                    from ..patches.expert_streaming.residency import (
+                        expert_streaming_estimate,
+                    )
+
+                    if is_supported_model_type(model_type) and expert_streaming_estimate(
+                        self._model_name
+                    ).supported:
+                        # Lazy-load so giant MoE checkpoints (Qwen3.8-Flash-Next
+                        # 99G, GLM-5.3-Flash-oQ4e 190G) stream from SSD instead of
+                        # materializing fully in RAM; expert streaming replaces
+                        # the MoE projections afterwards.
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
@@ -1867,8 +1806,50 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_name,
                 )
 
+        # Expert streaming (SSD): keep hot experts resident, stream the rest.
+        # Runs BEFORE materialize_lazy_state on purpose. On lazy-loaded
+        # checkpoints (qwen4_exp, glm5_next) every tensor is a plain mx.array
+        # and materialize_lazy_state would evaluate the entire tree — including
+        # the multi-hundred-GB MoE expert banks (OOM). Converting to streaming
+        # first drops those arrays (GC'd), so the materialize that follows only
+        # evaluates dense weights, RoPE freqs and vision/audio towers.
+        # Also runs before gate+up fusion (fusion would change the stacked
+        # layout).
+        if getattr(self._model_settings, "expert_streaming_enabled", False):
+            try:
+                from ..patches.expert_streaming import convert_model_to_streaming
+
+                def _do_vlm_streaming():
+                    _, backing = convert_model_to_streaming(
+                        self._vlm_model, self._model_name, self._model_settings
+                    )
+                    if backing is not None:
+                        self._expert_streaming_backing = backing
+                        try:
+                            self._vlm_model._expert_streaming_backing = backing  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    return backing
+
+                await loop.run_in_executor(get_mlx_executor(), _do_vlm_streaming)
+                logger.info("Expert streaming enabled for VLM %s", self._model_name)
+            except Exception as e:
+                # Fail clean: streaming was explicitly enabled, so a backing
+                # failure must fail the load — continuing to materialize
+                # would retain all expert banks in RAM (OOM).
+                logger.error(
+                    "Expert streaming conversion failed for VLM %s: %s",
+                    self._model_name,
+                    e,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"Expert streaming conversion failed for VLM {self._model_name}: {e}"
+                ) from e
+
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
+        # Post-streaming: the MoE banks are gone, so this stays bounded.
         from ..utils.model_loading import materialize_lazy_state
 
         await loop.run_in_executor(
@@ -1895,10 +1876,12 @@ class VLMBatchedEngine(BaseEngine):
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
-        # the MLX executor because it rewrites weights in place.
+        # the MLX executor because it rewrites weights in place. Skip when
+        # expert streaming is active — streaming already handles the projection layout.
         if (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
+            and not getattr(self._model_settings, "expert_streaming_enabled", False)
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (
@@ -2049,27 +2032,31 @@ class VLMBatchedEngine(BaseEngine):
 
         # Qwen3.5/3.6 verify-width GDN prework -> one fused Metal launch
         # (conv+SiLU+split+RMS+scale+conv-state), bit-exact to the chain.
-        try:
-            from ..patches.qwen35_gdn_prework import (
-                apply_qwen35_gdn_prework_patch,
-            )
+        # TEMP BISECT (revert): OMLX_MTP_NOGDN_PREWORK=1 skips for 8k probe.
+        if not __import__("os").environ.get("OMLX_MTP_NOGDN_PREWORK"):
+            try:
+                from ..patches.qwen35_gdn_prework import (
+                    apply_qwen35_gdn_prework_patch,
+                )
 
-            apply_qwen35_gdn_prework_patch()
-        except Exception:
-            logger.debug("Qwen GDN prework patch not applied", exc_info=True)
+                apply_qwen35_gdn_prework_patch()
+            except Exception:
+                logger.debug("Qwen GDN prework patch not applied", exc_info=True)
 
         # Qwen3.5/3.6 verify-width (MTP target-verify) attention -> chunked
         # causal vector-kernel calls instead of the per-row SDPA loop.
-        try:
-            from ..patches.qwen35_verify_sdpa_split import (
-                apply_qwen35_verify_sdpa_split_patch,
-            )
+        # TEMP BISECT (revert): OMLX_MTP_NOVERIFY_SDPA=1 skips for 8k probe.
+        if not __import__("os").environ.get("OMLX_MTP_NOVERIFY_SDPA"):
+            try:
+                from ..patches.qwen35_verify_sdpa_split import (
+                    apply_qwen35_verify_sdpa_split_patch,
+                )
 
-            apply_qwen35_verify_sdpa_split_patch()
-        except Exception:
-            logger.debug(
-                "Qwen verify-split attention patch not applied", exc_info=True
-            )
+                apply_qwen35_verify_sdpa_split_patch()
+            except Exception:
+                logger.debug(
+                    "Qwen verify-split attention patch not applied", exc_info=True
+                )
 
         # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
         # Decode and masked paths keep the original mlx-vlm kernel.
@@ -2402,6 +2389,22 @@ class VLMBatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        # Persist the learned expert-pin profile while the backing is still
+        # reachable (teardown below drops it with the model).
+        from omlx.patches.expert_streaming import (
+            save_expert_pin_profile,
+            shutdown_expert_streaming,
+        )
+
+        save_expert_pin_profile(self)
+        try:
+            shutdown_expert_streaming(getattr(self, "_expert_streaming_backing", None))
+        except Exception:
+            pass
+        try:
+            self._expert_streaming_backing = None
+        except Exception:
+            pass
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
@@ -3637,6 +3640,7 @@ class VLMBatchedEngine(BaseEngine):
                 return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
             return GenerationOutput(
                 text=full_text,
+                tokens=list(last_output.tokens),
                 prompt_tokens=last_output.prompt_tokens,
                 completion_tokens=last_output.completion_tokens,
                 finish_reason=last_output.finish_reason,
@@ -3686,7 +3690,6 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
-            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 
@@ -3694,6 +3697,7 @@ class VLMBatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
+            tokens=_output_tokens(output),
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
@@ -3800,7 +3804,6 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
-            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
@@ -3819,6 +3822,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
+                    tokens=_output_tokens(output),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -3852,6 +3856,48 @@ class VLMBatchedEngine(BaseEngine):
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await engine.abort_request(request_id)
+            else:
+                self._log_streaming_summary()
+
+    def _log_streaming_summary(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """Parity with BatchedEngine: one-line MoE streaming health log.
+
+        No-op unless expert streaming is active (VLM wrappers serve the
+        largest streaming checkpoints — qwen4_exp/glm5_next).
+        """
+        try:
+            backing = getattr(self, "_expert_streaming_backing", None)
+            if backing is None:
+                return
+            # Dynamic residency: parity with BatchedEngine (opt-in).
+            governor = getattr(backing, "governor", None)
+            if governor is not None:
+                governor.observe()
+            from ..patches.expert_streaming import expert_streaming_summary
+
+            cache = getattr(backing, "_streaming_cache", None)
+            summary = expert_streaming_summary(cache, backing)
+            if not summary:
+                return
+            logger.info(
+                "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
+                "(h=%d m=%d evict=%d size=%d/%d) advised=%d "
+                "ctx_fallbacks=%s",
+                prompt_tokens,
+                completion_tokens,
+                summary.get("lru_hit_rate", 0.0),
+                summary.get("lru_hits", 0),
+                summary.get("lru_misses", 0),
+                summary.get("lru_evictions", 0),
+                summary.get("lru_size", 0),
+                summary.get("lru_capacity", 0),
+                summary.get("advised", 0),
+                summary.get("ctx_fallbacks", {}),
+            )
+        except Exception:
+            pass
 
     async def chat(
         self,
@@ -3891,6 +3937,7 @@ class VLMBatchedEngine(BaseEngine):
                 return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
             return GenerationOutput(
                 text=full_text,
+                tokens=list(last_output.tokens),
                 prompt_tokens=last_output.prompt_tokens,
                 completion_tokens=last_output.completion_tokens,
                 finish_reason=last_output.finish_reason,
