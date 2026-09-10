@@ -932,6 +932,13 @@ class BlockAwarePrefixCache(CacheManager):
         # Supersede-on-extend tracking (rotating models only, see below).
         first_new_block_idx: int | None = None
         tip_block_saved = False
+        # _get_cache_seq_len(cache_data) is loop-invariant (depends only on
+        # cache_data, not per-block state), but many blocks in this loop
+        # dedup via `continue` or `break` before ever reaching it — computing
+        # it unconditionally before the loop would pay its cost even on an
+        # all-deduplicated prefix hit that currently pays nothing. Memoize on
+        # first actual need instead, so it still runs at most once per call.
+        cache_seq_len_memo: int | None = None
 
         for i in range(num_new_blocks):
             start_idx = i * self.block_size
@@ -1114,8 +1121,16 @@ class BlockAwarePrefixCache(CacheManager):
             # complete non-sliceable state without colliding with a normal
             # block that may contain placeholders.
             if len(block_tokens) == self.block_size and not is_exact_terminal:
+                # block.block_hash above was computed from these exact same
+                # (parent_hash, block_tokens, block_extra_keys, model_name)
+                # inputs — pass it through instead of recomputing the same
+                # SHA-256 over the block's token content a second time.
                 self.paged_cache.register_block_hash(
-                    block, block_tokens, parent_hash, extra_keys=block_extra_keys
+                    block,
+                    block_tokens,
+                    parent_hash,
+                    extra_keys=block_extra_keys,
+                    precomputed_hash=block.block_hash,
                 )
             elif is_exact_terminal and block.block_hash is not None:
                 self.paged_cache.cached_block_hash_to_block.insert(
@@ -1124,7 +1139,9 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Extract tensor slice and save to paged SSD
             if is_tensor_data and HAS_MLX and self.paged_ssd_cache is not None:
-                cache_seq_len = self._get_cache_seq_len(cache_data)
+                if cache_seq_len_memo is None:
+                    cache_seq_len_memo = self._get_cache_seq_len(cache_data)
+                cache_seq_len = cache_seq_len_memo
 
                 # Determine whether extracted cache_data uses:
                 # - global indices (full sequence cache, includes reused prefix), or
