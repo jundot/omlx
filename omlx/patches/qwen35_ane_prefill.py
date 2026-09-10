@@ -966,6 +966,11 @@ def _post_ane_down(
     ):
         raise RuntimeError("ANE down-projection state is incomplete")
 
+    # A latched down model would otherwise throw inside the native dual-qmm
+    # dispatch at eval time, where the per-module GPU fallback cannot catch it;
+    # raise here so the caller's try/except degrades to the GPU path instead.
+    _raise_if_latched(state.model, state.model1)
+
     from omlx.custom_kernels.qwen35_prefill import fast
 
     if state.cpu_weight is not None:
@@ -1542,6 +1547,57 @@ def _raise_if_latched(*models: Any) -> None:
             )
 
 
+# ANE dispatch is gated on Metal headroom. The ANE driver's per-request kernel
+# memory (DART/DMA mapping, firmware task allocation) is drawn from wired memory
+# OUTSIDE MLX's managed Metal budget, so near the wired-limit ceiling that pool
+# is starved and ANEProgramProcessRequestDirect fails with status=0x2 "Program
+# Inference error" — even though the Metal-side chunk was admitted (occupancy,
+# not context length, is the trigger). Above the fraction below we route the
+# full-tile prefill projection to the GPU path (the same fallback exercised on
+# every decode) instead of the ANE. OMLX_QWEN35_ANE_MAX_METAL_FRAC=1 disables
+# the gate.
+_ANE_MAX_METAL_FRAC = float(
+    os.environ.get("OMLX_QWEN35_ANE_MAX_METAL_FRAC", "0.85") or "0.85"
+)
+_ane_metal_cap_cache: int | None = None
+
+
+def _ane_metal_cap_bytes() -> int:
+    # Wired-limit cap is set once at startup and stable thereafter; cache it so
+    # the gate never runs the sysctl in get_effective_metal_cap_bytes per call.
+    global _ane_metal_cap_cache
+    if _ane_metal_cap_cache is None:
+        try:
+            from omlx.process_memory_enforcer import get_effective_metal_cap_bytes
+
+            _ane_metal_cap_cache = int(get_effective_metal_cap_bytes())
+        except Exception:
+            _ane_metal_cap_cache = 0
+    return _ane_metal_cap_cache
+
+
+def _ane_headroom_ok() -> bool:
+    """False when Metal occupancy is too high to safely dispatch to the ANE.
+
+    Guards the status=0x2 "Program Inference error" that
+    ANEProgramProcessRequestDirect returns when the ANE's wired-memory pool is
+    starved near the Metal ceiling. Never raises — on any error it returns True
+    so the ANE path is unaffected. ``mx.get_active_memory()`` is a cheap counter
+    read and this only runs on full-tile prefill projections (decode and
+    sub-tile chunks return before reaching it).
+    """
+    frac = _ANE_MAX_METAL_FRAC
+    if frac <= 0.0 or frac >= 1.0:
+        return True
+    cap = _ane_metal_cap_bytes()
+    if cap <= 0:
+        return True
+    try:
+        return int(mx.get_active_memory()) < frac * cap
+    except Exception:
+        return True
+
+
 def _gdn_backend_exact(
     gdn: Any, x: mx.array, target_verify: bool = False
 ) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
@@ -1549,6 +1605,8 @@ def _gdn_backend_exact(
     if config is None or target_verify or not _eligible_input(x, config):
         return None
     if getattr(gdn, "_omlx_ane_gdn_failed", False):
+        return None
+    if not _ane_headroom_ok():
         return None
     state = getattr(gdn, "_omlx_ane_gdn_state", None)
     if state is None:
@@ -1734,6 +1792,8 @@ def _backend_exact(
         return None
     if getattr(mlp, "_omlx_ane_prefill_failed", False):
         return None
+    if not _ane_headroom_ok():
+        return None
 
     fused_down_state = getattr(mlp, "_omlx_ane_fused_down_state", None)
     if fused_down_state is not None:
@@ -1805,7 +1865,12 @@ def _backend_exact(
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
-        _raise_if_latched(state.model, state.model1, state.down_ane)
+        _raise_if_latched(
+            state.model,
+            state.model1,
+            state.down_ane.model if state.down_ane is not None else None,
+            state.down_ane.model1 if state.down_ane is not None else None,
+        )
         if state.cpu_weight is not None:
             if state.model1 is not None and state.bits == 4:
                 activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
