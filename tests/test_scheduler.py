@@ -153,6 +153,74 @@ class TestSchedulerConfig:
         assert config.mlx_cache_cleanup_interval == 20
 
 
+class TestPagedCacheBlockSizeEnvOverride:
+    """Tests for the OMLX_PAGED_CACHE_BLOCK_SIZE escape hatch."""
+
+    ENV_VAR = "OMLX_PAGED_CACHE_BLOCK_SIZE"
+
+    @staticmethod
+    def _scheduler(block_size: int = 4096, ssd_dir: str | None = "/tmp/cache"):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.config = SchedulerConfig(
+            paged_cache_block_size=block_size,
+            paged_ssd_cache_dir=ssd_dir,
+        )
+        return scheduler
+
+    def test_unset_leaves_resolved_block_size_untouched(self, monkeypatch):
+        """Absent the variable, the heuristics' choice must stand."""
+        monkeypatch.delenv(self.ENV_VAR, raising=False)
+        scheduler = self._scheduler()
+
+        scheduler._apply_block_size_env_override()
+
+        assert scheduler.config.paged_cache_block_size == 4096
+
+    def test_empty_value_is_ignored(self, monkeypatch):
+        monkeypatch.setenv(self.ENV_VAR, "   ")
+        scheduler = self._scheduler()
+
+        scheduler._apply_block_size_env_override()
+
+        assert scheduler.config.paged_cache_block_size == 4096
+
+    def test_override_replaces_resolved_block_size(self, monkeypatch):
+        monkeypatch.setenv(self.ENV_VAR, "512")
+        scheduler = self._scheduler()
+
+        scheduler._apply_block_size_env_override()
+
+        assert scheduler.config.paged_cache_block_size == 512
+
+    def test_override_can_raise_block_size(self, monkeypatch):
+        """The hatch is not one-directional."""
+        monkeypatch.setenv(self.ENV_VAR, "2048")
+        scheduler = self._scheduler(block_size=256)
+
+        scheduler._apply_block_size_env_override()
+
+        assert scheduler.config.paged_cache_block_size == 2048
+
+    @pytest.mark.parametrize("raw", ["abc", "512.5", "0", "-512", "768"])
+    def test_invalid_values_are_ignored(self, monkeypatch, raw):
+        """Non-integer, non-positive and non-power-of-two values are refused."""
+        monkeypatch.setenv(self.ENV_VAR, raw)
+        scheduler = self._scheduler()
+
+        scheduler._apply_block_size_env_override()
+
+        assert scheduler.config.paged_cache_block_size == 4096
+
+    def test_ignored_when_paged_cache_disabled(self, monkeypatch):
+        """Matches the gate on _enlarge_block_size_for_arrays_cache."""
+        monkeypatch.setenv(self.ENV_VAR, "512")
+        scheduler = self._scheduler(ssd_dir=None)
+
+        scheduler._apply_block_size_env_override()
+
+        assert scheduler.config.paged_cache_block_size == 4096
+
+
 class TestVLMExtraSlicing:
     """Tests for VLM prompt-aligned extra kwargs used during external prefill."""
 
