@@ -796,6 +796,28 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
+    def test_xtc_sampling_disables_mtp_eligibility(self):
+        """MTP's rejection-sampling acceptance math has no XTC term (D2), so
+        a batch built from an xtc_probability > 0 request must be ineligible
+        even though every other gate passes."""
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *args, **kwargs: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        gen_batch = SimpleNamespace(
+            model=model,
+            uids=[0],
+            logits_processors=None,
+            _omlx_mtp_disabled_xtc=True,
+        )
+        assert batch_generator._mtp_common_eligible(gen_batch) is False
+
+        gen_batch._omlx_mtp_disabled_xtc = False
+        assert batch_generator._mtp_common_eligible(gen_batch) is True
+
     def test_decode_marker_is_found_on_wrapped_language_model(self):
         from omlx.patches.mlx_lm_mtp import batch_generator
 
