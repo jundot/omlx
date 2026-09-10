@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lifecycle wrap for dflash-mlx's class-level monkey patches.
+"""Lifecycle wrap for dflash-mlx's process-global monkey patches.
 
 dflash-mlx patches linear-attention / attention ``__call__`` at the class
 level (``cls.__call__ = speculative_call`` etc.) inside its hook installer
@@ -17,6 +17,10 @@ This module wraps each dflash hook installer so oMLX can:
   - on ``restore_dflash_class_patches()`` (called from ``DFlashEngine.stop()``),
     revert each touched class to that captured state and clear dflash's
     idempotency flag so a subsequent DFlash load can re-arm cleanly
+
+The install step also wires narrowly gated target-loader compatibility patches
+that must exist before ``load_target_bundle`` runs. Those loader wrappers are
+idempotent and delegate unrelated targets to dflash-mlx's original loader.
 
 The wrap is idempotent and runs once per process — typically at the
 beginning of ``DFlashEngine.start()`` just before ``load_target_bundle``.
@@ -154,11 +158,19 @@ def set_dflash_guard_base(cls: type, new_call: Any) -> None:
 
 
 def install_dflash_lifecycle_wrap() -> bool:
-    """Monkey-patch dflash's hook installers to record pre-dflash class state.
+    """Monkey-patch dflash process-global hooks before target loading.
 
-    Safe to call repeatedly — each installer is wrapped at most once.
-    Returns True if at least one backend's installers were wrapped.
+    Safe to call repeatedly — each class-hook installer and compatibility
+    loader is wrapped at most once. Returns True if at least one backend's
+    class-hook installers were wrapped.
     """
+    from .qwen38_modelopt_dflash import install_dflash_modelopt_loader
+
+    # DFlash imports mlx_lm.utils.load into runtime.loading at module import
+    # time. Install the exact-weight Qwen3.8 ModelOpt dispatcher before
+    # load_target_bundle resolves the target; unrelated models pass through.
+    install_dflash_modelopt_loader()
+
     wrapped_any = False
 
     try:
@@ -205,7 +217,8 @@ def restore_dflash_class_patches() -> None:
 
     Also clears the dflash idempotency flag on each class so a later
     DFlash engine load can re-install its hook freshly. Empties the
-    backup table.
+    backup table. Target-loader compatibility wrappers are deliberately
+    left installed: they are stateless, idempotent and narrowly gated.
     """
     if not _DFLASH_BACKUP:
         return
