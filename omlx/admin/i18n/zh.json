@@ -634,6 +634,8 @@
   "modal.model_settings.temperature": "温度",
   "modal.model_settings.repetition_penalty": "重复惩罚",
   "modal.model_settings.repetition_penalty_short": "重复惩罚",
+  "modal.model_settings.repetition_context_size": "重复上下文大小",
+  "modal.model_settings.repetition_context_size_hint": "重复惩罚所考虑的前置 token 数量。默认值：20。",
   "modal.model_settings.min_p": "Min P",
   "modal.model_settings.presence_penalty": "存在惩罚",
   "modal.model_settings.top_p": "Top P",
