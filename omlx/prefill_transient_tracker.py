@@ -25,6 +25,9 @@ class _TransientHistory:
     last_delta_bytes: int = 0
     last_n_tokens: int = 0
     observed_max_bytes: int = 0
+    partial_bytes: int = 0
+    partial_per_token: float = 0.0
+    has_representative_sample: bool = False
     flat_overhead_bytes: int = 0
     reclaim_debt_bytes: int = 0
 
@@ -61,28 +64,84 @@ class PrefillTransientTracker:
         self._model_id = model_id
         self._dense_history = _TransientHistory()
         self._gathered_history = _TransientHistory()
-        # Net process footprint released by negative post-chunk deltas. MLX may
-        # need to allocate that pool again on the next chunk, so the scheduler
-        # prices it once until a positive measurement confirms reallocation.
-        self._recent_reclaim_bytes: int = 0
+        self._reclaim_state: tuple[int | None, int] = (None, 0)
 
     def _history(self, gathered_core: bool) -> _TransientHistory:
         return self._gathered_history if gathered_core is True else self._dense_history
 
-    def record_reclaim(self, reclaimed_bytes: int) -> None:
-        """Accumulate footprint released since the last positive sample."""
-        if reclaimed_bytes > 0:
-            self._recent_reclaim_bytes += int(reclaimed_bytes)
+    def observe_footprint(self, pre_bytes: int, post_bytes: int) -> None:
+        """Account for releases against an absolute footprint reference.
 
-    def clear_reclaim(self) -> None:
-        """Drop the charge once any positive measurement confirms realloc.
-
-        Callers invoke this for every positive delta, including samples the
-        EWMA gates skip (sub-floor tails, speed-priority partials) — the
-        footprint has grown back, so keeping the charge would double count
-        against the guard's gates.
+        Between-chunk growth pays down the outstanding release as well. Two
+        measurements of 100 -> 98 are one 2-byte gap, whereas 100 -> 98 -> 96
+        really releases 4 bytes. Partial reallocation only pays its own bytes.
         """
-        self._recent_reclaim_bytes = 0
+        reference, _ = self._reclaim_state
+        if reference is not None and pre_bytes >= reference:
+            reference = None
+        if post_bytes < pre_bytes:
+            reference = max(reference or 0, pre_bytes)
+        gap = max(0, reference - post_bytes) if reference is not None else 0
+        # Publish the reference and gap together: early admission also reads
+        # this state from the event loop while the executor records chunks.
+        self._reclaim_state = (reference if gap else None, gap)
+
+    def reclaim_bytes_at(self, current_bytes: int) -> int:
+        """Read the unpaid gap without mutating executor-owned history."""
+        reference, gap = self._reclaim_state
+        if reference is None:
+            return 0
+        return min(gap, max(0, reference - current_bytes))
+
+    def observe_floor(
+        self, transient_bytes: int, *, floor_sample: bool, gathered_core: bool
+    ) -> None:
+        history = self._history(gathered_core)
+        # The very first sample in each execution regime carries weight
+        # page-fault and load-residue noise, so it seeds that regime's EWMA
+        # but is excluded from its running max.
+        if floor_sample and history.samples > 0:
+            if transient_bytes <= self._OBSERVED_MAX_CLAMP_BYTES:
+                history.observed_max_bytes = max(
+                    history.observed_max_bytes, transient_bytes
+                )
+            else:
+                logger.debug(
+                    "PrefillTransientTracker(%s): rejected %d-byte outlier "
+                    "from observed max (clamp %d)",
+                    self._model_id,
+                    transient_bytes,
+                    self._OBSERVED_MAX_CLAMP_BYTES,
+                )
+
+    def observe_partial(
+        self, n_tokens: int, transient_bytes: int, *, gathered_core: bool = False
+    ) -> None:
+        """Keep partial allocation evidence outside the representative rate.
+
+        Cheap reuse does not retire this evidence. A positive representative
+        sample can replace it only when its rate covers this bound at every width.
+        """
+        history = self._history(gathered_core)
+        if n_tokens > 0 and transient_bytes > 0:
+            history.partial_bytes = max(history.partial_bytes, transient_bytes)
+            history.partial_per_token = max(
+                history.partial_per_token, transient_bytes / n_tokens
+            )
+
+    def partial_bytes_for(self, gathered_core: bool) -> int:
+        return self._history(gathered_core).partial_bytes
+
+    def partial_bound(self, n_tokens: int, gathered_core: bool) -> float:
+        history = self._history(gathered_core)
+        if n_tokens <= 0:
+            return 0.0
+        # Preserve the existing downward scaling for smaller candidates;
+        # never amplify a partial allocation when considering a larger step.
+        return min(history.partial_bytes, n_tokens * history.partial_per_token)
+
+    def has_representative_sample_for(self, gathered_core: bool) -> bool:
+        return self._history(gathered_core).has_representative_sample
 
     def update(
         self,
@@ -91,6 +150,7 @@ class PrefillTransientTracker:
         *,
         floor_sample: bool = False,
         gathered_core: bool = False,
+        representative: bool = True,
     ) -> None:
         """Record one chunk observation.
 
@@ -118,29 +178,16 @@ class PrefillTransientTracker:
         if transient_bytes <= 0:
             return
 
-        self._recent_reclaim_bytes = 0
-
         history = self._history(gathered_core)
 
-        # The very first sample in each execution regime carries weight
-        # page-fault and load-residue noise, so it seeds that regime's EWMA
-        # but is excluded from its running max.
-        if floor_sample and history.samples > 0:
-            if transient_bytes <= self._OBSERVED_MAX_CLAMP_BYTES:
-                history.observed_max_bytes = max(
-                    history.observed_max_bytes, transient_bytes
-                )
-            else:
-                logger.debug(
-                    "PrefillTransientTracker(%s): rejected %d-byte outlier "
-                    "from observed max (clamp %d)",
-                    self._model_id,
-                    transient_bytes,
-                    self._OBSERVED_MAX_CLAMP_BYTES,
-                )
+        self.observe_floor(
+            transient_bytes, floor_sample=floor_sample, gathered_core=gathered_core
+        )
 
         per_token = transient_bytes / n_tokens
-        if history.samples == 0:
+        if history.samples == 0 or (
+            representative and not history.has_representative_sample
+        ):
             history.ewma_per_token = per_token
         elif per_token > history.ewma_per_token * self._EWMA_OUTLIER_RATIO:
             # Reject from the EWMA blend: a single sample this far above
@@ -162,6 +209,11 @@ class PrefillTransientTracker:
                 self._EWMA_ALPHA * per_token
                 + (1.0 - self._EWMA_ALPHA) * history.ewma_per_token
             )
+        if representative:
+            if per_token >= history.partial_per_token:
+                history.partial_bytes = 0
+                history.partial_per_token = 0.0
+            history.has_representative_sample = True
         history.samples += 1
         history.last_delta_bytes = transient_bytes
         history.last_n_tokens = n_tokens
@@ -288,8 +340,8 @@ class PrefillTransientTracker:
 
     @property
     def recent_reclaim_bytes(self) -> int:
-        """Footprint released since the last positive chunk measurement."""
-        return self._recent_reclaim_bytes
+        """Outstanding release at the last completed footprint observation."""
+        return self._reclaim_state[1]
 
     def reset_history(self, *, gathered_core: bool = False) -> None:
         """Drop observations for one execution regime."""
@@ -302,4 +354,4 @@ class PrefillTransientTracker:
         """Drop all observations (e.g. on model reload or after a long idle)."""
         self.reset_history()
         self.reset_history(gathered_core=True)
-        self._recent_reclaim_bytes = 0
+        self._reclaim_state = (None, 0)

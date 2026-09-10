@@ -13,6 +13,7 @@ Key features:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import Counter
@@ -28,6 +29,19 @@ from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
+
+
+def qwen4_gathered_min_query_tokens() -> int:
+    """Share the Qwen4 runtime's minimum gathered-prefill query width."""
+    raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
+    if raw:
+        try:
+            return max(2, int(raw))
+        except ValueError:
+            pass
+    return 16
+
+
 
 # Check if MLX Metal is available
 try:
@@ -1312,7 +1326,15 @@ class _Qwen4ExpPrefillMemoryProfile:
             + self.indexer_n_heads * query_tokens * self.indexer_head_dim * 4
         )
         core_kv = kv_len
-        if gathered_core and kv_len > self.indexer_budget:
+        if (
+            gathered_core
+            # Single-token calls use the separate gathered decode gate.
+            and (
+                query_tokens == 1
+                or query_tokens >= qwen4_gathered_min_query_tokens()
+            )
+            and kv_len > self.indexer_budget
+        ):
             core_kv = min(kv_len, self.indexer_budget + self.compress_ratio - 1)
 
         # The head_dim-256 sdpa256 patch keeps long-context prefill O(L):

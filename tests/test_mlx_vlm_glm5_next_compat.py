@@ -9,6 +9,7 @@ import io
 import json
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 from PIL import Image
 
@@ -713,3 +714,57 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
     mx.eval(actual, reference)
 
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_prepared_projections_match_lazy_prefill_and_decode(quantized):
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    mx.random.seed(3417)
+    config = _tiny_config().text_config
+    model = LanguageModel(config)
+    if quantized:
+        nn.quantize(
+            model, group_size=32, bits=4,
+            class_predicate=lambda _, module: isinstance(module, nn.Linear)
+            and module.weight.shape[1] % 32 == 0,
+        )
+    tokens = mx.array([[1, 2, 3, 4]])
+    lazy_cache = model.make_cache()
+    expected = model(tokens, cache=lazy_cache).logits
+    mx.eval(expected)
+    attention = model.model.layers[0].self_attn
+    attention._fused_ready = False
+    model.prepare_fused_projections()
+    assert attention._fused_ready
+    weights = attention._fw
+    prepared_cache = model.make_cache()
+    actual = model(tokens, cache=prepared_cache).logits
+    mx.eval(actual)
+    assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-5).item()
+    model.prepare_fused_projections()
+    assert attention._fw is weights
+    for _ in range(3):
+        token = mx.argmax(expected[:, -1], axis=-1)[:, None]
+        expected = model(token, cache=lazy_cache).logits
+        actual = model(token, cache=prepared_cache).logits
+        mx.eval(expected, actual)
+        assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-5).item()
+
+
+def test_projection_preparation_preserves_mixed_quantization_fallback():
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    model = LanguageModel(_tiny_config().text_config)
+    attention = model.model.layers[0].self_attn
+    attention.q_proj = nn.QuantizedLinear.from_linear(
+        attention.q_proj, group_size=32, bits=4
+    )
+    model.prepare_fused_projections()
+    assert not attention._fused_ready
+    tokens = mx.array([[1, 2]])
+    actual = model(tokens, cache=model.make_cache()).logits
+    attention.fuse_in = False
+    expected = model(tokens, cache=model.make_cache()).logits
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()

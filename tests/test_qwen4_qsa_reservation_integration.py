@@ -47,6 +47,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
     )
 
     def stop(*args, **kwargs):
+        assert kwargs["kv_len"] == 128
         raise RuntimeError("reservation complete")
 
     ns._adaptive_chunk_size = stop

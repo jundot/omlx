@@ -359,3 +359,87 @@ class TestPoolReleaseAccounting:
         )
         assert tracker.flat_overhead_charge_for(True) == 0
         assert tracker.flat_overhead_charge_for(False) == 3 * 1024**3
+
+
+class TestFootprintReclaim:
+    def test_repeated_and_contiguous_releases(self):
+        tracker = PrefillTransientTracker()
+        tracker.observe_footprint(100, 98)
+        tracker.observe_footprint(100, 98)
+        assert tracker.recent_reclaim_bytes == 2
+        tracker.observe_footprint(98, 96)
+        assert tracker.recent_reclaim_bytes == 4
+        tracker.observe_footprint(96, 97)
+        tracker.update(32, 1)
+        assert tracker.recent_reclaim_bytes == 3
+        tracker.observe_footprint(97, 100)
+        assert tracker.recent_reclaim_bytes == 0
+
+    def test_live_growth_reduces_charge_without_mutating_history(self):
+        tracker = PrefillTransientTracker()
+        tracker.observe_footprint(100, 94)
+        assert tracker.reclaim_bytes_at(99) == 1
+        assert tracker.reclaim_bytes_at(101) == 0
+        assert tracker.reclaim_bytes_at(90) == 6
+        assert tracker.recent_reclaim_bytes == 6
+        tracker.reset()
+        assert tracker.reclaim_bytes_at(94) == 0
+
+    def test_one_off_spike_does_not_pin_unseen_width(self):
+        tracker = PrefillTransientTracker()
+        mib = 1024**2
+        for cost in (100, 2048, 100):
+            tracker.update(512, cost * mib)
+        assert tracker.predict(2048, safety_factor=1) == 400 * mib
+
+    def test_repeated_large_allocation_remains_visible(self):
+        tracker = PrefillTransientTracker()
+        for cost in (100, 2048, 2048):
+            tracker.update(512, cost * 1024**2)
+        assert tracker.last_delta_bytes == 2048 * 1024**2
+
+
+class TestPartialHistory:
+    def test_routes_and_reset_are_independent(self):
+        tracker = PrefillTransientTracker()
+        tracker.observe_partial(128, 1000, gathered_core=False)
+        tracker.observe_partial(64, 200, gathered_core=True)
+        assert tracker.partial_bound(512, False) == 1000
+        assert tracker.partial_bound(512, True) == 200
+        tracker.reset_history(gathered_core=True)
+        assert tracker.partial_bound(512, True) == 0
+        assert tracker.partial_bound(512, False) == 1000
+        tracker.reset()
+        assert tracker.partial_bound(512, False) == 0
+
+    def test_larger_byte_full_sample_with_lower_rate_cannot_retire_partial_evidence(self):
+        tracker = PrefillTransientTracker()
+        tracker.update(512, 333)
+        tracker.observe_partial(128, 1319)
+        tracker.update(512, 1400)
+        assert tracker.partial_bytes_for(False) == 1319
+        assert tracker.partial_bound(128, False) == 1319
+
+    def test_release_does_not_erase_partial_evidence(self):
+        tracker = PrefillTransientTracker()
+        tracker.update(512, 333)
+        tracker.observe_partial(128, 1319)
+        tracker.observe_footprint(10000, 1000)
+        assert tracker.partial_bound(512, False) == 1319
+
+
+    def test_larger_partial_cannot_erase_a_narrower_allocation(self):
+        tracker = PrefillTransientTracker()
+        tracker.observe_partial(64, 1000)
+        tracker.observe_partial(128, 1100)
+        assert tracker.partial_bound(64, False) == 1000
+        assert tracker.partial_bound(512, False) == 1100
+
+
+    def test_first_full_step_replaces_bootstrap_rate_but_keeps_partial_bound(self):
+        tracker = PrefillTransientTracker()
+        tracker.observe_partial(128, 1319)
+        tracker.update(128, 1319, representative=False)
+        tracker.update(512, 333)
+        assert tracker.bytes_per_token == 333 / 512
+        assert tracker.partial_bound(512, False) == 1319

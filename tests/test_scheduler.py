@@ -6343,6 +6343,7 @@ class TestVLMPositionStateClearing:
 
     def test_cached_text_only_prefill_seeds_zero_mrope_delta(self, mock_tokenizer):
         """Cached text-only mRoPE suffixes must start at the restored offset."""
+
         model = self._make_vlm_model()
         model._language_model = MagicMock()
         model._language_model._rope_deltas = mx.array([[123]])
@@ -6357,11 +6358,16 @@ class TestVLMPositionStateClearing:
         request.num_prompt_tokens = 4
         request.cached_tokens = 2048
 
-        with patch.object(
-            scheduler_module,
-            "_seed_text_only_mrope_delta_for_cached_prefill",
-            wraps=scheduler_module._seed_text_only_mrope_delta_for_cached_prefill,
-        ) as seed_mrope:
+        with (
+            patch.object(
+                scheduler, "_adaptive_chunk_size", wraps=scheduler._adaptive_chunk_size
+            ) as sizing,
+            patch.object(
+                scheduler_module,
+                "_seed_text_only_mrope_delta_for_cached_prefill",
+                wraps=scheduler_module._seed_text_only_mrope_delta_for_cached_prefill,
+            ) as seed_mrope,
+        ):
             scheduler._do_external_prefill(
                 request,
                 tokens=[1, 2, 3, 4],
@@ -6375,6 +6381,8 @@ class TestVLMPositionStateClearing:
         assert seeded.shape == (1, 1)
         assert seeded.dtype == mx.int64
         assert seeded.item() == 0
+
+        assert sizing.call_args.kwargs["kv_len"] == 2048
 
     def test_cached_text_only_mrope_seed_is_materialized(self):
         """The exact restore-only seed must be concrete before prefill starts."""

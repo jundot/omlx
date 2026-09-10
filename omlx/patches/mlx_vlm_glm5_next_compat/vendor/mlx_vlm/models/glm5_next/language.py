@@ -161,7 +161,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.fuse_in = True
         self._fused_ready = False
 
-    def _fused_in_proj(self, inputs):
+    def prepare_fused_in_proj(self) -> bool:
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
         # output-axis concat of the (quantized) weights, built once and cached.
         if not self._fused_ready:
@@ -175,13 +175,13 @@ class Glm5NextLinearAttention(nn.Module):
             ]
             quantized = [hasattr(m, "scales") for m in mods]
             if any(quantized) and not all(quantized):
-                return tuple(linear_forward(m, inputs) for m in mods)
+                return False
             if all(quantized):
                 specs = {
                     (m.group_size, m.bits, getattr(m, "mode", "affine")) for m in mods
                 }
                 if len(specs) != 1:
-                    return tuple(linear_forward(m, inputs) for m in mods)
+                    return False
             pts, acc = [], 0
             for m in mods[:-1]:
                 acc += m.weight.shape[0]
@@ -194,6 +194,17 @@ class Glm5NextLinearAttention(nn.Module):
                 self._fb = mx.concatenate([m.biases for m in mods], axis=0)
                 self._gs, self._bits = mods[0].group_size, mods[0].bits
             self._fused_ready = True
+        return True
+
+    def _fused_in_proj(self, inputs):
+        if not self.prepare_fused_in_proj():
+            return tuple(
+                linear_forward(m, inputs)
+                for m in (
+                    self.q_proj, self.k_proj, self.v_proj,
+                    self.forget_gate.f_a_proj, self.g_a_proj, self.b_proj,
+                )
+            )
         if self._fq:
             out = fused_quantized_matmul(
                 inputs,
@@ -904,6 +915,20 @@ class LanguageModel(nn.Module):
         self.model = Glm5NextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def prepare_fused_projections(self) -> None:
+        """Materialize persistent projection weights before prefill accounting."""
+        for layer in self.model.layers:
+            attention = layer.self_attn
+            if (
+                isinstance(attention, Glm5NextLinearAttention)
+                and attention.fuse_in
+                and attention.prepare_fused_in_proj()
+            ):
+                arrays = [attention._fw]
+                if attention._fq:
+                    arrays.extend((attention._fs, attention._fb))
+                mx.eval(arrays)
 
     def __call__(
         self,

@@ -1729,6 +1729,8 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         **load_kwargs,
                     )
+                    if model_type == "glm5_next":
+                        loaded[0].language_model.prepare_fused_projections()
                     return loaded
 
         loop = asyncio.get_running_loop()
