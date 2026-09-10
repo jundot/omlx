@@ -2,6 +2,10 @@
 
 Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check model selection, saved tier precedence, and the final Claude Code environment. Mixed-context cases verify that the selected initial model is passed through `ANTHROPIC_MODEL` and that the process-wide context and auto-compact limits use the smallest known context window across the initial model and configured tiers. Larger models consequently compact at that shared limit; models without reported limits cannot contribute a limit.
 
+# ModernBERT embedding tests
+
+Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py tests/test_mlx_embeddings_compat.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
+
 # QSA reservation tests
 
 Run `python -m pytest -q tests/test_qwen4_qsa_reservation_integration.py tests/test_qwen4_qsa_reserved_capacity.py` to check QSA capacity reservations.
