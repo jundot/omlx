@@ -227,9 +227,21 @@ def _patch_inner_model(mod: Any) -> None:
         arms an undo log around the verify forward, so ``is_trimmable()``
         answers for that snapshot rather than for the ring. A layer carrying
         neither returns False and the caller takes the standard step.
+
+        The cache holds one entry per distinct K/V owner, which is not one per
+        layer. E2B and E4B share the last ``num_kv_shared_layers`` layers' K/V
+        with an earlier layer of the same type (20 of 35, 18 of 42), so
+        ``make_cache`` returns ``num_hidden_layers - num_kv_shared_layers``
+        entries and a per-layer count refuses every rollback on those
+        checkpoints -- silently, since the caller just rebuilds and takes a
+        standard step. mlx-lm materializes the mapping as ``previous_kvs``,
+        whose distinct values are exactly the caches that exist; a backbone
+        that does not publish one keeps the per-layer count.
         """
         layers = self.model.layers
-        if len(cache) != len(layers):
+        previous_kvs = getattr(self.model, "previous_kvs", None)
+        expected = len(set(previous_kvs)) if previous_kvs else len(layers)
+        if len(cache) != expected:
             return False
         trim_n = num_drafts - accepted
         if trim_n <= 0:

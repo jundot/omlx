@@ -547,13 +547,18 @@ class _FakeTrimmable:
         return n
 
 
-def _rollback(caches, accepted, num_drafts, layer_count=None):
+def _rollback(caches, accepted, num_drafts, layer_count=None, previous_kvs=None):
     from mlx_lm.models.gemma4_text import Model
 
+    gemma4_text_model.apply()
     if layer_count is None:
         layer_count = len(caches)
-    host = SimpleNamespace(model=SimpleNamespace(layers=[object()] * layer_count))
-    return Model.mtp_partial_rollback(host, caches, accepted, num_drafts)
+    inner = SimpleNamespace(layers=[object()] * layer_count)
+    if previous_kvs is not None:
+        inner.previous_kvs = previous_kvs
+    return Model.mtp_partial_rollback(
+        SimpleNamespace(model=inner), caches, accepted, num_drafts
+    )
 
 
 def test_rollback_is_a_noop_when_every_draft_was_accepted():
@@ -593,6 +598,39 @@ def test_rollback_refuses_a_cache_of_the_wrong_length():
     caches = [_FakeTrimmable(), _FakeTrimmable()]
     assert _rollback(caches, 0, 1, layer_count=3) is False
     assert all(c.trimmed == 0 for c in caches)
+
+
+def test_rollback_accepts_a_kv_shared_cache_shorter_than_the_layer_count():
+    # E2B shares the last 20 of 35 layers' K/V and E4B the last 18 of 42, so
+    # make_cache returns one entry per distinct owner, not per layer. Counting
+    # per layer refused every rollback on those checkpoints, and refused it
+    # silently: the caller rebuilds the cache and takes a standard step, so
+    # MTP stays switched on and simply stops paying for itself.
+    caches = [_FakeTrimmable(), _FakeTrimmable()]
+    assert _rollback(caches, 1, 3, layer_count=4, previous_kvs=[0, 1, 0, 1]) is True
+    assert all(c.trimmed == 2 for c in caches)
+
+
+def test_rollback_still_refuses_a_stale_cache_under_kv_sharing():
+    # The distinct-owner count is the invariant; "shorter than the layer
+    # count" on its own is not enough to accept.
+    caches = [_FakeTrimmable()]
+    assert _rollback(caches, 0, 1, layer_count=4, previous_kvs=[0, 1, 0, 1]) is False
+    assert caches[0].trimmed == 0
+
+
+def test_rollback_matches_the_backbones_own_cache_under_kv_sharing():
+    # End to end against a real backbone with sharing configured, driven by
+    # the cache its own make_cache builds -- the shape no local checkpoint
+    # has, since 12B/26B/31B all set num_kv_shared_layers = 0 and reduce KV
+    # with within-layer attention_k_eq_v instead.
+    gemma4_text_model.apply()
+    model = _inner({"num_kv_shared_layers": 2})
+    caches = model.make_cache()
+    assert len(caches) < len(model.model.layers)
+    fakes = [_FakeTrimmable() for _ in caches]
+    assert model.mtp_partial_rollback(fakes, 1, 3) is True
+    assert all(c.trimmed == 2 for c in fakes)
 
 
 class TestPartialRollbackAcrossCacheClasses:
