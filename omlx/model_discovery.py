@@ -1514,6 +1514,33 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     return False
 
 
+def _gemma4_text_only_wants_vlm_engine(config: dict) -> bool:
+    """True for a text-only gemma4 whose merged MTP head only mlx-vlm drives."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type != "gemma4":
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return _has_merged_mtp_head(config)
+
+
+def _has_merged_mtp_head(config: dict) -> bool:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    return isinstance(text_config.get("mtp_assistant_config"), dict)
+
+
+def _gemma4_text_only_prefers_llm_engine(config: dict) -> bool:
+    """True for a text-only Gemma 4 with no MTP head; mlx-lm serves it cheaper."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in ("gemma4", "gemma4_unified"):
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return not _has_merged_mtp_head(config)
+
+
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
@@ -1570,14 +1597,39 @@ def _register_model(
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
         is_helper = False
+        # The routing below reads this even when config.json does not parse.
+        _config: dict = {}
         try:
             import json
             with open(model_dir / "config.json") as f:
-                _config = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _config = loaded
             config_model_type = _config.get("model_type", "")
             is_helper = is_helper_model_config(_config)
         except Exception:
             pass
+
+        # Engine, not identity: the model is still text-only and is reported
+        # that way, it is only served by the engine that can drive its head.
+        if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
+            engine_type = "vlm"
+            logger.info(
+                "%s is text-only Gemma 4 with a merged MTP head; serving it "
+                "on the VLM engine, which can drive that head",
+                model_id,
+            )
+        elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
+            # `supports_images` is `model_type == "vlm"`, so moving only the
+            # engine would leave a text-only checkpoint advertising images.
+            engine_type = "batched"
+            model_type = "llm"
+            text_only_size = 0
+            logger.info(
+                "%s is text-only Gemma 4 with no merged MTP head; serving it "
+                "on the LLM engine, which carries less overhead",
+                model_id,
+            )
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)

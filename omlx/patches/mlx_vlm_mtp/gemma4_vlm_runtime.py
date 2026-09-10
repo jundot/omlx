@@ -69,15 +69,21 @@ def apply() -> bool:
         return False
 
     from mlx_vlm.models.gemma4 import Model
+    from mlx_vlm.models.gemma4_unified import Model as UnifiedModel
 
-    original_sanitize = Model.sanitize
+    def keep_head(original_sanitize):
+        def sanitize(self, weights):
+            head = {
+                k: v for k, v in weights.items() if k.startswith("language_model.mtp.")
+            }
+            backbone = {k: v for k, v in weights.items() if k not in head}
+            return {**original_sanitize(self, backbone), **head}
 
-    def sanitize(self, weights):
-        head = {k: v for k, v in weights.items() if k.startswith("language_model.mtp.")}
-        backbone = {k: v for k, v in weights.items() if k not in head}
-        return {**original_sanitize(self, backbone), **head}
+        return sanitize
 
-    Model.sanitize = sanitize
+    # Text-only gemma4 checkpoints load as gemma4_unified; see omlx.engine.vlm.
+    Model.sanitize = keep_head(Model.sanitize)
+    UnifiedModel.sanitize = keep_head(UnifiedModel.sanitize)
     _patch_text_config(g4_config)
     # Gemma4 unified reuses Gemma4's LanguageModel but declares its own
     # TextConfig subclass. Retain the embedded assistant config there too so

@@ -740,9 +740,18 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
     import mlx.nn as _nn
     import mlx_vlm.utils as _vu
 
+    original_load_config = _vu.load_config
     original_update_module_configs = _vu.update_module_configs
     original_load_weights = _nn.Module.load_weights
     warned = False
+
+    def _text_capable_load_config(path, **kwargs):
+        cfg = original_load_config(path, **kwargs)
+        # mlx-vlm's gemma4 builds a vision tower unconditionally; gemma4_unified
+        # shares its language_model layout and runs without one.
+        if cfg.get("model_type") == "gemma4":
+            cfg = {**cfg, "model_type": "gemma4_unified"}
+        return cfg
 
     def _patched_update_module_configs(model_config, model_class, config, modules):
         model_config = original_update_module_configs(
@@ -778,11 +787,13 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
             )
         return original_load_weights(self, kept, *args, **kwargs)
 
+    _vu.load_config = _text_capable_load_config
     _vu.update_module_configs = _patched_update_module_configs
     _nn.Module.load_weights = _vision_filtering_load_weights
     try:
         yield
     finally:
+        _vu.load_config = original_load_config
         _vu.update_module_configs = original_update_module_configs
         _nn.Module.load_weights = original_load_weights
 
