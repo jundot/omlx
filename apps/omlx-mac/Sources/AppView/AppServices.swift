@@ -26,9 +26,8 @@ final class AppServices: NSObject {
     var requestedSection: AppSection?
     /// Pair with `requestedSection` to scroll the Server screen to a
     /// specific section after the deep-link lands. ContentScaffold's
-    /// `ScrollViewReader` observes this, scrolls, then nils it. Only the
-    /// Default Profile anchor is wired today — extend the enum as more
-    /// deep links land.
+    /// `ScrollViewReader` observes this, scrolls, then nils it. Extend the
+    /// enum as more deep links land.
     var requestedServerAnchor: ServerAnchor?
 
     let client: OMLXClient
@@ -429,4 +428,5 @@ final class AppServices: NSObject {
 /// `.id(_:)` attached to the corresponding `SectionHeader`.
 enum ServerAnchor: String, Sendable {
     case defaultProfile = "server.defaultProfile"
+    case usageHistory = "server.usageHistory"
 }

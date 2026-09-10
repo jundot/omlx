@@ -1,0 +1,63 @@
+{
+  "_comment": "POST /admin/api/cluster/autoconfigure — the complete server-owned plan and activation contract that v2 must preserve unchanged.",
+  "backend": "ring",
+  "backend_reason": "live fabric probe selected the TCP ring",
+  "tensor_parallel_size": 2,
+  "pipeline_stages": 1,
+  "ready_to_activate": true,
+  "performance_probe": {
+    "ok": true,
+    "status": "applied_before_staging",
+    "profiles": [
+      {"node_id": "node-a", "rank": 0, "prefill_weight_bytes_per_second": 1300, "decode_weight_bytes_per_second": 700},
+      {"node_id": "node-b", "rank": 1, "prefill_weight_bytes_per_second": 900, "decode_weight_bytes_per_second": 500}
+    ]
+  },
+  "plan": {
+    "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "placement_signature": "bbbbbbbbbbbbbbbb",
+    "tensor_parallel_size": 2,
+    "assignments": [
+      {"rank": 0, "node_id": "node-a", "start_layer": 0, "end_layer": 43, "layer_count": 43, "tensor_parallel_rank": 0, "tensor_parallel_size": 2},
+      {"rank": 1, "node_id": "node-b", "start_layer": 0, "end_layer": 43, "layer_count": 43, "tensor_parallel_rank": 1, "tensor_parallel_size": 2}
+    ]
+  },
+  "activation": {
+    "model_path": "/models/m",
+    "model_source": "127.0.0.1",
+    "backend": "ring",
+    "execution_profile": "balanced",
+    "auto_tune": true,
+    "sampling_rank_only": true,
+    "async_overlap": true,
+    "cache_affinity": true,
+    "max_kv_size": null,
+    "target_context_tokens": 32768,
+    "ring_connections_per_ip": 4,
+    "tensor_parallel_size": 2,
+    "nodes": [
+      {
+        "node_id": "node-a",
+        "capacity_bytes": 274877906944,
+        "reserve_bytes": 137438953472,
+        "role": "workstation",
+        "memory_guard_tier": "balanced",
+        "performance": {"node_id": "node-a", "rank": 0, "prefill_weight_bytes_per_second": 1300, "decode_weight_bytes_per_second": 700}
+      },
+      {
+        "node_id": "node-b",
+        "capacity_bytes": 137438953472,
+        "reserve_bytes": 13743895347,
+        "role": "headless",
+        "memory_guard_tier": "balanced",
+        "performance": {"node_id": "node-b", "rank": 1, "prefill_weight_bytes_per_second": 900, "decode_weight_bytes_per_second": 500}
+      }
+    ],
+    "hosts": [
+      {"node_id": "node-a", "ssh": "127.0.0.1", "ips": ["10.0.0.1"], "rdma": []},
+      {"node_id": "node-b", "ssh": "worker.example", "ips": ["10.0.0.2"], "rdma": [], "python_executable": "/peer/venv/bin/python"}
+    ],
+    "preflight": true,
+    "approved_placement": "bbbbbbbbbbbbbbbb"
+  }
+}

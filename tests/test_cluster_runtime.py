@@ -98,6 +98,22 @@ def test_runtime_markers_report_this_macs_live_rank(tmp_path):
     assert result["jobs"][0]["end_layer"] == 26
 
 
+def test_runtime_reader_ignores_launch_and_control_json_files(tmp_path):
+    (tmp_path / "job.json").write_text(json.dumps(_marker()))
+    for name in (
+        "launch-deployment.json",
+        "deployment-cancel.json",
+        "deployment-cancel-ack.json",
+        "deployment-serve.json",
+    ):
+        (tmp_path / name).write_text("not a rank marker", encoding="utf-8")
+
+    result = read_runtime_markers(tmp_path)
+
+    assert len(result["jobs"]) == 1
+    assert result["warnings"] == []
+
+
 def test_runtime_marker_with_reused_live_pid_is_not_reported_as_running(tmp_path):
     payload = _marker(
         updated_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),

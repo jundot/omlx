@@ -199,7 +199,10 @@ def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_trim():
     assert mx.array_equal(extracted_pool, pooled).item()
 
     assert cache.trim(3) == 3
-    assert cache._pooled_index_keys is None
+    # trim keeps the pooled blocks below the new complete count (10 // 4 = 2)
+    # and only clamps the pooled frontier; the tail is re-pooled lazily.
+    assert cache._pooled_index_keys is not None
+    assert cache._pooled_index_offset == 2
     replacement = mx.cos(mx.arange(3 * 8, dtype=mx.float32)).reshape(1, 3, 8)
     _append(cache, mx.concatenate([raw[:, :10], replacement], axis=1), 10, 13)
     rebuilt = cache.pooled_indexer_keys(

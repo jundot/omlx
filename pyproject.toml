@@ -99,7 +99,7 @@ dependencies = [
     # cutoff (2026-04-23), and the last with the minimal dep tree
     # (click/primp/lxml only; 9.14.2+ adds fake-useragent and httpx
     # extras). Bump together with the cutoff.
-    "ddgs==9.15.0",
+    "ddgs==9.16.0",
     "tabulate>=0.9.0",
     # Resource monitoring
     "psutil>=5.9.0",
@@ -147,6 +147,13 @@ grammar = [
 ]
 mcp = [
     "mcp>=2.0.0,<3",
+]
+cluster = [
+    # mDNS advertise/browse for cluster v2 peer discovery (_omlx._tcp.local.).
+    # Pure-Python; works in launchd agents. Absence disables mDNS only — the
+    # IPv6 multicast fallback, manual peer add, and Tailscale paths keep
+    # working (see omlx/cluster/discovery.py).
+    "zeroconf>=0.131.0",
 ]
 modelscope = [
     "modelscope>=1.10.0",

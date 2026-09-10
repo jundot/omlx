@@ -1639,9 +1639,17 @@ class ProcessMemoryEnforcer:
                                 "hard memory pressure",
                                 abort_requested=True,
                             )
-                            await self._engine_pool._unload_pending_if_idle_locked(
-                                busy_victim
+                            unloaded = (
+                                await self._engine_pool._unload_pending_if_idle_locked(
+                                    busy_victim
+                                )
                             )
+                            if not unloaded:
+                                # Not drained yet: schedule the poller, mirroring
+                                # request_unload's own fallback, or the latch never clears.
+                                self._engine_pool._schedule_pending_unload_locked(
+                                    busy_victim
+                                )
                         logger.warning(
                             "Hard memory pressure: requested abort/unload for "
                             "'%s' (aborted=%d)",

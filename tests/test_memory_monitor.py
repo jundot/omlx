@@ -1078,6 +1078,215 @@ class TestDeepSeekV4PrefillMemoryProfile:
         assert make_prefill_memory_profile(config, compute_dtype_size=2) is None
 
 
+class TestQwen4ExpPrefillMemoryProfile:
+    """Qwen4 profile must price the head-dim-256 core through the same
+    bounded-route registry the generic estimator uses: dense Q x kv_len fp32
+    without a registered route, output + one fp32 score tile with one."""
+
+    @staticmethod
+    def _profile():
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        config = SimpleNamespace(
+            model_type="qwen4_exp",
+            num_hidden_layers=48,
+            num_attention_heads=24,
+            num_key_value_heads=2,
+            head_dim=256,
+            indexer_n_heads=4,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+            full_attention_interval=4,
+            layer_types=None,
+        )
+        return make_prefill_memory_profile(config, compute_dtype_size=2)
+
+    def _monitor(self, profile):
+        from omlx.memory_monitor import MemoryMonitor
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=48,
+            num_kv_heads=2,
+            head_dim=256,
+            dtype_size=2,
+            num_attention_heads=24,
+            compute_dtype_size=2,
+            prefill_memory_profile=profile,
+        )
+        return monitor
+
+    @staticmethod
+    def _indexer_bytes(query_tokens, kv_len):
+        pooled = max(kv_len // 4, 1)
+        return 4 * query_tokens * pooled * 4 + 4 * query_tokens * 128 * 4
+
+    def test_no_registration_prices_dense_fp32_core(self):
+        import omlx.memory_monitor as memory_monitor
+
+        memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        try:
+            profile = self._profile()
+            query_tokens, kv_len = 2048, 160_000
+            estimate = profile.estimate_prefill_transient_bytes(
+                query_tokens, kv_len
+            )
+            # Dense unfused core is priced at the measured fp32 width, not
+            # the bf16 model compute dtype (issue #2204 follow-up).
+            assert estimate == self._indexer_bytes(query_tokens, kv_len) + (
+                24 * query_tokens * kv_len * 4 + 24 * query_tokens * 256 * 4
+            )
+        finally:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+    def test_causal_only_registration_keeps_array_mask_core_dense(self):
+        import omlx.memory_monitor as memory_monitor
+
+        memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        memory_monitor.register_tiled_prefill_head_dim(
+            256, min_query_len=16, min_kv_len=2048, kv_tile=1024
+        )
+        try:
+            profile = self._profile()
+            query_tokens, kv_len = 2048, 4096
+            expected = self._indexer_bytes(query_tokens, kv_len) + (
+                24 * query_tokens * kv_len * 4 + 24 * query_tokens * 256 * 4
+            )
+            assert profile.estimate_prefill_transient_bytes(
+                query_tokens, kv_len
+            ) == expected
+        finally:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+    def test_matching_registration_prices_output_plus_one_fp32_tile(self):
+        import omlx.memory_monitor as memory_monitor
+
+        memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        memory_monitor.register_tiled_prefill_head_dim(
+            256, min_query_len=16, min_kv_len=8192, kv_tile=1024, supports_array_mask=True
+        )
+        try:
+            profile = self._profile()
+            query_tokens, kv_len = 2048, 160_000
+            estimate = profile.estimate_prefill_transient_bytes(
+                query_tokens, kv_len
+            )
+            # Indexer charge is retained; the core is fp32 output plus one
+            # 1024-wide fp32 score tile — no Q x kv_len matrix.
+            expected = self._indexer_bytes(query_tokens, kv_len) + (
+                24 * query_tokens * 256 * 4 + 24 * query_tokens * 1024 * 4
+            )
+            assert estimate == expected
+            dense = self._indexer_bytes(query_tokens, kv_len) + (
+                24 * query_tokens * kv_len * 4 + 24 * query_tokens * 256 * 4
+            )
+            assert estimate < dense / 10
+        finally:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+    def test_threshold_misses_stay_dense(self):
+        import omlx.memory_monitor as memory_monitor
+
+        memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        memory_monitor.register_tiled_prefill_head_dim(
+            256, min_query_len=16, min_kv_len=8192, kv_tile=1024, supports_array_mask=True
+        )
+        try:
+            profile = self._profile()
+            dense_small_kv = self._indexer_bytes(2048, 4096) + (
+                24 * 2048 * 4096 * 4 + 24 * 2048 * 256 * 4
+            )
+            # kv below the route floor -> dense.
+            assert (
+                profile.estimate_prefill_transient_bytes(2048, 4096)
+                == dense_small_kv
+            )
+            # query below the route floor -> dense.
+            dense_short_q = self._indexer_bytes(8, 160_000) + (
+                24 * 8 * 160_000 * 4 + 24 * 8 * 256 * 4
+            )
+            assert (
+                profile.estimate_prefill_transient_bytes(8, 160_000)
+                == dense_short_q
+            )
+        finally:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+    def test_crossed_registrations_never_invent_coverage(self):
+        """Two routes whose individual (query, kv) thresholds are not jointly
+        met must not produce a bounded price (mirror of the generic
+        estimator's threshold-independence regression)."""
+        import omlx.memory_monitor as memory_monitor
+
+        memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        memory_monitor.register_tiled_prefill_head_dim(
+            256, min_query_len=16, min_kv_len=8192, kv_tile=1024, supports_array_mask=True
+        )
+        memory_monitor.register_tiled_prefill_head_dim(
+            256, min_query_len=64, min_kv_len=2048, kv_tile=512, supports_array_mask=True
+        )
+        try:
+            profile = self._profile()
+            # q=16 / kv=2048 meets one threshold from each route but no
+            # complete route.
+            dense = self._indexer_bytes(16, 2048) + (
+                24 * 16 * 2048 * 4 + 24 * 16 * 256 * 4
+            )
+            assert profile.estimate_prefill_transient_bytes(16, 2048) == dense
+            # The widest tile among matching routes binds for full matches.
+            bounded = self._indexer_bytes(64, 8192) + (
+                24 * 64 * 256 * 4 + 24 * 64 * 1024 * 4
+            )
+            assert profile.estimate_prefill_transient_bytes(64, 8192) == bounded
+        finally:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+    def test_gathered_core_below_route_floor_stays_dense(self):
+        """The route covers the dense core's actual K width. A gathered QSA
+        core attending ~indexer_budget tokens is below the 8192 route floor
+        and must not borrow a bounded price registered for the dense path."""
+        import omlx.memory_monitor as memory_monitor
+
+        memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        memory_monitor.register_tiled_prefill_head_dim(
+            256, min_query_len=16, min_kv_len=8192, kv_tile=1024, supports_array_mask=True
+        )
+        try:
+            profile = self._profile()
+            query_tokens, kv_len = 2048, 160_000
+            core_kv = min(kv_len, 2048 + 4 - 1)
+            dense = self._indexer_bytes(query_tokens, kv_len) + (
+                24 * query_tokens * core_kv * 4 + 24 * query_tokens * 256 * 4
+            )
+            assert (
+                profile.estimate_prefill_transient_bytes(
+                    query_tokens, kv_len, gathered_core=True
+                )
+                == dense
+            )
+        finally:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+    def test_bounded_price_reaches_monitor_via_chunk_transient(self):
+        import omlx.memory_monitor as memory_monitor
+
+        memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        memory_monitor.register_tiled_prefill_head_dim(
+            256, min_query_len=16, min_kv_len=8192, kv_tile=1024, supports_array_mask=True
+        )
+        try:
+            profile = self._profile()
+            monitor = self._monitor(profile)
+            direct = profile.estimate_prefill_transient_bytes(2048, 160_000)
+            routed = monitor.estimate_chunk_transient_bytes(
+                2048, 160_000, gathered_core=False
+            )
+            assert routed == direct
+        finally:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
 class TestAnePrefillTransientReserve:
     def test_ane_prefill_transient_is_added_to_the_peak(self):
         # issue #2841: the ANE I/O surfaces are dirtied by the first long
@@ -1130,4 +1339,31 @@ class TestAnePrefillTransientReserve:
             ane_prefill_transient_bytes=123,
         )
         monitor.clear_ane_prefill_transient()
+        assert monitor._ane_prefill_transient_bytes == 0
+
+    def test_setter_refreshes_after_compile_and_clears_after_release(self):
+        # The banks compile after the scheduler snapshots model info, so the
+        # load-time reserve reads 0; engines refresh it post-compile, and the
+        # release rung clears it while the model stays resident.
+        from omlx.memory_monitor import MemoryMonitor
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_size=2,
+        )
+        assert monitor._ane_prefill_transient_bytes == 0
+        reserve = 12 * 1024**3
+        base_peak = monitor.estimate_prefill_peak_bytes(32768, 2048)
+        monitor.set_ane_prefill_transient_bytes(reserve)
+        assert monitor._ane_prefill_transient_bytes == reserve
+        assert (
+            monitor.estimate_prefill_peak_bytes(32768, 2048) == base_peak + reserve
+        )
+        monitor.clear_ane_prefill_transient()
+        assert monitor._ane_prefill_transient_bytes == 0
+        # Negative input clamps to zero instead of widening headroom.
+        monitor.set_ane_prefill_transient_bytes(-5)
         assert monitor._ane_prefill_transient_bytes == 0

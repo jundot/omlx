@@ -569,6 +569,7 @@ class EngineCore:
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
         skip_cache_store: bool = False,
+        preserve_reasoning: bool = False,
         benchmark_trace: bool = False,
         benchmark_ane_sequence_length: int = 0,
         tools: list[dict[str, Any]] | None = None,
@@ -611,6 +612,7 @@ class EngineCore:
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=skip_cache_store,
+            preserve_reasoning=preserve_reasoning,
             benchmark_trace=benchmark_trace,
             benchmark_ane_sequence_length=benchmark_ane_sequence_length,
         )

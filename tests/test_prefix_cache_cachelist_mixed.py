@@ -312,6 +312,7 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         block_aware_cache=object(),
         config=SimpleNamespace(paged_cache_block_size=BLOCK_SIZE),
         model=SimpleNamespace(),
+        _model_has_unreconstructible_cache=lambda: False,
         _cache_list_needs_boundary_snapshot=lambda cache: True,
         _boundary_cache_snapshots={},
         _boundary_snapshot_store=None,

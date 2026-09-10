@@ -84,9 +84,9 @@ def test_reasoning_effort_has_presets_and_custom_input():
     assert 'placeholder="0.9"' in section
     assert "<datalist" not in section
 
-    order = ["low", "medium", "high", "xhigh", "max"]
-    positions = [section.index(f'value="{value}"') for value in order]
-    assert positions == sorted(positions)
+    assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
+    assert ':value="value" x-text="value"' in section
+    assert '!selectedModel?.reasoning_effort_custom && !entry.custom' in section
 
 
 def test_reasoning_effort_add_guard_covers_custom_entries():
@@ -190,8 +190,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
         "qwen35_ane_prefill_gdn_max_layers",
     }
 
-    assert 'x-if="isQwen35AnePrefillModel(selectedModel)"' in html
-    assert "'qwen3_5', 'qwen3_6', 'qwen3_8'" in script
+    assert "x-if=\"selectedModel?.ane_prefill_backend === 'qwen'\"" in html
     for field in fields:
         assert f"modelSettings.{field}" in html
         assert f"{field}:" in script
@@ -239,9 +238,10 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "cancelANETuning()" in html
     assert "applyANETuningRecommendation()" in html
     assert "aneTuningRecommendationText()" in html
-    assert "aneTuningResultText(result)" in html
+    assert "aneTuning.status?.message" in html
+    assert "aneTuningProgressPercent()" in html
     assert "aneTuning.status?.termination_reason" in html
-    assert "aneTuning.status?.results || []" in html
+    assert "!aneTuning.running && aneTuning.status?.recommendation" in html
     assert 'x-model="aneTuningOverrides.allowCpu"' in html
     assert 'x-model="aneTuningOverrides.allowAneGdn"' in html
     assert 'x-model="aneTuningOverrides.allowCpuGdn"' in html
@@ -258,8 +258,6 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
     assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
     assert "recommendation.cpu_shared_resource" in script
-    assert "if (result?.processing_tps === null" in script
-    assert "result?.latency_ms !== null" in script
 
 
 def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
@@ -281,7 +279,10 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     )[0]
 
     assert "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048" in state
-    assert "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53" in state
+    assert (
+        "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53"
+        in state
+    )
     assert "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
     assert "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state

@@ -13,9 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import omlx.server  # noqa: F401 — triggers set_admin_getters
 import omlx.admin.routes as admin_routes
-
+import omlx.server  # noqa: F401 — triggers set_admin_getters
 
 MODEL_ID = "test-model"
 
@@ -121,7 +120,12 @@ class TestHotCacheClear:
         ):
             result = _run_clear()
 
-        assert set(result.keys()) == {"status", "total_cleared", "bytes_reclaimed"}
+        assert set(result.keys()) == {
+            "status",
+            "total_cleared",
+            "bytes_reclaimed",
+            "distributed_ranks",
+        }
         assert result["status"] == "ok"
 
 
@@ -188,9 +192,8 @@ class TestClearReclaimBranches:
         )
         with _reclaim_env() as env, patch.object(
             admin_routes, "_get_engine_pool", return_value=pool
-        ):
-            with pytest.raises(RuntimeError, match="boom"):
-                _run_clear()
+        ), pytest.raises(RuntimeError, match="boom"):
+            _run_clear()
         assert not env.get_mlx_executor.called, "must not fall back on a non-shutdown error"
 
     def test_mixed_loaded_and_orphan_no_double_count(self):

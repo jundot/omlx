@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Per-scheduler EWMA of bytes-per-prefill-token.
+Per-scheduler prefill memory observations.
 
 Used by the adaptive prefill throttle in Scheduler: when current memory
 enters the caution zone (>= hard_cap * safe_zone_ratio), the next chunk
@@ -25,14 +25,15 @@ class _TransientHistory:
     last_delta_bytes: int = 0
     last_n_tokens: int = 0
     observed_max_bytes: int = 0
+    flat_overhead_bytes: int = 0
+    reclaim_debt_bytes: int = 0
 
 
 class PrefillTransientTracker:
-    """EWMA estimator of MLX prefill chunk transient bytes per token.
+    """Keep separate gathered and dense observations for one loaded model.
 
-    Updated post-chunk from `phys_footprint()` deltas. The first chunk
-    has no measurement yet — callers fall back to a static estimate
-    (MemoryMonitor.estimate_prefill_peak_bytes) until samples > 0.
+    Generic models use token-linear EWMA estimates. Qwen4 uses its static
+    profile plus observed allocator overhead that must return after a pool release.
     """
 
     _EWMA_ALPHA = 0.3  # weight on the most recent chunk
@@ -54,6 +55,7 @@ class PrefillTransientTracker:
     # above the largest observed legitimate fluctuation and below the
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
+    _FLAT_OVERHEAD_NOISE_BYTES = 64 * 1024**2
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -164,6 +166,64 @@ class PrefillTransientTracker:
         history.last_delta_bytes = transient_bytes
         history.last_n_tokens = n_tokens
 
+    def observe_flat_overhead(
+        self,
+        n_tokens: int,
+        delta_bytes: int,
+        *,
+        static_bytes: int,
+        gathered_core: bool = False,
+        representative: bool = True,
+    ) -> None:
+        """Track Qwen4 process-footprint noise as flat, never per-token work."""
+        if n_tokens <= 0:
+            return
+        history = self._history(gathered_core)
+        noise = max(self._FLAT_OVERHEAD_NOISE_BYTES, max(0, static_bytes) // 10)
+        if delta_bytes < -noise:
+            history.reclaim_debt_bytes += -delta_bytes
+            return
+
+        # A positive delta first repays a preceding pool release. Only net-new
+        # growth beyond both that repayment and the static profile is overhead.
+        reallocated = min(history.reclaim_debt_bytes, max(0, delta_bytes))
+        history.reclaim_debt_bytes -= reallocated
+        residual = delta_bytes - reallocated - max(0, static_bytes)
+        if residual <= noise or not representative:
+            return
+        history.flat_overhead_bytes = max(history.flat_overhead_bytes, residual)
+        history.samples += 1
+        history.last_delta_bytes = delta_bytes
+        history.last_n_tokens = n_tokens
+
+    def flat_overhead_bytes_for(self, gathered_core: bool) -> int:
+        return self._history(gathered_core).flat_overhead_bytes
+
+    def reclaim_debt_bytes_for(self, gathered_core: bool) -> int:
+        return self._history(gathered_core).reclaim_debt_bytes
+
+    def record_flat_reclaim(self, reclaimed_bytes: int) -> None:
+        """Record a process-wide pool release against each route's own overhead.
+
+        A cache clear can release buffers from either route, regardless of the
+        request that triggered it. Each route is bounded by its own observed
+        overhead; dense observations never increase the gathered prediction.
+        """
+        if reclaimed_bytes <= 0:
+            return
+        for history in (self._dense_history, self._gathered_history):
+            history.reclaim_debt_bytes = min(
+                history.flat_overhead_bytes,
+                history.reclaim_debt_bytes + int(reclaimed_bytes),
+            )
+
+    def flat_overhead_charge_for(self, gathered_core: bool) -> int:
+        history = self._history(gathered_core)
+        # Retained pool growth is already present in the scheduler's current
+        # physical-footprint reading. Charging it again double-counts it.
+        # Only the portion actually reclaimed can be reallocated next chunk.
+        return min(history.flat_overhead_bytes, history.reclaim_debt_bytes)
+
     def predict(
         self,
         n_tokens: int,
@@ -231,8 +291,15 @@ class PrefillTransientTracker:
         """Footprint released since the last positive chunk measurement."""
         return self._recent_reclaim_bytes
 
+    def reset_history(self, *, gathered_core: bool = False) -> None:
+        """Drop observations for one execution regime."""
+        if gathered_core:
+            self._gathered_history = _TransientHistory()
+        else:
+            self._dense_history = _TransientHistory()
+
     def reset(self) -> None:
         """Drop all observations (e.g. on model reload or after a long idle)."""
-        self._dense_history = _TransientHistory()
-        self._gathered_history = _TransientHistory()
+        self.reset_history()
+        self.reset_history(gathered_core=True)
         self._recent_reclaim_bytes = 0

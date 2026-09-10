@@ -28,6 +28,7 @@ from omlx.settings import (
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
+    UsageSettings,
     burst_decode_env,
     get_settings,
     get_ssd_capacity,
@@ -795,6 +796,58 @@ class TestMCPSettings:
         backups = list(tmp_path.glob("settings.json.corrupt-*"))
         assert len(backups) == 1
         assert "garbage-tail" in backups[0].read_text()
+
+
+class TestUsageSettings:
+    """Tests for UsageSettings and the usage_history toggle."""
+
+    def test_default_values(self):
+        assert UsageSettings().usage_history is True
+        assert GlobalSettings().usage.usage_history is True
+
+    def test_to_dict_from_dict_round_trip(self):
+        settings = UsageSettings.from_dict({"usage_history": False})
+        assert settings.usage_history is False
+        assert settings.to_dict() == {"usage_history": False}
+        assert UsageSettings.from_dict({}).usage_history is True
+
+    def test_global_settings_save_load_round_trip(self, tmp_path):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.usage.usage_history = False
+        gs.save()
+        data = json.loads((tmp_path / "settings.json").read_text())
+        assert data["usage"] == {"usage_history": False}
+        assert gs.to_dict()["usage"] == {"usage_history": False}
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.usage.usage_history is False
+
+    def test_legacy_settings_file_defaults_on(self, tmp_path):
+        """Settings files written before the toggle existed keep recording."""
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.save()
+        settings_file = tmp_path / "settings.json"
+        data = json.loads(settings_file.read_text())
+        del data["usage"]
+        settings_file.write_text(json.dumps(data))
+        assert GlobalSettings.load(base_path=tmp_path).usage.usage_history is True
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("0", False),
+            ("false", False),
+            ("off", False),
+            ("1", True),
+            ("on", True),
+            ("TRUE", True),
+        ],
+    )
+    def test_env_override(self, tmp_path, monkeypatch, value, expected):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.usage.usage_history = not expected
+        gs.save()
+        monkeypatch.setenv("OMLX_USAGE_HISTORY", value)
+        assert GlobalSettings.load(base_path=tmp_path).usage.usage_history is expected
 
 
 class TestHuggingFaceSettings:

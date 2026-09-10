@@ -47,6 +47,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
@@ -1500,6 +1501,21 @@ class VLMBatchedEngine(BaseEngine):
         return self._tokenizer
 
     @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Opt in only when the local scheduler has no structured parser."""
+
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        return bool(
+            scheduler is not None
+            and hasattr(scheduler, "_output_parser_factory")
+            and scheduler._output_parser_factory is None
+        )
+
+    @property
     def model_type(self) -> str | None:
         vlm_model = getattr(self, "_vlm_model", None)
         if vlm_model is not None and hasattr(vlm_model, "config"):
@@ -1998,7 +2014,13 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
-        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+        if (
+            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(self.model_type) == "qwen"
+        ):
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
             try:
                 from ..patches.qwen35_ane_prefill import (
                     configure_qwen35_ane_prefill_scheduler,
@@ -2025,11 +2047,7 @@ class VLMBatchedEngine(BaseEngine):
                             )
                             or 0
                         ),
-                        fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fraction",
-                            0.53,
-                        ),
+                        fraction=ane_fraction,
                         max_layers=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_max_layers",
@@ -2056,11 +2074,7 @@ class VLMBatchedEngine(BaseEngine):
                             True,
                         ),
                         ane_down_fraction=(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fraction",
-                                0.53,
-                            )
+                            ane_fraction
                             if getattr(
                                 self._model_settings,
                                 "qwen35_ane_prefill_fused_down",
@@ -2129,6 +2143,18 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
+                    # The scheduler snapshotted model info before these
+                    # banks existed; price the compiled I/O surfaces now so
+                    # admission charges them while the banks are resident.
+                    from ..patches.qwen35_ane_prefill import (
+                        ane_prefill_transient_bytes,
+                    )
+
+                    monitor = getattr(scheduler, "memory_monitor", None)
+                    if monitor is not None:
+                        monitor.set_ane_prefill_transient_bytes(
+                            ane_prefill_transient_bytes(self._vlm_model)
+                        )
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
@@ -3553,6 +3579,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 
@@ -3666,6 +3693,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
@@ -3693,6 +3721,7 @@ class VLMBatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    first_token_at=getattr(output, "first_token_at", None),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))

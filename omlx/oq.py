@@ -687,7 +687,7 @@ def _is_audio_tensor(name: str) -> bool:
 
 def _is_moe_router(path: str) -> bool:
     """Detect MoE router/gate layers (distinct from gate_proj)."""
-    if path.endswith(("mlp.gate", ".router", ".router.layer")):
+    if path.endswith(("mlp.gate", ".router", ".router.layer", ".v_router")):
         return True
     if path.endswith(".gate") and "gate_proj" not in path:
         return True
@@ -7631,18 +7631,11 @@ class OQImatrixCollector:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
 
 
-def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
-    """Capture the untied GLM-5.3 output head without materializing logits."""
-    if str(getattr(model, "model_type", "")) != "glm5_next":
-        return False
-
-    language_model = getattr(model, "language_model", None)
-    core = getattr(language_model, "model", None)
+def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
+    """Capture normalized head inputs without materializing vocabulary logits."""
     norm = getattr(core, "norm", None)
-    if language_model is None or core is None or norm is None:
+    if core is None or norm is None:
         return False
-
-    name = "language_model.lm_head"
     module = collector._original_modules.get(name)
     if module is None:
         # Tied checkpoints project through embed_tokens and have no lm_head.
@@ -7652,6 +7645,24 @@ def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
         hidden = hidden.mean(axis=2)
     collector.collect_dense(name, module, norm(hidden))
     return name in collector.entries
+
+
+def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
+    if str(getattr(model, "model_type", "")) != "glm5_next":
+        return False
+    language_model = getattr(model, "language_model", None)
+    core = getattr(language_model, "model", None)
+    return _collect_untied_lm_head_imatrix(
+        core, hidden, collector, "language_model.lm_head"
+    )
+
+
+def _collect_k2_horizon_lm_head_imatrix(model, hidden, collector) -> bool:
+    if str(getattr(model, "model_type", "")) != "k2_horizon":
+        return False
+    return _collect_untied_lm_head_imatrix(
+        getattr(model, "model", None), hidden, collector, "lm_head"
+    )
 
 
 def _collect_mtp_head_imatrix(
@@ -7914,6 +7925,7 @@ def _collect_imatrix_from_model(
                     mx.clear_cache()
 
                 _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
+                _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
 
                 # MTP-head pass: the layer walk above leaves ``inputs`` as
                 # the final-layer hidden states; feed them (post-norm) plus

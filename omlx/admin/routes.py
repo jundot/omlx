@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -37,6 +39,9 @@ from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
     merge_chat_template_kwargs,
 )
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
@@ -61,6 +66,87 @@ from .auth import (
 logger = logging.getLogger(__name__)
 
 PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
+
+
+def _clear_cold_remote_cluster_cache_roots(
+    roots: tuple[Path, ...],
+    *,
+    runner: Any = subprocess.run,
+) -> tuple[int, int]:
+    """Remove unloaded cluster snapshots from every configured peer Mac.
+
+    Loaded ranks clear through their live cache managers. With no resident
+    engine, the normal SSD-clear action still has to reach peer-local snapshot
+    trees; deleting only the coordinator root makes the next load silently
+    restore data the user explicitly cleared.
+    """
+
+    from ..cluster.launch import _run_cluster_ssh
+    from ..cluster.registry import get_cluster_registry
+
+    try:
+        deployments = get_cluster_registry().list()
+    except RuntimeError:
+        return 0, 0
+    if not deployments:
+        return 0, 0
+
+    allowed = {"cluster-prompt-snapshots", "prompt-cache-ssd"}
+    if any(path.expanduser().name not in allowed for path in roots):
+        raise RuntimeError("refusing to clear an unexpected cluster cache root")
+
+    node_ids: set[str] = set()
+    remote_targets: set[str] = set()
+    for deployment in deployments:
+        for rank, host in enumerate(deployment.hosts):
+            node_ids.add(host.node_id)
+            if rank > 0:
+                remote_targets.add(host.ssh)
+
+    # Resolve settings on the peer. Sending the coordinator's expanded
+    # /Users/<name>/... roots breaks as soon as the Macs use different login
+    # names, data roots, or SSD-cache locations.
+    script = r"""
+import shutil
+from pathlib import Path
+from omlx.settings import GlobalSettings
+settings = GlobalSettings.load()
+roots = [
+    settings.cache.get_ssd_cache_dir(settings.base_path) / 'cluster-prompt-snapshots',
+    Path(settings.base_path) / 'cluster/runtime/prompt-cache-ssd',
+]
+allowed = {'cluster-prompt-snapshots', 'prompt-cache-ssd'}
+if any(root.name not in allowed for root in roots):
+    raise SystemExit(3)
+deleted = 0
+for root in roots:
+    if not root.exists():
+        continue
+    deleted += sum(1 for item in root.rglob('*') if item.is_file())
+    shutil.rmtree(root)
+print(deleted)
+""".strip()
+    command = shlex.join(["python3", "-c", script])
+    deleted = 0
+    for target in sorted(remote_targets):
+        completed = _run_cluster_ssh(
+            target,
+            command,
+            timeout=45.0,
+            runner=runner,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                f"cold cluster SSD clear failed on {target}: {detail[:300]}"
+            )
+        try:
+            deleted += max(0, int(completed.stdout.strip() or "0"))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"cold cluster SSD clear returned invalid output on {target}"
+            ) from exc
+    return deleted, len(node_ids)
 
 
 # =============================================================================
@@ -151,6 +237,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_sequence_length: int | None = None
     qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
     qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_shared_fraction: float | None = None
     qwen35_ane_prefill_fused_down: bool | None = None
     qwen35_ane_prefill_max_layers: int | None = None
     qwen35_ane_prefill_dual_ane: bool | None = None
@@ -300,6 +387,9 @@ class GlobalSettingsRequest(BaseModel):
     # MCP settings
     mcp_config: str | None = None
     mcp_expose_tools: bool | None = None
+
+    # Usage history settings
+    usage_history: bool | None = None
 
     # HuggingFace settings
     hf_endpoint: str | None = None
@@ -1868,6 +1958,33 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
+def _model_options(model_info: dict, settings) -> dict:
+    """Describe model controls once for the web and native settings clients."""
+    from ..patches.k2_horizon import REASONING_EFFORTS
+
+    model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
+    is_k2 = model_type == "k2_horizon"
+    thinking_modes = ["auto", "on_limit"] if is_k2 else [
+        "auto", "on_unlimit", "on_limit", "off"
+    ]
+    ane_backend = (
+        None if model_info.get("is_helper") else ane_prefill_backend(model_type)
+    )
+    return {
+        "thinking_forced": is_k2,
+        "thinking_modes": thinking_modes,
+        "reasoning_effort_options": list(REASONING_EFFORTS) if is_k2 else [
+            "low", "medium", "high", "xhigh", "max"
+        ],
+        "reasoning_effort_default": "high" if is_k2 else "low",
+        "reasoning_effort_custom": not is_k2,
+        "ane_prefill_backend": ane_backend,
+        "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
+        "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
+        "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
+    }
+
+
 def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
     if global_settings is None:
         return []
@@ -2018,6 +2135,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
+            "distributed": model_info.get("distributed", False),
+            "cluster": model_info.get("cluster"),
             "last_access": model_info.get("last_access"),
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
@@ -2031,6 +2150,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
+
+        model_data.update(_model_options(model_data, settings))
 
         # Add settings if available
         if settings:
@@ -2407,29 +2528,19 @@ async def update_model_settings(
             True if request.turboquant_skip_last is None
             else bool(request.turboquant_skip_last)
         )
-    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
-    # controls; the runtime signature below causes a loaded model to be
-    # re-created when the user applies a changed profile.
+    # Shared load-time ANE controls. Model metadata selects limits and backend.
+    ane_backend = ane_prefill_backend(entry.config_model_type)
     if "qwen35_ane_prefill_enabled" in sent:
-        enabled = bool(request.qwen35_ane_prefill_enabled)
-        config_type = str(getattr(entry, "config_model_type", "") or "")
-        config_type = config_type.lower().replace("-", "_")
-        if enabled and not config_type.startswith(
-            ("qwen3_5", "qwen3_6", "qwen3_8")
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
-            )
-        current_settings.qwen35_ane_prefill_enabled = enabled
+        current_settings.qwen35_ane_prefill_enabled = bool(
+            request.qwen35_ane_prefill_enabled
+        )
     if "qwen35_ane_prefill_sequence_length" in sent:
         value = request.qwen35_ane_prefill_sequence_length
-        if value is None or value < 1024 or value % 64:
+        if value is None:
             raise HTTPException(
-                status_code=400,
-                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+                status_code=400, detail="ANE prompt block cannot be null."
             )
-        current_settings.qwen35_ane_prefill_sequence_length = int(value)
+        current_settings.qwen35_ane_prefill_sequence_length = value
         if (
             current_settings.qwen35_ane_prefill_tail_padding_min_tokens
             >= int(value)
@@ -2450,13 +2561,14 @@ async def update_model_settings(
             )
         current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
     if "qwen35_ane_prefill_fraction" in sent:
-        value = request.qwen35_ane_prefill_fraction
-        if value is None or not 0.05 <= value <= 0.90:
-            raise HTTPException(
-                status_code=400,
-                detail="MLP ANE fraction must be between 0.05 and 0.90.",
-            )
-        current_settings.qwen35_ane_prefill_fraction = float(value)
+        current_settings.qwen35_ane_prefill_fraction = (
+            request.qwen35_ane_prefill_fraction
+        )
+    if "qwen35_ane_prefill_shared_fraction" in sent:
+        value = request.qwen35_ane_prefill_shared_fraction
+        current_settings.qwen35_ane_prefill_shared_fraction = (
+            1.0 if value is None else value
+        )
     if "qwen35_ane_prefill_max_layers" in sent:
         value = request.qwen35_ane_prefill_max_layers
         if value is None or value < 1:
@@ -2531,8 +2643,12 @@ async def update_model_settings(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
     if (
-        current_settings.qwen35_ane_prefill_fused_down
-        and current_settings.qwen35_ane_prefill_fraction > 0.50
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_fused_down
+        and ane_prefill_fraction(
+            current_settings.qwen35_ane_prefill_fraction, entry.config_model_type
+        )
+        > 0.50
     ):
         # The fused loader reuses the MLP fraction for the down projection and
         # rejects anything above 0.50 at enable time. Without this check the
@@ -2545,8 +2661,11 @@ async def update_model_settings(
             ),
         )
     if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
-        and current_settings.qwen35_ane_prefill_fraction
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_cpu_enabled
+        and ane_prefill_fraction(
+            current_settings.qwen35_ane_prefill_fraction, entry.config_model_type
+        )
         * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
         + current_settings.qwen35_ane_prefill_cpu_fraction
         >= 1.0
@@ -2560,7 +2679,8 @@ async def update_model_settings(
             ),
         )
     if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_cpu_enabled
         and current_settings.qwen35_ane_prefill_gdn
         and current_settings.qwen35_ane_prefill_gdn_fraction
         + current_settings.qwen35_ane_prefill_cpu_gdn_fraction
@@ -2831,6 +2951,7 @@ async def update_model_settings(
     if "guided_grammar" in sent:
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
+    _validate_model_settings(entry, current_settings.to_dict())
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -3074,6 +3195,21 @@ def _raise_if_alias_conflicts_exposed_profiles(
             )
 
 
+def _validate_model_settings(entry, settings):
+    if any(key.startswith("qwen35_ane_prefill_") for key in settings):
+        try:
+            validate_ane_prefill(settings, entry.config_model_type)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    if entry.config_model_type == "k2_horizon":
+        from ..patches.k2_horizon import validate_chat_template_kwargs
+
+        kwargs = dict(settings.get("chat_template_kwargs") or {})
+        if settings.get("enable_thinking") is not None:
+            kwargs["enable_thinking"] = settings["enable_thinking"]
+        validate_chat_template_kwargs(kwargs)
+
+
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
     model_id: str,
@@ -3093,7 +3229,8 @@ async def create_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
+    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3137,7 +3274,8 @@ async def update_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
+    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3196,7 +3334,11 @@ async def apply_model_profile(
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
     is_diffusion_model = _entry_is_diffusion_model(entry)
-    sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
+    def sanitizer(settings):
+        if is_diffusion_model:
+            _sanitize_diffusion_settings_dict(settings)
+        _validate_model_settings(entry, settings)
+
     try:
         applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
     except ValueError as e:
@@ -3626,6 +3768,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "mcp": {
             "config_path": global_settings.mcp.config_path,
             "expose_tools": global_settings.mcp.expose_tools,
+        },
+        "usage": {
+            "usage_history": global_settings.usage.usage_history,
         },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
@@ -4224,6 +4369,18 @@ async def update_global_settings(
     if request.mcp_expose_tools is not None:
         global_settings.mcp.expose_tools = request.mcp_expose_tools
         runtime_applied.append("mcp_expose_tools")
+
+    # Usage history recording is applied at runtime (no restart needed).
+    # Disabling flushes pending aggregates and leaves usage.sqlite3 in place.
+    if request.usage_history is not None:
+        global_settings.usage.usage_history = request.usage_history
+        from ..server_metrics import get_server_metrics
+
+        history = get_server_metrics().usage_history
+        if history is not None:
+            # Disabling flushes to SQLite; keep that off the event loop.
+            await asyncio.to_thread(history.set_enabled, request.usage_history)
+        runtime_applied.append("usage_history")
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
@@ -4922,6 +5079,44 @@ def _parse_commits_from_pyproject(pyproject_path, packages: dict[str, str]) -> d
     return commits
 
 
+def _distributed_runtime_cache_stats(engine) -> dict | None:
+    """Rank zero's telemetry cache counters as a runtime-cache row source.
+
+    Distributed engines own no local scheduler, so the paged hot/SSD stats do
+    not exist for them. What rank zero reports is its per-rank prompt cache
+    (in-memory LRU) and prompt-snapshot store — returned here under a
+    separate ``rank_prompt_cache`` key so callers never confuse it with the
+    tiered hot/SSD cache columns or aggregates.
+    """
+
+    get_live = getattr(engine, "get_live_metrics", None)
+    if not callable(get_live):
+        return None
+    try:
+        live = get_live()
+    except Exception:  # noqa: BLE001
+        logger.debug("cluster live metrics failed", exc_info=True)
+        return None
+    if live is None or live.get("stale"):
+        return None
+    metrics = live.get("metrics")
+    cache = metrics.get("cache") if isinstance(metrics, dict) else None
+    if not isinstance(cache, dict):
+        return None
+    return {
+        "rank_prompt_cache": {
+            "entries": int(cache.get("entries", 0) or 0),
+            "bytes": int(cache.get("bytes", 0) or 0),
+            "lookups": int(cache.get("lookups", 0) or 0),
+            "hits": int(cache.get("hits", 0) or 0),
+            "misses": int(cache.get("misses", 0) or 0),
+            "hit_rate": float(cache.get("hit_rate", 0.0) or 0.0),
+            "tokens_reused": int(cache.get("tokens_reused", 0) or 0),
+            "affinity": str(cache.get("affinity", "none")),
+        },
+    }
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -5015,6 +5210,12 @@ def _build_runtime_cache_observability(
                     exc,
                 )
                 continue
+
+        if not runtime_stats and model_info.get("cluster"):
+            # Distributed engines own no local scheduler; fall back to rank
+            # zero's telemetry cache counters (kept out of the tiered hot/SSD
+            # columns and aggregates — see _distributed_runtime_cache_stats).
+            runtime_stats = _distributed_runtime_cache_stats(entry.engine)
 
         if not runtime_stats:
             continue
@@ -5178,6 +5379,15 @@ def _build_runtime_cache_observability(
         if cache_rates:
             model_payload["cache_rates"] = cache_rates
 
+        rank_prompt_cache = runtime_stats.get("rank_prompt_cache")
+        if isinstance(rank_prompt_cache, dict):
+            # Label the row so the UI presents these as rank-local prompt
+            # cache/snapshot stats, never as the tiered hot/SSD cache. Every
+            # tiered numeric field above stays 0, so the hot-cache and SSD
+            # aggregates are unaffected.
+            model_payload["cache_tier"] = "rank-prompt-snapshot"
+            model_payload["rank_prompt_cache"] = rank_prompt_cache
+
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
         payload["total_size_bytes"] += model_payload["total_size_bytes"]
@@ -5226,6 +5436,26 @@ def _build_runtime_cache_observability(
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
     return payload
+
+
+@router.get("/api/usage")
+def get_usage_history(
+    range: Literal["today", "yesterday", "7d", "30d", "90d", "month"] = "today",
+    model: str = "",
+    include_details: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
+    """Local hourly serving history. Sync route keeps SQLite off the event loop."""
+    from ..server_metrics import get_server_metrics
+
+    history = get_server_metrics().usage_history
+    if history is None:
+        raise HTTPException(status_code=503, detail="Usage history unavailable")
+    try:
+        # Exact canonical IDs allow filtering historical models no longer loaded.
+        return history.query(range, model, include_details=include_details)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Usage history unavailable") from exc
 
 
 @router.get("/api/stats")
@@ -5386,6 +5616,28 @@ def _build_active_models_data() -> dict:
                 activity_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
 
+        # Cluster (distributed) engines own no local scheduler or collectors;
+        # their live stats come from rank zero's telemetry marker instead.
+        cluster_live = None
+        if (
+            model_info.get("cluster")
+            and entry is not None
+            and entry.engine is not None
+        ):
+            get_live = getattr(entry.engine, "get_live_metrics", None)
+            if callable(get_live):
+                try:
+                    cluster_live = get_live()
+                except Exception:  # noqa: BLE001
+                    logger.debug("cluster live metrics failed", exc_info=True)
+        # A stale marker proves nothing about the ranks' current state; show
+        # the model as idle rather than repeating outdated rates.
+        cluster_metrics = (
+            cluster_live["metrics"]
+            if cluster_live is not None and not cluster_live.get("stale")
+            else None
+        )
+
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
@@ -5395,6 +5647,10 @@ def _build_active_models_data() -> dict:
         if has_scheduler_snapshot or collector_request_ids:
             active_requests = len(active_request_ids)
         active_requests += activity_requests
+        if cluster_metrics is not None:
+            # Rank zero's count is the only live source for distributed rows.
+            rank_active = cluster_metrics.get("active_requests", 0)
+            active_requests = int(rank_active) if isinstance(rank_active, int) else 0
 
         # Generating = active requests that finished prefill.
         generating = []
@@ -5421,6 +5677,40 @@ def _build_active_models_data() -> dict:
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
                 }
             )
+
+        if cluster_metrics is not None:
+            # Synthesize scheduler-shaped prefill/generate rows from rank
+            # zero's most recent request sample so the existing sub-row
+            # rendering applies unchanged.
+            last = cluster_metrics.get("last_request")
+            if isinstance(last, dict) and last.get("status") == "running":
+                progress = last.get("prefill_progress")
+                if isinstance(progress, dict) and progress.get("active"):
+                    prefilling.append(
+                        {
+                            "request_id": "rank0",
+                            "processed": progress.get("processed", 0),
+                            "total": progress.get("total", 0),
+                            "speed": progress.get("speed", 0.0),
+                            "eta": progress.get("eta"),
+                            "elapsed": progress.get("elapsed"),
+                            "detail": "cluster prefill",
+                        }
+                    )
+                elif last.get("decode_tps"):
+                    generating.append(
+                        {
+                            "request_id": "rank0",
+                            "elapsed_seconds": last.get("elapsed_seconds"),
+                            "generated_tokens": last.get("completion_tokens", 0),
+                            "tokens_per_second": last.get("decode_tps", 0.0),
+                            "last_activity_age_seconds": cluster_live.get(
+                                "age_seconds"
+                            ),
+                            "prompt_tokens": last.get("prompt_tokens", 0),
+                            "max_tokens": None,
+                        }
+                    )
 
         loading_started_at = model_info.get("loading_started_at")
         loading_elapsed_seconds = (
@@ -5523,6 +5813,11 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
+                "cluster": (
+                    {**model_info["cluster"], "live": cluster_live}
+                    if model_info.get("cluster")
+                    else None
+                ),
             }
         )
 
@@ -5604,8 +5899,8 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
-def _iter_loaded_scheduler_records():
-    """Yield (model_id, scheduler, core) for each loaded model.
+def _iter_loaded_engine_records():
+    """Yield (model_id, scheduler-or-None, core) for each loaded model.
 
     Traverses the internal engine hierarchy: pool entry → async engine →
     core engine → scheduler.
@@ -5620,9 +5915,26 @@ def _iter_loaded_scheduler_records():
         entry = engine_pool._entries.get(model_id)
         if entry is None or entry.engine is None:
             continue
-        async_core = getattr(entry.engine, "_engine", None)
-        core = getattr(async_core, "engine", None) if async_core is not None else None
+        # DistributedBatchedEngine is stored directly in the pool; local
+        # batched engines retain the historical async-wrapper chain.
+        direct = entry.engine
+        async_core = getattr(direct, "_engine", None)
+        core = (
+            direct
+            if callable(getattr(direct, "clear_prompt_caches", None))
+            else getattr(async_core, "engine", None)
+            if async_core is not None
+            else None
+        )
         scheduler = getattr(core, "scheduler", None) if core is not None else None
+        if core is not None:
+            yield model_id, scheduler, core
+
+
+def _iter_loaded_scheduler_records():
+    """Yield local scheduler records, excluding distributed proxy engines."""
+
+    for model_id, scheduler, core in _iter_loaded_engine_records():
         if scheduler is not None:
             yield model_id, scheduler, core
 
@@ -5645,8 +5957,24 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     is loaded.
     """
     total_deleted = 0
+    distributed_ranks = 0
+    distributed_failures = []
 
-    for model_id, scheduler in _iter_loaded_schedulers():
+    for model_id, scheduler, core in _iter_loaded_engine_records():
+        distributed_clear = getattr(core, "clear_prompt_caches", None)
+        if callable(distributed_clear):
+            try:
+                report = await distributed_clear(ssd=True)
+                total_deleted += int(report.get("ssd_deleted", 0))
+                distributed_ranks += len(report.get("ranks", ()))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear distributed SSD cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+                distributed_failures.append(f"{model_id}: {exc}")
+            continue
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None:
             try:
@@ -5679,7 +6007,50 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
-    return {"status": "ok", "total_deleted": total_deleted}
+        # When no distributed engine is resident, no rank-local maintenance
+        # endpoint exists. Clear the coordinator's cold cluster trees directly
+        # and ask every configured peer to resolve and clear its own paths.
+        if distributed_ranks == 0:
+            cluster_roots = (
+                cache_dir / "cluster-prompt-snapshots",
+                Path(global_settings.base_path)
+                / "cluster/runtime/prompt-cache-ssd",
+            )
+            for cluster_root in cluster_roots:
+                if not cluster_root.exists():
+                    continue
+                try:
+                    total_deleted += sum(
+                        1 for item in cluster_root.rglob("*") if item.is_file()
+                    )
+                    shutil.rmtree(cluster_root)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to clean distributed SSD cache directory %s: %s",
+                        cluster_root,
+                        exc,
+                    )
+            try:
+                remote_deleted, configured_ranks = await asyncio.to_thread(
+                    _clear_cold_remote_cluster_cache_roots,
+                    cluster_roots,
+                )
+                total_deleted += remote_deleted
+                distributed_ranks = configured_ranks
+            except Exception as exc:
+                logger.warning("Failed to clean cold peer SSD cache: %s", exc)
+                distributed_failures.append(f"cold cluster peers: {exc}")
+
+    if distributed_failures:
+        raise HTTPException(
+            status_code=503,
+            detail="; ".join(distributed_failures)[:1000],
+        )
+    return {
+        "status": "ok",
+        "total_deleted": total_deleted,
+        "distributed_ranks": distributed_ranks,
+    }
 
 
 @router.post("/api/hot-cache/clear")
@@ -5699,7 +6070,24 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
 
     footprint_before = get_phys_footprint()
     total_cleared = 0
+    distributed_ranks = 0
+    distributed_failures = []
     reclaim_targets = []
+    for model_id, scheduler, core in _iter_loaded_engine_records():
+        distributed_clear = getattr(core, "clear_prompt_caches", None)
+        if not callable(distributed_clear):
+            continue
+        try:
+            report = await distributed_clear(hot=True)
+            total_cleared += int(report.get("hot_cleared", 0))
+            distributed_ranks += len(report.get("ranks", ()))
+        except Exception as exc:
+            logger.warning(
+                "Failed to clear distributed hot cache for model '%s': %s",
+                model_id,
+                exc,
+            )
+            distributed_failures.append(f"{model_id}: {exc}")
     for model_id, scheduler, core in _iter_loaded_scheduler_records():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
@@ -5756,10 +6144,16 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
     bytes_reclaimed = max(0, footprint_before - get_phys_footprint())
 
+    if distributed_failures:
+        raise HTTPException(
+            status_code=503,
+            detail="; ".join(distributed_failures)[:1000],
+        )
     return {
         "status": "ok",
         "total_cleared": total_cleared,
         "bytes_reclaimed": bytes_reclaimed,
+        "distributed_ranks": distributed_ranks,
     }
 
 
@@ -6807,7 +7201,7 @@ async def start_ane_tuning(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    """Tune the model’s ANE/GPU split without changing persisted settings."""
     from .accuracy_benchmark import get_queue_status
     from .ane_tuning import (
         ANETuningRequest,
@@ -6867,6 +7261,7 @@ async def start_ane_tuning(
             detail=f"Model {tuning_request.model_id} is not a supported language model",
         )
 
+    tuning_request.backend = "k2" if entry.config_model_type == "k2_horizon" else "qwen"
     cleanup_old_runs()
     run = create_run(tuning_request)
     run.task = asyncio.create_task(run_tuning(run, engine_pool))
@@ -6900,6 +7295,8 @@ async def cancel_ane_tuning(
         raise HTTPException(
             status_code=400, detail=f"ANE tuning is not running ({run.status})"
         )
+    if run.phase == "cleaning_up":
+        return {"status": "cleaning_up", "tuning_id": tuning_id}
     if run.task is not None and not run.task.done():
         run.task.cancel()
     return {"status": "cancelled", "tuning_id": tuning_id}

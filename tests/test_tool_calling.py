@@ -781,6 +781,90 @@ def _make_tokenizer(tool_call_start=""):
 class TestToolCallStreamFilter:
     """Tests for ToolCallStreamFilter."""
 
+    def test_complete_envelope_is_exposed_once_for_structured_streaming(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+        assert f.feed("<tool_call><function=get_weather>") == ""
+        assert f.envelope_open
+        assert f.take_completed_envelopes() == []
+        assert (
+            f.feed(
+                "<parameter=city>Seattle</parameter>"
+                "</function></tool_call>"
+            )
+            == ""
+        )
+        assert not f.envelope_open
+        assert f.take_completed_envelopes() == [
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Seattle</parameter>"
+            "</function></tool_call>"
+        ]
+        assert f.take_completed_envelopes() == []
+
+    def test_ordered_segments_preserve_content_call_content_fifo(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+        envelope = (
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Oslo</parameter></function></tool_call>"
+        )
+        assert f.feed("before " + envelope + " after") == "before  after"
+        segments = f.take_ordered_segments()
+        assert [(segment.kind, segment.text) for segment in segments] == [
+            ("content", "before "),
+            ("envelope", envelope),
+            ("content", " after"),
+        ]
+
+    def test_default_filter_does_not_retain_completed_envelope_copies(self):
+        f = ToolCallStreamFilter(_make_tokenizer())
+        envelope = '<tool_call>{"name":"f","arguments":{}}</tool_call>'
+        assert f.feed(envelope) == ""
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+
+    def test_seventeenth_queued_envelope_latches_off_eighteenth(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+
+        def envelope(index):
+            return f"<tool_call>{{\"name\":\"f\",\"arguments\":{{\"i\":{index}}}}}</tool_call>"
+
+        assert f.feed("".join(envelope(i) for i in range(17))) == ""
+        assert f.completed_envelope_overflowed
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+        assert f.feed(envelope(17)) == ""
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+
+    def test_oversize_envelope_latches_off_later_valid_envelope(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+        oversize = (
+            "<tool_call>"
+            + ("x" * (f._COMPLETED_ENVELOPE_MAX_BYTES + 1))
+            + "</tool_call>"
+        )
+        assert f.feed(oversize) == ""
+        assert f.completed_envelope_overflowed
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+
+        later = '<tool_call>{"name":"f","arguments":{}}</tool_call>'
+        assert f.feed(later) == ""
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+
     def test_no_marker_passthrough(self):
         """Without tokenizer marker, fallback envelopes are still active."""
         f = ToolCallStreamFilter(_make_tokenizer())
