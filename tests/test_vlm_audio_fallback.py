@@ -139,15 +139,21 @@ class TestHasAudioWeights:
 
 
 class TestStripAudioConfigIfOrphaned:
-    def test_passthrough_when_config_has_no_audio(self, tmp_path: Path):
-        # Config with no audio_config — patch must leave the dict untouched.
+    def test_absent_audio_config_is_pinned_to_none(self, tmp_path: Path):
+        # An absent audio_config is not the same as a harmless one. mlx-vlm's
+        # load_model runs `config.setdefault("audio_config", {})`, and
+        # gemma4_unified builds embed_audio for any audio_config that is not
+        # None -- so leaving the key absent is what causes a module the
+        # checkpoint has no weights for, and a strict load that fails on
+        # embed_audio.embedding_projection.weight. Pin it to None instead.
         model_dir = _build_model_dir(
             tmp_path, name="vision_only",
             has_audio_config=False, has_audio_weights=False,
         )
         with _strip_audio_config_if_orphaned(model_dir):
             cfg = _vu.load_config(model_dir)
-        assert "audio_config" not in cfg
+        assert "audio_config" in cfg
+        assert cfg["audio_config"] is None
 
     def test_passthrough_when_audio_weights_present(self, tmp_path: Path):
         # Healthy multimodal model — audio_config must remain in the dict.

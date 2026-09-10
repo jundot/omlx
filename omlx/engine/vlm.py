@@ -565,6 +565,18 @@ _AUDIO_CONFIG_KEYS = (
 )
 
 
+# Model types whose Gemma 4 weight prefixes are known well enough to conclude
+# a modality is absent. Other families keep the audio-only behavior, because a
+# prefix this list does not know would read as "no vision" and disable it.
+_GEMMA4_FAMILY_TYPES = ("gemma4", "gemma4_unified")
+
+# Prefixes that carry Gemma 4 vision weights. "unified" checkpoints have no
+# vision tower at all -- the single transformer does the work, and vision needs
+# only a patch embedder and a projection -- so the embedder prefixes are as
+# load-bearing as the tower one.
+_GEMMA4_VISION_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.")
+
+
 def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
     """Resolve the OptiQ multimodal sidecar declared by ``config.json``."""
     config_path = model_dir / "config.json"
@@ -596,8 +608,23 @@ def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
     return sidecar
 
 
+def _is_gemma4_family(config: dict) -> bool:
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    return model_type in _GEMMA4_FAMILY_TYPES
+
+
+def _has_vision_weights(model_dir: Path) -> bool:
+    """Return True iff any shard carries Gemma 4 vision tower/embedder keys."""
+    return _has_prefixed_weights(model_dir, _GEMMA4_VISION_PREFIXES)
+
+
 def _has_audio_weights(model_dir: Path) -> bool:
     """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
+    return _has_prefixed_weights(model_dir, ("audio_tower.", "embed_audio."))
+
+
+def _has_prefixed_weights(model_dir: Path, prefixes: tuple[str, ...]) -> bool:
+    """Return True iff any safetensors shard carries a key with one of ``prefixes``."""
     import safetensors
 
     weight_files = list(model_dir.glob("*.safetensors"))
@@ -609,12 +636,13 @@ def _has_audio_weights(model_dir: Path) -> bool:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
                 for k in f.keys():
-                    if k.startswith(("audio_tower.", "embed_audio.")):
+                    if k.startswith(prefixes):
                         return True
         except Exception:
-            # Corrupt or unreadable shard — treat as no audio info, let
-            # downstream loader produce its own error.
-            return False
+                # Skip the shard rather than answer for the whole checkpoint:
+                # one unreadable shard would otherwise drop a real modality.
+            logger.debug("could not scan %s for %s", sf.name, prefixes)
+            continue
     return False
 
 
@@ -645,15 +673,55 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
 
         expand_per_layer_quant_keys(cfg)
 
-        if cfg.get("audio_config") is None:
-            return cfg
         try:
             p = Path(path) if not isinstance(path, Path) else path
             if not p.is_dir():
                 return cfg
-            if _has_audio_weights(p):
-                return cfg
         except Exception:
+            return cfg
+
+            # An absent key is the case `setdefault` fabricates, which makes
+            # mlx-vlm's own text-only branch unreachable. Decide from weights.
+        if _is_gemma4_family(cfg):
+            cfg = dict(cfg)
+
+                # Audio is nulled outright, the long-standing behavior:
+                # nothing dereferences audio_config as a dict.
+            if not _has_audio_weights(p):
+                cfg["audio_config"] = None
+                for k in _AUDIO_CONFIG_KEYS:
+                    if k != "audio_config":
+                        cfg.pop(k, None)
+                if str(p) not in warned:
+                    warned.add(str(p))
+                    logger.warning(
+                        "audio_tower weights missing for %s; loading without "
+                        "audio support",
+                        p.name,
+                    )
+
+            # Vision cannot be nulled the same way: load_model reads
+            # `config.get("vision_config", {}).get("skip_vision", False)`, so
+            # the key has to keep its dict shape. Mark it instead, and let the
+            # two config-inflation points consult the marker.
+            if not _has_vision_weights(p):
+                from ..patches import mlx_vlm_gemma4_text_only as text_only
+
+                text_only.mark_absent(cfg, "vision")
+                if str(cfg.get("model_type") or "").lower() == "gemma4":
+                        # Only `gemma4_unified` carries mlx-vlm's text-only
+                        # branch; the two share the language_model layout.
+                    cfg["model_type"] = "gemma4_unified"
+                text_only.apply()
+                logger.info(
+                    "%s carries no vision weights; loading it as text-only",
+                    p.name,
+                )
+            return cfg
+
+        if cfg.get("audio_config") is None:
+            return cfg
+        if _has_audio_weights(p):
             return cfg
         cfg = dict(cfg)
         # Explicit None instead of pop: mlx-vlm's load_model runs
