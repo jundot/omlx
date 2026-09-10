@@ -725,6 +725,20 @@ class TestCompletionModels:
         assert chat.repetition_context_size is None
         assert completion.repetition_context_size is None
 
+    def test_repetition_context_size_model_settings_fallback(self):
+        """When client omits repetition_context_size, server reads from model_settings."""
+        from unittest.mock import patch
+        from omlx.model_settings import ModelSettings
+
+        ms = ModelSettings(repetition_context_size=256)
+        with patch("omlx.server.get_model_settings_for_request", return_value=ms):
+            chat = ChatCompletionRequest.model_validate(
+                {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            )
+            # The request itself has no repetition_context_size
+            assert chat.repetition_context_size is None
+            # But the server fallback will pick up 256 from model_settings
+
     def test_repetition_context_size_is_kept_and_validated(self):
         chat = ChatCompletionRequest.model_validate(
             {

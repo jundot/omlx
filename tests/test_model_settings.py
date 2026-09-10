@@ -33,6 +33,17 @@ class TestModelSettings:
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
+    def test_repetition_context_size_defaults_to_none(self):
+        settings = ModelSettings()
+        assert settings.repetition_context_size is None
+
+    def test_repetition_context_size_roundtrip(self):
+        original = ModelSettings(repetition_context_size=128)
+        d = original.to_dict()
+        assert d["repetition_context_size"] == 128
+        restored = ModelSettings.from_dict(d)
+        assert restored.repetition_context_size == 128
+
     def test_trust_remote_code_roundtrip(self):
         """Test trust_remote_code field survives to_dict -> from_dict roundtrip."""
         original = ModelSettings(trust_remote_code=True)

@@ -144,6 +144,9 @@ class ModelSettings:
         top_k: Top-k sampling parameter (None = use global default).
         min_p: Minimum probability threshold (None = use global default).
         repetition_penalty: Repetition penalty (None = use default 1.0, i.e. disabled).
+        repetition_context_size: Look-back window (tokens) for the repetition penalty.
+            None = mlx-lm default (20 tokens). Loop units longer than the window
+            never overlap their own penalty context, making the penalty inert.
         presence_penalty: Presence penalty (None = use global default).
         force_sampling: Force sampling even with temperature=0.
         max_tool_result_tokens: Maximum tokens in tool result (None = use global default).
@@ -244,6 +247,7 @@ class ModelSettings:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = None
     min_p: Optional[float] = None
     presence_penalty: Optional[float] = None
     force_sampling: bool = False
