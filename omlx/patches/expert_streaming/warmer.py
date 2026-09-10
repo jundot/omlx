@@ -117,12 +117,11 @@ class PageCacheWarmer:
             for layer, linears in linears_by_layer.items()
         }
         self.last_uniq: Dict[int, list[int]] = {}
-        # P2-11: these three are bumped from _WARM_POOL workers (_advise_one
+        # P2-11: these two are bumped from _WARM_POOL workers (_advise_one
         # runs inside the submitted _run), so a bare ``+=`` loses updates.
         # RunPoolTelemetry / ReadTelemetry already lock theirs; same reason.
         self._stats_lock = threading.Lock()
         self.advised = 0
-        self.advised_bytes = 0
         self.advise_failures = 0
 
     def on_layer_start(self, layer_idx: int, positions: int) -> None:
@@ -185,14 +184,6 @@ class PageCacheWarmer:
         except Exception:
             with self._stats_lock:
                 self.advise_failures += 1
-
-    def advise_stats(self) -> dict[str, int]:
-        with self._stats_lock:
-            return {
-                "advised": self.advised,
-                "advised_bytes": self.advised_bytes,
-                "advise_failures": self.advise_failures,
-            }
 
 
 class PinController:

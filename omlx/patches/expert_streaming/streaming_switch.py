@@ -161,7 +161,6 @@ _PREFILL_DIAG_MIN_ROUTES = 512
 # overrides.
 _ADMISSION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION", "") == "1"
 _ADMISSION_WINDOW_ENV = int(os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION_WINDOW", "0") or 0)
-_ADMISSION_WINDOW = 1024
 
 # O2 cross-layer speculation (G2 F_RDADVISE). RA is default-on (like G2)
 # and can be disabled with OMLX_EXPERT_STREAMING_RA=0. When enabled, each
@@ -1136,13 +1135,6 @@ class S3FIFOExpertCache(ExpertLRUCache):
     def policy(self) -> str:
         return "s3fifo"
 
-    def _in(self, key: tuple[int, int, str]) -> int:
-        if key in self._small:
-            return 0
-        if key in self._store:
-            return 1
-        return -1
-
     def __contains__(self, key: tuple[int, int, str]) -> bool:
         with self._lock:
             return key in self._small or key in self._store
@@ -1895,7 +1887,7 @@ class _LayerLoadContext:
 
     # -- legacy union path --------------------------------------------------
 
-    def _ensure_union(self, linear: Any, expert_ids: list[int]) -> None:
+    def _ensure_union(self, expert_ids: list[int]) -> None:
         if self._loaded:
             return
         self._loaded = True
@@ -1995,7 +1987,7 @@ class _LayerLoadContext:
     def ensure(self, linear: Any, expert_ids: list[int]) -> None:
         """Resolve linear's demand set for this layer call."""
         if self.mode == "union":
-            self._ensure_union(linear, expert_ids)
+            self._ensure_union(expert_ids)
         else:
             self._ensure_rolling(linear, expert_ids)
 
@@ -3099,7 +3091,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             )
         remapped = plan.remapped
 
-        def _stack_tier(t: int, idxs: list[int]) -> tuple:
+        def _stack_tier(t: int) -> tuple:
             """Legacy per-expert stack for one tier (no matching segment)."""
             ws, ss, bs_ = tier_w[t], tier_s[t], tier_b[t]
             if len(ws) == 1:
@@ -3131,7 +3123,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 if t in tier_single:
                     w_b, s_b, b_b = tier_single[t]
                 else:
-                    w_b, s_b, b_b = _stack_tier(t, idxs)
+                    w_b, s_b, b_b = _stack_tier(t)
                 bits_ = self.bits if t == 0 else self._cold_bits
                 gs_ = self.group_size if t == 0 else self._cold_gs
                 if memtrace.enabled:
@@ -3219,7 +3211,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 if 0 in tier_single:
                     w_b, s_b, b_b = tier_single[0]
                 else:
-                    w_b, s_b, b_b = _stack_tier(0, hot_idx)
+                    w_b, s_b, b_b = _stack_tier(0)
                 out = mx.gather_qmm(
                     x, w_b, s_b, b_b, rhs_indices=plan.remapped,
                     transpose=True, group_size=self.group_size, bits=self.bits,

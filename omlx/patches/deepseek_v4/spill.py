@@ -30,12 +30,9 @@ Set ``OMLX_DSV4_SPILL=0`` to restore the legacy in-RAM stacking, or
 from __future__ import annotations
 
 import json
-import logging
 import os
 from pathlib import Path
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 _SPILL_VERSION = 1
 _MANIFEST_NAME = "manifest.json"
