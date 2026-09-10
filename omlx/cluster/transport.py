@@ -13,6 +13,7 @@ import re
 import secrets
 import shlex
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager, suppress
@@ -1450,7 +1451,23 @@ def _run_link_command(
     """Run one bounded link check locally or through the paired SSH identity."""
 
     argv = list(command)
-    if ssh_hostname not in _LOCAL_HOSTS:
+    if ssh_hostname in _LOCAL_HOSTS:
+        # A bare "python3" resolves through PATH, not through PYTHONHOME —
+        # the two can point at different interpreter trees. The packaged
+        # app's own launch wrappers (omlx-cli, omlx-cluster-python) set
+        # PYTHONHOME for the server process, and that value is inherited
+        # here since this runs as a plain local subprocess (unlike the SSH
+        # branch below, which gets a fresh remote environment). Any other
+        # "python3" earlier on PATH than the one PYTHONHOME names then
+        # fails at interpreter startup ("No module named 'encodings'") —
+        # a crash, not a network failure, that this function cannot tell
+        # apart from "TCP refused" by exit code alone. sys.executable is
+        # the interpreter actually running right now, under the
+        # environment it is actually running in, so it always matches.
+        argv = [
+            sys.executable if part == "python3" else part for part in argv
+        ]
+    else:
         argv = [
             "ssh",
             *cluster_ssh_options(connect_timeout=5),
