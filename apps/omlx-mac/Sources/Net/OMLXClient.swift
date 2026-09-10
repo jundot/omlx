@@ -94,6 +94,10 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    func getActivity() async throws -> ActivityDTO {
+        try await get(AdminAPI.activity)
+    }
+
     @discardableResult
     func clearStats() async throws -> SimpleStatusResponse {
         try await postEmpty(AdminAPI.statsClear)

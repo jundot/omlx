@@ -15,6 +15,7 @@ enum AdminAPI {
     static let globalSettings  = "\(prefix)/global-settings"
     static let serverInfo      = "\(prefix)/server-info"
     static let stats           = "\(prefix)/stats"
+    static let activity        = "\(prefix)/activity"
     static let statsClear      = "\(prefix)/stats/clear"
     static let statsClearAlltime = "\(prefix)/stats/clear-alltime"
     static let ssdCacheClear   = "\(prefix)/ssd-cache/clear"

@@ -25,6 +25,8 @@ class PrefillProgressTracker:
     Called once per prefill chunk (default 2048 tokens).
     """
 
+    _SPEED_EMA_ALPHA = 0.35
+
     def __init__(self) -> None:
         self._progress: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -60,10 +62,19 @@ class PrefillProgressTracker:
                     dtok = processed - prev["processed"]
                     if dt > 0 and dtok > 0:
                         speed = dtok / dt
+                        previous_ema = prev.get("smoothed_speed")
+                        smoothed_speed = (
+                            speed
+                            if previous_ema is None
+                            else previous_ema
+                            + self._SPEED_EMA_ALPHA * (speed - previous_ema)
+                        )
                     else:
                         speed = prev.get("speed", 0.0)
+                        smoothed_speed = prev.get("smoothed_speed")
                 else:
                     speed = 0.0
+                    smoothed_speed = None
 
                 entry = dict(extra or {})
                 entry.update(
@@ -74,6 +85,7 @@ class PrefillProgressTracker:
                         "start_time": start_time,
                         "last_time": now,
                         "speed": speed,
+                        "smoothed_speed": smoothed_speed,
                         "phase": phase,
                         "detail": detail,
                     }
@@ -109,7 +121,8 @@ class PrefillProgressTracker:
                 elapsed = time.monotonic() - entry["start_time"]
                 speed = entry.get("speed", 0.0)
                 remaining = entry["total"] - entry["processed"]
-                eta = remaining / speed if speed > 0 else None
+                smoothed_speed = entry.get("smoothed_speed")
+                eta = remaining / smoothed_speed if smoothed_speed else None
                 result = {
                     "request_id": rid,
                     "processed": entry["processed"],

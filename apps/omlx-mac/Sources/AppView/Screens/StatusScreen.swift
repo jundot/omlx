@@ -65,7 +65,8 @@ struct StatusScreen: View {
             SectionHeader(String(localized: "status.section.active_now",
                                   defaultValue: "Active Now",
                                   comment: "Section header for the currently active models list"))
-            ActiveNowList(models: vm.stats?.activeModels.models ?? [])
+            ActiveNowList(models: vm.stats?.activeModels.models ?? [],
+                          activity: vm.activity)
 
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
@@ -522,6 +523,9 @@ private struct ThermalTrailing: View {
 
 private struct ActiveNowList: View {
     let models: [StatsDTO.ActiveModelDTO]
+    /// Progress polls faster than the 5 s stats read `models` comes from.
+    let activity: ModelActivityPoller
+
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -538,14 +542,27 @@ private struct ActiveNowList: View {
                 }
             } else {
                 ForEach(Array(models.enumerated()), id: \.element.id) { index, model in
-                    Row(label: model.id, isLast: index == models.count - 1) {
-                        HStack(spacing: 12) {
-                            modelStateBadge(for: model)
-                            Text(model.estimatedSizeFormatted ?? "—")
-                                .font(.omlxMono(11))
-                                .foregroundStyle(theme.textSecondary)
-                                .frame(minWidth: 60, alignment: .trailing)
+                    let live = activity.snapshot(for: model.id)
+                    FreeRow(isLast: index == models.count - 1) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 12) {
+                                Text(model.id)
+                                    .font(.omlxText(13, weight: .medium))
+                                    .foregroundStyle(theme.text)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 12)
+                                modelStateBadge(for: model, live: live)
+                                Text(model.estimatedSizeFormatted ?? "—")
+                                    .font(.omlxMono(11))
+                                    .foregroundStyle(theme.textSecondary)
+                                    .frame(minWidth: 60, alignment: .trailing)
+                            }
+                            if let live, model.isLoading != true {
+                                ModelActivityList(snapshot: live)
+                            }
                         }
+                        .animation(.easeInOut(duration: 0.18), value: live != nil)
                     }
                 }
             }
@@ -553,9 +570,14 @@ private struct ActiveNowList: View {
     }
 
     @ViewBuilder
-    private func modelStateBadge(for model: StatsDTO.ActiveModelDTO) -> some View {
+    private func modelStateBadge(
+        for model: StatsDTO.ActiveModelDTO,
+        live: ModelActivitySnapshot?
+    ) -> some View {
         if model.isLoading == true {
             StatusPill(status: .starting)
+        } else if let live, live.isBusy {
+            ModelActivityBadge(snapshot: live)
         } else if (model.activeRequests ?? 0) > 0 {
             StatusPill(status: .custom(color: theme.greenDot,
                                         label: String(localized: "status.active_now.badge.generating",

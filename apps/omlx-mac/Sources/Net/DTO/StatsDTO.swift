@@ -47,6 +47,35 @@ struct StatsDTO: Codable, Equatable, Sendable {
         let isLoading: Bool?
         let activeRequests: Int?
         let waitingRequests: Int?
+        /// Per-request live progress from `_build_active_models_data`.
+        /// `nil` on servers predating the fields.
+        let prefilling: [PrefillProgressDTO]?
+        let generating: [GenerationProgressDTO]?
+        let activities: [NonStreamingActivityDTO]?
+    }
+
+    struct PrefillProgressDTO: Codable, Equatable, Sendable {
+        let requestId: String?
+        let processed: Int?
+        let total: Int?
+        let speed: Double?
+        let eta: Double?
+        let elapsed: Double?
+        let detail: String?
+    }
+
+    struct GenerationProgressDTO: Codable, Equatable, Sendable {
+        let requestId: String?
+        let generatedTokens: Int?
+        let tokensPerSecond: Double?
+        let elapsedSeconds: Double?
+    }
+
+    struct NonStreamingActivityDTO: Codable, Equatable, Sendable {
+        let requestId: String?
+        let kind: String?
+        let detail: String?
+        let elapsedSeconds: Double?
     }
 
     /// Mirrors `_build_runtime_cache_observability` in `omlx/admin/routes.py`.
@@ -80,4 +109,10 @@ struct ClearSsdCacheResponse: Codable, Sendable {
 struct ClearHotCacheResponse: Codable, Sendable {
     let status: String?
     let totalCleared: Int?
+}
+
+/// `GET /admin/api/activity` — the `active_models` slice of `/admin/api/stats`
+/// without the counters, cheap enough to poll once a second.
+struct ActivityDTO: Codable, Equatable, Sendable {
+    let activeModels: StatsDTO.ActiveModelsDTO
 }

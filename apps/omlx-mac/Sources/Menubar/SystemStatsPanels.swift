@@ -6,7 +6,12 @@
 
 import SwiftUI
 
-private let panelWidth: CGFloat = 270
+enum MenubarStatsPanelLayout {
+    static let width: CGFloat = 270
+    static let horizontalInset: CGFloat = 14
+    static let verticalInset: CGFloat = 8
+    static let contentWidth = width - (horizontalInset * 2)
+}
 
 // MARK: - CPU
 
@@ -21,7 +26,7 @@ struct CPUStatsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            StatsPanelHeader(title: "CPU")
+            MenubarStatsPanelHeader(title: "CPU")
             UsageBarRow(
                 label: String(localized: "menubar.system.e_cores",
                               defaultValue: "E-cores",
@@ -38,7 +43,7 @@ struct CPUStatsPanel: View {
                 fraction: snapshot.pCoreUsage ?? 0,
                 color: pColor
             )
-            StatsPanelCaption(
+            MenubarStatsPanelCaption(
                 text: String(localized: "menubar.system.cpu_caption",
                              defaultValue: "E (amber) / P (blue) usage",
                              comment: "CPU panel caption under the usage bars"),
@@ -52,7 +57,7 @@ struct CPUStatsPanel: View {
                                 height: 26, domain: 0...1)
             }
             Divider()
-            StatsValueRow(
+            MenubarStatsValueRow(
                 label: String(localized: "menubar.system.thermal",
                               defaultValue: "Thermal",
                               comment: "CPU panel row label for the system thermal state"),
@@ -60,22 +65,22 @@ struct CPUStatsPanel: View {
                     for: SystemMetricsPoller.severity(for: snapshot.thermalState)
                 )
             )
-            StatsValueRow(
+            MenubarStatsValueRow(
                 label: String(localized: "menubar.system.load_avg",
                               defaultValue: "Load avg",
                               comment: "CPU panel row label for the 1/5/15-minute load averages"),
                 value: SystemStatsSampler.formatLoadAverages(snapshot.loadAverages)
             )
-            StatsValueRow(
+            MenubarStatsValueRow(
                 label: String(localized: "menubar.system.uptime",
                               defaultValue: "Uptime",
                               comment: "CPU panel row label for system uptime"),
                 value: SystemStatsSampler.formatUptime(snapshot.uptimeSeconds)
             )
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .frame(width: panelWidth)
+        .padding(.horizontal, MenubarStatsPanelLayout.horizontalInset)
+        .padding(.vertical, MenubarStatsPanelLayout.verticalInset)
+        .frame(width: MenubarStatsPanelLayout.width)
     }
 }
 
@@ -92,7 +97,7 @@ struct GPUStatsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            StatsPanelHeader(title: "GPU")
+            MenubarStatsPanelHeader(title: "GPU")
             UsageBarRow(
                 label: "GPU",
                 value: StatsFormat.percent(snapshot.gpuUsage),
@@ -111,7 +116,7 @@ struct GPUStatsPanel: View {
                 fraction: gpuMemoryFraction,
                 color: gpuMemColor
             )
-            StatsPanelCaption(
+            MenubarStatsPanelCaption(
                 text: String(localized: "menubar.system.gpu_caption",
                              defaultValue: "GPU (green) / GPU mem (cyan)",
                              comment: "GPU panel caption under the usage bars"),
@@ -121,9 +126,9 @@ struct GPUStatsPanel: View {
             MetricSparkline(values: snapshot.gpuHistory, color: gpuColor,
                             height: 26, domain: 0...1)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .frame(width: panelWidth)
+        .padding(.horizontal, MenubarStatsPanelLayout.horizontalInset)
+        .padding(.vertical, MenubarStatsPanelLayout.verticalInset)
+        .frame(width: MenubarStatsPanelLayout.width)
     }
 
     private var gpuMemoryFraction: Double {
@@ -150,7 +155,7 @@ struct MemoryStatsPanel: View {
     var body: some View {
         let memory = snapshot.memory
         VStack(alignment: .leading, spacing: 6) {
-            StatsPanelHeader(title: String(
+            MenubarStatsPanelHeader(title: String(
                 localized: "menubar.system.memory_title",
                 defaultValue: "Memory",
                 comment: "Title of the Memory panel in the System Stats submenu"
@@ -193,9 +198,9 @@ struct MemoryStatsPanel: View {
                                     comment: "Memory panel legend row for free memory"),
                       bytes: memory.freeBytes)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .frame(width: panelWidth)
+        .padding(.horizontal, MenubarStatsPanelLayout.horizontalInset)
+        .padding(.vertical, MenubarStatsPanelLayout.verticalInset)
+        .frame(width: MenubarStatsPanelLayout.width)
     }
 
     private func legendRow(color: Color, label: String, bytes: UInt64) -> some View {
@@ -237,7 +242,7 @@ struct SystemStatsPanelStack: View {
         // echo whatever the popover proposed — and a popover proposes its
         // default ~320 pt frame on first open, which then sticks, leaving a
         // dead right margin whenever two or more panels are stacked.
-        .frame(width: panelWidth)
+        .frame(width: MenubarStatsPanelLayout.width)
     }
 
     @ViewBuilder
@@ -260,20 +265,20 @@ struct SystemStatsPanelStack: View {
 /// stack level would let the hosting controller's fitting width track the
 /// popover's proposed frame instead of the panel width.
 struct SectionRule: View {
-    var containerWidth: CGFloat = panelWidth
+    var containerWidth: CGFloat = MenubarStatsPanelLayout.width
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         Rectangle()
             .fill(theme.rowSep)
-            .frame(width: containerWidth - 28, height: 1)
+            .frame(width: containerWidth - (MenubarStatsPanelLayout.horizontalInset * 2), height: 1)
             .frame(width: containerWidth)
             .padding(.vertical, 4)
             .accessibilityHidden(true)
     }
 }
 
-private struct StatsPanelHeader: View {
+struct MenubarStatsPanelHeader: View {
     let title: String
     @Environment(\.omlxTheme) private var theme
 
@@ -286,10 +291,15 @@ private struct StatsPanelHeader: View {
     }
 }
 
-private struct StatsPanelCaption: View {
+struct MenubarStatsPanelCaption: View {
     let text: String
     let window: String
     @Environment(\.omlxTheme) private var theme
+
+    init(text: String, window: String? = nil) {
+        self.text = text
+        self.window = window ?? ""
+    }
 
     var body: some View {
         Text(window.isEmpty ? text : "\(text) · \(window)")
@@ -333,7 +343,7 @@ private struct UsageBarRow: View {
     }
 }
 
-private struct StatsValueRow: View {
+struct MenubarStatsValueRow: View {
     let label: String
     let value: String
     @Environment(\.omlxTheme) private var theme

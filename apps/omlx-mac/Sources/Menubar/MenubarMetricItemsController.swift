@@ -75,9 +75,9 @@ final class MenubarMetricItemsController: NSObject, NSPopoverDelegate {
             // can be dark over a dark wallpaper while the app is light.
             let darkMenubar = button.effectiveAppearance
                 .bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            let rates = store.rates[spec.kind]
-            let promptValue = MenubarMetricGlyph.formatTps(rates?.promptTps)
-            let generationValue = MenubarMetricGlyph.formatTps(rates?.generationTps)
+            let snapshot = store.snapshot(for: spec.kind)
+            let promptValue = MenubarMetricGlyph.formatTps(snapshot.rates?.promptTps)
+            let generationValue = MenubarMetricGlyph.formatTps(snapshot.rates?.generationTps)
             let signature = MenubarMetricGlyph.signature(
                 tag: spec.tag,
                 promptValue: promptValue,

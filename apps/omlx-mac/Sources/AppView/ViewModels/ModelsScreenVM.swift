@@ -12,6 +12,7 @@ final class ModelsScreenVM {
     /// trash glyph and the whole row's button-stack is disabled to prevent
     /// double-tap deletes against a model the server is still unloading.
     private(set) var deletingID: String?
+    var activity = ModelActivityPoller()
 
     @ObservationIgnored
     private weak var client: OMLXClient?
@@ -25,6 +26,7 @@ final class ModelsScreenVM {
 
     func start(client: OMLXClient) async {
         self.client = client
+        activity.start(client: client)
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -38,6 +40,7 @@ final class ModelsScreenVM {
     func stop() {
         pollTask?.cancel()
         pollTask = nil
+        activity.stop()
     }
 
     func load(id: String, client: OMLXClient) {

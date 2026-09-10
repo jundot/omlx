@@ -15,6 +15,36 @@ struct MetricRates: Equatable, Sendable {
     var generationTps: Double?
 }
 
+/// Presentation-ready serving data for one menubar metric scope. This keeps
+/// popovers independent of the poller's transport DTOs.
+struct ServingStatsSnapshot: Equatable, Sendable {
+    let rates: MetricRates?
+    let totalPromptTokens: Int?
+    let totalCachedTokens: Int?
+    let cacheEfficiency: Double?
+    let totalRequests: Int?
+    let liveActivity: MenubarStatsPoller.Stats.LiveActivity?
+
+    static let unavailable = ServingStatsSnapshot(
+        rates: nil,
+        totalPromptTokens: nil,
+        totalCachedTokens: nil,
+        cacheEfficiency: nil,
+        totalRequests: nil,
+        liveActivity: nil
+    )
+
+    var isUnavailable: Bool {
+        rates?.promptTps == nil
+            && rates?.generationTps == nil
+            && totalPromptTokens == nil
+            && totalCachedTokens == nil
+            && cacheEfficiency == nil
+            && totalRequests == nil
+            && liveActivity == nil
+    }
+}
+
 @MainActor
 @Observable
 final class MenubarMetricsStore {
@@ -33,7 +63,7 @@ final class MenubarMetricsStore {
     /// graphs cover the last minute.
     nonisolated static let historyCapacity = 60
 
-    private(set) var rates: [Kind: MetricRates] = [:]
+    private(set) var snapshots: [Kind: ServingStatsSnapshot] = [:]
     private(set) var history: [Kind: Series] = [:]
     private(set) var serverIsRunning = false
 
@@ -41,9 +71,9 @@ final class MenubarMetricsStore {
     /// glyph shows "–") but roll a 0 into the history so the graph timeline
     /// stays contiguous.
     func applyTick(
-        live: MetricRates?,
-        average: MetricRates?,
-        alltime: MetricRates?,
+        live: ServingStatsSnapshot?,
+        average: ServingStatsSnapshot?,
+        alltime: ServingStatsSnapshot?,
         serverRunning: Bool
     ) {
         serverIsRunning = serverRunning
@@ -56,14 +86,18 @@ final class MenubarMetricsStore {
     /// the history where it was.
     func markServerStopped() {
         serverIsRunning = false
-        rates = [:]
+        snapshots = [:]
     }
 
-    private func record(_ kind: Kind, _ reading: MetricRates?) {
-        rates[kind] = reading
+    func snapshot(for kind: Kind) -> ServingStatsSnapshot {
+        snapshots[kind] ?? .unavailable
+    }
+
+    private func record(_ kind: Kind, _ snapshot: ServingStatsSnapshot?) {
+        snapshots[kind] = snapshot ?? .unavailable
         var series = history[kind] ?? Series()
-        Self.append(&series.promptTps, reading?.promptTps ?? 0)
-        Self.append(&series.generationTps, reading?.generationTps ?? 0)
+        Self.append(&series.promptTps, snapshot?.rates?.promptTps ?? 0)
+        Self.append(&series.generationTps, snapshot?.rates?.generationTps ?? 0)
         history[kind] = series
     }
 
@@ -79,6 +113,42 @@ final class MenubarMetricsStore {
 // MARK: - Rate aggregation (pure, unit-testable)
 
 extension MenubarMetricsStore {
+    /// Maps each polling source into one shared popover model. LIV is
+    /// intentionally limited to instantaneous rates and current requests;
+    /// AVG and ALL retain the scalar counters from their respective scopes.
+    nonisolated static func snapshot(
+        for kind: Kind,
+        from stats: MenubarStatsPoller.Stats?
+    ) -> ServingStatsSnapshot? {
+        guard let stats else {
+            return nil
+        }
+
+        switch kind {
+        case .live:
+            guard let rates = liveRates(from: stats) else {
+                return nil
+            }
+            return ServingStatsSnapshot(
+                rates: rates,
+                totalPromptTokens: nil,
+                totalCachedTokens: nil,
+                cacheEfficiency: nil,
+                totalRequests: nil,
+                liveActivity: stats.liveActivity
+            )
+        case .average, .alltime:
+            return ServingStatsSnapshot(
+                rates: averageRates(from: stats),
+                totalPromptTokens: stats.totalPromptTokens,
+                totalCachedTokens: stats.totalCachedTokens,
+                cacheEfficiency: stats.cacheEfficiency,
+                totalRequests: stats.totalRequests,
+                liveActivity: nil
+            )
+        }
+    }
+
     /// Instantaneous rates summed across every in-flight request of every
     /// model. A decoded-but-idle activity payload yields 0/0; a missing
     /// payload (fetch disabled or failed) yields nil.
