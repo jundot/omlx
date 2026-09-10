@@ -388,5 +388,23 @@ def apply() -> bool:
     _patch_text_model(lm_gemma4_text)
     _patch_inner_model(lm_gemma4_text)
     _patch_outer_model(lm_gemma4)
+
+    # The verify forward is the other half of what makes drafting pay. Gemma 4
+    # global layers carry head_dim 512, which MLX fuses only at L=1, so every
+    # multi-row verify drops to the unfused pass and that cost grows with
+    # context -- the mlx-vlm path has carried this route since #2683 and the
+    # mlx-lm path had no equivalent, which is the shape of our own weakest
+    # measurement (+28% short context against +11.6% at 2.7k).
+    #
+    # Failure is not fatal: without it the verify forward is slower, not
+    # wrong, so a missing kernel or an unpatchable Attention leaves drafting
+    # working on the stock route.
+    try:
+        from ..gemma4_verify_attention import apply_mlx_lm as _apply_verify_attn
+
+        _apply_verify_attn()
+    except Exception as exc:
+        logger.debug("gemma4 verify attention unavailable on mlx-lm: %s", exc)
+
     logger.debug("mlx-lm gemma4 assistant MTP patch applied")
     return True

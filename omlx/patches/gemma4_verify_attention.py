@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small-L attention route for gemma4 speculative verify forwards.
 
+Installed on either engine. The routing below depends only on the Attention
+module's own attributes and on a module-level ``scaled_dot_product_attention``,
+both of which mlx-vlm's ``gemma4.language`` and mlx-lm's ``gemma4_text``
+provide under the same names and with the same call signature -- so the two
+engines share one copy of the kernel decision rather than each carrying a
+version that can drift from the other.
+
 Gemma4 uses head_dim 256 for sliding layers and 512 for global layers. MLX
 0.32.2 now handles small multi-row head-dim-256 calls with its native vector
 kernel, so this patch explicitly leaves those shapes alone. Head-dim 512 still
@@ -77,15 +84,39 @@ def apply() -> bool:
     except Exception as e:
         logger.debug(f"mlx_vlm.gemma4 not importable for verify attention: {e}")
         return False
+    return _install(
+        g4_lang.Attention, g4_lang.scaled_dot_product_attention, "mlx-vlm"
+    )
 
+
+def apply_mlx_lm() -> bool:
+    """Wrap ``mlx_lm.models.gemma4_text.Attention.__call__``. Idempotent.
+
+    The same two routes, on the engine that serves text-only checkpoints.
+    Without this the mlx-lm verify forward drops to the unfused pass on
+    head_dim 512 global layers, which is the cost that grows with context and
+    makes a verify cycle lose to plain decoding on low-accept content.
+    """
+    try:
+        from mlx_lm.models import gemma4_text as g4_text
+    except Exception as e:
+        logger.debug(
+            f"mlx_lm.gemma4_text not importable for verify attention: {e}"
+        )
+        return False
+    return _install(
+        g4_text.Attention, g4_text.scaled_dot_product_attention, "mlx-lm"
+    )
+
+
+def _install(cls, sdpa, engine: str) -> bool:
+    """Install the small-L verify routes on one engine's Attention class."""
     from . import gemma4_verify_kernel
 
-    cls = g4_lang.Attention
     if getattr(cls, "_omlx_verify_attn_patched", False):
         return True
 
     original_call = cls.__call__
-    sdpa = g4_lang.scaled_dot_product_attention
 
     def _zero_left_padding(cache) -> bool:
         left = getattr(cache, "left_padding", None)
@@ -200,5 +231,8 @@ def apply() -> bool:
 
     cls.__call__ = __call__
     cls._omlx_verify_attn_patched = True
-    logger.info("gemma4 small-L verify attention patch applied (kernel + per-token)")
+    logger.info(
+        "gemma4 small-L verify attention patch applied on %s (kernel + per-token)",
+        engine,
+    )
     return True
