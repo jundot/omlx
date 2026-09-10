@@ -328,9 +328,9 @@ final class ServerProcess: @unchecked Sendable {
         proc.environment = runtime.makeEnvironment()
         proc.standardOutput = handle
         proc.standardError  = handle
-        proc.terminationHandler = { [weak self] term in
+        proc.terminationHandler = { [weak self, proc] term in
             DispatchQueue.main.async {
-                self?.handleProcessExit(code: term.terminationStatus)
+                self?.handleProcessExit(proc: proc, code: term.terminationStatus)
             }
         }
 
@@ -346,7 +346,18 @@ final class ServerProcess: @unchecked Sendable {
         startHealthCheckLoop()
     }
 
-    private func handleProcessExit(code: Int32) {
+    private func handleProcessExit(proc: Process, code: Int32) {
+        // The handler is enqueued via DispatchQueue.main.async, while
+        // stop()/forceRestart() only poll proc.isRunning — so a stale
+        // handler from an OLD process can land after a new child has
+        // already been spawned and assigned to `process`. Without this
+        // guard it would null the new process reference, close the new
+        // log handle, and (if the new process is still .starting)
+        // tryAutoRestart a second time — orphaning the first child, which
+        // the menubar's stop/forceRestart can no longer reach, typically
+        // surfacing as a port conflict (§F2).
+        guard self.process === proc else { return }
+
         let wasExpectingExit = expectingExit
         expectingExit = false
         process = nil
