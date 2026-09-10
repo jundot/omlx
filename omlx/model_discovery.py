@@ -1554,10 +1554,18 @@ def _register_model(
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
         is_helper = False
+        # Defaulted alongside the other two, because the routing below reads it
+        # outside this block: an unparseable config.json must leave a config
+        # the predicates can answer False for, not an unbound name. Raising
+        # here would be caught as a failed discovery and drop the model, which
+        # is how a malformed config used to reach the repo-name heuristic.
+        _config: dict = {}
         try:
             import json
             with open(model_dir / "config.json") as f:
-                _config = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _config = loaded
             config_model_type = _config.get("model_type", "")
             is_helper = is_helper_model_config(_config)
         except Exception:
@@ -1573,8 +1581,8 @@ def _register_model(
                 model_id,
             )
         elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
-                # `supports_images` is `model_type == "vlm"`, so moving only the
-                # engine would leave a text-only checkpoint advertising images.
+            # `supports_images` is `model_type == "vlm"`, so moving only the
+            # engine would leave a text-only checkpoint advertising images.
             engine_type = "batched"
             model_type = "llm"
             text_only_size = 0
