@@ -1,26 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The gemma4 assistant draft step, shared by the mlx-lm and mlx-vlm paths.
 
-Google ships the gemma4 draft head as a separate ``gemma4_assistant``
-model, and the only implementation of it lives in mlx-vlm. Serving a
-merged checkpoint through mlx-lm therefore needs mlx-vlm installed —
-which is true of gemma4 and of nothing else in ``mlx_lm_mtp``.
-
-Which model needs mlx-vlm is load-bearing, not tidiness.
-``cluster.autoconfigure.required_imports`` tells a rank what to install by
-scanning each patch package for third-party imports, and it scans the whole
-package directory. An ``import mlx_vlm`` anywhere under ``mlx_lm_mtp`` would
-therefore ask every rank serving any model — a plain llama included — to
-bring mlx-vlm, and over-asking blocks a cluster that would have worked.
-Living here instead, imported from the dispatcher under a gemma4 guard,
-asks exactly the ranks that need it. Deferring the import to dodge that
-scan would hide the requirement and put the failure back in the middle of
-a load, which is the bug the scan exists to prevent.
-
-Both engines drive the head identically, so ``draft_step`` lives here too
-and both call it. Everything it needs a host to provide — ``mtp``,
-``model.embed_tokens``, and the stash a ``return_hidden`` forward leaves
-behind — the two hosts already expose under the same names.
+The draft head only exists in mlx-vlm, so serving a merged checkpoint
+through mlx-lm needs mlx-vlm installed -- true of gemma4 and of nothing
+else in ``mlx_lm_mtp``. This module sits outside that package on purpose:
+``cluster.autoconfigure.required_imports`` scans a patch package whole, so
+an ``import mlx_vlm`` under ``mlx_lm_mtp`` would ask every rank serving any
+model to install it.
 """
 
 from __future__ import annotations
@@ -32,11 +18,8 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
-# Resolved once and kept. The rejection path then costs a global read rather
-# than the import machinery. It stays deferred rather than module-level for
-# the reason in the docstring above: an ``import mlx_vlm`` at module scope
-# would make importing this module fail outright without mlx-vlm, which is
-# the failure ``warn_if_unavailable`` exists to replace with a sentence.
+# Resolved once and kept. Deferred rather than module-level, for the reason
+# in the docstring above.
 _slice_after_reject = None
 
 

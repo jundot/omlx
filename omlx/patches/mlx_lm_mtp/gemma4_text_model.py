@@ -1,34 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lightning MTP for merged gemma4 checkpoints on the mlx-lm path.
 
-Google ships the gemma4 draft head as a separate ``gemma4_assistant``
-model, which ``oq.combine_gemma4_assistant_mtp`` merges under
-``language_model.mtp.*``. The head was only ever attached on the mlx-vlm
-side (``mlx_vlm_mtp.gemma4_vlm_runtime``), so a checkpoint served through
-mlx-lm — a text-only quant, a DFlash target, the VLM->LLM fallback — had
-no binding site and this module simply discarded the head. It still does
-when MTP is off; when MTP is on it attaches the head and supplies the two
-things the head reads from a backbone forward — the per-layer-type K/V
-banks (``shared_kv_sink``) and the pre-norm hidden. ``draft_step`` in
-``mlx_lm_gemma4_assistant`` then drives it, shared with the mlx-vlm path.
+``oq.combine_gemma4_assistant_mtp`` merges Google's separate
+``gemma4_assistant`` model under ``language_model.mtp.*``. The head only
+ever had a binding site on the mlx-vlm side, so a checkpoint served
+through mlx-lm -- a text-only quant, a DFlash target, the VLM->LLM
+fallback -- discarded it. With MTP on this attaches it and supplies what
+it reads from a backbone forward: the per-layer-type K/V banks and the
+pre-norm hidden. ``mlx_lm_gemma4_assistant.draft_step`` drives it, shared
+with the mlx-vlm path.
 
-Hidden is captured BEFORE the trunk RMSNorm. ``_trunk_norm_module``
-re-applies it for any model that does not set
-``_omlx_mtp_head_hidden_normed``, so capturing post-norm would double-norm
-the head's inputs — silently, as a weak acceptance rate.
-
-Both outputs come from wrapping gemma4's layer loop rather than copying
-it: each ``DecoderLayer`` already returns its ``kvs``, and swapping
-``norm`` for a recorder captures its input. Reading the K/V back out of
-the cache instead would be wrong, because ``RotatingKVCache.state``
-returns the raw ring and a wrapped sliding layer would hand the head
-out-of-order banks.
-
-The sink and the stash both carry state out of a forward, and neither can
-cross requests: MLX runs on the one-worker executor in
-``omlx.engine_core`` (issue #85), and MTP is admitted only for singleton
-batches. The sink is a ``threading.local`` anyway, which costs nothing and
-bounds a failure that would otherwise draft over another request's K/V.
+Hidden is captured BEFORE the trunk RMSNorm, which
+``_trunk_norm_module`` re-applies -- a post-norm capture would
+double-norm the head's input and show up only as a weak accept rate.
 """
 
 from __future__ import annotations
@@ -134,11 +118,8 @@ def _patch_inner_model(mod: Any) -> None:
     if getattr(cls, "_omlx_mtp_attach_patched", False):
         return
 
-    # Bound here, at patch time, not inside the methods below: both run once
-    # per decode step, so a function-level import pays the import machinery on
-    # every draft. Relative imports, so the cluster scanner still reads the
-    # mlx-vlm requirement off mlx_lm_gemma4_assistant rather than off anything
-    # under mlx_lm_mtp -- see that module's docstring.
+    # Bound at patch time: both run per decode step, where a function-level
+    # import would pay the import machinery on every draft.
     from ..mlx_lm_gemma4_assistant import draft_step, query_position
 
     original_init = cls.__init__
@@ -218,28 +199,13 @@ def _patch_inner_model(mod: Any) -> None:
         return []
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
-        """Trim the rejected tail after a depth-k verify over [confirmed, d1..dk].
+        """Trim the rejected tail after a depth-k verify.
 
-        Gemma 4 is attention-only, so unlike qwen35 there is no recurrent
-        state to restore and replay: every layer drops
-        ``num_drafts - accepted`` positions. Every layer is asked whether it
-        can trim before any of them is trimmed, because a half-rolled-back
-        cache is unrecoverable.
-
-        A sliding layer whose ring has wrapped still trims: ``cache_rollback``
-        arms an undo log around the verify forward, so ``is_trimmable()``
-        answers for that snapshot rather than for the ring. A layer carrying
-        neither returns False and the caller takes the standard step.
-
-        The cache holds one entry per distinct K/V owner, which is not one per
-        layer. E2B and E4B share the last ``num_kv_shared_layers`` layers' K/V
-        with an earlier layer of the same type (20 of 35, 18 of 42), so
-        ``make_cache`` returns ``num_hidden_layers - num_kv_shared_layers``
-        entries and a per-layer count refuses every rollback on those
-        checkpoints -- silently, since the caller just rebuilds and takes a
-        standard step. mlx-lm materializes the mapping as ``previous_kvs``,
-        whose distinct values are exactly the caches that exist; a backbone
-        that does not publish one keeps the per-layer count.
+        Every layer is asked before any is trimmed, because a half
+        rolled-back cache is unrecoverable. The cache holds one entry per
+        distinct K/V owner, not one per layer -- E2B/E4B share the last
+        ``num_kv_shared_layers``, so a per-layer count refuses every
+        rollback there.
         """
         layers = self.model.layers
         previous_kvs = getattr(self.model, "previous_kvs", None)
@@ -275,31 +241,9 @@ def _is_head_key(key: str) -> bool:
 def _align_head_dtype(weights: dict) -> dict:
     """Store the assistant head at the backbone's float dtype.
 
-    The head ships bfloat16 and the combine step preserves that, so in a
-    float16 build every head matmul meets float16 activations and MLX
-    promotes the result to float32 — the head then runs at twice the
-    memory traffic it needs, on the decode hot path. Mirrors the
-    bfloat16 -> float16 normalization deepseek_v4_model already applies to
-    its own MTP metadata.
-
-    Either direction is safe to cast, for a reason specific to drafting:
-    the head only proposes. Every token the engine emits is one the
-    backbone verified, so head precision moves the acceptance rate and can
-    never move the output.
-
-    Measured on the 31B, two loads of one checkpoint over 120 depth-1
-    draft steps: float16 and bfloat16 heads accepted the same 32 drafts,
-    at 76ms against 152ms per step. bfloat16 -> float16 costs nothing
-    here, as expected (float16 carries 10 mantissa bits against
-    bfloat16's 7, and the head's largest weight is 23.1 against a 65504
-    ceiling). float16 -> bfloat16 does drop 3 mantissa bits, and needs a
-    checkpoint whose head and backbone were written by different tools;
-    it is still worth it against a float32 hot path.
-
-    The target is the dtype most of the backbone is stored in, not the
-    first one seen: in a quantized checkpoint most tensors are packed
-    uint32 with float scales beside them, and dict order would otherwise
-    let one unrepresentative tensor choose for the whole model.
+    The head ships bfloat16, so on a float16 build every head matmul
+    promotes to float32. Safe in either direction: the head only proposes,
+    and every token emitted is one the backbone verified.
     """
     from collections import Counter
 
@@ -392,16 +336,8 @@ def apply() -> bool:
     _patch_inner_model(lm_gemma4_text)
     _patch_outer_model(lm_gemma4)
 
-    # The verify forward is the other half of what makes drafting pay. Gemma 4
-    # global layers carry head_dim 512, which MLX fuses only at L=1, so every
-    # multi-row verify drops to the unfused pass and that cost grows with
-    # context -- the mlx-vlm path has carried this route since #2683 and the
-    # mlx-lm path had no equivalent, which is the shape of our own weakest
-    # measurement (+28% short context against +11.6% at 2.7k).
-    #
-    # Failure is not fatal: without it the verify forward is slower, not
-    # wrong, so a missing kernel or an unpatchable Attention leaves drafting
-    # working on the stock route.
+    # head_dim 512 global layers fuse only at L=1, so a multi-row verify
+    # drops to the unfused pass. Absent, the verify is slower, not wrong.
     try:
         from ..gemma4_verify_attention import apply_mlx_lm as _apply_verify_attn
 

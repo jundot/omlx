@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small-L attention route for gemma4 speculative verify forwards.
 
-Installed on either engine. The routing below depends only on the Attention
-module's own attributes and on a module-level ``scaled_dot_product_attention``,
-both of which mlx-vlm's ``gemma4.language`` and mlx-lm's ``gemma4_text``
-provide under the same names and with the same call signature -- so the two
-engines share one copy of the kernel decision rather than each carrying a
-version that can drift from the other.
+Installed on either engine: the routing depends only on the Attention
+module's own attributes and a module-level
+``scaled_dot_product_attention``, which both provide under those names.
 
 Gemma4 uses head_dim 256 for sliding layers and 512 for global layers. MLX
 0.32.2 now handles small multi-row head-dim-256 calls with its native vector
