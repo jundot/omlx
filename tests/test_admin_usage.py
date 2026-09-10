@@ -164,7 +164,8 @@ def test_usage_template_renders_with_localized_labels(client):
     assert "Usage History" in response.text
     assert "js/usage.js" in response.text
     assert (
-        'id="usage-heading" class="text-xl font-bold">Usage History</h3>'
+        'id="usage-heading" class="text-xs font-bold uppercase tracking-wider '
+        'text-neutral-600">Usage History</h3>'
         in response.text
     )
 

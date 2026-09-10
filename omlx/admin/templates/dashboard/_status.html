@@ -2,11 +2,8 @@
                 <div class="animate-fade-in-up">
                     <!-- Serving Stats Header -->
                     <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
-                        <div>
-                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('status.section_label') }}</h2>
+                        <div class="flex flex-wrap items-center gap-3">
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('status.heading') }}</h3>
-                        </div>
-                        <div class="flex flex-wrap items-center gap-2">
                             <!-- Scope toggle -->
                             <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
                                 <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
@@ -20,6 +17,8 @@
                                     {{ t('status.scope_alltime') }}
                                 </button>
                             </div>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
                             <!-- Clear button -->
                             <div class="flex items-center gap-1.5">
                                 <button x-show="(statsScope === 'session' && !showClearStatsConfirm) || (statsScope === 'alltime' && !showClearAlltimeConfirm)"
@@ -42,6 +41,12 @@
                                     </button>
                                 </div>
                             </div>
+                            <button @click="window.resetStatusLayout && window.resetStatusLayout()"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
+                                    title="{{ t('status.reset_layout_tooltip') }}">
+                                <i data-lucide="layout-grid" class="w-3.5 h-3.5"></i>
+                                {{ t('status.reset_layout') }}
+                            </button>
                             <select x-model="selectedStatsModel"
                                     @change="loadStats()"
                                     class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
@@ -53,6 +58,11 @@
                         </div>
                     </div>
 
+                    <div id="status-layout" class="omlx-status-layout">
+                        <div data-zone="top" class="omlx-status-top">
+                            <div data-column="left" class="omlx-status-col">
+<div data-card="stats-cards" data-default-parent="left" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Three Stat Cards -->
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
                         <!-- Total Prefill Tokens -->
@@ -79,7 +89,10 @@
                                x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
                         </div>
                     </div>
+                            </div>
 
+                            <div data-card="speed" data-default-parent="left" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Speed Stats -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -99,9 +112,10 @@
                             </div>
                         </div>
                     </div>
+                            </div>
 
-                    {% include 'dashboard/_usage.html' %}
-
+                            <div data-card="active-models" data-default-parent="left" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Active Models -->
                     <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
                         <div class="lg:hidden flex flex-col gap-2 px-4 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
@@ -394,7 +408,12 @@
                             </span>
                         </div>
                     </div>
+                            </div>
 
+                            </div>
+                            <div data-column="right" class="omlx-status-col">
+                            <div data-card="runtime-cache" data-default-parent="right" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Runtime Cache Observability / 运行时缓存可观测性 -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="lg:hidden flex flex-col gap-3 px-4 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -648,7 +667,23 @@
                             </div>
                         </div>
                     </div>
+                            </div>
 
+                            </div>
+                        </div>
+                        <div data-zone="below" class="omlx-status-below">
+                            <div data-card="usage-heatmap" data-default-parent="below" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
+                                {% include 'dashboard/_usage_heatmap.html' %}
+                            </div>
+
+                            <div data-card="usage" data-default-parent="below" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
+                                {% include 'dashboard/_usage.html' %}
+                            </div>
+
+                            <div data-card="api-endpoints" data-default-parent="below" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- API Endpoints -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -700,7 +735,10 @@
                             </div>
                         </div>
                     </div>
+                            </div>
 
+                            <div data-card="claude-code" data-default-parent="below" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Claude Code with oMLX -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -812,7 +850,10 @@
                             </div>
                         </div>
                     </div>
+                            </div>
 
+                            <div data-card="applications" data-default-parent="below" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Applications -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -983,7 +1024,10 @@
 
                         </div>
                     </div>
+                            </div>
 
+                            <div data-card="engines" data-default-parent="below" class="omlx-card">
+                                <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Engine Versions -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -1009,6 +1053,10 @@
                                     </div>
                                 </div>
                             </template>
+                        </div>
+                    </div>
+                            </div>
+
                         </div>
                     </div>
                 </div>

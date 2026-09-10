@@ -1129,3 +1129,133 @@
             animation-iteration-count: 1 !important;
         }
     }
+
+
+/* ===== Status tab draggable panel layout (local patch) ===== */
+.omlx-status-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+}
+.omlx-status-top,
+.omlx-status-col,
+.omlx-status-below {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+    min-width: 0;
+}
+.omlx-card {
+    position: relative;
+    min-width: 0;
+}
+/* Spacing between cards is the column gap; neutralize the legacy mb-8/mt-8
+   the wrapped sections carry. */
+.omlx-card > *:last-child {
+    margin-bottom: 0;
+    margin-top: 0;
+}
+.omlx-drag-handle {
+    display: none;
+}
+@media (min-width: 1024px) {
+    .omlx-status-top {
+        display: grid;
+        grid-template-columns: minmax(0, 11fr) minmax(0, 9fr);
+        gap: 2rem;
+        align-items: start;
+    }
+}
+.omlx-drag-handle {
+    position: absolute;
+    top: 0.45rem;
+    left: 0.35rem;
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.15rem;
+    height: 1.75rem;
+    border-radius: 0.35rem;
+    color: var(--text-muted, #94a3b8);
+    opacity: 0.45; /* always faintly visible so the grip is discoverable */
+    cursor: grab;
+    touch-action: none; /* pointer-event dragging must own touch gestures */
+    transition: opacity 150ms ease, background-color 150ms ease;
+}
+.omlx-drag-active .omlx-drag-handle {
+    opacity: 0.7;
+}
+.omlx-drag-active {
+    user-select: none;
+    cursor: grabbing !important;
+}
+.omlx-card:hover > .omlx-drag-handle {
+    opacity: 0.7;
+}
+.omlx-drag-handle:hover {
+    opacity: 1 !important;
+    background-color: var(--bg-tertiary, #f1f5f9);
+}
+.omlx-drag-handle:active {
+    cursor: grabbing;
+}
+.omlx-card.omlx-dragging {
+    opacity: 0.45;
+}
+.omlx-status-col.omlx-drop-target,
+.omlx-status-below.omlx-drop-target {
+    outline: 2px dashed var(--border-normal, #cbd5e1);
+    outline-offset: 8px;
+    border-radius: 1rem;
+}
+/* Dark theme */
+[data-theme="dark"] .omlx-drag-handle:hover {
+    background-color: var(--bg-tertiary, #2d2d32);
+}
+[data-theme="dark"] .omlx-status-col.omlx-drop-target,
+[data-theme="dark"] .omlx-status-below.omlx-drop-target {
+    outline-color: var(--border-normal, #3f3f46);
+}
+/* end status tab draggable panel layout */
+
+/* Narrow-column fixes for wrapped cards */
+.omlx-status-col .omlx-card[data-card="stats-cards"] .sm\:p-8 { padding: 1.25rem; }
+.omlx-status-col .omlx-card[data-card="stats-cards"] .text-5xl,
+.omlx-status-col .omlx-card[data-card="stats-cards"] .text-3xl,
+.omlx-status-col .omlx-card[data-card="stats-cards"] .text-2xl {
+    font-size: clamp(1rem, 1.3vw, 1.4rem);
+    overflow-wrap: anywhere;
+}
+.omlx-card > div > .bg-neutral-100,
+.omlx-card > section > .bg-neutral-100 {
+    flex-wrap: wrap;
+}
+/* Narrow-column variants: only while the card sits inside a column. */
+.omlx-status-col .omlx-card[data-card="usage"] .lg\:grid-cols-5 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.omlx-status-col .omlx-card[data-card="usage"] .text-2xl {
+    font-size: clamp(1rem, 1.4vw, 1.5rem);
+    white-space: nowrap;
+}
+/* end narrow-column fixes */
+
+.omlx-status-col .omlx-card[data-card="runtime-cache"] .bg-neutral-100 .whitespace-nowrap {
+    white-space: normal;
+}
+
+/* Page shell: scale content with very wide displays instead of capping at
+   max-w-7xl (1280px) and leaving empty margins. */
+@media (min-width: 1536px) {
+  .omlx-page-shell.max-w-7xl { max-width: 1536px; }
+}
+@media (min-width: 1740px) {
+  .omlx-page-shell.max-w-7xl { max-width: min(100% - 3rem, 1740px); }
+}
+@media (min-width: 1980px) {
+  .omlx-page-shell.max-w-7xl { max-width: min(100% - 4rem, 1980px); }
+}
+@media (min-width: 2400px) {
+  .omlx-page-shell.max-w-7xl { max-width: min(100% - 5rem, 2560px); }
+}
