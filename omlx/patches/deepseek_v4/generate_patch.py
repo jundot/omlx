@@ -5,9 +5,10 @@ PR 1192 adds one ``elif`` branch to the ``to_batch_cache`` closure inside
 ``_make_cache``: ``isinstance(c, PoolingCache)`` → ``BatchPoolingCache``.
 
 The closure is not externally hookable, so we replace ``_make_cache``
-itself with a copy whose body is identical to PR 1192. ``_make_cache`` is
-called via the module-level binding from inside ``mlx_lm.generate``, so
-overwriting the attribute is sufficient.
+with a compatible wrapper that adds PR 1192's PoolingCache conversion while
+preserving any previously installed model-owned cache conversion.
+``_make_cache`` is called via the module-level binding from inside
+``mlx_lm.generate``, so overwriting the attribute is sufficient.
 
 When mlx-lm merges PR 1192 upstream this patch should be removed.
 """
@@ -50,13 +51,26 @@ def apply_generate_patch() -> bool:
     _gen = importlib.import_module("mlx_lm.generate")
     from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
 
+    previous_make_cache = _gen._make_cache
+
+    def has_pooling_cache(cache_obj):
+        if isinstance(cache_obj, PoolingCache):
+            return True
+        sub_caches = getattr(cache_obj, "caches", None)
+        return isinstance(sub_caches, (list, tuple)) and any(
+            has_pooling_cache(child) for child in sub_caches
+        )
+
     def _patched_make_cache(model, left_padding, max_kv_size):
         """Convert a list of regular caches into their corresponding
         batch-aware caches.
         """
 
         def to_batch_cache(c):
-            if type(c) is KVCache:
+            model_owned_to_batch = getattr(c, "to_batch", None)
+            if callable(model_owned_to_batch):
+                return model_owned_to_batch(left_padding)
+            elif type(c) is KVCache:
                 return BatchKVCache(left_padding)
             elif isinstance(c, ArraysCache):
                 c.left_padding = mx.array(left_padding)
@@ -76,6 +90,15 @@ def apply_generate_patch() -> bool:
 
         if hasattr(model, "make_cache"):
             cache = model.make_cache()
+            if not any(has_pooling_cache(c) for c in cache):
+
+                class _CachedModel:
+                    layers = getattr(model, "layers", ())
+
+                    def make_cache(self):
+                        return cache
+
+                return previous_make_cache(_CachedModel(), left_padding, max_kv_size)
             return [to_batch_cache(c) for c in cache]
         else:
             if max_kv_size is not None:

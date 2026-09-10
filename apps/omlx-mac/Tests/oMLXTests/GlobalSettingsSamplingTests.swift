@@ -201,4 +201,65 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         XCTAssertTrue(str.contains("\"port\":9000"))
         XCTAssertFalse(str.contains("sampling_"))
     }
+
+    func testUsageDecodesFromNestedObjectAndIsOptional() throws {
+        // Mirrors `omlx.settings.UsageSettings.to_dict()` under the `usage`
+        // key; servers without the toggle omit the block entirely.
+        let json = """
+        {
+            "server": {"host": "127.0.0.1", "port": 8080, "log_level": "info", "server_aliases": []},
+            "usage": {"usage_history": false}
+        }
+        """.data(using: .utf8)!
+        XCTAssertEqual(try decoder.decode(GlobalSettingsDTO.self, from: json).usage?.usageHistory, false)
+
+        let legacy = """
+        {
+            "server": {"host": "127.0.0.1", "port": 8080, "log_level": "info", "server_aliases": []}
+        }
+        """.data(using: .utf8)!
+        XCTAssertNil(try decoder.decode(GlobalSettingsDTO.self, from: legacy).usage)
+    }
+
+    func testPatchEncodesUsageHistoryAsSnakeCaseFlatKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.usageHistory = false
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["usage_history"] as? Bool, false)
+
+        let empty = try JSONSerialization.jsonObject(
+            with: try encoder.encode(GlobalSettingsPatch())
+        ) as! [String: Any]
+        XCTAssertNil(empty["usage_history"])
+    }
+
+    func testServerDecodesAudioUploadSize() throws {
+        let json = """
+        {
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8080,
+                "log_level": "info",
+                "server_aliases": [],
+                "max_audio_upload_size": "500MB"
+            }
+        }
+        """.data(using: .utf8)!
+
+        let dto = try decoder.decode(GlobalSettingsDTO.self, from: json)
+        XCTAssertEqual(dto.server.maxAudioUploadSize, "500MB")
+    }
+
+    func testPatchEncodesAudioUploadSizeAsFlatSnakeCaseKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.maxAudioUploadSize = "1GB"
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["max_audio_upload_size"] as? String, "1GB")
+    }
 }

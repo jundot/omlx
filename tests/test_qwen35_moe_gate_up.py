@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the Qwen3.5/3.6 MoE gate+up fusion patch (issue #2238)."""
+"""Tests for the supported MoE gate+up fusion patch (issue #2238)."""
 
 from __future__ import annotations
 
@@ -21,6 +21,13 @@ class _FakeQwenModel:
 _FakeQwenModel.__module__ = "mlx_lm.models.qwen3_5_moe"
 
 
+class _FakeQwen4Model:
+    pass
+
+
+_FakeQwen4Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
+
+
 class _FakeOtherModel:
     pass
 
@@ -28,14 +35,27 @@ class _FakeOtherModel:
 _FakeOtherModel.__module__ = "mlx_lm.models.deepseek_v3"
 
 
-def _make_model(quantize=True, model_cls=_FakeQwenModel, n_blocks=2):
+class _FakeHyV3Model:
+    pass
+
+
+_FakeHyV3Model.__module__ = "mlx_lm.models.hy_v3"
+
+
+def _make_model(
+    quantize=True,
+    model_cls=_FakeQwenModel,
+    n_blocks=2,
+    group_size=32,
+    bits=4,
+):
     mx.random.seed(7)
     blocks = []
     for _ in range(n_blocks):
         glu = SwitchGLU(HIDDEN, INTER, E)
         if quantize:
-            glu.gate_proj = glu.gate_proj.to_quantized(32, 4)
-            glu.up_proj = glu.up_proj.to_quantized(32, 4)
+            glu.gate_proj = glu.gate_proj.to_quantized(group_size, bits)
+            glu.up_proj = glu.up_proj.to_quantized(group_size, bits)
             glu.down_proj = glu.down_proj.to_quantized(32, 4)
         blocks.append(glu)
     model = model_cls()
@@ -136,6 +156,31 @@ def test_laguna_family_fused_bit_exact():
     out = model(x)
     mx.eval(out)
     assert mx.array_equal(ref, out).item()
+
+
+@pytest.mark.parametrize("bits", [5, 6, 8])
+def test_hy_v3_family_fused_bit_exact(bits):
+    """HyV3 uses stock SwitchGLU and receives the same bit-exact fusion."""
+    model = _make_model(model_cls=_FakeHyV3Model, group_size=64, bits=bits)
+    x = (mx.random.normal(shape=(1, 1, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    indices = mx.random.randint(0, E, shape=(1, 1, TOPK))
+
+    ref = _forward_all(model, x, indices)
+    mx.eval(ref)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 2
+    out = _forward_all(model, x, indices)
+    mx.eval(out)
+
+    for expected, actual in zip(ref, out):
+        assert mx.array_equal(expected, actual).item()
+
+
+def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
+    model = _make_model(model_cls=_FakeQwen4Model, n_blocks=1)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    assert hasattr(model.blocks[0], "gate_up_proj")
 
 
 def test_env_kill_switch(monkeypatch):

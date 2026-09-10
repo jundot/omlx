@@ -1020,6 +1020,27 @@ def _eligible_gdn(gdn: Any) -> bool:
     )
 
 
+def _recurrent_safe_gdn_ane_outputs(
+    z_outputs: int,
+    qkv_outputs: int,
+    fraction: float,
+    alignment: int,
+) -> int:
+    """Return an aligned ANE slice that never enters recurrent QKV rows.
+
+    The ANE compiler requantizes its source slice to per-output-channel INT8.
+    Applying that approximation to QKV changes the recurrent state at every
+    token, so the error can accumulate over a long prompt. Z is a token-local
+    output gate: offloading all of it preserves useful ANE/GPU overlap without
+    feeding approximate values back into the next recurrent step.
+    """
+    if z_outputs <= 0 or qkv_outputs <= 0 or z_outputs % alignment:
+        return 0
+    total_outputs = z_outputs + qkv_outputs
+    requested = (int(total_outputs * fraction) // alignment) * alignment
+    return z_outputs if requested >= z_outputs else 0
+
+
 def _pack_affine_gdn_suffix(
     qkv: Any,
     b: Any,
@@ -1064,9 +1085,9 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         cache = {}
         gdn._omlx_ane_gdn_cache = cache
 
-    # Put z first in the logical concatenation. At the 40% split this keeps
-    # almost all recurrent q/k/v channels on the exact q5 GPU path while ANE
-    # handles the output gate plus a small qkv prefix.
+    # Put z first so the approximate ANE slice can stop at the token-local
+    # gate boundary. Recurrent q/k/v channels remain on the source-precision
+    # GPU path (or the explicitly configured FP16 CPU path).
     logical = (z, qkv)
     z_outputs = int(z.weight.shape[0])
     qkv_outputs = int(qkv.weight.shape[0])
@@ -1078,7 +1099,12 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     qkv_bits, qkv_group_size = qkv_spec
     dual_ane = bool(config.dual_ane and fast.has_symbol("qwen35_ane_dual_affine_qmm_t"))
     alignment = 128 if dual_ane else 64
-    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
+    ane_outputs = _recurrent_safe_gdn_ane_outputs(
+        z_outputs,
+        qkv_outputs,
+        config.fraction,
+        alignment,
+    )
     cpu_enabled = bool(
         config.cpu_fraction > 0
         and qkv.scales.dtype == mx.float16
@@ -1090,9 +1116,9 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         else 0
     )
     gpu_outputs = total_outputs - ane_outputs - cpu_outputs
-    # The native GPU suffix accepts one quantization format. Put all of z on
-    # ANE so an oQ4e-style q5-z/q4-qkv mix leaves a homogeneous qkv suffix.
-    if ane_outputs < z_outputs:
+    # The native GPU suffix accepts one quantization format. The quality-safe
+    # split puts exactly all of z on ANE, leaving homogeneous qkv on the GPU.
+    if ane_outputs != z_outputs:
         return None
     qkv_offset = ane_outputs - z_outputs
     packed_suffix = (
@@ -1211,28 +1237,62 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
 
 
 def _min_viable_gdn_fraction(gdn: Any, alignment: int) -> float | None:
-    """Smallest gdn_fraction whose aligned slice engages the ANE on ``gdn``.
+    """Smallest fraction whose aligned slice covers exactly z on ``gdn``.
 
-    Mirrors the rule in ``_prepare_gdn_for_bank`` below: the aligned slice
-    ``(int(total * f) // alignment) * alignment`` has to cover the z
-    projection, otherwise every GDN layer is rejected and no GDN procedure
-    compiles at all (issue #2899). ``None`` when z alone exceeds the whole
-    projection, i.e. no fraction can work.
+    Wider requests are capped at z so approximate ANE rows never enter the
+    recurrent qkv projection. ``None`` means z cannot be represented exactly
+    with this ANE alignment.
     """
     qkv, z, _, _ = _gdn_linears(gdn)
     if qkv is None or z is None:
         return None
     z_outputs = int(z.weight.shape[0])
     total_outputs = z_outputs + int(qkv.weight.shape[0])
-    if total_outputs <= 0:
+    if total_outputs <= 0 or z_outputs <= 0 or z_outputs % alignment:
         return None
-    ane_min = ((z_outputs + alignment - 1) // alignment) * alignment
-    if ane_min > total_outputs:
-        return None
+    ane_min = z_outputs
     fraction = ane_min / total_outputs
     if (int(total_outputs * fraction) // alignment) * alignment < ane_min:
         fraction = (ane_min + 1) / total_outputs
     return fraction
+
+
+def _log_gdn_recurrent_safe_cap(
+    model: Any,
+    requested_fraction: float,
+    gdn_count: int,
+    dual_ane: bool,
+) -> None:
+    """Report when a wider requested GDN slice is precision-capped at z."""
+    if not gdn_count:
+        return
+    gdn = next(
+        (
+            module
+            for module in (model.modules() if hasattr(model, "modules") else ())
+            if getattr(module, "_omlx_ane_gdn_state", None) is not None
+        ),
+        None,
+    )
+    if gdn is None:
+        return
+    qkv, z, _, _ = _gdn_linears(gdn)
+    z_outputs = int(z.weight.shape[0])
+    qkv_outputs = int(qkv.weight.shape[0])
+    total_outputs = z_outputs + qkv_outputs
+    alignment = 128 if dual_ane else 64
+    requested_outputs = (
+        int(total_outputs * requested_fraction) // alignment
+    ) * alignment
+    if requested_outputs <= z_outputs:
+        return
+    logger.info(
+        "Capped ANE GDN output rows from requested %.3f to %.3f: ANE handles "
+        "only token-local z while recurrent qkv stays off the approximate "
+        "ANE INT8 path",
+        requested_fraction,
+        z_outputs / total_outputs,
+    )
 
 
 def _warn_gdn_below_floor(
@@ -1283,7 +1343,12 @@ def _prepare_gdn_for_bank(
     qkv_bits, qkv_group_size = qkv_spec
     dual_ane = bool(config.dual_ane)
     alignment = 128 if dual_ane else 64
-    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
+    ane_outputs = _recurrent_safe_gdn_ane_outputs(
+        z_outputs,
+        qkv_outputs,
+        config.fraction,
+        alignment,
+    )
     from omlx.custom_kernels.qwen35_prefill import fast
 
     cpu_enabled = bool(
@@ -1297,7 +1362,7 @@ def _prepare_gdn_for_bank(
         else 0
     )
     gpu_outputs = total_outputs - ane_outputs - cpu_outputs
-    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
+    if ane_outputs != z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
         return None
     qkv_offset = ane_outputs - z_outputs
     packed_suffix = (
@@ -1405,7 +1470,12 @@ def _prepare_gdn_runtime_state(
     qkv_outputs = int(qkv.weight.shape[0])
     total_outputs = z_outputs + qkv_outputs
     alignment = 128 if config.dual_ane else 64
-    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
+    ane_outputs = _recurrent_safe_gdn_ane_outputs(
+        z_outputs,
+        qkv_outputs,
+        config.fraction,
+        alignment,
+    )
     cpu_enabled = bool(
         config.cpu_fraction > 0
         and qkv.scales.dtype == mx.float16
@@ -1419,7 +1489,7 @@ def _prepare_gdn_runtime_state(
         else 0
     )
     gpu_outputs = total_outputs - ane_outputs - cpu_outputs
-    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
+    if ane_outputs != z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
         return None
     qkv_offset = ane_outputs - z_outputs
     gpu_offset = qkv_offset + cpu_outputs
@@ -1641,10 +1711,17 @@ def _gdn_backend(
                 )
             )
 
-    return tuple(
+    result = tuple(
         mx.concatenate([part[index] for part in projected], axis=-2)
         for index in range(4)
     )
+    # The four tiled projections are sibling consumers of the same native
+    # hybrid outputs. Schedule them together before the recurrent GDN graph
+    # consumes individual branches; otherwise MLX can interleave their Metal
+    # merge/lifetime boundaries after a prefix-cache restore (#3117). This is
+    # asynchronous, so ANE/GPU overlap is preserved without a host fence.
+    mx.async_eval(*result)
+    return result
 
 
 def _backend_exact(
@@ -3218,6 +3295,9 @@ def enable_qwen35_ane_prefill(
                 gdn_fraction,
                 dual_ane,
             )
+            _log_gdn_recurrent_safe_cap(
+                model, gdn_fraction, gdn_count, dual_ane
+            )
             logger.info(
                 "Eagerly compiled %d fused MLP/down and %d GDN procedures "
                 "into %d "
@@ -3281,6 +3361,7 @@ def enable_qwen35_ane_prefill(
         _warn_gdn_below_floor(
             model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
         )
+        _log_gdn_recurrent_safe_cap(model, gdn_fraction, gdn_count, dual_ane)
         if count or gdn_count:
             logger.info(
                 "Eagerly compiled %d MLP and %d GDN procedures into %d "
@@ -3371,6 +3452,7 @@ def enable_qwen35_ane_prefill(
     _warn_gdn_below_floor(
         model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
     )
+    _log_gdn_recurrent_safe_cap(model, gdn_fraction, gdn_count, dual_ane)
 
     if count:
         logger.info(
@@ -3480,8 +3562,9 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
     prefill needs back once the KV cache has grown into the guard's sizing
     target. Latches every sliced module through the existing per-module
     failure flags first (so the dispatch sites fall back to stock GPU compute
-    and never lazily recompile), then drops the state references; the native
-    models free their programs and mapped blobs when the last reference dies.
+    and never lazily recompile), then drops the state references and clears the
+    per-module state caches that hold the same objects; the native models free
+    their programs and mapped blobs when the last reference dies.
     Idempotent, and scoped to this engine instance: the next load of the
     model rebuilds the banks from its settings.
 
@@ -3505,6 +3588,12 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             setattr(module, failed_attr, True)
             setattr(module, state_attr, None)
             modules_released += 1
+        # Clear cached references too, including states no longer attached.
+        # Loading has finished and the engine step loop is paused for release.
+        for cache_attr in ("_omlx_ane_prefill_cache", "_omlx_ane_gdn_cache"):
+            cache = getattr(module, cache_attr, None)
+            if cache:
+                cache.clear()
     if modules_released:
         # Zero (not delete) the status counters and set the shed marker:
         # attempted=True/configured=False alone is indistinguishable from a

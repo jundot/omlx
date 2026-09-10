@@ -478,11 +478,50 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
     )
 
     assert out.shape == queries.shape
-    assert prefill_calls == [(ks, vs)]
+    assert prefill_calls == []
     assert len(calls) == 1
     assert calls[0][0] is ks
     assert calls[0][1] is vs
     assert calls[0][2] == 256
+
+
+def test_attention_patch_keeps_short_prefill_fast_path(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4096)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    keys, values = tq.state
+    calls = []
+
+    def fake_prefill(self, queries, **kwargs):
+        calls.append("prefill")
+        return mx.zeros_like(queries)
+
+    def fake_quantized(self, queries, **kwargs):
+        calls.append("quantized")
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(TurboQuantKVCache, "prefill_attention", fake_prefill)
+    monkeypatch.setattr(
+        TurboQuantKVCache, "quantized_attention", fake_quantized
+    )
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    result = mlx_base.scaled_dot_product_attention(
+        queries, keys, values, tq, scale=32**-0.5, mask=None
+    )
+
+    assert result.shape == queries.shape
+    assert calls == ["prefill"]
 
 
 def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
@@ -500,22 +539,33 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     )
     tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
     ks, vs = tq.state
-    calls = {"quantized": 0, "dequantize": 0}
+    calls = {"quantized": 0, "prefill": 0, "dequantize": 0}
 
     def failing_quantized_attention(self, *args, **kwargs):
         calls["quantized"] += 1
         raise RuntimeError("forced quantized prefill failure")
 
+    def none_prefill_attention(self, *args, **kwargs):
+        calls["prefill"] += 1
+        return None
+
     original_dequantize = TurboQuantKVCache.dequantize
+    dequant_kwargs = {}
 
     def spy_dequantize(self, *args, **kwargs):
         calls["dequantize"] += 1
+        dequant_kwargs.update(kwargs)
         return original_dequantize(self, *args, **kwargs)
 
     monkeypatch.setattr(
         TurboQuantKVCache,
         "quantized_attention",
         failing_quantized_attention,
+    )
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "prefill_attention",
+        none_prefill_attention,
     )
     monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
 
@@ -526,7 +576,8 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     mx.eval(out)
 
     assert out.shape == queries.shape
-    assert calls == {"quantized": 1, "dequantize": 1}
+    assert calls == {"quantized": 1, "prefill": 1, "dequantize": 1}
+    assert dequant_kwargs == {"keys_state": ks, "values_state": vs}
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 9])

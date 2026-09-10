@@ -175,7 +175,7 @@ class TestRoundTrip:
         assert FakeLinearAttn.__call__ is stock_call
         assert "_dflash_speculative_call_installed" not in FakeLinearAttn.__dict__
 
-        # Simulate a Native MTP patch replacing __call__.
+        # Simulate a Lightning MTP patch replacing __call__.
         def mtp_call(self, x, mask=None, cache=None, n_confirmed=0):
             return ("mtp", n_confirmed)
         FakeLinearAttn.__call__ = mtp_call
@@ -326,6 +326,141 @@ class TestBatchCacheGuard:
         restore_dflash_class_patches()
         assert FakeAttention.__call__ is stock_call
         assert "_dflash_full_attention_gqa_installed" not in FakeAttention.__dict__
+
+    def test_swapped_base_routes_batch_and_mtp_calls(self, _clear_backup_state):
+        import mlx.core as mx
+
+        from omlx.patches.dflash_lifecycle import (
+            get_dflash_guard_base,
+            restore_dflash_class_patches,
+            set_dflash_guard_base,
+        )
+
+        mod = _make_fake_dflash_module()
+
+        class FakeAttention:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-attn"
+
+        stock_call = FakeAttention.__call__
+        self._arm(mod, FakeAttention)
+        assert get_dflash_guard_base(FakeAttention) is stock_call
+
+        def mtp_call(self, x, mask=None, cache=None, n_confirmed=0):
+            return ("mtp", n_confirmed)
+
+        mtp_call._omlx_mtp_call_marker = True
+        set_dflash_guard_base(FakeAttention, mtp_call)
+
+        class ScalarCache:
+            offset = 4
+
+        class BatchCache:
+            offset = mx.array([4, 9])
+
+        assert FakeAttention()("x", cache=ScalarCache()) == "x"
+        assert FakeAttention()("x", cache=BatchCache()) == ("mtp", 0)
+        assert FakeAttention()(
+            "x", cache=ScalarCache(), n_confirmed=2
+        ) == ("mtp", 2)
+
+        restore_dflash_class_patches()
+        assert FakeAttention.__call__ is mtp_call
+
+
+class TestDFlashMTPComposition:
+    def test_mtp_self_heal_keeps_active_dflash_guard(self, _clear_backup_state):
+        from types import SimpleNamespace
+
+        from omlx.patches.dflash_lifecycle import (
+            _wrap_installer,
+            get_dflash_guard_base,
+            restore_dflash_class_patches,
+        )
+        from omlx.patches.mlx_lm_mtp import qwen35_model
+
+        mod = _make_fake_dflash_module()
+
+        class FakeGatedDeltaNet:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-gdn"
+
+        _wrap_installer(
+            mod,
+            "_install_speculative_linear_cache_hook",
+            "_dflash_speculative_call_installed",
+        )
+        mod._install_speculative_linear_cache_hook(FakeGatedDeltaNet())
+        guard = FakeGatedDeltaNet.__call__
+
+        q35 = SimpleNamespace(GatedDeltaNet=FakeGatedDeltaNet)
+        qwen35_model._patch_gated_delta_net(q35)
+
+        assert FakeGatedDeltaNet.__call__ is guard
+        mtp_base = get_dflash_guard_base(FakeGatedDeltaNet)
+        assert getattr(mtp_base, "_omlx_mtp_call_marker", False)
+
+        qwen35_model._patch_gated_delta_net(q35)
+        assert get_dflash_guard_base(FakeGatedDeltaNet) is mtp_base
+
+        restore_dflash_class_patches()
+        assert FakeGatedDeltaNet.__call__ is mtp_base
+
+    def test_stale_mtp_replacement_rearms_dflash(self, _clear_backup_state):
+        from omlx.patches.dflash_lifecycle import (
+            _wrap_installer,
+            get_dflash_guard_base,
+            restore_dflash_class_patches,
+        )
+
+        mod = _make_fake_dflash_module()
+
+        class FakeGatedDeltaNet:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-gdn"
+
+        _wrap_installer(
+            mod,
+            "_install_speculative_linear_cache_hook",
+            "_dflash_speculative_call_installed",
+        )
+        target = FakeGatedDeltaNet()
+        mod._install_speculative_linear_cache_hook(target)
+
+        def mtp_call(self, x, mask=None, cache=None, n_confirmed=0):
+            return ("mtp", n_confirmed)
+
+        mtp_call._omlx_mtp_call_marker = True
+        FakeGatedDeltaNet.__call__ = mtp_call
+        assert FakeGatedDeltaNet._dflash_speculative_call_installed is True
+
+        mod._install_speculative_linear_cache_hook(target)
+
+        assert getattr(
+            FakeGatedDeltaNet.__call__, "_omlx_dflash_batch_guard", False
+        )
+        assert get_dflash_guard_base(FakeGatedDeltaNet) is mtp_call
+        assert target("x") == "x"
+
+        restore_dflash_class_patches()
+        assert FakeGatedDeltaNet.__call__ is mtp_call
+
+    def test_guard_without_backup_fails_loudly(self, _clear_backup_state):
+        from omlx.patches.dflash_lifecycle import (
+            get_dflash_guard_base,
+            set_dflash_guard_base,
+        )
+
+        class FakeAttention:
+            def __call__(self, x, mask=None, cache=None):
+                return x
+
+        FakeAttention.__call__._omlx_dflash_batch_guard = True
+
+        with pytest.raises(RuntimeError, match="no fallback base"):
+            get_dflash_guard_base(FakeAttention)
+        with pytest.raises(RuntimeError, match="state changed"):
+            set_dflash_guard_base(FakeAttention, lambda self, x: x)
 
 
 class TestRealDflashIntegration:

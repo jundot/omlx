@@ -183,7 +183,6 @@ def get_effective_metal_cap_bytes() -> int:
         return sysctl_cap
     return _get_max_metal_working_set_bytes()
 
-
 def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     """Clamp and align a wired-limit recommendation to leave 5% of RAM.
 
@@ -707,6 +706,28 @@ class ProcessMemoryEnforcer:
         if self._prefill_memory_guard:
             return self._get_hard_limit_bytes()
         return self._get_static_ceiling()
+
+    def get_residency_ceiling(self) -> int:
+        """Stable ceiling for *where weights live*, not for admitting a load.
+
+        Admission must respect memory free right now — overcommitting thrashes
+        the machine. Choosing whether a model's PLE table stays resident or
+        falls back to mmap is a throughput call, and the instantaneous ceiling
+        is actively wrong for it: engine_pool asks right after the previous
+        model unloaded, before the OS has returned its pages, so ``dynamic``
+        dips and a table that fits gets pushed to SSD for the rest of that
+        engine's life. Measured on a model swap here: 35.3 -> 14.1 tok/s.
+
+        Uses only the two components that don't move with instantaneous
+        pressure. Returns 0 when the guard is off, like the other accessors.
+        """
+        breakdown = self._get_ceiling_breakdown()
+        candidates = [
+            value
+            for value in (breakdown["static"], breakdown["metal_cap"])
+            if value > 0
+        ]
+        return min(candidates) if candidates else 0
 
     def get_admission_soft_target(self) -> int:
         """Soft watermark that pre-load admission evicts down to (#2319).
@@ -1618,9 +1639,17 @@ class ProcessMemoryEnforcer:
                                 "hard memory pressure",
                                 abort_requested=True,
                             )
-                            await self._engine_pool._unload_pending_if_idle_locked(
-                                busy_victim
+                            unloaded = (
+                                await self._engine_pool._unload_pending_if_idle_locked(
+                                    busy_victim
+                                )
                             )
+                            if not unloaded:
+                                # Not drained yet: schedule the poller, mirroring
+                                # request_unload's own fallback, or the latch never clears.
+                                self._engine_pool._schedule_pending_unload_locked(
+                                    busy_victim
+                                )
                         logger.warning(
                             "Hard memory pressure: requested abort/unload for "
                             "'%s' (aborted=%d)",

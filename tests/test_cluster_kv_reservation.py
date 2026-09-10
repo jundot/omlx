@@ -103,6 +103,27 @@ def test_mla_models_are_not_over_counted():
     assert _kv_cache_replicated_across_tp(uniform) is False
 
 
+def test_glm5_next_nope_hybrid_uses_sparse_layer_average():
+    text_config = {
+        "num_hidden_layers": 4,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 0,
+        "index_head_dim": 128,
+        "index_kpool": 4,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "deepseek_sparse_attention",
+        ],
+    }
+    config = {"model_type": "glm5_next", "text_config": text_config}
+
+    # One of four layers grows with context: (512 + 128 / 4) * fp16 / 4.
+    assert _kv_bytes_per_token_per_layer(config) == 272
+    assert _kv_cache_replicated_across_tp(config) is True
+
+
 def test_an_unreadable_config_reserves_nothing_rather_than_guessing():
     assert _kv_bytes_per_token_per_layer({}) == 0
     assert _kv_bytes_per_token_per_layer({"num_attention_heads": 8}) == 0

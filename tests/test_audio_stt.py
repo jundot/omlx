@@ -265,6 +265,87 @@ def server_audio_client():
 # ---------------------------------------------------------------------------
 
 
+class TestAudioUploadLimitSettings:
+    """_max_audio_upload_bytes() against the settings singleton.
+
+    Snapshot/restore so reset_settings() here cannot leak into later tests.
+    """
+
+    @pytest.fixture(autouse=True)
+    def restore_global_settings(self):
+        import omlx.settings as settings_mod
+
+        snapshot = settings_mod._global_settings
+        try:
+            yield
+        finally:
+            settings_mod._global_settings = snapshot
+
+    def test_uninitialized_settings_keep_default_limit(self):
+        """Without init_settings(), the 100MB default still applies."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import reset_settings
+
+        reset_settings()
+        assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert MAX_AUDIO_UPLOAD_BYTES == 100 * 1024 * 1024
+
+    def test_reads_limit_from_initialized_settings(self, tmp_path):
+        """init_settings() with a CLI override is what _read_upload enforces."""
+        from argparse import Namespace
+
+        from omlx.api.audio_routes import _max_audio_upload_bytes
+        from omlx.settings import init_settings, reset_settings
+
+        reset_settings()
+        init_settings(
+            base_path=tmp_path,
+            cli_args=Namespace(max_audio_upload_size="2MB"),
+        )
+        assert _max_audio_upload_bytes() == 2 * 1024 * 1024
+
+    def test_invalid_configured_size_warns_and_falls_back(self, caplog):
+        """Garbage settings.json/env values log a warning instead of failing silent."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import ServerSettings
+
+        bogus = ServerSettings(max_audio_upload_size="bogus")
+        with (
+            patch(
+                "omlx.settings.get_settings",
+                return_value=type("GS", (), {"server": bogus})(),
+            ),
+            caplog.at_level("WARNING", logger="omlx.api.audio_routes"),
+        ):
+            assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert "Invalid max_audio_upload_size" in caplog.text
+
+    def test_non_positive_configured_size_warns_and_falls_back(self, caplog):
+        """0MB parses cleanly but would reject every upload; fall back instead."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import ServerSettings
+
+        zero = ServerSettings(max_audio_upload_size="0MB")
+        with (
+            patch(
+                "omlx.settings.get_settings",
+                return_value=type("GS", (), {"server": zero})(),
+            ),
+            caplog.at_level("WARNING", logger="omlx.api.audio_routes"),
+        ):
+            assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert "Invalid max_audio_upload_size" in caplog.text
+
+
 class TestSTTEndpointBasic:
     """Core STT endpoint behaviour."""
 
@@ -313,6 +394,36 @@ class TestSTTEndpointBasic:
             data={"model": "whisper-tiny"},
         )
         mock_pool.get_engine.assert_awaited()
+
+    def test_upload_exceeding_limit_returns_413(self, server_audio_client):
+        """A payload larger than the resolved limit is rejected with 413."""
+        client, _ = server_audio_client
+        oversized = b"\x00" * 2048
+        with patch(
+            "omlx.api.audio_routes._max_audio_upload_bytes",
+            return_value=1024,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", oversized, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+        assert response.status_code == 413
+        assert "1024" in response.json()["error"]["message"]
+
+    def test_upload_within_raised_limit_returns_200(self, server_audio_client):
+        """Raising the limit allows an upload that the default cap would reject."""
+        client, _ = server_audio_client
+        with patch(
+            "omlx.api.audio_routes._max_audio_upload_bytes",
+            return_value=len(TINY_WAV) + 1,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+        assert response.status_code == 200
 
     def test_language_parameter_accepted(self, server_audio_client):
         """language= form field is accepted without error."""

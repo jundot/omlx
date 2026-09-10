@@ -76,6 +76,106 @@ class CacheRateTracker:
             self._snapshots.clear()
 
 
+class BoundarySnapshotDiagnostics:
+    """Thread-safe counters for hybrid-cache boundary snapshot decisions.
+
+    The scheduler writes these counters on its inference thread while the
+    admin endpoint can read them concurrently.  Reasons are intentionally
+    stable, content-free identifiers so operators can tell whether a cache
+    store was missed because capture never ran, positional alignment failed,
+    or a persisted snapshot could not be restored.
+    """
+
+    _COUNTERS = (
+        "capture_attempts",
+        "captures",
+        "captures_ssd",
+        "captures_memory",
+        "ssd_fallbacks",
+        "override_attempts",
+        "override_hits",
+        "override_misses",
+        "store_skips",
+    )
+
+    def __init__(self) -> None:
+        self._counters = {name: 0 for name in self._COUNTERS}
+        self._reasons: dict[str, int] = {}
+        self._last_event: dict[str, Any] | None = None
+        self._lock = threading.Lock()
+
+    def record(
+        self,
+        event: str,
+        *,
+        reason: str | None = None,
+        request_id: str | None = None,
+        token_count: int | None = None,
+        block_size: int | None = None,
+        source: str | None = None,
+        storage: str | None = None,
+        available_boundaries: int | None = None,
+    ) -> None:
+        counter = {
+            "capture_attempt": "capture_attempts",
+            "capture_success": "captures",
+            "ssd_fallback": "ssd_fallbacks",
+            "override_attempt": "override_attempts",
+            "override_hit": "override_hits",
+            "override_miss": "override_misses",
+            "store_skip": "store_skips",
+        }.get(event)
+
+        with self._lock:
+            cause = None
+            if (
+                event == "store_skip"
+                and self._last_event is not None
+                and self._last_event.get("event") == "override_miss"
+                and self._last_event.get("request_id") == request_id
+            ):
+                cause = self._last_event.get("reason")
+
+            if counter is not None:
+                self._counters[counter] += 1
+            if event == "capture_success" and storage in {"ssd", "memory"}:
+                self._counters[f"captures_{storage}"] += 1
+            if reason:
+                self._reasons[reason] = self._reasons.get(reason, 0) + 1
+
+            last_event: dict[str, Any] = {"event": event}
+            for key, value in (
+                ("reason", reason),
+                ("request_id", request_id),
+                ("token_count", token_count),
+                ("block_size", block_size),
+                ("source", source),
+                ("storage", storage),
+                ("available_boundaries", available_boundaries),
+                ("cause", cause),
+            ):
+                if value is not None:
+                    last_event[key] = value
+            self._last_event = last_event
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                **self._counters,
+                "reasons": dict(sorted(self._reasons.items())),
+                "last_event": (
+                    dict(self._last_event) if self._last_event is not None else None
+                ),
+            }
+
+    def clear(self) -> None:
+        with self._lock:
+            for name in self._counters:
+                self._counters[name] = 0
+            self._reasons.clear()
+            self._last_event = None
+
+
 def _window_label(seconds: int) -> str:
     if seconds < 60:
         return f"{seconds}s"

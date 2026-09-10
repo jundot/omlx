@@ -1,15 +1,18 @@
-// PR 3 — button styles for primary / destructive / plain / regular.
+// Button styles for primary / destructive / normal / plain.
 //
 // Use:
 //   Button("Save") { … }
 //     .buttonStyle(.omlx(.primary))
 //
-// The plain kind is the JSX "kind=plain" — borderless action label, e.g. the
-// chevron-only row buttons in screens.
+// primary / destructive / normal delegate to the native bordered styles so
+// buttons share bezel metrics, fonts, and disabled/pressed treatment with
+// the native fields and pickers they sit next to. plain stays a quiet
+// custom label (text-colored, hover-highlight only) because the native
+// borderless style would accent-tint the many icon-only row buttons.
 
 import SwiftUI
 
-struct OMLXButtonStyle: ButtonStyle {
+struct OMLXButtonStyle: PrimitiveButtonStyle {
     enum Kind: Sendable { case primary, destructive, normal, plain }
     enum Size: Sendable { case small, regular }
 
@@ -17,72 +20,46 @@ struct OMLXButtonStyle: ButtonStyle {
     let size: Size
 
     @Environment(\.omlxTheme) private var theme
-    /// Without this, a `.disabled()` button keeps its enabled paint because the
-    /// custom background ignores SwiftUI's default isEnabled tint. Users then
-    /// click an enabled-looking primary button and see no press animation
-    /// (SwiftUI suppresses `isPressed` on disabled buttons) — leading to the
-    /// "Apply only animates the first time" report. Reading `isEnabled` here
-    /// dims the whole label so disabled state is visually unmistakable.
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeBody(configuration: Configuration) -> some View {
-        let labelFont = Font.omlxText(size == .small ? 11.5 : 13, weight: .medium)
-        let hPad: CGFloat = size == .small ? 10 : 12
-        let vPad: CGFloat = size == .small ? 4 : 6
-
-        return configuration.label
-            .font(labelFont)
-            .padding(.horizontal, hPad)
-            .padding(.vertical, vPad)
-            .foregroundStyle(foreground(configuration))
-            .background(background(configuration))
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .overlay(border(configuration))
-            .opacity(opacity(configuration))
-            .contentShape(Rectangle())
-    }
-
-    /// Disabled state wins over press feedback. 0.45 is the macOS-feeling
-    /// "this control is inert" tint — tested against `.primary` (blue),
-    /// `.destructive` (red), `.normal` (themed control bg), and `.plain`
-    /// (transparent + dimmed text).
-    private func opacity(_ cfg: Configuration) -> Double {
-        guard isEnabled else { return 0.45 }
-        return cfg.isPressed ? 0.78 : 1.0
-    }
 
     @ViewBuilder
-    private func background(_ cfg: Configuration) -> some View {
+    func makeBody(configuration: Configuration) -> some View {
+        let button = Button(configuration)
+            .controlSize(size == .small ? .small : .regular)
         switch kind {
         case .primary:
-            theme.accent
+            button.buttonStyle(.borderedProminent)
         case .destructive:
-            theme.redDot
+            button.buttonStyle(.borderedProminent).tint(theme.redDot)
         case .normal:
-            theme.controlBg
+            button.buttonStyle(.bordered)
         case .plain:
-            cfg.isPressed ? theme.hoverBg : Color.clear
-        }
-    }
-
-    private func foreground(_ cfg: Configuration) -> Color {
-        switch kind {
-        case .primary, .destructive: return theme.accentText
-        case .normal: return theme.text
-        case .plain:  return theme.text
-        }
-    }
-
-    @ViewBuilder
-    private func border(_ cfg: Configuration) -> some View {
-        if kind == .normal {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(theme.inputBorder, lineWidth: 0.5)
+            button.buttonStyle(QuietButtonStyle(theme: theme, size: size))
         }
     }
 }
 
-extension ButtonStyle where Self == OMLXButtonStyle {
+/// The former custom "plain" rendering: label in text color, hover-style
+/// highlight while pressed, dimmed when disabled.
+private struct QuietButtonStyle: ButtonStyle {
+    let theme: OMLXTheme
+    let size: OMLXButtonStyle.Size
+
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.omlxText(size == .small ? 11.5 : 13, weight: .medium))
+            .padding(.horizontal, size == .small ? 10 : 12)
+            .padding(.vertical, size == .small ? 4 : 6)
+            .foregroundStyle(theme.text)
+            .background(configuration.isPressed ? theme.hoverBg : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .opacity(isEnabled ? (configuration.isPressed ? 0.78 : 1.0) : 0.45)
+            .contentShape(Rectangle())
+    }
+}
+
+extension PrimitiveButtonStyle where Self == OMLXButtonStyle {
     static func omlx(
         _ kind: OMLXButtonStyle.Kind = .normal,
         size: OMLXButtonStyle.Size = .regular

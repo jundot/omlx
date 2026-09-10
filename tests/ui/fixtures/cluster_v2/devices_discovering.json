@@ -1,0 +1,25 @@
+{
+  "_state": "discovering",
+  "_comment": "Identity exists, nobody else on the network: radar/searching state.",
+  "paired": [],
+  "discovered": [],
+  "self": {
+    "node_id": "3f6f2a90-7d1c-4b55-9c2a-1f0e9a8b7c6d",
+    "friendly_name": "studio-1",
+    "version": "0.6.1",
+    "cluster_name": "omlx",
+    "caps": {
+      "chip": "M3 Ultra",
+      "ram_gb": 512,
+      "backends": ["metal"],
+      "thunderbolt": true,
+      "jaccl": true
+    },
+    "addrs": [{"ip": "192.168.1.10", "if_type": "ethernet"}],
+    "http_port": 8000,
+    "paired": true,
+    "last_seen": 1782000000.0,
+    "link": "ethernet",
+    "state": "discovered"
+  }
+}

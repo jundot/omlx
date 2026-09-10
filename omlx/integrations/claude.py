@@ -101,6 +101,8 @@ class ClaudeCodeIntegration(Integration):
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
         # Large timeout for local model inference (model loading + generation).
         env["API_TIMEOUT_MS"] = "3000000"
+        if ctx.model:
+            env["ANTHROPIC_MODEL"] = ctx.model
 
         if ctx.cross_session:
             # Cross-session messaging (ListAgents/SendMessage) needs telemetry

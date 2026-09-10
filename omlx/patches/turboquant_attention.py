@@ -9,8 +9,8 @@ When TurboQuantKVCache is detected, routes attention to:
     are folded into the GQA repeat dimension so the codecs' decode kernels
     apply, with the causal tail mask injected between key scoring and the
     value weighted sum — one lazy pass over the KV, no dequantize
-  - Prefill (L>1): cache.prefill_attention() fast path, fallback to
-    dequantize + mx.fast.scaled_dot_product_attention
+  - Prefill (L>1): tiled quantized attention first for long contexts;
+    cache.prefill_attention() first for short contexts; then dequantized SDPA
 """
 
 import logging
@@ -606,25 +606,16 @@ def apply_turboquant_attention_patch() -> bool:
                         "falling back to prefill paths",
                         exc_info=True,
                     )
-            # Prefill: try quantized fast path, fallback to dequantize+SDPA
-            result = real_cache.prefill_attention(
-                queries,
-                keys_state=keys,
-                values_state=values,
-                scale=scale,
-                mask=mask,
-            )
-            if result is not None:
-                return result
             keys_state = getattr(keys, "_state", keys)
             try:
                 total_tokens = _state_length(keys_state)
             except Exception:
                 total_tokens = 0
-            if (
+            use_tiled_first = (
                 total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD
                 and hasattr(real_cache, "quantized_attention")
-            ):
+            )
+            if use_tiled_first:
                 old_query_block_size = getattr(
                     real_cache, "prefill_query_block_size", None
                 )
@@ -646,7 +637,7 @@ def apply_turboquant_attention_patch() -> bool:
                 except Exception:
                     logger.debug(
                         "TurboQuant quantized prefill attention failed; "
-                        "falling back to dequantize+SDPA",
+                        "falling back to prefill_attention / dequantize+SDPA",
                         exc_info=True,
                     )
                 finally:
@@ -654,7 +645,19 @@ def apply_turboquant_attention_patch() -> bool:
                         real_cache.prefill_query_block_size = old_query_block_size
                     if old_key_chunk_size is not None:
                         real_cache.prefill_key_chunk_size = old_key_chunk_size
-            dequantized_keys, dequantized_values = real_cache.dequantize()
+            result = real_cache.prefill_attention(
+                queries,
+                keys_state=keys,
+                values_state=values,
+                scale=scale,
+                mask=mask,
+            )
+            if result is not None:
+                return result
+            dequantized_keys, dequantized_values = real_cache.dequantize(
+                keys_state=keys,
+                values_state=values,
+            )
             return mx.fast.scaled_dot_product_attention(
                 queries,
                 dequantized_keys.astype(queries.dtype),

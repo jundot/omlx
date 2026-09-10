@@ -1,0 +1,1 @@
+"""Vendored dependency namespace."""

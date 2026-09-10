@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,6 +26,26 @@ def _failed_pool() -> tuple[EnginePool, EngineEntry]:
     )
     pool._entries[entry.model_id] = entry
     return pool, entry
+
+
+def _write_qwen4_mtp_checkpoint(tmp_path, *, embedded_mtp: bool) -> None:
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "num_hidden_layers": 48,
+            "mtp_num_hidden_layers": 1,
+            "num_nextn_predict_layers": 1,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weight_key = (
+        "mtp.fc_hidden.weight"
+        if embedded_mtp
+        else "model.layers.48.self_attn.q_proj.weight"
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_key: "model.safetensors"}})
+    )
 
 
 async def _update_settings(
@@ -169,6 +190,72 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
 
 
 @pytest.mark.asyncio
+async def test_qwen4_ple_ssd_offload_is_persisted_for_qwen4_only():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_ple_ssd_offload=True),
+    )
+
+    assert settings.qwen4_ple_ssd_offload is True
+
+
+@pytest.mark.asyncio
+async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_ple_ssd_offload=True),
+    )
+
+    assert settings.qwen4_ple_ssd_offload is False
+
+
+@pytest.mark.asyncio
+async def test_qwen4_mtp_setting_accepts_embedded_head(tmp_path):
+    _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=True)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_enabled=True),
+    )
+
+    assert settings.mtp_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_qwen4_mtp_setting_rejects_nextn_only_layout(tmp_path):
+    _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=False)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(mtp_enabled=True),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "native nextn layers are not supported" in exc_info.value.detail
+    assert settings.mtp_enabled is False
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_rejects_invalid_block_size():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
@@ -241,9 +328,116 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
     pool, entry = _failed_pool()
     entry.config_model_type = "gemma4"
 
-    with pytest.raises(admin_routes.HTTPException, match="Qwen3.5/3.6/3.8"):
+    with pytest.raises(admin_routes.HTTPException, match="ANE prefill is unavailable"):
         await _update_settings(
             pool,
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_mtp_draft_tokens_is_persisted_not_dropped():
+    """#2823: mtp_num_draft_tokens used to be silently discarded by PUT."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(mtp_num_draft_tokens=None)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8),
+    )
+
+    assert settings.mtp_num_draft_tokens == 8
+    assert result["settings"]["mtp_num_draft_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_preserve_thinking_and_turboquant_skip_last_are_persisted():
+    """Same silent-drop class as #2823 for the other two engine settings."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(
+        preserve_thinking=False,
+        turboquant_skip_last=True,
+    )
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            preserve_thinking=True,
+            turboquant_skip_last=False,
+        ),
+    )
+
+    assert settings.preserve_thinking is True
+    assert settings.turboquant_skip_last is False
+    assert result["settings"]["preserve_thinking"] is True
+    assert result["settings"]["turboquant_skip_last"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, 9])
+async def test_mtp_draft_tokens_rejects_out_of_range_values(value):
+    pool, _ = _failed_pool()
+
+    with pytest.raises(admin_routes.HTTPException, match="must be between 1 and 8"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=value),
+        )
+
+
+def test_unknown_settings_fields_are_rejected_loudly():
+    """Unknown keys must 422 instead of silently returning success:true."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError, match="bogus_field"):
+        # Simulate a client sending a field that has no admin-PUT support.
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8, bogus_field=1)
+
+
+@pytest.mark.asyncio
+async def test_turboquant_skip_last_null_preserves_default_true():
+    """null = clear to the model default; it must not flip the default to
+    False via bool(None) (review feedback on the silent-drop fix)."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings()  # default turboquant_skip_last=True
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(turboquant_skip_last=None),
+    )
+
+    assert settings.turboquant_skip_last is True
+    assert result["settings"]["turboquant_skip_last"] is True
+
+
+def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
+    """mtp_num_draft_tokens must be part of the engine runtime signature only
+    while Lightning MTP (mtp_enabled) is active (review feedback), so a depth
+    change reloads a loaded engine, but a stale value never forces one."""
+    from omlx.engine_pool import EnginePool
+
+    pool = EnginePool()
+
+    depth_3_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
+    depth_8_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=8)
+    depth_3_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=3)
+    depth_8_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=8)
+
+    on_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_on)}
+    assert "mtp_num_draft_tokens" in on_keys
+    off_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_off)}
+    assert "mtp_num_draft_tokens" not in off_keys
+
+    # Active MTP: different depths produce different signatures (reload).
+    assert pool._engine_runtime_signature("m", depth_3_on) != pool._engine_runtime_signature(
+        "m", depth_8_on
+    )
+    # Inactive MTP: the value is invisible to the signature (no reload).
+    assert pool._engine_runtime_signature("m", depth_3_off) == pool._engine_runtime_signature(
+        "m", depth_8_off
+    )

@@ -1,6 +1,115 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "settings.experimental.k2_ane.label" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2 ANE Prompt Processing"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка промпта K2 на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.sub" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использует ANE для предзаполнения плотных MLP и общих экспертов. Внимание и декодирование остаются на GPU. Применяется после перезагрузки модели."
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.dense" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dense MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Плотные MLP на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.shared" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Shared MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Общие MLP на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.tuner.sub": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLP 重みが 8 ビット以下のモデルで長いプロンプトの処理を任意で調整します。結果はバッチ処理性能を予測するものではありません。目安は 3 分ですが、読み込みや後処理で長くなる場合があります。テストなしで ANE を有効にできます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLP 가중치가 8비트 이하인 모델의 긴 프롬프트 처리를 선택적으로 조정합니다. 결과는 배치 처리 성능을 예측하지 않습니다. 약 3분이 목표이며 로딩과 정리에 더 걸릴 수 있습니다. 테스트 없이 ANE를 켤 수 있습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Необязательная настройка обработки длинных промптов с весами MLP до восьми бит включительно. Результаты не предсказывают производительность пакетной обработки. Около трёх минут; загрузка и очистка могут занять больше времени. ANE можно включить без теста."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选调优：针对 MLP 权重为 8 位及以下的模型处理长提示词。结果不代表批处理性能。目标约三分钟，加载和清理可能需要更久。无需测试即可启用 ANE。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "選用調校：針對 MLP 權重為 8 位元及以下的模型處理長提示詞。結果不代表批次處理效能。目標約三分鐘，載入和清理可能需要更久。無需測試即可啟用 ANE。"
+          }
+        }
+      }
+    },
     "" : {
       "localizations" : {
         "ru" : {
@@ -17102,6 +17211,54 @@
         }
       }
     },
+    "server.advanced.max_audio_upload_size" : {
+      "comment" : "Advanced row label for the audio upload size limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum Audio Upload Size"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный размер загрузки аудио"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大音频上传大小"
+          }
+        }
+      }
+    },
+    "server.advanced.max_audio_upload_size.sub" : {
+      "comment" : "Sublabel describing the audio upload size limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum file size accepted by audio transcription and processing endpoints. Higher values can increase memory use for concurrent requests."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный размер файла для расшифровки и обработки аудио. Большие значения могут увеличить использование памяти при одновременных запросах."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音频转录和处理接口接受的最大文件大小。较大的值可能会增加并发请求的内存使用量。"
+          }
+        }
+      }
+    },
     "server.advanced.sse_keepalive" : {
       "comment" : "Advanced row label for the SSE keep-alive mode picker",
       "extractionState" : "manual",
@@ -17338,6 +17495,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "OpenAI 兼容"
+          }
+        }
+      }
+    },
+    "server.error.audio_upload_size_invalid" : {
+      "comment" : "Server screen error when the audio upload size is invalid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum Audio Upload Size must be a positive value such as 100MB or 1GB."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный размер загрузки аудио должен быть положительным значением, например 100MB или 1GB."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大音频上传大小必须是正值，例如 100MB 或 1GB。"
           }
         }
       }
@@ -19439,6 +19620,78 @@
         }
       }
     },
+    "server.section.usage" : {
+      "comment" : "Section heading for the local usage history switch in Server screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage History"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史"
+          }
+        }
+      }
+    },
+    "server.row.usage_history" : {
+      "comment" : "Row label for the switch that records local hourly usage history",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Record usage history"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Записывать историю использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "记录使用历史"
+          }
+        }
+      }
+    },
+    "server.row.usage_history.sub" : {
+      "comment" : "Sublabel explaining the usage history switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохраняет почасовые итоги токенов по моделям в usage.sqlite3. При отключении существующая история сохраняется."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 usage.sqlite3 中存储各模型每小时的 token 总量。关闭后会保留现有历史。"
+          }
+        }
+      }
+    },
     "server.section.storage" : {
       "comment" : "Section heading for storage rows in Server screen",
       "extractionState" : "manual",
@@ -19987,6 +20240,42 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "为此模型启用推理/思考模式"
+          }
+        }
+      }
+    },
+    "settings.advanced.qwen4_ssd_offload.forced" : {
+      "comment" : "Sublabel when Qwen4 PLE SSD offload is forced by memory limits",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Required because resident loading exceeds the configured model-memory limit."
+          }
+        }
+      }
+    },
+    "settings.advanced.qwen4_ssd_offload.label" : {
+      "comment" : "Row label for the Qwen4 PLE SSD mmap toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD N-gram Offload (Qwen4 only)"
+          }
+        }
+      }
+    },
+    "settings.advanced.qwen4_ssd_offload.sub" : {
+      "comment" : "Sublabel for the Qwen4 PLE SSD mmap toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes."
           }
         }
       }
@@ -23567,6 +23856,47 @@
         }
       }
     },
+    "settings.k2.thinking_hint" : {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 uses reasoning effort. Use Thinking Budget to limit reasoning."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 は推論の強度を使用します。「Thinking Budget」で推論を制限できます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2는 추론 강도를 사용합니다. Thinking Budget으로 추론을 제한하세요."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 использует уровень рассуждения. Используйте «Бюджет thinking», чтобы ограничить рассуждение."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 使用推理强度。可通过“思考预算”限制推理。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 使用推理強度。可透過「Thinking Budget」限制推理。"
+          }
+        }
+      }
+    },
     "settings.vlm_mtp.conflict.dflash" : {
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on",
       "extractionState" : "manual",
@@ -26569,6 +26899,654 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%1$@ · 构建 %2$@"
+          }
+        }
+      }
+    },
+    "status.usage.heading" : {
+      "comment" : "Section header for the local usage history panel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage History"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史"
+          }
+        }
+      }
+    },
+    "status.usage.subtitle" : {
+      "comment" : "Subtitle under the usage history header describing data scope",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local aggregates · server local time · 400-day retention"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Локальные агрегаты · локальное время сервера · хранение 400 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "本地聚合 · 服务器本地时间 · 保留 400 天"
+          }
+        }
+      }
+    },
+    "status.usage.range" : {
+      "comment" : "Picker label for the usage history time range",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Time range"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Период"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "时间范围"
+          }
+        }
+      }
+    },
+    "status.usage.range.today" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Today"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сегодня"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "今天"
+          }
+        }
+      }
+    },
+    "status.usage.range.yesterday" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Yesterday"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вчера"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "昨天"
+          }
+        }
+      }
+    },
+    "status.usage.range.7d" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "7 Days"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "7 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "7 天"
+          }
+        }
+      }
+    },
+    "status.usage.range.30d" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 Days"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 天"
+          }
+        }
+      }
+    },
+    "status.usage.range.90d" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "90 Days"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "90 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "90 天"
+          }
+        }
+      }
+    },
+    "status.usage.range.month" : {
+      "comment" : "Usage history range option for the current calendar month",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This Month"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Этот месяц"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "本月"
+          }
+        }
+      }
+    },
+    "status.usage.model" : {
+      "comment" : "Picker label for the usage history model filter",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型"
+          }
+        }
+      }
+    },
+    "status.usage.all_models" : {
+      "comment" : "Usage history model filter option that includes every model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All Models"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "所有模型"
+          }
+        }
+      }
+    },
+    "status.usage.empty" : {
+      "comment" : "Shown when the selected usage history range has no recorded requests",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No recorded usage in this range. History begins after upgrading."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "В этом периоде нет записей об использовании. История ведётся с момента обновления."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此范围内没有使用记录。历史记录自升级后开始。"
+          }
+        }
+      }
+    },
+    "status.usage.delayed" : {
+      "comment" : "Warning shown when usage history storage is degraded but data is still displayed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "History may be incomplete: storage is delayed or the pending buffer overflowed."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История может быть неполной: запись задерживается или буфер ожидания переполнен."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "历史记录可能不完整：存储延迟或待处理缓冲区已溢出。"
+          }
+        }
+      }
+    },
+    "status.usage.unavailable" : {
+      "comment" : "Error shown when the usage history endpoint cannot be reached",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage history is unavailable. Inference continues normally."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования недоступна. Инференс продолжает работать."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史不可用。推理正常继续。"
+          }
+        }
+      }
+    },
+    "status.usage.disabled" : {
+      "comment" : "Shown on the Status screen when usage history recording is switched off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage history is off. Turn it on in Server settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования отключена. Включите её в настройках сервера."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史已关闭。请在服务器设置中开启。"
+          }
+        }
+      }
+    },
+    "status.usage.open_settings" : {
+      "comment" : "Button that jumps from the Status screen to the usage history switch on the Server screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open Server Settings"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть настройки сервера"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开服务器设置"
+          }
+        }
+      }
+    },
+    "status.usage.tile.requests" : {
+      "comment" : "Usage history tile label for request count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Requests"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запросы"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请求"
+          }
+        }
+      }
+    },
+    "status.usage.tile.total" : {
+      "comment" : "Usage history tile label for prompt plus output tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Total Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Всего токенов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token 总数"
+          }
+        }
+      }
+    },
+    "status.usage.tile.prompt" : {
+      "comment" : "Usage history tile label for prompt tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Токены промпта"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提示 Token"
+          }
+        }
+      }
+    },
+    "status.usage.tile.output" : {
+      "comment" : "Usage history tile label for generated tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Output Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выходные токены"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "输出 Token"
+          }
+        }
+      }
+    },
+    "status.usage.tile.cached" : {
+      "comment" : "Usage history tile label for prompt tokens served from cache",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cached Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Кэшированные токены"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已缓存 Token"
+          }
+        }
+      }
+    },
+    "status.usage.heatmap.title" : {
+      "comment" : "Heading above the usage history day/hour heatmap",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token Usage by Day and Hour"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использование токенов по дням и часам"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按日期和小时的 Token 使用量"
+          }
+        }
+      }
+    },
+    "status.usage.heatmap.note" : {
+      "comment" : "Legend text under the usage heatmap heading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "00–23 hours · darker green means more tokens · repeated DST hours combine"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Часы 00–23 · чем темнее зелёный, тем больше токенов · повторные часы при переводе времени объединяются"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "00–23 时 · 绿色越深表示 Token 越多 · 夏令时重复的小时会合并"
+          }
+        }
+      }
+    },
+    "status.usage.row.tokens" : {
+      "comment" : "Per-model total token count; placeholder is a compact number",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%@ tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ токенов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ Token"
+          }
+        }
+      }
+    },
+    "status.usage.row.requests_speed" : {
+      "comment" : "Per-model request count and output speed; placeholders are a count and a formatted tokens-per-second value",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld requests · %2$@ tok/s"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld запросов · %2$@ ток/с"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld 个请求 · %2$@ tok/s"
+          }
+        }
+      }
+    },
+    "status.usage.row.detail" : {
+      "comment" : "Per-model breakdown sublabel; placeholders are compact prompt, output, and cached token counts",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Prompt %1$@ · output %2$@ · cached %3$@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Промпт %1$@ · вывод %2$@ · кэш %3$@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提示 %1$@ · 输出 %2$@ · 已缓存 %3$@"
+          }
+        }
+      }
+    },
+    "status.usage.heatmap.cell" : {
+      "comment" : "Tooltip and accessibility label for one heatmap cell; placeholders are the date, the two-digit hour, and a formatted token count",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ %2$@:00 · %3$@ tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ %2$@:00 · %3$@ токенов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ %2$@:00 · %3$@ Token"
           }
         }
       }

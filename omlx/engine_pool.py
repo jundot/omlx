@@ -14,6 +14,7 @@ when memory limits are exceeded. It supports:
 from __future__ import annotations
 
 import asyncio
+import copy
 import gc
 import json
 import logging
@@ -38,7 +39,7 @@ from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
-from .engine_core import get_mlx_executor
+from .engine_core import get_mlx_executor, shutdown_mlx_executor
 from .exceptions import (
     DEFAULT_CEILING_ADVICE,
     InsufficientMemoryError,
@@ -50,6 +51,11 @@ from .exceptions import (
     describe_ceiling_binding,
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_settings import (
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
+)
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -200,6 +206,7 @@ class EngineEntry:
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     runtime_estimated_size: int | None = None  # Includes active load-time variants
+    runtime_settle_size: int | None = None  # Excludes K2 ANE admission headroom
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -284,6 +291,7 @@ class EnginePool:
         self._get_final_ceiling: object | None = None  # Set by server
         self._get_admission_ceiling: object | None = None  # Set by server
         self._get_admission_soft_target: object | None = None  # Set by server
+        self._get_residency_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
@@ -292,12 +300,15 @@ class EnginePool:
         # rung can "succeed" marginally on every pass of a long prompt while
         # the durable rung behind it (ANE bank release) is never reached; a
         # request coming back for more headroom escalates instead of
-        # reclaiming again first. Bounded FIFO — request ids are transient.
-        self._prefill_headroom_recurring: OrderedDict[str, None] = OrderedDict()
+        # reclaiming again first. Values count callback attempts per request
+        # (>1 = recurring). Bounded FIFO — request ids are transient.
+        self._prefill_headroom_recurring: OrderedDict[str, int] = OrderedDict()
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
+        self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
         self.configure_hot_cache_budget()
 
@@ -342,12 +353,18 @@ class EnginePool:
         runtime_settings: object | None,
         *,
         base_size: int | None = None,
+        include_ane_reservation: bool = True,
     ) -> int:
-        """Include eager CPU-share storage in load and prefill accounting."""
+        """Include runtime storage and optional K2 ANE admission headroom."""
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
+        qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
+            entry, runtime_settings
+        )
+        if qwen4_offload and qwen4_estimate is not None:
+            base = min(base, qwen4_estimate.mmap_bytes)
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -365,7 +382,94 @@ class EnginePool:
                 format_size(extra),
                 entry.model_id,
             )
+        if (
+            include_ane_reservation
+            and getattr(runtime_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(entry.config_model_type) == "k2"
+        ):
+            from .patches.k2_horizon.ane_prefill import prefill_memory_reservation
+
+            config = json.loads((Path(entry.model_path) / "config.json").read_text())
+            extra += prefill_memory_reservation(
+                config,
+                fraction=ane_prefill_fraction(
+                    runtime_settings.qwen35_ane_prefill_fraction,
+                    entry.config_model_type,
+                ),
+                shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
+                width=runtime_settings.qwen35_ane_prefill_sequence_length,
+            )
         return base + extra
+
+    def _qwen4_ple_offload_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
+
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "qwen4_exp":
+            return False, False, None
+        try:
+            from .patches.mlx_vlm_qwen4_exp_compat.residency import (
+                qwen4_exp_residency_estimate,
+            )
+
+            estimate = qwen4_exp_residency_estimate(entry.model_path)
+        except (OSError, TypeError, ValueError):
+            logger.debug(
+                "Could not inspect Qwen4-Exp PLE residency for %s",
+                entry.model_id,
+                exc_info=True,
+            )
+            return False, False, None
+        # Normal residency calls use the stable ceiling so a post-unload
+        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
+        # pass its earlier live ceiling explicitly when only mmap fits.
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
+                "roughly 2.5x slower than a resident load.",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
+        requested = bool(
+            settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
+        )
+        return requested or forced, forced, estimate if estimate.supported else None
+
+    def _effective_qwen4_model_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> object | None:
+        """Apply a forced mmap decision without mutating persisted settings."""
+
+        enabled, forced, _ = self._qwen4_ple_offload_status(
+            entry,
+            settings,
+            ceiling=ceiling,
+        )
+        if not enabled or not forced or settings is None:
+            return settings
+        effective = copy.copy(settings)
+        setattr(effective, "qwen4_ple_ssd_offload", True)
+        return effective
 
     @property
     def current_model_memory(self) -> int:
@@ -411,6 +515,22 @@ class EnginePool:
         pools admit unconditionally).
         """
         cb = self._get_admission_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _residency_ceiling(self) -> int:
+        """Stable ceiling for the resident-vs-mmap call (#PLE residency).
+
+        Wired to `enforcer.get_residency_ceiling`, which drops the vm_stat
+        component so a model swap does not push a table that fits onto SSD.
+        Returns 0 when no callback is wired up; callers fall back to the
+        admission ceiling.
+        """
+        cb = self._get_residency_ceiling
         if cb is None:
             return 0
         try:
@@ -534,6 +654,14 @@ class EnginePool:
         # force a reload when the corresponding feature is disabled.
         mtp_active = bool(data.get("mtp_enabled", False))
         add("mtp_enabled", mtp_active)
+        # Draft depth is read once at engine construction; it must be in the
+        # signature while Lightning MTP is active so a change reloads the
+        # engine, but a stale value must not force one when MTP is off.
+        if mtp_active:
+            add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
+        if entry is not None:
+            qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
+            add("qwen4_ple_ssd_offload", qwen4_offload)
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -541,18 +669,33 @@ class EnginePool:
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
-        qwen_ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
-        add("qwen35_ane_prefill_enabled", qwen_ane_active)
-        if qwen_ane_active:
+        ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
+        model_type = entry.config_model_type if entry else None
+        backend = ane_prefill_backend(model_type)
+        add("qwen35_ane_prefill_enabled", ane_active)
+        if ane_active:
+            add("ane_prefill_backend", backend)
             add(
                 "qwen35_ane_prefill_sequence_length",
                 data.get("qwen35_ane_prefill_sequence_length", 2048),
             )
             add(
+                "qwen35_ane_prefill_fraction",
+                ane_prefill_fraction(
+                    data.get("qwen35_ane_prefill_fraction"),
+                    model_type,
+                ),
+            )
+            if backend == "k2":
+                add(
+                    "qwen35_ane_prefill_shared_fraction",
+                    data.get("qwen35_ane_prefill_shared_fraction", 1.0),
+                )
+        if ane_active and backend != "k2":
+            add(
                 "qwen35_ane_prefill_tail_padding_min_tokens",
                 data.get("qwen35_ane_prefill_tail_padding_min_tokens", 0),
             )
-            add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.53))
             add(
                 "qwen35_ane_prefill_fused_down",
                 data.get("qwen35_ane_prefill_fused_down", False),
@@ -777,7 +920,7 @@ class EnginePool:
         return model_type == "diffusion_gemma"
 
     def apply_settings_overrides(
-        self, settings_manager: "ModelSettingsManager"
+        self, settings_manager: ModelSettingsManager
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
@@ -1119,9 +1262,22 @@ class EnginePool:
         if not callable(has_active_requests):
             return False
         try:
-            return has_active_requests() is True
+            if has_active_requests() is True:
+                return True
         except Exception:
             return True
+        # Do not use instance getattr here: test doubles and dynamic proxies
+        # can manufacture a truthy method for any name. Only engines whose
+        # class explicitly implements rank-side telemetry participate.
+        rank_side = getattr(type(engine), "rank_side_active_requests", None)
+        if callable(rank_side):
+            try:
+                remaining = rank_side(engine)
+            except Exception:
+                remaining = None
+            if remaining:
+                return True
+        return False
 
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
@@ -1421,6 +1577,16 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
+            qwen4_admission_ceiling = None
+            if (
+                (entry.config_model_type or "").replace("-", "_").lower()
+                == "qwen4_exp"
+            ):
+                candidate = self._current_ceiling()
+                if candidate <= 0:
+                    candidate = self._fallback_admission_ceiling()
+                if candidate > 0:
+                    qwen4_admission_ceiling = candidate
             unloaded_for_admission = False
 
             # Already loaded - just update access time
@@ -1508,9 +1674,18 @@ class EnginePool:
                 get_settings = getattr(self._settings_manager, "get_settings", None)
                 if callable(get_settings):
                     admission_settings = get_settings(model_id)
-            admission_size = self._entry_runtime_resident_size(
+            load_settings = self._effective_qwen4_model_settings(
                 entry,
                 admission_settings,
+                ceiling=qwen4_admission_ceiling,
+            )
+            qwen4_admission_override = load_settings is not admission_settings
+            runtime_load_settings = (
+                load_settings if qwen4_admission_override else runtime_settings
+            )
+            admission_size = self._entry_runtime_resident_size(
+                entry,
+                load_settings,
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
@@ -1654,10 +1829,15 @@ class EnginePool:
             await self._load_engine(
                 model_id,
                 force_lm=force_lm,
-                runtime_settings=runtime_settings,
+                runtime_settings=runtime_load_settings,
             )
 
             loaded = self._entries[model_id]
+            if qwen4_admission_override and expected_signature is not None:
+                # Automatic mmap is local to this admission attempt. Keep the
+                # user's requested variant as the reuse key so the next request
+                # does not reload the model merely because pressure recovered.
+                loaded.runtime_settings_signature = expected_signature
             self._validate_llm_engine_ready(model_id, loaded.engine)
             if _lease:
                 loaded.in_use += 1
@@ -1853,43 +2033,61 @@ class EnginePool:
             return False
 
         evicted_any = False
+        evicted_count = 0
         reclaim_attempted = False
         ane_release_attempted = False
-        # Snapshot once per call: "a PREVIOUS pass for this request already
-        # got a reclaim". Marking inside this call must not flip it.
-        recurring = request_id in self._prefill_headroom_recurring
+        reason = str(getattr(eviction_request, "reason", "") or "")
         async with self._lock:
-            while True:
-                current = max(
-                    mx.get_active_memory(),
-                    get_phys_footprint(),
-                    self._current_model_memory,
+            attempt = self._prefill_headroom_recurring.get(request_id, 0) + 1
+            self._prefill_headroom_recurring[request_id] = attempt
+            while len(self._prefill_headroom_recurring) > 512:
+                self._prefill_headroom_recurring.popitem(last=False)
+            # Count no-op calls too so another attempt prioritizes bank release.
+            recurring = attempt > 1
+
+            def _log_decision(outcome: str) -> None:
+                if ane_release_attempted:
+                    action = "release_ane"
+                elif reclaim_attempted:
+                    action = "reclaim_pool"
+                elif evicted_any:
+                    action = "evict_model"
+                else:
+                    action = "already_fit"
+                logger.info(
+                    "[prefill-eviction] request=%s retry=%d reason=%s "
+                    "action=%s outcome=%s recurring=%s mx_active=%.2fGB "
+                    "phys_footprint=%.2fGB model_memory=%.2fGB "
+                    "predicted=%.2fGB target=%.2fGB evicted=%d",
+                    request_id,
+                    attempt,
+                    reason,
+                    action,
+                    outcome,
+                    recurring,
+                    active / 1024**3,
+                    footprint / 1024**3,
+                    self._current_model_memory / 1024**3,
+                    predicted / 1024**3,
+                    target / 1024**3,
+                    evicted_count,
                 )
+
+            while True:
+                active = mx.get_active_memory()
+                footprint = get_phys_footprint()
+                current = max(active, footprint, self._current_model_memory)
                 if current + predicted <= target:
-                    # A model eviction and/or the pooled-buffer reclaim below
-                    # created enough headroom; signal the caller to re-admit.
-                    # reclaim_attempted stands in for "the reclaim freed
-                    # memory": the helper's own footprint delta is
-                    # process-wide and can be masked by concurrent
-                    # allocation, but reaching this check with headroom
-                    # after an attempt means admission will now succeed.
+                    # Use the same sample for admission and its decision log.
+                    _log_decision("headroom_available")
                     return evicted_any or reclaim_attempted or ane_release_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
                 )
                 if victim is None:
-                    # No idle model left to evict -- the "No idle model
-                    # evicted" case that used to reject outright even when
-                    # tens of GB were reclaimable. Two rungs remain: the
-                    # cheap pooled-buffer reclaim, and shedding the
-                    # requesting model's own ANE prefill banks. Ordering
-                    # matters: prefill continuously refills MLX's buffer
-                    # cache, so on a long prompt the reclaim can "succeed"
-                    # by a marginal few GB on every pass while the durable
-                    # rung is never reached — a request that already had a
-                    # reclaim pass and is back for more headroom escalates
-                    # straight to the bank release instead.
+                    # Reclaim pooled buffers first, unless this request has
+                    # already tried to obtain headroom in a previous callback.
                     if recurring and not ane_release_attempted:
                         ane_release_attempted = True
                         await self._release_ane_prefill_for_headroom(
@@ -1906,9 +2104,6 @@ class EnginePool:
                         # requesting engine's own MLX thread, then let the
                         # loop re-measure.
                         reclaim_attempted = True
-                        self._prefill_headroom_recurring[request_id] = None
-                        while len(self._prefill_headroom_recurring) > 512:
-                            self._prefill_headroom_recurring.popitem(last=False)
                         await self._reclaim_pooled_buffers_for_prefill(
                             exclude_model_id, request_id
                         )
@@ -1946,6 +2141,8 @@ class EnginePool:
                             format_size(predicted),
                             format_size(target),
                         )
+                    # The scheduler may still fit a smaller chunk.
+                    _log_decision("insufficient_headroom")
                     return evicted_any
 
                 logger.info(
@@ -1959,6 +2156,7 @@ class EnginePool:
                 )
                 await self._unload_engine(victim)
                 evicted_any = True
+                evicted_count += 1
 
     @staticmethod
     def _resolve_engine_core_from_engine(engine: object) -> object | None:
@@ -2181,16 +2379,24 @@ class EnginePool:
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
         resident_size = self._entry_resident_size(entry)
+        settle_size = (
+            entry.runtime_settle_size
+            if entry.runtime_settle_size is not None
+            else resident_size
+        )
         pre_unload_active = 0 if distributed else mx.get_active_memory()
 
         try:
             await entry.engine.stop()
         except Exception as e:
             if distributed:
-                # Keep the supervisor reachable and the planned memory
-                # accounted so a later unload can retry process teardown.
+                # The supervisor raises (DistributedTeardownError) when the
+                # final SIGKILL cannot be verified, so this path is now
+                # reachable: keep the supervisor reachable and the planned
+                # memory accounted so a later unload can retry process
+                # teardown instead of releasing the budget over a live rank.
                 logger.error(
-                    f"Distributed teardown failed for {model_id}; "
+                    f"Distributed teardown failed for {model_id} ({e}); "
                     "keeping the engine registered for retry",
                     exc_info=True,
                 )
@@ -2243,6 +2449,7 @@ class EnginePool:
         entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
         entry.runtime_estimated_size = None
+        entry.runtime_settle_size = None
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -2278,8 +2485,12 @@ class EnginePool:
         # Scale tolerance with model size: estimated_size includes a 5%
         # overhead factor (model_discovery.py) that may not be reflected in
         # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(resident_size * 0.05))
-        min_expected_freed = max(0, resident_size - settle_tolerance)
+        # K2 retains its original GPU weights for decode/tails, but its extra
+        # ANE admission allowance includes private storage and staging that
+        # cannot be reclaimed through the MLX allocator. Check the weights;
+        # release the full admission charge only after this barrier.
+        settle_tolerance = max(2 * 1024**3, int(settle_size * 0.05))
+        min_expected_freed = max(0, settle_size - settle_tolerance)
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
@@ -2371,6 +2582,15 @@ class EnginePool:
 
         self._wake_process_memory_enforcer()
 
+    def _finish_failed_load_reclaim_task(self, task: asyncio.Task[None]) -> None:
+        self._failed_load_reclaim_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Post-failed-load reclaim task failed")
+
     def _schedule_failed_load_reclaim(
         self, model_id: str, pre_load_memory: int
     ) -> None:
@@ -2414,11 +2634,15 @@ class EnginePool:
             )
             self._wake_process_memory_enforcer()
 
-        # Keep a reference so the task isn't garbage-collected mid-flight;
-        # one slot suffices -- a newer failure supersedes the previous task.
-        self._failed_load_reclaim_task = asyncio.get_running_loop().create_task(
-            _reclaim()
+        # Keep every task reachable until it finishes. Concurrent load failures
+        # can overlap, and shutdown must cancel/drain all of them before the
+        # process-wide MLX executor is reclaimed.
+        task = asyncio.get_running_loop().create_task(
+            _reclaim(), name=f"engine-failed-load-reclaim:{model_id}"
         )
+        self._failed_load_reclaim_task = task
+        self._failed_load_reclaim_tasks.add(task)
+        task.add_done_callback(self._finish_failed_load_reclaim_task)
 
     async def _load_engine(
         self,
@@ -2461,6 +2685,9 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
+                validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)
@@ -2476,6 +2703,12 @@ class EnginePool:
                 base_size=base_resident_size,
             )
             entry.runtime_estimated_size = resident_size
+            entry.runtime_settle_size = self._entry_runtime_resident_size(
+                entry,
+                model_settings,
+                base_size=base_resident_size,
+                include_ane_reservation=False,
+            )
 
             # Wire the correct model_id / model_path into the shared scheduler
             # config so every engine (Batched/VLM/DFlash/Embedding) sees the
@@ -2945,6 +3178,7 @@ class EnginePool:
             entry.abort_loading = False
             if not load_completed:
                 entry.runtime_estimated_size = None
+                entry.runtime_settle_size = None
             self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:
@@ -2967,6 +3201,13 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
+        reclaim_tasks = tuple(self._failed_load_reclaim_tasks)
+        for task in reclaim_tasks:
+            task.cancel()
+        if reclaim_tasks:
+            await asyncio.gather(*reclaim_tasks, return_exceptions=True)
+        self._failed_load_reclaim_tasks.clear()
+        self._failed_load_reclaim_task = None
         pending_tasks = tuple(self._pending_unload_tasks.values())
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
@@ -2980,6 +3221,7 @@ class EnginePool:
                     except Exception as e:
                         logger.error(f"Error unloading {model_id} during shutdown: {e}")
 
+        shutdown_mlx_executor()
         logger.info("Engine pool shutdown complete")
 
     def get_status(self) -> dict:
@@ -2989,16 +3231,10 @@ class EnginePool:
         Returns:
             Dictionary with pool status information
         """
-        return {
-            "final_ceiling": self._current_ceiling(),
-            "current_model_memory": self._current_model_memory,
-            "model_count": len(self._entries),
-            "loaded_count": sum(
-                1 for e in self._entries.values() if e.engine is not None
-            ),
-            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
-            "load_time_observations": self._load_time_observations,
-            "models": [
+        models = []
+        for mid, e in sorted(self._entries.items()):
+            deployment = self._distributed_deployment_for_entry(e)
+            models.append(
                 {
                     "id": mid,
                     "model_path": e.model_path,
@@ -3007,8 +3243,11 @@ class EnginePool:
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
                     "resident_estimated_size": self._entry_resident_size(e),
-                    "distributed": (
-                        self._distributed_deployment_for_entry(e) is not None
+                    "distributed": deployment is not None,
+                    "cluster": (
+                        self._cluster_status_payload(deployment)
+                        if deployment is not None
+                        else None
                     ),
                     "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
@@ -3026,8 +3265,40 @@ class EnginePool:
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
-                for mid, e in sorted(self._entries.items())
-            ],
+            )
+        return {
+            "final_ceiling": self._current_ceiling(),
+            "current_model_memory": self._current_model_memory,
+            "model_count": len(self._entries),
+            "loaded_count": sum(
+                1 for e in self._entries.values() if e.engine is not None
+            ),
+            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
+            "load_time_observations": self._load_time_observations,
+            "models": models,
+        }
+
+    @staticmethod
+    def _cluster_status_payload(deployment: ClusterDeployment) -> dict:
+        """Badge/cluster topology summary for dashboard model rows."""
+
+        world_size = deployment.world_size
+        tensor_parallel_size = deployment.tensor_parallel_size
+        return {
+            "deployment_id": deployment.deployment_id,
+            "world_size": world_size,
+            "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_stages": world_size // tensor_parallel_size,
+            "strategy": (
+                "tensor"
+                if tensor_parallel_size == world_size
+                else "pipeline"
+                if tensor_parallel_size == 1
+                else "hybrid"
+            ),
+            "backend": str(deployment.backend),
+            "target_context_tokens": deployment.target_context_tokens,
+            "profile": deployment.execution.profile,
         }
 
     async def check_ttl_expirations(

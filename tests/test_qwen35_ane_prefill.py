@@ -70,6 +70,32 @@ def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
     assert source.count("ane_guard.transfer_ticket1();") == 2
 
 
+def test_hybrid_merge_waits_for_gpu_suffix_completion():
+    """ANE completion alone must not let merge race an in-flight GPU qmm."""
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    single = source.split("class AneHybridQ4Primitive", 1)[1]
+    single = single.split("class DualAneHybridPrimitive", 1)[0]
+    dual = source.split("class DualAneHybridPrimitive", 1)[1]
+    dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
+
+    for block, ane_wait in (
+        (single, "model_->wait(ticket)"),
+        (dual, "model1_->wait(ticket1)"),
+    ):
+        assert "[qmm_buffer retain];" in block
+        assert block.count("[qmm_buffer waitUntilCompleted];") == 2
+        assert block.index(ane_wait) < block.rindex(
+            "[qmm_buffer waitUntilCompleted];"
+        )
+        assert block.rindex("[qmm_buffer waitUntilCompleted];") < block.index(
+            "auto merge ="
+        )
+        assert block.rindex("[qmm_buffer release];") < block.index("auto merge =")
+
+
 @pytest.fixture(autouse=True)
 def _restore_lm_gdn_backend():
     import omlx.patches.qwen35_q4_mlp as q4_patch
@@ -472,6 +498,7 @@ def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
 
 def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
     calls = []
+    scheduled = []
 
     def exact(_gdn, block, _target_verify=False):
         calls.append(("ane", int(block.shape[-2])))
@@ -491,6 +518,7 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
             )
 
     monkeypatch.setattr(ane_patch, "_gdn_backend_exact", exact)
+    monkeypatch.setattr(mx, "async_eval", lambda *values: scheduled.append(values))
     linears = [Linear(value) for value in (10, 20, 30, 40)]
     gdn = SimpleNamespace(
         in_proj_qkv=linears[0],
@@ -504,6 +532,10 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
         gdn, mx.zeros((1, 4095, 8), dtype=mx.float16)
     )
     assert result is not None
+    assert len(scheduled) == 1
+    assert all(
+        actual is expected for actual, expected in zip(scheduled[0], result)
+    )
     mx.eval(*result)
 
     assert [part.shape for part in result] == [(1, 4095, 1)] * 4
@@ -1446,9 +1478,9 @@ def test_compile_gdn_accepts_q8_and_propagates_bits(monkeypatch):
     assert state is not None
     assert state.bits == 8
     assert state.group_size == 64
-    assert state.weight.shape == (192, 32)
-    assert state.scales.shape == (192, 2)
-    assert compiled == [((192, 128), mx.float32, 2048)]
+    assert state.weight.shape == (256, 32)
+    assert state.scales.shape == (256, 2)
+    assert compiled == [((128, 128), mx.float32, 2048)]
 
 
 @pytest.mark.parametrize("group_size", [64, 128])
@@ -1505,7 +1537,7 @@ def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
     mixed_qkv, z, b, a = ane_patch._gdn_backend(gdn, x)
     mx.eval(mixed_qkv, z, b, a)
 
-    assert compiled == [(192, 128)]
+    assert compiled == [(128, 128)]
     assert z.shape == (1, 1, state.z_outputs)
     assert mixed_qkv.shape == (1, 1, state.qkv_outputs)
     assert b.shape == (1, 1, state.b_outputs)
@@ -1723,11 +1755,11 @@ def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
     state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
 
     assert state is not None
-    assert compiled == [((192, 128), mx.float32, 2048)]
+    assert compiled == [((128, 128), mx.float32, 2048)]
     assert state.z_outputs == 128
     assert state.qkv_outputs == 256
-    assert state.weight.shape == (192, 20)
-    assert state.scales.shape == (192, 2)
+    assert state.weight.shape == (256, 20)
+    assert state.scales.shape == (256, 2)
     assert state.bits == 5
     assert state.group_size == 64
 
@@ -1752,10 +1784,10 @@ def test_prepare_gdn_accepts_oq4e_mixed_q4_q5_quantization():
     state, dense0, dense1 = prepared
     assert state.bits == 4
     assert state.group_size == 64
-    assert state.weight.shape == (128, 16)
-    assert state.scales.shape == (128, 2)
-    assert dense0.shape == (128, 128)
-    assert dense1.shape == (128, 128)
+    assert state.weight.shape == (256, 16)
+    assert state.scales.shape == (256, 2)
+    assert dense0.shape == (64, 128)
+    assert dense1.shape == (64, 128)
 
 
 def test_prepare_gdn_single_ane_keeps_one_full_prefix():
@@ -1778,7 +1810,7 @@ def test_prepare_gdn_single_ane_keeps_one_full_prefix():
     state, dense0, dense1 = prepared
     assert state.z_outputs == 128
     assert state.qkv_outputs == 256
-    assert dense0.shape == (256, 128)
+    assert dense0.shape == (128, 128)
     assert dense1 is None
 
 
@@ -1841,12 +1873,12 @@ def test_prepare_gdn_splits_cpu_work_with_single_ane(monkeypatch):
 
     assert prepared is not None
     state, dense0, dense1 = prepared
-    assert dense0.shape == (192, 128)
+    assert dense0.shape == (128, 128)
     assert dense1 is None
     assert state.cpu_outputs == 64
     assert state.cpu_weight is not None
     assert state.cpu_weight.shape == (64, 128)
-    assert state.weight.shape == (128, 16)
+    assert state.weight.shape == (192, 16)
 
 
 def test_gdn_backend_routes_cpu_split_through_three_way_native_merge(monkeypatch):
@@ -3081,25 +3113,11 @@ def test_compile_cache_native_gate_is_exact_opt_in(ane_mm):
     assert 'strcmp(value, "1") == 0' in gate.group()
 
 
-def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
-    """Individual linear, single fused SwiGLU/down, linear banks, and fused
-    banks use one instance-aware cache/fallback implementation."""
-    assert ane_mm.count("load_or_compile_ane_model(") == 5
+def test_compile_cache_covers_all_five_native_compile_sites(ane_mm):
+    """Qwen and K2 compile sites share the content-hash cache."""
+    assert ane_mm.count("load_or_compile_ane_model(") == 6
     assert ane_mm.count("model, identifier, ane_instance") == 4
     assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
-
-
-def test_compile_cache_cleanup_refuses_paths_resolving_outside_root(ane_mm):
-    """A cache-rooted path that resolves elsewhere must be left alone, while
-    the historical temp path still deletes directly."""
-    body = re.search(
-        r"void remove_ane_staging_directory\(NSString \*directory\) noexcept \{.*?\n\}",
-        ane_mm,
-        re.S,
-    )
-    assert body, "remove_ane_staging_directory() is absent from qwen35_ane.mm"
-    assert "ANE compile cache cleanup skipped" in body.group()
-    assert "stringByResolvingSymlinksInPath" in body.group()
 
 
 def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
@@ -3117,45 +3135,66 @@ def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
 def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
     """Apple owns the compiled AOT cache; oMLX staging files remain temporary."""
     assert "persistent_" not in ane_mm
-    assert ane_mm.count("remove_ane_staging_directory(directory_)") == 2
-    assert "ScopedAneCacheLock cache_lock(directory);" in ane_mm
+    assert ane_mm.count(
+        "remove_ane_staging_directory(directory_, cache_lock_entry_)"
+    ) == 2
+    assert "ScopedAneCacheLock cache_lock(cache_lock_entry);" in ane_mm
     assert "ANE compile cache cleanup deferred" in ane_mm
     assert "NSTemporaryDirectory()" in ane_mm
 
 
 def test_compile_cache_hit_restores_without_recompiling(ane_mm):
-    assert "@selector(setModelURL:)" in ane_mm
+    """The framework-derived URL and descriptor hash must remain authoritative.
+
+    macOS 27 verifies the in-memory model's per-file hashes and rejects the
+    caller-assigned staging URL that rc3 introduced in both cache modes.
+    """
+    assert "setModelURL:" not in ane_mm
+    assert "fileURLWithPath:" not in ane_mm
     assert "@selector(compiledModelExists)" in ane_mm
     assert re.search(r"if \(!restored\) \{\s*compile_fresh\(\);\s*\}", ane_mm)
+    assert re.search(
+        r"return \{\s*staged \? directory : nil,\s*"
+        r"staged \? cache_lock_entry : nil,\s*\};",
+        ane_mm,
+    )
 
 
 def test_compile_cache_hit_load_failure_invalidates_then_compiles_once(ane_mm):
     assert "ANE compile cache fallback" in ane_mm
+    assert "@selector(purgeCompiledModel)" in ane_mm
     assert ane_mm.count("compile_fresh();") == 2
     assert ane_mm.count("@selector(loadWithQoS:options:error:)") == 2
+    fallback = ane_mm.index('NSLog(@"oMLX: ANE compile cache fallback')
+    purge = ane_mm.index("@selector(purgeCompiledModel)", fallback)
+    recompile = ane_mm.index("compile_fresh();", purge)
+    assert fallback < purge < recompile
 
 
-def test_compile_cache_path_is_stable_per_os_and_instance(ane_mm):
+def test_compile_cache_lock_key_matches_native_content_hash(ane_mm):
     assert "NSCachesDirectory" in ane_mm
     assert 'stringByAppendingPathComponent:@"v1"' in ane_mm
     assert "operatingSystemVersionString" in ane_mm
-    assert re.search(r'@"%@\.i%d"', ane_mm)
-    assert "fileURLWithPath:directory" in ane_mm
+    assert "ane_compile_cache_lock_entry(NSString *identifier)" in ane_mm
+    assert '.i%d"' not in ane_mm
+    assert "stringByAppendingPathComponent:identifier" in ane_mm
 
 
 def test_compile_cache_serializes_cross_process_writers(ane_mm):
     assert "#include <sys/file.h>" in ane_mm
     assert re.search(r"flock\(.*LOCK_EX", ane_mm)
-    assert "Hold the entry lock from probe through load" in ane_mm
+    assert "Hold the descriptor-hash lock from probe through load" in ane_mm
 
 
 def test_compile_cache_fails_open_when_root_or_lock_is_unavailable(ane_mm):
     assert "ANE compile cache unavailable" in ane_mm
     assert "temporary" in ane_mm
 
+
 def test_compile_cache_telemetry_uses_native_log_prefix(ane_mm):
     for event in ("hit", "miss", "fallback"):
         assert f'@"oMLX: ANE compile cache {event}' in ane_mm
+
 
 def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
     """A suspended holder must not hang later loads: non-blocking flock with a
@@ -3163,12 +3202,6 @@ def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
     assert "LOCK_EX | LOCK_NB" in ane_mm
     assert "kAneCacheLockTimeout" in ane_mm
     assert "ANE compile cache lock acquisition timed out" in ane_mm
-
-
-def test_compile_cache_staging_delete_resolves_symlinks(ane_mm):
-    """The cache-root prefix check must compare resolved paths so a symlink
-    under the root cannot redirect the delete outside it."""
-    assert "stringByResolvingSymlinksInPath" in ane_mm
 
 class _ReleasableModel(nn.Module):
     def __init__(self):
@@ -3183,6 +3216,7 @@ class _NativeHandle:
 
 def test_release_latches_modules_drops_states_and_zeroes_counters():
     import gc
+
     model = _ReleasableModel()
     handle = _NativeHandle()
     ref = weakref.ref(handle)
@@ -3212,6 +3246,55 @@ def test_release_latches_modules_drops_states_and_zeroes_counters():
     assert status["configured"] is False
     assert status["shed"] is True
     assert status["resident_programs"] == 0
+
+
+def test_release_clears_the_state_cache_that_pins_the_same_states():
+    import gc
+
+    model = _ReleasableModel()
+    mlp_handle = _NativeHandle()
+    gdn_handle = _NativeHandle()
+    mlp_ref = weakref.ref(mlp_handle)
+    gdn_ref = weakref.ref(gdn_handle)
+    mlp_state = SimpleNamespace(model=mlp_handle)
+    gdn_state = SimpleNamespace(model=gdn_handle)
+    model.mlp._omlx_ane_prefill_state = mlp_state
+    # _compile_pair and _compile_gdn cache the state per module, so this is a
+    # second reference to everything the release drops.
+    model.mlp._omlx_ane_prefill_cache = {("mlp-key",): mlp_state}
+    model.gdn._omlx_ane_gdn_state = gdn_state
+    model.gdn._omlx_ane_gdn_cache = {("gdn-key",): gdn_state}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del mlp_state, gdn_state, mlp_handle, gdn_handle
+    gc.collect()
+
+    assert released == 2
+    assert mlp_ref() is None
+    assert gdn_ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
+    assert model.gdn._omlx_ane_gdn_cache == {}
+
+
+def test_release_clears_a_stale_state_cache_entry():
+    import gc
+
+    model = _ReleasableModel()
+    handle = _NativeHandle()
+    ref = weakref.ref(handle)
+    # An entry can outlive its state attribute -- an earlier release, or a
+    # slice replaced at a different chunk width.
+    model.mlp._omlx_ane_prefill_cache = {("stale",): SimpleNamespace(model=handle)}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del handle
+    gc.collect()
+
+    # Nothing to latch, so nothing counts as released -- but the bank the entry
+    # pinned still has to be handed back.
+    assert released == 0
+    assert ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
 
 
 def test_release_is_idempotent_and_noop_without_slices():
@@ -3266,6 +3349,36 @@ def _floor_gdn(z_outputs: int, qkv_outputs: int):
     )
 
 
+def test_recurrent_safe_gdn_slice_caps_ane_at_z():
+    """A wider requested slice must not move recurrent qkv rows onto ANE."""
+    assert (
+        ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.50, 128)
+        == 6144
+    )
+    assert (
+        ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.375, 128)
+        == 6144
+    )
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.35, 128) == 0
+
+
+def test_recurrent_safe_gdn_slice_rejects_unaligned_z():
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(320, 1728, 0.50, 128) == 0
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(320, 1728, 0.50, 64) == 320
+
+
+def test_recurrent_safe_gdn_cap_is_reported(caplog):
+    gdn = _floor_gdn(512, 1536)
+    gdn._omlx_ane_gdn_state = object()
+    model = SimpleNamespace(modules=lambda: [gdn])
+
+    with caplog.at_level(logging.INFO):
+        ane_patch._log_gdn_recurrent_safe_cap(model, 0.50, 1, True)
+
+    assert "requested 0.500 to 0.250" in caplog.text
+    assert "recurrent qkv" in caplog.text
+
+
 def test_min_viable_gdn_fraction_tracks_the_alignment():
     """Single-ANE slices align to 64, dual to 128, so the same model has a
     different floor in each mode."""
@@ -3276,10 +3389,10 @@ def test_min_viable_gdn_fraction_tracks_the_alignment():
     assert (int(total * 0.25) // 128) * 128 >= 512
     assert (int(total * 0.15) // 128) * 128 < 512
 
-    # A 64-aligned slice reaches z at the same 0.25 here, but the rule is
-    # evaluated against the requested alignment, not a fixed 128.
+    # Exact z must satisfy the active ANE alignment. A wider aligned prefix
+    # would enter recurrent qkv rows and is intentionally rejected.
     assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 64) == 0.15625
-    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) == 0.1875
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) is None
 
     # z alone larger than the whole projection can never engage
     assert ane_patch._min_viable_gdn_fraction(_floor_gdn(2050, 10), 128) is None

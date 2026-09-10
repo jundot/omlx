@@ -20,6 +20,8 @@ _VLM_TEXT_PREFIX = "language_model."
 _CKPT_TEXT_PREFIX = "model.language_model."
 _RUNTIME_TEXT_PREFIX = "language_model.model."
 
+_MATERIALIZE_EVAL_CHUNK = 8
+
 _MLX_LM_LOAD_CONFIG_PATCHED = False
 
 _REMOTE_CODE_METADATA_PATTERNS = [
@@ -117,7 +119,11 @@ def preflight_text_remote_code(
 
 
 def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
-    """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    """Forward the configured trust setting to the model and tokenizer loaders."""
+    kwargs["tokenizer_config"] = {
+        **(kwargs.get("tokenizer_config") or {}),
+        "trust_remote_code": trust_remote_code,
+    }
     preflight_text_remote_code(
         path_or_repo,
         tokenizer_config=kwargs.get("tokenizer_config"),
@@ -398,7 +404,7 @@ def maybe_apply_pre_load_patches(
       declares ``model_type == "glm_moe_dsa"``. Required because pinned
       mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
       checkpoints whose shared DSA layers carry no indexer weights.
-    - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
+    - Lightning MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
     - mlx-vlm side MTP runtime + nested-visual patches when ``for_vlm`` is
@@ -414,8 +420,14 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    Both patches inject modules into ``sys.modules`` and replace mlx-lm
-    internals; gating keeps non-affected models at zero cost.
+    - mlx-vlm MLX 0.32.2 compatibility backport when ``for_vlm`` is True.
+      This installs before model-module imports and carries only upstream PRs
+      #1949, #1982, and #2006, without moving the deliberately stable mlx-vlm
+      pin.
+    Some model patches inject modules into ``sys.modules`` or replace mlx-lm
+    internals; the mlx-vlm compatibility hook instead transforms only the
+    affected pinned sources as they load. Gating keeps non-affected models at
+    zero cost.
 
     Safe to call repeatedly; the patches are idempotent.
     """
@@ -427,6 +439,13 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+
+    if for_vlm:
+        from ..patches.mlx_vlm_mlx0322_compat import (
+            apply_mlx_vlm_mlx0322_compat_patch,
+        )
+
+        apply_mlx_vlm_mlx0322_compat_patch()
 
     # Machine-conditioned, model-independent: reroute sorted gather_qmm
     # around the defective M5 NAX kernels (issue #2267). Install is cheap
@@ -526,6 +545,12 @@ def maybe_apply_pre_load_patches(
         if apply_laguna_patch():
             logger.info("Laguna pre-load patch applied for %s", model_name)
 
+    if model_type == "k2_horizon":
+        from ..patches.k2_horizon import apply_k2_horizon_patch
+
+        if apply_k2_horizon_patch():
+            logger.info("K2 Horizon pre-load patch applied for %s", model_name)
+
     if model_type == "hy_v3":
         from ..patches.hy_v3 import apply_hy_v3_patch
 
@@ -613,6 +638,75 @@ def maybe_apply_pre_load_patches(
         if apply_mlx_vlm_muse_glimmer_compat_patch():
             logger.info(
                 "Muse Glimmer mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
+    if for_vlm and model_type == "qwen4_exp":
+        from ..patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+            configure_qwen4_exp_runtime,
+        )
+
+        if apply_mlx_vlm_qwen4_exp_compat_patch():
+            logger.info(
+                "Qwen4-Exp mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+        mtp_requested = bool(
+            model_settings is not None and getattr(model_settings, "mtp_enabled", False)
+        )
+        has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+        mtp_active = mtp_requested and has_mtp_weights
+        if mtp_requested and not has_mtp_weights:
+            logger.warning(
+                "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "
+                "MTP tensors were found",
+                model_name,
+            )
+
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+            set_mtp_depth,
+        )
+
+        set_mtp_active(mtp_active)
+        depth = (
+            getattr(model_settings, "mtp_num_draft_tokens", None)
+            if model_settings is not None
+            else None
+        )
+        # Qwen4-Exp uses the same adaptive draft-depth controller as the
+        # general Lightning MTP path.  A single MTP hidden layer can be
+        # chained autoregressively, so default to the validated max depth 3.
+        set_mtp_depth(int(depth) if depth else 3)
+        if mtp_active and not apply_mlx_lm_mtp_patch():
+            logger.warning(
+                "Qwen4-Exp Lightning MTP dispatch patch failed for %s; "
+                "speculative decoding will remain inactive",
+                model_name,
+            )
+            set_mtp_active(False)
+            mtp_active = False
+        configure_qwen4_exp_runtime(
+            model_name,
+            mode=(
+                "mmap"
+                if model_settings is not None
+                and getattr(model_settings, "qwen4_ple_ssd_offload", False)
+                else "resident" if model_settings is not None else None
+            ),
+            mtp_enabled=mtp_active,
+        )
+
+    if for_vlm and model_type == "glm5_next":
+        from ..patches.mlx_vlm_glm5_next_compat import (
+            apply_mlx_vlm_glm5_next_compat_patch,
+        )
+
+        if apply_mlx_vlm_glm5_next_compat_patch():
+            logger.info(
+                "GLM-5.3 mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
 
@@ -771,7 +865,11 @@ def maybe_apply_pre_load_patches(
                             "load only)",
                             model_name,
                         )
-    elif model_settings is not None and getattr(model_settings, "mtp_enabled", False):
+    elif (
+        model_type != "qwen4_exp"
+        and model_settings is not None
+        and getattr(model_settings, "mtp_enabled", False)
+    ):
         logger.warning(
             "mtp_enabled=True for %s but model is incompatible "
             "(model_type=%r, mtp_heads=%s); MTP path will be inactive",
@@ -927,14 +1025,68 @@ def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
         config = json.loads((Path(model_path) / "config.json").read_text())
     except Exception:
         return ()
+    if config.get("model_type") == "qwen4_exp":
+        # The dedicated Qwen4 runtime constructs a root-level MTP module and
+        # can bind only the embedded mtp.* layouts. Extra nextn decoder layers
+        # must not make generic callers report this checkpoint as compatible.
+        return ()
     return _nextn_weight_prefixes_from_config(config)
+
+
+def _checkpoint_weight_prefix(
+    model_path: str | Path,
+    prefixes: tuple[str, ...],
+) -> str | None:
+    """Return the first supported prefix present in a checkpoint."""
+    p = Path(model_path)
+    if not p.is_dir():
+        return None
+
+    index_path = p / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text())
+            weight_map = data.get("weight_map") or {}
+            for prefix in prefixes:
+                if any(key.startswith(prefix) for key in weight_map):
+                    return prefix
+            return None
+        except Exception as e:
+            logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
+
+    shards = sorted(p.glob("*.safetensors"))
+    if not shards:
+        return None
+    try:
+        import safetensors
+    except Exception as e:
+        logger.debug("safetensors import failed for mtp weight scan: %s", e)
+        return None
+
+    for shard in shards:
+        try:
+            with safetensors.safe_open(str(shard), framework="numpy") as f:
+                keys = tuple(f.keys())
+                for prefix in prefixes:
+                    if any(key.startswith(prefix) for key in keys):
+                        return prefix
+        except Exception as e:
+            logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
+    return None
+
+
+def _checkpoint_qwen4_mtp_weight_prefix(model_path: str | Path) -> str | None:
+    """Return the embedded MTP prefix supported by the Qwen4 runtime."""
+    return _checkpoint_weight_prefix(model_path, _MTP_WEIGHT_PREFIXES)
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     """True iff the checkpoint at *model_path* ships any MTP weight tensor.
 
-    Matches both the ``mtp.*`` naming and the nextn layout (extra decoder
-    layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
+    Matches both the ``mtp.*`` naming and compatible nextn layouts (extra
+    decoder layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
+    Qwen4-Exp is intentionally restricted to ``mtp.*`` because its dedicated
+    runtime cannot bind native nextn layers.
 
     Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
     ``config.json`` but strip the MTP weights during conversion (e.g.
@@ -948,39 +1100,8 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     False when neither resolves — callers treat that as "no MTP weights"
     (the conservative choice: skip MTPModule attachment).
     """
-    p = Path(model_path)
-    if not p.is_dir():
-        return False
-
-    prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(p)
-
-    index_path = p / "model.safetensors.index.json"
-    if index_path.exists():
-        try:
-            data = json.loads(index_path.read_text())
-            weight_map = data.get("weight_map") or {}
-            return any(k.startswith(prefixes) for k in weight_map)
-        except Exception as e:
-            logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
-
-    shards = sorted(p.glob("*.safetensors"))
-    if not shards:
-        return False
-    try:
-        import safetensors
-    except Exception as e:
-        logger.debug("safetensors import failed for mtp weight scan: %s", e)
-        return False
-
-    for shard in shards:
-        try:
-            with safetensors.safe_open(str(shard), framework="numpy") as f:
-                for k in f.keys():
-                    if k.startswith(prefixes):
-                        return True
-        except Exception as e:
-            logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
-    return False
+    prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
+    return _checkpoint_weight_prefix(model_path, prefixes) is not None
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
@@ -1075,7 +1196,16 @@ def materialize_lazy_state(model: Any) -> None:
                 _scan_plain_object(value)
 
     if arrays:
-        mx.eval(arrays)
+        # Evaluate in bounded chunks rather than one mx.eval(arrays). A single
+        # eval over the whole parameter tree submits one Metal command buffer
+        # spanning every array; on a multi-hundred-GB checkpoint (e.g. the raw
+        # BF16 Qwen3.8-Flash-Next base, ~336 GB / 1676 arrays) that buffer
+        # exceeds the GPU command-buffer watchdog and aborts the process with
+        # "[METAL] Command buffer execution failed: Caused GPU Timeout Error
+        # (kIOGPUCommandBufferCallbackErrorTimeout)". Chunking bounds each
+        # command buffer; small models see only a handful of chunks. See #3179.
+        for start in range(0, len(arrays), _MATERIALIZE_EVAL_CHUNK):
+            mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:

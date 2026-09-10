@@ -47,6 +47,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
@@ -102,6 +103,7 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
 
@@ -168,6 +170,28 @@ def _is_missing_chat_template_error(exc: ValueError) -> bool:
         or "does not have a chat template" in message
         or "No chat template found" in message
     )
+
+
+def _capture_vlm_position_state(lm: Any, extra_kwargs: dict[str, Any]) -> None:
+    """Copy the language model's per-request mRoPE state into extra_kwargs.
+
+    get_input_embeddings() leaves ``_position_ids`` and ``_rope_deltas`` lazy
+    on the executor's default stream. They are materialized here because a
+    lazy default-stream input inside the engine-stream prefill graph deadlocks
+    the Qwen ANE prefill primitive on restored-prefix requests (#3305, the
+    same class as the text-only seed in #3279).
+    """
+    if lm is None:
+        return
+    pid = getattr(lm, "_position_ids", None)
+    if pid is not None and "position_ids" not in extra_kwargs:
+        extra_kwargs["position_ids"] = pid
+    rd = getattr(lm, "_rope_deltas", None)
+    if rd is not None:
+        extra_kwargs["_captured_rope_deltas"] = rd
+    lazy_state = [v for v in (pid, rd) if isinstance(v, mx.array)]
+    if lazy_state:
+        mx.eval(*lazy_state)
 
 
 def _apply_minimax_m3_thinking_mode(
@@ -742,6 +766,112 @@ def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
     return isinstance(metadata, dict) and metadata.get("format") == "mlx"
 
 
+def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
+    """Derive Gemma4's legacy full-attention head fields from ``per_layer_config``.
+
+    Newer Gemma4 checkpoints (Transformers >= 5.15) record the ``head_dim`` /
+    ``num_key_value_heads`` overrides of the full-attention layers under
+    ``text_config.per_layer_config`` instead of the legacy global
+    ``global_head_dim`` / ``num_global_key_value_heads`` fields. The pinned
+    mlx-vlm Gemma4 loader reads only the legacy fields, so it sizes the
+    full-attention K/V projections with the sliding-window head count and
+    ``load_weights`` fails with a shape mismatch (#3537).
+
+    Returns the legacy fields that are absent from ``text_config`` and can be
+    derived unambiguously (every overridden full-attention layer agrees), or
+    an empty dict.
+    """
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return {}
+    model_type = str(text_config.get("model_type") or config.get("model_type") or "")
+    if not model_type.startswith("gemma4"):
+        return {}
+    per_layer = text_config.get("per_layer_config")
+    if not isinstance(per_layer, dict) or not per_layer:
+        return {}
+    layer_types = text_config.get("layer_types")
+    if not isinstance(layer_types, list):
+        layer_types = None
+
+    derived: dict[str, int] = {}
+    for legacy_key, layer_key in (
+        ("global_head_dim", "head_dim"),
+        ("num_global_key_value_heads", "num_key_value_heads"),
+    ):
+        if text_config.get(legacy_key) is not None:
+            continue
+        values: set[int] = set()
+        for layer_id, overrides in per_layer.items():
+            if not isinstance(overrides, dict) or overrides.get(layer_key) is None:
+                continue
+            if layer_types is not None:
+                try:
+                    layer_idx = int(layer_id)
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= layer_idx < len(layer_types):
+                    continue
+                if layer_types[layer_idx] != "full_attention":
+                    continue
+            try:
+                values.add(int(overrides[layer_key]))
+            except (TypeError, ValueError):
+                continue
+        if len(values) == 1:
+            derived[legacy_key] = values.pop()
+    return derived
+
+
+@contextlib.contextmanager
+def _derive_gemma4_global_kv_on_load(model_dir: Path):
+    """Feed ``per_layer_config``-only Gemma4 head overrides to the mlx-vlm loader.
+
+    Wraps ``mlx_vlm.utils.load_config`` for one ``vlm_load(...)`` so the
+    config handed to the Gemma4 ``TextConfig`` carries ``global_head_dim`` /
+    ``num_global_key_value_heads`` derived from ``per_layer_config`` when the
+    checkpoint does not spell them out (#3537). Checkpoints that already
+    carry the legacy fields, and non-Gemma4 models, are untouched.
+    """
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        yield
+        return
+    derived = (
+        _gemma4_global_kv_from_per_layer_config(config)
+        if isinstance(config, dict)
+        else {}
+    )
+    if not derived:
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original_load_config = _vu.load_config
+
+    def _patched_load_config(model_path, **kwargs):
+        loaded = original_load_config(model_path, **kwargs)
+        text_config = loaded.get("text_config") if isinstance(loaded, dict) else None
+        if isinstance(text_config, dict):
+            for key, value in derived.items():
+                if text_config.get(key) is None:
+                    text_config[key] = value
+        return loaded
+
+    logger.info(
+        "derive_gemma4_global_kv_on_load: per_layer_config -> %s",
+        ", ".join(f"{k}={v}" for k, v in derived.items()),
+    )
+    _vu.load_config = _patched_load_config
+    try:
+        yield
+    finally:
+        _vu.load_config = original_load_config
+
+
 @contextlib.contextmanager
 def _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir: Path):
     """Drop Gemma4 shared-KV extra weights for MLX-format VLM checkpoints.
@@ -906,6 +1036,20 @@ def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
     )
 
 
+def _model_shard_matcher(model_dir: Path):
+    """Return a predicate for safetensors shards directly under *model_dir*."""
+    target_dir = model_dir.resolve()
+
+    def matches(filename: object) -> bool:
+        try:
+            path = Path(filename)
+            return path.suffix == ".safetensors" and path.parent.resolve() == target_dir
+        except (TypeError, OSError, RuntimeError):
+            return False
+
+    return matches
+
+
 @contextlib.contextmanager
 def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
@@ -932,7 +1076,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
     original_safe_open = safetensors.safe_open
     original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
-    target_dir = model_dir.resolve()
+    is_target_shard = _model_shard_matcher(model_dir)
 
     class _SafeOpenMetadataWrapper:
         def __init__(self, inner):
@@ -957,11 +1101,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
-        try:
-            path = Path(filename).resolve()
-        except TypeError:
-            return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
+        if is_target_shard(filename):
             return _SafeOpenMetadataWrapper(handle)
         return handle
 
@@ -1031,6 +1171,67 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     finally:
         safetensors.safe_open = original_safe_open
         _minimax_m3_vl._sanitize_moe_weights = original_sanitize_moe_weights
+
+
+@contextlib.contextmanager
+def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
+    """Run vendored-model key sanitization before quantization selection.
+
+    Converted MLX checkpoints legitimately declare ``format=mlx``, but the
+    published Qwen4 layout still uses ``model.language_model.*`` and
+    ``model.visual.*`` names.  mlx-vlm normally skips ``Model.sanitize`` for
+    MLX-format files, which makes its quantization predicate inspect the wrong
+    names and leaves every ``scales``/``biases`` tensor unmatched.  Hide only
+    the format marker for this model and this load so sanitization happens at
+    the point expected by the upstream loader: before ``nn.quantize``.
+    """
+    model_type = _read_config_model_type(model_dir)
+    if model_type not in ("qwen4_exp", "glm5_next"):
+        yield
+        return
+
+    import safetensors
+
+    original_safe_open = safetensors.safe_open
+    is_target_shard = _model_shard_matcher(model_dir)
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        if is_target_shard(filename):
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    safetensors.safe_open = _patched_safe_open
+    try:
+        logger.info(
+            "%s pre-quantization sanitize active for %s",
+            model_type,
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
 
 
 @contextlib.contextmanager
@@ -1117,7 +1318,7 @@ def _uses_mrope(vlm_model) -> bool:
     return False
 
 
-# Qwen-style VLMs: vision_tower takes (pixel_values, grid_thw)
+# Qwen-style VLMs: vision_tower takes (pixel_values, grid_thw).
 _QWEN_VISION_MODELS = {
     "qwen3_5",
     "qwen3_5_moe",
@@ -1126,6 +1327,9 @@ _QWEN_VISION_MODELS = {
     "qwen2_vl",
     "qwen2_5_vl",
 }
+
+# Grid-based VLMs whose flat vision features can be split with grid_thw.
+_GRID_VISION_MODELS = _QWEN_VISION_MODELS | {"glm5_next"}
 
 
 # Conservative fallback upper bound on image-placeholder tokens per image
@@ -1143,9 +1347,10 @@ _IMAGE_TOKEN_UPPER_BOUND_FALLBACK = 1280
 def _derive_image_token_upper_bound(processor: Any) -> int:
     """Derive the per-image token upper bound from the processor config.
 
-    Qwen-style image processors expose ``max_pixels`` (an *area*) and
-    pack pixels into ``patch_size`` × ``patch_size`` patches, then merge
-    ``merge_size`` × ``merge_size`` patches into one model token. The
+    GLM processors expose the final ``max_image_tokens`` bound directly.
+    Qwen-style image processors expose ``max_pixels`` (an *area*) and pack
+    pixels into ``patch_size`` × ``patch_size`` patches, then merge
+    ``merge_size`` × ``merge_size`` patches into one model token. Their
     per-image token bound is therefore::
 
         max_tokens = max_pixels / (patch_size**2 * merge_size**2)
@@ -1157,6 +1362,9 @@ def _derive_image_token_upper_bound(processor: Any) -> int:
     if processor is None:
         return _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
     ip = getattr(processor, "image_processor", None) or processor
+    max_image_tokens = getattr(ip, "max_image_tokens", None)
+    if isinstance(max_image_tokens, int) and max_image_tokens > 0:
+        return max(max_image_tokens, _IMAGE_TOKEN_UPPER_BOUND_FALLBACK)
     max_pixels = getattr(ip, "max_pixels", None)
     patch_size = getattr(ip, "patch_size", None)
     merge_size = getattr(ip, "merge_size", None)
@@ -1292,8 +1500,13 @@ def _count_image_tokens_real(
     ms = getattr(ip, "merge_size", None)
     minp = getattr(ip, "min_pixels", None)
     maxp = getattr(ip, "max_pixels", None)
-    qwen_ok = all(
-        isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp)
+    qwen_ok = all(isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp))
+    patch_counter = getattr(ip, "get_number_of_image_patches", None)
+    glm_ok = (
+        callable(patch_counter)
+        and isinstance(ms, int)
+        and ms > 0
+        and isinstance(getattr(ip, "max_image_tokens", None), int)
     )
 
     total = 0
@@ -1306,9 +1519,14 @@ def _count_image_tokens_real(
                 continue
             if part.get("type") not in ("image_url", "image", "input_image"):
                 continue
-            wh = _read_image_dims(part) if qwen_ok else None
+            wh = _read_image_dims(part) if qwen_ok or glm_ok else None
             if wh is None:
                 total += upper_bound
+            elif glm_ok:
+                try:
+                    total += int(patch_counter(wh[1], wh[0]) // (ms**2))
+                except Exception:
+                    total += upper_bound
             else:
                 total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
     return total
@@ -1365,6 +1583,7 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        text_only: bool = False,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -1376,6 +1595,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
+            text_only=text_only,
         )
 
     @property
@@ -1385,6 +1605,21 @@ class VLMBatchedEngine(BaseEngine):
     @property
     def tokenizer(self) -> Any:
         return self._tokenizer
+
+    @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Opt in only when the local scheduler has no structured parser."""
+
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        return bool(
+            scheduler is not None
+            and hasattr(scheduler, "_output_parser_factory")
+            and scheduler._output_parser_factory is None
+        )
 
     @property
     def model_type(self) -> str | None:
@@ -1567,7 +1802,9 @@ class VLMBatchedEngine(BaseEngine):
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
+                _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
+                _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
                 _transpose_qwen35_mlx_vision_patch_embed_on_load(
                     Path(self._model_name)
@@ -1581,19 +1818,25 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                if _read_config_model_type(self._model_name) == COHERE2_MOE_MODEL_TYPE:
+                model_type = _read_config_model_type(self._model_name)
+                if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
-
                 with _load_optiq_vision_sidecar_on_load(
                     Path(self._model_name)
                 ):
-                    return vlm_load(
+                    load_kwargs = {
+                        "trust_remote_code": self._trust_remote_code,
+                    }
+                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                        load_kwargs["lazy"] = True
+                    loaded = vlm_load(
                         self._model_name,
-                        trust_remote_code=self._trust_remote_code,
+                        **load_kwargs,
                     )
+                    return loaded
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
@@ -1648,7 +1891,7 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
 
-        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
@@ -1668,7 +1911,7 @@ class VLMBatchedEngine(BaseEngine):
                     self._vlm_model,
                 )
             except Exception:
-                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
+                logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
@@ -1756,6 +1999,12 @@ class VLMBatchedEngine(BaseEngine):
         scheduler = self._engine.engine.scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled and self.model_type == "glm5_next":
+                logger.warning(
+                    "TurboQuant KV cache is not supported for GLM-5.3-Flash's "
+                    "composite latent/indexer cache; using the native cache layout"
+                )
+                tq_enabled = False
             if tq_enabled:
                 from ..patches.turboquant_attention import (
                     apply_turboquant_attention_patch,
@@ -1872,7 +2121,13 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
-        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+        if (
+            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(self.model_type) == "qwen"
+        ):
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
             try:
                 from ..patches.qwen35_ane_prefill import (
                     configure_qwen35_ane_prefill_scheduler,
@@ -1899,11 +2154,7 @@ class VLMBatchedEngine(BaseEngine):
                             )
                             or 0
                         ),
-                        fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fraction",
-                            0.53,
-                        ),
+                        fraction=ane_fraction,
                         max_layers=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_max_layers",
@@ -1930,11 +2181,7 @@ class VLMBatchedEngine(BaseEngine):
                             True,
                         ),
                         ane_down_fraction=(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fraction",
-                                0.53,
-                            )
+                            ane_fraction
                             if getattr(
                                 self._model_settings,
                                 "qwen35_ane_prefill_fused_down",
@@ -2003,6 +2250,18 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
+                    # The scheduler snapshotted model info before these
+                    # banks existed; price the compiled I/O surfaces now so
+                    # admission charges them while the banks are resident.
+                    from ..patches.qwen35_ane_prefill import (
+                        ane_prefill_transient_bytes,
+                    )
+
+                    monitor = getattr(scheduler, "memory_monitor", None)
+                    if monitor is not None:
+                        monitor.set_ane_prefill_transient_bytes(
+                            ane_prefill_transient_bytes(self._vlm_model)
+                        )
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
@@ -2383,6 +2642,45 @@ class VLMBatchedEngine(BaseEngine):
                 )
             ):
                 formatted_messages.append(msg)
+            elif model_type == "glm5_next" and msg_num_images > 0:
+                # mlx-vlm does not yet register glm5_next in MODEL_CONFIG, so
+                # get_message_json() treats it as unsupported and its generic
+                # fallback strips image parts.  Preserve their relative order
+                # as template-visible markers; the checkpoint's native chat
+                # template expands each marker to the GLM image token triplet.
+                glm_content: list[Any] = []
+                inserted_images = 0
+                if isinstance(raw_content, list):
+                    for item in raw_content:
+                        if isinstance(item, dict):
+                            item_type = item.get("type", "")
+                            item_text = item.get("text", "")
+                        else:
+                            item_type = getattr(item, "type", "")
+                            item_text = getattr(item, "text", "")
+
+                        if item_type in image_part_types:
+                            if inserted_images < msg_num_images:
+                                glm_content.append({"type": "image"})
+                                inserted_images += 1
+                        elif item_type == "text":
+                            glm_content.append({"type": "text", "text": item_text})
+                        elif isinstance(item, str):
+                            glm_content.append(item)
+
+                if inserted_images < msg_num_images:
+                    glm_content[:0] = [
+                        {"type": "image"}
+                        for _ in range(msg_num_images - inserted_images)
+                    ]
+                if not any(
+                    isinstance(item, str)
+                    or (isinstance(item, dict) and item.get("type") == "text")
+                    for item in glm_content
+                ):
+                    glm_content.append({"type": "text", "text": content})
+
+                formatted_messages.append({"role": role, "content": glm_content})
             else:
                 formatted = get_message_json(
                     model_type,
@@ -2395,7 +2693,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 # Collapse text-only list content to plain string so that
                 # simplified chat templates (without render_content macro)
-                # can handle it.  Image/audio/video parts stay as list.
+                # can handle it. Image/audio parts stay as a list.
                 fc = formatted.get("content")
                 if isinstance(fc, list) and all(
                     isinstance(p, dict) and p.get("type") == "text" for p in fc
@@ -2489,8 +2787,6 @@ class VLMBatchedEngine(BaseEngine):
         if model_type in _QWEN_VISION_MODELS:
             grid_thw = extra_model_inputs.get("image_grid_thw")
             if grid_thw is None:
-                grid_thw = extra_model_inputs.get("video_grid_thw")
-            if grid_thw is None:
                 return None
             dtype = model.vision_tower.patch_embed.proj.weight.dtype
             pv = (
@@ -2582,13 +2878,14 @@ class VLMBatchedEngine(BaseEngine):
                 return result
 
         # Qwen: flat (total_merged_tokens, dim) → split using grid_thw
-        if model_type in _QWEN_VISION_MODELS and features.ndim == 2:
+        if model_type in _GRID_VISION_MODELS and features.ndim == 2:
             grid_thw = extra_model_inputs.get("image_grid_thw")
             if grid_thw is None:
                 return None
-            spatial_merge_size = getattr(
-                self._vlm_model.vision_tower, "spatial_merge_size", 2
-            )
+            vision_tower = getattr(self._vlm_model, "vision_tower", None)
+            if vision_tower is None:
+                vision_tower = getattr(self._vlm_model, "vision_model", None)
+            spatial_merge_size = getattr(vision_tower, "spatial_merge_size", 2)
             merge_sq = spatial_merge_size**2
             per_image_tokens = []
             for i in range(num_images):
@@ -2756,10 +3053,17 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
-        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
+        if model_type == COHERE2_MOE_MODEL_TYPE and (
+            num_images > 0 or num_audios > 0
+        ):
             raise InvalidRequestError(
                 "Cohere2 MoE is a text-only model and does not support "
                 "image or audio input.",
+                field="messages",
+            )
+        if model_type == QWEN4_EXP_MODEL_TYPE and num_audios > 0:
+            raise InvalidRequestError(
+                "Qwen4-Exp supports text and image input but not audio.",
                 field="messages",
             )
 
@@ -2789,7 +3093,9 @@ class VLMBatchedEngine(BaseEngine):
         try:
             formatted_messages, image_message_ranges = (
                 self._format_messages_for_vlm_template(
-                    messages, num_images=num_images, num_audios=num_audios
+                    messages,
+                    num_images=num_images,
+                    num_audios=num_audios,
                 )
             )
         except Exception as e:
@@ -2979,7 +3285,11 @@ class VLMBatchedEngine(BaseEngine):
         extra_model_inputs = {
             k: v
             for k, v in inputs.items()
-            if k not in ("input_ids", "attention_mask", "pixel_values")
+            if k not in (
+                "input_ids",
+                "attention_mask",
+                "pixel_values",
+            )
             and v is not None
         }
 
@@ -3119,14 +3429,9 @@ class VLMBatchedEngine(BaseEngine):
             # global state that gets overwritten by subsequent calls.
             # Storing per-request ensures correct position computation
             # when multiple VLM requests are batched.
-            lm = getattr(self._vlm_model, "language_model", None)
-            if lm is not None:
-                pid = getattr(lm, "_position_ids", None)
-                if pid is not None and "position_ids" not in extra_kwargs:
-                    extra_kwargs["position_ids"] = pid
-                rd = getattr(lm, "_rope_deltas", None)
-                if rd is not None:
-                    extra_kwargs["_captured_rope_deltas"] = rd
+            _capture_vlm_position_state(
+                getattr(self._vlm_model, "language_model", None), extra_kwargs
+            )
 
             # Extract token IDs as list
             token_ids = (
@@ -3381,6 +3686,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 
@@ -3494,6 +3800,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
@@ -3521,6 +3828,7 @@ class VLMBatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    first_token_at=getattr(output, "first_token_at", None),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))
@@ -3715,19 +4023,23 @@ class VLMBatchedEngine(BaseEngine):
             return
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
-        num_tokens += _count_image_tokens_real(
+        image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
             upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),
         )
+        num_tokens += image_tokens
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            text_only=image_tokens == 0,
         )
 
     async def preflight_completion(
@@ -3760,7 +4072,10 @@ class VLMBatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            text_only=True,
         )
 
     async def stream_chat(

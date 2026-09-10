@@ -33,6 +33,26 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
 
 
 class TestRemoteCodePreflight:
+    @pytest.mark.parametrize("supported", [False, True])
+    @pytest.mark.parametrize("trusted", [False, True])
+    def test_final_tokenizer_load_uses_the_configured_trust_setting(
+        self, monkeypatch, supported, trusted
+    ):
+        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", supported)
+        monkeypatch.setattr(model_loading, "preflight_text_remote_code", MagicMock())
+        loader = MagicMock(return_value=("MODEL", "TOKENIZER"))
+        monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(load=loader))
+        options = {"trust_remote_code": not trusted, "tool_parser_type": "k2_horizon"}
+        model_loading.lm_load_compat(
+            "K2", trust_remote_code=trusted, tokenizer_config=options
+        )
+        actual = loader.call_args.kwargs
+        assert actual["tokenizer_config"] == {
+            "trust_remote_code": trusted, "tool_parser_type": "k2_horizon"
+        }
+        assert ("trust_remote_code" in actual) is supported
+        assert options["trust_remote_code"] is not trusted
+
     def test_custom_model_file_is_rejected_before_weight_loading(self, tmp_path):
         with pytest.raises(ValueError, match="Enable Trust Remote Code"):
             ensure_model_code_trusted(
@@ -613,7 +633,10 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
-
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "language_model.mtp."
+        )
 
     def test_returns_true_when_index_has_bare_mtp(self, tmp_path):
         self._write_index(
@@ -621,6 +644,9 @@ class TestCheckpointHasMtpWeights:
             {"mtp.layers.0.self_attn.q_proj.weight": "model.safetensors"},
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) == "mtp."
+        )
 
     def test_returns_true_when_index_has_model_language_model_mtp(self, tmp_path):
         # mlx-vlm HF-source layout before sanitize-time remap (oQ writes this).
@@ -629,6 +655,10 @@ class TestCheckpointHasMtpWeights:
             {"model.language_model.mtp.norm.weight": "model.safetensors"},
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "model.language_model.mtp."
+        )
 
     def test_returns_false_when_index_lacks_mtp(self, tmp_path):
         # Unsloth Qwen3.6 UD MLX layout: vision_tower + language_model.model.*
@@ -642,6 +672,7 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+        assert model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) is None
 
     @pytest.mark.parametrize(
         "prefix",
@@ -667,6 +698,27 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) is None
+
+    def test_returns_false_for_qwen4_nextn_layout(self, tmp_path):
+        import json as _json
+
+        (tmp_path / "config.json").write_text(
+            _json.dumps(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {
+                        "num_hidden_layers": 78,
+                        "num_nextn_predict_layers": 1,
+                    },
+                }
+            )
+        )
+        self._write_index(
+            tmp_path,
+            {"model.layers.78.eh_proj.weight": "model.safetensors"},
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
 
     def test_returns_false_for_nextn_config_without_weights(self, tmp_path):
         # Config declares nextn layers but the checkpoint stripped them.
@@ -715,6 +767,10 @@ class TestCheckpointHasMtpWeights:
         )
 
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "language_model.mtp."
+        )
 
 
 class TestExpandPerLayerQuantKeys:
@@ -801,6 +857,26 @@ class TestExpandPerLayerQuantKeys:
 
 
 class TestMaterializeLazyState:
+    def test_evaluates_arrays_in_bounded_chunks(self, monkeypatch):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.tensor_list = [mx.array(i) * 2 for i in range(17)]
+
+        chunk_sizes = []
+        monkeypatch.setattr(
+            model_loading.mx,
+            "eval",
+            lambda arrays: chunk_sizes.append(len(arrays)),
+        )
+
+        model_loading.materialize_lazy_state(_Model())
+
+        assert chunk_sizes == [8, 8, 1]
+
     def test_covers_arrays_in_plain_helper_objects(self):
         """Lazy arrays hidden in non-Module helpers must be materialized.
 

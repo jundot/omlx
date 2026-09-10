@@ -210,6 +210,20 @@ def _install_ready_pool(
     # established. Do not let their synthetic ``studio.local`` host escape to
     # the real SSH liveness probe; peer-loss behavior has dedicated coverage.
     monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
+    pool.verified_teardowns = []
+    monkeypatch.setattr(
+        routes,
+        "stop_deployment_processes",
+        lambda deployment: (
+            pool.verified_teardowns.append(deployment.deployment_id)
+            or {
+                "verified": True,
+                "deployment_id": deployment.deployment_id,
+                "ranks_checked": deployment.world_size,
+                "manifest_retired": False,
+            }
+        ),
+    )
     return pool
 
 
@@ -522,7 +536,9 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     assert studio["capacity_bytes"] < 223 * gib
 
 
-def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monkeypatch):
+def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
+    monkeypatch,
+):
     """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
 
     gib = 1024**3
@@ -608,9 +624,10 @@ def test_cluster_plan_route_builds_unequal_pipeline():
     assert payload["assignments"][0]["layer_count"] == 54
     assert payload["assignments"][1]["node_id"] == "mobile"
     assert payload["assignments"][1]["layer_count"] == 26
-    assert [
-        item["memory_guard_tier"] for item in payload["assignments"]
-    ] == ["aggressive", "safe"]
+    assert [item["memory_guard_tier"] for item in payload["assignments"]] == [
+        "aggressive",
+        "safe",
+    ]
 
 
 def test_cluster_plan_route_requires_exactly_one_model_source():
@@ -823,28 +840,28 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     )
 
     body = {
-            "deployment_id": "nemotron-pool",
-            "model_path": str(model_path),
-            "backend": "jaccl",
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["192.168.5.1"],
-                    "rdma": [None, "rdma_en5"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["192.168.5.2"],
-                    "rdma": ["rdma_en5", None],
-                },
-            ],
-        }
+        "deployment_id": "nemotron-pool",
+        "model_path": str(model_path),
+        "backend": "jaccl",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["192.168.5.1"],
+                "rdma": [None, "rdma_en5"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["192.168.5.2"],
+                "rdma": ["rdma_en5", None],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -865,15 +882,28 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     assert pool.reloads == 1
     assert len(payload["preflight"]) == 2
     assert payload["performance_probe"]["status"] in {"applied", "placement_locked"}
-    assert (
-        payload["plan"]["placement_signature"]
-        == body["approved_placement"]
-    )
+    assert payload["plan"]["placement_signature"] == body["approved_placement"]
     assert payload["deployment"]["execution"]["profile"] == "balanced"
 
     listed = _client().get("/admin/api/cluster/deployments")
     assert listed.status_code == 200
     assert listed.json()["deployments"][0]["deployment_id"] == "nemotron-pool"
+
+    unloaded = _client().post("/admin/api/cluster/deployments/nemotron-pool/unload")
+    assert unloaded.status_code == 200, unloaded.json()
+    assert unloaded.json()["configured"] is True
+    assert unloaded.json()["stopped"] is True
+    assert unloaded.json()["teardown"]["verified"] is True
+    assert pool.verified_teardowns == ["nemotron-pool"]
+    assert pool.entry.engine is None
+    assert routes.get_cluster_registry().get("nemotron-pool") is not None
+
+    loaded = _client().post("/admin/api/cluster/deployments/nemotron-pool/load")
+    assert loaded.status_code == 200, loaded.json()
+    assert loaded.json()["loaded"] is True
+    assert loaded.json()["canary_completion_tokens"] == 1
+    assert len(loaded.json()["ranks"]) == 2
+    assert pool.entry.engine is not None
 
     removed = _client().delete("/admin/api/cluster/deployments/nemotron-pool")
     assert removed.status_code == 200
@@ -915,26 +945,26 @@ def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
     )
 
     body = {
-            "deployment_id": "fallback-pool",
-            "model_path": str(model_path),
-            "backend": "ring",
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "deployment_id": "fallback-pool",
+        "model_path": str(model_path),
+        "backend": "ring",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -974,27 +1004,27 @@ def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
     )
 
     body = {
-            "deployment_id": "canary-failure",
-            "model_path": str(model_path),
-            "backend": "ring",
-            "auto_tune": False,
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "deployment_id": "canary-failure",
+        "model_path": str(model_path),
+        "backend": "ring",
+        "auto_tune": False,
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -1022,25 +1052,25 @@ def test_cluster_deployment_rejects_unsafe_ssh_target(tmp_path, monkeypatch):
     )
 
     body = {
-            "model_path": str(tmp_path / "model"),
-            "backend": "ring",
-            "nodes": [
-                {"node_id": "local", "capacity_bytes": 10},
-                {"node_id": "peer", "capacity_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "local",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "peer",
-                    "ssh": "peer.local; bad",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "model_path": str(tmp_path / "model"),
+        "backend": "ring",
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 10},
+            {"node_id": "peer", "capacity_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "local",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "peer",
+                "ssh": "peer.local; bad",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -1192,9 +1222,7 @@ def test_pairing_token_route_authenticates_with_the_shared_secret():
     assert rejected.json() == {"valid": False}
 
 
-def test_cuda_join_command_is_single_use_pinned_and_not_cached(
-    monkeypatch, tmp_path
-):
+def test_cuda_join_command_is_single_use_pinned_and_not_cached(monkeypatch, tmp_path):
     from omlx.cluster import ssh_keys
 
     store = ClusterEnrollmentStore(tmp_path)
@@ -1226,9 +1254,10 @@ def test_cuda_join_command_is_single_use_pinned_and_not_cached(
     assert payload["controller_key_fingerprint"] == fingerprint
     assert payload["single_use"] is True
     assert payload["expires_at"] - payload["created_at"] == 30 * 60
-    assert '"join_key":' not in _enrollment_client().get(
-        "/admin/api/cluster/join-status"
-    ).text
+    assert (
+        '"join_key":'
+        not in _enrollment_client().get("/admin/api/cluster/join-status").text
+    )
 
 
 def test_cuda_join_command_only_accepts_a_private_ipv4_controller():
@@ -1242,9 +1271,7 @@ def test_cuda_join_command_only_accepts_a_private_ipv4_controller():
         assert "controller" in response.json()["detail"]
 
 
-def test_cuda_worker_claim_replay_and_completion_fail_closed(
-    monkeypatch, tmp_path
-):
+def test_cuda_worker_claim_replay_and_completion_fail_closed(monkeypatch, tmp_path):
     from omlx.cluster import ssh_keys
 
     store = ClusterEnrollmentStore(tmp_path)
@@ -1342,9 +1369,10 @@ def test_cuda_worker_completion_refuses_a_forged_host_fingerprint(
             fingerprint=ssh_keys.ssh_public_key_fingerprint(controller_key),
         ),
     )
-    worker_key = "ssh-ed25519 " + base64.b64encode(
-        b"worker-host-key-material-long-enough"
-    ).decode()
+    worker_key = (
+        "ssh-ed25519 "
+        + base64.b64encode(b"worker-host-key-material-long-enough").decode()
+    )
     raw_key, _ = store.issue_join_key(
         controller_url="http://10.42.0.10:8000",
         source_digest="b" * 64,
@@ -2037,8 +2065,7 @@ def test_cuda_fabric_verification_is_a_gui_api_and_uses_live_peer_facts(monkeypa
         ("192.168.100.2", "192.168.101.2"),
     ]
     assert all(
-        host.interfaces == ("enp1s0f0np0", "enp2s0f0np0")
-        for host in captured["hosts"]
+        host.interfaces == ("enp1s0f0np0", "enp2s0f0np0") for host in captured["hosts"]
     )
 
 

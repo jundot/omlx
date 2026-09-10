@@ -228,4 +228,24 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
 
         XCTAssertFalse(vm.autoStartOnLaunch)
     }
+
+    func testAudioUploadSizeValidation() {
+        for valid in ["1B", "100MB", "1.5GB", "1024"] {
+            XCTAssertTrue(ServerScreenVM.isValidAudioUploadSize(valid), valid)
+        }
+        for invalid in ["", "0MB", "-1MB", "100 MB", "infMB", "bogus"] {
+            XCTAssertFalse(ServerScreenVM.isValidAudioUploadSize(invalid), invalid)
+        }
+    }
+
+    func testAudioUploadChangeEnablesApply() {
+        let services = makeServices(basePath: "/Users/Fido/.omlx",
+                                    modelDir: "/Users/Fido/.omlx/models")
+        let vm = ServerScreenVM()
+        vm.basePathText = "/Users/Fido/.omlx"
+        vm.modelDirTexts = ["/Users/Fido/.omlx/models"]
+        vm.maxAudioUploadSizeText = "250MB"
+
+        XCTAssertTrue(vm.hasPendingServerChanges(services: services))
+    }
 }

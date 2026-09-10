@@ -62,6 +62,8 @@ struct StatusScreen: View {
                                   comment: "Header label above average serving speed metrics"))
             AverageSpeedTilesRow(stats: vm.stats)
 
+            UsageHistoryView()
+
             SectionHeader(String(localized: "status.section.active_now",
                                   defaultValue: "Active Now",
                                   comment: "Section header for the currently active models list"))
@@ -125,12 +127,7 @@ struct StatusScreen: View {
                                   comment: "Section header for the updates section"))
             UpdatesSection(updates: services.updates)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18).padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task(id: vm.scope) {
             await vm.start(client: services.client)
@@ -619,7 +616,7 @@ private struct UpdatesSection: View {
                         get: { updates.channel },
                         set: { updates.channel = $0 }
                     ),
-                    width: 190,
+                    width: .controlMedium,
                     options: UpdateChannel.allCases.map { ($0, $0.displayName) }
                 )
             }
@@ -631,12 +628,10 @@ private struct UpdatesSection: View {
                                  defaultValue: "Look for updates daily in the background",
                                  comment: "Sublabel for the auto-check toggle")
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoCheck },
                     set: { updates.autoCheck = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
             Row(
                 label: String(localized: "status.updates.auto_download",
@@ -647,12 +642,10 @@ private struct UpdatesSection: View {
                                  comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoNotify },
                     set: { updates.autoNotify = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
         }
     }

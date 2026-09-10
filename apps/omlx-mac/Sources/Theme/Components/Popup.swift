@@ -1,4 +1,5 @@
-// PR 3 — dropdown picker styled to match the JSX `Popup`.
+// PR 3 — dropdown picker. Renders the native macOS menu picker so selects
+// share one bezel, height, and font with the rest of the system controls.
 
 import SwiftUI
 
@@ -13,78 +14,35 @@ struct Popup<Value: Hashable>: View {
     var titleKey: LocalizedStringKey
     let options: [PopupOption<Value>]
     let width: CGFloat?
-    let fillsWidth: Bool
 
-    @Environment(\.omlxTheme) private var theme
-
-    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, fillsWidth: Bool = false, options: [PopupOption<Value>]) {
+    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, options: [PopupOption<Value>]) {
         self.titleKey = titleKey
         self._selection = selection
         self.options = options
         self.width = width
-        self.fillsWidth = fillsWidth
     }
 
-    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, fillsWidth: Bool = false, options: [(Value, String)]) {
+    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, options: [(Value, String)]) {
         self.titleKey = titleKey
         self._selection = selection
         self.options = options.map { PopupOption(value: $0.0, label: $0.1) }
         self.width = width
-        self.fillsWidth = fillsWidth
     }
 
     var body: some View {
-        if fillsWidth, let width {
-            Menu {
-                ForEach(options) { opt in
-                    Button {
-                        selection = opt.value
-                    } label: {
-                        if opt.value == selection {
-                            Label(opt.label, systemImage: "checkmark")
-                        } else {
-                            Text(opt.label)
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Text(selectedOption?.label ?? "")
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                .font(.omlxText(13, weight: .medium))
-                .foregroundStyle(theme.text)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .frame(width: width)
-                .background(theme.controlBg)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(theme.inputBorder, lineWidth: 0.5)
-                }
-                .contentShape(Rectangle())
+        Picker(titleKey, selection: $selection) {
+            ForEach(options) { opt in
+                Text(opt.label)
+                    .tag(opt.value)
             }
-            .menuStyle(.borderlessButton)
-            .accessibilityValue(selectedOption?.label ?? "")
-        } else {
-            Picker(titleKey, selection: $selection) {
-                ForEach(options) { opt in
-                    Text(opt.label)
-                        .tag(opt.value)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(maxWidth: width)
         }
-    }
-
-    private var selectedOption: PopupOption<Value>? {
-        options.first { $0.value == selection }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        // The native popup bezel hugs its label, and a bare `maxWidth` frame
+        // would center it — leaving air on both sides. Pin it trailing so
+        // select bezels end flush with the other controls in the column;
+        // `width` stays the cap that keeps long labels from sprawling.
+        .frame(maxWidth: width, alignment: .trailing)
     }
 }
 
@@ -93,13 +51,13 @@ struct Popup<Value: Hashable>: View {
     @Previewable @State var quant = "q4"
 
     VStack(alignment: .leading, spacing: 14) {
-        Popup(selection: $host, width: 220, options: [
+        Popup(selection: $host, width: .controlMedium, options: [
             ("127.0.0.1", "127.0.0.1 (Local only)"),
             ("0.0.0.0", "0.0.0.0 (IPv4 only)"),
             ("::", "0.0.0.0 & :: (All Networks)"),
             ("localhost", "localhost"),
         ])
-        Popup(selection: $quant, width: 120, options: [
+        Popup(selection: $quant, width: .controlCompact, options: [
             ("auto", "Auto"), ("q4", "q4"), ("q5", "q5"), ("q6", "q6"), ("q8", "q8"), ("fp16", "fp16"),
         ])
     }

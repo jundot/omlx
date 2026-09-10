@@ -8,6 +8,7 @@ import json
 import re
 from typing import Any, List
 
+from ..exceptions import InvalidRequestError
 from .openai_models import Message
 
 # Model families whose chat templates consume message.reasoning_content directly.
@@ -21,6 +22,8 @@ _NATIVE_REASONING_MODEL_TYPES = {
     # Muse Glimmer's chat template renders history reasoning_content into
     # <|start|>assistant to=self<|message|> blocks.
     "muse_glimmer",
+    # K2 requires a reasoning field for every assistant turn.
+    "k2_horizon",
 }
 
 
@@ -42,6 +45,22 @@ def uses_native_reasoning_content(
 
     lowered = (model_name or "").lower()
     return "minimax" in lowered and "m3" in lowered
+
+
+def cache_reasoning_output(
+    settings: Any,
+    *,
+    native_reasoning: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> bool:
+    """Whether a reasoning request's output tokens can prefix-match the next turn."""
+    forced = getattr(settings, "cache_reasoning_output", None)
+    if forced is not None:
+        return bool(forced)
+    preserve_thinking = (chat_template_kwargs or {}).get("preserve_thinking")
+    if preserve_thinking is False:
+        return False
+    return bool(native_reasoning) or preserve_thinking is True
 
 
 def merge_reasoning_effort_chat_template_kwargs(
@@ -239,6 +258,11 @@ def _extract_multimodal_content_list(content: list) -> list:
                             "input_audio": input_audio,
                         }
                     )
+            elif item_type in ("video_url", "input_video"):
+                raise InvalidRequestError(
+                    "Video input is not supported by oMLX.",
+                    field="messages",
+                )
     return parts
 
 
@@ -1338,6 +1362,41 @@ def _wrap_truncated_for_harmony(truncated_text: str) -> dict:
             "truncated": f"Showing {match.group(2)} of {match.group(1)} tokens",
         }
     return {"output": truncated_text}
+
+
+_K2_THINKING_FIELDS = (
+    "think",
+    "think_fast",
+    "think_faster",
+    "reasoning",
+    "reasoning_content",
+)
+
+
+def extract_k2_horizon_messages(
+    messages: list[Any],
+    max_tool_result_tokens: int | None = None,
+    tokenizer: Any | None = None,
+    consolidate_system_messages: bool = True,
+) -> list[dict]:
+    """Give every assistant turn the thinking field the K2 Horizon template requires."""
+    if any(not isinstance(msg, dict) for msg in messages):
+        processed = extract_text_content(
+            messages,
+            max_tool_result_tokens,
+            tokenizer,
+            native_reasoning_content=True,
+            consolidate_system_messages=consolidate_system_messages,
+        )
+    else:
+        processed = [dict(msg) for msg in messages]
+
+    for msg in processed:
+        if msg.get("role") != "assistant":
+            continue
+        if not any(isinstance(msg.get(field), str) for field in _K2_THINKING_FIELDS):
+            msg["reasoning_content"] = ""
+    return processed
 
 
 def extract_harmony_messages(

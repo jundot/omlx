@@ -47,7 +47,8 @@ router = APIRouter()
 # {"type": "start"} message instead.
 realtime_router = APIRouter()
 
-# Maximum upload size for audio files (100 MB).
+# Maximum upload size for audio files (100 MB). Used as the default when
+# server settings are not initialized.
 MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
 
 # Maximum base64-encoded ref_audio size (~15 MB raw audio, enough for ~60s).
@@ -134,8 +135,26 @@ def _record_audio_request(model_id: str) -> None:
         logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
 
 
+def _max_audio_upload_bytes() -> int:
+    """Return the configured audio upload limit, falling back to the default."""
+    try:
+        from omlx.settings import get_settings
+
+        return get_settings().server.max_audio_upload_bytes()
+    except RuntimeError:
+        return MAX_AUDIO_UPLOAD_BYTES
+    except (AttributeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Invalid max_audio_upload_size; using %s byte default: %s",
+            MAX_AUDIO_UPLOAD_BYTES,
+            exc,
+        )
+        return MAX_AUDIO_UPLOAD_BYTES
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
+    limit = _max_audio_upload_bytes()
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -143,12 +162,12 @@ async def _read_upload(file: UploadFile) -> bytes:
         if not chunk:
             break
         total += len(chunk)
-        if total > MAX_AUDIO_UPLOAD_BYTES:
+        if total > limit:
             raise HTTPException(
                 status_code=413,
                 detail=(
                     f"Audio file exceeds maximum allowed size "
-                    f"({MAX_AUDIO_UPLOAD_BYTES} bytes)"
+                    f"({limit} bytes)"
                 ),
             )
         chunks.append(chunk)

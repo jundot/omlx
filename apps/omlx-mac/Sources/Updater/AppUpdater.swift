@@ -20,6 +20,8 @@ final class AppUpdater {
         case notWritable(String)
         case downloadFailed(String)
         case mountFailed(String)
+        case unmountFailed(String)
+        case cleanupFailed(String)
         case appNotFoundInVolume
         case stageFailed(String)
         case cancelled
@@ -30,6 +32,8 @@ final class AppUpdater {
                 return "Cannot write to \(path). Move oMLX.app to a writable location and try again."
             case .downloadFailed(let m): return "Download failed: \(m)"
             case .mountFailed(let m): return "Could not mount DMG: \(m)"
+            case .unmountFailed(let m): return "Could not unmount DMG: \(m)"
+            case .cleanupFailed(let m): return "Could not clean up update files: \(m)"
             case .appNotFoundInVolume: return "oMLX.app not found inside the downloaded DMG"
             case .stageFailed(let m): return "Could not stage the update: \(m)"
             case .cancelled: return "Update cancelled"
@@ -124,7 +128,12 @@ final class AppUpdater {
             onError(.downloadFailed("Could not create temp dir: \(error.localizedDescription)"))
             return
         }
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        var temporaryDirectoryNeedsCleanup = true
+        defer {
+            if temporaryDirectoryNeedsCleanup {
+                try? FileManager.default.removeItem(at: tmpDir)
+            }
+        }
 
         let dmgPath = tmpDir.appendingPathComponent("oMLX-\(version).dmg")
 
@@ -150,7 +159,12 @@ final class AppUpdater {
             onError(.mountFailed(error.localizedDescription)); return
         }
 
-        defer { _ = try? unmountDMG(at: mountPoint) }
+        var mountedDMGNeedsCleanup = true
+        defer {
+            if mountedDMGNeedsCleanup {
+                try? unmountDMG(at: mountPoint)
+            }
+        }
 
         if cancelled { return }
         onProgress(.staging)
@@ -165,8 +179,40 @@ final class AppUpdater {
         }
 
         if cancelled { return }
-        onProgress(.ready)
-        onReady()
+        do {
+            try Self.finishStagedUpdate(
+                detach: {
+                    try unmountDMG(at: mountPoint)
+                    mountedDMGNeedsCleanup = false
+                },
+                removeTemporaryFiles: {
+                    try FileManager.default.removeItem(at: tmpDir)
+                    temporaryDirectoryNeedsCleanup = false
+                },
+                notifyReady: {
+                    onProgress(.ready)
+                    onReady()
+                }
+            )
+        } catch let err as UpdateError {
+            onError(err)
+        } catch {
+            onError(.cleanupFailed(error.localizedDescription))
+        }
+    }
+
+    /// Releases every resource owned by a staged update before notifying the
+    /// controller. `notifyReady` may synchronously terminate the process, so
+    /// moving either cleanup step after it would leak the mounted image and
+    /// its downloaded backing file.
+    static func finishStagedUpdate(
+        detach: () throws -> Void,
+        removeTemporaryFiles: () throws -> Void,
+        notifyReady: () -> Void
+    ) throws {
+        try detach()
+        try removeTemporaryFiles()
+        notifyReady()
     }
 
     // MARK: - Download
@@ -313,13 +359,16 @@ final class AppUpdater {
         throw UpdateError.mountFailed("Could not parse hdiutil output")
     }
 
-    @discardableResult
-    private func unmountDMG(at mountPoint: URL) throws -> Bool {
+    private func unmountDMG(at mountPoint: URL) throws {
         let result = try runProcess(
             "/usr/bin/hdiutil",
             args: ["detach", mountPoint.path, "-force"]
         )
-        return result.status == 0
+        guard result.status == 0 else {
+            throw UpdateError.unmountFailed(
+                result.stderr.isEmpty ? result.stdout : result.stderr
+            )
+        }
     }
 
     // MARK: - Stage

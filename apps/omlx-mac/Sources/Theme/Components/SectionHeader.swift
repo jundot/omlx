@@ -36,7 +36,9 @@ struct SectionHeader<Trailing: View>: View {
             Spacer(minLength: 0)
             trailing
         }
-        .padding(.horizontal, 14)
+        // 28 = card gutter (14) + row inset (14): header text lines up with
+        // the row text inside the ListGroup below, like System Settings.
+        .padding(.horizontal, 28)
         .padding(.top, 14)
         .padding(.bottom, 6)
     }

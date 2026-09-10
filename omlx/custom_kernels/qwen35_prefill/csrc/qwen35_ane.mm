@@ -135,22 +135,20 @@ NSString *ane_compile_cache_root_directory() {
       stringByAppendingPathComponent:@"v1"];
 }
 
-// ~/Library/Caches/omlx/ane/v1/<os-build>/<identifier>.i<instance>. The ANE
-// identifier covers weights, shapes, sequence length, and split layout. The
-// remaining path components invalidate artifacts when the cache schema or the
-// OS compiler/runtime changes.
-NSString *ane_compile_cache_directory(NSString *identifier, int ane_instance) {
+// ~/Library/Caches/omlx/ane/v1/<os-build>/<identifier>. The private ANE
+// runtime keys its compiled-program cache by this descriptor content hash.
+// oMLX only needs a matching cross-process lock; it must not assign this path
+// as the in-memory model URL (#3124).
+NSString *ane_compile_cache_lock_entry(NSString *identifier) {
   NSString *os_build =
       [[NSProcessInfo processInfo] operatingSystemVersionString];
   os_build =
       [os_build stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
   os_build =
       [os_build stringByReplacingOccurrencesOfString:@":" withString:@"_"];
-  NSString *entry =
-      [NSString stringWithFormat:@"%@.i%d", identifier, ane_instance];
   return [[ane_compile_cache_root_directory()
       stringByAppendingPathComponent:os_build]
-      stringByAppendingPathComponent:entry];
+      stringByAppendingPathComponent:identifier];
 }
 
 std::string error_text(NSString *prefix, NSError *error);
@@ -227,39 +225,19 @@ std::string error_text(NSString *prefix, NSError *error) {
   return std::string([value UTF8String]);
 }
 
-void remove_ane_staging_directory(NSString *directory) noexcept {
+void remove_ane_staging_directory(NSString *directory,
+                                  NSString *cache_lock_entry) noexcept {
   if (directory == nil) {
     return;
   }
-  // Resolve before the prefix check: a symlink under the cache root could
-  // otherwise redirect the delete outside it while the textual prefix still
-  // matched. The resolved path is what removeItemAtPath: will actually touch.
-  NSString *root = ane_compile_cache_root_directory();
-  NSString *resolved =
-      [directory stringByResolvingSymlinksInPath];
-  NSString *cache_root = [root stringByResolvingSymlinksInPath];
-  NSString *cache_prefix = [cache_root stringByAppendingString:@"/"];
-  if (![resolved hasPrefix:cache_prefix]) {
-    if ([directory hasPrefix:[root stringByAppendingString:@"/"]]) {
-      // A path that sits under the cache root but resolves outside it is not
-      // ours to delete: following it would take the delete somewhere this
-      // process never staged anything. The temp-directory path below is a
-      // different case, it never claimed to be a cache entry.
-      NSLog(@"oMLX: ANE compile cache cleanup skipped, %@ resolves outside "
-            @"the cache root",
-            directory);
-      return;
-    }
-    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-    return;
-  }
-  if (!ane_compile_cache_enabled()) {
+  if (cache_lock_entry == nil) {
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
     return;
   }
   try {
-    // Compile/load and cleanup mutate the same shared staging path.
-    ScopedAneCacheLock cache_lock(directory);
+    // Compile/load and cleanup mutate the same historical temp path. Keep
+    // cleanup in the descriptor-hash lock domain used by cache-enabled loads.
+    ScopedAneCacheLock cache_lock(cache_lock_entry);
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
   } catch (const std::exception &failure) {
     // Cleanup must not make model teardown fail. Leaving staging behind is
@@ -268,37 +246,40 @@ void remove_ane_staging_directory(NSString *directory) noexcept {
   }
 }
 
-// Cache-first load for one private-ANE program. When the cache is disabled
-// (the default) this is the historical sequence: staging directory,
-// stage files, compile, load, delete on unload. When enabled, the model URL
-// points at a stable cache path so the private runtime can reuse a program
-// it already compiled in an earlier process; the lock serializes writers,
-// and a restored program whose load fails is invalidated and recompiled
-// exactly once. An unavailable cache root or lock fails open to the
-// historical temp path instead of breaking the load. Apple owns the
-// persistent compiled artifacts; oMLX only stages its MIL and weight inputs,
-// and the caller deletes that staging directory on unload as before. The
-// helper writes `mil` as model.mil and each blob of `weight_files` under
-// weights/ in a directory that has just been cleared.
-NSString *load_or_compile_ane_model(
-    id model, NSString *identifier, int ane_instance,
-    NSDictionary *execution_options, NSData *mil,
-    NSDictionary<NSString *, NSData *> *weight_files,
-    NSString *compile_what, NSString *load_what) {
-  NSString *directory = nil;
+struct AneLoadResult {
+  NSString *staging_directory;
+  NSString *cache_lock_entry;
+};
+
+// Cache-first load for one private-ANE program. The in-memory model already
+// derives its model URL and compiled-cache key from the descriptor content
+// hash. Overriding that URL breaks the per-file bundle hash verification added
+// by macOS 27, so both cache modes retain the historical temporary staging
+// path. With caching enabled, compiledModelExists probes Apple's persistent
+// cache directly; a hit skips materialization and compilation. A restored
+// program whose load fails is purged and recompiled exactly once. oMLX owns
+// only temporary MIL and weight inputs, deleting them on unload as before.
+AneLoadResult
+load_or_compile_ane_model(id model, NSString *identifier, int ane_instance,
+                          NSDictionary *execution_options, NSData *mil,
+                          NSDictionary<NSString *, NSData *> *weight_files,
+                          NSString *compile_what, NSString *load_what) {
+  NSString *directory =
+      [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
+  NSString *cache_lock_entry = nil;
   bool restored = false;
+  bool staged = false;
   std::unique_ptr<ScopedAneCacheLock> cache_lock;
   if (ane_compile_cache_enabled()) {
     try {
-      directory = ane_compile_cache_directory(identifier, ane_instance);
-      // Hold the entry lock from probe through load so a second process
-      // compiling the same program waits instead of racing the writes.
-      cache_lock = std::make_unique<ScopedAneCacheLock>(directory);
-      ((void (*)(id, SEL, id))objc_msgSend)(
-          model, @selector(setModelURL:),
-          [NSURL fileURLWithPath:directory isDirectory:YES]);
-      restored = ((BOOL (*)(id, SEL))objc_msgSend)(
-          model, @selector(compiledModelExists));
+      cache_lock_entry = ane_compile_cache_lock_entry(identifier);
+      // Hold the descriptor-hash lock from probe through load so a second
+      // process compiling the same program waits instead of racing writes to
+      // the framework-selected temporary staging path.
+      cache_lock = std::make_unique<ScopedAneCacheLock>(cache_lock_entry);
+      SEL exists_selector = @selector(compiledModelExists);
+      restored = [model respondsToSelector:exists_selector] &&
+                 ((BOOL (*)(id, SEL))objc_msgSend)(model, exists_selector);
       if (restored) {
         NSLog(@"oMLX: ANE compile cache hit identifier=%@ instance=%d",
               identifier, ane_instance);
@@ -313,20 +294,13 @@ NSString *load_or_compile_ane_model(
             @"directory",
             failure.what());
       cache_lock.reset();
-      directory = nil;
+      cache_lock_entry = nil;
       restored = false;
     }
   }
-  if (directory == nil) {
-    directory = [NSTemporaryDirectory()
-        stringByAppendingPathComponent:identifier];
-    ((void (*)(id, SEL, id))objc_msgSend)(
-        model, @selector(setModelURL:),
-        [NSURL fileURLWithPath:directory isDirectory:YES]);
-  }
   auto compile_fresh = [&]() {
     // Clear any stale or half-written entry first: a crash mid-compile can
-    // leave an incomplete cache entry, and it must never be reused.
+    // leave incomplete staging inputs, and they must never be reused.
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
     NSString *weight_directory =
         [directory stringByAppendingPathComponent:@"weights"];
@@ -352,6 +326,7 @@ NSString *load_or_compile_ane_model(
           [compile_what stringByAppendingString:@" compilation failed"],
           error));
     }
+    staged = true;
   };
 
   if (!restored) {
@@ -362,10 +337,15 @@ NSString *load_or_compile_ane_model(
       model, @selector(loadWithQoS:options:error:), 21, execution_options,
       &error);
   if (!ok && restored) {
-    // Corrupt or incompatible entry: invalidate it and compile exactly
-    // once more before giving up.
+    // Corrupt or incompatible native entry: purge it before compiling exactly
+    // once more, otherwise compiledModelExists would keep returning the same
+    // unusable artifact.
     NSLog(@"oMLX: ANE compile cache fallback identifier=%@ instance=%d",
           identifier, ane_instance);
+    SEL purge_selector = @selector(purgeCompiledModel);
+    if ([model respondsToSelector:purge_selector]) {
+      ((void (*)(id, SEL))objc_msgSend)(model, purge_selector);
+    }
     compile_fresh();
     ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
         model, @selector(loadWithQoS:options:error:), 21, execution_options,
@@ -376,7 +356,10 @@ NSString *load_or_compile_ane_model(
     throw std::runtime_error(error_text(
         [load_what stringByAppendingString:@" load failed"], error));
   }
-  return directory;
+  return {
+      staged ? directory : nil,
+      staged ? cache_lock_entry : nil,
+  };
 }
 
 NSData *make_blob(const void *bytes, size_t byte_count) {
@@ -730,8 +713,11 @@ NSDictionary *ane_execution_options(int ane_instance) {
 
 class SharedAneProgram {
 public:
-  SharedAneProgram(id model, NSString *directory, NSDictionary *options)
-      : model_([model retain]), directory_([directory copy]),
+  SharedAneProgram(id model, const AneLoadResult &load_result,
+                   NSDictionary *options)
+      : model_([model retain]),
+        directory_([load_result.staging_directory copy]),
+        cache_lock_entry_([load_result.cache_lock_entry copy]),
         execution_options_([options copy]) {}
 
   ~SharedAneProgram() {
@@ -741,15 +727,17 @@ public:
         ((BOOL (*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
             model_, @selector(unloadWithQoS:error:), 21, &error);
       }
-      remove_ane_staging_directory(directory_);
+      remove_ane_staging_directory(directory_, cache_lock_entry_);
       [model_ release];
       [directory_ release];
+      [cache_lock_entry_ release];
       [execution_options_ release];
     }
   }
 
   id model_;
   NSString *directory_;
+  NSString *cache_lock_entry_;
   NSDictionary *execution_options_;
   std::mutex evaluation_mutex_;
 };
@@ -837,14 +825,14 @@ public:
 
       id identifier = ((id (*)(id, SEL))objc_msgSend)(
           model, @selector(hexStringIdentifier));
-      NSString *directory = load_or_compile_ane_model(
-          model, identifier, ane_instance, execution_options_, mil,
-          @{
+      AneLoadResult load_result = load_or_compile_ane_model(
+          model, identifier, ane_instance, execution_options_, mil, @{
             @"weight_data.bin" : data_blob,
             @"weight_scale.bin" : scale_blob,
           },
           @"ANE", @"ANE model");
-      directory_ = [directory copy];
+      directory_ = [load_result.staging_directory copy];
+      cache_lock_entry_ = [load_result.cache_lock_entry copy];
       model_ = [model retain];
 
       input_surface_ = make_surface(static_cast<size_t>(input_dim_) *
@@ -939,13 +927,13 @@ public:
 
       id identifier = ((id (*)(id, SEL))objc_msgSend)(
           model, @selector(hexStringIdentifier));
-      NSString *directory = load_or_compile_ane_model(
-          model, identifier, ane_instance, @{}, mil,
-          @{
+      AneLoadResult load_result = load_or_compile_ane_model(
+          model, identifier, ane_instance, @{}, mil, @{
             @"weight.bin" : weight_blob,
           },
           @"ANE", @"ANE model");
-      directory_ = [directory copy];
+      directory_ = [load_result.staging_directory copy];
+      cache_lock_entry_ = [load_result.cache_lock_entry copy];
 
       model_ = [model retain];
 
@@ -1062,7 +1050,7 @@ public:
         ((BOOL (*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
             model_, @selector(unloadWithQoS:error:), 21, &error);
       }
-      remove_ane_staging_directory(directory_);
+      remove_ane_staging_directory(directory_, cache_lock_entry_);
       [request_ release];
       [execution_options_ release];
       [event_ release];
@@ -1076,6 +1064,7 @@ public:
         CFRelease(output_surface_);
       [model_ release];
       [directory_ release];
+      [cache_lock_entry_ release];
     }
   }
 
@@ -1115,7 +1104,11 @@ public:
     ++submitted_;
     id<MTLCommandBuffer> buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(command_buffer));
-    [buffer encodeSignalEvent:event_ value:ready];
+    if (command_buffer) {
+      [buffer encodeSignalEvent:event_ value:ready];
+    } else {
+      [event_ setSignaledValue:ready];
+    }
     return {ready, done};
   }
 
@@ -1240,6 +1233,7 @@ public:
   int sequence_length_;
   id model_ = nil;
   NSString *directory_ = nil;
+  NSString *cache_lock_entry_ = nil;
   IOSurfaceRef input_surface_ = nullptr;
   IOSurfaceRef output_surface_ = nullptr;
   id input_object_ = nil;
@@ -1561,14 +1555,13 @@ AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
     }
     id identifier = ((id (*)(id, SEL))objc_msgSend)(
         model, @selector(hexStringIdentifier));
-    NSString *directory = load_or_compile_ane_model(
-        model, identifier, ane_instance, execution_options, mil,
-        @{
+    AneLoadResult load_result = load_or_compile_ane_model(
+        model, identifier, ane_instance, execution_options, mil, @{
           @"weight.bin" : weight_blob,
         },
         @"ANE procedure bank", @"ANE procedure bank");
-    auto program =
-        std::make_shared<SharedAneProgram>(model, directory, execution_options);
+    auto program = std::make_shared<SharedAneProgram>(model, load_result,
+                                                      execution_options);
     std::vector<std::shared_ptr<AneLinearModel>> result;
     result.reserve(span);
     for (int index = 0; index < span; ++index) {
@@ -1607,6 +1600,131 @@ qwen35_ane_compile_fp16_linear(const array &weight, int sequence_length) {
       weight.data<float>(), static_cast<int>(weight.shape(0)),
       static_cast<int>(weight.shape(1)), sequence_length, true);
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
+}
+
+class K2AnePlanarPrimitive : public Primitive {
+public:
+  K2AnePlanarPrimitive(Stream stream, std::shared_ptr<AneLinearModel> model)
+      : Primitive(stream), model_(std::move(model)) {}
+
+  void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
+    throw std::runtime_error("K2 ANE planar transfer has no CPU implementation");
+  }
+
+  void eval_gpu(const std::vector<array> &inputs, std::vector<array> &outputs) override {
+    auto &device = metal::device(stream().device);
+    auto &encoder = metal::get_command_encoder(stream());
+    auto library = device.get_library("omlx_qwen35_prefill_kernels", binary_dir());
+    auto copy = device.get_kernel("k2_ane_copy_planar", library);
+    const auto &x = inputs[0];
+    auto &output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const bool profiling = ane_profile_enabled();
+    const uint64_t start = profiling ? profile_now_ns() : 0;
+    if (profiling) profile_add(0, kOperations, 1);
+
+    encoder.set_compute_pipeline_state(copy);
+    encoder.set_input_array(x, 0);
+    encoder.set_buffer(model_->input_buffer(), 1);
+    encoder.dispatch_threads(MTL::Size(x.size(), 1, 1), MTL::Size(256, 1, 1));
+    encoder.end_encoding();
+    auto *producer = encoder.get_command_buffer();
+    producer->retain();
+    AneLinearModel::Ticket ticket{};
+    try {
+      ticket = model_->begin(producer);
+    } catch (...) {
+      producer->release();
+      throw;
+    }
+    AneDispatchGuard guard(producer, model_, ticket);
+    encoder.commit();
+    producer->waitUntilCompleted();
+    if (pack_buffer_failed(producer)) {
+      throw std::runtime_error(pack_buffer_error(producer));
+    }
+    producer->release();
+    guard.producer_released();
+    const uint64_t ready = profiling ? profile_now_ns() : 0;
+    std::thread([model = model_, ticket] { model->execute(ticket); }).detach();
+    guard.disarm();
+    model_->wait(ticket);
+    if (profiling) {
+      profile_add(0, kPackNs, ready - start);
+      profile_add(0, kAne0EvalNs, profile_now_ns() - ready);
+    }
+
+    encoder.set_compute_pipeline_state(copy);
+    encoder.set_buffer(model_->output_buffer(), 0);
+    encoder.set_output_array(output, 1);
+    encoder.dispatch_threads(MTL::Size(output.size(), 1, 1), MTL::Size(256, 1, 1));
+    // MLX detaches the primitive after scheduling; its command buffers do not
+    // retain resources. Keep the ANE IOSurfaces alive through the output copy.
+    encoder.get_command_buffer()->addCompletedHandler(
+        MTL::HandlerFunction([model = model_](MTL::CommandBuffer *) {}));
+    // As in Qwen, force MLX onto its post-commit path after the input commit.
+    auto commit_guard = device.get_kernel("qwen35_ane_commit_guard", library);
+    encoder.set_compute_pipeline_state(commit_guard);
+    while (!encoder.needs_commit()) {
+      encoder.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+    }
+  }
+  DEFINE_NAME(K2AnePlanarPrimitive);
+  bool is_equivalent(const Primitive &other) const override {
+    return model_ == static_cast<const K2AnePlanarPrimitive &>(other).model_;
+  }
+private:
+  std::shared_ptr<AneLinearModel> model_;
+};
+
+array ane_planar(const array &x, const std::shared_ptr<AneLinearModel> &model) {
+  if (!model || x.ndim() != 2 || x.dtype() != float16 || !row_contiguous(x) ||
+      x.shape(0) != model->input_dim() || x.shape(1) != model->sequence_length() ||
+      model->sequence_length() % 32) {
+    throw std::invalid_argument("ANE planar I/O requires contiguous FP16 [channels, tile] input");
+  }
+  if (model->has_error()) throw std::runtime_error("ANE program has a prior execution failure");
+  // A host wait inside eval_gpu cannot advance lazy producers on other streams.
+  // Serving already evaluates packing before submitting the GPU MLP suffix.
+  array input = x;
+  input.eval();
+  // Keep transfers independent of the already-submitted GPU MLP suffix.
+  static const auto transfer_stream = new_thread_unsafe_stream(Device::gpu);
+  return array({model->output_dim(), model->sequence_length()}, float16,
+      std::make_shared<K2AnePlanarPrimitive>(transfer_stream, model), {input});
+}
+
+std::shared_ptr<AneLinearModel> ane_compile_program(
+    const std::string &mil_source, const array &weight_blob,
+    int input_dim, int output_dim, int sequence_length) {
+  if (!qwen35_ane_available()) throw std::runtime_error("Private ANE runtime is unavailable.");
+  if (mil_source.empty() || weight_blob.dtype() != mlx::core::uint8 || weight_blob.ndim() != 1 ||
+      !row_contiguous(weight_blob) || weight_blob.size() < 128 ||
+      input_dim <= 0 || output_dim <= 0 || sequence_length < 2 ||
+      sequence_length % 32) {
+    throw std::invalid_argument("Invalid generated ANE program.");
+  }
+  @autoreleasepool {
+    NSData *mil = [NSData dataWithBytes:mil_source.data() length:mil_source.size()];
+    NSData *blob = [NSData dataWithBytes:weight_blob.data<uint8_t>() length:weight_blob.size()];
+    NSDictionary *weights = @{@"@model_path/weights/weight.bin" : @{@"offset" : @0, @"data" : blob}};
+    Class descriptors = NSClassFromString(@"_ANEInMemoryModelDescriptor");
+    Class models = NSClassFromString(@"_ANEInMemoryModel");
+    id descriptor = ((id (*)(Class, SEL, id, id, id))objc_msgSend)(
+        descriptors, @selector(modelWithMILText:weights:optionsPlist:), mil, weights, nil);
+    id model = ((id (*)(Class, SEL, id))objc_msgSend)(
+        models, @selector(inMemoryModelWithDescriptor:), descriptor);
+    if (!model) throw std::runtime_error("Generated ANE program creation failed.");
+    id identifier = ((id (*)(id, SEL))objc_msgSend)(model, @selector(hexStringIdentifier));
+    NSDictionary *options = ane_execution_options(0);
+    AneLoadResult loaded = load_or_compile_ane_model(
+        model, identifier, 0, options, mil, @{@"weight.bin" : blob},
+        @"K2 ANE program", @"K2 ANE program");
+    auto program = std::make_shared<SharedAneProgram>(model, loaded, options);
+    auto impl = std::make_unique<AneLinearModel::Impl>(
+        program, input_dim, output_dim, sequence_length, 0);
+    return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
+  }
 }
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
@@ -1750,15 +1868,14 @@ AneFusedBankBuilder::compile(int ane_instance, int start, int stop) {
     }
     id identifier = ((id (*)(id, SEL))objc_msgSend)(
         model, @selector(hexStringIdentifier));
-    NSString *directory = load_or_compile_ane_model(
-        model, identifier, ane_instance, execution_options, mil,
-        @{
+    AneLoadResult load_result = load_or_compile_ane_model(
+        model, identifier, ane_instance, execution_options, mil, @{
           @"weight.bin" : weight_blob,
         },
         @"ANE SwiGLU/down bank", @"ANE SwiGLU/down bank");
 
-    auto program =
-        std::make_shared<SharedAneProgram>(model, directory, execution_options);
+    auto program = std::make_shared<SharedAneProgram>(model, load_result,
+                                                      execution_options);
     std::vector<std::shared_ptr<AneLinearModel>> result;
     result.reserve(shapes.size());
     for (size_t index = 0; index < shapes.size(); ++index) {
@@ -2418,6 +2535,7 @@ public:
     id<MTLCommandBuffer> qmm_buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
             encoder.get_command_buffer()));
+    [qmm_buffer retain];
     if (profiling) {
       [qmm_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         const double duration = completed.GPUEndTime - completed.GPUStartTime;
@@ -2429,12 +2547,6 @@ public:
                     profile_now_ns() - launch);
       }];
     }
-    id<MTLCommandBuffer> cpu_gpu_buffer = nil;
-    if (cpu_weight) {
-      cpu_gpu_buffer = qmm_buffer;
-      [cpu_gpu_buffer retain];
-    }
-
     // Keep the wait in a third command buffer. Metal may hold an entire
     // command buffer at an encoded wait, even when compute encoders precede
     // it, which serializes the otherwise independent GPU remainder behind
@@ -2479,20 +2591,29 @@ public:
       // the GPU is still writing. The detached ANE thread holds its own
       // model reference and signals the ticket on its own.
       [qmm_buffer waitUntilCompleted];
-      if (cpu_gpu_buffer != nil) {
-        [cpu_gpu_buffer release];
-      }
+      [qmm_buffer release];
       throw;
     }
-    if (cpu_gpu_buffer != nil) {
-      [cpu_gpu_buffer waitUntilCompleted];
-      [cpu_gpu_buffer release];
+    // ANE completion does not order an independently committed GPU suffix
+    // command buffer before the merge encoder. This is observable on the
+    // first qmm dispatch, when pipeline setup lets ANE finish first: the merge
+    // can otherwise read a partially written suffix. Preserve ANE/GPU overlap,
+    // then join both branches explicitly before consuming either output.
+    const bool gpu_finished_at_ane_done =
+        qmm_buffer.status == MTLCommandBufferStatusCompleted;
+    [qmm_buffer waitUntilCompleted];
+    if (qmm_buffer.status == MTLCommandBufferStatusError) {
+      const std::string error = error_text(
+          @"ANE hybrid GPU suffix command buffer failed", qmm_buffer.error);
+      [qmm_buffer release];
+      throw std::runtime_error(error);
     }
+    [qmm_buffer release];
     if (profiling) {
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (gpu_finished_at_ane_done) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);
@@ -2734,6 +2855,7 @@ public:
     id<MTLCommandBuffer> qmm_buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
             encoder.get_command_buffer()));
+    [qmm_buffer retain];
     if (profiling) {
       [qmm_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         const double duration = completed.GPUEndTime - completed.GPUStartTime;
@@ -2744,11 +2866,6 @@ public:
         profile_add(profile_category, kGpuCompletionNs,
                     profile_now_ns() - launch);
       }];
-    }
-    id<MTLCommandBuffer> cpu_gpu_buffer = nil;
-    if (cpu_weight) {
-      cpu_gpu_buffer = qmm_buffer;
-      [cpu_gpu_buffer retain];
     }
     encoder.commit();
 
@@ -2793,20 +2910,28 @@ public:
       // qmm before this frame's MLX arrays can be recycled. The detached ANE
       // threads hold their own model references.
       [qmm_buffer waitUntilCompleted];
-      if (cpu_gpu_buffer != nil) {
-        [cpu_gpu_buffer release];
-      }
+      [qmm_buffer release];
       throw;
     }
-    if (cpu_gpu_buffer != nil) {
-      [cpu_gpu_buffer waitUntilCompleted];
-      [cpu_gpu_buffer release];
+    // ANE completion does not order the separately committed GPU suffix
+    // before this primitive's merge. Join the already-overlapped branches so
+    // the merge cannot observe an in-flight qmm output on its first dispatch.
+    const bool gpu_finished_at_ane_done =
+        qmm_buffer.status == MTLCommandBufferStatusCompleted;
+    [qmm_buffer waitUntilCompleted];
+    if (qmm_buffer.status == MTLCommandBufferStatusError) {
+      const std::string error = error_text(
+          @"Dual ANE hybrid GPU suffix command buffer failed",
+          qmm_buffer.error);
+      [qmm_buffer release];
+      throw std::runtime_error(error);
     }
+    [qmm_buffer release];
     if (profiling) {
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (gpu_finished_at_ane_done) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);

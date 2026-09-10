@@ -76,30 +76,47 @@ def main() -> None:
 
     gpu_seconds, gpu_samples, reference = _measure(gpu_call, args.repeats)
     prepared = []
+    prepared_outputs = set()
+    qkv, z, _, _ = linears
+    z_outputs = int(z.weight.shape[0])
+    qkv_outputs = int(qkv.weight.shape[0])
+    total_outputs = z_outputs + qkv_outputs
     for fraction in args.fractions:
+        ane_outputs = patch._recurrent_safe_gdn_ane_outputs(
+            z_outputs, qkv_outputs, fraction, 128
+        )
+        if not ane_outputs or ane_outputs in prepared_outputs:
+            continue
         config = patch._AneGDNConfig(args.tokens, fraction, 8, True)
         value = patch._prepare_gdn_for_bank(gdn, config)
         if value is not None:
             state, dense0, dense1 = value
-            prepared.append((fraction, state, dense0, dense1))
+            prepared.append(
+                (fraction, ane_outputs / total_outputs, state, dense0, dense1)
+            )
+            prepared_outputs.add(ane_outputs)
+    if not prepared:
+        raise RuntimeError("No recurrent-safe GDN ANE width could be prepared")
     mx.eval(
-        *[entry[2] for entry in prepared],
         *[entry[3] for entry in prepared],
+        *[entry[4] for entry in prepared],
     )
     banks = patch._compile_dual_banks(
-        [entry[2] for entry in prepared],
         [entry[3] for entry in prepared],
+        [entry[4] for entry in prepared],
         args.tokens,
     )
     if banks is None:
         raise RuntimeError("GDN calibration bank failed to compile")
     models0, models1, programs = banks
     results = []
-    for index, (fraction, _state, _, _) in enumerate(prepared):
+    for index, (requested_fraction, effective_fraction, _state, _, _) in enumerate(
+        prepared
+    ):
         for cpu_fraction in args.cpu_fractions:
             config = patch._AneGDNConfig(
                 args.tokens,
-                fraction,
+                requested_fraction,
                 8,
                 True,
                 cpu_fraction=cpu_fraction,
@@ -118,7 +135,8 @@ def main() -> None:
                 lambda: patch._gdn_backend_exact(gdn, x), args.repeats
             )
             result = {
-                "ane_fraction": fraction,
+                "ane_fraction": effective_fraction,
+                "requested_ane_fraction": requested_fraction,
                 "cpu_fraction": cpu_fraction,
                 "median_ms": seconds * 1000,
                 "samples_ms": [sample * 1000 for sample in samples],

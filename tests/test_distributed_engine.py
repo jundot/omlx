@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import tempfile
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -49,7 +50,100 @@ def _ready_engine(handler) -> DistributedBatchedEngine:
         base_url="http://127.0.0.1:1",
         transport=httpx.MockTransport(handler),
     )
+    engine._supervisor.port = 8001
     return engine
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_cancel_all_does_not_widen_later_targeted_cancel(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    cancel_path = tmp_path / "engine-test-cancel.json"
+    ack_path = tmp_path / "engine-test-cancel-ack.json"
+    old_epoch = 9_999_999_999_999
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "engine-test",
+                "plan_hash": "d" * 64,
+                "epoch": old_epoch,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    ack_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "engine-test",
+                "plan_hash": "d" * 64,
+                "epoch": old_epoch,
+                "cancelled": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_id = await engine._enter_request("transport-new-client")
+    try:
+        assert await engine.abort_request(request_id, reason="socket closed") is True
+        payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+        assert payload["scope"] == "requests"
+        assert payload["request_ids"] == [request_id]
+    finally:
+        await engine._leave_request(request_id)
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"status": "ok", "rank": 0, "ssd_deleted": 3, "hot_cleared": 0},
+        )
+
+    remote_calls = []
+
+    def remote(ssh_target, command, timeout, runner):
+        remote_calls.append((ssh_target, command, timeout))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"status": "ok", "rank": 1, "ssd_deleted": 5, "hot_cleared": 0}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(distributed, "_run_cluster_ssh", remote)
+    engine = _ready_engine(handler)
+    try:
+        result = await engine.clear_prompt_caches(ssd=True)
+    finally:
+        await engine._client.aclose()
+
+    assert result["ssd_deleted"] == 8
+    assert len(result["ranks"]) == 2
+    assert requests[0].url.path == "/omlx/internal/cache/ssd/clear"
+    assert requests[0].headers["X-oMLX-Plan-Hash"] == "d" * 64
+    assert remote_calls[0][0] == "peer.local"
+    assert "engine-test-cache-clear.json" in remote_calls[0][1]
+    assert '"ssd":true' in remote_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_distributed_cache_clear_refuses_active_requests():
+    engine = _ready_engine(lambda _request: httpx.Response(200, json={}))
+    engine._active_requests = 1
+    try:
+        with pytest.raises(DistributedInferenceError, match="requests are active"):
+            await engine.clear_prompt_caches(ssd=True)
+    finally:
+        await engine._client.aclose()
 
 
 def test_backend_chat_messages_serialize_native_tool_history_once():
@@ -145,6 +239,9 @@ def _stalled_engine():
         raise httpx.ReadTimeout("collective stalled", request=request)
 
     engine = _ready_engine(handler)
+    # Read timeouts now drop a rank-side cancel file; keep it out of the
+    # real runtime state dir.
+    engine._supervisor.state_dir = tempfile.mkdtemp(prefix="omlx-test-runtime-")
     status_calls = []
 
     def status():
@@ -872,9 +969,7 @@ def test_reasoning_effort_retry_payloads_ignores_when_not_requested():
 
     payload = {"chat_template_kwargs": {}}
     assert (
-        _reasoning_effort_retry_payloads(
-            payload, "Unexpected reasoning effort high."
-        )
+        _reasoning_effort_retry_payloads(payload, "Unexpected reasoning effort high.")
         == []
     )
 
@@ -900,7 +995,10 @@ async def test_distributed_chat_retries_unsupported_reasoning_effort():
             200,
             json={
                 "choices": [
-                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
                 ],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             },
@@ -1084,6 +1182,26 @@ async def test_distributed_chat_does_not_retry_unrelated_404():
 
 def _healthy_supervisor_status():
     return SimpleNamespace(returncode=None, failure_reason=None)
+
+
+def test_runtime_failure_reconciles_supervisor_terminal_state(monkeypatch):
+    """Pool status/release must see a rank death even after a 200 response."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(
+            returncode=0,
+            failure_reason=(
+                "rank 0 exited with code 75 after JACCL all_reduce made no progress"
+            ),
+            phase="failed",
+        ),
+    )
+
+    assert engine.runtime_failed_reason is not None
+    assert "rank 0 exited with code 75" in engine.runtime_failed_reason
 
 
 @pytest.mark.asyncio

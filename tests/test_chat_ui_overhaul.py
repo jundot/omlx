@@ -91,7 +91,9 @@ def test_chat_history_is_sorted_before_it_is_trimmed():
 
 def test_chat_navigation_preserves_the_previous_chat_timestamp():
     html = _template()
-    start_new = _section(html, "    async startNewChat()", "    async loadChat(chatId)")
+    start_new = _section(
+        html, "    async startNewChat(options = {})", "    async loadChat(chatId)"
+    )
     load = _section(
         html,
         "    async loadChat(chatId)",
@@ -107,6 +109,54 @@ def test_chat_navigation_preserves_the_previous_chat_timestamp():
     assert "{ touchUpdatedAt: false }" in load
     assert "options.touchUpdatedAt === false && existingChat?.updatedAt" in save
     assert "? existingChat.updatedAt" in save
+
+
+def test_lazy_chat_creation_preserves_preconfigured_draft():
+    html = _template()
+    start_new = _section(
+        html, "    async startNewChat(options = {})", "    async loadChat(chatId)"
+    )
+    send = _section(
+        html,
+        "    async sendMessage()",
+        "    async sendTranscriptionMessage()",
+    )
+    transcription = _section(
+        html,
+        "    async sendTranscriptionMessage()",
+        "    async streamTranscription(",
+    )
+    microphone = _section(
+        html,
+        "    async startMicTranscription()",
+        "    stopMicTranscription(",
+    )
+    clear_all = _section(
+        html,
+        "    async clearAllHistory()",
+        "    // Thinking/Reasoning tag processing",
+    )
+
+    assert (
+        "const preserveDraft = options.preserveDraft === true && !prevChatId"
+        in start_new
+    )
+    assert "? draftSystemPrompt" in start_new
+    assert "? draftActiveProfile" in start_new
+    assert "if (preserveDraft && this.modelSettingsDirty)" in start_new
+    assert "this.syncSessionModelSettingsFromUi(session)" in start_new
+    assert "this.loadModelCapabilities(" in start_new
+    assert "this.resolveGatewayModelId(this.currentModel)" in start_new
+    assert (
+        "await this.ensureSessionModelSettings(session, this.currentModel)" in start_new
+    )
+
+    lazy_create = "await this.startNewChat({ preserveDraft: true })"
+    assert lazy_create in send
+    assert lazy_create in transcription
+    assert lazy_create in microphone
+    assert '<button @click="startNewChat()"' in html
+    assert "await this.startNewChat();" in clear_all
 
 
 def test_new_chat_strings_exist_in_every_locale():

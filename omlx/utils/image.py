@@ -17,7 +17,6 @@ from PIL import Image, ImageOps
 
 from ..exceptions import InvalidRequestError
 
-
 _IMAGE_INPUT_ERROR = (
     "Image inputs must be base64 data URIs "
     "(data:image/...;base64,...). Remote URLs and local file paths are not supported."
@@ -208,6 +207,12 @@ def extract_images_from_messages(
                         audio.append(io.BytesIO(data))
                     else:
                         audio.append(data)
+
+            elif part_type in ("video", "video_url", "input_video"):
+                raise InvalidRequestError(
+                    "Video input is not supported by oMLX.",
+                    field="messages",
+                )
 
         new_msg = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
         # Preserve extra fields

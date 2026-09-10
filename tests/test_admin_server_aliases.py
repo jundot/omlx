@@ -574,6 +574,7 @@ class TestGetGlobalSettingsGdnSplit:
         gs = GlobalSettings()
         gs.cache.gdn_ssd_split_enabled = True
         gs.cache.gdn_ssd_pending_max_size = "768MB"
+        gs.server.max_audio_upload_size = "500MB"
 
         memory_info = {
             "total_bytes": 16 * 1024**3,
@@ -599,6 +600,41 @@ class TestGetGlobalSettingsGdnSplit:
         assert result["cache"]["gdn_ssd_split_enabled"] is True
         assert result["cache"]["gdn_snapshot_storage"] == "ssd_sidecar"
         assert result["cache"]["gdn_ssd_pending_max_size"] == "768MB"
+        assert result["server"]["max_audio_upload_size"] == "500MB"
+
+
+class TestUpdateGlobalSettingsAudioUpload:
+    """update_global_settings: persist the audio upload size cap."""
+
+    def test_saves_max_audio_upload_size(self):
+        gs = _make_global_settings()
+        gs.server.max_audio_upload_size = "100MB"
+        request = GlobalSettingsRequest(max_audio_upload_size="250MB")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "max_audio_upload_size" in result["runtime_applied"]
+        assert gs.server.max_audio_upload_size == "250MB"
+        gs.save.assert_called_once()
+
+    @pytest.mark.parametrize("value", ["bogus", "1e999MB"])
+    def test_rejects_invalid_max_audio_upload_size(self, value):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(max_audio_upload_size=value)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "max_audio_upload_size" in exc_info.value.detail
+        gs.save.assert_not_called()
 
 
 class TestApplyCacheSettingsRuntimeGdn:

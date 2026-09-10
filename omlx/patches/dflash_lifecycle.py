@@ -36,6 +36,7 @@ dflash never owns) to the pre-dflash ``__call__``.
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from typing import Any
 
 import mlx.core as mx
@@ -65,6 +66,18 @@ def _wrap_installer(mod: Any, fn_name: str, flag_name: str) -> bool:
 
     def wrapped(module_target: Any) -> Any:
         cls = type(module_target)
+        current = cls.__dict__.get("__call__")
+        if getattr(cls, flag_name, False) and getattr(
+            current, "_omlx_mtp_call_marker", False
+        ):
+            # A Lightning MTP self-heal replaced dflash's hook while the
+            # idempotency flag stayed set (issue #2972): dflash's installer
+            # would skip re-installing and the engine would run without its
+            # speculative hook. Clear the stale flag and re-snapshot the
+            # current (MTP) __call__ as the base to restore/fall back to.
+            with suppress(AttributeError):
+                delattr(cls, flag_name)
+            _DFLASH_BACKUP[cls] = {"call": current, "flag": flag_name}
         if not getattr(cls, flag_name, False):
             # First time dflash installs on this class — snapshot the
             # current __call__ so restore can put it back unchanged.
@@ -105,12 +118,39 @@ def _install_batch_cache_guard(cls: type) -> None:
     def guarded_call(
         self: Any, x: Any, mask: Any = None, cache: Any = None, **kwargs: Any
     ) -> Any:
-        if isinstance(getattr(cache, "offset", None), mx.array):
-            return pre_dflash_call(self, x, mask=mask, cache=cache, **kwargs)
+        # Resolve the fallback base dynamically: a Lightning MTP load may
+        # legitimately swap the non-dflash implementation underneath this
+        # guard while a DFlash engine stays resident (issue #2972).
+        live = _DFLASH_BACKUP.get(cls)
+        base = live["call"] if live is not None else pre_dflash_call
+        if kwargs.get("n_confirmed") or isinstance(
+            getattr(cache, "offset", None), mx.array
+        ):
+            return base(self, x, mask=mask, cache=cache, **kwargs)
         return dflash_call(self, x, mask=mask, cache=cache, **kwargs)
 
     guarded_call._omlx_dflash_batch_guard = True  # type: ignore[attr-defined]
     cls.__call__ = guarded_call  # type: ignore[method-assign]
+
+
+def get_dflash_guard_base(cls: type) -> Any | None:
+    """Return the fallback base owned by an armed dflash guard."""
+    current = cls.__dict__.get("__call__")
+    if not getattr(current, "_omlx_dflash_batch_guard", False):
+        return None
+    info = _DFLASH_BACKUP.get(cls)
+    if info is None:
+        raise RuntimeError("dflash guard has no fallback base")
+    return info["call"]
+
+
+def set_dflash_guard_base(cls: type, new_call: Any) -> None:
+    """Replace the fallback base under an armed dflash guard."""
+    current = cls.__dict__.get("__call__")
+    info = _DFLASH_BACKUP.get(cls)
+    if not getattr(current, "_omlx_dflash_batch_guard", False) or info is None:
+        raise RuntimeError("dflash guard state changed during MTP patching")
+    info["call"] = new_call
 
 
 def install_dflash_lifecycle_wrap() -> bool:
@@ -179,10 +219,8 @@ def restore_dflash_class_patches() -> None:
             continue
         flag = info["flag"]
         if flag in cls.__dict__:
-            try:
+            with suppress(AttributeError):
                 delattr(cls, flag)
-            except AttributeError:
-                pass
         restored += 1
 
     _DFLASH_BACKUP.clear()

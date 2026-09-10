@@ -61,7 +61,7 @@ def test_candidate_settings_are_transient_copy():
     assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.10
     assert tuned.qwen35_ane_prefill_tail_padding_min_tokens == 0
     assert base.qwen35_ane_prefill_enabled is False
-    assert base.qwen35_ane_prefill_fraction == 0.53
+    assert base.qwen35_ane_prefill_fraction is None
     assert base.qwen35_ane_prefill_tail_padding_min_tokens == 1500
 
 
@@ -906,8 +906,8 @@ def test_min_viable_gdn_fraction_matches_bank_rule():
     assert ane_tuning._min_viable_gdn_fraction(patch, impossible, 128) is None
 
 
-def test_profile_refinement_respects_the_gdn_floor(monkeypatch):
-    """The refinement grid must not offer fractions below the floor (#2899)."""
+def test_profile_refinement_locks_gdn_to_the_z_floor(monkeypatch):
+    """The refinement must use the sole recurrent-safe ANE width."""
     monkeypatch.setattr(
         ane_tuning, "_fraction_grid", lambda: [0.15, 0.25, 0.35, 0.45, 0.53]
     )
@@ -929,7 +929,7 @@ def test_profile_refinement_respects_the_gdn_floor(monkeypatch):
     assert unclamped.gdn_fraction < 0.4  # sanity: the pull downward is real
 
     clamped = ane_tuning._profile_refinement(candidate, result, gdn_floor=0.42)
-    assert clamped.gdn_fraction >= 0.42
+    assert clamped.gdn_fraction == 0.42
 
 
 def test_settings_for_candidate_disables_dflash():

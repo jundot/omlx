@@ -324,10 +324,10 @@ struct ActiveProfileBanner: View {
         .padding(.vertical, isSlim ? 10 : 12)
         .background(bannerBackground)
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(bannerBorder, lineWidth: 0.5)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 12)
     }
@@ -491,10 +491,10 @@ struct SaveAsPopover: View {
         .padding(12)
         .background(theme.groupBg)
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(theme.groupBorder, lineWidth: 0.5)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 12)
         .onAppear { nameFocused = true }
@@ -1067,7 +1067,9 @@ struct ProfileDetailCard: View {
                             .foregroundStyle(theme.textSecondary)
                     }
                     .toggleStyle(.switch)
-                    .controlSize(.mini)
+                    // Same switch size as `RowSwitch` so every switch in the
+                    // app reads as one control.
+                    .controlSize(.small)
                     if exposeAsModel, let exposedModelId {
                         Text(exposedModelId)
                             .font(.omlxMono(11))

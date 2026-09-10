@@ -81,9 +81,9 @@ def apply() -> bool:
 
     _patch_vlm_model_adapter()
 
-    # Small-L verify forwards otherwise pay gemma4's unfused multi-token
-    # attention (head_dim 256/512 has no fused SDPA above L=1); the
-    # decomposed route keeps shallow-depth speculation profitable.
+    # MLX 0.32.2 covers Gemma4's head-dim-256 small-L shapes natively. Global
+    # head-dim-512 verify still needs the custom fused route to keep
+    # shallow-depth speculation profitable.
     from ..gemma4_verify_attention import apply as apply_verify_attention
 
     apply_verify_attention()

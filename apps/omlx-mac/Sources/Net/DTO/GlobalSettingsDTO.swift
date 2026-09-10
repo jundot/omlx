@@ -50,6 +50,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
     let mcp: MCPSettings?
+    let usage: UsageSettings?
 
     struct ServerSettings: Codable, Equatable, Sendable {
         let host: String
@@ -58,6 +59,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let serverAliases: [String]
         let sseKeepaliveMode: String?
         let autoStartOnLaunch: Bool?
+        let maxAudioUploadSize: String?
     }
 
     struct ModelSettings: Codable, Equatable, Sendable {
@@ -175,6 +177,14 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let configPath: String?
     }
 
+    /// Mirrors `omlx.settings.UsageSettings`. `usage_history` switches the
+    /// local hourly serving history behind Status → Usage History. Patched
+    /// via the flat `usage_history` key; the server applies it live and keeps
+    /// the existing usage.sqlite3 when it is turned off.
+    struct UsageSettings: Codable, Equatable, Sendable {
+        let usageHistory: Bool?
+    }
+
     /// Mirrors `omlx.settings.ModelScopeSettings`. Empty string means
     /// "use the default" (modelscope.cn). Patched via `ms_endpoint`.
     struct ModelScopeDTO: Codable, Equatable, Sendable {
@@ -212,6 +222,8 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// `"off"`. Server rejects anything else with a 400.
     var sseKeepaliveMode: String? = nil
     var autoStartOnLaunch: Bool? = nil
+    /// Human-readable cap such as `100MB` or `1GB`. Applied immediately.
+    var maxAudioUploadSize: String? = nil
 
     // Claude Code (PR 9)
     var claudeCodeContextScalingEnabled: Bool? = nil
@@ -234,6 +246,11 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// the server (`global_settings.mcp.config_path = None`). Shared across
     /// every integration launcher.
     var mcpConfig: String? = nil
+
+    /// Record local usage history (Status → Usage History). Applied at
+    /// runtime; turning it off keeps the existing usage.sqlite3 so turning
+    /// it back on resumes the same history.
+    var usageHistory: Bool? = nil
 
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil

@@ -325,6 +325,34 @@ def test_a_new_store_reclaims_what_a_dead_process_left(tmp_path):
     assert store.put(MODEL, list(range(STEP)), _kv())  # still fully usable
 
 
+def test_persistent_store_restores_its_chain_after_rank_restart(tmp_path):
+    tokens = list(range(8))
+    first = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    kv = KVCache()
+    for boundary in (4, 8):
+        _feed(kv, 4)
+        assert first.put(MODEL, tokens[:boundary], [kv])
+
+    manifest = tmp_path / "index.json"
+    assert manifest.is_file()
+    second = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    assert second.present_boundaries(MODEL, tokens) == (8, 4)
+    restored = second.load(MODEL, tokens, 8)
+    assert restored is not None
+    assert mx.array_equal(restored[0].state[0], kv.state[0])
+
+
+def test_invalid_persistent_manifest_fails_closed(tmp_path):
+    (tmp_path / "deadbeef.safetensors").write_bytes(b"stale")
+    (tmp_path / "index.json").write_text('{"version":1,"step":4,"entries":[{}]}')
+
+    store = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+
+    assert len(store) == 0
+    assert not (tmp_path / "deadbeef.safetensors").exists()
+    assert (tmp_path / "index.json").is_file()
+
+
 def test_an_unaligned_prompt_is_rejected(tmp_path):
     store = SSDPromptSnapshotStore(tmp_path, step=STEP)
     assert store.put(MODEL, list(range(STEP + 1)), _kv()) is False
@@ -465,3 +493,15 @@ def test_a_failed_write_leaves_the_index_unchanged(tmp_path, monkeypatch):
     assert store.present_boundaries(MODEL, list(range(STEP))) == ()
     # No half-written temp file is left behind.
     assert list(tmp_path.glob("*")) == []
+
+
+def test_clear_removes_live_files_without_a_write_behind_flush(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=STEP, persistent=True)
+    assert store.put(MODEL, list(range(STEP)), _kv()) is True
+    assert len(store) == 1
+
+    assert store.clear(timeout=0.01) == 1
+
+    assert len(store) == 0
+    assert store.nbytes == 0
+    assert list(tmp_path.glob("*.safetensors")) == []

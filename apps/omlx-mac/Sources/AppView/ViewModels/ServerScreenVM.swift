@@ -10,6 +10,7 @@ final class ServerScreenVM {
 
     // Phase 4 — Advanced disclosure.
     var sseKeepaliveMode: String = "chunk"
+    var maxAudioUploadSizeText: String = "100MB"
     /// Comma-separated text shown in the input. Parsed to `[String]` on save
     /// so the user can edit incrementally without intermediate trips to the
     /// server. Empty string clears all aliases.
@@ -17,6 +18,9 @@ final class ServerScreenVM {
     var basePathText: String = AppConfig.defaultBasePath()
     var modelDirTexts: [String] = [""]
     var hfCacheEnabled: Bool = true
+    /// Live switch; commits through `saveUsageHistory()` like the other
+    /// auto-apply rows rather than the Apply button.
+    var usageHistoryEnabled: Bool = true
     var lastError: String?
     private(set) var isMovingBasePath: Bool = false
 
@@ -50,6 +54,7 @@ final class ServerScreenVM {
     private var baselineSamplingTopKText: String = "0"
     private var baselineSamplingRepetitionPenaltyText: String = "1.0"
     private var baselineServerAliasesText: String = ""
+    private var baselineMaxAudioUploadSizeText: String = "100MB"
     private var baselineModelDirs: [String] = []
     private var baselineHfCacheEnabled: Bool = true
 
@@ -70,6 +75,7 @@ final class ServerScreenVM {
             self.effectiveHost = AppConfig.connectableHost(for: dto.server.host)
             self.effectivePort = dto.server.port
             self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
+            self.maxAudioUploadSizeText = dto.server.maxAudioUploadSize ?? "100MB"
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
             let modelDirs = Self.cleanedModelDirs(
                 dto.model?.modelDirs ?? dto.model?.modelDir.map { [$0] } ?? []
@@ -78,6 +84,7 @@ final class ServerScreenVM {
                 self.modelDirTexts = modelDirs
             }
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -108,6 +115,7 @@ final class ServerScreenVM {
         baselineSamplingTopKText = t(samplingTopKText)
         baselineSamplingRepetitionPenaltyText = t(samplingRepetitionPenaltyText)
         baselineServerAliasesText = serverAliasesText
+        baselineMaxAudioUploadSizeText = t(maxAudioUploadSizeText)
         baselineModelDirs = Self.normalizedModelDirs(from: modelDirTexts)
         baselineHfCacheEnabled = hfCacheEnabled
     }
@@ -126,6 +134,7 @@ final class ServerScreenVM {
         if t(samplingTopKText) != baselineSamplingTopKText { return true }
         if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText { return true }
         if parseAliases(serverAliasesText) != parseAliases(baselineServerAliasesText) { return true }
+        if t(maxAudioUploadSizeText) != baselineMaxAudioUploadSizeText { return true }
         if hfCacheEnabled != baselineHfCacheEnabled { return true }
         return hasPendingStorageChanges(services: services)
     }
@@ -206,6 +215,18 @@ final class ServerScreenVM {
             }
             patch.samplingRepetitionPenalty = v
         }
+        if t(maxAudioUploadSizeText) != baselineMaxAudioUploadSizeText {
+            let value = t(maxAudioUploadSizeText)
+            guard Self.isValidAudioUploadSize(value) else {
+                self.lastError = String(
+                    localized: "server.error.audio_upload_size_invalid",
+                    defaultValue: "Maximum Audio Upload Size must be a positive value such as 100MB or 1GB.",
+                    comment: "Server screen error when the audio upload size is invalid"
+                )
+                return
+            }
+            patch.maxAudioUploadSize = value
+        }
 
         let newAliases = parseAliases(serverAliasesText)
         if newAliases != parseAliases(baselineServerAliasesText) {
@@ -239,6 +260,7 @@ final class ServerScreenVM {
             || patch.samplingTopP != nil
             || patch.samplingTopK != nil
             || patch.samplingRepetitionPenalty != nil
+            || patch.maxAudioUploadSize != nil
             || patch.serverAliases != nil
             || patch.hfCacheEnabled != nil
             || patch.modelDirs != nil
@@ -315,6 +337,31 @@ final class ServerScreenVM {
             .filter { !$0.isEmpty }
         var seen = Set<String>()
         return parts.filter { seen.insert($0).inserted }
+    }
+
+    /// Mirror the server's human-readable size grammar closely enough to
+    /// reject incomplete edits before sending a multi-field settings patch.
+    static func isValidAudioUploadSize(_ raw: String) -> Bool {
+        let text = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        let units: [(suffix: String, multiplier: Double)] = [
+            ("TB", 1024 * 1024 * 1024 * 1024),
+            ("GB", 1024 * 1024 * 1024),
+            ("MB", 1024 * 1024),
+            ("KB", 1024),
+            ("B", 1),
+        ]
+
+        for unit in units where text.hasSuffix(unit.suffix) {
+            let number = String(text.dropLast(unit.suffix.count))
+            guard let value = Double(number), value.isFinite else { return false }
+            let bytes = value * unit.multiplier
+            return bytes.isFinite && bytes >= 1
+        }
+
+        guard let bytes = Int(text) else { return false }
+        return bytes > 0
     }
 
     func modelDirText(at index: Int) -> String {
@@ -516,6 +563,10 @@ final class ServerScreenVM {
 
     func saveSseKeepaliveMode() {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
+    }
+
+    func saveUsageHistory() {
+        Task { await commit(GlobalSettingsPatch(usageHistory: usageHistoryEnabled)) }
     }
 
     func saveAutoStartOnLaunch(services: AppServices) {

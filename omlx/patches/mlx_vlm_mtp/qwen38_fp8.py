@@ -13,9 +13,11 @@ FP8_BLOCK_SIZE = 128
 def dequantize_fp8_weights(
     weights: dict[str, Any],
     dtype: Any = mx.bfloat16,
+    *,
+    copy_weights: bool = True,
 ) -> dict[str, Any]:
     """Expand Qwen3.8 block-FP8 tensors using their inverse-scale grids."""
-    weights = dict(weights)
+    weights = dict(weights) if copy_weights else weights
     scale_suffix = ".weight_scale_inv"
 
     for scale_key in [key for key in weights if key.endswith(scale_suffix)]:

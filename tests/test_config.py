@@ -79,6 +79,14 @@ class TestParseSize:
         with pytest.raises(ValueError):
             parse_size("1XB")  # Invalid unit
 
+    @pytest.mark.parametrize(
+        "value", ["infMB", "-infMB", "nanMB", "1e999MB", "1e308TB"]
+    )
+    def test_parse_non_finite_raises_value_error(self, value):
+        """Non-finite unit values are rejected as invalid size strings."""
+        with pytest.raises(ValueError, match="Invalid size string"):
+            parse_size(value)
+
 
 class TestServerConfig:
     """Test cases for ServerConfig dataclass."""

@@ -1170,9 +1170,6 @@ class TestRerankerClose:
         with (
             patch("omlx.models.reranker.gc.collect") as collect,
             patch("omlx.models.reranker.mx") as mock_mx,
-            patch(
-                "omlx.models.reranker.clear_thread_compile_cache"
-            ) as clear_compile_cache,
         ):
             model.close()
 
@@ -1195,5 +1192,4 @@ class TestRerankerClose:
         assert model._is_compiled is False
         mock_mx.synchronize.assert_called_once()
         mock_mx.clear_cache.assert_called_once()
-        clear_compile_cache.assert_called_once()
         assert collect.call_count == 2

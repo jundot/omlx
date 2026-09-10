@@ -156,6 +156,23 @@ class TestGSM8K:
         assert _extract_numeric_answer("The answer is 42.") == "42"
         assert _extract_numeric_answer("She has 15 apples and 20 oranges, so 35 total.") == "35"
 
+    def test_extract_numeric_answer_trailing_comma_after_last_number(self):
+        # A bare "," is not a number: punctuation after the final digit must
+        # not become the extracted answer.
+        assert _extract_numeric_answer("The total is 72 clips, altogether.") == "72"
+        assert (
+            _extract_numeric_answer("Thus, the answer is 18, which is the total.")
+            == "18"
+        )
+        assert _extract_numeric_answer("He gave away 8 lollipops,") == "8"
+
+    def test_extract_numeric_answer_keeps_thousands_separator(self):
+        assert _extract_numeric_answer("The final total is 1,234 dollars.") == "1234"
+        assert _extract_numeric_answer("That comes to 1,234.50, in the end.") == "1234.50"
+
+    def test_extract_numeric_answer_commas_only(self):
+        assert _extract_numeric_answer("Well, hmm, no idea,") == ""
+
     def test_extract_numeric_answer_empty(self):
         assert _extract_numeric_answer("I don't know") == ""
         assert _extract_numeric_answer("") == ""

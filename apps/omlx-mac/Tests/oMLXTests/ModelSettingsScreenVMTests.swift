@@ -23,6 +23,18 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         )
     }
 
+    func testLightningMtpAllowsTurboQuantInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        vm.turboquantKvEnabled = true
+
+        XCTAssertNil(vm.mtpConflictReason)
+
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings["mtp_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"
@@ -120,6 +132,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
     func testQwenAneSettingsAreIncludedInWorkingProfile() {
         let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "qwen", configModelType: "qwen3_5")
         vm.qwen35AnePrefillEnabled = true
         vm.qwen35AnePrefillCpuEnabled = true
 
@@ -210,19 +223,88 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")
     }
 
-    func testQwenAneCompatibilityUsesQwenConfigFamily() {
+    func testK2AnePresetsKeepOneThirdAndExistingValues() {
         let vm = ModelSettingsScreenVM()
-        vm.model = makeModel(id: "qwen", configModelType: "qwen3_5_moe")
-        XCTAssertTrue(vm.isQwen35AnePrefillModel)
+        vm.model = makeModel(id: "mova", configModelType: "k2_horizon")
+        vm.qwen35AnePrefillEnabled = true
+        let presets = ModelSettingsScreenVM.aneFractionOptions(current: "0.42", presets: [1.0 / 3.0, 0.5])
+        XCTAssertEqual(presets.map(\.0), ["0.42", String(1.0 / 3.0), "0.5"])
+        XCTAssertEqual(presets.map(\.1), ["42%", "33%", "50%"])
+        vm.qwen35AnePrefillFraction = presets[0].0
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.qwen35AnePrefillFraction]?.value as? Double, 0.42)
+        vm.qwen35AnePrefillFraction = presets[1].0
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.qwen35AnePrefillFraction]?.value as? Double, 1.0 / 3.0)
+        XCTAssertEqual(ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillFraction, presets: [1.0 / 3.0, 0.5]).count, 2)
+    }
 
-        vm.model = makeModel(id: "qwen", configModelType: "qwen3-6")
-        XCTAssertTrue(vm.isQwen35AnePrefillModel)
+    func testK2SharedPresetsKeepLoadedStringSelection() {
+        for current in ["0", "0.0", "1", "1.0", String(1.0 / 3.0)] {
+            let options = ModelSettingsScreenVM.aneFractionOptions(current: current, presets: [0, 1.0 / 3.0, 1])
+            XCTAssertEqual(options.map(\.1), ["0%", "33%", "100%"])
+            XCTAssertEqual(options.filter { $0.0 == current }.count, 1)
+        }
+    }
 
-        vm.model = makeModel(id: "qwen", configModelType: "qwen3_8")
-        XCTAssertTrue(vm.isQwen35AnePrefillModel)
+    func testMovaAneRecommendationUsesSharedProfileFields() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "mova", configModelType: "k2_horizon")
+        let data = Data(#"{"tuning_id":"k2","model_id":"mova","status":"completed","phase":"completed","message":"Done","current":1,"total":1,"results":[],"recommendation":{"backend":"k2","enabled":true,"mlp_fraction":0.3333333333333333,"shared_fraction":1,"gdn_enabled":false,"processing_tps":100,"speedup_percent":4,"sequence_length":2048}}"#.utf8)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        vm.aneTuningStatus = try decoder.decode(ANETuningStatusResponse.self, from: data)
+        XCTAssertEqual(vm.aneTuningStatus?.recommendation?.processingTps, 100)
+        XCTAssertEqual(vm.aneTuningStatus?.recommendation?.speedupPercent, 4)
+        vm.applyANETuningRecommendation()
+        XCTAssertTrue(vm.thinkingForced)
+        XCTAssertTrue(vm.qwen35AnePrefillEnabled)
+        XCTAssertTrue(vm.qwen35AnePrefillGdn)
+        XCTAssertEqual(Double(vm.qwen35AnePrefillFraction), 1.0 / 3.0)
+        XCTAssertEqual(Double(vm.qwen35AnePrefillSharedFraction), 1)
+        XCTAssertTrue(vm.profileDirty)
+        let fields = vm.currentSettingsDict()
+        XCTAssertNotNil(fields[ProfileSettingsKey.qwen35AnePrefillEnabled])
+    }
 
-        vm.model = makeModel(id: "other", configModelType: "gemma4")
+    func testControlsUseServerCapabilitiesForAnyModelFamily() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let data = Data(#"{"id":"future","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"future_model","thinking_forced":true,"reasoning_effort_options":["medium","high"],"reasoning_effort_default":"medium","reasoning_effort_custom":false,"ane_prefill_backend":"qwen","ane_prefill_mlp_fractions":[0.25]}"#.utf8)
+        let vm = ModelSettingsScreenVM()
+        vm.model = try decoder.decode(ModelDTO.self, from: data)
+        XCTAssertTrue(vm.thinkingForced)
+        XCTAssertTrue(vm.isQwen35AnePrefillModel)
+        XCTAssertEqual(vm.reasoningEffortPresets, ["medium", "high"])
+        XCTAssertEqual(vm.model?.anePrefillMlpFractions, [0.25])
+        vm.addKwarg(.enableThinking)
+        XCTAssertTrue(vm.chatTemplateEntries.isEmpty)
+        vm.addKwarg(.reasoningEffort)
+        XCTAssertEqual(vm.chatTemplateEntries.first?.value, "medium")
+        XCTAssertNil(vm.currentSettingsDict()["enable_thinking"])
+        vm.model?.anePrefillBackend = nil
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
+    }
+
+    func testQwen4SsdOffloadWireKeysAndCompatibility() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "qwen4", configModelType: "qwen4_exp")
+        XCTAssertTrue(vm.isQwen4Exp)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let dto = try decoder.decode(
+            ModelSettingsDTO.self,
+            from: Data(#"{"qwen4_ple_ssd_offload":true}"#.utf8)
+        )
+        XCTAssertEqual(dto.qwen4PleSsdOffload, true)
+
+        var patch = ModelSettingsPatch()
+        patch.qwen4PleSsdOffload = true
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(
+            with: encoder.encode(patch)
+        ) as? [String: Any]
+        XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
     }
 
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
@@ -304,8 +386,67 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["allow_cpu_shared_resource"] as? Bool, false)
     }
 
+    func testK2UsesExistingReasoningEffortAndBudgetSettings() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "mova", configModelType: "k2_horizon")
+        XCTAssertEqual(vm.reasoningEffortPresets, ["low", "medium", "high"])
+        vm.addKwarg(.enableThinking)
+        XCTAssertTrue(vm.chatTemplateEntries.isEmpty)
+        vm.addKwarg(.reasoningEffort)
+        XCTAssertEqual(vm.chatTemplateEntries.first?.value, "high")
+        vm.thinkingBudgetEnabled = true
+        vm.thinkingBudgetTokens = "1"
+        let settings = vm.currentSettingsDict()
+        XCTAssertNil(settings["enable_thinking"])
+        XCTAssertEqual(settings["thinking_budget_tokens"]?.value as? Int, 1)
+        let kwargs = settings["chat_template_kwargs"]?.value as? [String: AnyCodable]
+        XCTAssertEqual(kwargs?["reasoning_effort"]?.value as? String, "high")
+        vm.model = makeModel(id: "qwen", configModelType: "qwen3")
+        XCTAssertTrue(vm.reasoningEffortPresets.contains("xhigh"))
+        XCTAssertNotNil(vm.currentSettingsDict()["enable_thinking"])
+    }
+
+
+
+
+    func testThinkingPatchCanClearK2SettingWithoutChangingOtherWireValues() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let cases: [(Bool??, String)] = [
+            (nil, "{}"),
+            (.some(nil), #"{"enable_thinking":null}"#),
+            (true, #"{"enable_thinking":true}"#),
+            (false, #"{"enable_thinking":false}"#),
+        ]
+        for (value, expected) in cases {
+            var patch = ModelSettingsPatch()
+            patch.enableThinking = value
+            XCTAssertEqual(String(decoding: try encoder.encode(patch), as: UTF8.self), expected)
+        }
+    }
+
+    func testSharedAneSettingsPreserveSplitAndExcludeOtherBackendOptions() {
+        let vm = ModelSettingsScreenVM()
+        vm.qwen35AnePrefillEnabled = true
+        vm.qwen35AnePrefillFraction = String(1.0 / 3.0)
+        vm.qwen35AnePrefillSharedFraction = "0"
+        vm.qwen35AnePrefillCpuEnabled = true
+        vm.model = makeModel(id: "k2", configModelType: "k2_horizon")
+        let k2 = vm.currentSettingsDict()
+        XCTAssertEqual(k2["qwen35_ane_prefill_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(k2["qwen35_ane_prefill_fraction"]?.value as? Double, 1.0 / 3.0)
+        XCTAssertEqual(k2["qwen35_ane_prefill_shared_fraction"]?.value as? Double, 0)
+        XCTAssertNil(k2["qwen35_ane_prefill_cpu_enabled"])
+        XCTAssertFalse(k2.keys.contains { $0.hasPrefix("k2_ane_") })
+        vm.model = makeModel(id: "qwen", configModelType: "qwen3_5")
+        let qwen = vm.currentSettingsDict()
+        XCTAssertEqual(qwen["qwen35_ane_prefill_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(qwen["qwen35_ane_prefill_cpu_enabled"]?.value as? Bool, true)
+        XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
+    }
+
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {
-        ModelDTO(
+        var model = ModelDTO(
             id: id,
             displayName: nil,
             modelPath: nil,
@@ -328,8 +469,21 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            qwen4PleSsdOffloadSupported: nil,
+            qwen4PleSsdOffloadForced: nil,
+            qwen4PleResidentBytes: nil,
+            qwen4PleMmapBytes: nil,
             virtual: nil,
             settings: nil
         )
+        model.thinkingForced = configModelType == "k2_horizon"
+        model.reasoningEffortOptions = model.thinkingForced == true ? ["low", "medium", "high"] : ["low", "medium", "high", "xhigh", "max"]
+        model.reasoningEffortDefault = model.thinkingForced == true ? "high" : "low"
+        model.reasoningEffortCustom = model.thinkingForced != true
+        model.anePrefillBackend = configModelType == "k2_horizon" ? "k2" : (configModelType?.hasPrefix("qwen3_5") == true ? "qwen" : nil)
+        model.anePrefillDefaultFraction = model.anePrefillBackend == "k2" ? 1.0 / 3.0 : 0.53
+        model.anePrefillMlpFractions = [1.0 / 3.0, 0.5]
+        model.anePrefillSharedFractions = [0, 1.0 / 3.0, 1]
+        return model
     }
 }
