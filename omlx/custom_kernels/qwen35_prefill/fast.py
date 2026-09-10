@@ -99,6 +99,12 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_q4_swiglu_down_t",
     "qwen35_ane_dual_q4_swiglu_down_t",
     "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t",
+    "oq_a8_kernels_available",
+    "qwen35_oq_a8_quantize",
+    "qwen35_oq_a8_qmm_t",
+    "qwen35_oq_a8_i4_qmm_t",
+    "qwen35_oq_a8_decode_weights",
+    "qwen35_oq_a8_stage_a_v8",
 )
 
 
@@ -1190,6 +1196,245 @@ def qwen35_moe_weighted_sum(
             stream=stream or mx.gpu,
         )
     raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+
+
+# --- oQ mixed-bit QxA8 (Q4/Q5, GS64, affine) on the M5 tensor units ---------
+
+OQ_A8_VARIANT = int(os.environ.get("OMLX_OQ_A8_VARIANT", "0"))
+OQ_A8_ACT_MODE = int(os.environ.get("OMLX_OQ_A8_ACT_MODE", "0"))
+
+
+def oq_a8_available() -> bool:
+    """True when the INT8 NAX GEMM can actually run on this machine.
+
+    Distinct from ``has_symbol``: the binding can exist in a build whose NAX
+    metallib was skipped (SDK < 26.2) or on hardware without tensor units.
+    """
+    if _ext is None or not hasattr(_ext, "oq_a8_kernels_available"):
+        return False
+    try:
+        return bool(_ext.oq_a8_kernels_available())
+    except Exception:
+        return False
+
+
+def qwen35_oq_a8_quantize(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Stage A: BF16/FP16 activations -> (Qa int8, Sa float32, Ra int16).
+
+    Run this once per shared activation and feed the result to every
+    projection that consumes it, whatever their bit widths.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_quantize"):
+        raise RuntimeError("qwen35_oq_a8_quantize native kernel is unavailable")
+    qa, sa, ra = _ext.qwen35_oq_a8_quantize(
+        x,
+        act_mode,
+        **_native_stream_kwargs(stream),
+    )
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_qmm_t(
+    qa: mx.array,
+    sa: mx.array,
+    ra: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_qmm_t"):
+        raise RuntimeError("qwen35_oq_a8_qmm_t native kernel is unavailable")
+    return _ext.qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        scales,
+        biases,
+        bits,
+        act_mode,
+        variant,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen35_oq_a8_linear(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Convenience Stage-A + GEMM for a projection with no shared activation."""
+    qa, sa, ra = qwen35_oq_a8_quantize(x, act_mode, stream=stream)
+    return qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        scales,
+        biases,
+        bits,
+        act_mode,
+        variant,
+        stream=stream,
+    )
+
+
+_I4_NIBBLE_FLIP = 0x88888888
+
+
+def qwen35_oq_a8_prepare_q4(
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """One-time load-time transform for the Q4 decode-free path.
+
+    ``int4b_format`` reads each nibble as two's-complement signed while oQ's
+    affine codes are unsigned 0..15. Flipping the top bit of every nibble makes
+    the hardware read exactly ``q - 8``, and the offset folds into the affine
+    bias because ``Sw*q + Bw == Sw*(q - 8) + (8*Sw + Bw)``.
+
+    Nothing is repacked: MLX's nibble order already matches what the tensor
+    units expect, so this is an XOR over the packed words plus a fused
+    multiply-add over the (much smaller) bias table.
+    """
+    flipped = weight ^ mx.array(_I4_NIBBLE_FLIP, dtype=mx.uint32)
+    folded = (biases.astype(mx.float32) + 8.0 * scales.astype(mx.float32)).astype(
+        biases.dtype
+    )
+    return flipped, scales, folded
+
+
+def qwen35_oq_a8_stage_a_v8(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Stage A in the layout the step-transposed GEMM reads.
+
+    The weight stream is the checkpoint's own, unmodified, so Qa is the only
+    operand that carries the schedule's K order: fragment slot ``16c + 4t + j``
+    of an affine group holds ``k = 16c + 8*(t>>1) + 2j + (t&1)``. That is legal
+    because a dot product does not care about summation order, the affine group
+    is the same set of 64 either way, and Ra is a sum over it -- so scales,
+    biases and Ra are untouched by the reorder.
+
+    Writing ``t = 2a + b``, the map is the transpose of the last two axes of
+    ``(c, a, j, b)``, so it costs one contiguous copy of an INT8 [M, K] -- tens
+    of microseconds against a GEMM measured in milliseconds, and nothing is
+    stored.
+
+    Ra (and Sa in per-group mode) come back group-major, ``[K/64, M]``, which
+    is what makes a group's metadata contiguous across the lanes that need it.
+    """
+    qa, sa, ra = qwen35_oq_a8_quantize(x, act_mode, stream=stream)
+    shape = qa.shape
+    k = shape[-1]
+    m = qa.size // k
+    # Reshaped back to the input's own rank, not to [M, K]: the op derives the
+    # output shape from Qa, so flattening a [B, S, K] activation here would
+    # hand the caller a [B*S, N] result. With B == 1 that broadcasts against
+    # the residual and hides; with B > 1 it is silently wrong.
+    qa = mx.contiguous(
+        qa.reshape(m, k // 64, 4, 2, 4, 2).transpose(0, 1, 2, 3, 5, 4).reshape(shape)
+    )
+    # Flattened to [M, groups] before transposing, not transposed in place:
+    # mx.transpose reverses *every* axis, so a [B, S, groups] Ra would come
+    # back as [groups, S, B] -- which is the layout the kernel wants only when
+    # B == 1, and silently interleaves the sequences when it is not.
+    ra = mx.contiguous(ra.reshape(m, -1).T)
+    if act_mode != 0:
+        sa = mx.contiguous(sa.reshape(m, -1).T)
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_i4_qmm_t(
+    qa: mx.array,
+    sa: mx.array,
+    ra: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    act_mode: int = 0,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Q4 GEMM with no weight decode.
+
+    ``weight`` and ``biases`` must come from :func:`qwen35_oq_a8_prepare_q4`.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_i4_qmm_t"):
+        raise RuntimeError("qwen35_oq_a8_i4_qmm_t native kernel is unavailable")
+    return _ext.qwen35_oq_a8_i4_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        scales,
+        biases,
+        act_mode,
+        variant,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen35_oq_a8_i4_linear(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    act_mode: int = 0,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Stage A + decode-free Q4 GEMM, for a projection sharing no activation."""
+    qa, sa, ra = qwen35_oq_a8_quantize(x, act_mode, stream=stream)
+    return qwen35_oq_a8_i4_qmm_t(
+        qa, sa, ra, weight, scales, biases, act_mode, variant, stream=stream
+    )
+
+
+def qwen35_oq_a8_decode_weights(
+    weight: mx.array,
+    bits: int,
+    group_count: int,
+    *,
+    stream=None,
+) -> mx.array:
+    """Unpack Q4/Q5 codes to INT8.
+
+    Test helper only: the production path never materializes unpacked weights
+    in device memory.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_decode_weights"):
+        raise RuntimeError(
+            "qwen35_oq_a8_decode_weights native kernel is unavailable"
+        )
+    return _ext.qwen35_oq_a8_decode_weights(
+        weight,
+        bits,
+        group_count,
+        **_native_stream_kwargs(stream),
+    )
 
 
 def __getattr__(name: str) -> Any:

@@ -128,6 +128,25 @@ def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
     resolved = dict(data)
     resolved["vlm_mtp_enabled"] = False
     return resolved, conflicts
+
+
+def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
+    """Clear ``qwen35_oq_a8_enabled`` when ANE prefill is also on.
+
+    Both wrap ``Qwen3_5MLP.__call__`` and claim the same projections, so
+    enabling both leaves whichever patched last in charge -- with the other
+    silently inert. ANE prefill wins because it is the older setting and the
+    one a saved profile is more likely to have been tuned around. Used for
+    dicts that predate the exclusivity rule so ``__post_init__`` does not
+    reject the whole blob.
+    """
+    if not (data.get("qwen35_oq_a8_enabled") and data.get("qwen35_ane_prefill_enabled")):
+        return data, []
+    resolved = dict(data)
+    resolved["qwen35_oq_a8_enabled"] = False
+    return resolved, ["qwen35_ane_prefill_enabled"]
+
+
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -191,6 +210,14 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
+        qwen35_oq_a8_enabled: Route eligible Qwen3.5/3.6/3.8 prefill matmuls
+            through the oQ mixed-bit INT8-activation (QxA8) tensor kernels.
+            Prefill only, and only a speed-up on hardware with native INT8
+            tensor operations -- M5-series and newer. On anything older the
+            kernels do not load and the setting is refused. Decode is
+            unaffected. Changes numerics: activations are quantized to INT8.
+            Mutually exclusive with qwen35_ane_prefill_enabled.
+        qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -312,6 +339,21 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
 
+    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8.
+    #
+    # Off by default because it is an accuracy decision, not just a speed one:
+    # activations are quantized to INT8 per row, which the W4/W5A16 path does
+    # not do. On M5 the Q4 GEMM measures 42 TOP/s against 23 for the shipping
+    # NAX path -- about 1.66x on an MLP block at 2048 tokens, and about 1.4x
+    # on end-to-end prompt processing, which is the figure the UI quotes
+    # because only part of prefill is routed.
+    #
+    # The kernel reads the checkpoint's own packed weight stream, so a routed
+    # projection costs no extra weight memory and the module's arrays stay
+    # readable by the decode path.
+    qwen35_oq_a8_enabled: bool = False
+    qwen35_oq_a8_min_tokens: int = 128
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = (
@@ -393,6 +435,18 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
+            raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
+        # Both accelerate the same Qwen3.5 prefill projections by wrapping
+        # Qwen3_5MLP.__call__, so enabling both leaves whichever patched last
+        # in charge and the other silently inert -- with different numerics
+        # depending on which won. Rejected at construction time so the clash
+        # surfaces in the admin UI / API rather than as a silent no-op.
+        if self.qwen35_oq_a8_enabled and self.qwen35_ane_prefill_enabled:
+            raise ValueError(
+                "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
+                "both be True; choose one Qwen3.5 prefill accelerator per model"
+            )
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is
@@ -540,6 +594,17 @@ class ModelSettingsManager:
                         "to re-enable vlm_mtp.",
                         model_id,
                         ", ".join(conflicts),
+                    )
+                model_data, prefill_conflicts = resolve_qwen35_prefill_conflicts(
+                    model_data
+                )
+                if prefill_conflicts:
+                    logger.warning(
+                        "Model '%s': qwen35_oq_a8_enabled disabled on load; it "
+                        "cannot be combined with %s. Unset that setting to "
+                        "re-enable the oQ A8 prefill kernels.",
+                        model_id,
+                        ", ".join(prefill_conflicts),
                     )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
@@ -889,6 +954,7 @@ class ModelSettingsManager:
         # vlm_mtp base model would make __post_init__ raise on this
         # request-time merge; drop vlm_mtp for the merged view instead.
         merged, _ = resolve_vlm_mtp_conflicts(merged)
+        merged, _ = resolve_qwen35_prefill_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def _runtime_settings_with_profile_locked(
@@ -898,6 +964,7 @@ class ModelSettingsManager:
         merged = base.to_dict() if base is not None else {}
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
         merged, _ = resolve_vlm_mtp_conflicts(merged)
+        merged, _ = resolve_qwen35_prefill_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
@@ -1261,6 +1328,7 @@ class ModelSettingsManager:
             # profile overlays: output-shaping settings win over the speed-only
             # VLM MTP toggle when the merged settings need logits processors.
             merged, _ = resolve_vlm_mtp_conflicts(merged)
+            merged, _ = resolve_qwen35_prefill_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
             try:

@@ -669,6 +669,15 @@ class EnginePool:
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
+        # The oQ A8 patch replaces MLP.__call__ process-wide, registers
+        # process-wide projection backends, and caches a prepared plan and
+        # metadata on every module it classifies. None of that can be undone
+        # in place, so a change here has to land on a fresh engine.
+        oq_a8_active = bool(data.get("qwen35_oq_a8_enabled", False))
+        add("qwen35_oq_a8_enabled", oq_a8_active)
+        if oq_a8_active:
+            add("qwen35_oq_a8_min_tokens", data.get("qwen35_oq_a8_min_tokens", 128))
+
         ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
         model_type = entry.config_model_type if entry else None
         backend = ane_prefill_backend(model_type)

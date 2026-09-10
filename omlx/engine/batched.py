@@ -431,6 +431,25 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
+        # because it quantizes activations to INT8, which changes numerics;
+        # the patch itself falls through for anything it cannot route.
+        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+            try:
+                from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
+
+                # The model itself is what gets opted in: the patch tags its
+                # modules, so a model loaded with the setting off is never
+                # routed even though the class wrapper is process-wide.
+                apply_qwen35_oq_a8_patch(
+                    self._model,
+                    min_tokens=int(
+                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                    ),
+                )
+            except Exception:
+                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
         if ane_enabled:

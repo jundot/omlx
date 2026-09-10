@@ -43,6 +43,8 @@
         'qwen35_ane_prefill_cpu_gdn_fraction',
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
+        'qwen35_oq_a8_enabled',
+        'qwen35_oq_a8_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -239,6 +241,8 @@
                 qwen35_ane_prefill_cpu_gdn_fraction: 0,
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
+                qwen35_oq_a8_enabled: false,
+                qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -1672,6 +1676,8 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
+                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -2429,6 +2435,22 @@
                 }
             },
 
+            validateQwenOqA8Settings() {
+                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+                // Both wrap the same MLP call, so the combination silently
+                // disables one of them. Caught here so the modal explains it
+                // instead of surfacing the server's 400.
+                if (this.modelSettings.qwen35_ane_prefill_enabled) {
+                    return 'ANE prefill and INT8 activation prefill cannot both be '
+                        + 'enabled; they accelerate the same projections. Turn one off.';
+                }
+                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                if (!Number.isInteger(minTokens) || minTokens < 1) {
+                    return 'oQ A8 minimum prompt tokens must be a positive integer.';
+                }
+                return null;
+            },
+
             validateQwenAneSettings() {
                 if (!this.modelSettings.qwen35_ane_prefill_enabled
                     || this.selectedModel?.ane_prefill_backend !== 'qwen') return null;
@@ -2508,6 +2530,12 @@
 
             async saveModelSettings() {
                 if (!this.selectedModel) return;
+
+                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
+                if (qwenOqA8ValidationError) {
+                    alert(qwenOqA8ValidationError);
+                    return;
+                }
 
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
@@ -2589,6 +2617,8 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
+                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
                                 // Validation only runs when the feature is enabled, so a
                                 // blank numeric input must fall back to the server default

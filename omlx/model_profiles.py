@@ -63,6 +63,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_gdn_fraction",
     "qwen35_ane_prefill_cpu_threads",
     "qwen35_ane_prefill_cpu_shared_resource",
+    "qwen35_oq_a8_enabled",
+    "qwen35_oq_a8_min_tokens",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

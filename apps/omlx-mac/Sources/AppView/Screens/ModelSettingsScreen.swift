@@ -1165,13 +1165,34 @@ private struct ExperimentalSection: View {
                     }
                 }
                 if vm.isQwen35AnePrefillModel {
+                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                      defaultValue: "Qwen INT8 Activation Prefill",
+                                      comment: "Row label for the oQ INT8-activation prefill kernels"),
+                        sublabel: qwenOqA8Sublabel) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
+                            .disabled(vm.qwen35OqA8ConflictReason != nil)
+                            .help(vm.qwen35OqA8ConflictReason ?? "")
+                    }
+                    if vm.qwen35OqA8Enabled {
+                        Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
+                                          defaultValue: "Minimum Prompt Tokens",
+                                          comment: "Row label for the oQ A8 minimum prompt length"),
+                            sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
+                                             defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
+                                             comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                                      placeholder: "128", mono: true,
+                                      isNumeric: true, range: 1...262_144,
+                                      step: 64, width: .controlCompact)
+                        }
+                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
-                        sublabel: String(localized: "settings.experimental.qwen_ane.sub",
-                                         defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
-                                         comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
+                        sublabel: qwenAnePrefillSublabel) {
                         RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                            .disabled(vm.qwen35AnePrefillConflictReason != nil)
+                            .help(vm.qwen35AnePrefillConflictReason ?? "")
                     }
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
@@ -1732,6 +1753,20 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.dflash.ssd_cache.sub",
                       defaultValue: "L2 spill of evicted L1 entries to disk.",
                       comment: "Default sublabel for the DFlash SSD cache toggle")
+    }
+
+    private var qwenOqA8Sublabel: String {
+        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_oq_a8.sub",
+                      defaultValue: "Run eligible Qwen 3.5/3.6/3.8 prompt-processing matmuls with INT8 activations. Requires a chip with native INT8 tensor operations (M5-series or newer) — on anything older there is no speed-up and the setting is refused. Speeds up prompt processing only; token generation is unchanged. Roughly 1.4x faster, and it changes numerics slightly. Cannot be combined with ANE prompt processing. Takes effect after the model reloads.",
+                      comment: "Sublabel describing the oQ INT8-activation prefill kernels")
+    }
+
+    private var qwenAnePrefillSublabel: String {
+        if let reason = vm.qwen35AnePrefillConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_ane.sub",
+                      defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")
     }
 
     private var vlmMtpToggleDisabled: Bool {

@@ -190,6 +190,79 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
 
 
 @pytest.mark.asyncio
+async def test_oq_a8_is_refused_while_ane_prefill_is_on():
+    """The two accelerators wrap the same MLP call, so the pair is a silent
+    no-op for whichever loses. The handler mutates the dataclass in place, so
+    __post_init__ never re-runs -- the check has to live on the merged result,
+    and it has to fire whether both arrive together or one is already set."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+
+    already_on = ModelSettings(qwen35_ane_prefill_enabled=True)
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        with pytest.raises(admin_routes.HTTPException) as one_at_a_time:
+            await _update_settings(
+                pool,
+                already_on,
+                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+            )
+        with pytest.raises(admin_routes.HTTPException) as same_request:
+            await _update_settings(
+                pool,
+                ModelSettings(),
+                admin_routes.ModelSettingsRequest(
+                    qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True
+                ),
+            )
+
+    for excinfo in (one_at_a_time, same_request):
+        assert excinfo.value.status_code == 400
+        assert "cannot both be enabled" in excinfo.value.detail
+    # Refused, not half-applied.
+    assert already_on.qwen35_oq_a8_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_alone_is_persisted():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=256
+            ),
+        )
+
+    assert settings.qwen35_oq_a8_enabled is True
+    assert settings.qwen35_oq_a8_min_tokens == 256
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_needs_native_int8_kernels():
+    """Nothing on this hardware would run faster, so the setting is refused
+    rather than accepted and silently ignored at load."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool,
+                settings,
+                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+            )
+
+    assert excinfo.value.status_code == 400
+    assert "M5-series or newer" in excinfo.value.detail
+    assert settings.qwen35_oq_a8_enabled is False
+
+
+@pytest.mark.asyncio
 async def test_qwen4_ple_ssd_offload_is_persisted_for_qwen4_only():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen4_exp"

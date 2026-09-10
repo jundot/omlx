@@ -33,6 +33,7 @@ target_sources(
   omlx_qwen35_prefill_kernel_ops
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/qwen35_prefill.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/qwen35_oq_a8.cpp
   ${CMAKE_CURRENT_LIST_DIR}/qwen35_ane.mm)
 target_include_directories(
   omlx_qwen35_prefill_kernel_ops
@@ -51,6 +52,7 @@ if(MLX_BUILD_METAL)
   set(OMLX_QWEN35_PREFILL_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/qwen35_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm.metal
+      ${CMAKE_CURRENT_LIST_DIR}/qwen35_oq_a8.metal
       ${CMAKE_CURRENT_LIST_DIR}/qwen35_ane.metal)
   file(GLOB_RECURSE OMLX_QWEN35_PREFILL_METAL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/*.h
@@ -137,19 +139,24 @@ if(MLX_BUILD_METAL)
           ${OMLX_QWEN35_PREFILL_NAX_METAL_FLAGS} -gline-tables-only
           -frecord-sources)
     endif()
-    set(OMLX_QWEN35_PREFILL_NAX_AIR
-        ${CMAKE_CURRENT_BINARY_DIR}/qwen35_qmm_nax.air)
-    add_custom_command(
-      OUTPUT ${OMLX_QWEN35_PREFILL_NAX_AIR}
-      COMMAND
-        xcrun -sdk macosx metal ${OMLX_QWEN35_PREFILL_NAX_METAL_FLAGS} -c
+    set(OMLX_QWEN35_PREFILL_NAX_SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm_nax.metal
-        ${OMLX_QWEN35_PREFILL_METAL_INCLUDE_ARGS} -o
-        ${OMLX_QWEN35_PREFILL_NAX_AIR}
-      DEPENDS ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm_nax.metal
-              ${OMLX_QWEN35_PREFILL_METAL_HEADERS}
-      COMMENT "Building qwen35_qmm_nax.air"
-      VERBATIM)
+        ${CMAKE_CURRENT_LIST_DIR}/qwen35_oq_a8_nax.metal)
+    set(OMLX_QWEN35_PREFILL_NAX_AIR)
+    foreach(NAX_SRCFILE IN LISTS OMLX_QWEN35_PREFILL_NAX_SOURCES)
+      get_filename_component(NAX_TARGET_NAME ${NAX_SRCFILE} NAME_WE)
+      set(NAX_AIR_FILE ${CMAKE_CURRENT_BINARY_DIR}/${NAX_TARGET_NAME}.air)
+      add_custom_command(
+        OUTPUT ${NAX_AIR_FILE}
+        COMMAND
+          xcrun -sdk macosx metal ${OMLX_QWEN35_PREFILL_NAX_METAL_FLAGS} -c
+          ${NAX_SRCFILE} ${OMLX_QWEN35_PREFILL_METAL_INCLUDE_ARGS} -o
+          ${NAX_AIR_FILE}
+        DEPENDS ${NAX_SRCFILE} ${OMLX_QWEN35_PREFILL_METAL_HEADERS}
+        COMMENT "Building ${NAX_TARGET_NAME}.air"
+        VERBATIM)
+      list(APPEND OMLX_QWEN35_PREFILL_NAX_AIR ${NAX_AIR_FILE})
+    endforeach()
     set(OMLX_QWEN35_PREFILL_NAX_METALLIB
         ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/omlx_qwen35_prefill_kernels_nax.metallib)
     add_custom_command(

@@ -1398,6 +1398,35 @@ class TestEnginePoolAsync:
         assert second is base_engine
         base_engine.stop.assert_not_awaited()
 
+    def test_oq_a8_forces_a_separate_engine(self, pool_with_mock_engines):
+        """The patch replaces MLP.__call__ process-wide, registers process-wide
+        projection backends, and caches a plan on every module it classifies;
+        none of that can be undone in place, so a change here has to land on a
+        fresh engine rather than a live toggle."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        off = ModelSettings(qwen35_oq_a8_enabled=False)
+        on = ModelSettings(qwen35_oq_a8_enabled=True)
+        other_floor = ModelSettings(
+            qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=1024
+        )
+
+        sig = lambda s: pool._engine_runtime_signature("model-a", s)  # noqa: E731
+        assert sig(off) != sig(on)
+        assert sig(on) != sig(other_floor)
+
+    def test_oq_a8_tuning_is_ignored_while_disabled(self, pool_with_mock_engines):
+        """A stale floor on a disabled feature must not split the engine."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        a = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=512)
+        b = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=2048)
+        assert pool._engine_runtime_signature(
+            "model-a", a
+        ) == pool._engine_runtime_signature("model-a", b)
+
     def test_runtime_signature_ignores_request_only_profile_fields(
         self, pool_with_mock_engines
     ):

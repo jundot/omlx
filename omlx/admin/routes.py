@@ -149,6 +149,21 @@ print(deleted)
     return deleted, len(node_ids)
 
 
+def _oq_a8_kernels_available() -> bool:
+    """True when the oQ A8 prefill kernels can actually run on this host.
+
+    Enabling the setting on a machine without tensor units would leave every
+    projection falling back, so the save is refused rather than accepted into
+    a no-op.
+    """
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        return bool(fast.oq_a8_available())
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Pydantic Models
 # =============================================================================
@@ -250,6 +265,9 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
+    qwen35_oq_a8_enabled: bool | None = None
+    qwen35_oq_a8_min_tokens: int | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -2638,6 +2656,54 @@ async def update_model_settings(
     if "qwen35_ane_prefill_cpu_shared_resource" in sent:
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
+        )
+    # oQ mixed-bit QxA8 prefill. Load-time like the ANE controls above: the
+    # runtime signature re-creates a loaded model when this changes.
+    if "qwen35_oq_a8_enabled" in sent:
+        enabled = bool(request.qwen35_oq_a8_enabled)
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if enabled and not config_type.startswith(
+            ("qwen3_5", "qwen3_6", "qwen3_8")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 models."
+                ),
+            )
+        if enabled and not _oq_a8_kernels_available():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "oQ A8 prefill needs the native Qwen3.5 prefill kernels and "
+                    "a Metal device with native INT8 tensor operations "
+                    "(M5-series or newer)."
+                ),
+            )
+        current_settings.qwen35_oq_a8_enabled = enabled
+    if "qwen35_oq_a8_min_tokens" in sent:
+        value = request.qwen35_oq_a8_min_tokens
+        if value is None or value < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="oQ A8 min tokens must be at least 1.",
+            )
+        current_settings.qwen35_oq_a8_min_tokens = int(value)
+    if (
+        current_settings.qwen35_oq_a8_enabled
+        and current_settings.qwen35_ane_prefill_enabled
+    ):
+        # Checked on the merged result rather than inside either branch, so it
+        # catches enabling one while the other is already on as well as both
+        # arriving in the same request. Both wrap Qwen3_5MLP.__call__, so the
+        # combination is a silent no-op for whichever loses, not an error.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "ANE prefill and oQ A8 prefill cannot both be enabled; they "
+                "accelerate the same Qwen3.5 projections. Turn one off first."
+            ),
         )
     if (
         ane_backend == "qwen"
