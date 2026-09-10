@@ -151,6 +151,13 @@ class _BatchedVerifyCtx:
         self.skip_hidden: Optional[mx.array] = None  # (B, H)
         self.greedy_cache: Dict[int, bool] = {}
         self.host: Any = None
+        # review round 1: composition + verify-cycle bookkeeping so fallback
+        # can restore committed state and row replacement re-frontiers.
+        self.last_uids: List[Any] = []
+        self.disabled: bool = False
+        self.cycle_k: int = 0
+        self.committed: List[int] = []   # per-row emissions this cycle
+        self.in_verify: bool = False    # cache advanced past committed?
 
 
 def _eligible(gen_batch: Any) -> bool:
@@ -168,6 +175,12 @@ def _eligible(gen_batch: Any) -> bool:
     ctx = getattr(gen_batch, "_omlx_batched_verify_ctx", None)
     if ctx is not None and getattr(ctx, "disabled", False):
         return False  # runtime self-check banned this batch composition
+    greedy_cache = ctx.greedy_cache if ctx is not None else {}
+    samplers_l = list(getattr(gen_batch, "samplers", None) or [])
+    if not samplers_l:
+        samplers_l = [gen_batch.fallback_sampler] * len(uids)
+    if not all(_sampler_is_greedy(sm, greedy_cache) for sm in samplers_l):
+        return False  # non-greedy: oracle bursts would skew top_p/suppression
     prompt_cache = getattr(gen_batch, "prompt_cache", None)
     if not prompt_cache or not hasattr(prompt_cache[0], "left_padding"):
         return False
@@ -390,7 +403,16 @@ def _head_norm(model: Any, host: Any, hidden: mx.array) -> mx.array:
 
 def _emit_one(gen_batch: Any, i: int, uid: Any, token: int,
               lp: Any, responses: List[Any], keep: List[int],
-              finished: List[int]) -> None:
+              finished: List[int],
+              unemitted_this_cycle: int = 0) -> None:
+    """Emit one token for row ``i``.
+
+    ``unemitted_this_cycle`` is the count of positions the current cycle
+    already advanced into the row's cache but will NOT emit after this token
+    (accepted drafts dropped by the finish, or the rejected tail when the
+    finish lands before the cycle-end trim). On finish the extracted cache
+    is tail-trimmed by that amount so the terminal response never exposes
+    KV beyond the committed tokens."""
     finish_reason = None
     match_sequence = None
     current_state = None
@@ -403,11 +425,23 @@ def _emit_one(gen_batch: Any, i: int, uid: Any, token: int,
     )
     if match_sequence is not None and current_state is None:
         finish_reason = "stop"
+    prompt_cache = None
+    if finish_reason is not None:
+        prompt_cache = gen_batch.extract_cache(i)
+        if unemitted_this_cycle > 0 and prompt_cache is not None:
+            for c in prompt_cache:
+                trim = getattr(c, "trim", None)
+                if callable(trim):
+                    try:
+                        if getattr(c, "is_trimmable", lambda: True)():
+                            trim(unemitted_this_cycle)
+                    except Exception:
+                        pass
     responses.append(
         gen_batch.Response(
             uid=uid, token=token, logprobs=lp, finish_reason=finish_reason,
             current_state=current_state, match_sequence=match_sequence,
-            prompt_cache=gen_batch.extract_cache(i) if finish_reason else None,
+            prompt_cache=prompt_cache,
             all_tokens=gen_batch.tokens[i] if finish_reason else None,
         )
     )
@@ -419,17 +453,30 @@ def _emit_one(gen_batch: Any, i: int, uid: Any, token: int,
 
 def _finish_cycle(gen_batch: Any, ctx: _BatchedVerifyCtx, B: int,
                   keep: List[int], finished: List[int]) -> None:
+    # keep collects one entry per emission; a row surviving a full cycle
+    # with drafts appears multiple times, which both inflates the length
+    # check below (finished rows can survive the filter) and hands filter()
+    # duplicate indices.
+    keep_dedup = list(dict.fromkeys(keep))
     live_uids = set(gen_batch.uids)
     for uid in list(ctx.rows):
         if uid not in live_uids:
             del ctx.rows[uid]
-    if len(keep) < B:
-        gen_batch.filter(keep)
-    if len(getattr(gen_batch, "uids", [])) != B:
-        # Row set changed (join/leave) — drop skip state so the next cycle
-        # re-frontiers with a plain forward (safe seam).
+    if len(keep_dedup) < B:
+        gen_batch.filter(keep_dedup)
+    # Composition change (join/leave, INCLUDING same-sized replacement):
+    # re-frontier with a plain forward (a replaced row's skip state would
+    # be attributed to its successor) and re-allow eligibility — the ban
+    # applied to a composition that no longer exists.
+    now_uids = set(map(str, getattr(gen_batch, "uids", []) or []))
+    if now_uids != set(map(str, ctx.last_uids)):
         ctx.skip_logits = None
         ctx.skip_hidden = None
+        ctx.disabled = False
+    ctx.last_uids = list(getattr(gen_batch, "uids", []) or [])
+    # Cycle closed: the cache now matches committed state exactly.
+    ctx.in_verify = False
+    ctx.committed = []
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +582,8 @@ def _batched_next(gen_batch: Any) -> List[Any]:
     _t_cycle = time.perf_counter()
 
     # ---- steady cycle (sampler-exact-once), depth k >= 1 ----
+    ctx.cycle_k = k
+    ctx.committed = [0] * B
     # Verify feeds [P', d1, ..., dk]; v_j is the oracle after position j.
     # Per row the sampler is called exactly as often as tokens are emitted:
     # a chain accepting ``a`` drafts calls sample(v0..v_a); the sample(v_a)
@@ -602,6 +651,9 @@ def _batched_next(gen_batch: Any) -> List[Any]:
     v_logits, v_hidden = _model_forward(
         gen_batch.model, verify_inputs, gen_batch.prompt_cache, n_confirmed=1
     )
+    # The cache has advanced k+1 per row past the last committed position;
+    # emission + trims below bring it back to exactly the committed length.
+    ctx.in_verify = True
     _stats["verify_ms"] += time.perf_counter() - t_v
     v_lp = [_norm_lp(v_logits[:, j, :]) for j in range(k + 1)]
 
@@ -667,6 +719,12 @@ def _batched_next(gen_batch: Any) -> List[Any]:
             ctx.disabled = True
             raise _Fallback("GDN exact rollback unavailable (no stash)")
         kv_ok = _trim_rows(gen_batch, [k - a for a in acc_counts])
+        if not kv_ok:
+            # KV tail trim failed: the cache still holds the rejected tail,
+            # so committed state cannot be restored on this path — ban the
+            # composition and let the fallback's restore run.
+            ctx.disabled = True
+            raise _Fallback("KV speculative-tail trim failed")
         _stats["rollback_ms"] += time.perf_counter() - t_r
         _stats["reject_rollbacks"] += 1
         if not gdn_ok:
@@ -695,8 +753,12 @@ def _batched_next(gen_batch: Any) -> List[Any]:
     _t_emit = time.perf_counter()
     for i, uid in enumerate(uids):
         row = ctx.rows.get(uid)
+        # If the finish lands on the primary, the a accepted drafts behind
+        # it never emit: trim them from the terminal cache.
         _emit_one(gen_batch, i, uid, tokens_list[i], emit_lps[i],
-                  responses, keep, finished)
+                  responses, keep, finished,
+                  unemitted_this_cycle=acc_counts[i])
+        ctx.committed[i] += 1
         if row is None:
             continue
         row.fold_pairs = [
@@ -712,7 +774,14 @@ def _batched_next(gen_batch: Any) -> List[Any]:
         for j in range(acc_counts[i]):
             d_ij = drafts_all[i][j]
             d_lp = float(v_lp[j][i, d_ij].item())
-            _emit_one(gen_batch, i, uid, d_ij, d_lp, responses, keep, finished)
+            # Remaining positions this cycle advanced but won't emit if this
+            # draft finishes the row: the drafts after j (inclusive count is
+            # handled by passing acc - j - 1... we emit THIS one, so the
+            # un-emitted tail after it is acc - (j + 1).
+            _emit_one(gen_batch, i, uid, d_ij, d_lp, responses, keep,
+                      finished,
+                      unemitted_this_cycle=acc_counts[i] - j - 1)
+            ctx.committed[i] += 1
             if i in finished:
                 break
 
@@ -930,6 +999,29 @@ def install() -> bool:
             _stats["fallbacks"] += 1
             ctx = getattr(self, "_omlx_batched_verify_ctx", None)
             if ctx is not None:
+                # Restore committed state: if the abort landed mid-cycle the
+                # verify forward already advanced the cache past what the
+                # rows emitted — trim the uncommitted tail so the standard
+                # path re-feeds from the last committed token exactly once.
+                if getattr(ctx, "in_verify", False):
+                    k_c = getattr(ctx, "cycle_k", 0)
+                    committed = getattr(ctx, "committed", None) or []
+                    B_now = len(getattr(self, "uids", []) or [])
+                    amounts = [
+                        max(0, k_c + 1 - (committed[i] if i < len(committed) else 0))
+                        for i in range(B_now)
+                    ]
+                    try:
+                        if not _trim_rows(self, amounts):
+                            logger.error(
+                                "[batched-verify] fallback cache restore "
+                                "failed (untrimmed speculative tail)")
+                    except Exception as trim_exc:
+                        logger.error(
+                            "[batched-verify] fallback cache restore error: "
+                            "%s", trim_exc)
+                    ctx.in_verify = False
+                    ctx.committed = []
                 ctx.skip_logits = None
                 ctx.skip_hidden = None
             try:
