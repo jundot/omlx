@@ -350,3 +350,66 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
             assert evaluate.call_count == 1
         mx.eval(first, second)
     assert len(hc_fused._VALIDATED) == 7
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("rows", [17, 2048])
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
+    """Prefill retains canonical normalization while compiling the stream mean."""
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(bits, use_combine)
+    x = (mx.random.normal((1, rows, WIDTH)) * 2).astype(mx.bfloat16)
+    mx.eval(x)
+    assert not hc_fused.compatible(module, x)
+    assert hc_fused.prefill_compatible(module, x)
+    kernel_norm = Mock(side_effect=AssertionError("prefill must use canonical norm"))
+    monkeypatch.setattr(hc_fused, "_kernel_norm", kernel_norm)
+    out = hc_fused.prefill_forward(module, x)
+    kernel_norm.assert_not_called()
+    assert out is not None
+    canon = module._forward(x)
+    if use_combine:
+        mixed, passthrough, inject = out
+        canon_mixed, _, canon_inject = canon
+        assert passthrough is x
+        assert inject.shape == canon_inject.shape == (1, rows, HC)
+        assert _ulps(inject, canon_inject)[0] <= 4
+    else:
+        mixed, canon_mixed = out, canon
+    assert mixed.shape == canon_mixed.shape == (1, rows, HIDDEN)
+    assert mixed.dtype == mx.bfloat16
+    max_ulps, mean_ulps = _ulps(mixed, canon_mixed)
+    assert max_ulps <= 16 and mean_ulps <= 0.5
+
+
+def test_prefill_path_not_offered_for_fused_rows():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4)
+    x = mx.zeros((1, hc_fused.MAX_ROWS, WIDTH), dtype=mx.bfloat16)
+    assert not hc_fused.prefill_compatible(module, x)
+
+
+def test_prefill_path_kill_switch(monkeypatch):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4)
+    x = mx.zeros((1, 64, WIDTH), dtype=mx.bfloat16)
+    assert hc_fused.prefill_compatible(module, x)
+    monkeypatch.setattr(hc_fused, "_DISABLED", True)
+    assert not hc_fused.prefill_compatible(module, x)
+
+
+def test_module_routes_prefill_rows_through_the_prefill_path(monkeypatch):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4)
+    x = mx.zeros((1, 64, WIDTH), dtype=mx.bfloat16)
+    calls = []
+    monkeypatch.setattr(hc_fused, "prefill_forward", lambda m, h: calls.append(h.shape) or "prefill")
+    assert module(x) == "prefill"
+    assert calls == [(1, 64, WIDTH)]
+    assert module(x, target_verify=True) != "prefill"

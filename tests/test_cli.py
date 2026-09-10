@@ -753,8 +753,8 @@ class TestLaunchCommandFunction:
         assert "Using model: only-32k" in output
         assert "Cannot launch Claude Code with model 'only-32k'" in output
 
-    def test_launch_command_shows_picker_and_clears_saved_tiers(self):
-        """Bare `omlx launch claude` shows the picker and ignores saved tier models."""
+    def test_launch_command_shows_picker_and_keeps_saved_tiers(self):
+        """Bare `omlx launch claude` shows the picker for the default model and keeps the saved tier models (#3543)."""
         from omlx.cli import launch_command
 
         integration = MagicMock()
@@ -813,9 +813,9 @@ class TestLaunchCommandFunction:
         integration.select_model.assert_called_once()
         ctx = integration.launch.call_args.args[0]
         assert ctx.model == "sonnet-local"
-        assert ctx.opus_model is None
-        assert ctx.sonnet_model is None
-        assert ctx.haiku_model is None
+        assert ctx.opus_model == "opus-local"
+        assert ctx.sonnet_model == "sonnet-local"
+        assert ctx.haiku_model == "haiku-local"
         assert ctx.api_key == "saved-key"
 
     def test_launch_command_claude_cli_tiers_override_saved_settings(self):
@@ -1353,3 +1353,178 @@ class TestCLIDocstrings:
         assert (
             "multi-model" in result.stdout.lower() or "server" in result.stdout.lower()
         )
+
+
+class TestLaunchClaudeTierPrecedence:
+    def _run(
+        self, *, args_model, settings_tiers, cli_tiers=None, picked="picked-model"
+    ):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+        integration.select_model.return_value = picked
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {"id": m, "max_context_window": 131072}
+                for m in (
+                    "picked-model",
+                    "other-model",
+                    "opus-cfg",
+                    "sonnet-cfg",
+                    "haiku-cfg",
+                    "opus-flag",
+                )
+            ]
+        }
+
+        # Third request: the interactive path lists /v1/models before the picker.
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [
+                {"id": m["id"], "model_type": "llm"}
+                for m in status_response.json.return_value["models"]
+            ]
+        }
+
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(**settings_tiers),
+        )
+        cli_tiers = cli_tiers or {}
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key=None,
+            model=args_model,
+            tools_profile="coding",
+            opus_model=cli_tiers.get("opus_model"),
+            sonnet_model=cli_tiers.get("sonnet_model"),
+            haiku_model=cli_tiers.get("haiku_model"),
+        )
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+        integration.launch.assert_called_once()
+        return integration.launch.call_args.args[0]
+
+    def test_interactive_pick_keeps_saved_tier_models(self):
+        """The picker chooses the default model; the persisted tiers keep their roles (#3543)."""
+        ctx = self._run(
+            args_model=None,
+            settings_tiers={
+                "opus_model": "opus-cfg",
+                "sonnet_model": "sonnet-cfg",
+                "haiku_model": "haiku-cfg",
+            },
+        )
+        assert ctx.model == "picked-model"
+        assert (ctx.opus_model, ctx.sonnet_model, ctx.haiku_model) == (
+            "opus-cfg",
+            "sonnet-cfg",
+            "haiku-cfg",
+        )
+
+    def test_explicit_tier_flag_overrides_saved_setting(self):
+        ctx = self._run(
+            args_model="picked-model",
+            settings_tiers={
+                "opus_model": "opus-cfg",
+                "sonnet_model": "sonnet-cfg",
+                "haiku_model": "haiku-cfg",
+            },
+            cli_tiers={"opus_model": "opus-flag"},
+        )
+        assert ctx.opus_model == "opus-flag"
+        assert (ctx.sonnet_model, ctx.haiku_model) == ("sonnet-cfg", "haiku-cfg")
+
+    def test_without_saved_tiers_the_picked_model_is_used(self):
+        ctx = self._run(
+            args_model=None,
+            settings_tiers={
+                "opus_model": None,
+                "sonnet_model": None,
+                "haiku_model": None,
+            },
+        )
+        assert ctx.model == "picked-model"
+        assert (ctx.opus_model, ctx.sonnet_model, ctx.haiku_model) == (None, None, None)
+
+    @pytest.mark.parametrize(
+        "windows, expected_window",
+        [
+            ((131072, 49152, 65536, 65536), "49152"),
+            ((131072, 65536, 49152, 65536), "49152"),
+            ((131072, 65536, 65536, 49152), "49152"),
+            ((49152, 131072, 131072, 131072), "49152"),
+            ((131072, 131072, 131072, 131072), "131072"),
+            ((131072, None, None, None), "131072"),
+            ((None, 49152, 65536, 65536), "49152"),
+            ((None, None, None, None), None),
+        ],
+    )
+    def test_launch_passes_initial_model_and_shared_context_limit(
+        self, windows, expected_window
+    ):
+        from omlx.cli import launch_command
+        from omlx.integrations.claude import ClaudeCodeIntegration
+
+        integration = ClaudeCodeIntegration()
+        model_ids = ("picked-model", "opus-cfg", "sonnet-cfg", "haiku-cfg")
+        models = [
+            {"id": model_id, "max_context_window": window, "model_type": "llm"}
+            for model_id, window in zip(model_ids, windows)
+        ]
+        responses = [MagicMock(), MagicMock(), MagicMock()]
+        responses[1].json.return_value = {"models": models}
+        responses[2].json.return_value = {"data": models}
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(
+                opus_model="opus-cfg",
+                sonnet_model="sonnet-cfg",
+                haiku_model="haiku-cfg",
+            ),
+        )
+        args = argparse.Namespace(
+            tool="claude", host=None, port=None, api_key=None, model=None
+        )
+        with (
+            patch("requests.get", side_effect=responses),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch.object(integration, "is_installed", return_value=True),
+            patch.object(integration, "select_model", return_value="picked-model"),
+            patch.object(integration, "_find_claude_binary", return_value="claude"),
+            patch.dict("os.environ", {"ANTHROPIC_MODEL": "old-model"}, clear=True),
+            patch("omlx.integrations.claude.os.execvpe") as execute,
+        ):
+            launch_command(args, extra_args=["--resume", "session-id"])
+
+        execute.assert_called_once()
+        binary, argv, env = execute.call_args.args
+        assert binary == "claude"
+        assert argv == ["claude", "--disallowedTools", "LSP", "--resume", "session-id"]
+        assert env["ANTHROPIC_MODEL"] == "picked-model"
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "opus-cfg"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sonnet-cfg"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-cfg"
+        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-cfg"
+        assert env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == expected_window
+        assert env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected_window

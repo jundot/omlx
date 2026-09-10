@@ -495,6 +495,8 @@ class ClusterDeploymentRequest(BaseModel):
     sampling_rank_only: bool = True
     async_overlap: bool = True
     cache_affinity: bool = True
+    prompt_cache_ssd: bool = True
+    prompt_cache_ssd_max_bytes: int = Field(default=20 * 1024**3, gt=0)
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
@@ -886,6 +888,10 @@ def _create_cluster_plan(request: ClusterPlanRequest):
 class ClusterAutoconfigureRequest(BaseModel):
     """Everything one-click activation needs; the server decides the rest."""
 
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: str | None = Field(default=None, max_length=128)
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
     model_path: str | None = Field(default=None, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
     model_source_python: str | None = Field(default=None, max_length=4096)
@@ -907,6 +913,8 @@ class ClusterAutoconfigureRequest(BaseModel):
     sampling_rank_only: bool = True
     async_overlap: bool = True
     cache_affinity: bool = True
+    prompt_cache_ssd: bool = True
+    prompt_cache_ssd_max_bytes: int = Field(default=20 * 1024**3, gt=0)
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
@@ -970,6 +978,7 @@ def _staging_for(
             source_python_executable=(
                 request.model_source_python or DEFAULT_REMOTE_PYTHON
             ),
+            **({"path_map": request.path_map} if request.path_map else {}),
         )
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         return {"error": str(exc), "ready": False}
@@ -1117,6 +1126,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     """
 
     _validate_cluster_hosts(request.hosts)
+    try:
+        path_map = validate_model_path_map(
+            request.path_map, tuple(node.node_id for node in request.nodes)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    request = request.model_copy(update={"path_map": path_map})
 
     plan_request = ClusterPlanRequest(
         model_path=request.model_path,
@@ -1163,9 +1179,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         except (OSError, RuntimeError, ValueError) as exc:
             fabric_error = str(exc)
     provisional_backend = (
-        str(fabric["backend"])
-        if fabric is not None
-        else choose_backend(transports)[0]
+        str(fabric["backend"]) if fabric is not None else choose_backend(transports)[0]
     )
     strategy_transports = transports
     if provisional_backend == "ring" and transports:
@@ -1420,9 +1434,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 for profile in performance_probe.get("profiles", ())
             )
             if len(profiles) != len(profiled_request_nodes):
-                raise ValueError(
-                    "performance probe did not return every cluster rank"
-                )
+                raise ValueError("performance probe did not return every cluster rank")
             profile_by_node = {profile.node_id: profile for profile in profiles}
             profiled_request_nodes = [
                 node.model_copy(
@@ -1474,6 +1486,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 f"memory-balanced split. {exc}"
             )
 
+    # Destination paths participate in the same placement signature checked
+    # by staging and activation; adding them only to activation yields 409.
+    if path_map:
+        choice = replace(choice, plan=replace(choice.plan, path_map=path_map))
+
     # stage_manifest probes peers with blocking SSH. Keep it off the FastAPI
     # event loop just like transport detection and preflight above.
     staging = await asyncio.to_thread(_staging_for, request, choice)
@@ -1510,11 +1527,16 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         # a fix the user can paste, and a sentence hides it.
         "preflight_issues": [asdict(issue) for issue in issues],
         "ready_to_activate": not issues and staging_ready and fabric_ready,
+        "ready_to_stage": not issues
+        and fabric_ready
+        and not bool((staging or {}).get("error")),
         "warnings": _redact_diagnostic(warnings),
         "transports": [transport.__dict__ for transport in transports],
         "plan": plan_payload,
         # Ready to POST straight to /deployments once the user approves.
         "activation": {
+            "deployment_id": request.deployment_id,
+            "path_map": request.path_map,
             "model_path": request.model_path,
             "model_source": request.model_source,
             "model_source_python": request.model_source_python,
@@ -1524,6 +1546,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "sampling_rank_only": request.sampling_rank_only,
             "async_overlap": request.async_overlap,
             "cache_affinity": request.cache_affinity,
+            "prompt_cache_ssd": request.prompt_cache_ssd,
+            "prompt_cache_ssd_max_bytes": request.prompt_cache_ssd_max_bytes,
             "max_kv_size": request.max_kv_size,
             "target_context_tokens": request.target_context_tokens,
             "ring_connections_per_ip": (
@@ -1873,30 +1897,70 @@ async def cluster_status(route_to: str | None = None):
     return status.to_dict() | {"runtime_jobs": read_runtime_markers()}
 
 
+def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
+    """Retained marker files do not establish engine ownership."""
+    loaded: set[str] = set()
+    loading: set[str] = set()
+    launchers = []
+    for model_id in getattr(pool, "get_loaded_model_ids", lambda: [])():
+        entry = pool.get_entry(model_id)
+        status = getattr(getattr(entry, "engine", None), "cluster_status", None)
+        if not callable(status):
+            continue
+        try:
+            launcher = status() | {"model_id": model_id}
+        except Exception:
+            continue
+        loaded.add(launcher.get("deployment_id"))
+        launchers.append(launcher)
+    try:
+        registry = get_cluster_registry()
+        for model_id in pool.get_model_ids():
+            entry = pool.get_entry(model_id)
+            if entry is not None and getattr(entry, "is_loading", False):
+                deployment = registry.get_for_model(entry.model_path)
+                if deployment is not None:
+                    loading.add(deployment.deployment_id)
+                    if deployment.deployment_id not in loaded:
+                        launchers.append(
+                            {
+                                "deployment_id": deployment.deployment_id,
+                                "model_id": model_id,
+                                "phase": "loading",
+                            }
+                        )
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        pass
+    for job in payload.get("jobs", []):
+        deployment_id = job.get("deployment_id")
+        job["ownership"] = (
+            "loaded"
+            if deployment_id in loaded
+            else "loading" if deployment_id in loading else "detached"
+        )
+        if job["ownership"] == "detached":
+            job["live"] = False
+        for launcher in launchers:
+            if deployment_id == launcher.get("deployment_id"):
+                job["ranks"] = launcher.get("ranks", [])
+                job["endpoint"] = launcher.get("endpoint")
+    payload["launchers"] = launchers
+
+
 @router.get("/runtime")
 async def cluster_runtime():
     """Return lightweight local rank markers for dashboard polling."""
 
     payload = await asyncio.to_thread(read_runtime_markers)
     if _get_engine_pool is None:
+        _reconcile_runtime_ownership(payload, None)
         return payload
     try:
         pool = _engine_pool()
     except HTTPException:
+        _reconcile_runtime_ownership(payload, None)
         return payload
-    launchers: list[dict[str, Any]] = []
-    for model_id in pool.get_loaded_model_ids():
-        entry = pool.get_entry(model_id)
-        status = getattr(getattr(entry, "engine", None), "cluster_status", None)
-        if not callable(status):
-            continue
-        launcher = status() | {"model_id": model_id}
-        launchers.append(launcher)
-        for job in payload.get("jobs", []):
-            if job.get("deployment_id") == launcher.get("deployment_id"):
-                job["ranks"] = launcher.get("ranks", [])
-                job["endpoint"] = launcher.get("endpoint")
-    payload["launchers"] = launchers
+    _reconcile_runtime_ownership(payload, pool)
     return payload
 
 
@@ -2696,13 +2760,14 @@ def _execution_for_request(
         requested,
         async_overlap=request.async_overlap,
         cache_affinity=request.cache_affinity,
+        prompt_cache_ssd=getattr(request, "prompt_cache_ssd", requested.prompt_cache_ssd),
+        prompt_cache_ssd_max_bytes=getattr(request, "prompt_cache_ssd_max_bytes", requested.prompt_cache_ssd_max_bytes),
         # The context chosen beside the model is both a reservation and a
         # runtime ceiling. Without this fallback the planner could reserve
         # 256k while the server used an unrelated advanced default (or no
         # bound at all), making the memory promise on screen untrue.
         max_kv_size=(
-            request.max_kv_size
-            or getattr(request, "target_context_tokens", None)
+            request.max_kv_size or getattr(request, "target_context_tokens", None)
         ),
         ring_connections_per_ip=(
             request.ring_connections_per_ip or requested.ring_connections_per_ip
@@ -2978,6 +3043,7 @@ async def cluster_node_roles() -> dict[str, Any]:
                 "summary": role.summary,
                 "detail": role.detail,
                 "reserve_bytes": role.reserve_bytes,
+                "reserve_fraction": role.reserve_fraction,
             }
             for role in ROLES.values()
         ],
@@ -3605,19 +3671,17 @@ class ClusterReplanRequest(BaseModel):
     hosts: list[ClusterHostRequest] | None = Field(
         default=None, min_length=2, max_length=64
     )
-    execution_profile: Literal["interactive", "balanced", "throughput"] = (
-        "balanced"
-    )
+    execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
     auto_tune: bool = False
     sampling_rank_only: bool = True
     async_overlap: bool = True
     cache_affinity: bool = True
+    prompt_cache_ssd: bool = True
+    prompt_cache_ssd_max_bytes: int = Field(default=20 * 1024**3, gt=0)
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int | None = Field(default=None, ge=1, le=64)
-    target_context_tokens: int | None = Field(
-        default=None, ge=1, le=1_048_576
-    )
+    target_context_tokens: int | None = Field(default=None, ge=1, le=1_048_576)
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
 
@@ -3649,17 +3713,11 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
     if request.deployment_id:
         current = await asyncio.to_thread(registry.get, request.deployment_id)
         if current is None:
-            raise HTTPException(
-                status_code=404, detail="cluster deployment not found"
-            )
+            raise HTTPException(status_code=404, detail="cluster deployment not found")
     elif request.model_path:
-        current = await asyncio.to_thread(
-            registry.get_for_model, request.model_path
-        )
+        current = await asyncio.to_thread(registry.get_for_model, request.model_path)
 
-    if current is None and not (
-        request.model_path and request.nodes and request.hosts
-    ):
+    if current is None and not (request.model_path and request.nodes and request.hosts):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -3689,8 +3747,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
         if current is None:
             raise HTTPException(status_code=400, detail="hosts are required")
         hosts = [
-            ClusterHostRequest(**payload)
-            for payload in hosts_from_deployment(current)
+            ClusterHostRequest(**payload) for payload in hosts_from_deployment(current)
         ]
         derived["hosts"] = True
     backend = request.backend
@@ -3728,7 +3785,8 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
     try:
         _validate_cluster_hosts(hosts)
         effective = ClusterDeploymentRequest(
-            deployment_id=request.deployment_id,
+            deployment_id=request.deployment_id
+            or (current.deployment_id if current else None),
             model_path=(request.model_path or (current.model if current else "")),
             model_source=request.model_source,
             model_source_python=request.model_source_python,
@@ -3740,21 +3798,19 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             sampling_rank_only=request.sampling_rank_only,
             async_overlap=request.async_overlap,
             cache_affinity=request.cache_affinity,
+            prompt_cache_ssd=request.prompt_cache_ssd,
+            prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
             max_kv_size=request.max_kv_size,
             ring_connections_per_ip=request.ring_connections_per_ip,
             tensor_parallel_size=(
                 request.tensor_parallel_size
                 if request.tensor_parallel_size is not None
-                else current.tensor_parallel_size
-                if current is not None
-                else 1
+                else current.tensor_parallel_size if current is not None else 1
             ),
             target_context_tokens=(
                 request.target_context_tokens
                 if request.target_context_tokens is not None
-                else current.target_context_tokens
-                if current is not None
-                else 8192
+                else current.target_context_tokens if current is not None else 8192
             ),
             path_map=path_map,
             # Not consulted by planning; activation re-checks the real one
@@ -3771,9 +3827,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
 
     signed_plan = _plan_with_signature(plan)
     changes = (
-        _plan_changes(placement_view(current), plan)
-        if current is not None
-        else None
+        _plan_changes(placement_view(current), plan) if current is not None else None
     )
 
     if request.approved_placement is None:
@@ -3782,9 +3836,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             "mode": "preview",
             "steps": list(_REPLAN_STEPS),
             "derived": derived,
-            "current": (
-                summarize_deployment(current) if current is not None else None
-            ),
+            "current": (summarize_deployment(current) if current is not None else None),
             "changes": changes,
             "deployment_id": deployment.deployment_id,
             "backend": deployment.backend,

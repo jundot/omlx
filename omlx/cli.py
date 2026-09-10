@@ -497,15 +497,12 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"Install: {integration.install_hint}")
         sys.exit(1)
 
-    # If the model was chosen interactively (no --model and no explicit tier flags),
-    # use the picked model for all tiers instead of letting settings-based tier
-    # models override the user's selection.
-    if args.model is None and not (
-        cli_opus_model or cli_sonnet_model or cli_haiku_model
-    ):
-        opus_model = None
-        sonnet_model = None
-        haiku_model = None
+    # Tier precedence: explicit tier flag > saved claude_code tier setting >
+    # the model picked (or auto-selected) above. The picker only chooses the
+    # default model; tiers configured on the Claude Code settings page keep
+    # their role, otherwise the three persisted selections would be silently
+    # replaced by one model on every interactive launch (#3543). Roles without
+    # a saved model fall back to the picked model in the integration.
 
     # Enforce Claude Code's model requirements after all interactive,
     # automatic, and explicit model paths have resolved. The picker also marks
@@ -542,6 +539,18 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
+    context_window = model_info.get("max_context_window")
+    if tool_name == "claude":
+        # Claude's context overrides are process-wide, including tier switches
+        # and subagents. Do not advertise more than any configured model allows.
+        context_windows = [
+            info["max_context_window"]
+            for model_id in (model, opus_model, sonnet_model, haiku_model)
+            if (info := models_status_map.get(model_id, {}))
+            and isinstance(info.get("max_context_window"), int)
+            and info["max_context_window"] > 0
+        ]
+        context_window = min(context_windows) if context_windows else None
     ctx = IntegrationContext(
         host=connect_host,
         port=port,
@@ -550,7 +559,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         opus_model=opus_model if tool_name == "claude" else None,
         sonnet_model=sonnet_model if tool_name == "claude" else None,
         haiku_model=haiku_model if tool_name == "claude" else None,
-        context_window=model_info.get("max_context_window"),
+        context_window=context_window,
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),

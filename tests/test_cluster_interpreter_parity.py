@@ -351,14 +351,18 @@ def test_every_probe_branch_returns_the_same_result_keys():
 
 
 def test_dashboard_does_not_render_a_warned_peer_as_an_unqualified_match():
-    cluster = pathlib.Path(
-        "omlx/admin/templates/dashboard/_cluster.html"
+    wizard = pathlib.Path(
+        "omlx/admin/static/js/cluster_v2.js"
+    ).read_text(encoding="utf-8")
+    template = pathlib.Path(
+        "omlx/admin/templates/dashboard/_cluster_v2.html"
     ).read_text(encoding="utf-8")
 
-    assert "clusterPeerProbe.runtime_warnings" in cluster
-    assert "text-amber-700" in cluster
-    # 'Runtime match' must be the else-branch, not the whole truthy branch.
-    assert "runtime_warnings || []).length ? 'text-amber-700' : 'text-green-700'" in cluster
+    assert "probe.result?.runtime_warnings" in wizard
+    assert "warnings.length" in wizard
+    assert "? 'warn'" in wizard
+    assert "row.status === 'warn'" in template
+    assert "text-amber-700" in template
 
 
 def test_interpreter_parity_ignores_a_non_string_report():

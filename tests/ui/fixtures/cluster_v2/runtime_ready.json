@@ -1,0 +1,22 @@
+{
+  "_comment": "GET /admin/api/cluster/runtime — the engine pool owns a fresh ready marker.",
+  "jobs": [
+    {
+      "deployment_id": "minimax-m3-9f2ab41cd0e1",
+      "rank": 0,
+      "world_size": 2,
+      "phase": "ready",
+      "live": true,
+      "ownership": "loaded"
+    }
+  ],
+  "launchers": [
+    {
+      "deployment_id": "minimax-m3-9f2ab41cd0e1",
+      "phase": "ready",
+      "returncode": null,
+      "failure_reason": null
+    }
+  ],
+  "warnings": []
+}

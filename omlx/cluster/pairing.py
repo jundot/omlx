@@ -606,6 +606,7 @@ class _PendingRequest:
     attempts: int = 0
     locked_until: float | None = None
     approving: bool = False
+    cancel_token_hash: str | None = None
 
     def to_dict(self, now: float) -> dict[str, Any]:
         locked = self.locked_until is not None and self.locked_until > now
@@ -871,6 +872,9 @@ class PairingManager:
         self._pending: dict[str, _PendingRequest] = {}
         self._denied: dict[str, float] = {}
         self._local_code: dict[str, Any] | None = None
+        from .pairing_session import PairingSession
+
+        self.ui_session = PairingSession(self)
 
     # -- helpers ------------------------------------------------------------
 
@@ -1189,6 +1193,13 @@ class PairingManager:
         node_id = str(payload.get("node_id") or "").strip()
         friendly_name = str(payload.get("friendly_name") or "").strip()
         code_hash = str(payload.get("code_hash") or "").strip()
+        cancel_token_hash = payload.get("cancel_token_hash")
+        if cancel_token_hash is not None and (
+            not isinstance(cancel_token_hash, str)
+            or len(cancel_token_hash) != 64
+            or any(c not in "0123456789abcdef" for c in cancel_token_hash)
+        ):
+            raise PairingRequestError("invalid cancellation verifier")
         code_salt_encoded = str(payload.get("code_salt") or "").strip()
         caps = payload.get("caps")
         addrs = payload.get("addrs") or []
@@ -1242,6 +1253,7 @@ class PairingManager:
                     and existing.ssh_public_key == ssh_public_key
                     and existing.ssh_host_public_key == ssh_host_public_key
                     and existing.addrs == normalized_addrs[:8]
+                    and existing.cancel_token_hash == cancel_token_hash
                 )
                 if same_request:
                     return existing.to_dict(now)
@@ -1259,6 +1271,7 @@ class PairingManager:
                 caps=dict(caps),
                 code_hash=code_hash,
                 code_salt=code_salt,
+                cancel_token_hash=cancel_token_hash,
                 addrs=normalized_addrs[:8],
                 http_port=int(http_port) if http_port is not None else None,
                 ssh_public_key=ssh_public_key,
@@ -1479,6 +1492,24 @@ class PairingManager:
             "coordinator_identity_tag": coordinator_tag,
             "enrollment": enrollment,
         }
+
+    def cancel_join_request(self, node_id: str, token: str) -> dict[str, Any]:
+        """Withdraw only the pending attempt that owns this cancellation token."""
+        with self._lock:
+            self._prune_pending(self._clock())
+            pending = self._pending.get(node_id)
+            if pending is None:
+                return {"ok": True}
+            proof = hashlib.sha256(token.encode()).hexdigest()
+            if not pending.cancel_token_hash or not hmac.compare_digest(
+                pending.cancel_token_hash, proof
+            ):
+                raise PairingCodeError("invalid cancellation token")
+            if pending.approving:
+                raise PairingStateError("approval is already in progress")
+            self._pending.pop(node_id)
+        self._record_audit("join_request_cancelled", node_id=node_id)
+        return {"ok": True}
 
     def deny(self, node_id: str) -> bool:
         """Refuse a pending request; the joiner sees ``denied`` on its next poll."""

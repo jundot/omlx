@@ -167,3 +167,33 @@ def test_completion_boundary_requires_known_consistent_positions(
 
     assert scheduler._on_prefill_boundary_snapshot.called is expected
     scheduler.shutdown()
+
+
+@pytest.mark.parametrize("preserve_reasoning, expected", [(False, False), (True, True)])
+def test_completion_boundary_counts_output_only_when_reasoning_is_preserved(
+    mock_model, mock_tokenizer, preserve_reasoning, expected
+):
+    """With a think prefix the terminal boundary covers prompt + output only if the history keeps the reasoning."""
+    scheduler = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(paged_cache_block_size=4),
+    )
+    scheduler._boundary_snapshot_required = True
+    scheduler._on_prefill_boundary_snapshot = MagicMock()
+    request = Request(
+        request_id="finished-think",
+        prompt=[3, 4, 5],
+        sampling_params=SamplingParams(max_tokens=1),
+        preserve_reasoning=preserve_reasoning,
+    )
+    request.prompt_token_ids = [3, 4, 5]
+    request.num_prompt_tokens = 3
+    request.output_token_ids = [6]
+    request.needs_think_prefix = True
+    cache = [SimpleNamespace(caches=[SimpleNamespace(offset=4), SimpleNamespace()])]
+
+    scheduler._capture_finished_boundary_snapshot(request, cache)
+
+    assert scheduler._on_prefill_boundary_snapshot.called is expected
+    scheduler.shutdown()

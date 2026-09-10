@@ -168,6 +168,8 @@ def _loopback_pair(tmp_path):
     )
 
     def http_post(url, payload, timeout):
+        if url.endswith("/api/cluster/pair/request/cancel"):
+            return coordinator.cancel_join_request(payload["node_id"], payload["token"])
         assert url.endswith("/api/cluster/pair/request")
         return coordinator.handle_join_request(payload)
 

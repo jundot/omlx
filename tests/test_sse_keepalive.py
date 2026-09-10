@@ -6,9 +6,11 @@ import json
 import socket
 
 import pytest
+from fastapi import HTTPException
 
 from omlx.server import (
     ClientDisconnectTrackingMiddleware,
+    _with_json_keepalive,
     _with_request_disconnect_abort,
     _with_sse_keepalive,
 )
@@ -420,3 +422,28 @@ class TestResolveKeepalive:
                 assert _resolve_keepalive(protocol) is None
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,error_type", [(400, "invalid_request_error"), (500, "server_error")]
+)
+async def test_json_keepalive_preserves_http_error_after_first_byte(
+    status_code, error_type
+):
+    result = asyncio.get_running_loop().create_future()
+    stream = _with_json_keepalive(None, result)
+    assert await anext(stream) == " "
+    result.set_exception(
+        HTTPException(status_code=status_code, detail="Request failed")
+    )
+
+    chunks = [chunk async for chunk in stream]
+    assert json.loads("".join(chunks)) == {
+        "error": {
+            "message": "Request failed",
+            "type": error_type,
+            "param": None,
+            "code": None,
+        }
+    }

@@ -1411,6 +1411,23 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
     if not _is_model_dir(model_dir):
         return False
+    try:
+        config = json.loads((model_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    if (
+        isinstance(config, dict)
+        and config.get("model_type") == "k2_horizon"
+        and not config.get("model_file")
+    ):
+        try:
+            from .patches.k2_horizon.checkpoint import checkpoint_files
+
+            checkpoint_files(model_dir)
+            return True
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
+            return False
     if not list(model_dir.glob("model*.safetensors")):
         logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
         return False

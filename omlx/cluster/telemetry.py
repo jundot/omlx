@@ -917,6 +917,7 @@ class RuntimeTelemetry:
         end_to_end_tps = sample.completion_tokens / elapsed if elapsed > 0 else 0.0
         return {
             "status": status,
+            "request_id": sample.request_id,
             "prompt_tokens": sample.prompt_tokens,
             "cached_tokens": sample.cached_tokens,
             "completion_tokens": sample.completion_tokens,
@@ -964,6 +965,11 @@ class RuntimeTelemetry:
         result = {
             "scope": "end_to_end_pipeline",
             "active_requests": len(self._requests),
+            "active_request_metrics": [
+                self._sample_snapshot(sample, now=now, status="running")
+                for sample in list(self._requests.values())[:64]
+            ],
+            "active_request_metrics_truncated": max(0, len(self._requests) - 64),
             "requests_completed": self._requests_completed,
             "requests_failed": self._requests_failed,
             "requests_cancelled": self._requests_cancelled,
@@ -1095,6 +1101,7 @@ def install_server_telemetry(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 512,
+    ssd_cache_max_bytes: int = 20 * 1024**3,
     ssd_cache_persistent: bool = False,
     prefill_step_size: int = 2048,
     control_plane: Any | None = None,
@@ -1170,6 +1177,7 @@ def install_server_telemetry(
             ssd_cache_dir,
             step=snapshot_step,
             max_entries=ssd_max_entries,
+            max_bytes=ssd_cache_max_bytes,
             persistent=ssd_cache_persistent,
         )
     try:

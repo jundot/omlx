@@ -1668,3 +1668,249 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
 
     assert resident_owner.mtp is not None
     assert later_owner.mtp is not None
+
+
+def _disk_ple(tmp_path, *, shards, rows, dims, bits=None):
+    """Write a sharded PLE table (affine-packed when ``bits`` is set, else dense bf16) and open it from disk."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors, dense_rows = {}, []
+    for shard_index in range(shards):
+        dense = (mx.random.normal((rows, dims)) * (shard_index + 1)).astype(mx.bfloat16)
+        base = f"{prefix}.shard_{shard_index}"
+        if bits is None:
+            tensors[f"{base}.weight"] = dense
+            dense_rows.append(dense)
+        else:
+            weight, scales, biases = mx.quantize(dense, group_size=32, bits=bits, mode="affine")
+            tensors[f"{base}.weight"], tensors[f"{base}.scales"], tensors[f"{base}.biases"] = weight, scales, biases
+            dense_rows.append(mx.dequantize(weight, scales, biases, group_size=32, bits=bits, mode="affine").astype(mx.bfloat16))
+    mx.eval(*tensors.values(), *dense_rows)
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: filename for key in tensors}}), encoding="utf-8")
+    table = mx.concatenate(dense_rows)
+    return DiskBackedShardedEmbedding(tmp_path, prefix, num_embeddings=shards * rows, dims=dims, num_shards=shards), table
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_backed_ple_gathers_a_chunk_with_one_upload_per_tensor(tmp_path, bits):
+    """A chunk's rows are assembled on the host and uploaded once per tensor, not once per shard."""
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits)
+    mx.random.seed(11)
+    indices = mx.random.randint(0, 24, (2, 40)).astype(mx.int32)
+    mx.eval(indices)
+    values = embedding(indices)
+    mx.eval(values)
+    expected = mx.take(table, indices.reshape(-1), axis=0).reshape(2, 40, 64)
+    assert values.dtype == mx.bfloat16
+    assert mx.array_equal(values, expected).item()
+    assert embedding.rows_read == 80
+    assert embedding.last_touched_shards == (0, 1, 2)
+    assert embedding.last_uploads == (1 if bits is None else 3)
+    embedding.close()
+
+
+def test_disk_backed_ple_rejects_out_of_range_indices(tmp_path):
+    embedding, _ = _disk_ple(tmp_path, shards=2, rows=4, dims=32, bits=4)
+    with pytest.raises(IndexError):
+        embedding(mx.array([[1, 8]], dtype=mx.int32))
+    embedding.close()
+
+
+def test_disk_backed_ple_prefetch_serves_the_matching_call(tmp_path):
+    """A prefetched chunk is assembled off the main thread and consumed by the next call with the same indices."""
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=5)
+    first = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+    other = mx.array([[1, 2]], dtype=mx.int32)
+    embedding.prefetch(first)
+    # The prefill loops announce chunk k+1 before chunk k gathers: both must stay pending until consumed.
+    embedding.prefetch(other)
+    values = embedding(first)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is True
+    values_other = embedding(other)
+    mx.eval(values_other)
+    assert embedding.last_prefetch_hit is True
+    assert mx.array_equal(values_other, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    assert embedding(other) is not None and embedding.last_prefetch_hit is False
+    values = embedding(first)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is False
+    assert mx.array_equal(values, mx.take(table, first.reshape(-1), axis=0)[None]).item()
+    values = embedding(other)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is False
+    assert mx.array_equal(values, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    embedding.close()
+
+
+def test_prompt_loop_prefetches_the_next_chunk(monkeypatch):
+    """While a chunk runs, the model is told the next chunk and the chunk it follows."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    seen, forwards = [], []
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            forwards.append(tokens.tolist()[0])
+
+        def prefetch_ple(self, next_ids, current_ids):
+            seen.append((next_ids.tolist()[0], current_ids.tolist()[0]))
+
+    batch = PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4)
+    batch.prompt([list(range(10, 20))])
+    assert forwards == [[10, 11, 12, 13], [14, 15, 16, 17], [18, 19]]
+    assert seen == [([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
+
+
+def test_prompt_loop_without_a_prefetch_hook_is_unchanged():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    forwards = []
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            forwards.append(tokens.shape[1])
+
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=3).prompt([list(range(7))])
+    assert forwards == [3, 3, 1]
+
+
+def test_ngram_prefetch_computes_the_next_chunks_indices():
+    """prefetch(next, tail of current) hashes exactly the rows the next real call will gather."""
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpNGramEmbedding
+
+    config = _tiny_config()
+    config = getattr(config, "text_config", config)
+    embedding = Qwen4ExpNGramEmbedding(config, config.ple_embed_dim, 1, 0)
+    inner = embedding.ngram_embedding
+    seen = {}
+
+    class Recorder:
+        def __call__(self, indices):
+            seen["call"] = indices
+            return inner(indices)
+
+        def prefetch(self, indices):
+            seen["prefetch"] = indices
+
+    embedding.ngram_embedding = Recorder()
+    cache = [None, None, None, None]
+    chunk1 = mx.array([[5, 9, 2, 7, 1, 4, 4, 8]], dtype=mx.int64)
+    chunk2 = mx.array([[3, 3, 6, 1, 9]], dtype=mx.int64)
+    mx.eval(embedding(chunk1, cache))
+    embedding.prefetch(chunk2, chunk1[:, -embedding.context_len :])
+    mx.eval(embedding(chunk2, cache))
+    assert seen["prefetch"].shape == seen["call"].shape
+    assert mx.array_equal(seen["prefetch"], seen["call"]).item()
+
+
+def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
+    """The scheduler wraps prompt() to set mRoPE deltas first; the lookahead loop must run under it, not over it."""
+    import omlx.scheduler as scheduler  # installs the wrapper
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    order = []
+    monkeypatch.setattr(scheduler, "_prepare_mrope_prompt", lambda self: order.append("before"))
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            order.append(("forward", tokens.shape[1]))
+
+        def prefetch_ple(self, next_ids, current_ids):
+            order.append(("prefetch", next_ids.shape[1]))
+
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4).prompt([list(range(6))])
+    assert order == ["before", ("prefetch", 2), ("forward", 4), ("forward", 2)]
+
+
+def test_disk_ple_cancels_displaced_queued_prefetches(tmp_path, monkeypatch):
+    from threading import Event
+
+    embedding, _ = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=4)
+    entered, release = Event(), Event()
+    assemble = embedding._assemble
+
+    def paused_assemble(host, plan):
+        entered.set()
+        assert release.wait(10)
+        return assemble(host, plan)
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    futures = []
+    try:
+        for index in range(10):
+            embedding.prefetch(mx.array([[index]], dtype=mx.int32))
+            futures.append(list(embedding._pending.values())[-1][1])
+            if index == 0:
+                assert entered.wait(10)
+        assert len(embedding._pending) == 2
+        assert futures[0].running()
+        assert all(future.cancelled() for future in futures[1:8])
+        assert sum(not future.done() for future in futures) == 3
+    finally:
+        release.set()
+        embedding.close()
+
+
+def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
+    from threading import Event, Thread
+
+    embedding, _ = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=4)
+    entered, release, closing, closed = Event(), Event(), Event(), Event()
+    assemble = embedding._assemble
+    shutdown = embedding._prefetch_executor.shutdown
+    readers = list(embedding._readers.values())
+    errors = []
+
+    def paused_assemble(host, plan):
+        entered.set()
+        assert release.wait(10)
+        return assemble(host, plan)
+
+    def observed_shutdown(*args, **kwargs):
+        closing.set()
+        return shutdown(*args, **kwargs)
+
+    def close():
+        try:
+            embedding.close()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    monkeypatch.setattr(embedding._prefetch_executor, "shutdown", observed_shutdown)
+    thread = Thread(target=close)
+    try:
+        embedding.prefetch(mx.array([[1]], dtype=mx.int32))
+        active = next(iter(embedding._pending.values()))[1]
+        assert entered.wait(10)
+        embedding.prefetch(mx.array([[2]], dtype=mx.int32))
+        embedding.prefetch(mx.array([[3]], dtype=mx.int32))
+        assert all(future is not active for _, future in embedding._pending.values())
+        thread.start()
+        assert closing.wait(10)
+        assert not closed.is_set()
+        assert all(reader._mapping is not None for reader in readers)
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(timeout=10)
+        else:
+            embedding.close()
+    assert closed.is_set() and not errors
+    assert active.result(timeout=10)
+    assert all(reader._mapping is None for reader in readers)
+    assert not embedding._pending
+    embedding.prefetch(mx.array([[4]], dtype=mx.int32))
+    assert not embedding._pending
+    embedding.close()

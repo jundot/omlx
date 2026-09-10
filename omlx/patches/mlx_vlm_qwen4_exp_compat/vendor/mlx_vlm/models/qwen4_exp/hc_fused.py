@@ -277,17 +277,39 @@ def _ineligible(reason: str) -> bool:
     return False
 
 
-def compatible(module, hyper_input) -> bool:
-    """Whether ``module`` (a Qwen4ExpGatedResidual) can take the fused path for ``hyper_input``."""
-    if not enabled():
-        return False
+def _rows_of(hyper_input) -> int | None:
     if not (
         isinstance(hyper_input, mx.array)
         and hyper_input.ndim == 3
         and hyper_input.dtype == mx.bfloat16
-        and 1 <= hyper_input.shape[0] * hyper_input.shape[1] <= MAX_ROWS
     ):
-        return False
+        return None
+    return hyper_input.shape[0] * hyper_input.shape[1]
+
+
+def compatible(module, hyper_input) -> bool:
+    """Whether ``module`` (a Qwen4ExpGatedResidual) can take the fused path for ``hyper_input``."""
+    rows = _rows_of(hyper_input)
+    return (
+        enabled()
+        and rows is not None
+        and 1 <= rows <= MAX_ROWS
+        and _layout_compatible(module, hyper_input)
+    )
+
+
+def prefill_compatible(module, hyper_input) -> bool:
+    """Whether rows above MAX_ROWS can use the compiled prefill mean."""
+    rows = _rows_of(hyper_input)
+    return (
+        enabled()
+        and rows is not None
+        and rows > MAX_ROWS
+        and _layout_compatible(module, hyper_input)
+    )
+
+
+def _layout_compatible(module, hyper_input) -> bool:
     if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
@@ -338,6 +360,71 @@ def _eps_array(module) -> mx.array:
     return eps
 
 
+def _kernel_norm(module, flat, rows, hc, hidden, dtype):
+    width = hc * hidden
+    return _kernel(
+        "omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE
+    )(
+        inputs=[flat, module.hc_norm.weight, _eps_array(module)],
+        template=[("T", dtype), ("K", width), ("H", hidden)],
+        grid=(256, hc, rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, width)],
+        output_dtypes=[dtype],
+    )[0]
+
+
+_TAILS: dict[tuple[int, int], object] = {}
+
+
+def _tail(hc: int, hidden: int):
+    """Compiled mean over the streams as slice products: one fused pass instead of a strided reduce."""
+    fn = _TAILS.get((hc, hidden))
+    if fn is None:
+
+        def tail(up, normed):
+            gate = mx.sigmoid(up)
+            acc = gate[..., :hidden] * normed[..., :hidden]
+            for g in range(1, hc):
+                lo = g * hidden
+                acc = acc + gate[..., lo : lo + hidden] * normed[..., lo : lo + hidden]
+            return acc * (1.0 / hc)
+
+        fn = mx.compile(tail)
+        _TAILS[(hc, hidden)] = fn
+    return fn
+
+
+def prefill_forward(module, hyper_input):
+    """Prefill with canonical normalization and a compiled mean; None on failure."""
+    global _RUNTIME_FAILED, _FAILURE_LOGGED
+    try:
+        hc, hidden = module.hc_count, module.hidden_size
+        dtype = hyper_input.dtype
+        normed = module.hc_norm(hyper_input)
+        mix = nn.silu(module.input_mix_weight_down(normed) / hc)
+        mixed = _tail(hc, hidden)(module.input_mix_weight_up(mix), normed)
+        inject = module.block_inject_weight if "block_inject_weight" in module else None
+        injection = None if inject is None else 2 * mx.sigmoid(inject(normed) / hc)
+        signature = ("prefill", dtype, hc, hidden, module.hc_lowrank, module.input_mix_weight_down.bits)
+        if signature not in _VALIDATED:
+            mx.eval(mixed) if injection is None else mx.eval(mixed, injection)
+            _VALIDATED.add(signature)
+        if injection is None:
+            return mixed
+        return mixed, hyper_input, injection
+    except Exception as exc:  # noqa: BLE001 - optional native path
+        _RUNTIME_FAILED = True
+        if not _FAILURE_LOGGED:
+            _FAILURE_LOGGED = True
+            logger.warning(
+                "Qwen4 fused hyper-connection kernels failed closed; using the "
+                "canonical path: %s",
+                exc,
+            )
+        return None
+
+
 def fused_forward(module, hyper_input):
     """Return fused outputs, or None on construction or first-evaluation failure."""
     global _RUNTIME_FAILED, _FAILURE_LOGGED
@@ -350,18 +437,7 @@ def fused_forward(module, hyper_input):
         inject = module.block_inject_weight if "block_inject_weight" in module else None
         flat = hyper_input.reshape(rows, width)
         dtype = hyper_input.dtype
-        normed = _kernel(
-            "omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE
-        )(
-            inputs=[flat, module.hc_norm.weight, _eps_array(module)],
-            template=[("T", dtype), ("K", width), ("H", hidden)],
-            grid=(256, hc, rows),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(rows, width)],
-            output_dtypes=[dtype],
-        )[
-            0
-        ]
+        normed = _kernel_norm(module, flat, rows, hc, hidden, dtype)
         if inject is not None:
             inject_tensors = (inject.weight, inject.scales, inject.biases)
         else:
@@ -446,4 +522,4 @@ def fused_forward(module, hyper_input):
         return None
 
 
-__all__ = ["MAX_ROWS", "compatible", "enabled", "fused_forward"]
+__all__ = ["MAX_ROWS", "compatible", "enabled", "fused_forward", "prefill_compatible", "prefill_forward"]

@@ -298,3 +298,32 @@ def test_cleanup_finished_skip_cache_store_takes_leak_guard_branch(
     )
     assert request.request_id not in scheduler.running
     assert request.request_id not in scheduler.requests
+
+
+@pytest.mark.parametrize(
+    "preserve_reasoning, expected_sequence",
+    [(False, list(range(6))), (True, list(range(12)))],
+)
+def test_prompt_boundary_store_covers_output_when_reasoning_is_preserved(
+    preserve_reasoning, expected_sequence
+):
+    """A think-prefix request whose history keeps the reasoning stores prompt + output after a parser stop."""
+    scheduler = _scheduler()
+    request = SimpleNamespace(
+        prompt_token_ids=list(range(6)),
+        output_token_ids=list(range(6, 12)),
+        needs_think_prefix=True,
+        preserve_reasoning=preserve_reasoning,
+        specprefill_indices=None,
+    )
+    scheduler._get_boundary_store_override = MagicMock(return_value=None)
+    scheduler._detect_boundary_snapshot_need = MagicMock(return_value=False)
+    scheduler._extract_live_request_cache_for_store = MagicMock(
+        return_value=([{"state": ("kv",), "class_name": "KVCache", "cache_type": "KVCache"}], "cfg")
+    )
+
+    result = scheduler._prepare_prompt_boundary_cache_store("req", request, uid=3)
+
+    scheduler._get_boundary_store_override.assert_called_once_with("req", expected_sequence)
+    assert result is not None
+    assert result[0] == expected_sequence[: (len(expected_sequence) // 4) * 4]

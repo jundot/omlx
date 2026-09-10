@@ -33,6 +33,26 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
 
 
 class TestRemoteCodePreflight:
+    @pytest.mark.parametrize("supported", [False, True])
+    @pytest.mark.parametrize("trusted", [False, True])
+    def test_final_tokenizer_load_uses_the_configured_trust_setting(
+        self, monkeypatch, supported, trusted
+    ):
+        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", supported)
+        monkeypatch.setattr(model_loading, "preflight_text_remote_code", MagicMock())
+        loader = MagicMock(return_value=("MODEL", "TOKENIZER"))
+        monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(load=loader))
+        options = {"trust_remote_code": not trusted, "tool_parser_type": "k2_horizon"}
+        model_loading.lm_load_compat(
+            "K2", trust_remote_code=trusted, tokenizer_config=options
+        )
+        actual = loader.call_args.kwargs
+        assert actual["tokenizer_config"] == {
+            "trust_remote_code": trusted, "tool_parser_type": "k2_horizon"
+        }
+        assert ("trust_remote_code" in actual) is supported
+        assert options["trust_remote_code"] is not trusted
+
     def test_custom_model_file_is_rejected_before_weight_loading(self, tmp_path):
         with pytest.raises(ValueError, match="Enable Trust Remote Code"):
             ensure_model_code_trusted(

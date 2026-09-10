@@ -11,7 +11,7 @@ Provides:
 import base64
 import math
 import struct
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Sequence, Union
 
 from .embedding_models import EmbeddingInputItem
 
@@ -30,6 +30,31 @@ def encode_embedding_base64(embedding: List[float]) -> str:
     """
     packed = struct.pack(f"<{len(embedding)}f", *embedding)
     return base64.b64encode(packed).decode("ascii")
+
+
+def find_non_finite_embeddings(embeddings: Sequence[Sequence[float]]) -> List[int]:
+    """
+    Return the indices of embeddings that contain NaN or infinite values.
+
+    A model that overflows in its attention mask (see modernbert in
+    mlx-embeddings) can hand back NaN vectors for some items of a padded
+    batch. Those must not be serialized as a successful response: JSON has
+    no NaN, so the client would receive ``null``-filled vectors with a 200.
+
+    Args:
+        embeddings: One vector per input item.
+
+    Returns:
+        Indices of the items whose vector is not entirely finite.
+    """
+    bad: List[int] = []
+    for index, embedding in enumerate(embeddings):
+        try:
+            if not all(math.isfinite(float(value)) for value in embedding):
+                bad.append(index)
+        except (TypeError, ValueError):
+            bad.append(index)
+    return bad
 
 
 def truncate_embedding(embedding: List[float], dimensions: int) -> List[float]:

@@ -12,6 +12,7 @@ from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Lock
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -75,6 +76,20 @@ def _broadcast_text_mrope_position_ids(
     if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
         del _TEXT_MROPE_EQUAL_PLANES[:-8]
     return same
+
+
+def _rank_two_text_position_ids(
+    position_ids: Optional[mx.array],
+    length: int,
+) -> bool:
+    """True for missing or ``(1, length)`` text ids only; no plane comparison."""
+    if position_ids is None:
+        return True
+    return (
+        isinstance(position_ids, mx.array)
+        and position_ids.ndim == 2
+        and tuple(position_ids.shape) == (1, length)
+    )
 
 
 def _gathered_min_query_tokens() -> int:
@@ -1025,6 +1040,10 @@ _EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower
     "off",
 }
 _EAGER_DISPATCH_MAX_ROWS = 64
+# Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
+_GATHERED_VERIFY_DISABLED = os.environ.get(
+    "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
+).strip().lower() in {"0", "false", "no", "off"}
 
 
 class Qwen4ExpRMSNorm(nn.Module):
@@ -1334,11 +1353,48 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         prospective_blocks = (cache.offset + 1) // self.indexer.compress_ratio
         return prospective_blocks > self.indexer.block_topk
 
+    def _gathered_text_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Lightning MTP verify rows (batch-one text, rank-two positions, aligned
+        indexer) attend only the selected blocks; rollback is unaffected."""
+
+        if _GATHERED_VERIFY_DISABLED or not target_verify:
+            return False
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] > 1
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and _rank_two_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+        return cache.offset + x.shape[1] > self.indexer.token_budget
+
     def _gathered_text_prefill(
         self,
         x: mx.array,
         cache: QSAKVCache,
         position_ids: Optional[mx.array] = None,
+        target_verify: bool = False,
     ) -> mx.array:
         """Project once, append both caches, and attend only to selected K/V."""
 
@@ -1346,7 +1402,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         q_proj_output, keys, values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj),
             x,
-            False,
+            target_verify,
         )
         queries, gate = mx.split(
             q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
@@ -1374,7 +1430,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         keys, values = cache.update_and_fetch(keys, values)
 
-        projected = self.indexer.index_qk_proj(x).reshape(
+        projected = _target_verify_linear(
+            self.indexer.index_qk_proj, x, target_verify
+        ).reshape(
             batch,
             length,
             self.indexer.n_heads + self.indexer.kv_heads,
@@ -1417,7 +1475,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             pooled_index_keys=pooled_index_keys,
         )
         output = output.reshape(batch, length, -1)
-        return self.o_proj(output * mx.sigmoid(gate))
+        return _target_verify_linear(
+            self.o_proj, output * mx.sigmoid(gate), target_verify
+        )
 
     def _gathered_text_decode(
         self,
@@ -1535,6 +1595,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
 
+        if self._gathered_text_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            cache._omlx_last_prefill_gathered = True
+            return self._gathered_text_prefill(
+                x, cache, position_ids, target_verify=True
+            )
+
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
         qsa_mask = self.indexer(
@@ -1591,6 +1664,10 @@ class Qwen4ExpGatedResidual(nn.Module):
     def __call__(self, hyper_input: mx.array, target_verify: bool = False):
         if hc_fused.compatible(self, hyper_input):
             fused = hc_fused.fused_forward(self, hyper_input)
+            if fused is not None:
+                return fused
+        if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
+            fused = hc_fused.prefill_forward(self, hyper_input)
             if fused is not None:
                 return fused
         compiled_forward = getattr(self, "_compiled_forward", None)
@@ -1876,7 +1953,8 @@ class _SafeTensorMMap:
     def tensor_dtype(self, key: str) -> str:
         return str(self._header[key]["dtype"])
 
-    def rows(self, key: str, rows: list[int]) -> mx.array:
+    def rows_np(self, key: str, rows) -> tuple[np.ndarray, str]:
+        """Copy the requested rows out of the mapping; returns the raw array and the safetensors dtype."""
         entry = self._header[key]
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
@@ -1895,33 +1973,37 @@ class _SafeTensorMMap:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
         row_indices = np.asarray(rows, dtype=np.intp)
         if row_indices.size == 0:
-            copied = np.empty((0, shape[1]), dtype=np_dtype)
-        else:
-            gather_start = None
-            if row_indices.size > 8:
-                fully_seen = self._prefetch_missing_pages(
-                    row_indices,
-                    self._data_start + start,
-                    shape[1] * item_size,
-                )
-                gather_start = time.perf_counter() if fully_seen else None
-            view = np.ndarray(
-                shape,
-                dtype=np_dtype,
-                buffer=self._mapping,
-                offset=self._data_start + start,
+            return np.empty((0, shape[1]), dtype=np_dtype), dtype
+        gather_start = None
+        if row_indices.size > 8:
+            fully_seen = self._prefetch_missing_pages(
+                row_indices,
+                self._data_start + start,
+                shape[1] * item_size,
             )
-            copied = np.array(view[row_indices], copy=True)
-            if gather_start is not None:
-                self._rearm_if_slow(
-                    time.perf_counter() - gather_start, row_indices.size
-                )
+            gather_start = time.perf_counter() if fully_seen else None
+        view = np.ndarray(
+            shape,
+            dtype=np_dtype,
+            buffer=self._mapping,
+            offset=self._data_start + start,
+        )
+        copied = np.array(view[row_indices], copy=True)
+        if gather_start is not None:
+            self._rearm_if_slow(time.perf_counter() - gather_start, row_indices.size)
+        return copied, dtype
+
+    @staticmethod
+    def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
+
+    def rows(self, key: str, rows: list[int]) -> mx.array:
+        return self.to_mx(*self.rows_np(key, rows))
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
@@ -2005,6 +2087,14 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         self._prefix = prefix
         self.rows_read = 0
+        self.last_uploads = 0
+        self.last_prefetch_hit = False
+        self._pending: dict[bytes, tuple] = {}
+        self._prefetch_lock = Lock()
+        self._prefetch_closed = False
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ple-prefetch"
+        )
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
@@ -2134,13 +2224,110 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
-    def __call__(self, indices: mx.array) -> mx.array:
-        shape = indices.shape
+    def _plan(self, host: np.ndarray):
+        """Shards, local rows and tensor families for a chunk; None when the touched shards differ."""
+        offsets = np.asarray(self.shard_offsets, dtype=np.int64)
+        shard = np.searchsorted(offsets, host, side="right") - 1
+        local = host - offsets[shard]
+        touched = [int(index) for index in np.unique(shard)]
+        specs = [self._shard_specs[index] for index in touched]
+        bits, group_size = specs[0][3], specs[0][4]
+        families = [0] if bits is None else [0, 1, 2]
+        dtypes = {
+            family: self._tensor_readers[specs[0][family]].tensor_dtype(specs[0][family])
+            for family in families
+        }
+        if any(spec[3:] != (bits, group_size) for spec in specs) or any(
+            self._tensor_readers[spec[family]].tensor_dtype(spec[family]) != dtypes[family]
+            for spec in specs
+            for family in families
+        ):
+            return None
+        return shard, local, touched, specs, families, dtypes, bits, group_size
+
+    def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
+        """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
+        shard, local, touched, specs, families, _, _, _ = plan
+        buffers: dict[int, np.ndarray] = {}
+        for shard_index, spec in zip(touched, specs):
+            positions = np.flatnonzero(shard == shard_index)
+            rows = local[positions]
+            for family in families:
+                key = spec[family]
+                copied, _ = self._tensor_readers[key].rows_np(key, rows)
+                buffer = buffers.get(family)
+                if buffer is None:
+                    buffer = np.empty((host.size, copied.shape[1]), dtype=copied.dtype)
+                    buffers[family] = buffer
+                buffer[positions] = copied
+        return buffers
+
+    def _host_indices(self, indices: mx.array) -> np.ndarray:
         flat = indices.reshape(-1)
         mx.eval(flat)
-        host_indices = [int(index) for index in flat.tolist()]
-        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+        host = np.asarray(flat.astype(mx.int64)).reshape(-1)
+        if host.size and (int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]):
             raise IndexError("embedding index is outside the sharded vocabulary")
+        return host
+
+    def prefetch(self, indices: mx.array) -> None:
+        """Assemble a chunk's rows on the prefetch worker; a later call with the same indices consumes them."""
+        host = self._host_indices(indices)
+        if host.size == 0:
+            return
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                return
+            plan = self._plan(host)
+            if plan is None:
+                return
+            key = host.tobytes()
+            if key in self._pending:
+                return
+            # Keep two upcoming chunks; obsolete queued reads need not run.
+            while len(self._pending) >= 2:
+                _, future = self._pending.pop(next(iter(self._pending)))
+                future.cancel()
+            self._pending[key] = (
+                plan,
+                self._prefetch_executor.submit(self._assemble, host, plan),
+            )
+
+    def __call__(self, indices: mx.array) -> mx.array:
+        shape = indices.shape
+        host = self._host_indices(indices)
+        if host.size == 0:
+            return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
+        pending = self._pending.pop(host.tobytes(), None)
+        if pending is not None:
+            plan, buffers = pending[0], pending[1].result()
+            self.last_prefetch_hit = True
+        else:
+            self.last_prefetch_hit = False
+            plan = self._plan(host)
+            if plan is None:
+                return self._gather_per_shard([int(index) for index in host], shape)
+            buffers = self._assemble(host, plan)
+        _, _, touched, _, families, dtypes, bits, group_size = plan
+        self.last_touched_shards = tuple(touched)
+        self.rows_read = int(host.size)
+        arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
+        self.last_uploads = len(arrays)
+        values = arrays[0]
+        if bits is not None:
+            values = mx.dequantize(
+                values,
+                arrays[1],
+                arrays[2],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+        values = values.astype(mx.bfloat16) * self.weight_scale
+        return values.reshape(*shape, self.dims)
+
+    def _gather_per_shard(self, host_indices: list[int], shape) -> mx.array:
+        """Fallback for tables whose touched shards differ in dtype or quantization."""
         shard_indices = [
             bisect_right(self.shard_offsets, index) - 1 for index in host_indices
         ]
@@ -2181,11 +2368,19 @@ class DiskBackedShardedEmbedding(nn.Module):
         return result.reshape(*shape, self.dims)
 
     def close(self):
-        for reader in self._readers.values():
-            reader.close()
-        self._readers.clear()
-        self._tensor_readers.clear()
-        self._shard_specs.clear()
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                return
+            self._prefetch_closed = True
+            # Shutdown also drains running reads displaced from the two slots.
+            # Their numpy views must be released before closing the mappings.
+            self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            self._pending.clear()
+            for reader in self._readers.values():
+                reader.close()
+            self._readers.clear()
+            self._tensor_readers.clear()
+            self._shard_specs.clear()
 
     @property
     def _prefix(self):
@@ -2436,14 +2631,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             (batch, self.context_len), self.eos_token_id, dtype=mx.int64
         )
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
-        input_ids = input_ids.astype(mx.int64)
-        previous_context = self._previous_context(input_ids, cache)
-
-        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
-        if cache is not None:
-            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
-
+    def _ngram_indices(self, token_history: mx.array, length: int) -> mx.array:
+        """Hashed table rows for the last ``length`` tokens of ``token_history``."""
         shifted_tokens = [
             self._shift_right_ignore_eos(token_history, shift)
             for shift in range(self.ngram_size)
@@ -2463,7 +2652,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids = mixed_ids[..., None] % sizes[None, None]
             blocks.append(ngram_ids + offsets[None, None])
 
-        ngram_ids = mx.concatenate(blocks, axis=-1)[:, -input_ids.shape[1] :]
+        return mx.concatenate(blocks, axis=-1)[:, -length:]
+
+    def prefetch(self, next_ids: mx.array, previous_context: mx.array) -> None:
+        """Gather the rows of an upcoming chunk ahead of time (SSD-backed tables only)."""
+        prefetch = getattr(self.ngram_embedding, "prefetch", None)
+        if prefetch is None:
+            return
+        next_ids = next_ids.astype(mx.int64)
+        history = mx.concatenate([previous_context.astype(mx.int64), next_ids], axis=-1)
+        prefetch(self._ngram_indices(history, next_ids.shape[1]))
+
+    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+        input_ids = input_ids.astype(mx.int64)
+        previous_context = self._previous_context(input_ids, cache)
+
+        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
+        if cache is not None:
+            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
+
+        ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
         embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
@@ -2869,6 +3077,26 @@ class LanguageModel(Qwen3_5LanguageModel):
         if mtp_capture and output.hidden_states:
             output.hidden_states = [output.hidden_states[0]]
         return output
+
+    def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
+        """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""
+        for layer in self.model.layers:
+            ple = getattr(layer, "ple", None)
+            if ple is None:
+                continue
+            embedding = ple.ple_embedding
+            if getattr(embedding.ngram_embedding, "prefetch", None) is None:
+                continue
+            fill = mx.full(
+                (current_ids.shape[0], embedding.context_len),
+                embedding.eos_token_id,
+                dtype=mx.int64,
+            )
+            history = mx.concatenate([fill, current_ids.astype(mx.int64)], axis=-1)
+            embedding.prefetch(next_ids, history[:, -embedding.context_len :])
+            if not getattr(self, "_ple_lookahead_logged", False):
+                self._ple_lookahead_logged = True
+                logger.info("PLE gather-ahead active: next prefill chunk rows are gathered during the current chunk")
 
     def mtp_forward(
         self,

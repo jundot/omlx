@@ -3060,6 +3060,37 @@ class TestSchedulerBoundarySnapshots:
         assert args[0] == "req-reasoning"
         assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt only
 
+    def test_cleanup_finished_stores_output_tokens_when_reasoning_is_preserved(
+        self, mock_model, mock_tokenizer
+    ):
+        """A reasoning request whose history keeps the <think> output caches prompt + output."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = Request(
+            request_id="req-reasoning-kept",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+            preserve_reasoning=True,
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        request.num_prompt_tokens = 8
+        request.output_token_ids = [9, 10, 11, 12]
+        request.needs_think_prefix = True
+        request._extracted_cache = [{"state": "cache"}]
+        request._model_cache_config = None
+
+        scheduler.running["req-reasoning-kept"] = request
+        scheduler.requests["req-reasoning-kept"] = request
+
+        scheduler._cleanup_finished({"req-reasoning-kept"})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
     def test_cleanup_finished_stores_output_tokens_for_non_reasoning_model(
         self, mock_model, mock_tokenizer
     ):
@@ -3335,6 +3366,30 @@ class TestSchedulerBoundarySnapshots:
         assert (
             scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
         )
+        assert scheduler._boundary_snapshot_required is True
+        assert mock_model._omlx_mtp_commit_align == 4
+
+    def test_add_request_arms_mtp_boundary_alignment_before_decode(
+        self, mock_model, mock_tokenizer
+    ):
+        """A prompt shorter than a block meets its first boundary mid-decode, so the
+        MTP commit alignment must be armed at admission, not at the first capture."""
+        RotatingStub = type("RotatingKVCache", (), {})
+        mock_model.make_cache = lambda: [RotatingStub()]
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        request = Request(
+            request_id="req-short-prompt",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+
+        scheduler.add_request(request)
+
         assert scheduler._boundary_snapshot_required is True
         assert mock_model._omlx_mtp_commit_align == 4
 

@@ -2,13 +2,16 @@
 """Exact gathered QSA for contiguous batch-one text prompts.
 
 The native path reads selected four-token blocks directly from K/V. The MLX
-fallback gathers the selected rows and causal tail. Batched, padded,
-multimodal, and target-verify requests use mlx-vlm's general implementation.
+fallback gathers the selected rows and causal tail. Eligible text-only Lightning
+MTP verification uses this path too. Batched, padded, and multimodal requests
+use mlx-vlm's general implementation.
 """
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 from collections.abc import Callable
 
 import mlx.core as mx
@@ -25,6 +28,46 @@ _NATIVE_QSA_MAIN_DISABLED = False
 _NATIVE_QSA_MAIN_PROVEN = False
 
 
+def _nax_gpu() -> bool:
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:
+        return False
+
+
+def _min_rows(env: str, nax_default: int) -> int:
+    raw = os.environ.get(env, "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return nax_default if _nax_gpu() else 0
+
+
+@functools.lru_cache(maxsize=None)
+def _native_score_min_rows() -> int:
+    """Query rows from which the native indexer-score kernel engages; below it the
+    MLX ops are faster on NAX GPUs (0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
+    return _min_rows("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", 32)
+
+
+@functools.lru_cache(maxsize=None)
+def _native_topk_min_rows() -> int:
+    """Query rows from which the native top-k engages; argpartition ties or wins
+    below it on NAX GPUs (0.26-0.31 vs 0.26 ms per layer at one row)."""
+    return _min_rows("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", 8)
+
+
+@functools.lru_cache(maxsize=None)
+def _native_main_min_rows() -> int:
+    """Query rows from which the native sparse GQA kernel engages; the gathered SDPA
+    is faster below it on NAX GPUs (0.7 vs 1.6 ms per layer at verify width)."""
+    return _min_rows("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", 24)
+
+
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
     """Keep long-context score sheets bounded without tiny launch overhead."""
 
@@ -35,16 +78,46 @@ def contiguous_causal_query_chunk(key_tokens: int) -> int:
     return 128
 
 
-def _batch_gather_tokens(values: mx.array, indices: mx.array) -> mx.array:
-    """Gather token rows independently for every batch without a host read."""
+_TOKEN_MAJOR_MIN_QUERIES = 32
+_TOKEN_MAJOR_MAX_TOKENS = 131072
 
-    batch, tokens = values.shape[:2]
-    trailing = values.shape[2:]
-    offset_shape = (batch,) + (1,) * (indices.ndim - 1)
-    offsets = mx.arange(batch, dtype=mx.int32).reshape(offset_shape) * tokens
-    flat_indices = (indices.astype(mx.int32) + offsets).reshape(-1)
-    flat_values = values.reshape(batch * tokens, *trailing)
-    return flat_values[flat_indices].reshape(*indices.shape, *trailing)
+
+def _gather_kv_rows(kv: mx.array, indices: mx.array) -> mx.array:
+    """Gather token rows of the stored ``(B, H, N, D)`` cache: ``(B, S)`` -> ``(B, H, S, D)``,
+    ``(B, T, S)`` -> ``(B, T, H, S, D)``. Prefill-width gathers copy token-major below 128k."""
+
+    per_query = indices.shape[1] if indices.ndim == 3 else 1
+    if per_query >= _TOKEN_MAJOR_MIN_QUERIES and kv.shape[2] < _TOKEN_MAJOR_MAX_TOKENS:
+        return _gather_kv_rows_token_major(kv, indices)
+    return _gather_kv_rows_stored(kv, indices)
+
+
+def _gather_kv_rows_stored(kv: mx.array, indices: mx.array) -> mx.array:
+    """Take along the stored token axis: cheapest for few queries, no copy of the cache."""
+
+    batch, heads, _, dim = kv.shape
+    flat = indices.astype(mx.int32).reshape(batch, -1)
+    if batch == 1:
+        rows = mx.take(kv, flat[0], axis=2)
+    else:
+        rows = mx.stack([mx.take(kv[b], flat[b], axis=1) for b in range(batch)])
+    if indices.ndim == 2:
+        return rows
+    per_query, width = indices.shape[1], indices.shape[2]
+    return rows.reshape(batch, heads, per_query, width, dim).transpose(0, 2, 1, 3, 4)
+
+
+def _gather_kv_rows_token_major(kv: mx.array, indices: mx.array) -> mx.array:
+    """Copy the cache token-major and gather flat rows: cheaper for many queries per token."""
+
+    batch, heads, tokens, dim = kv.shape
+    rows = kv.transpose(0, 2, 1, 3).reshape(batch * tokens, heads, dim)
+    flat = indices.astype(mx.int32).reshape(batch, -1)
+    if batch > 1:
+        flat = flat + (mx.arange(batch, dtype=mx.int32) * tokens)[:, None]
+    gathered = rows[flat.reshape(-1)].reshape(*indices.shape, heads, dim)
+    axes = (0, 2, 1, 3) if indices.ndim == 2 else (0, 1, 3, 2, 4)
+    return gathered.transpose(*axes)
 
 
 def _portable_indexer_scores(
@@ -143,6 +216,8 @@ def _native_indexer_scores(
         or mask_q_offset < 0
     ):
         return None
+    if queries.shape[1] < _native_score_min_rows():
+        return None
 
     try:
         from omlx.custom_kernels.glm_moe_dsa import fast
@@ -190,6 +265,8 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
         or scores.dtype != mx.float32
         or topk != 512
     ):
+        return None
+    if scores.shape[1] < _native_topk_min_rows():
         return None
     try:
         from omlx.custom_kernels.glm_moe_dsa import fast
@@ -240,6 +317,8 @@ def _native_sparse_gqa_attention(
         or q_offset < 0
         or q_offset + queries.shape[2] > keys.shape[2]
     ):
+        return None
+    if queries.shape[2] < _native_main_min_rows():
         return None
     try:
         from omlx.custom_kernels.glm_moe_dsa import fast
@@ -408,14 +487,8 @@ def contiguous_causal_gathered_qsa_decode(
         tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
         selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
 
-    key_rows = keys.transpose(0, 2, 1, 3)
-    value_rows = values.transpose(0, 2, 1, 3)
-    selected_keys = mx.contiguous(
-        _batch_gather_tokens(key_rows, selected_tokens).transpose(0, 2, 1, 3)
-    )
-    selected_values = mx.contiguous(
-        _batch_gather_tokens(value_rows, selected_tokens).transpose(0, 2, 1, 3)
-    )
+    selected_keys = _gather_kv_rows(keys, selected_tokens)
+    selected_values = _gather_kv_rows(values, selected_tokens)
     output = _decode_qsa_sdpa(
         queries,
         selected_keys,
@@ -517,8 +590,6 @@ def contiguous_causal_gathered_qsa(
     max_blocks = key_tokens // ratio
     block_budget = token_budget // ratio
     query_start = key_tokens - query_tokens
-    key_rows = keys.transpose(0, 2, 1, 3)
-    value_rows = values.transpose(0, 2, 1, 3)
 
     # A contiguous prompt shares the same block bank for every query.  The
     # caller can provide its cache of completed blocks; standalone users still
@@ -649,12 +720,8 @@ def contiguous_causal_gathered_qsa(
 
         safe_selected = mx.where(selected_valid, selected_indices, 0).astype(mx.int32)
 
-        selected_keys = _batch_gather_tokens(key_rows, safe_selected).transpose(
-            0, 1, 3, 2, 4
-        )
-        selected_values = _batch_gather_tokens(value_rows, safe_selected).transpose(
-            0, 1, 3, 2, 4
-        )
+        selected_keys = _gather_kv_rows(keys, safe_selected)
+        selected_values = _gather_kv_rows(values, safe_selected)
 
         chunk_queries = queries[:, :, start:stop].transpose(0, 2, 1, 3)
         grouped_queries = chunk_queries.reshape(
