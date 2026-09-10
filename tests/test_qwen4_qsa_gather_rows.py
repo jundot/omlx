@@ -57,7 +57,9 @@ def test_gather_kv_rows_does_not_copy_the_whole_cache():
         return (time.perf_counter() - t0) / 20
 
     small, large = cost(16_384), cost(131_072)
-    assert large < 2.0 * small, (small, large)
+    # 8x more tokens. A whole-cache copy is ~8x. Shared macos-14 runners
+    # jitter sub-millisecond Metal evals past 2x (CI saw 2.6x on 3.11).
+    assert large < 4.0 * small, (small, large)
 
 
 def _dispatch(monkeypatch, per_query, tokens):
