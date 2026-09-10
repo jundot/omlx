@@ -137,7 +137,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         ModelConfig as Gemma4AssistantConfig,
     )
 
-    from ..mlx_lm_gemma4_assistant import query_position
+    from ..mlx_lm_gemma4_assistant import draft_step, query_position
 
     original_init = cls.__init__
     original_call = cls.__call__
@@ -215,8 +215,6 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
     ):
         """Drive the assistant head; the mlx-lm path drives it the same way."""
         del mtp_cache, logits_keep  # stateless head; output is 1 position
-        from ..mlx_lm_gemma4_assistant import draft_step
-
         return draft_step(self, hidden_states, next_token_ids, return_hidden)
 
     def make_mtp_cache(self):

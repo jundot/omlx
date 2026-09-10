@@ -134,6 +134,13 @@ def _patch_inner_model(mod: Any) -> None:
     if getattr(cls, "_omlx_mtp_attach_patched", False):
         return
 
+    # Bound here, at patch time, not inside the methods below: both run once
+    # per decode step, so a function-level import pays the import machinery on
+    # every draft. Relative imports, so the cluster scanner still reads the
+    # mlx-vlm requirement off mlx_lm_gemma4_assistant rather than off anything
+    # under mlx_lm_mtp -- see that module's docstring.
+    from ..mlx_lm_gemma4_assistant import draft_step, query_position
+
     original_init = cls.__init__
     original_call = cls.__call__
 
@@ -175,8 +182,6 @@ def _patch_inner_model(mod: Any) -> None:
         if sink is not None and getattr(self, "mtp", None) is not None:
             # mtp_forward is a separate top-level call, so this outlives the
             # forward; see the module docstring for why that is safe.
-            from ..mlx_lm_gemma4_assistant import query_position
-
             self._omlx_mtp_shared_kv = sink
             self._omlx_mtp_cache_ref = cache
             self._omlx_mtp_kv_offset = query_position(self)
@@ -206,8 +211,6 @@ def _patch_inner_model(mod: Any) -> None:
     ):
         """Drive the assistant head; the mlx-vlm path drives it the same way."""
         del mtp_cache, logits_keep  # stateless head, one output position
-        from ..mlx_lm_gemma4_assistant import draft_step
-
         return draft_step(self, hidden_states, next_token_ids, return_hidden)
 
     def make_mtp_cache(self):

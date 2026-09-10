@@ -28,7 +28,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import mlx.core as mx
+
 logger = logging.getLogger(__name__)
+
+# Resolved once and kept. The rejection path then costs a global read rather
+# than the import machinery. It stays deferred rather than module-level for
+# the reason in the docstring above: an ``import mlx_vlm`` at module scope
+# would make importing this module fail outright without mlx-vlm, which is
+# the failure ``warn_if_unavailable`` exists to replace with a sentence.
+_slice_after_reject = None
 
 
 def build_draft_model(assistant_config: dict) -> Any:
@@ -43,11 +52,15 @@ def build_draft_model(assistant_config: dict) -> Any:
 
 def slice_shared_kv_after_reject(shared_kv: dict, rejected: int) -> dict:
     """Drop the rejected tail from a captured K/V stash."""
-    from mlx_vlm.speculative.mtp import (  # noqa: SLF001
-        _slice_shared_kv_after_reject,
-    )
+    global _slice_after_reject
 
-    return _slice_shared_kv_after_reject(shared_kv, rejected)
+    if _slice_after_reject is None:
+        from mlx_vlm.speculative.mtp import (  # noqa: SLF001
+            _slice_shared_kv_after_reject,
+        )
+
+        _slice_after_reject = _slice_shared_kv_after_reject
+    return _slice_after_reject(shared_kv, rejected)
 
 
 def query_position(host: Any) -> int:
@@ -84,8 +97,6 @@ def draft_step(host: Any, hidden_states, next_token_ids, return_hidden: bool = F
     is what ``draft_block`` feeds back as ``h_prev``. The head is stateless,
     so there is no cache to thread.
     """
-    import mlx.core as mx
-
     drafter = host.mtp
     # nn.quantize() swaps embed_tokens for a QuantizedEmbedding after
     # construction, so a bind taken in __init__ can point at a random-init
