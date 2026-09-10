@@ -536,8 +536,13 @@ class BoundarySnapshotSSDStore:
             if not self._is_safe_snapshot_path(detached_path):
                 return None
             os.replace(file_path, detached_path)
-            with suppress(OSError):
-                file_path.parent.rmdir()
+            # Do not tidy the (possibly empty) request directory here. The
+            # writer thread creates it with ``mkdir(exist_ok=True)`` and only
+            # then writes the staging file for a later boundary; an ``rmdir``
+            # slipping between those two steps made that write fail with
+            # ENOENT, so the later checkpoint could never be promoted and
+            # the split-GDN store stopped one block short. ``cleanup_request``
+            # removes the directory once the request is done.
             return detached_path
         except Exception as e:
             logger.debug(
