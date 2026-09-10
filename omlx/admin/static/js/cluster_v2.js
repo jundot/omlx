@@ -98,6 +98,11 @@ function clusterV2Wizard() {
         return CLUSTER_V2_MEMORY_GUARD_TIERS.has(value) ? value : fallback;
     }
 
+    function memoryGuardCustomCeiling(value, fallback = 0) {
+        const ceiling = Number(value);
+        return Number.isFinite(ceiling) && ceiling >= 0 ? ceiling : fallback;
+    }
+
     const CLUSTER_V2_LINK_META = {
         tb: { label: 'Thunderbolt', icon: 'zap' },
         ethernet: { label: 'Ethernet', icon: 'cable' },
@@ -2486,6 +2491,10 @@ function clusterV2Wizard() {
                             measured.memory_guard_tier,
                             node.memory_guard_tier,
                         ),
+                        memory_guard_custom_ceiling_gb: memoryGuardCustomCeiling(
+                            measured.memory_guard_custom_ceiling_gb,
+                            node.memory_guard_custom_ceiling_gb,
+                        ),
                     }
                     : node;
             }).filter((node) => node.capacity_bytes > 0);
@@ -2763,6 +2772,10 @@ function clusterV2Wizard() {
                     memory_guard_tier: memoryGuardTier(
                         budget.memory_guard_tier,
                         node.memory_guard_tier,
+                    ),
+                    memory_guard_custom_ceiling_gb: memoryGuardCustomCeiling(
+                        budget.memory_guard_custom_ceiling_gb,
+                        node.memory_guard_custom_ceiling_gb,
                     ),
                 };
             });
@@ -3239,6 +3252,9 @@ function clusterV2Wizard() {
                         role: roles[node.node_id] || 'headless',
                         memory_guard_tier: memoryGuardTier(
                             node.memory_guard_tier,
+                        ),
+                        memory_guard_custom_ceiling_gb: memoryGuardCustomCeiling(
+                            node.memory_guard_custom_ceiling_gb,
                         ),
                         accelerator: 'metal',
                         ...(performance ? { performance } : {}),

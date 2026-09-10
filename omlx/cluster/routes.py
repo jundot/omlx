@@ -415,6 +415,7 @@ class ClusterPlanNodeRequest(BaseModel):
     memory_guard_tier: Literal["safe", "balanced", "aggressive", "custom"] = (
         "balanced"
     )
+    memory_guard_custom_ceiling_gb: float = Field(default=0.0, ge=0)
     performance: dict[str, Any] | None = None
     accelerator: Literal["metal", "cuda", "cpu"] | None = None
     fabric_kind: str | None = Field(default=None, max_length=64)
@@ -613,6 +614,7 @@ def _node_budgets(
                 target_weight_bytes=target_weight_bytes,
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
+                memory_guard_custom_ceiling_gb=node.memory_guard_custom_ceiling_gb,
                 rank=rank,
                 performance=performance,
             )
@@ -713,6 +715,7 @@ _PLACEMENT_FIELDS = (
     "manual_memory_limit",
     "role",
     "memory_guard_tier",
+    "memory_guard_custom_ceiling_gb",
     "tensor_parallel_rank",
     "tensor_parallel_size",
 )

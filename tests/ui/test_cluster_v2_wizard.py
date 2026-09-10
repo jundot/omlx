@@ -1517,36 +1517,53 @@ process.stdout.write(JSON.stringify({
     assert result["usableSelf"] == "128 GB usable as Workstation"
 
 
-def test_measured_memory_guard_tiers_reach_the_v2_plan_payload():
+def test_measured_memory_guard_settings_reach_the_v2_plan_payload():
     result = _run_wizard(
         _WIZARD_TWO_MACS
         + """
-component.apiFetch = async (url) => {
-  if (!url.endsWith('/node-budgets')) throw new Error('unexpected URL ' + url);
-  return {nodes: [
+component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+component.selectedModelPath = '/models/m';
+let posted = null;
+component.apiFetch = async (url, options = {}) => {
+  if (url.endsWith('/node-budgets')) return {nodes: [
     { node_id: 'node-a', capacity_bytes: 250000, reserve_bytes: 10000,
-      role: 'workstation', memory_guard_tier: 'aggressive' },
+      role: 'workstation', memory_guard_tier: 'aggressive',
+      memory_guard_custom_ceiling_gb: 12.5 },
     { node_id: 'node-b', capacity_bytes: 120000, reserve_bytes: 10000,
-      role: 'headless', memory_guard_tier: 'custom' },
+      role: 'headless', memory_guard_tier: 'custom',
+      memory_guard_custom_ceiling_gb: 44.0 },
   ]};
+  if (url.endsWith('/autoconfigure')) {
+    posted = JSON.parse(options.body);
+    return {
+      plan: { assignments: [], placement_signature: 'a'.repeat(16) },
+      activation: { approved_placement: 'a'.repeat(16) },
+    };
+  }
+  throw new Error('unexpected URL ' + url);
 };
 (async () => {
-  const hosts = [
-    {node_id: 'node-a', ssh: '127.0.0.1'},
-    {node_id: 'node-b', ssh: 'node-b.local'},
-  ];
-  await component.measurePlanNodes(hosts, component.planNodes());
-  process.stdout.write(JSON.stringify(component.planNodes().map((node) => ({
+  await component.runPlan();
+  process.stdout.write(JSON.stringify(posted.nodes.map((node) => ({
     node_id: node.node_id,
     memory_guard_tier: node.memory_guard_tier,
+    memory_guard_custom_ceiling_gb: node.memory_guard_custom_ceiling_gb,
   }))));
 })();
 """
     )
 
     assert result == [
-        {"node_id": "node-a", "memory_guard_tier": "aggressive"},
-        {"node_id": "node-b", "memory_guard_tier": "custom"},
+        {
+            "node_id": "node-a",
+            "memory_guard_tier": "aggressive",
+            "memory_guard_custom_ceiling_gb": 12.5,
+        },
+        {
+            "node_id": "node-b",
+            "memory_guard_tier": "custom",
+            "memory_guard_custom_ceiling_gb": 44.0,
+        },
     ]
 
 

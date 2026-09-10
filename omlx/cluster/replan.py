@@ -58,6 +58,7 @@ def nodes_from_deployment(deployment: ClusterDeployment) -> list[dict[str, Any]]
             "manual_memory_limit": assignment.manual_memory_limit,
             "role": assignment.role or "headless",
             "memory_guard_tier": assignment.memory_guard_tier,
+            "memory_guard_custom_ceiling_gb": assignment.memory_guard_custom_ceiling_gb,
         }
         profile = profiles.get((assignment.rank, assignment.node_id))
         if profile is not None:
