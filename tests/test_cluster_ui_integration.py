@@ -34,14 +34,21 @@ def test_join_http_flow_completes_both_sides_and_cancels(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert client.get("/api/cluster/pair/join").headers["cache-control"] == "no-store"
-    assert client.post("/api/cluster/pair/join", json={"coordinator_addr": "other:8000"}).status_code == 409
+    assert (
+        client.post(
+            "/api/cluster/pair/join", json={"coordinator_addr": "other:8000"}
+        ).status_code
+        == 409
+    )
     assert client.get("/api/cluster/pair/join").json()["state"] == "awaiting_approval"
     coordinator.approve(joiner.node_id, response.json()["code"])
     assert client.get("/api/cluster/pair/join").json()["state"] == "approved"
     assert client.get("/api/cluster/pair/join").json()["state"] == "approved"
     assert len(enrollments) == 2
     assert joiner._devices.get(coordinator.node_id)["state"] == "paired"
-    assert client.post("/api/cluster/pair/join/cancel").json() == {"state": "idle"}
+    cancelled = client.post("/api/cluster/pair/join/cancel").json()
+    assert cancelled["state"] == "idle"
+    assert cancelled["code"] is None
 
 
 def test_join_mutations_are_on_admin_router():
@@ -60,6 +67,18 @@ def test_join_mutations_are_on_admin_router():
     )
     assert client.get("/api/cluster/pair/join").status_code == 401
     assert client.post("/api/cluster/pair/join/cancel").status_code == 401
+
+
+def test_expired_join_retains_retry_address_and_clears_code(tmp_path):
+    from omlx.cluster.pairing import CODE_TTL_SECONDS
+
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    joiner.ui_session.begin("coordinator:8000")
+    joiner._clock.now += CODE_TTL_SECONDS + 1
+    status = joiner.ui_session.poll()
+    assert status["state"] == "error"
+    assert status["coordinator_addr"] == "coordinator:8000"
+    assert status["code"] is None
 
 
 def test_cancel_prevents_delayed_approval_from_completing_a_new_join(tmp_path):

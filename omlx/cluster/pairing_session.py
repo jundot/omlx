@@ -22,15 +22,26 @@ class PairingSession:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            empty = {
+                "state": "idle",
+                "code": None,
+                "expires_at": None,
+                "coordinator_addr": None,
+                "error": None,
+                "seconds_remaining": 0,
+            }
             if self.attempt is None:
-                return {"state": "idle"}
-            result = dict(self.attempt)
+                return empty
+            result = empty | self.attempt
             if result["state"] == "awaiting_approval":
                 remaining = max(0, int(result["expires_at"] - self.manager._clock()))
                 result["seconds_remaining"] = remaining
                 if remaining == 0:
                     self.attempt = {
+                        **result,
                         "state": "error",
+                        "code": None,
+                        "seconds_remaining": 0,
                         "error": "The pairing code expired. Start again.",
                     }
                     self.manager._local_code = None
@@ -121,18 +132,26 @@ class PairingSession:
                     record = self.manager.complete_join(status)
                     self.attempt = {
                         "state": "approved",
+                        "coordinator_addr": current["coordinator_addr"],
                         "coordinator_name": record.get("friendly_name", ""),
                     }
                 elif status.get("state") == "denied":
                     self.manager._local_code = None
-                    self.attempt = {"state": "denied"}
+                    self.attempt = {
+                        "state": "denied",
+                        "coordinator_addr": current["coordinator_addr"],
+                    }
                 else:
                     self.attempt["error"] = None
         except PairingError as exc:
             with self.lock:
                 if self.attempt is attempt:
                     self.manager._local_code = None
-                    self.attempt = {"state": "error", "error": str(exc)}
+                    self.attempt = {
+                        "state": "error",
+                        "error": str(exc),
+                        "coordinator_addr": current["coordinator_addr"],
+                    }
         except Exception:
             with self.lock:
                 if self.attempt is attempt:
@@ -152,4 +171,4 @@ class PairingSession:
                 )
             self.attempt = None
             self.manager._local_code = None
-            return {"state": "idle"}
+            return self.snapshot()
