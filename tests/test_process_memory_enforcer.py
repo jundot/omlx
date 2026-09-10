@@ -229,6 +229,10 @@ def mock_engine_pool():
     pool._mark_pending_unload_locked = MagicMock(
         side_effect=_mark_pending_unload_locked
     )
+    pool._scheduled_pending_unloads = []
+    pool._schedule_pending_unload_locked = MagicMock(
+        side_effect=pool._scheduled_pending_unloads.append
+    )
     return pool
 
 
@@ -1523,6 +1527,36 @@ class TestSingleModelMemoryPressure:
         entry.in_use = 0
         await enforcer._engine_pool._unload_pending_if_idle_locked("big-model")
         enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model")
+
+    @pytest.mark.asyncio
+    async def test_single_busy_model_schedules_retry_when_still_busy_after_abort(
+        self, enforcer
+    ):
+        """The pending-unload latch must not depend on a later manual drain check.
+
+        _check_and_enforce()'s while loop is not revisited once pressure recovers
+        to "ok" (an earlier branch returns before reaching it), so if the busy
+        victim has not drained by the time this tick's single inline
+        _unload_pending_if_idle_locked call runs, nothing else will ever retry it.
+        """
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [13 * 1024**3, 13 * 1024**3]
+            )
+            await enforcer._check_and_enforce()
+
+        assert entry.pending_unload_reason == "hard memory pressure"
+        enforcer._engine_pool._schedule_pending_unload_locked.assert_called_once_with(
+            "big-model"
+        )
 
     @pytest.mark.asyncio
     async def test_two_models_one_inferring_evicts_idle(self, enforcer):
