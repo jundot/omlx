@@ -194,5 +194,18 @@ struct AttnChunkReduceParams {
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
 };
 
+// Streaming chunk-fold (Phase 3.1 / §B1): merge ONE chunk slot into a running
+// fp32 accumulator + running logsumexp, so the transient is O(1) in n_chunks.
+// The single-chunk buffers (o_slot/lse_slot/acc/lse_run) are contiguous
+// [B,H,qL,D] / [B,H,qL] at offset 0, so only the final output needs strides.
+struct AttnChunkFoldParams {
+  int H; ///< Heads
+  int qL; ///< Query sequence length
+  int D; ///< Head dim
+  bool is_first; ///< c == 0: initialize acc/lse_run, never read them
+  bool is_last; ///< c == n_chunks-1: cast-store the running acc to O
+  int64_t O_strides[3]; ///< Final output strides (B, H, L; D = 1) — is_last only
+};
+
 } // namespace steel
 } // namespace mlx

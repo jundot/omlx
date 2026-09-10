@@ -231,6 +231,20 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     else:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
 
+    # Phase 3.1 (§B1): stream the chunk fold into a running accumulator instead
+    # of materializing the n_chunks-scaled partial slab. Default ON where the
+    # rebuilt extension supports it — the Step-3 benchmark measured only
+    # ~2-8% fa256 prefill overhead (bounded fold dispatches) against a ~1.9GB
+    # per-op transient drop that lifts the long-context admission ceiling, and
+    # streaming honors the per-dispatch budget exactly (legacy caps at the
+    # 2GiB slab and can re-expose the #2225 IOGPU preemption at huge kL).
+    # OMLX_FA256_STREAM_FOLD=0 forces the legacy slab path.
+    stream_fold_env = os.environ.get("OMLX_FA256_STREAM_FOLD", "").strip().lower()
+    if stream_fold_env in ("0", "false", "no", "off"):
+        stream_fold = False
+    else:
+        stream_fold = _fa256_fast.fa256_supports_stream_fold()
+
     patched_any = False
 
     try:
@@ -267,6 +281,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                         q_block=q_block,
                         k_block=k_block,
                         dispatch_budget=dispatch_budget,
+                        stream_fold=stream_fold,
                     )
                 except Exception:
                     logger.warning(
@@ -323,6 +338,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                             q_block=q_block,
                             k_block=k_block,
                             dispatch_budget=dispatch_budget,
+                            stream_fold=stream_fold,
                         )
                     except Exception:
                         logger.warning(
@@ -367,10 +383,12 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         _PATCHED = True
         logger.info(
             "Qwen3.5/3.6 FA-256 steel attention patch applied "
-            "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d)",
+            "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d, "
+            "stream_fold=%s)",
             min_kv_len,
             q_block,
             k_block,
             dispatch_budget,
+            "on" if stream_fold else "off",
         )
     return patched_any

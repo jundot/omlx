@@ -24,6 +24,10 @@ bool nax_qmm_runtime_active();
 // dispatch_budget bounds the per-dispatch work (B * H * qL * keys) by
 // splitting the key axis into separately dispatched chunks combined with
 // logsumexp weights; 0 keeps the single-dispatch behavior (issue #2225).
+// stream_fold merges each chunk into a running fp32 accumulator instead of
+// materializing all partials, dropping the per-op transient from the
+// n_chunks-scaled 2GiB slab to ~one chunk slot (Phase 3.1 / §B1); it also
+// lifts the n_mem_cap so the dispatch budget is honored exactly.
 mx::array qwen35_fa256_attention(
     const mx::array& q,
     const mx::array& k,
@@ -33,6 +37,7 @@ mx::array qwen35_fa256_attention(
     int q_block = 32,
     int k_block = 8,
     int64_t dispatch_budget = 0,
+    bool stream_fold = false,
     mx::StreamOrDevice s = {});
 
 mx::array qwen35_q2_affine_qmm_t(
