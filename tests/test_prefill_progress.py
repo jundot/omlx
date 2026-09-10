@@ -96,6 +96,48 @@ class TestPrefillProgressTracker:
         result = self.tracker.get_model_progress("llama-3b")
         assert result[0]["eta"] is None
 
+    def test_get_direct_lookup(self):
+        self.tracker.update("req-1", 2048, 8192, "llama-3b")
+        self.tracker.update("req-2", 1024, 4096, "llama-3b")
+        result = self.tracker.get("req-1")
+        assert result is not None
+        assert result["request_id"] == "req-1"
+        assert result["processed"] == 2048
+        assert result["total"] == 8192
+
+    def test_get_missing_returns_none(self):
+        assert self.tracker.get("nonexistent") is None
+
+    def test_get_matches_model_progress_entry(self):
+        self.tracker.update("req-1", 2048, 8192, "llama-3b")
+        direct = self.tracker.get("req-1")
+        (listed,) = self.tracker.get_model_progress("llama-3b")
+        assert direct == listed
+
+    def test_decode_phase_update_and_get(self):
+        self.tracker.update("req-1", 10, 256, "llama-3b", phase="decode")
+        result = self.tracker.get("req-1")
+        assert result is not None
+        assert result["phase"] == "decode"
+        assert result["processed"] == 10
+        assert result["total"] == 256
+
+    def test_phase_transition_resets_speed(self):
+        t = 100.0
+        with patch("omlx.prefill_progress.time") as mock_time:
+            mock_time.monotonic.return_value = t
+            self.tracker.update("req-1", 0, 8192, "llama-3b", phase="prefill")
+            mock_time.monotonic.return_value = t + 1.0
+            self.tracker.update("req-1", 4096, 8192, "llama-3b", phase="prefill")
+            # phase change (prefill -> decode) for the same request_id, even
+            # with an entry still present, must not carry the old phase's
+            # speed forward as if it applied to the new phase.
+            mock_time.monotonic.return_value = t + 2.0
+            self.tracker.update("req-1", 8, 256, "llama-3b", phase="decode")
+        result = self.tracker.get("req-1")
+        assert result["phase"] == "decode"
+        assert result["speed"] == 0.0
+
     def test_thread_safety(self):
         """Concurrent updates from multiple threads should not corrupt state."""
         errors = []

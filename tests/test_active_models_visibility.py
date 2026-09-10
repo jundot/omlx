@@ -94,6 +94,8 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
             "last_activity_age_seconds": 0.5,
             "prompt_tokens": 12,
             "max_tokens": 64,
+            # remaining = 64 - 20 = 44; eta = 44 / 2.0 tok/s = 22.0s
+            "eta": 22.0,
         }
     ]
 
