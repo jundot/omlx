@@ -55,15 +55,15 @@
                             <p class="text-sm text-neutral-500 mt-2">{{ t('models.manager.description') }}</p>
                         </div>
 
-                        <!-- Local Models Section -->
+                        <!-- Available Models Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.manager.local_models') }}</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.manager.available_models') }}</span>
                                     <span class="text-xs text-neutral-400" x-text="window.t('models.manager.models_count').replace('{count}', sortedManagerModels.length)"></span>
                                 </div>
-                                <button @click="loadHFModels()"
+                                <button @click="loadModels()"
                                         class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
                                                hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5">
                                     <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
@@ -72,7 +72,7 @@
                             </div>
 
                             <!-- Search + reset sort toolbar -->
-                            <div x-show="hfModels.length > 0" class="flex flex-col sm:flex-row sm:items-center gap-3 px-4 sm:px-6 py-3 border-b border-neutral-100">
+                            <div x-show="managerModels.length > 0" class="flex flex-col sm:flex-row sm:items-center gap-3 px-4 sm:px-6 py-3 border-b border-neutral-100">
                                 <div class="relative flex-1">
                                     <i data-lucide="search" class="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"></i>
                                     <input type="text" x-model="managerSearch"
@@ -90,8 +90,14 @@
                                 </button>
                             </div>
 
-                            <!-- Empty (no models on disk) -->
-                            <template x-if="hfModels.length === 0">
+                            <div x-show="managerError" x-cloak
+                                 class="px-4 sm:px-6 py-3 bg-red-50 border-b border-red-200 text-red-700 text-sm flex items-center gap-2">
+                                <i data-lucide="alert-circle" class="w-4 h-4 shrink-0"></i>
+                                <span x-text="managerError"></span>
+                            </div>
+
+                            <!-- Empty catalog -->
+                            <template x-if="managerModels.length === 0">
                                 <div class="px-6 py-12 text-center">
                                     <i data-lucide="inbox" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
                                     <p class="text-sm text-neutral-500">{{ t('models.manager.no_models') }}</p>
@@ -99,7 +105,7 @@
                             </template>
 
                             <!-- Table -->
-                            <div x-show="hfModels.length > 0" class="overflow-x-auto">
+                            <div x-show="managerModels.length > 0" class="overflow-x-auto">
                                 <!-- Table Header -->
                                 <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
                                     <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('name')">
@@ -121,75 +127,86 @@
                                 <div class="divide-y divide-neutral-100">
                                     <div x-show="sortedManagerModels.length === 0" class="px-6 py-10 text-center text-sm text-neutral-500"
                                          x-text="window.t('models.manager.no_match')"></div>
-                                    <template x-for="model in sortedManagerModels" :key="model.name">
-                                        <div class="flex items-center gap-4 px-4 sm:px-6 py-3 hover:bg-neutral-50 transition-colors">
-                                            <!-- Name -->
-                                            <div class="min-w-0 flex-1 flex items-center gap-2">
-                                                <template x-if="managerModelInfo(model.name)">
-                                                    <button
-                                                        @click.stop="updateModelSetting(model.name, 'is_favorite', !managerModelInfo(model.name)?.is_favorite)"
-                                                        @mouseenter="showTip($event.currentTarget, managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
-                                                        @mouseleave="hideTip()"
-                                                        @focus="showTip($event.currentTarget, managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
-                                                        @blur="hideTip()"
-                                                        :class="managerModelInfo(model.name)?.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                        class="hidden sm:flex p-1 rounded-md flex-shrink-0 transition-all">
-                                                        <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="managerModelInfo(model.name)?.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-                                                    </button>
-                                                </template>
-                                                <span class="text-sm font-medium text-neutral-900 truncate"
-                                                      :title="model.display_name || model.name"
-                                                      x-text="model.display_name || model.name"></span>
-                                                <template x-if="managerModelInfo(model.name)?.settings?.model_alias">
-                                                    <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
-                                                          x-text="managerModelInfo(model.name)?.settings?.model_alias"></span>
-                                                </template>
-                                                <button x-data="{ copied: false }"
-                                                        @click.stop="copyToClipboard(managerModelInfo(model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
-                                                        class="p-1 rounded-md transition-all flex-shrink-0"
-                                                        :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                        :title="window.t('models.manager.copy_model_name_tooltip')">
-                                                    <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                    <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                                </button>
-                                            </div>
-                                            <!-- Type -->
-                                            <div class="hidden sm:flex w-24 justify-center">
-                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 uppercase tracking-wide"
-                                                      x-text="managerModelInfo(model.name)?.model_type || 'llm'"></span>
-                                            </div>
-                                            <!-- Size -->
-                                            <div class="hidden sm:block w-24 text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
-                                            <!-- Actions -->
-                                            <div class="flex items-center justify-end gap-1 shrink-0">
-                                                <template x-if="managerModelInfo(model.name)">
-                                                    <button @click="openModelSettingsFromManager(model.name)"
-                                                            class="p-1.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all"
-                                                            :title="window.t('models.manager.settings_tooltip')">
-                                                        <i data-lucide="settings-2" class="w-4 h-4"></i>
-                                                    </button>
-                                                </template>
-                                                <template x-if="hfDeleteConfirm !== model.name">
-                                                    <button @click="hfDeleteConfirm = model.name"
-                                                            class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                                                            :title="window.t('models.manager.delete_tooltip')">
-                                                        <i data-lucide="trash-2" class="w-4 h-4"></i>
-                                                    </button>
-                                                </template>
-                                                <template x-if="hfDeleteConfirm === model.name">
-                                                    <div class="flex items-center gap-1.5">
-                                                        <span class="text-xs text-red-600 hidden sm:inline">{{ t('models.manager.delete_confirm') }}</span>
-                                                        <button @click="deleteHFModel(model.name)"
-                                                                class="px-2 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
-                                                            {{ t('models.manager.delete_yes') }}
+                                    <template x-for="model in sortedManagerModels" :key="model.id">
+                                        <div class="hover:bg-neutral-50 transition-colors">
+                                            <div class="flex items-center gap-4 px-4 sm:px-6 py-3">
+                                                <!-- Name -->
+                                                <div class="min-w-0 flex-1 flex items-center gap-2">
+                                                    <template x-if="!model.virtual && model.removal_kind !== 'profile'">
+                                                        <button
+                                                            @click.stop="updateModelSetting(model.id, 'is_favorite', !model.is_favorite)"
+                                                            @mouseenter="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                            @mouseleave="hideTip()"
+                                                            @focus="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                            @blur="hideTip()"
+                                                            :class="model.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                            class="hidden sm:flex p-1 rounded-md flex-shrink-0 transition-all">
+                                                            <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="model.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
                                                         </button>
-                                                        <button @click="hfDeleteConfirm = null"
-                                                                class="px-2 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
-                                                            {{ t('models.manager.delete_no') }}
+                                                    </template>
+                                                    <span class="text-sm font-medium text-neutral-900 truncate"
+                                                          :title="model.display_name || model.id"
+                                                          x-text="model.display_name || model.id"></span>
+                                                    <span x-show="model.settings?.model_alias" x-cloak
+                                                          class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
+                                                          x-text="model.settings?.model_alias"></span>
+                                                    <span x-show="model.removal_kind === 'local_cache'" x-cloak
+                                                          class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-blue-50 text-blue-700 border border-blue-200 whitespace-nowrap"
+                                                          x-text="window.t('models.manager.badge.local_cache')"></span>
+                                                    <span x-show="model.virtual" x-cloak
+                                                          class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-600 border border-neutral-200 whitespace-nowrap"
+                                                          x-text="window.t('models.manager.badge.virtual')"></span>
+                                                    <span x-show="model.removal_kind === 'profile'" x-cloak
+                                                          class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-violet-50 text-violet-700 border border-violet-200 whitespace-nowrap"
+                                                          x-text="window.t('models.manager.badge.profile')"></span>
+                                                    <button x-data="{ copied: false }"
+                                                            @click.stop="copyToClipboard(model.settings?.model_alias || model.id); copied = true; setTimeout(() => copied = false, 2000)"
+                                                            class="p-1 rounded-md transition-all flex-shrink-0"
+                                                            :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                            :title="window.t('models.manager.copy_model_name_tooltip')">
+                                                        <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                        <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                                    </button>
+                                                </div>
+                                                <!-- Type -->
+                                                <div class="hidden sm:flex w-24 justify-center">
+                                                    <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 uppercase tracking-wide"
+                                                          x-text="model.model_type || 'llm'"></span>
+                                                </div>
+                                                <!-- Size -->
+                                                <div class="hidden sm:block w-24 text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
+                                                <!-- Actions -->
+                                                <div class="flex items-center justify-end gap-1 shrink-0">
+                                                    <template x-if="!model.virtual && model.removal_kind !== 'profile'">
+                                                        <button @click="openModelSettings(model)"
+                                                                class="p-1.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all"
+                                                                :title="window.t('models.manager.settings_tooltip')">
+                                                            <i data-lucide="settings-2" class="w-4 h-4"></i>
                                                         </button>
-                                                    </div>
-                                                </template>
+                                                    </template>
+                                                    <template x-if="model.deletable && managerRemoveConfirm !== model.id">
+                                                        <button @click="managerRemoveConfirm = model.id"
+                                                                class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                                                :title="managerRemovalLabel(model)">
+                                                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                                        </button>
+                                                    </template>
+                                                    <template x-if="model.deletable && managerRemoveConfirm === model.id">
+                                                        <div class="flex items-center gap-1.5">
+                                                            <button @click="removeManagerModel(model)"
+                                                                    class="px-2 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all whitespace-nowrap"
+                                                                    x-text="managerRemovalLabel(model)"></button>
+                                                            <button @click="managerRemoveConfirm = null"
+                                                                    class="px-2 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                                {{ t('models.manager.delete_no') }}
+                                                            </button>
+                                                        </div>
+                                                    </template>
+                                                </div>
                                             </div>
+                                            <div x-show="model.deletable && managerRemoveConfirm === model.id" x-cloak
+                                                 class="px-4 sm:px-6 pb-3 text-xs text-red-700"
+                                                 x-text="managerRemovalWarning(model)"></div>
                                         </div>
                                     </template>
                                 </div>
