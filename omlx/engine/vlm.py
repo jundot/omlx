@@ -1531,6 +1531,101 @@ def _count_image_tokens_real(
                 total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
     return total
 
+# ---------------------------------------------------------------------------
+# Aspect-ratio pre-check
+# ---------------------------------------------------------------------------
+
+# The upstream ``_smart_resize_image`` (Qwen3-VL/Qwen3.5, Qwen2-VL/Qwen2.5-VL via
+# Qwen3VLImageProcessor, Hunyuan-VL, MiniMax-M3-VL, GLM-OCR, GLM-4V, PaddleOCR-VL)
+# rejects images whose aspect ratio exceeds this threshold with an unguarded
+# ``ValueError``.  Catching it *before* streaming headers commit (inside
+# ``preflight_chat``) converts the failure into HTTP 400.
+#
+# Only these model families reject in the installed mlx-vlm runtime.
+# Other VLMs (LLaVA, Pixtral, Gemma-Vision, …) clamp or use different
+# resize rules and must not be rejected here.
+_ASPECT_RATIO_LIMIT = 200
+
+_ASPECT_RATIO_MODELS: frozenset[str] = frozenset({
+    # Qwen3-VL family (processing_qwen3_vl.py)
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    # Qwen3.5 family — no own processing file; uses Qwen3VLProcessor via
+    # install_auto_processor_patch() in mlx_vlm.  OvisOCR2 resolves to
+    # model_type "qwen3_5".
+    "qwen3_5",
+    "qwen3_5_moe",
+    # Qwen2-VL family — mlx-vlm builds Qwen3VLImageProcessor at runtime
+    # (processing_qwen2_vl.py / processing_qwen2_5_vl.py from_pretrained),
+    # so the same > 200 rejection applies.
+    "qwen2_vl",
+    "qwen2_5_vl",
+    # Hunyuan-VL (processing_hunyuan_vl.py)
+    "hunyuan_vl",
+    # MiniMax-M3-VL — top-level ModelConfig type.  The nested TextConfig
+    # type "minimax_m3" never reaches VLMBatchedEngine.model_type.
+    MINIMAX_M3_VL_MODEL_TYPE,
+    # GLM-OCR — top-level ModelConfig type.  The nested TextConfig type
+    # "glm_ocr_text" never reaches VLMBatchedEngine.model_type.
+    # Also present in OCR_MODEL_TYPES.
+    "glm_ocr",
+    # GLM-4V family — mlx-vlm wraps transformers Glm4vImageProcessor
+    # (processing.py from_pretrained), which enforces the same limit.
+    "glm4v",
+    "glm4v_moe",
+    # PaddleOCR-VL (processing_paddleocr_vl.py)
+    "paddleocr_vl",
+})
+
+
+def _validate_image_aspect_ratios(
+    messages: list[dict[str, Any]],
+    model_type: str | None = None,
+) -> None:
+    """Reject images whose aspect ratio exceeds the processor's hard limit.
+
+    Only runs for ``model_type`` values in ``_ASPECT_RATIO_MODELS`` — i.e.
+    processors that actually enforce the ``_smart_resize_image`` constraint.
+    For all other models the function is a no-op.
+
+    Iterates OpenAI-style ``messages``, reads image dimensions decode-free via
+    ``_read_image_dims``, and raises ``InvalidRequestError`` for any image
+    whose ``max(w,h)/min(w,h) > _ASPECT_RATIO_LIMIT``.
+
+    Images whose dimensions cannot be read decode-free (corrupt data) are
+    silently skipped — the downstream processor will surface its own error.
+    In production, non-data: URIs never reach here: preflight_chat extracts
+    images first, and extract_images_from_messages raises InvalidRequestError
+    for remote URLs.  Only the specific aspect-ratio constraint is checked here.
+    """
+    if model_type not in _ASPECT_RATIO_MODELS:
+        return
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in ("image_url", "image", "input_image"):
+                continue
+            wh = _read_image_dims(part)
+            if wh is None:
+                continue
+            w, h = wh
+            if w <= 0 or h <= 0:
+                continue
+            ratio = max(w, h) / min(w, h)
+            if ratio > _ASPECT_RATIO_LIMIT:
+                raise InvalidRequestError(
+                    f"Image aspect ratio {ratio:.1f} exceeds the maximum "
+                    f"supported ratio of {_ASPECT_RATIO_LIMIT} "
+                    f"(image dimensions: {w}\u00d7{h}). "
+                    f"The vision processor cannot resize images with such "
+                    f"extreme proportions.",
+                    field="messages",
+                )
+
 
 class VLMBatchedEngine(BaseEngine):
     """
@@ -3290,12 +3385,26 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         # Tokenize text and preprocess images and audio
-        inputs = prepare_inputs(
-            self._processor,
-            images=images if images else None,
-            audio=audio if audio else None,
-            prompts=[prompt] if isinstance(prompt, str) else prompt,
-        )
+        try:
+            inputs = prepare_inputs(
+                self._processor,
+                images=images if images else None,
+                audio=audio if audio else None,
+                prompts=[prompt] if isinstance(prompt, str) else prompt,
+            )
+        except ValueError as exc:
+            # Defense-in-depth: the preflight_chat aspect-ratio guard catches
+            # listed models decode-free before headers commit.  This catch
+            # covers model types outside _ASPECT_RATIO_MODELS and any image
+            # whose dimensions _read_image_dims couldn't parse.  Only re-map
+            # the *specific* upstream aspect-ratio ValueError — all other
+            # ValueErrors propagate unchanged.
+            if "aspect ratio must be smaller than" in str(exc):
+                raise InvalidRequestError(
+                    f"Image rejected by the vision processor: {exc}",
+                    field="messages",
+                ) from exc
+            raise
 
         input_ids = inputs["input_ids"]
         pixel_values = inputs.get("pixel_values")
@@ -4092,6 +4201,10 @@ class VLMBatchedEngine(BaseEngine):
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
         text_messages, _, _ = extract_images_from_messages(messages)
+        # Reject images whose aspect ratio exceeds the processor's hard
+        # limit BEFORE the StreamingResponse 200 is committed.  Uses the
+        # original ``messages`` (which still contain image content parts).
+        _validate_image_aspect_ratios(messages, model_type=self.model_type)
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
