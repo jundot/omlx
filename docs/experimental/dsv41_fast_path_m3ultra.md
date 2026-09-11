@@ -1,15 +1,16 @@
 # DeepSeek-V4.1-Flash fast path on Apple M3 Ultra
 
-Opt-in decode/prefill stack for `DeepSeek-V4.1-Flash` on Mac Studio (M3 Ultra).
-Enable with `OMLX_DSV41_FAST=1`.
+Default decode/prefill stack for `DeepSeek-V4.1-Flash` on Mac Studio (M3 Ultra).
+Applied automatically when loading `deepseek_v41`. Optional knobs are Engram
+backend (`OMLX_DSV41_ENGRAM`) and hot-row cache size (`OMLX_DSV41_ENGRAM_CACHE_GB`).
 
 ## What changed
 
-- **Fast model path** (`omlx/patches/deepseek_v41/deepseek_v41_model.py` via
-  `fast_path.py`): SwitchGLU MoE, wsdpa / native sparse prefill, deferred mHC,
-  CSA2 shared runtime, decode-oriented indexer Metal helpers.
-- **Engram modes**: `OMLX_DSV41_ENGRAM=stub|mmap|full` (default `mmap` when
-  fast path is on). Optional hot-row cache for mmap/SSD gathers.
+- **Default model path** (`deepseek_v41_model.py` via `fast_path.py`): SwitchGLU
+  MoE, wsdpa / native sparse prefill, deferred mHC, CSA2 shared runtime,
+  decode-oriented indexer Metal helpers.
+- **Optional Engram**: `OMLX_DSV41_ENGRAM=stub|mmap|full` (default `mmap`).
+  Optional hot-row cache size via `OMLX_DSV41_ENGRAM_CACHE_GB`.
 - **Quant load fix**: V4.1 fp8 weights use V4.1 `make_quantization_config`
   (engram.wkv mxfp8) so mmap load no longer expects missing affine biases.
 - **Batch decode plumbing**: fresh pools per `make_cache`, shared-pool identity
@@ -21,8 +22,9 @@ Enable with `OMLX_DSV41_FAST=1`.
 ```bash
 source ~/omlx-venv313/bin/activate
 export PYTHONPATH=/path/to/omlx
-export OMLX_DSV41_FAST=1
-export OMLX_DSV41_ENGRAM=stub   # or mmap + OMLX_DSV41_ENGRAM_DIR=...
+export OMLX_DSV41_ENGRAM=stub   # optional: stub | mmap | full
+# export OMLX_DSV41_ENGRAM_DIR=...          # mmap/SSD tables
+# export OMLX_DSV41_ENGRAM_CACHE_GB=24      # optional hot-row RAM cap
 
 python - <<'PY'
 import mlx.core as mx
@@ -47,9 +49,9 @@ SSD (`DeepSeek-V4.1-Flash`). Wired limit set in all timed runs below.
 
 | Config | Decode (tok/s) | Prefill ~2k (tok/s) | Notes |
 | --- | ---: | ---: | --- |
-| **Before** stock patch (`language.py`, no `OMLX_DSV41_FAST`) | ~15.5 | ~337 | Prompt ~1105, gen 15; stock wall clock |
-| **After** `OMLX_DSV41_FAST=1` + Engram **stub** | **~26.5–27.2** | **~490–500** | L=2048 prefill med ~499 |
-| **After** fast + Engram **mmap** + hot cache | **~25.5** | **~481** | Hot cache ~25 GB/layer, ~85–87% hit |
+| **Before** stock `#3574` `language.py` path | ~15.5 | ~337 | Prompt ~1105, gen 15; stock wall clock |
+| **After** default stack + Engram **stub** | **~26.5–27.2** | **~490–500** | L=2048 prefill med ~499 |
+| **After** default + Engram **mmap** + hot cache | **~25.5** | **~481** | Hot cache ~25 GB/layer, ~85–87% hit |
 
 Relative to stock on the same machine:
 
@@ -77,8 +79,7 @@ bit-exact (bf16 / path differences); twin rows inside one batch match.
 
 | Variable | Meaning |
 | --- | --- |
-| `OMLX_DSV41_FAST=1` | Enable fast path |
-| `OMLX_DSV41_ENGRAM=stub / mmap / full` | Engram backend |
+| `OMLX_DSV41_ENGRAM=stub / mmap / full` | Engram backend (optional; default `mmap`) |
 | `OMLX_DSV41_ENGRAM_DIR` | mmap/SSD table directory |
 | `OMLX_DSV41_ENGRAM_CACHE_GB` | Hot-row RAM budget (mmap) |
 

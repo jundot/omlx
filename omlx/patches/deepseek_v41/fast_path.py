@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in fast DeepSeek-V4.1 path (our SwitchGLU + wsdpa + deferred HC stack).
+"""Default DeepSeek-V4.1 load path (SwitchGLU + wsdpa + deferred HC).
 
-Enable with ``OMLX_DSV41_FAST=1``. Uses mlx_lm.load of ``deepseek_v41_model.py``
-instead of the #3574 language.py reference port. Engram via
-``OMLX_DSV41_ENGRAM=stub|mmap|full``.
+Registered automatically by ``apply_patch()`` for ``deepseek_v41``. Engram
+backend is optional via ``OMLX_DSV41_ENGRAM=stub|mmap|full`` (default
+``mmap``); hot-row RAM budget via ``OMLX_DSV41_ENGRAM_CACHE_GB``.
 """
 from __future__ import annotations
 
@@ -18,12 +18,8 @@ _APPLIED = False
 
 
 def fast_path_enabled() -> bool:
-    return os.environ.get("OMLX_DSV41_FAST", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    """Fast path is the default V4.1 stack; always on once patches load."""
+    return True
 
 
 def _inject_pooling_cache() -> None:
@@ -102,5 +98,5 @@ def apply_fast_path() -> bool:
         except Exception as e:
             logger.warning("fast path %s skipped: %s", name, e)
     _APPLIED = True
-    logger.info("DeepSeek-V4.1 FAST path applied (OMLX_DSV41_FAST)")
+    logger.info("DeepSeek-V4.1 path applied (engram=%s)", os.environ.get("OMLX_DSV41_ENGRAM", "mmap"))
     return True
