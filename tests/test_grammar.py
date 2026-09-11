@@ -418,7 +418,9 @@ class TestCompileBareGrammar:
         schema = {"type": "object"}
         result = self._call(compiler, {"type": "json_schema", "json_schema": schema})
         assert result == "compiled_json"
-        compiler.compile_json_schema.assert_called_once()
+        compiler.compile_json_schema.assert_called_once_with(
+            json.dumps(schema), max_whitespace_cnt=32
+        )
 
     def test_empty_json_schema(self):
         compiler = MagicMock()
@@ -482,7 +484,12 @@ class TestCompileGrammarForRequest:
             "json": {"type": "object", "properties": {"x": {"type": "integer"}}},
         })
         assert result == "compiled_json"
-        compiler.compile_json_schema.assert_called_once()
+        compiler.compile_json_schema.assert_called_once_with(
+            json.dumps(
+                {"type": "object", "properties": {"x": {"type": "integer"}}}
+            ),
+            max_whitespace_cnt=32,
+        )
 
     def test_bare_regex(self):
         compiler = MagicMock()
@@ -573,7 +580,9 @@ class TestCompileGrammarForRequest:
             reasoning_parser=None,
         )
         assert result == "compiled_bare"
-        compiler.compile_json_schema.assert_called_once()
+        compiler.compile_json_schema.assert_called_once_with(
+            json.dumps({"type": "object"}), max_whitespace_cnt=32
+        )
         compiler.compile_structural_tag.assert_not_called()
 
     def test_compilation_error_raises_for_structured_outputs(self):
