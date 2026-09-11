@@ -64,6 +64,7 @@ from .prefill_boundaries import (
 )
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
+from .logprobs import extract_token_logprob
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
@@ -11446,6 +11447,30 @@ class Scheduler:
             ):
                 response.logprobs = None
 
+            # Keep only the requested per-token payload, then release the
+            # full-vocabulary vector produced for sampling.
+            token_logprobs = None
+            if hasattr(response, "logprobs") and response.logprobs is not None:
+                if request.sampling_params.logprobs and not is_stop:
+                    # Speculative heads do not describe target-model
+                    # probabilities, so do not expose misleading values.
+                    logprobs_unsafe = (
+                        isinstance(response, _VLMMTPResponse)
+                        or getattr(self.model, "mtp", None) is not None
+                        # Parser output may combine, hide, or rewrite raw
+                        # tokens, so it cannot keep an OpenAI token alignment.
+                        or parser_session is not None
+                    )
+                    if not logprobs_unsafe:
+                        entry = extract_token_logprob(
+                            response.logprobs,
+                            response.token,
+                            request.sampling_params.top_logprobs or 0,
+                        )
+                        entry.text = new_text
+                        token_logprobs = [entry]
+                response.logprobs = None
+
             # Create output
             output_generated_at = (
                 generated_at
@@ -11478,6 +11503,7 @@ class Scheduler:
                 benchmark_cache_block_size=int(
                     getattr(request, "benchmark_cache_block_size", 0) or 0
                 ),
+                logprobs=token_logprobs,
             )
 
             if not is_finished:

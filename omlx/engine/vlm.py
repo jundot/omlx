@@ -3689,6 +3689,8 @@ class VLMBatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            logprobs=kwargs.get("logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs", None),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -3719,6 +3721,7 @@ class VLMBatchedEngine(BaseEngine):
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
+            logprobs=getattr(output, "logprobs", None),
         )
 
     async def stream_generate(
@@ -3803,6 +3806,8 @@ class VLMBatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            logprobs=kwargs.get("logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs", None),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -3864,6 +3869,7 @@ class VLMBatchedEngine(BaseEngine):
                     benchmark_cache_block_size=int(
                         getattr(output, "benchmark_cache_block_size", 0) or 0
                     ),
+                    logprobs=getattr(output, "logprobs", None),
                 )
         except GeneratorExit:
             logger.info(f"[vlm_stream_generate] GeneratorExit for request {request_id}")
