@@ -213,6 +213,7 @@ class ModelSettingsRequest(BaseModel):
     repetition_penalty: float | None = None
     min_p: float | None = None
     presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     force_sampling: bool | None = None
     max_tool_result_tokens: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -2462,6 +2463,8 @@ async def update_model_settings(
         current_settings.min_p = request.min_p
     if "presence_penalty" in sent:
         current_settings.presence_penalty = request.presence_penalty
+    if "frequency_penalty" in sent:
+        current_settings.frequency_penalty = request.frequency_penalty
     if "force_sampling" in sent:
         current_settings.force_sampling = request.force_sampling
     if "max_tool_result_tokens" in sent:
