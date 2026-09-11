@@ -38,3 +38,39 @@ jobs:
 
       - name: Run unit tests
         run: python -m pytest tests/ -m "not slow and not integration"
+
+  native-affine-moe:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install with native custom kernels
+        env:
+          OMLX_WITH_CUSTOM_KERNEL: "1"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install setuptools wheel "cmake>=3.27" "nanobind==2.13.0" "mlx==0.32.0"
+          export CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
+          python -m pip install --no-build-isolation -e ".[mcp]"
+          python -m pip install pytest pytest-asyncio
+
+      - name: Verify affine MoE symbols
+        run: >-
+          python -c 'from omlx.custom_kernels.glm_moe_dsa import fast;
+          assert fast.is_native_available(), fast.import_error();
+          assert fast.has_symbol("deepseek_affine_gather_qmm_blocks");
+          assert fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks");
+          assert all(fast.affine_moe_supports_bits(bits) for bits in (4, 6, 8))'
+
+      - name: Run affine MoE native tests
+        run: >-
+          python -m pytest -q
+          tests/test_glm_moe_dsa_patch.py::test_deepseek_affine_block_moe_kernels_match_gather_qmm_for_oq_bits
+          tests/test_glm_moe_dsa_patch.py::test_deepseek_switchglu_uses_affine_block_kernels
