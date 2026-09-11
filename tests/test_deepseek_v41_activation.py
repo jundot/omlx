@@ -123,3 +123,36 @@ def test_paired_swiglu_preserves_row_and_quantization_boundaries(
     np.testing.assert_array_equal(
         actual.astype(mx.float32), repeated.astype(mx.float32)
     )
+
+
+@pytest.mark.parametrize("device", [mx.cpu, mx.gpu])
+def test_normal_scales_are_exact_and_nonzero(device):
+    from omlx.patches.deepseek_v41.quantization import _normal_power_of_two
+
+    with mx.stream(device):
+        exponent = mx.arange(-126, 128, dtype=mx.float32)
+        actual = _normal_power_of_two(exponent)
+        compiled = mx.compile(_normal_power_of_two)(exponent)
+        expected = np.exp2(np.arange(-126, 128, dtype=np.float32))
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(compiled, expected)
+
+
+@pytest.mark.parametrize("bits,group,e4m3", [(8, 32, False), (4, 32, False), (4, 16, True)])
+def test_zero_activation_groups_remain_zero(bits, group, e4m3):
+    from omlx.patches.deepseek_v41.quantization import (
+        _quantize_activation,
+        pack_activation,
+        unpack_activation,
+    )
+
+    x = mx.zeros((3, 128), mx.float32)
+    for result in (
+        _quantize_activation(x, bits, group, e4m3),
+        _compiled_quantize_activation(x, bits, group, e4m3),
+        quantize_activation(x, bits, group, e4m3),
+        unpack_activation(pack_activation(x, bits, group, e4m3), bits, group, e4m3, mx.float32),
+    ):
+        # This rejects NaNs explicitly, including matching NaNs in both paths.
+        assert mx.all(mx.isfinite(result)).item()
+        np.testing.assert_array_equal(result, np.zeros((3, 128), np.float32))

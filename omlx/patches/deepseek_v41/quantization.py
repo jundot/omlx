@@ -14,11 +14,16 @@ from ..deepseek_v4.switch_layers import _AFFINE_NATIVE_MIN_ROUTES, QuantizedSwit
 from .activation import quantize_fp8_activation
 
 
+def _normal_power_of_two(exponent):
+    """Construct normal FP32 scales exactly, including the minimum exponent."""
+    return ((exponent + 127).astype(mx.uint32) << 23).view(mx.float32)
+
+
 def round_fp8(x):
     """E4M3FN, round to nearest even with finite saturation."""
     a = mx.minimum(mx.abs(x.astype(mx.float32)), 448.0)
     exponent = mx.floor(mx.log2(mx.maximum(a, 2.0**-9)))
-    step = mx.power(2.0, mx.maximum(exponent - 3, -9))
+    step = _normal_power_of_two(mx.maximum(exponent - 3, -9))
     return mx.sign(x) * mx.minimum(mx.round(a / step) * step, 448.0)
 
 
@@ -33,7 +38,7 @@ def _quantize_activation(x, bits=8, group_size=32, e4m3_scale=False):
     scale = (
         round_fp8(amax / limit)
         if e4m3_scale
-        else mx.power(2.0, mx.ceil(mx.log2(amax / limit)))
+        else _normal_power_of_two(mx.maximum(mx.ceil(mx.log2(amax / limit)), -126))
     )
     scaled = mx.clip(grouped / scale, -limit, limit)
     if bits == 8:
@@ -89,8 +94,8 @@ def pack_activation(x, bits=8, group_size=32, e4m3_scale=False):
         scale = round_fp8(amax / limit)
         scale_bytes = mx.to_fp8(scale)
     else:
-        exponent = mx.ceil(mx.log2(amax / limit))
-        scale = mx.power(2.0, exponent)
+        exponent = mx.maximum(mx.ceil(mx.log2(amax / limit)), -126)
+        scale = _normal_power_of_two(exponent)
         scale_bytes = (exponent + 127).astype(mx.uint8)
     scaled = mx.clip(grouped / scale[..., None], -limit, limit).reshape(x.shape)
     if bits == 8:
@@ -135,7 +140,7 @@ def unpack_activation(
     scales = (
         mx.from_fp8(scales, dtype=mx.float32)
         if e4m3_scale
-        else mx.power(2.0, scales.astype(mx.float32) - 127)
+        else _normal_power_of_two(scales.astype(mx.int32) - 127)
     )
     return (
         (values.reshape(*packed.shape[:-1], groups, group_size) * scales[..., None])

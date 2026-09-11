@@ -5,7 +5,6 @@ substitutions. See fixtures/deepseek_v41_expected.md for provenance and limits.
 """
 
 import sys
-import types
 import zlib
 from dataclasses import asdict
 from pathlib import Path
@@ -52,73 +51,33 @@ def tiny(**kwargs):
     return ModelConfig(**values)
 
 
-def cpu_kernels(torch):
-    mod = types.ModuleType("kernel")
+def decode_e4m3(raw):
+    """Decode the E4M3FN bit fields independently of MLX."""
+    raw = np.asarray(raw, dtype=np.uint8)
+    exponent = ((raw >> 3) & 15).astype(np.int32)
+    fraction = (raw & 7).astype(np.float32)
+    magnitude = np.where(
+        exponent == 0, fraction * 2.0**-9,
+        np.ldexp(1.0 + fraction / 8, exponent - 7),
+    )
+    magnitude = np.where((raw & 127) == 127, np.nan, magnitude)
+    return np.copysign(magnitude, np.where(raw & 128, -1, 1)).astype(np.float32)
 
-    def act_quant(x, block_size=32, scale_fmt=None, scale_dtype=None, inplace=False):
-        y = x.float().unflatten(-1, (-1, block_size))
-        scale = (
-            (y.abs().amax(-1, keepdim=True).clamp_min(448 * 2**-126) / 448)
-            .log2()
-            .ceil()
-            .exp2()
-        )
-        out = (
-            ((y / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scale)
-            .flatten(-2)
-            .to(x.dtype)
-        )
-        if inplace:
-            x.copy_(out)
-        return out
 
-    def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=None):
-        y = x.float().unflatten(-1, (-1, block_size))
-        e4 = scale_dtype == torch.float8_e4m3fn
-        scale = (
-            y.abs().amax(-1, keepdim=True).clamp_min(6 * (2**-9 if e4 else 2**-126)) / 6
-        )
-        scale = (
-            scale.to(torch.float8_e4m3fn).float() if e4 else scale.log2().ceil().exp2()
-        )
-        table = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6.0])
-        a = (y / scale).abs().clamp_max(6)
-        # Independent nearest-code selection, preferring even codes on ties.
-        order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7])
-        index = (a[..., None] - table[order]).abs().argmin(-1)
-        result = (torch.sign(y) * table[order[index]] * scale).flatten(-2).to(x.dtype)
-        if inplace:
-            x.copy_(result)
-        return result
+def reference_activation(raw, bits=8, group=32, e4m3=False):
+    """Nearest representable value, with even-code tie breaking."""
+    def nearest(values, levels):
+        order = np.concatenate([np.arange(0, len(levels), 2), np.arange(1, len(levels), 2)])
+        index = np.abs(np.abs(values)[..., None] - levels[order]).argmin(-1)
+        return np.copysign(levels[order[index]], values)
 
-    def sparse_attn(q, kv, sink, indices, scale):
-        selected = kv[0, indices[0].clamp_min(0).long()][None].float()
-        scores = torch.einsum("bshd,bskd->bshk", q.float(), selected) * scale
-        scores = scores.masked_fill(indices[:, :, None] < 0, -torch.inf)
-        sink = sink[None, None, :, None].expand(*scores.shape[:-1], 1)
-        probabilities = torch.cat([scores, sink], -1).softmax(-1)[..., :-1]
-        return torch.einsum("bshk,bskd->bshd", probabilities, selected).to(q.dtype)
-
-    def hc_split_sinkhorn(mixes, scale, base, n, iterations, eps):
-        pre = (mixes[..., :n] * scale[0] + base[:n]).sigmoid() + eps
-        post = 2 * (mixes[..., n : 2 * n] * scale[1] + base[n : 2 * n]).sigmoid()
-        comb = (mixes[..., 2 * n :] * scale[2] + base[2 * n :]).unflatten(
-            -1, (n, n)
-        ).softmax(-1) + eps
-        comb = comb / (comb.sum(-2, keepdim=True) + eps)
-        for _ in range(iterations - 1):
-            comb = comb / (comb.sum(-1, keepdim=True) + eps)
-            comb = comb / (comb.sum(-2, keepdim=True) + eps)
-        return pre, post, comb
-
-    mod.act_quant, mod.fp4_act_quant = act_quant, fp4_act_quant
-    mod.sparse_attn, mod.hc_split_sinkhorn = sparse_attn, hc_split_sinkhorn
-
-    def unavailable(*args, **kwargs):
-        raise AssertionError("This reference test uses float weights, not CUDA GEMM")
-
-    mod.fp4_gemm = mod.fp8_gemm = unavailable
-    return mod
+    fp8 = decode_e4m3(np.arange(127, dtype=np.uint8))
+    levels = fp8 if bits == 8 else np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float32)
+    rows = raw.reshape(*raw.shape[:-1], -1, group)
+    scale = np.maximum(np.abs(rows).max(-1, keepdims=True) / levels[-1],
+                       2.0**-9 if e4m3 else 2.0**-126)
+    scale = nearest(scale, fp8) if e4m3 else np.exp2(np.ceil(np.log2(scale)))
+    return (nearest(rows / scale, levels) * scale).reshape(raw.shape)
 
 
 @pytest.fixture
@@ -294,21 +253,19 @@ def test_image_processor_matches_reference(expected, shape):
 def test_fp8_and_fp4_roundtrip():
     from omlx.patches.deepseek_v41.quantization import quantize_activation
 
-    torch = pytest.importorskip("torch")
-    kernel = cpu_kernels(torch)
     rng = np.random.default_rng(8)
     raw = np.concatenate([rng.normal(0, 4, (4, 32)), np.zeros((1, 32))]).astype(
         np.float32
     )
     np.testing.assert_array_equal(
         quantize_activation(mx.array(raw)),
-        kernel.act_quant(torch.tensor(raw), inplace=True).numpy(),
+        reference_activation(raw),
     )
-    for group, scale in [(32, None), (16, torch.float8_e4m3fn)]:
-        expected = kernel.fp4_act_quant(torch.tensor(raw), group, True, scale)
+    for group, e4m3 in [(32, False), (16, True)]:
+        expected = reference_activation(raw, 4, group, e4m3)
         np.testing.assert_array_equal(
-            quantize_activation(mx.array(raw), 4, group, scale is not None),
-            expected.numpy(),
+            quantize_activation(mx.array(raw), 4, group, e4m3),
+            expected,
         )
 
 
@@ -615,12 +572,11 @@ def test_dsml_and_reasoning_encoding(tmp_path):
 def test_mxfp_repacking_has_exact_source_values():
     from omlx.patches.deepseek_v41.convert import repack_weight
 
-    torch = pytest.importorskip("torch")
     raw = np.arange(128, dtype=np.uint8).reshape(4, 32)
     scale = np.full((1, 1), 125, np.uint8)
     values, spec = repack_weight(raw, "F8_E4M3", scale, "F8_E8M0")
     actual = mx.dequantize(values["weight"], values["scales"], group_size=32, **spec)
-    expected = torch.from_numpy(raw).view(torch.float8_e4m3fn).float().numpy() * 0.25
+    expected = decode_e4m3(raw) * 0.25
     # Code 127 is NaN and is outside a finite converted checkpoint.
     np.testing.assert_array_equal(
         np.asarray(actual.astype(mx.float32))[:3], expected[:3]
@@ -678,7 +634,12 @@ async def _run_vlm_engine(tmp_path, direct=False):
         text = await asyncio.wait_for(
             engine.generate("hello world", max_tokens=3, temperature=0), 30
         )
-        assert text.finished and text.completion_tokens > 0
+        # Random fixture weights can select EOS on the first step. EOS is
+        # excluded from completion_tokens by the engine contract.
+        assert text.finished, text
+        assert text.finish_reason in ("stop", "length"), text
+        assert 0 <= text.completion_tokens <= 3, text
+        assert text.completion_tokens > 0 or text.finish_reason == "stop", text
         messages = [
             {
                 "role": "user",
@@ -730,7 +691,6 @@ def raw_safetensors(path, tensors):
 def test_mmap_fp8_rows_use_per_channel_scales(tmp_path):
     from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
 
-    torch = pytest.importorskip("torch")
     raw = np.arange(5 * 64, dtype=np.uint8).reshape(5, 64) % 120
     scales = np.arange(10, dtype=np.uint8).reshape(5, 2) + 120
     path = tmp_path / "engram.safetensors"
@@ -738,15 +698,10 @@ def test_mmap_fp8_rows_use_per_channel_scales(tmp_path):
     table = DiskEngramEmbedding(path, "weight", "scale")
     actual = table(mx.array([[4, 0, 2, 4]]))
     table.close()
-    selected = torch.from_numpy(raw[[4, 0, 2, 4]]).view(torch.float8_e4m3fn).float()
-    scale = torch.from_numpy(np.exp2(scales[[4, 0, 2, 4]].astype(np.float32) - 127))
-    expected = (
-        (selected.reshape(4, 2, 32) * scale[..., None])
-        .reshape(1, 4, 64)
-        .to(torch.bfloat16)
-        .float()
-        .numpy()
-    )
+    selected = decode_e4m3(raw[[4, 0, 2, 4]])
+    scale = np.exp2(scales[[4, 0, 2, 4]].astype(np.float32) - 127)
+    # E4M3 values scaled by these powers of two are exactly representable in BF16.
+    expected = (selected.reshape(4, 2, 32) * scale[..., None]).reshape(1, 4, 64)
     np.testing.assert_array_equal(actual.astype(mx.float32), expected)
 
 
@@ -757,7 +712,6 @@ def test_quantized_conversion_and_loaded_projection(tmp_path):
     from omlx.patches.deepseek_v41.loading import load
     from omlx.patches.deepseek_v41.quantization import QuantizedProjection
 
-    torch = pytest.importorskip("torch")
     source, _ = write_checkpoint(tmp_path, vision=False)
     name = "layers.0.attn.wq_a"
     fp8 = np.arange(32 * 32, dtype=np.uint8).reshape(32, 32) % 120
@@ -780,9 +734,9 @@ def test_quantized_conversion_and_loaded_projection(tmp_path):
     projection = model.language_model.layers[0].attn.wq_a
     assert isinstance(projection, QuantizedProjection)
     values = np.random.default_rng(14).normal(0, 0.1, (2, 32)).astype(np.float32)
-    x = cpu_kernels(torch).act_quant(torch.tensor(values), inplace=True)
-    weight = torch.from_numpy(fp8).view(torch.float8_e4m3fn).float() * 0.125
-    expected = (x @ weight.T).numpy()
+    x = reference_activation(values)
+    weight = decode_e4m3(fp8) * 0.125
+    expected = x @ weight.T
     np.testing.assert_allclose(
         projection(mx.array(values)), expected, atol=2e-6, rtol=1e-5
     )

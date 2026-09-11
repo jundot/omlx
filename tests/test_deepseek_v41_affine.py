@@ -36,6 +36,10 @@ def expert_for(bits):
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 6, 8, (2, 3, 6)])
+@pytest.mark.skipif(
+    not fast.has_symbol("deepseek_v41_grouped_expert"),
+    reason="Requires the native extension",
+)
 def test_affine_decode_grouped_matches_stock(monkeypatch, bits):
     mx.random.seed(948)
     expert = expert_for(bits)
@@ -65,6 +69,10 @@ def test_affine_decode_grouped_matches_stock(monkeypatch, bits):
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 6, 8, (2, 3, 6)])
+@pytest.mark.skipif(
+    not fast.has_symbol("deepseek_affine_gather_qmm_blocks"),
+    reason="Requires the native extension",
+)
 def test_affine_prefill_native_blocks_and_pair(monkeypatch, bits):
     mx.random.seed(714)
     expert = expert_for(bits)
