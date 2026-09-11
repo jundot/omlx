@@ -687,6 +687,9 @@ class ModelSettingsManager:
     def get_settings(self, model_id: str) -> ModelSettings:
         """Get settings for a specific model.
 
+        After an exact miss, an ``org/name`` model ID also checks the ``name``
+        settings key used by local discovery.
+
         Args:
             model_id: The model identifier.
 
@@ -698,6 +701,12 @@ class ModelSettingsManager:
                 # Return a copy to prevent external modification
                 settings = self._settings[model_id]
                 return ModelSettings.from_dict(settings.to_dict())
+
+            if "/" in model_id:
+                stripped = model_id.split("/", 1)[1]
+                if stripped in self._settings:
+                    settings = self._settings[stripped]
+                    return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
 
