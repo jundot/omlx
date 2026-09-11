@@ -6853,6 +6853,54 @@
         }
       }
     },
+    "integrations.claude.desktop" : {
+      "comment" : "Row label for the Claude Desktop tier-alias toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Desktop"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Desktop"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Desktop"
+          }
+        }
+      }
+    },
+    "integrations.claude.desktop.sub" : {
+      "comment" : "Sublabel explaining the Claude Desktop tier-alias toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Expose claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 as aliases of the tier models"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Показывать claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 как алиасы моделей уровней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将 claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 公开为层级模型的别名"
+          }
+        }
+      }
+    },
     "integrations.claude.haiku" : {
       "comment" : "Row label for the Haiku model picker",
       "extractionState" : "manual",

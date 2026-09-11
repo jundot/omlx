@@ -158,6 +158,11 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let opusModel: String?
         let sonnetModel: String?
         let haikuModel: String?
+        /// exposes claude-opus-5 / claude-sonnet-5 /
+        /// claude-haiku-4-5-20251001 as tier-model aliases for Claude
+        /// Desktop. Optional so older servers that omit the key still
+        /// decode (nil = disabled).
+        let desktopEnabled: Bool?
     }
 
     struct IntegrationsSettings: Codable, Equatable, Sendable {
@@ -232,6 +237,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var claudeCodeOpusModel: String? = nil
     var claudeCodeSonnetModel: String? = nil
     var claudeCodeHaikuModel: String? = nil
+    /// This field (`claude_code_desktop_enabled` on the wire via
+    /// `convertToSnakeCase`): Claude Desktop tier-alias toggle.
+    var claudeCodeDesktopEnabled: Bool? = nil
 
     // Other integrations (PR 9)
     var integrationsCodexModel: String? = nil
