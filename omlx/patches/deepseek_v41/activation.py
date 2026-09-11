@@ -8,10 +8,13 @@ import mlx.core as mx
 _ROUND = r"""
     // Clamp to 448 * 2^-126 so the power-of-two scale stays normal.
     const float amax = max(simd_max(abs(v)), 0x1.cp-118f);
-    const float scale = exp2(ceil(log2(amax / 448.0f)));
+    const int scale_exponent = max(int(ceil(log2(amax / 448.0f))), -126);
+    // Integer powers of two must be exact, including FP8 rounding ties.
+    const float scale = as_type<float>(uint(scale_exponent + 127) << 23);
     const float scaled = clamp(v / scale, -448.0f, 448.0f);
     const float a = abs(scaled);
-    const float step = exp2(max(floor(log2(max(a, 0x1p-9f))) - 3.0f, -9.0f));
+    const int step_exponent = max(int(floor(log2(max(a, 0x1p-9f)))) - 3, -9);
+    const float step = as_type<float>(uint(step_exponent + 127) << 23);
     const float q = sign(scaled) * min(rint(a / step) * step, 448.0f);
     if (i < n) y[i] = T(q * scale);
 """

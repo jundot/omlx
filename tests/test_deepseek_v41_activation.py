@@ -156,3 +156,12 @@ def test_zero_activation_groups_remain_zero(bits, group, e4m3):
         # This rejects NaNs explicitly, including matching NaNs in both paths.
         assert mx.all(mx.isfinite(result)).item()
         np.testing.assert_array_equal(result, np.zeros((3, 128), np.float32))
+
+
+def test_fp8_kernel_preserves_exact_power_of_two_scaled_values():
+    # Every scale whose maximum finite FP8 value fits in a normal FP32.
+    # A transcendental exp2 approximation can shift these values and FP8 ties.
+    exponents = np.arange(-126, 119, dtype=np.int32)
+    rows = np.repeat(np.ldexp(np.float32(448), exponents)[:, None], 32, axis=1)
+    actual = quantize_activation(mx.array(rows))
+    np.testing.assert_array_equal(actual, rows)
