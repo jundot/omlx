@@ -37,10 +37,7 @@ def test_select_candidate_blocks_pins_last_block():
     assert bool(mask[0, 4:8].any())
 
 
-def test_fast_path_env_gate(monkeypatch):
+def test_fast_path_is_default():
     from omlx.patches.deepseek_v41 import fast_path as fp
 
-    monkeypatch.delenv("OMLX_DSV41_FAST", raising=False)
-    assert fp.fast_path_enabled() is False
-    monkeypatch.setenv("OMLX_DSV41_FAST", "1")
     assert fp.fast_path_enabled() is True
