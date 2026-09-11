@@ -12,6 +12,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import struct as _struct
@@ -164,6 +165,36 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
             "DeepSeek V4 fp16 oQ can collapse to repeated BOS tokens during "
             "generation; use dtype='bfloat16' instead."
         )
+
+
+def _canonical_output_dtype(dtype: str) -> str:
+    """Name the dtype oQ will actually store, mirroring ``target_dtype``.
+
+    Both write paths store fp16 for anything not exactly ``"bfloat16"``, so
+    deriving the label from the same test keeps the config from disagreeing
+    with the tensors. Assumes ``dtype`` already passed the ``OQ_DTYPES``
+    check, which is what keeps the fallback from mislabelling a third value.
+    """
+    return "bfloat16" if dtype == "bfloat16" else "float16"
+
+
+def _apply_output_dtype(config: dict, dtype: str) -> None:
+    """Record the dtype oQ wrote, replacing the source's inherited claim.
+
+    A source config describes the checkpoint oQ read, not the one it writes,
+    and nothing in the load path corrects it, so a float16 build of a bfloat16
+    source reads back as bfloat16. Follows ``_clone_config`` in
+    ``tools/clone_mlx_model_fp16.py``, but only rewrites keys the source
+    declared rather than adding any. ``vision_config`` is left alone: under a
+    float16 target, vision and audio weights are stored as float32.
+    """
+    resolved = _canonical_output_dtype(dtype)
+    for section in (config, config.get("text_config")):
+        if not isinstance(section, dict):
+            continue
+        for key in ("dtype", "torch_dtype"):
+            if key in section:
+                section[key] = resolved
 
 
 def _is_vlm_load(config: dict) -> bool:
@@ -982,6 +1013,7 @@ def _build_quant_plan(
     target_bpw: float = 4.6,
     hard_cap_bpw: float = 4.7,
     fixed_overrides: dict[str, dict] | None = None,
+    supported_bits: tuple[int, ...] = _VALID_QUANT_BITS,
 ) -> QuantPlan:
     """Allocate byte-budgeted boosts using sensitivity-driven allocation.
 
@@ -998,6 +1030,8 @@ def _build_quant_plan(
     boost decision.
     """
     base_bits = _base_bits_for_level(oq_level)
+    if base_bits not in supported_bits:
+        raise ValueError("Base quantization width is not supported by this model")
     base_mode = _mode_for_bits(base_bits)
     base_group_size = _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE)
     boost_map: dict[str, dict] = {}
@@ -1178,7 +1212,7 @@ def _build_quant_plan(
         candidates, key=lambda x: x[0], reverse=True
     ):
         for cand_bits in range(max_target, cur_bits, -1):
-            if cand_bits not in _VALID_QUANT_BITS or cand_bits <= cur_bits:
+            if cand_bits not in supported_bits or cand_bits <= cur_bits:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
             cand_mode = _mode_for_bits(cand_bits)
@@ -1223,6 +1257,8 @@ def _build_quant_plan(
             fallback_candidates, key=lambda x: x[0], reverse=True
         ):
             for cand_bits in (8, 6, 5, 4, 3):
+                if cand_bits not in supported_bits:
+                    continue
                 if cand_bits <= cur_bits:
                     continue
                 cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
@@ -3157,6 +3193,8 @@ def validate_quantizable(config: dict) -> bool:
     quantization_config records training-time settings but whose weights are
     stored in full precision (bfloat16/float16).
     """
+    if config.get("model_type") == "deepseek_v41" and "omlx_deepseek_v41" in config:
+        return False
     if "quantization" in config:
         return False
     if "quantization_config" in config:
@@ -3250,6 +3288,47 @@ def estimate_bpw_and_size(
 
         if not _checkpoint_has_mtp_weights(source):
             preserve_mtp = False
+
+    if config.get("model_type") == "deepseek_v41":
+        from .patches.deepseek_v41.oq import source_budget
+
+        if oq_level not in (3, 4) or group_size != 64:
+            raise ValueError("V4.1 supports oQ3/oQ4 with group size 64")
+        if "omlx_deepseek_v41" in config:
+            raise ValueError("V4.1 quantization requires the original checkpoint")
+        mapping = json.loads((source / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        budget = source_budget(
+            source, config, mapping, preserve_mtp=preserve_mtp, engram_bits=oq_level
+        )
+        remaining = budget["remaining_weights"]
+        # The oQ3 allocation is not known until calibration. Quote its budget
+        # ceiling rather than assuming original FP4 expert bytes pass through.
+        remaining_bytes = remaining["tensor_bytes"]
+        if oq_level == 3:
+            remaining_bytes = math.ceil(
+                remaining["logical_parameters"] * _OQ_BPW_TARGETS[3][1] / 8
+            )
+        total = remaining_bytes + budget["engram"]["tensor_bytes"]
+        parameters = (
+            remaining["logical_parameters"] + budget["engram"]["logical_parameters"]
+        )
+        # Retain the existing conservative workspace multiplier, but do not
+        # count the SSD-offloaded Engram table as resident model weights.
+        streaming_peak = int(remaining["tensor_bytes"] * 1.5) + 5 * 1024**3
+        return {
+            "effective_bpw": total * 8 / max(parameters, 1),
+            "output_size_bytes": total,
+            "output_size_formatted": _format_size(total),
+            "estimate_basis": (
+                "calibration_budget_ceiling" if oq_level == 3 else "source_precision"
+            ),
+            "engram_size_bytes": budget["engram"]["tensor_bytes"],
+            "remaining_size_bytes": remaining_bytes,
+            "memory_streaming_bytes": streaming_peak,
+            "memory_streaming_formatted": _format_size(streaming_peak),
+        }
 
     # Header-only scan: shapes/dtypes come from the safetensors headers, so
     # checkpoints with dtypes mx.load rejects (F8_E8M0 block scales) still
@@ -4422,7 +4501,9 @@ def _get_predicate_bits(
     # the selected oQ level and use the group-32 layout published by existing
     # Qwen4-Exp quantizations. Embeddings have no input-channel imatrix entry;
     # the streaming loop deliberately applies ordinary affine quantization.
-    if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config):
+    if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config) or (
+        config.get("model_type") == "deepseek_v41" and ".engram.embed" in tensor_name
+    ):
         return base_bits, _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
@@ -5196,6 +5277,8 @@ def _source_imatrix_signature(
         # Invalidate caches produced by the old independent-block walk, which
         # captured only q_proj in the shared-KV tail of E2B/E4B.
         signature["layer_walk"] = "gemma4_shared_kv_v1"
+    elif str(config.get("model_type", "")).lower() == "deepseek_v41":
+        signature["layer_walk"] = "deepseek_v41_full_forward_v1"
     elif str(config.get("model_type", "")).lower() == "glm5_next":
         # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
         # capture. Older caches completed without either and must not be reused.
@@ -5711,7 +5794,8 @@ def quantize_oq_streaming(
             faster prefill on M1/M2 Apple Silicon (native fp16 support), but
             is unsupported for DeepSeek V4.
         preserve_mtp: Keep mtp.* tensors and config fields in the output so
-            the Lightning MTP toggle works after quantization. Stashes mtp.*
+            supported models retain Lightning MTP after quantization, including
+            V4.1 DSpark draft stages used by server verification. Stashes mtp.*
             keys around the model.sanitize() call (which would otherwise
             strip them) and re-merges. When False (default), mtp.* tensors
             are stripped *and* the output config's mtp_num_hidden_layers /
@@ -5781,6 +5865,29 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    if normalized_model_type == "deepseek_v41":
+        from .patches.deepseek_v41.oq import quantize as quantize_v41
+
+        return quantize_v41(
+            source,
+            output,
+            oq_level=oq_level,
+            enhanced=enhanced,
+            group_size=group_size,
+            sensitivity_model_path=sensitivity_model_path,
+            sensitivity_map_override=sensitivity_map_override,
+            imatrix_cache_path=imatrix_cache_path,
+            imatrix_reuse_cache=imatrix_reuse_cache,
+            imatrix_strict=imatrix_strict,
+            imatrix_num_samples=imatrix_num_samples,
+            imatrix_seq_length=imatrix_seq_length,
+            preserve_mtp=preserve_mtp,
+            target_bpw=target_bpw,
+            hard_cap_bpw=hard_cap_bpw,
+            text_only=text_only,
+            dtype=dtype,
+            progress_callback=progress_callback,
+        )
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
         and _has_vision_subconfig(config)
@@ -6507,6 +6614,7 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    _apply_output_dtype(output_config, dtype)
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
     if imatrix_report is not None:
@@ -6536,6 +6644,15 @@ _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
 _OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
+
+
+def _is_oqe_switch_module(module) -> bool:
+    return (
+        type(module).__name__ in _OQE_SWITCH_LINEAR_CLASSES
+        or (type(module).__name__ == "QuantizedProjection"
+            and getattr(module.weight, "ndim", 0) == 3)
+    )
+
 _OQE_MULTI_LINEAR_CLASSES = {"MultiLinear", "QuantizedMultiLinear"}
 _OQ_CODE_MULTILINGUAL_KEYS = (
     "code",
@@ -7382,7 +7499,7 @@ class _ImatrixCaptureWrapper(nn.Module):
     def __call__(self, *args, **kwargs):
         if args:
             if (
-                type(self._module).__name__ in _OQE_SWITCH_LINEAR_CLASSES
+                _is_oqe_switch_module(self._module)
                 and len(args) >= 2
             ):
                 self._collector.collect_switch(
@@ -7414,7 +7531,7 @@ class OQImatrixCollector:
     @staticmethod
     def _is_capture_module(module) -> bool:
         cls = type(module).__name__
-        if cls in _OQE_SWITCH_LINEAR_CLASSES:
+        if _is_oqe_switch_module(module):
             return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
         if cls in _OQE_MULTI_LINEAR_CLASSES:
             return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
@@ -7422,7 +7539,7 @@ class OQImatrixCollector:
         # already-quantized checkpoints (e.g. deriving a recalibrated MTP
         # head from an oQ8 model when the bf16 source is gone).
         return (
-            cls in ("Linear", "QuantizedLinear")
+            cls in ("Linear", "QuantizedLinear", "QuantizedProjection")
             and hasattr(module, "weight")
             and getattr(module.weight, "ndim", 0) == 2
         )
@@ -7453,7 +7570,7 @@ class OQImatrixCollector:
             self.capture_module_classes[cls] = (
                 self.capture_module_classes.get(cls, 0) + 1
             )
-            if cls in _OQE_SWITCH_LINEAR_CLASSES:
+            if _is_oqe_switch_module(module):
                 self.switch_capture_modules += 1
             self._original_modules[name] = module
             replacements.append((name, _ImatrixCaptureWrapper(module, name, self)))
@@ -8088,6 +8205,19 @@ def _collect_imatrix(
     progress_start: float = 13.0,
     progress_end: float = 18.0,
 ) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
+    if str(config.get("model_type", "")).replace("-", "_") == "deepseek_v41":
+        from .patches.deepseek_v41.calibration import collect_checkpoint_imatrix
+
+        return collect_checkpoint_imatrix(
+            model_path,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+        )
+
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
@@ -8193,6 +8323,13 @@ def _oqe_cache_missing_mtp_entries(
     """True when the model declares MTP heads but the cache predates the
     MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
     the head gets calibrated quantization instead of landing in "missing"."""
+    collection = cache.metadata.get("collection")
+    if (
+        config.get("model_type") == "deepseek_v41"
+        and isinstance(collection, dict)
+        and collection.get("uncalibrated_policy") == "preserve_source_precision"
+    ):
+        return False
     try:
         from omlx.utils.model_loading import (
             _checkpoint_has_mtp_weights,
@@ -8334,6 +8471,18 @@ def _measure_sensitivity_from_model(
     Returns:
         Dict of {layer_idx: relative_mse_score}.
     """
+    if str(config.get("model_type", "")).replace("-", "_") == "deepseek_v41":
+        from .patches.deepseek_v41.sensitivity import measure_sensitivity
+
+        return measure_sensitivity(
+            model,
+            tokenizer,
+            bits=_base_bits_for_level(oq_level),
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+        )
+
     calib_data = _load_calibration_data(
         tokenizer,
         dataset=calib_dataset,
@@ -8811,6 +8960,7 @@ def _build_streaming_proxy_for_sensitivity(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    _apply_output_dtype(output_config, dtype)
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
 
@@ -8836,8 +8986,10 @@ def _measure_sensitivity_from_quantized_model(
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
-        lm_load_compat as lm_load,
         maybe_apply_pre_load_patches,
+    )
+    from omlx.utils.model_loading import (
+        lm_load_compat as lm_load,
     )
 
     # Reuse the centralised pre-load dispatch (DeepSeek V4 base patch,

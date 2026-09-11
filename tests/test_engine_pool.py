@@ -415,6 +415,58 @@ class TestEnginePoolErrors:
             asyncio.run(pool.get_engine("model-a"))
         assert pool._entries["model-a"].engine is mock_engine
 
+    def test_moe_offload_admits_oversized_moe(self, small_mock_model_dir):
+        """An MoE checkpoint over the ceiling must admit by the offload-
+        adjusted estimate when expert offload is enabled for the model, and
+        still refuse when it is not (#2595 review). The estimator only counts
+        containers where all three projections carry weight AND scales — an
+        unquantized or partial container wraps nothing — and floors capacity
+        at 8 experts, so the fixture is a 32-expert quantized container:
+        2400 expert bytes at 25% residency keeps 8 of 32 and saves 1800,
+        so the 2000-byte model admits under the 1500 ceiling."""
+        from types import SimpleNamespace
+
+        import mlx.core as mx
+
+        experts = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            experts[f"model.layers.0.mlp.switch_glu.{proj}.weight"] = mx.zeros(
+                (32, 5, 4), dtype=mx.uint8
+            )
+            experts[f"model.layers.0.mlp.switch_glu.{proj}.scales"] = mx.zeros(
+                (32, 5, 1), dtype=mx.uint8
+            )
+        mx.save_safetensors(
+            str(small_mock_model_dir / "model-a" / "model.safetensors"),
+            {
+                **experts,
+                "model.layers.0.attn.q_proj.weight": mx.zeros((20, 20), dtype=mx.uint8),
+            },
+        )
+        pool = _make_pool(ceiling=1500)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.estimated_size = 2000
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        ):
+            with pytest.raises(ModelTooLargeError):
+                asyncio.run(pool.get_engine("model-a"))
+
+            pool._settings_manager = SimpleNamespace(
+                get_settings=lambda mid: SimpleNamespace(
+                    moe_expert_offload_enabled=True,
+                    moe_expert_offload_resident_fraction=0.25,
+                )
+            )
+            mock_engine = MagicMock()
+            mock_engine.start = AsyncMock()
+            with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+                asyncio.run(pool.get_engine("model-a"))
+            assert pool._entries["model-a"].engine is mock_engine
+
     def test_missing_model_path_removes_unloaded_entry(self, small_mock_model_dir):
         """A deleted model directory is removed and reported as not found."""
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -729,6 +781,101 @@ class TestQwenCpuShareMemoryEstimate:
         assert entry.runtime_estimated_size == 400
         signature = dict(entry.runtime_settings_signature or ())
         assert signature["qwen4_ple_ssd_offload"] == "False"
+
+    def test_v41_ple_offload_reduces_resident_projection(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.deepseek_v41.residency import (
+            EngramResidencyEstimate,
+        )
+
+        model = tmp_path / "v41"
+        model.mkdir()
+        settings = ModelSettings(deepseek_v41_engram_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="v41",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="deepseek_v41",
+            estimated_size=1000,
+        )
+        estimate = EngramResidencyEstimate(
+            supported=True,
+            engram_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._entries[entry.model_id] = entry
+
+        with patch(
+            "omlx.patches.deepseek_v41.residency." "deepseek_v41_residency_estimate",
+            return_value=estimate,
+        ):
+            projected = pool._entry_runtime_resident_size(entry, settings)
+            effective = pool._effective_deepseek_v41_model_settings(entry, settings)
+            signature = dict(pool._engine_runtime_signature("v41", settings))
+
+        assert projected == 400
+        assert settings.deepseek_v41_engram_ssd_offload is False
+        assert effective.deepseek_v41_engram_ssd_offload is True
+        assert signature["deepseek_v41_engram_ssd_offload"] == "True"
+
+    @pytest.mark.asyncio
+    async def test_v41_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
+        """Real pressure may select mmap without making that override sticky."""
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.deepseek_v41.residency import (
+            EngramResidencyEstimate,
+        )
+
+        model = tmp_path / "v41"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+        settings = ModelSettings(deepseek_v41_engram_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="v41",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="deepseek_v41",
+            estimated_size=1000,
+        )
+        estimate = EngramResidencyEstimate(
+            supported=True,
+            engram_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._get_admission_soft_target = lambda: 500
+        pool._get_residency_ceiling = lambda: 1000
+        pool._entries[entry.model_id] = entry
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_engine) as cls,
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch(
+                "omlx.patches.deepseek_v41.residency."
+                "deepseek_v41_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            loaded = await pool.get_engine("v41", runtime_settings=settings)
+            reused = await pool.get_engine("v41", runtime_settings=settings)
+
+        assert loaded is mock_engine
+        assert reused is mock_engine
+        cls.assert_called_once()
+        effective = cls.call_args.kwargs["model_settings"]
+        assert effective.deepseek_v41_engram_ssd_offload is True
+        assert settings.deepseek_v41_engram_ssd_offload is False
+        assert entry.runtime_estimated_size == 400
+        signature = dict(entry.runtime_settings_signature or ())
+        assert signature["deepseek_v41_engram_ssd_offload"] == "False"
 
 
 class TestApplySettingsOverrides:
@@ -1397,6 +1544,35 @@ class TestEnginePoolAsync:
         assert first is base_engine
         assert second is base_engine
         base_engine.stop.assert_not_awaited()
+
+    def test_oq_a8_forces_a_separate_engine(self, pool_with_mock_engines):
+        """The patch replaces MLP.__call__ process-wide, registers process-wide
+        projection backends, and caches a plan on every module it classifies;
+        none of that can be undone in place, so a change here has to land on a
+        fresh engine rather than a live toggle."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        off = ModelSettings(qwen35_oq_a8_enabled=False)
+        on = ModelSettings(qwen35_oq_a8_enabled=True)
+        other_floor = ModelSettings(
+            qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=1024
+        )
+
+        sig = lambda s: pool._engine_runtime_signature("model-a", s)  # noqa: E731
+        assert sig(off) != sig(on)
+        assert sig(on) != sig(other_floor)
+
+    def test_oq_a8_tuning_is_ignored_while_disabled(self, pool_with_mock_engines):
+        """A stale floor on a disabled feature must not split the engine."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        a = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=512)
+        b = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=2048)
+        assert pool._engine_runtime_signature(
+            "model-a", a
+        ) == pool._engine_runtime_signature("model-a", b)
 
     def test_runtime_signature_ignores_request_only_profile_fields(
         self, pool_with_mock_engines
@@ -3121,6 +3297,52 @@ class TestMemorySettleBarrier:
         assert pool._current_model_memory == initial_memory - est_size
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("offload", [False, True])
+    async def test_v41_settle_tracks_metal_engram_and_admission(
+        self, pool_with_loaded_model, offload, caplog
+    ):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.deepseek_v41.residency import EngramResidencyEstimate
+
+        pool = pool_with_loaded_model
+        entry = pool._entries["model-a"]
+        entry.config_model_type = "deepseek_v41"
+        gib = 1024**3
+        estimate = EngramResidencyEstimate(True, 80 * gib, 50 * gib, 30 * gib)
+        settings = ModelSettings(deepseek_v41_engram_ssd_offload=offload)
+        with patch(
+            "omlx.patches.deepseek_v41.residency.deepseek_v41_residency_estimate",
+            return_value=estimate,
+        ):
+            entry.runtime_estimated_size = pool._entry_runtime_resident_size(
+                entry, settings
+            )
+            entry.runtime_settle_size = pool._entry_runtime_resident_size(
+                entry, settings, include_ane_reservation=False,
+            )
+        charge = (50 if offload else 80) * gib
+        assert entry.runtime_estimated_size == charge
+        assert entry.runtime_settle_size == charge
+        pool._current_model_memory = charge
+
+        def active_memory():
+            assert pool._current_model_memory == charge
+            return next(readings)
+
+        readings = iter([charge + gib, gib])
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            mock_mx.get_active_memory.side_effect = active_memory
+            await pool._unload_engine("model-a")
+        assert pool._current_model_memory == 0
+        assert "Settle barrier timed out" not in caplog.text
+        assert mock_mx.get_active_memory.call_count == 2
+        assert not any(call.args == (0.1,) for call in sleep.call_args_list)
+
+    @pytest.mark.asyncio
     async def test_settle_takes_multiple_rounds(self, pool_with_loaded_model):
         """Test settle barrier succeeds after multiple rounds of GC."""
         pool = pool_with_loaded_model
@@ -4114,3 +4336,56 @@ class TestLoadRefusalNamesBindingCeiling:
         assert "dynamic memory ceiling" in message
         assert "close other apps" in message.lower()
         assert "lower memory_guard_tier" not in message
+
+
+@pytest.mark.parametrize(
+    "ple_enabled,ceiling,expected,forced",
+    [
+        (False, 700, 580, False),
+        (True, 700, 180, False),
+        (False, 300, 180, True),
+    ],
+)
+def test_qwen4_moe_savings_precede_ple_force_decision(
+    tmp_path, ple_enabled, ceiling, expected, forced
+):
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+        Qwen4ExpResidencyEstimate,
+    )
+
+    settings = ModelSettings(
+        moe_expert_offload_enabled=True,
+        moe_expert_offload_resident_fraction=0.125,
+        qwen4_ple_ssd_offload=ple_enabled,
+    )
+    entry = EngineEntry(
+        model_id="qwen4",
+        model_path=str(tmp_path),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="qwen4_exp",
+        estimated_size=1000,
+    )
+    estimate = Qwen4ExpResidencyEstimate(
+        supported=True,
+        checkpoint_bytes=950,
+        ple_bytes=400,
+        resident_bytes=1000,
+        mmap_bytes=600,
+    )
+    pool = _make_pool(ceiling=ceiling)
+    with (
+        patch(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+            "qwen4_exp_residency_estimate",
+            return_value=estimate,
+        ),
+        patch(
+            "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
+            side_effect=lambda path, size, fraction: size - 400,
+        ),
+    ):
+        _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
+        assert is_forced is forced
+        assert pool._entry_runtime_resident_size(entry, settings) == expected

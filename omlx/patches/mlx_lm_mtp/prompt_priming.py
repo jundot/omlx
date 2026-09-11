@@ -441,6 +441,11 @@ def prepare_prefix_context(
     for the same request is idempotent and never double-primes a live suffix.
     """
     host = _eligible_host(model)
+    if host is not None and getattr(host, "_omlx_dspark_decode_enabled", False):
+        # DSpark owns a different context in the shared priming slot. Another
+        # request may still need it at activation; generic sidecar preparation
+        # must neither interpret it nor replace it with a generic plan.
+        return False
     if host is None or not priming_enabled() or prefix_cache is None:
         drop_ctx(model)
         return False

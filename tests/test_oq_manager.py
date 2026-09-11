@@ -788,3 +788,39 @@ class TestOQManagerHfCacheDiscovery:
 
         assert len(source_models) == 0
         assert len(all_models) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer_key", ["n_layers", "num_hidden_layers"])
+async def test_v41_source_metadata_and_converted_filter(tmp_path, layer_key):
+    root = tmp_path / "models"
+    root.mkdir()
+    base = {
+        "model_type": "deepseek_v41",
+        "text_config": {layer_key: 40, "dim": 5120, "n_routed_experts": 384},
+    }
+    for name, config in (
+        (
+            "original",
+            {
+                **base,
+                "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"},
+            },
+        ),
+        ("converted", {**base, "omlx_deepseek_v41": {"version": 1}}),
+    ):
+        folder = root / name
+        folder.mkdir()
+        (folder / "config.json").write_text(json.dumps(config))
+        (folder / "model.safetensors").write_bytes(bytes(64))
+    sources, all_models = await OQManager(
+        model_dirs=[str(root)]
+    ).list_quantizable_models()
+    assert [row["name"] for row in sources] == ["original"]
+    assert sources[0]["num_layers"] == 40
+    assert sources[0]["num_experts"] == 384
+    assert sources[0]["hidden_size"] == 5120
+    assert {row["name"]: row["is_quantized"] for row in all_models} == {
+        "original": False,
+        "converted": True,
+    }

@@ -82,7 +82,7 @@ final class SystemMetricsTests: XCTestCase {
         XCTAssertEqual(vm.gpuUtilizationPercent, 0.0, accuracy: 0.001)
     }
 
-    // MARK: - Bytes → GB formatter
+    // MARK: - Byte formatters
 
     func testFormatBytesAsGbRoundsToOneDecimal() {
         // 34.6 GB in decimal bytes = 34_600_000_000.
@@ -92,6 +92,11 @@ final class SystemMetricsTests: XCTestCase {
 
     func testFormatBytesAsGbZero() {
         XCTAssertEqual(SystemMetricsPoller.formatBytesAsGB(0), "0.0")
+    }
+
+    func testFormatBytesAsGibUsesBinaryUnits() {
+        XCTAssertEqual(SystemMetricsPoller.formatBytesAsGiB(51_539_607_552), "48.0")
+        XCTAssertEqual(SystemMetricsPoller.formatBytesAsGiB(2_684_354_560), "2.5")
     }
 
     func testFormatBytesAsGbRoundsHalfUp() {

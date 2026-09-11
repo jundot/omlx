@@ -43,6 +43,10 @@
         'qwen35_ane_prefill_cpu_gdn_fraction',
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
+        'moe_expert_offload_enabled',
+        'moe_expert_offload_resident_fraction',
+        'qwen35_oq_a8_enabled',
+        'qwen35_oq_a8_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -240,6 +244,10 @@
                 qwen35_ane_prefill_cpu_gdn_fraction: 0,
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
+                moe_expert_offload_enabled: false,
+                moe_expert_offload_resident_fraction: 0.25,
+                qwen35_oq_a8_enabled: false,
+                qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -1663,6 +1671,14 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
+                        || s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_requested:
+                        s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_supported:
+                        model?.deepseek_v41_engram_ssd_offload_supported === true,
+                    deepseek_v41_engram_ssd_offload_forced:
+                        model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -1675,6 +1691,10 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
+                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -2432,6 +2452,27 @@
                 }
             },
 
+            isQwenOqA8Model(model) {
+                const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
+                return ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
+            },
+
+            validateQwenOqA8Settings() {
+                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+                // Both wrap the same MLP call, so the combination silently
+                // disables one of them. Caught here so the modal explains it
+                // instead of surfacing the server's 400.
+                if (this.modelSettings.qwen35_ane_prefill_enabled) {
+                    return 'ANE prefill and INT8 activation prefill cannot both be '
+                        + 'enabled; they accelerate the same projections. Turn one off.';
+                }
+                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                if (!Number.isInteger(minTokens) || minTokens < 1) {
+                    return 'oQ A8 minimum prompt tokens must be a positive integer.';
+                }
+                return null;
+            },
+
             validateQwenAneSettings() {
                 if (!this.modelSettings.qwen35_ane_prefill_enabled
                     || this.selectedModel?.ane_prefill_backend !== 'qwen') return null;
@@ -2512,6 +2553,12 @@
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
+                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
+                if (qwenOqA8ValidationError) {
+                    alert(qwenOqA8ValidationError);
+                    return;
+                }
+
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
                     alert(qwenAneValidationError);
@@ -2573,6 +2620,10 @@
                                 enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                deepseek_v41_engram_ssd_offload:
+                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
+                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
+                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -2592,6 +2643,10 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
+                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
+                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
+                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
                                 // Validation only runs when the feature is enabled, so a
                                 // blank numeric input must fall back to the server default

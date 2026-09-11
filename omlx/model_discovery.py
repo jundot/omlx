@@ -30,6 +30,7 @@ EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "au
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
+    "deepseek_v41",
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_vl",

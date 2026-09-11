@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reliable TCP control plane kept independent of MLX/JACCL collectives."""
 
+import errno
 import pickle
 import socket
 import struct
+import sys
 import threading
 import zlib
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from omlx.cluster import control_plane as control_module
+from omlx.cluster import system_socket_proxy as proxy_module
 from omlx.cluster.control_plane import RankControlPlane
 
 
@@ -246,4 +252,204 @@ def test_worker_authenticates_payload_before_unpickling():
             control.broadcast_object(None)
     finally:
         sender.close()
+        control.close()
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EPERM, errno.ETIMEDOUT])
+def test_auto_transport_falls_back_before_coordinator_deadline(
+    monkeypatch, error_number
+):
+    port = _free_port()
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto")
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", sys.executable)
+    # Exercise the non-loopback macOS policy using a real local coordinator.
+    monkeypatch.setattr(proxy_module, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(
+        control_module,
+        "should_proxy_control_socket",
+        lambda host: proxy_module.should_proxy_control_socket("10.0.0.1"),
+    )
+    original_connect = socket.socket.connect
+    worker_thread = threading.current_thread()
+    attempts = []
+
+    def connect(stream, address):
+        if threading.current_thread() is worker_thread and address[1] == port:
+            attempts.append(address)
+            if error_number == errno.ETIMEDOUT:
+                threading.Event().wait(stream.gettimeout())
+            raise OSError(error_number, "Injected direct connection failure")
+        return original_connect(stream, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    failures = []
+
+    def coordinator():
+        try:
+            with RankControlPlane(
+                rank=0,
+                world_size=2,
+                host="127.0.0.1",
+                port=port,
+                token="test",
+                connect_timeout=2,
+                io_timeout=2,
+            ) as control:
+                control.broadcast_object({"proxy": "authenticated"})
+        except Exception as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=coordinator)
+    thread.start()
+    try:
+        with RankControlPlane(
+            rank=1,
+            world_size=2,
+            host="127.0.0.1",
+            port=port,
+            token="test",
+            connect_timeout=2,
+            io_timeout=3,
+        ) as control:
+            assert control.broadcast_object(None) == {"proxy": "authenticated"}
+            assert control._stream.gettimeout() == 3
+            proxy = control._stream_proxy
+            assert proxy is not None
+    finally:
+        thread.join(3)
+    assert not thread.is_alive()
+    assert failures == []
+    assert proxy.process.poll() is not None
+    if error_number in (errno.EACCES, errno.EPERM):
+        assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("mode", ["auto", "", "direct", "system-proxy", "invalid"])
+def test_control_transport_overrides_and_validation(monkeypatch, mode):
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", mode)
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", sys.executable)
+    monkeypatch.setattr(proxy_module, "sys", SimpleNamespace(platform="darwin"))
+    control = RankControlPlane(
+        rank=1,
+        world_size=2,
+        host="10.0.0.1",
+        port=12345,
+        token="test",
+    )
+    direct = Mock()
+    proxy = Mock()
+    monkeypatch.setattr(control, "_connect_direct", direct)
+    monkeypatch.setattr(control, "_connect_via_proxy", proxy)
+    if mode == "invalid":
+        with pytest.raises(RuntimeError, match="must be auto"):
+            control._connect_to_coordinator()
+        direct.assert_not_called()
+        proxy.assert_not_called()
+    else:
+        control._connect_to_coordinator()
+        assert direct.call_count == (mode != "system-proxy")
+        assert proxy.call_count == (mode == "system-proxy")
+
+
+@pytest.mark.parametrize("mode", ["auto", "", "direct"])
+def test_transport_fallback_preserves_overall_connection_budget(monkeypatch, mode):
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", mode)
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", sys.executable)
+    monkeypatch.setattr(proxy_module, "sys", SimpleNamespace(platform="darwin"))
+    now = [100.0]
+    monkeypatch.setattr(control_module.time, "monotonic", lambda: now[0])
+    control = RankControlPlane(
+        rank=1,
+        world_size=2,
+        host="10.0.0.1",
+        port=12345,
+        token="test",
+        connect_timeout=120,
+    )
+
+    def fail_direct(*, deadline, allow_proxy):
+        assert deadline == 220.0
+        assert allow_proxy == (mode != "direct")
+        now[0] = 101.0
+        raise TimeoutError("Direct connection timed out")
+
+    proxy = Mock()
+    monkeypatch.setattr(control, "_connect_direct", fail_direct)
+    monkeypatch.setattr(control, "_connect_via_proxy", proxy)
+    if mode == "direct":
+        with pytest.raises(TimeoutError):
+            control._connect_to_coordinator()
+        proxy.assert_not_called()
+    else:
+        control._connect_to_coordinator()
+        proxy.assert_called_once_with(deadline=220.0)
+
+
+def test_auto_transport_does_not_retry_invalid_authentication_via_proxy(monkeypatch):
+    monkeypatch.setattr(
+        control_module, "should_proxy_control_socket", lambda host: True
+    )
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto")
+    control = RankControlPlane(
+        rank=1,
+        world_size=2,
+        host="10.0.0.1",
+        port=12345,
+        token="test",
+    )
+    monkeypatch.setattr(
+        control,
+        "_connect_direct",
+        Mock(side_effect=RuntimeError("Invalid acknowledgement")),
+    )
+    proxy = Mock()
+    monkeypatch.setattr(control, "_connect_via_proxy", proxy)
+    with pytest.raises(RuntimeError, match="Invalid acknowledgement"):
+        control._connect_to_coordinator()
+    proxy.assert_not_called()
+
+
+@pytest.mark.parametrize("listener_delay", [6.0, 120.0])
+def test_auto_transport_waits_for_late_listener_without_switching_proxy(
+    monkeypatch, listener_delay
+):
+    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto")
+    monkeypatch.setattr(
+        control_module, "should_proxy_control_socket", lambda host: True
+    )
+    now = [100.0]
+    monkeypatch.setattr(control_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(control_module.time, "sleep", lambda delay: None)
+    control = RankControlPlane(
+        rank=1,
+        world_size=2,
+        host="10.0.0.1",
+        port=12345,
+        token="test",
+        connect_timeout=120,
+    )
+    first = Mock()
+    second = Mock()
+
+    def refused(address):
+        now[0] += listener_delay
+        raise ConnectionRefusedError("Coordinator has not started listening")
+
+    first.connect.side_effect = refused
+    monkeypatch.setattr(
+        control_module.socket, "socket", Mock(side_effect=[first, second])
+    )
+    monkeypatch.setattr(control, "_authenticate_worker_stream", Mock())
+    proxy = Mock()
+    monkeypatch.setattr(control, "_connect_via_proxy", proxy)
+    try:
+        if listener_delay == 120:
+            with pytest.raises(TimeoutError):
+                control._connect_to_coordinator()
+        else:
+            control._connect_to_coordinator()
+            assert control._stream is second
+        first.close.assert_called_once()
+        proxy.assert_not_called()
+    finally:
         control.close()

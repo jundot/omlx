@@ -1575,7 +1575,7 @@ def parse_tool_calls(
         return cleaned_text, tool_calls or None
 
     cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
-    if tool_calls:
+    if tool_calls and getattr(tokenizer, "tool_call_start", None) != "<｜DSML｜ calls>":
         _remap_tool_call_names(tool_calls, tools)
     return cleaned_text, tool_calls
 
@@ -1768,6 +1768,9 @@ def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
     """Remove tool-call control markup while preserving surrounding prose."""
     if not text:
         return ""
+    if getattr(tokenizer, "tool_call_start", None) == "<｜DSML｜ calls>":
+        # V4.1 requires calls after </think>; reasoning is opaque text.
+        return text.strip()
 
     # Every caller sanitizes thinking-channel text; keep it byte-identical
     # with the streamed reasoning deltas, which do not consume DeepSeek
@@ -1816,7 +1819,11 @@ def extract_tool_calls_with_thinking(
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
     tool_calls_from_thinking = False
 
-    if not tool_calls and thinking_content:
+    if (
+        not tool_calls
+        and thinking_content
+        and getattr(tokenizer, "tool_call_start", None) != "<｜DSML｜ calls>"
+    ):
         _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
         tool_calls_from_thinking = bool(tool_calls)
 
@@ -1933,6 +1940,9 @@ class ToolCallStreamFilter:
     ):
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
+        self._opaque_reasoning = (
+            not consume_dsml_separator and marker == "<｜DSML｜ calls>"
+        )
         # Normalize None-like values but preserve empty strings.
         if marker is None:
             marker = ""
@@ -2631,6 +2641,8 @@ class ToolCallStreamFilter:
 
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
+        if self._opaque_reasoning:
+            return text
         if self._suppressing or not text:
             return ""
         if self._ifm_pending_parts is not None:
@@ -2725,6 +2737,8 @@ class ToolCallStreamFilter:
         In clean-output strict mode, unresolved marker-like suffixes are dropped
         so partial control markup does not leak into user-visible text.
         """
+        if self._opaque_reasoning:
+            return ""
         if self._ifm_pending_parts is not None:
             raw = "".join(self._ifm_pending_parts)
             self._ifm_pending_parts = None

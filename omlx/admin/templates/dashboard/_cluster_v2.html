@@ -19,6 +19,13 @@
             </div>
         </div>
 
+        <div x-show="join.cleanup_pending" x-cloak
+             class="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
+             role="status" data-cluster-v2-join-cleanup>
+            The previous join is cancelled on this Mac. Cleanup on the other Mac
+            will be retried while this tab is visible. You can join a different Mac.
+        </div>
+
         <!-- Where you are. Five steps, derived from the live snapshot. -->
         <div class="mb-6" data-cluster-v2-steps x-show="wizardState() !== 'error'">
             <ol class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">

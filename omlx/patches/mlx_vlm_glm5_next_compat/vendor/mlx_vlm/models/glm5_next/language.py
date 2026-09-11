@@ -933,7 +933,16 @@ class LanguageModel(nn.Module):
 
         remapped = {}
         conv_parts = {}
-        fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight")
+        fg_parts = (
+            "A_log",
+            "dt_bias",
+            "f_a_proj.weight",
+            "f_a_proj.scales",
+            "f_a_proj.biases",
+            "f_b_proj.weight",
+            "f_b_proj.scales",
+            "f_b_proj.biases",
+        )
         for k, v in weights.items():
             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
 

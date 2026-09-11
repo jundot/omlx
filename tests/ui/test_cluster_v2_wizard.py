@@ -2532,3 +2532,44 @@ component.apiFetch = async (url, options) => {
     assert result["stagingError"] == ""
     assert result["busy"] is False
     assert result["toasts"] == ["warning", "success"]
+
+
+@pytest.mark.parametrize("delayed_action", ["poll", "begin"])
+def test_cancel_ignores_older_join_response(delayed_action):
+    result = _run_wizard("""
+let resolveOld;
+const notices = [];
+component.notify = (kind, message) => notices.push({kind, message});
+component.apiFetch = (url) => url.endsWith('/cancel')
+  ? Promise.resolve({state: 'idle', cleanup_pending: true})
+  : new Promise(resolve => { resolveOld = resolve; });
+(async () => {
+  const pending = DELAYED_ACTION === 'poll'
+    ? component.refreshJoinState()
+    : component.beginJoinAddr('peer:8000', 'Peer');
+  await component.cancelJoin();
+  resolveOld({state: 'awaiting_approval', code: '123456'});
+  await pending;
+  process.stdout.write(JSON.stringify({join: component.join, notices}));
+})().catch(error => { console.error(error); process.exit(1); });
+""".replace("DELAYED_ACTION", json.dumps(delayed_action)))
+    assert result["join"]["state"] == "idle"
+    assert result["join"]["busy"] is False
+    assert result["join"]["cleanup_pending"] is True
+    assert result["notices"][0]["kind"] == "warning"
+    assert "on this Mac" in result["notices"][0]["message"]
+
+
+def test_cleanup_status_does_not_hide_new_join_controls():
+    result = _run_wizard("""
+component.join.cleanup_pending = true;
+component.devicesPayload = {
+  self: {node_id: 'self'}, paired: [],
+  discovered: [{node_id: 'other', state: 'discovered'}],
+};
+process.stdout.write(JSON.stringify({state: component.wizardState(), active: component.joinActive()}));
+""")
+    assert result == {"state": "device_card", "active": False}
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-join-cleanup" in template
+    assert 'x-show="join.cleanup_pending"' in template
