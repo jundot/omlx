@@ -198,7 +198,11 @@ from .exceptions import (
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
-from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .model_settings import (
+    InvalidProfileSettingsError,
+    forced_ct_keys,
+    merge_chat_template_request_kwargs,
+)
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -914,6 +918,15 @@ async def invalid_request_error_handler(
     else:
         content = {"detail": str(exc)}
     return JSONResponse(status_code=400, content=content)
+
+
+@app.exception_handler(InvalidProfileSettingsError)
+async def invalid_profile_settings_handler(
+    request: FastAPIRequest, exc: InvalidProfileSettingsError
+):
+    return await invalid_request_error_handler(
+        request, InvalidRequestError(str(exc), field="model")
+    )
 
 
 @app.exception_handler(SchedulerQueueFullError)
@@ -3007,6 +3020,8 @@ def _with_exposed_profile_status(status: dict) -> dict:
                 "profile_name": profile.get("name"),
                 "profile_api_name": profile.get("api_name"),
                 "profile_display_name": profile.get("display_name"),
+                "invalid": profile.get("invalid", False),
+                "invalid_reason": profile.get("invalid_reason"),
             }
         )
         models.append(profile_status)
@@ -3268,7 +3283,13 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     ModelInfo(
                         id=profile_model_id,
                         owned_by="omlx",
-                        max_model_len=get_max_context_window(profile_model_id),
+                        max_model_len=(
+                            None
+                            if profile.get("invalid")
+                            else get_max_context_window(profile_model_id)
+                        ),
+                        invalid=profile.get("invalid", False),
+                        invalid_reason=profile.get("invalid_reason"),
                     )
                 )
                 existing_ids.add(profile_model_id)
@@ -3307,14 +3328,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
             continue
 
-        m["max_context_window"] = get_max_context_window(model_id)
+        invalid = m.get("invalid", False)
+        m["max_context_window"] = None if invalid else get_max_context_window(model_id)
         source_model_id = m.get("source_model_id") or model_id
 
         # Resolve effective max_tokens: model setting > global default
         max_tokens = _server_state.sampling.max_tokens
         if _server_state.settings_manager:
             sm = _server_state.settings_manager
-            if hasattr(sm, "get_settings_for_request"):
+            if invalid:
+                ms = None
+            elif hasattr(sm, "get_settings_for_request"):
                 ms = sm.get_settings_for_request(
                     model_id,
                     resolved_model_id=source_model_id,
@@ -3331,7 +3355,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         else:
             m["is_favorite"] = False
             m["is_hidden"] = False
-        m["max_tokens"] = max_tokens
+        m["max_tokens"] = None if invalid else max_tokens
     return status
 
 

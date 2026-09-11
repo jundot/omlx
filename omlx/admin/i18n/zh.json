@@ -293,6 +293,8 @@
   "models.detail.view_on_hf": "在 HuggingFace 上查看",
   "models.detail.view_on_ms": "在魔搭社区查看",
   "models.detail.close": "关闭",
+  "models.detail.uno_unverified": "Uno 适配器尚未验证",
+  "models.detail.retry_verification": "重试",
   "models.detail.lora_warning": "LoRA 适配器 — 不支持",
   "settings.tab.global": "全局设置",
   "settings.tab.models": "模型设置",

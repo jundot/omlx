@@ -293,6 +293,8 @@
   "models.detail.view_on_hf": "Ver en HuggingFace",
   "models.detail.view_on_ms": "Ver en ModelScope",
   "models.detail.close": "Cerrar",
+  "models.detail.uno_unverified": "Adaptador Uno sin verificar",
+  "models.detail.retry_verification": "Reintentar",
   "models.detail.lora_warning": "Adaptador LoRA — no soportado",
   "settings.tab.global": "Configuración Global",
   "settings.tab.models": "Configuración del Modelo",

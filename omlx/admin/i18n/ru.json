@@ -293,6 +293,8 @@
   "models.detail.view_on_hf": "Открыть на HuggingFace",
   "models.detail.view_on_ms": "Открыть на ModelScope",
   "models.detail.close": "Закрыть",
+  "models.detail.uno_unverified": "Адаптер Uno не проверен",
+  "models.detail.retry_verification": "Повторить",
   "models.detail.lora_warning": "Адаптер LoRA не поддерживается",
   "settings.tab.global": "Глобальные настройки",
   "settings.tab.models": "Настройки модели",

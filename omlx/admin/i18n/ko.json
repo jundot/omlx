@@ -293,6 +293,8 @@
   "models.detail.view_on_hf": "HuggingFace에서 보기",
   "models.detail.view_on_ms": "ModelScope에서 보기",
   "models.detail.close": "닫기",
+  "models.detail.uno_unverified": "Uno 어댑터를 확인하지 못했습니다",
+  "models.detail.retry_verification": "다시 시도",
   "models.detail.lora_warning": "LoRA adapter — not supported",
   "settings.tab.global": "기본 설정",
   "settings.tab.models": "모델 설정",

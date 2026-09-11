@@ -38,6 +38,7 @@ from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import (
+    InvalidProfileSettingsError,
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     ane_prefill_backend,
     ane_prefill_fraction,
@@ -2487,6 +2488,7 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
+    entry_type_update = None
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
     )
@@ -2534,7 +2536,7 @@ async def update_model_settings(
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
         current_settings.model_type_override = override_value
-        # Update engine pool entry type immediately
+        # Stage the runtime update until the settings and profiles validate.
         type_to_engine = {
             "llm": "batched",
             "vlm": "vlm",
@@ -2545,8 +2547,10 @@ async def update_model_settings(
             "audio_sts": "audio_sts",
         }
         if override_value:
-            entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+            entry_type_update = (
+                override_value,
+                type_to_engine.get(override_value, "batched"),
+            )
         else:
             # Reset to auto-detected type
             from pathlib import Path
@@ -2554,8 +2558,10 @@ async def update_model_settings(
             from ..model_discovery import detect_model_type
 
             detected_type = detect_model_type(Path(entry.model_path))
-            entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+            entry_type_update = (
+                detected_type,
+                type_to_engine.get(detected_type, "batched"),
+            )
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:
@@ -3097,6 +3103,12 @@ async def update_model_settings(
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
     _validate_model_settings(entry, current_settings.to_dict())
+    try:
+        settings_manager.validate_profiles_for_settings(
+            model_id, current_settings, _profile_settings_validator(entry)
+        )
+    except InvalidProfileSettingsError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
@@ -3169,6 +3181,8 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+    if entry_type_update is not None:
+        entry.model_type, entry.engine_type = entry_type_update
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective
@@ -3409,6 +3423,18 @@ def _validate_model_settings(entry, settings):
         validate_chat_template_kwargs(kwargs)
 
 
+def _profile_settings_validator(entry):
+    """Reuse model validation on effective profile settings under the manager lock."""
+
+    def validate(settings):
+        try:
+            _validate_model_settings(entry, settings)
+        except HTTPException as error:
+            raise ValueError(str(error.detail)) from error
+
+    return validate
+
+
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
     model_id: str,
@@ -3429,7 +3455,6 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3444,8 +3469,9 @@ async def create_model_profile(
             reserved_model_ids=(
                 set(engine_pool.get_model_ids()) if engine_pool is not None else None
             ),
+            settings_validator=_profile_settings_validator(entry),
         )
-    except InvalidProfileNameError as e:
+    except (InvalidProfileNameError, InvalidProfileSettingsError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -3474,7 +3500,6 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3490,8 +3515,9 @@ async def update_model_profile(
             reserved_model_ids=(
                 set(engine_pool.get_model_ids()) if engine_pool is not None else None
             ),
+            settings_validator=_profile_settings_validator(entry),
         )
-    except InvalidProfileNameError as e:
+    except (InvalidProfileNameError, InvalidProfileSettingsError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -3539,7 +3565,12 @@ async def apply_model_profile(
         _validate_model_settings(entry, settings)
 
     try:
-        applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
+        applied = mgr.apply_profile(
+            model_id,
+            name,
+            settings_sanitizer=sanitizer,
+            profile_settings_validator=_profile_settings_validator(entry),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if applied is None:

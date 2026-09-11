@@ -1,6 +1,30 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "downloads.card.uno_unverified" : {
+      "comment" : "Warning when checking Uno adapter compatibility failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uno adapter not verified"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Адаптер Uno не проверен"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uno 适配器尚未验证"
+          }
+        }
+      }
+    },
     "settings.experimental.k2_ane.label" : {
       "extractionState" : "manual",
       "localizations" : {

@@ -293,6 +293,8 @@
   "models.detail.view_on_hf": "HuggingFaceで表示",
   "models.detail.view_on_ms": "ModelScopeで表示",
   "models.detail.close": "閉じる",
+  "models.detail.uno_unverified": "Uno アダプターを確認できません",
+  "models.detail.retry_verification": "再試行",
   "models.detail.lora_warning": "LoRA adapter — not supported",
   "settings.tab.global": "グローバル設定",
   "settings.tab.models": "モデル設定",

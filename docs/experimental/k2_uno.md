@@ -6,6 +6,9 @@ selector under **Acceleration**. Choose **Off** for ordinary decoding. **Get ada
 opens the matching Hugging Face repository when no local adapter is available.
 The web and native downloaders recognize Uno helpers; helpers are excluded from
 standalone inference choices. The loader validates the pair and tensor layout.
+If adapter verification fails, the model card keeps its metadata and shows the
+reason with **Retry**. Download remains disabled until verification succeeds;
+an unverified adapter is not labeled unsupported.
 
 | Base | Adapter | Context limit |
 | --- | --- | --- |
@@ -24,6 +27,15 @@ repetition penalty 1.0, min-p and presence penalty 0, and conflicting accelerato
 Guided Grammar and Thinking Budget off. Save the working settings/profile to persist
 these changes. Global defaults remain unchanged. Profiles and model loading
 revalidate adapter availability; a stale profile cannot replace working settings.
+
+Profile creation and updates validate the effective base-plus-profile settings.
+A base save or profile application that would invalidate saved profiles is rejected
+with their names and conflicts. A profile can explicitly set `uno_enabled: false`
+to use ordinary decoding with its own sampling settings.
+Already-invalid exposed profiles remain in `/v1/models` and `/v1/models/status`
+with `invalid: true` and an `invalid_reason`; the server logs a warning. Requests
+to those aliases return a 400 naming the conflict. Repairing the profile clears
+the invalid state without changing the base model's settings.
 
 Uno runs while one request is active. Overlap uses ordinary continuous batching;
 unconsumed proposals are discarded before a merge, and Uno resumes when one request
