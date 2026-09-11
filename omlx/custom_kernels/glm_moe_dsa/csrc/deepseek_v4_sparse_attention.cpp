@@ -88,7 +88,7 @@ class DeepseekV4SparseAttentionPrimitive : public Primitive {
         sinks.shape(0) != q.shape(1)) {
       return true;
     }
-    if (q.shape(2) <= 1 || local_kv.shape(2) < q.shape(2) ||
+    if (q.shape(2) < 1 || local_kv.shape(2) < q.shape(2) ||
         pooled.shape(1) <= 0 || topk_indices.shape(3) <= 0 ||
         topk_indices.dtype() != uint32) {
       return true;

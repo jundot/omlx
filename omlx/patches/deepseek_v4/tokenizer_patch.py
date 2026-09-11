@@ -163,17 +163,17 @@ def _register_chat_template_and_parser_modules() -> None:
 
 
 def _is_deepseek_v4_model(model_path) -> bool:
-    """Return True if ``model_path/config.json`` declares deepseek_v4*."""
+    """Return True if ``model_path/config.json`` declares deepseek_v4 (not v41)."""
     import json
     from pathlib import Path
+
+    from omlx.patches.deepseek_v41.predicates import is_deepseek_v4
 
     p = Path(model_path) / "config.json"
     if not p.exists():
         return False
     try:
-        return str(json.loads(p.read_text()).get("model_type", "")).startswith(
-            "deepseek_v4"
-        )
+        return is_deepseek_v4(str(json.loads(p.read_text()).get("model_type", "")))
     except Exception:
         return False
 

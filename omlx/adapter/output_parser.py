@@ -189,8 +189,10 @@ def _is_deepseek_v4_model(
     tokenizer: Any,
     model_config: dict[str, Any] | None = None,
 ) -> bool:
+    from omlx.patches.deepseek_v41.predicates import is_deepseek_v4
+
     model_type = str(model_config.get("model_type", "")) if model_config else ""
-    if model_type.startswith("deepseek_v4"):
+    if is_deepseek_v4(model_type):
         return True
 
     if (

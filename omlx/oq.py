@@ -146,8 +146,10 @@ def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
 
 
 def _is_deepseek_v4_config(config: dict) -> bool:
+    from omlx.patches.deepseek_v41.predicates import is_deepseek_v4
+
     model_type = str(config.get("model_type", "")).lower()
-    if model_type.startswith("deepseek_v4"):
+    if is_deepseek_v4(model_type):
         return True
 
     architectures = config.get("architectures") or []
@@ -4151,7 +4153,17 @@ def _build_model_sanitizer(
         # into ``sys.modules`` by oMLX's base patch. Trigger that here so
         # ``_get_classes(config)`` for deepseek_v4* model types succeeds.
         # No-op for other model types.
-        if str(config.get("model_type", "")).startswith("deepseek_v4"):
+        from omlx.patches.deepseek_v41.predicates import is_deepseek_v4, is_deepseek_v41
+
+        mt = str(config.get("model_type", ""))
+        if is_deepseek_v41(mt):
+            try:
+                from omlx.patches.deepseek_v41 import apply_deepseek_v41_patch
+
+                apply_deepseek_v41_patch()
+            except Exception as patch_err:
+                logger.debug(f"deepseek_v41 base patch not applied: {patch_err}")
+        elif is_deepseek_v4(mt):
             try:
                 from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
 
@@ -7329,7 +7341,8 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
             for layer in layers
         ]
         return hidden, masks, {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
-    if model_type.startswith("deepseek_v4"):
+    from omlx.patches.deepseek_v41.predicates import is_deepseek_v4_family
+    if is_deepseek_v4_family(model_type):
         args = model.args
         h = mx.broadcast_to(
             inputs[:, :, None, :],

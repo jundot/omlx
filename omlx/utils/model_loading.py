@@ -513,11 +513,19 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
-    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
-        from ..patches.deepseek_v4 import apply_deepseek_v4_patch
+    if isinstance(model_type, str):
+        from ..patches.deepseek_v41.predicates import is_deepseek_v4, is_deepseek_v41
 
-        if apply_deepseek_v4_patch():
-            logger.info("DeepSeek V4 pre-load patch applied for %s", model_name)
+        if is_deepseek_v41(model_type):
+            from ..patches.deepseek_v41 import apply_deepseek_v41_patch
+
+            if apply_deepseek_v41_patch():
+                logger.info("Applied DeepSeek-V4.1 mlx-lm patch for model_type=%s", model_type)
+        elif is_deepseek_v4(model_type):
+            from ..patches.deepseek_v4 import apply_deepseek_v4_patch
+
+            if apply_deepseek_v4_patch():
+                logger.info("DeepSeek V4 pre-load patch applied for %s", model_name)
 
     if model_type == "step3p7":
         from ..patches.step3p7 import apply_step3p7_patch
@@ -1113,6 +1121,8 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     only). The model also has to declare MTP heads in the config; otherwise
     the patch is a no-op.
     """
+    from ..patches.deepseek_v41.predicates import is_deepseek_v4_family
+
     if not _has_mtp_heads(config):
         return False
     if not model_type:
@@ -1120,7 +1130,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     return (
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
-        or model_type.startswith("deepseek_v4")
+        or is_deepseek_v4_family(model_type)
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
         or model_type in ("gemma4", "gemma4_unified")

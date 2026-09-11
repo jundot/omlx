@@ -6,7 +6,7 @@ Two surgical changes from PR 1192 are applied:
 1. Weight loading goes through ``_load_safetensors`` instead of ``mx.load`` so
    safetensors files declaring the F8_E8M0 dtype (used by DeepSeek V4 fp8
    block-scale tensors) can be reinterpreted as U8 in-place.
-2. The ``elif quant_method == "fp8" and model_type.startswith("deepseek_v4")``
+2. The ``elif quant_method == "fp8" and is_deepseek_v4(model_type)``
    branch
    in the quantization config dispatch builds the per-layer quantization
    spec via ``deepseek_v4.make_quantization_config``.
@@ -19,6 +19,8 @@ When mlx-lm merges PR 1192 upstream this patch should be removed.
 """
 
 from __future__ import annotations
+
+from omlx.patches.deepseek_v41.predicates import is_deepseek_v4, is_deepseek_v41
 
 import glob
 import importlib.util
@@ -39,12 +41,30 @@ logger = logging.getLogger(__name__)
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
+
+def _skip_engram_embed_key(key: str) -> bool:
+    """When OMLX_DSV41_ENGRAM=mmap/ssd, never materialize ~200GB embed tables."""
+    if "engram.embed.weight" not in key and "engram.embed.scale" not in key:
+        return False
+    try:
+        from omlx.patches.deepseek_v41.engram import engram_is_mmap
+
+        return engram_is_mmap()
+    except Exception:
+        import os
+
+        return os.environ.get("OMLX_DSV41_ENGRAM", "stub").strip().lower() in (
+            "mmap",
+            "ssd",
+        )
+
+
 _PATCHED = False
 
 
 def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
     """Keep the native ratio-128 attention path off for sub-4-bit V4."""
-    if not str(config.get("model_type", "")).startswith("deepseek_v4"):
+    if not is_deepseek_v4(str(config.get('model_type', ''))):
         return True
 
     quantizations = [config.get("quantization"), config.get("quantization_config")]
@@ -70,13 +90,31 @@ def _load_safetensors(path: str) -> dict:
     exponent scale tensors. ``mx.load`` rejects unknown dtypes; the
     fallback rewrites the safetensors header in place to advertise the
     bytes as ``U8`` (raw uint8), loads, and restores the original header.
+
+    When Engram mmap mode is active, ``engram.embed.*`` tensors are removed
+    from the header before load so ~200GB tables are never materialized.
     """
+    needs_engram_strip = False
     try:
-        return mx.load(path)
-    except RuntimeError as e:
-        if not any(dtype in str(e) for dtype in SAFETENSORS_DTYPE_FALLBACKS):
-            raise
-        load_error = e
+        with open(path, "rb") as peek:
+            header_len = struct.unpack("<Q", peek.read(8))[0]
+            header_peek = json.loads(peek.read(header_len))
+        needs_engram_strip = any(
+            _skip_engram_embed_key(k)
+            for k in header_peek.keys()
+            if k != "__metadata__"
+        )
+    except Exception:
+        needs_engram_strip = False
+
+    load_error = None
+    if not needs_engram_strip:
+        try:
+            return mx.load(path)
+        except RuntimeError as e:
+            if not any(dtype in str(e) for dtype in SAFETENSORS_DTYPE_FALLBACKS):
+                raise
+            load_error = e
 
     with open(path, "r+b") as f:
         header_len = struct.unpack("<Q", f.read(8))[0]
@@ -84,7 +122,14 @@ def _load_safetensors(path: str) -> dict:
         header = json.loads(original_header)
         changed = False
 
-        for tensor_info in header.values():
+        for key in list(header.keys()):
+            if key == "__metadata__":
+                continue
+            if _skip_engram_embed_key(key):
+                del header[key]
+                changed = True
+                continue
+            tensor_info = header[key]
             if not isinstance(tensor_info, dict):
                 continue
             dtype = tensor_info.get("dtype")
@@ -93,7 +138,9 @@ def _load_safetensors(path: str) -> dict:
                 changed = True
 
         if not changed:
-            raise load_error
+            if load_error is not None:
+                raise load_error
+            return mx.load(path)
 
         patched_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
         if len(patched_header) > header_len:
@@ -171,7 +218,7 @@ def _build_patched_load_model() -> Callable:
             if "quantization_config" in text_config:
                 config["quantization_config"] = text_config["quantization_config"]
 
-        if str(config.get("model_type", "")).startswith("deepseek_v4"):
+        if is_deepseek_v4(str(config.get('model_type', ''))):
             config["use_native_ratio128_attention"] = bool(
                 config.get("use_native_ratio128_attention", True)
             ) and _native_ratio128_attention_enabled(config)
@@ -223,10 +270,19 @@ def _build_patched_load_model() -> Callable:
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
                 _quantize(quantization)
-            elif quant_method == "fp8" and str(config.get("model_type", "")).startswith(
-                "deepseek_v4"
+            elif quant_method == "fp8" and is_deepseek_v4(
+                str(config.get("model_type", ""))
             ):  # PR 1192 new branch
                 from mlx_lm.models.deepseek_v4 import make_quantization_config
+
+                quantization = make_quantization_config(model)
+                config["quantization"] = quantization
+                config["quantization_config"] = quantization
+                _quantize(quantization)
+            elif quant_method == "fp8" and is_deepseek_v41(
+                str(config.get("model_type", ""))
+            ):
+                from mlx_lm.models.deepseek_v41 import make_quantization_config
 
                 quantization = make_quantization_config(model)
                 config["quantization"] = quantization

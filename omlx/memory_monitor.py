@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
 from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
+from omlx.patches.deepseek_v41.predicates import is_deepseek_v4_family
 
 logger = logging.getLogger(__name__)
 
@@ -1421,7 +1422,7 @@ def make_prefill_memory_profile(
         return _make_qwen4_exp_prefill_memory_profile(
             config, compute_dtype_size=compute_dtype_size
         )
-    if not model_type.startswith("deepseek_v4"):
+    if not is_deepseek_v4_family(model_type):
         return None
 
     num_layers = _cfg_get(config, "num_hidden_layers")

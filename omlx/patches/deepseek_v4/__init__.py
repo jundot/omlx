@@ -25,8 +25,9 @@ without modifying the pinned mlx-lm. The patch:
    prefix-cache / SSD-cache state extraction does not silently fall
    through to ``DefaultCacheHandler``.
 
-The whole patch is gated on ``model_type.startswith("deepseek_v4")`` in
-``config.json``; other models pay zero cost.
+The whole patch is gated on DeepSeek-V4 model types in ``config.json``
+(exact ``deepseek_v4`` / ``deepseek_v4_*`` — **not** ``deepseek_v41``).
+Other models pay zero cost.
 
 Once mlx-lm merges PR 1192 upstream this package can be removed in a
 single delete (along with the conditional dispatch in
