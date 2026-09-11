@@ -27,15 +27,15 @@ from omlx.api.tool_calling import (
     _gemma4_args_to_json_robust,
     _json_value_end,
     _marker_payloads,
-    _parse_gemma4_tool_call_fallback,
     _parse_attribute_function_tool_calls,
+    _parse_gemma4_tool_call_fallback,
     _parse_hermes_tool_calls,
     _parse_namespaced_tool_calls,
     _parse_xml_tool_calls,
-    _strip_marker_spans,
     _remap_tool_call_names,
     _repair_json_value,
     _serialize_tool_call_arguments,
+    _strip_marker_spans,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -4655,7 +4655,7 @@ class TestAttributeStyleFunctionDialect:
             assert cleaned == self.BARE_CALL
 
     def test_stream_filter_suppresses_bare_dialect_across_chunks(self):
-        f = ToolCallStreamFilter(_make_tokenizer())
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
         chunks = [
             "Sure. ",
             "<funct",
@@ -4719,4 +4719,108 @@ class TestAttributeStyleFunctionDialect:
         assert calls is not None
         assert calls[0].function.name == "ping"
         assert json.loads(calls[0].function.arguments) == {}
+
+    def test_stream_filter_preserves_undeclared_function_in_prose(self):
+        # Gap 1: undeclared function markup in prose must not be suppressed
+        # during streaming, aligning with non-streaming behavior.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        text = 'Here is an example: <function name="example"><param name="k">v</param></function> in prose.'
+        out = f.feed(text) + f.finish()
+        assert out == text
+
+    def test_stream_filter_inert_for_bare_dialect_without_tools(self):
+        # Bare dialect is inert when no tools are declared.
+        for tools in (None, []):
+            f = ToolCallStreamFilter(_make_tokenizer(), tools=tools)
+            text = f"Prose {self.BARE_CALL} end."
+            out = f.feed(text) + f.finish()
+            assert out == text
+
+    def test_cdata_with_literal_function_close_tag(self):
+        # Gap 2: literal </function> inside CDATA must not truncate the call
+        # or produce empty arguments.
+        literal_code = 'def test():\n    return "</function>"\n'
+        text = (
+            '<function name="read"><param name="path"><![CDATA['
+            f'{literal_code}'
+            ']]></param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {"path": literal_code}
+
+    def test_cdata_with_embedded_function_call_example(self):
+        # Gap 2: a complete function call example inside CDATA should be
+        # preserved verbatim as argument value without triggering nested call extraction.
+        inner_example = '<function name="read"><param name="path">nested.py</param></function>'
+        text = (
+            f'Output: <function name="read"><param name="path"><![CDATA['
+            f'{inner_example}'
+            ']]></param></function> End.'
+        )
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {"path": inner_example}
+        assert "Output:" in cleaned
+        assert "End." in cleaned
+        assert "nested.py" not in cleaned
+
+    def test_stream_filter_cdata_with_literal_function_close_across_chunks(self):
+        # Gap 2 streaming: literal </function> inside CDATA across chunk boundaries
+        # must not end suppression prematurely or leak subsequent XML into visible output.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Before call. ",
+            '<function name="read"><param name="path"><![CDATA[',
+            'def foo():\n    return "</func',
+            'tion>"\n',
+            ']]></param></function>',
+            " After call.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Before call.  After call."
+
+    def test_stream_filter_cdata_delimiters_split_across_chunks(self):
+        # Gap 2 streaming: <![CDATA[ and ]]> delimiters split across chunks
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Prefix: ",
+            '<function name="read"><param name="path"><![CD',
+            'ATA[</function>]]',
+            '></param></function>',
+            " Suffix.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Prefix:  Suffix."
+
+    def test_stream_filter_multiple_spaces_in_tag(self):
+        # Gap 3: multiple spaces in opening tag must be suppressed during streaming.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Start ",
+            '<function  ',
+            ' name="read"  ><param  name="path">/test.py</param></function>',
+            " End",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Start  End"
+
+    def test_stream_filter_capture_ordered_segments(self):
+        # Verify capture_ordered_segments retains the complete envelope
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            tools=[self.READ_TOOL],
+            capture_ordered_segments=True,
+        )
+        raw_call = '<function name="read"><param name="path">/x</param></function>'
+        chunks = ["Hello ", raw_call, " world"]
+        out = "".join(f.feed(c) for c in chunks) + f.finish()
+        assert out == "Hello  world"
+        envelopes = f.take_completed_envelopes()
+        assert envelopes == [raw_call]
+
 
