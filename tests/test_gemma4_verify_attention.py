@@ -249,3 +249,101 @@ def test_kernel_route_matches_stock_logits(step_len):
 
     assert mx.allclose(got, ref, atol=2e-2, rtol=2e-2)
     assert mx.argmax(got[0, -1]).item() == mx.argmax(ref[0, -1]).item()
+
+
+# ---------------------------------------------------------------------------
+# The same routes on the mlx-lm engine
+# ---------------------------------------------------------------------------
+#
+# mlx-lm's gemma4_text.Attention takes the same (x, mask, cache, shared_kv,
+# offset) signature, carries the same attribute names and returns the same
+# (output, kv, offset) triple, so it is installed from the same code. These
+# repeat the load-bearing checks against that class rather than trusting the
+# shapes to have stayed aligned.
+
+
+def _lm_model(extra: dict | None = None):
+    from mlx_lm.models.gemma4_text import ModelArgs, Model
+
+    params = dict(TINY_TEXT_CONFIG)
+    if extra:
+        params.update(extra)
+    return Model(ModelArgs.from_dict(params))
+
+
+def _lm_run(model, prompt_len: int, step_len: int):
+    """Prefill then one step forward. mlx-lm returns logits directly."""
+    mx.random.seed(7)
+    tokens = mx.random.randint(0, 100, (1, prompt_len + step_len))
+    cache = model.make_cache()
+    mx.eval(model(tokens[:, :prompt_len], cache=cache))
+    result = model(tokens[:, prompt_len:], cache=cache)
+    mx.eval(result)
+    return result
+
+
+def _lm_count_single_token_updates(model, prompt_len: int, step_len: int) -> int:
+    mx.random.seed(7)
+    tokens = mx.random.randint(0, 100, (1, prompt_len + step_len))
+    cache = model.make_cache()
+    mx.eval(model(tokens[:, :prompt_len], cache=cache))
+
+    single = {"n": 0}
+    for c in cache:
+        original = c.update_and_fetch
+
+        def wrapper(k, v, _orig=original):
+            if k.shape[2] == 1:
+                single["n"] += 1
+            return _orig(k, v)
+
+        c.update_and_fetch = wrapper
+
+    mx.eval(model(tokens[:, prompt_len:], cache=cache))
+    return single["n"]
+
+
+def test_mlx_lm_apply_is_idempotent():
+    assert gemma4_verify_attention.apply_mlx_lm()
+    assert gemma4_verify_attention.apply_mlx_lm()
+
+
+@pytest.mark.parametrize("step_len", [2, 3])
+def test_mlx_lm_decomposed_matches_stock_logits(step_len):
+    # The port must not move the numbers. Same weights, same tokens, route
+    # on and route off -- a wrong port would show up here rather than as a
+    # quietly worse acceptance rate in a benchmark.
+    assert gemma4_verify_attention.apply_mlx_lm()
+    model = _lm_model()
+    got = _lm_run(model, prompt_len=24, step_len=step_len)
+
+    old_min = gemma4_verify_attention._MIN_L
+    gemma4_verify_attention._MIN_L = 99
+    try:
+        ref = _lm_run(model, prompt_len=24, step_len=step_len)
+    finally:
+        gemma4_verify_attention._MIN_L = old_min
+
+    assert mx.allclose(got, ref, atol=2e-2, rtol=2e-2)
+    assert mx.argmax(got[0, -1]).item() == mx.argmax(ref[0, -1]).item()
+
+
+def test_mlx_lm_kv_sharing_backbones_stay_on_stock_path():
+    # E2B/E4B again: a decomposed donor would hand downstream shared layers
+    # a final-token KV view they cannot causally slice.
+    assert gemma4_verify_attention.apply_mlx_lm()
+    model = _lm_model({"num_kv_shared_layers": 2})
+    assert _lm_count_single_token_updates(model, prompt_len=12, step_len=2) == 0
+
+
+def test_mlx_lm_l_gate_routes_only_small_steps():
+    assert gemma4_verify_attention.apply_mlx_lm()
+    model = _lm_model()
+    # head_dim 16 is not lane-splittable, so the fused kernel stays out and
+    # L=4 falls past the per-token ceiling to the stock chunked update.
+    assert _lm_count_single_token_updates(model, prompt_len=12, step_len=4) == 0
+    n_layers = len(model.make_cache())
+    assert (
+        _lm_count_single_token_updates(model, prompt_len=12, step_len=2)
+        == 2 * n_layers
+    )

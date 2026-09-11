@@ -743,6 +743,18 @@ def maybe_apply_pre_load_patches(
             set_mtp_depth,
         )
 
+        if model_type in ("gemma4", "gemma4_unified"):
+            # Gemma 4 alone ships its draft head as a separate model, and the
+            # only implementation of it is mlx-vlm's. Declaring that here, and
+            # not inside mlx_lm_mtp, is what keeps cluster.autoconfigure from
+            # asking every rank serving any model to install mlx-vlm.
+            from ..patches.mlx_lm_gemma4_assistant import warn_if_unavailable
+
+            # The import stays under the model-type test alone so the derived
+            # requirement keeps its guard; only the call is opt-in.
+            if mtp_enabled:
+                warn_if_unavailable(model_name)
+
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
             # mtp_num_draft_tokens is the MAX draft depth; an adaptive
@@ -1117,9 +1129,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
     fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
-    only). The model also has to declare MTP heads in the config; otherwise
-    the patch is a no-op.
+    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, on both
+    the mlx-vlm and mlx-lm paths). The model also has to declare MTP heads in
+    the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
