@@ -144,6 +144,7 @@
                     openclaw_model: null,
                     hermes_model: null,
                     pi_model: null,
+                    swival_model: null,
                     openclaw_tools_profile: 'full',
                     markitdown_enabled: true,
                     markitdown_expose_model: false,
@@ -3181,6 +3182,10 @@
                 return this._launchCmd('pi');
             },
 
+            get swivalCommand() {
+                return this._launchCmd('swival');
+            },
+
             get markitdownOcrModels() {
                 return (this.models || []).filter((model) => {
                     const configType = String(model.config_model_type || '').toLowerCase();
@@ -3200,6 +3205,7 @@
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
                             integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
+                            integrations_swival_model: this.globalSettings.integrations.swival_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                             markitdown_enabled: this.globalSettings.integrations.markitdown_enabled,
                             markitdown_expose_model: this.globalSettings.integrations.markitdown_expose_model,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -29,6 +30,7 @@ class IntegrationContext:
     tools_profile: str = "coding"
     extra_args: tuple[str, ...] = ()
     cross_session: bool = False
+    verbose: bool = False
 
     @property
     def base_url(self) -> str:
@@ -76,6 +78,16 @@ class Integration:
     def model_disabled_reason(self, model_info: dict) -> str | None:
         """Return why a model cannot be selected for this integration."""
         return None
+
+    def _echo_command(self, ctx: IntegrationContext, args: list[str]) -> None:
+        """Print the tool command line when launched with ``--verbose``.
+
+        Secrets are masked so the printed line is safe to paste into a bug
+        report; it is therefore not verbatim-reproducible.
+        """
+        if not ctx.verbose:
+            return
+        print("$ " + shlex.join(_mask_secrets(args, ctx.api_key)), flush=True)
 
     def _scrubbed_env(self) -> dict[str, str]:
         """Return an os.environ copy with bundled-Python vars removed.
@@ -191,6 +203,40 @@ class Integration:
             encoding="utf-8",
         )
         print(f"Config written: {config_path}")
+
+
+_SECRET_FLAGS = frozenset(
+    {"--api-key", "--apikey", "--auth-token", "--token", "--key"}
+)
+
+
+def _mask_secrets(args: list[str], api_key: str = "") -> list[str]:
+    """Replace secret values in an argv list with ``REDACTED``.
+
+    Masks the value following a known secret-bearing flag (both
+    ``--api-key KEY`` and ``--api-key=KEY`` forms) and, as a backstop, any
+    argument that contains the resolved API key.
+    """
+    masked: list[str] = []
+    mask_next = False
+    for arg in args:
+        if mask_next:
+            masked.append("REDACTED")
+            mask_next = False
+            continue
+        flag, sep, _ = arg.partition("=")
+        if flag in _SECRET_FLAGS:
+            if sep:
+                masked.append(f"{flag}=REDACTED")
+            else:
+                masked.append(arg)
+                mask_next = True
+            continue
+        if api_key and api_key in arg:
+            masked.append(arg.replace(api_key, "REDACTED"))
+            continue
+        masked.append(arg)
+    return masked
 
 
 def _select_model_curses(models_info: list[dict], tool_name: str) -> str:

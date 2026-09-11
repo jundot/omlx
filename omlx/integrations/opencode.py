@@ -79,4 +79,5 @@ class OpenCodeIntegration(Integration):
         env = self._scrubbed_env()
         args = ["opencode", *ctx.extra_args]
 
+        self._echo_command(ctx, args)
         os.execvpe("opencode", args, env)
