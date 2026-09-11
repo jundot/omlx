@@ -65,23 +65,6 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-def _output_tokens(output: Any) -> list[int]:
-    """Token IDs from an engine output; [] when absent/non-iterable (K8).
-
-    Production outputs carry output_token_ids (cumulative). Test doubles
-    and exotic engines may not, and a mocked attribute is not iterable;
-    degrade to [] instead of breaking the call. The bench's --gate-tokens
-    fail-high still catches a REAL path that never populates the list.
-    """
-    try:
-        oid = getattr(output, "output_token_ids", None)
-        if oid is None:
-            return []
-        return [int(t) for t in oid]
-    except Exception:  # noqa: BLE001
-        return []
-
-
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
 # unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
@@ -782,6 +765,112 @@ def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
     except Exception:
         return False
     return isinstance(metadata, dict) and metadata.get("format") == "mlx"
+
+
+def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
+    """Derive Gemma4's legacy full-attention head fields from ``per_layer_config``.
+
+    Newer Gemma4 checkpoints (Transformers >= 5.15) record the ``head_dim`` /
+    ``num_key_value_heads`` overrides of the full-attention layers under
+    ``text_config.per_layer_config`` instead of the legacy global
+    ``global_head_dim`` / ``num_global_key_value_heads`` fields. The pinned
+    mlx-vlm Gemma4 loader reads only the legacy fields, so it sizes the
+    full-attention K/V projections with the sliding-window head count and
+    ``load_weights`` fails with a shape mismatch (#3537).
+
+    Returns the legacy fields that are absent from ``text_config`` and can be
+    derived unambiguously (every overridden full-attention layer agrees), or
+    an empty dict.
+    """
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return {}
+    model_type = str(text_config.get("model_type") or config.get("model_type") or "")
+    if not model_type.startswith("gemma4"):
+        return {}
+    per_layer = text_config.get("per_layer_config")
+    if not isinstance(per_layer, dict) or not per_layer:
+        return {}
+    layer_types = text_config.get("layer_types")
+    if not isinstance(layer_types, list):
+        layer_types = None
+
+    derived: dict[str, int] = {}
+    for legacy_key, layer_key in (
+        ("global_head_dim", "head_dim"),
+        ("num_global_key_value_heads", "num_key_value_heads"),
+    ):
+        if text_config.get(legacy_key) is not None:
+            continue
+        values: set[int] = set()
+        for layer_id, overrides in per_layer.items():
+            if not isinstance(overrides, dict) or overrides.get(layer_key) is None:
+                continue
+            if layer_types is not None:
+                try:
+                    layer_idx = int(layer_id)
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= layer_idx < len(layer_types):
+                    continue
+                if layer_types[layer_idx] != "full_attention":
+                    continue
+            try:
+                values.add(int(overrides[layer_key]))
+            except (TypeError, ValueError):
+                continue
+        if len(values) == 1:
+            derived[legacy_key] = values.pop()
+    return derived
+
+
+@contextlib.contextmanager
+def _derive_gemma4_global_kv_on_load(model_dir: Path):
+    """Feed ``per_layer_config``-only Gemma4 head overrides to the mlx-vlm loader.
+
+    Wraps ``mlx_vlm.utils.load_config`` for one ``vlm_load(...)`` so the
+    config handed to the Gemma4 ``TextConfig`` carries ``global_head_dim`` /
+    ``num_global_key_value_heads`` derived from ``per_layer_config`` when the
+    checkpoint does not spell them out (#3537). Checkpoints that already
+    carry the legacy fields, and non-Gemma4 models, are untouched.
+    """
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        yield
+        return
+    derived = (
+        _gemma4_global_kv_from_per_layer_config(config)
+        if isinstance(config, dict)
+        else {}
+    )
+    if not derived:
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original_load_config = _vu.load_config
+
+    def _patched_load_config(model_path, **kwargs):
+        loaded = original_load_config(model_path, **kwargs)
+        text_config = loaded.get("text_config") if isinstance(loaded, dict) else None
+        if isinstance(text_config, dict):
+            for key, value in derived.items():
+                if text_config.get(key) is None:
+                    text_config[key] = value
+        return loaded
+
+    logger.info(
+        "derive_gemma4_global_kv_on_load: per_layer_config -> %s",
+        ", ".join(f"{k}={v}" for k, v in derived.items()),
+    )
+    _vu.load_config = _patched_load_config
+    try:
+        yield
+    finally:
+        _vu.load_config = original_load_config
 
 
 @contextlib.contextmanager
@@ -1714,6 +1803,7 @@ class VLMBatchedEngine(BaseEngine):
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
+                _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
@@ -2032,31 +2122,27 @@ class VLMBatchedEngine(BaseEngine):
 
         # Qwen3.5/3.6 verify-width GDN prework -> one fused Metal launch
         # (conv+SiLU+split+RMS+scale+conv-state), bit-exact to the chain.
-        # TEMP BISECT (revert): OMLX_MTP_NOGDN_PREWORK=1 skips for 8k probe.
-        if not __import__("os").environ.get("OMLX_MTP_NOGDN_PREWORK"):
-            try:
-                from ..patches.qwen35_gdn_prework import (
-                    apply_qwen35_gdn_prework_patch,
-                )
+        try:
+            from ..patches.qwen35_gdn_prework import (
+                apply_qwen35_gdn_prework_patch,
+            )
 
-                apply_qwen35_gdn_prework_patch()
-            except Exception:
-                logger.debug("Qwen GDN prework patch not applied", exc_info=True)
+            apply_qwen35_gdn_prework_patch()
+        except Exception:
+            logger.debug("Qwen GDN prework patch not applied", exc_info=True)
 
         # Qwen3.5/3.6 verify-width (MTP target-verify) attention -> chunked
         # causal vector-kernel calls instead of the per-row SDPA loop.
-        # TEMP BISECT (revert): OMLX_MTP_NOVERIFY_SDPA=1 skips for 8k probe.
-        if not __import__("os").environ.get("OMLX_MTP_NOVERIFY_SDPA"):
-            try:
-                from ..patches.qwen35_verify_sdpa_split import (
-                    apply_qwen35_verify_sdpa_split_patch,
-                )
+        try:
+            from ..patches.qwen35_verify_sdpa_split import (
+                apply_qwen35_verify_sdpa_split_patch,
+            )
 
-                apply_qwen35_verify_sdpa_split_patch()
-            except Exception:
-                logger.debug(
-                    "Qwen verify-split attention patch not applied", exc_info=True
-                )
+            apply_qwen35_verify_sdpa_split_patch()
+        except Exception:
+            logger.debug(
+                "Qwen verify-split attention patch not applied", exc_info=True
+            )
 
         # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
         # Decode and masked paths keep the original mlx-vlm kernel.
@@ -3640,7 +3726,6 @@ class VLMBatchedEngine(BaseEngine):
                 return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
             return GenerationOutput(
                 text=full_text,
-                tokens=list(last_output.tokens),
                 prompt_tokens=last_output.prompt_tokens,
                 completion_tokens=last_output.completion_tokens,
                 finish_reason=last_output.finish_reason,
@@ -3690,6 +3775,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 
@@ -3697,7 +3783,6 @@ class VLMBatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
-            tokens=_output_tokens(output),
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
@@ -3804,6 +3889,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
@@ -3822,7 +3908,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
-                    tokens=_output_tokens(output),
+    
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -3937,7 +4023,6 @@ class VLMBatchedEngine(BaseEngine):
                 return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
             return GenerationOutput(
                 text=full_text,
-                tokens=list(last_output.tokens),
                 prompt_tokens=last_output.prompt_tokens,
                 completion_tokens=last_output.completion_tokens,
                 finish_reason=last_output.finish_reason,

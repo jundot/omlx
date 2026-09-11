@@ -27,7 +27,7 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 1
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
@@ -265,14 +265,14 @@ class ModelSettings:
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
-    # Qwen4-Exp only (default on): keep the large PLE N-gram table on SSD and
+    # Qwen4-Exp only (default off): keep the large PLE N-gram table on SSD and
     # gather rows through mmap. PLE lookups are pure row gathers with no
     # matmuls, so SSD paging costs no throughput while freeing the ~25-30% of
     # RAM the table would otherwise pin (same behavior llama.cpp measures with
     # --mmap). Turn off to pin the table in memory. The runtime may force this
     # on when resident loading cannot fit under the configured model-memory
     # ceiling but mmap loading can.
-    qwen4_ple_ssd_offload: bool = True
+    qwen4_ple_ssd_offload: bool = False
     # MoE expert streaming (SSD): keep hot experts resident, stream the rest
     # from SSD. Hardware-specific; may be auto-forced when resident load cannot
     # fit under the memory ceiling but streaming fits. Budget None/0 =
@@ -363,6 +363,9 @@ class ModelSettings:
     expert_streaming_dynamic_max_gib: Optional[float] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    )
+    cache_reasoning_output: Optional[bool] = (
+        None  # Cache <think> output for the next turn (None = auto: when history keeps it)
     )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
@@ -614,25 +617,6 @@ class ModelSettingsManager:
             # Load model settings
             models_data = data.get("models", {})
             self._settings = {}
-
-            # v1 files persisted qwen4_ple_ssd_offload=False because False was
-            # the field default, not a deliberate opt-out. SSD mmap is now the
-            # default PLE residency, so coerce v1 blobs instead of silently
-            # keeping every existing model resident. An opt-out saved on v2
-            # survives because this only runs for version < 2.
-            if version < 2:
-                coerced = 0
-                for model_data in models_data.values():
-                    if model_data.get("qwen4_ple_ssd_offload") is False:
-                        model_data["qwen4_ple_ssd_offload"] = True
-                        coerced += 1
-                if coerced:
-                    logger.info(
-                        "Settings v1→v2: enabled qwen4_ple_ssd_offload (SSD "
-                        "mmap is now the default PLE residency) for %d "
-                        "model(s)",
-                        coerced,
-                    )
 
             for model_id, model_data in models_data.items():
                 # Settings saved before the vlm_mtp exclusivity rule may

@@ -164,7 +164,6 @@ def _throttle_ctx(
         _PREFILL_HEADROOM_SAFETY=Scheduler._PREFILL_HEADROOM_SAFETY,
         _PREFILL_ABORT_MARGIN=Scheduler._PREFILL_ABORT_MARGIN,
         _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
-        _PREFILL_STATIC_MAX_OVER_MEASURED=Scheduler._PREFILL_STATIC_MAX_OVER_MEASURED,
         _last_mlx_active_memory_bytes=0,
     )
     # Bind the real helper methods so the stand-in behaves like a Scheduler.

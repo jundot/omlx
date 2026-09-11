@@ -746,7 +746,7 @@ def _patched_generation_batch_step(self):
         and self.uids
     ):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
-        model.set_batch_rope_deltas(mx.array(deltas))
+        _bind_step_rope_deltas(model, mx.array(deltas), self.uids)
 
     # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
     # and `for p in self.logits_processors[e]`, both of which crash when a row
@@ -1216,7 +1216,8 @@ def _prepare_mrope_prompt(self):
 
 def _patched_ppb_prompt(self, tokens):
     _prepare_mrope_prompt(self)
-    return _original_ppb_prompt(self, tokens)
+    # Late-bound so model patches can swap the loop under this wrapper.
+    return PromptProcessingBatch._omlx_base_prompt(self, tokens)
 
 
 PromptProcessingBatch._omlx_base_prompt = _original_ppb_prompt
@@ -1273,6 +1274,13 @@ class _BoundaryStoreUnavailable(Exception):
     with a block-boundary token count and corrupt later prefix hits;
     the handler skips the store and releases the block references.
     """
+
+
+def _output_tokens_cacheable(request: "Request") -> bool:
+    """Output tokens are reusable unless the next turn drops a <think> block."""
+    return not getattr(request, "needs_think_prefix", False) or bool(
+        getattr(request, "preserve_reasoning", False)
+    )
 
 
 def _first_leaf_cache_offset(cache_obj: Any) -> int | None:
@@ -1422,6 +1430,39 @@ def _bind_text_prefill_rope_delta(model: Any, delta: float) -> None:
         generic_setter(mx.array([delta]))
 
 
+def _mark_text_positions(model: Any, request: Any, uid: int) -> None:
+    """Hand a text-proven request's batch uid to the adapter after insert(); the
+    prefill chunks ran under a temporary uid and only marked the request."""
+
+    if not getattr(request, "text_positions_proven", False):
+        # A complete text cache hit skips the prefill that normally proves this.
+        if not (
+            getattr(request, "cached_tokens", 0) > 0
+            and request.cached_tokens >= request.num_prompt_tokens - 1
+            and request.vlm_inputs_embeds is None
+            and not request.vlm_extra_kwargs
+            and not request.vlm_image_hash
+            and not request.vlm_cache_key_ranges
+            and request.rope_deltas == 0.0
+        ):
+            return
+        request.text_positions_proven = True
+    marker = getattr(type(model), "mark_text_positions", None)
+    if callable(marker):
+        marker(model, uid)
+
+
+def _bind_step_rope_deltas(model: Any, deltas: mx.array, uids) -> None:
+    """Bind per-row rope deltas for one decode step through the uid-aware
+    ``set_step_rope_deltas`` when the wrapper has it, else ``set_batch_rope_deltas``."""
+
+    step_setter = getattr(type(model), "set_step_rope_deltas", None)
+    if callable(step_setter):
+        step_setter(model, deltas, list(uids))
+        return
+    model.set_batch_rope_deltas(deltas)
+
+
 def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
     """Slice a VLM extra tensor along its seq dimension.
 
@@ -1555,6 +1596,15 @@ class SchedulingPolicy(Enum):
     PRIORITY = "priority"  # Priority-based
 
 
+def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_enabled: bool, block_size: int) -> int:
+    """Size the prefill loops give the next chunk: the step, clamped to the next block boundary."""
+    next_n = min(step_size, remaining)
+    if boundary_enabled and block_size > 0:
+        delta = ((kv_total // block_size) + 1) * block_size - kv_total
+        if delta > 0:
+            next_n = min(next_n, delta)
+    return max(1, next_n)
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -1569,7 +1619,7 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
-    prefill_step_size: int = 4096
+    prefill_step_size: int = 2048
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
     # reduces TTFT for concurrent requests but adds per-step overhead.
@@ -2021,19 +2071,11 @@ class Scheduler:
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
-        _tracker_model_path = None
         if config is not None and config.model_name:
             _tracker_model_id = config.model_name
-            _tracker_model_path = getattr(config, "model_path", None) or None
         self._prefill_transient_tracker = PrefillTransientTracker(
-            model_id=_tracker_model_id,
-            model_path=_tracker_model_path,
+            model_id=_tracker_model_id
         )
-        # B3: seed EWMA from per-model persisted prior (same infra as pin profile)
-        try:
-            self._prefill_transient_tracker.load_prior()
-        except Exception:
-            pass
         self._sdpa256_bounded_route_active: bool | None = None
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
@@ -3721,6 +3763,7 @@ class Scheduler:
             prompt_cache, _cache_base_sizes(prompt_cache) + n_tokens
         )
 
+        Scheduler._announce_first_prefill_chunk(self, input_arr, base_size, boundary_enabled, block_size, embeds_array)
         while input_arr.shape[1] > 0:
             _trace_chunk_start = time.perf_counter()
             _trace_processed_before = processed_tokens
@@ -3801,6 +3844,7 @@ class Scheduler:
                         self.model,
                         getattr(request, "rope_deltas", 0.0),
                     )
+                    request.text_positions_proven = True
                 if embeds_array is not None and embeds_array.shape[1] > 0:
                     model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
                     if extra_kwargs:
@@ -3809,6 +3853,18 @@ class Scheduler:
                         )
                 if self._supports_skip_lm_head():
                     model_kwargs["skip_lm_head"] = True
+                # Tell a gather-ahead model (SSD-backed PLE rows) which tokens come next.
+                prefetch = getattr(self.model, "prefetch_ple", None)
+                if prefetch is not None and embeds_array is None and remaining > n_to_process:
+                    after = processed_tokens + n_to_process
+                    next_n = _expected_chunk_len(
+                        self._prefill_step_size_for_progress(after, remaining - n_to_process),
+                        remaining - n_to_process,
+                        base_size + after,
+                        boundary_enabled,
+                        block_size,
+                    )
+                    prefetch(input_arr[:, n_to_process : n_to_process + next_n], input_arr[:, :n_to_process])
                 prefill_model = getattr(self.model, "_omlx_prefill", self.model)
                 prefill_model(
                     input_arr[:, :n_to_process],
@@ -4080,20 +4136,6 @@ class Scheduler:
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
 
-    # Fase K F4 (port of faseJ 061d8b9): when measured samples exist, the
-    # static SDPA+KV estimate may only RAISE the per-token prediction up to
-    # this multiple of the measured rate. A static estimate that is wildly
-    # higher (e.g. a generic dense / head-count formula over-predicting a
-    # 4-bit MoE model by ~40x) is treated as untrustworthy and capped, so it
-    # cannot force every chunk to the floor and inflate TTFT (8k Qwen3.8:
-    # predicted ~67 GB vs actual ~11.6 GiB peak, throttled 2048 -> 512, ~7x
-    # slower). A static that is modestly higher than the measured rate
-    # (legitimate kv_len-growth the EWMA lags) still wins, preserving the
-    # MAX-of-signals safety backstop. Env-overridable.
-    _PREFILL_STATIC_MAX_OVER_MEASURED: float = float(
-        os.environ.get("OMLX_PREFILL_STATIC_MAX_OVER_MEASURED", "") or 3.0
-    )
-
     # Streaming expert mini-banks: predicted unique experts touched per layer
     # per chunk, as a fraction of chunk tokens. Measured ~0.145 on qwen4_exp
     # (215 uniq experts/layer at 1488-token chunks — real-text expert selection
@@ -4221,139 +4263,62 @@ class Scheduler:
     ) -> float:
         """Predict additional memory needed for the next prefill chunk.
 
-        The per-chunk SDPA/MoE transient scales with ``query_len * kv_len``, so
-        the per-token cost GROWS with context length. A long-run EWMA average
-        lags that growth and underestimates the next chunk — the cause of the
-        Metal command-buffer OOM crash at large kv_len. We therefore take the
-        MAX of the available signals and apply a safety factor:
-          - the most recently MEASURED per-token growth (last_delta / last_n)
-            — anchored on reality at the current kv_len regime (used only
-            once the tracker has real samples; a restored prior with
-            samples == 0 is NOT measurement — Fase K K3),
-          - the long-run EWMA (model-specific constants the static misses),
-          - the kv_len-aware static estimate (SDPA transient + this chunk's
-            newly allocated KV), used ONLY as a fallback for the first chunk
-            of a freshly loaded model, before any measurement exists.
-
-        Once the tracker has samples the measured signals dominate: a static
-        estimate can be off by an order of magnitude for some model classes
-        (a generic dense formula over-predicts a 4-bit MoE model by ~40x), so
-        letting it win the MAX permanently would throttle every chunk to the
-        floor and inflate TTFT (Fase K F4 — the 8k Qwen3.8 case: predicted
-        ~67 GB vs actual ~11.6 GiB peak, throttled 2048 -> 512).
-        Qwen4 models with flat prefill accounting are priced separately
-        below: token-scaled work statically, with measured overhead added
-        only once the pool releases it for reallocation.
-        Returns 0 only when nothing is known (first chunk, no model info).
+        Generic models use the largest static, EWMA, or last-chunk estimate,
+        including recent reclaim. Qwen4 uses its nonlinear static profile
+        plus observed overhead released from the pool. Retained overhead is
+        already included in current footprint and must not be charged again.
         """
         if n_tokens <= 0:
             return 0.0
-        measured_signal = 0.0
-        effective_static_per_token = 0.0
+        per_token = 0.0
+        static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
-        # Upstream (#3465): Qwen4 models with flat prefill accounting price
-        # token-scaled work statically and add measured overhead only once
-        # the pool releases it for reallocation — before the generic
-        # measured-vs-static reconciliation below.
-        if (
-            tracker is not None
-            and Scheduler._qwen4_prefill_accounting_enabled(self)
-        ):
-            static_per_token = 0.0
-            try:
-                if self.memory_monitor is not None:
-                    static = self.memory_monitor.estimate_chunk_transient_bytes(
-                        n_tokens,
-                        kv_len + n_tokens,
-                        gathered_core=gathered_core,
-                    )
-                    static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-                    static_per_token = float(static) / n_tokens
-            except Exception:  # noqa: BLE001
-                static_per_token = 0.0
-            return (
-                static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
-                + tracker.flat_overhead_charge_for(gathered_core)
+        if self.memory_monitor is not None:
+            static = self.memory_monitor.estimate_chunk_transient_bytes(
+                n_tokens,
+                kv_len + n_tokens,
+                gathered_core=gathered_core,
             )
+            static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
+            static_per_token = float(static) / n_tokens
+            per_token = static_per_token
+            # Expert streaming: the chunk's expert mini-bank transient
+            # ( uniq experts per layer, see _streaming_bank_bytes) rides
+            # on top of the static estimate. Zero for non-streaming models.
+            try:
+                bank_bytes = self._streaming_bank_bytes(n_tokens)
+            except Exception:  # noqa: BLE001
+                bank_bytes = 0
+            if bank_bytes > 0:
+                static_per_token += bank_bytes / n_tokens
+                per_token = max(per_token, static_per_token)
+        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
         if tracker is not None:
-            # The reclaim ledger is not measurement: it charges whatever
-            # footprint a chunk released until the next chunk confirms
-            # reallocation, so it is priced even before any sample exists.
-            recent_reclaim = tracker.recent_reclaim_bytes
+            if qwen4_flat_overhead:
+                # Qwen4 models token-scaled work statically. Add measured
+                # overhead only after the pool releases it for reallocation.
+                return (
+                    static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+                    + tracker.flat_overhead_charge_for(gathered_core)
+                )
             # Dense SDPA and gathered QSA have different cost curves. The
             # tracker keeps their measured histories separate, so switching
             # paths cannot reintroduce a stale dense charge after the first
             # gathered sample.
-            if tracker.samples_for(gathered_core) > 0:
-                # K3: measured signal exists ONLY after real chunk updates.
-                # A restored prior has samples == 0 (and zeroed deltas), so
-                # it never acts as measurement — the first chunk prices the
-                # static estimate instead of a stale prior that could
-                # underestimate the Metal peak under a changed regime.
-                last_n_tokens = tracker.last_n_tokens_for(gathered_core)
-                last_delta_bytes = tracker.last_delta_bytes_for(gathered_core)
-                if last_n_tokens > 0 and last_delta_bytes > 0:
-                    measured_signal = max(
-                        measured_signal, last_delta_bytes / last_n_tokens
-                    )
-                ewma = tracker.bytes_per_token_for(gathered_core)
-                if ewma > 0:
-                    measured_signal = max(measured_signal, ewma)
-
-        # Static SDPA+KV estimate. Model-specific by construction: a generic
-        # dense / head-count formula can over-predict a quantized MoE model
-        # by an order of magnitude (observed ~34.5 MB/token vs ~0.9 MB/token
-        # measured on Qwen3.8-Flash-Next-oQ4e). Wrapped so a monitor failure
-        # can never break chunk sizing — the measured signal (or the caller's
-        # watermark fallback) still applies.
-        static_total = 0.0
-        try:
-            if self.memory_monitor is not None:
-                static_total = float(
-                    self.memory_monitor.estimate_chunk_transient_bytes(
-                        n_tokens, kv_len + n_tokens, gathered_core=gathered_core
-                    )
-                )
-                static_total += float(
-                    self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-                )
-        except Exception:  # noqa: BLE001
-            static_total = 0.0
-        bank_bytes = 0
-        try:
-            bank_bytes = self._streaming_bank_bytes(n_tokens)
-        except Exception:  # noqa: BLE001
-            bank_bytes = 0
-
-        # Reconcile the static estimate with the measured signal:
-        #  - NO measured samples yet (first chunk of a freshly loaded model,
-        #    or a loaded prior whose samples were clamped to 0 — K3: the
-        #    prior is not measurement until the first real chunk): the
-        #    static estimate is the conservative fallback.
-        #  - measured samples exist: the static may only RAISE the per-token
-        #    prediction up to _PREFILL_STATIC_MAX_OVER_MEASURED x the
-        #    measured rate. A static that is modestly higher (legitimate
-        #    kv_len-growth the EWMA lags) still wins the MAX, preserving the
-        #    safety backstop; a static that is wildly higher (a generic dense
-        #    formula over-predicting a 4-bit MoE model by ~40x) is treated as
-        #    untrustworthy and capped, so it cannot permanently dominate the
-        #    MAX and force every chunk to the floor, inflating TTFT.
-        per_token = 0.0
-        if bank_bytes > 0 or static_total > 0:
-            raw_static_per_token = (static_total + bank_bytes) / n_tokens
-            if measured_signal <= 0:
-                effective_static_per_token = raw_static_per_token
-                per_token = max(measured_signal, raw_static_per_token)
-            else:
-                cap = measured_signal * self._PREFILL_STATIC_MAX_OVER_MEASURED
-                effective_static_per_token = min(raw_static_per_token, cap)
-                per_token = max(measured_signal, effective_static_per_token)
-        else:
-            per_token = measured_signal
+            ewma = tracker.bytes_per_token_for(gathered_core)
+            recent_reclaim = tracker.recent_reclaim_bytes
+            if ewma > 0:
+                per_token = max(per_token, ewma)
+            last_n_tokens = tracker.last_n_tokens_for(gathered_core)
+            last_delta_bytes = tracker.last_delta_bytes_for(gathered_core)
+            if last_n_tokens > 0 and last_delta_bytes > 0:
+                measured = last_delta_bytes / last_n_tokens
+                if measured > 0:
+                    per_token = max(per_token, measured)
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
-            effective_static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+            static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
             + recent_reclaim
         )
         return max(base_prediction, reallocation_prediction)
@@ -5405,11 +5370,6 @@ class Scheduler:
             floor_sample=n_tokens <= min_chunk,
             gathered_core=gathered_core,
         )
-        # B3: persist the updated prior immediately (best-effort)
-        try:
-            self._prefill_transient_tracker.save_prior()
-        except Exception:
-            pass
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
             loop_label,
@@ -5793,6 +5753,28 @@ class Scheduler:
             total_length=len(tokens),
         )
 
+    def _announce_first_prefill_chunk(self, tokens, base_size, boundary_enabled, block_size, embeds_array) -> None:
+        """Let a gather-ahead model start on the first chunk before the loop reaches it (empty current chunk)."""
+        prefetch = getattr(self.model, "prefetch_ple", None)
+        if prefetch is None or embeds_array is not None or tokens.shape[1] == 0:
+            return
+        remaining = tokens.shape[1]
+        first_n = _expected_chunk_len(
+            self._prefill_step_size_for_progress(0, remaining), remaining, base_size, boundary_enabled, block_size
+        )
+        prefetch(tokens[:, :first_n], tokens[:, :0])
+
+    def _next_prefill_chunk_len(self, state: _PrefillState, n: int) -> int:
+        remaining = state.tokens_remaining.shape[1]
+        processed = state.tokens_processed + n
+        return _expected_chunk_len(
+            self._prefill_step_size_for_progress(processed, remaining),
+            remaining,
+            state.base_size + processed,
+            state.boundary_enabled,
+            state.block_size,
+        )
+
     def _step_prefill_chunk(self, state: _PrefillState) -> bool:
         """Process one prefill chunk from *state*.
 
@@ -5820,6 +5802,7 @@ class Scheduler:
         if state.tokens_processed == 0:
             # Etapa D: gated, same rationale as the external prefill path.
             self._clear_cache_if_pool_large()
+            Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None)
             # Known horizon: size the QSA indexer once instead of doubling
             # mid-prefill (see _reserve_qsa_index_capacity).
             self._reserve_qsa_index_capacity(
@@ -5879,6 +5862,10 @@ class Scheduler:
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
+            # Tell a gather-ahead model (SSD-backed PLE rows) which tokens come next.
+            prefetch = getattr(self.model, "prefetch_ple", None)
+            if prefetch is not None and state.tokens_remaining.shape[1] > 0:
+                prefetch(state.tokens_remaining[:, : Scheduler._next_prefill_chunk_len(self, state, n)], chunk)
             # A chunked text prefill can yield to active decode between
             # forwards. Completion cleanup or the intervening decode batch may
             # replace the VLM adapter's process-local mRoPE state. Rebind this
@@ -5889,6 +5876,7 @@ class Scheduler:
                 self.model,
                 getattr(state.request, "rope_deltas", 0.0),
             )
+            state.request.text_positions_proven = True
             prefill_model = getattr(self.model, "_omlx_prefill", self.model)
             if self._supports_skip_lm_head():
                 prefill_model(chunk, cache=state.cache, skip_lm_head=True)
@@ -6128,6 +6116,7 @@ class Scheduler:
             if vlm_mtp_uid is not None:
                 self.request_id_to_uid[request.request_id] = vlm_mtp_uid
                 self.uid_to_request_id[vlm_mtp_uid] = request.request_id
+                _mark_text_positions(self.model, request, vlm_mtp_uid)
                 now = time.monotonic()
                 request.batch_uid = vlm_mtp_uid
                 request.status = RequestStatus.RUNNING
@@ -6174,6 +6163,7 @@ class Scheduler:
 
             if hasattr(self.model, "register_rope_delta"):
                 self.model.register_rope_delta(uid, request.rope_deltas)
+            _mark_text_positions(self.model, request, uid)
 
             self.total_prompt_tokens += request.num_prompt_tokens
             cache_info = (
@@ -6293,10 +6283,6 @@ class Scheduler:
             # Prefill complete — emit final boundary snapshot and insert.
             self._prefill_states.pop(rid, None)
             self._emit_final_boundary_if_needed(state)
-            # Etapa D: deliberately UNGATED — same handoff-to-decode role as
-            # the external prefill path's end-of-prefill clear. Upstream's
-            # Qwen4 flat-reclaim accounting rides on _clear_cache; call it so
-            # this path records what it releases, then trim anything left.
             Scheduler._clear_cache(self)
 
             # Ensure a BatchGenerator exists (may not if all requests were
@@ -7977,9 +7963,9 @@ class Scheduler:
         if self._boundary_cache_snapshots.get(request.request_id):
             return
         token_count = (
-            len(request.prompt_token_ids)
-            if request.needs_think_prefix
-            else request.num_tokens
+            request.num_tokens
+            if _output_tokens_cacheable(request)
+            else len(request.prompt_token_ids)
         )
         block_size = self.config.paged_cache_block_size
         if (
@@ -8023,8 +8009,8 @@ class Scheduler:
         Parser-side stops (for example tool-call end markers) can finish a request
         after a normal streaming token response. That response has no
         ``prompt_cache``, so the usual final-response cache extraction never runs.
-        This fallback stores only prompt tokens up to a prefill block boundary,
-        never generated output tokens.
+        This fallback stores the prompt, plus the output when the next turn
+        keeps it (``_output_tokens_cacheable``), up to a block boundary.
         """
         if self.block_aware_cache is None:
             return None
@@ -8036,6 +8022,8 @@ class Scheduler:
             return None
 
         prompt_tokens = list(request.prompt_token_ids or [])
+        if _output_tokens_cacheable(request):
+            prompt_tokens += list(getattr(request, "output_token_ids", None) or [])
         boundary_len = (len(prompt_tokens) // block_size) * block_size
         if boundary_len <= 0:
             return None
@@ -8092,12 +8080,12 @@ class Scheduler:
                 model_cache_config = boundary_model_config
 
             logger.info(
-                "Using prompt boundary cache snapshot for %s: storing %s/%s prompt "
-                "tokens after scheduler-side stop (skipping output tokens, %s "
-                "intermediate snapshots)",
+                "Using prompt boundary cache snapshot for %s: storing %s/%s "
+                "tokens after scheduler-side stop (%s, %s intermediate snapshots)",
                 request_id,
                 len(token_sequence),
                 len(prompt_tokens),
+                "prompt + output" if _output_tokens_cacheable(request) else "prompt only",
                 len(intermediate_snapshots) if intermediate_snapshots else 0,
             )
             return (
@@ -9213,6 +9201,10 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        if self.block_aware_cache is not None:
+            # Arm MTP boundary alignment now: a prompt shorter than a block meets
+            # its first boundary mid-decode, before any capture would arm it.
+            self._detect_boundary_snapshot_need()
         # Prefix-cache lookup is intentionally delayed until admission. That
         # lets a same-prefix request wait for a relevant in-flight store_cache
         # without blocking the scheduler lane that continues decode/prefill.
@@ -11644,6 +11636,7 @@ class Scheduler:
                 # Register per-UID rope_delta for mRoPE decode.
                 if hasattr(self.model, "register_rope_delta"):
                     self.model.register_rope_delta(uid, request.rope_deltas)
+                _mark_text_positions(self.model, request, uid)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = (
@@ -12050,13 +12043,12 @@ class Scheduler:
                                 ) = prompt_boundary_store
                                 cacheable_sequence = list(token_sequence_to_store)
                             else:
-                                # For reasoning models, only cache prompt tokens.
-                                # Output contains <think> tokens that the API layer
-                                # strips before the next turn, so they never match.
-                                if getattr(request, "needs_think_prefix", False):
-                                    cacheable_sequence = list(request.prompt_token_ids)
-                                else:
+                                if _output_tokens_cacheable(request):
                                     cacheable_sequence = full_token_sequence
+                                else:
+                                    # <think> output is stripped before the next
+                                    # turn, so it can never prefix-match.
+                                    cacheable_sequence = list(request.prompt_token_ids)
                                 token_sequence_to_store = cacheable_sequence
                                 cache_to_store = request._extracted_cache
                                 model_cache_config = getattr(

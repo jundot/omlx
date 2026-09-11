@@ -214,9 +214,16 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
         for key, val in quant.items():
             if not isinstance(val, dict):
                 continue
-            if "mode" not in val:
-                # JANGQ publisher specs omit the mode; the triples carry
-                # scales+biases, so affine is the only valid reading.
+            if "mode" not in val and (
+                # JANGQ publisher specs omit the mode on fused-expert triples
+                # (and the dsv4 8-bit bookends); those carry scales+biases,
+                # so affine is the only valid reading. Every other modeless
+                # spec keeps the loader default (do not touch: main relies
+                # on the spec passing through unchanged).
+                ".experts.gate_up_proj" in key
+                or ".experts.down_proj" in key
+                or key in ("embed", "head")
+            ):
                 val["mode"] = "affine"
             # Laguna router overrides: published checkpoints key the
             # per-layer quantization spec by ``mlp.gate``, but the model's
@@ -924,7 +931,7 @@ def maybe_apply_pre_load_patches(
             mode=(
                 "mmap"
                 if model_settings is not None
-                and getattr(model_settings, "qwen4_ple_ssd_offload", True)
+                and getattr(model_settings, "qwen4_ple_ssd_offload", False)
                 else "resident" if model_settings is not None else None
             ),
             mtp_enabled=mtp_active,
