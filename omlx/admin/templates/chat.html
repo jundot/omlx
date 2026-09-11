@@ -1466,6 +1466,24 @@
                             </div>
                         </div>
 
+                        <!-- Images returned by an MCP tool. Same plain container as
+                             the web card above: the tool message itself stays out of
+                             the transcript, but renderable content it carried does not. -->
+                        <div x-show="msg.role === 'tool' && (msg._images?.length || msg._imagesStripped)"
+                            class="max-w-3xl">
+                            <div x-show="msg._images?.length" class="my-1 flex flex-wrap gap-2">
+                                <template x-for="(imgUrl, ii) in (msg._images || [])" :key="ii">
+                                    <img :src="imgUrl" @click="openImageModal(imgUrl)"
+                                        class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
+                                </template>
+                            </div>
+                            <div x-show="!msg._images?.length && msg._imagesStripped"
+                                class="my-1 rounded-xl border border-line bg-surface-muted px-3.5 py-2.5 text-xs"
+                                style="color: var(--text-tertiary);"
+                                x-text="window.t('chat.tool_images_stripped').replace('{count}', msg._imagesStripped)">
+                            </div>
+                        </div>
+
                         <!-- Assistant Message -->
                         <div x-show="msg.role === 'assistant' && !msg._toolRound && msg._ui !== false" class="assistant-message">
                             <div class="message-header">
@@ -3175,7 +3193,8 @@
                 // Tool-round turns and web tool cards are _ui:false for the
                 // API/variant machinery but still render, following their
                 // segment's final assistant variant.
-                if (msg._toolRound || (msg.role === 'tool' && msg._web)) {
+                if (msg._toolRound
+                    || (msg.role === 'tool' && (msg._web || msg._images || msg._imagesStripped))) {
                     return this.isToolFlowVisible(index);
                 }
                 if (msg._ui === false) return false;
@@ -4144,6 +4163,46 @@
                 }
             }
         ];
+    },
+
+    // MCP tool results can carry rendered media (image blocks) alongside
+    // their text. Those belong in the transcript, not in the model's context:
+    // one 768x768 PNG is ~1MB of base64, which the model cannot read and which
+    // is large enough to evict the rest of the chat from a small context
+    // window. So images are split out for display and the model gets a note.
+    splitToolContent(content) {
+        const parts = Array.isArray(content) ? content : [content];
+        const images = [];
+        const text = [];
+        let blobs = 0;
+        for (const part of parts) {
+            const blob = this.toolBlobPart(part);
+            if (blob && blob.mime.startsWith('image/')) {
+                images.push(`data:${blob.mime};base64,${blob.data}`);
+            } else if (blob) {
+                blobs++;
+            } else if (typeof part === 'string') {
+                text.push(part);
+            } else if (part !== null && part !== undefined) {
+                text.push(JSON.stringify(part));
+            }
+        }
+        if (blobs) {
+            text.unshift(window.t('chat.tool_binary_note').replace('{count}', blobs));
+        }
+        if (images.length) {
+            text.unshift(window.t('chat.tool_images_note').replace('{count}', images.length));
+        }
+        return { content: text.join('\n'), images };
+    },
+
+    // A non-text content block from an MCP tool: { type, mime_type, data }.
+    toolBlobPart(part) {
+        if (!part || typeof part !== 'object') return null;
+        const mime = part.mime_type || part.mimeType;
+        if (typeof mime !== 'string' || !mime) return null;
+        if (typeof part.data !== 'string' || !part.data) return null;
+        return { mime, data: part.data };
     },
 
     // Parsed summary of a built-in web tool result, rendered as an
@@ -5398,6 +5457,37 @@
         this.sidebarOpen = window.innerWidth >= 768;
     },
 
+    // Payloads too large for localStorage: base64 uploads inside content
+    // arrays, and images an MCP tool returned (~1MB each as a data URL). The
+    // image count survives so a reloaded chat can say one was there.
+    messageForStorage(msg) {
+        let out = msg;
+        if (out._images?.length) {
+            const { _images, ...rest } = out;
+            out = { ...rest, _imagesStripped: _images.length };
+        }
+        if (!Array.isArray(out.content)) return out;
+        return {
+            ...out,
+            content: out.content.map(part => {
+                if (part.type === 'image_url') {
+                    return { type: 'image_url', image_url: { url: '' } };
+                }
+                if (part.type === 'file') {
+                    return {
+                        type: 'file',
+                        file: {
+                            filename: part.file?.filename || '',
+                            mime_type: part.file?.mime_type || '',
+                            data: '',
+                        },
+                    };
+                }
+                return part;
+            })
+        };
+    },
+
     saveCurrentChat(
         chatId = this.currentChatId,
         messages = null,
@@ -5412,29 +5502,7 @@
         const existingIndex = this.chatHistory.findIndex(c => c.id === chatId);
         const existingChat = existingIndex >= 0 ? this.chatHistory[existingIndex] : null;
 
-        // Strip base64 image data from content arrays to avoid localStorage quota issues
-        const messagesForStorage = messagesToSave.map(msg => {
-            if (!Array.isArray(msg.content)) return msg;
-            return {
-                ...msg,
-                content: msg.content.map(part => {
-                    if (part.type === 'image_url') {
-                        return { type: 'image_url', image_url: { url: '' } };
-                    }
-                    if (part.type === 'file') {
-                        return {
-                            type: 'file',
-                            file: {
-                                filename: part.file?.filename || '',
-                                mime_type: part.file?.mime_type || '',
-                                data: '',
-                            },
-                        };
-                    }
-                    return part;
-                })
-            };
-        });
+        const messagesForStorage = messagesToSave.map(msg => this.messageForStorage(msg));
 
         const title = this.resolveAutoChatTitle(messagesToSave, existingChat);
 
@@ -6421,13 +6489,11 @@
                         }
                         const execData = await execResp.json();
                         // /v1/web endpoints return the whole payload; MCP wraps it in .content
-                        const content = webRoute
-                            ? JSON.stringify(execData)
-                            : (typeof execData.content === 'string'
-                                ? execData.content
-                                : JSON.stringify(execData.content ?? execData));
+                        const { content, images } = webRoute
+                            ? { content: JSON.stringify(execData), images: [] }
+                            : this.splitToolContent(execData.content ?? execData);
                         const web = webRoute ? this.buildWebCard(toolName, args, execData) : null;
-                        return { content, error: false, toolName, elapsed, web };
+                        return { content, error: false, toolName, elapsed, web, images };
                     } catch (e) {
                         const elapsed = ((Date.now() - (stream._toolTimers[toolName] || Date.now())) / 1000).toFixed(2);
                         const isTimeout = e.name === 'TimeoutError';
@@ -6459,6 +6525,7 @@
                         content: results[i].content,
                         _ui: false,
                         ...(results[i].web ? { _web: results[i].web } : {}),
+                        ...(results[i].images?.length ? { _images: results[i].images } : {}),
                     });
                 });
 
@@ -6851,28 +6918,7 @@
         };
         this.chatSessions[branchId] = branchSession;
 
-        const messagesForStorage = branchMessages.map(msg => {
-            if (!Array.isArray(msg.content)) return msg;
-            return {
-                ...msg,
-                content: msg.content.map(part => {
-                    if (part.type === 'image_url') {
-                        return { type: 'image_url', image_url: { url: '' } };
-                    }
-                    if (part.type === 'file') {
-                        return {
-                            type: 'file',
-                            file: {
-                                filename: part.file?.filename || '',
-                                mime_type: part.file?.mime_type || '',
-                                data: '',
-                            },
-                        };
-                    }
-                    return part;
-                })
-            };
-        });
+        const messagesForStorage = branchMessages.map(msg => this.messageForStorage(msg));
 
         const branchData = {
             id: branchId,
