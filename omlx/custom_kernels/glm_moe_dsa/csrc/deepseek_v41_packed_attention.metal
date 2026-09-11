@@ -16,4 +16,4 @@
       uint,                                                                      \
       float)
 
-instantiate_deepseek_v41_packed_attention(bfloat16, bfloat16_t, 128, 32, 64, 512, 8);
+instantiate_deepseek_v41_packed_attention(bfloat16, bfloat16_t, 64, 32, 64, 512, 8);

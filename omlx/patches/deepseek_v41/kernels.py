@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed CSA2 Metal kernels, following local DSV4 WSDPA and DSA scan patterns.
 
-Attention uses split-K online softmax, with float SIMD-matrix tiles for prefill.
+BF16 attention uses 64-key online maxima and BF16 PV probabilities.
+Other floating-point inputs retain the split-K FP32 probability path.
 Index scoring fuses the head reduction and optionally visits explicit candidates.
 The matrix fragment layout follows MLX-derived Bonsai kernels (Apple Inc.). No checkpoint or
 compiled extension is required; compilation/dispatch errors propagate.
@@ -10,6 +11,8 @@ compiled extension is required; compilation/dispatch errors propagate.
 from functools import cache
 
 import mlx.core as mx
+
+from .packed_attention import rounded_packed_attention
 
 _HEADER = r"""
 #include <metal_stdlib>
@@ -354,6 +357,9 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
         raise ValueError("Expected packed uint8 KV")
     if window.shape[-1] != dim + dim // 32 or pooled.shape[-1] != dim // 2 + dim // 16:
         raise ValueError("Invalid packed KV row width")
+    if q.dtype == mx.bfloat16:
+        return rounded_packed_attention(q, window, pooled, wi, ci, sink, scale)
+
     # Short verification blocks share the decode reduction and split geometry.
     # Each query owns its causal indices while all rows share one dispatch.
     chunk = 32 if length <= 8 else 128

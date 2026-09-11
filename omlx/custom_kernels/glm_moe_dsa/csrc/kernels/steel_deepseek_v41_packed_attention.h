@@ -7,35 +7,35 @@
 
 using namespace mlx::steel;
 
-struct DeepseekV4SparseMaxOp {
+struct DeepseekV41SparseMaxOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
     return metal::max(x, y);
   }
 };
 
-struct DeepseekV4SparseSumOp {
+struct DeepseekV41SparseSumOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
     return x + y;
   }
 };
 
-struct DeepseekV4SparseMulOp {
+struct DeepseekV41SparseMulOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
     return x * y;
   }
 };
 
-struct DeepseekV4SparseExpSubOp {
+struct DeepseekV41SparseExpSubOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
-    return fast::exp2(x - y);
+    return metal::exp(x - y);
   }
 };
 
-struct DeepseekV4SparseDivOp {
+struct DeepseekV41SparseDivOp {
   template <typename T>
   METAL_FUNC static constexpr T apply(T x, T y) {
     return x / y;
@@ -135,7 +135,7 @@ template <
   const short Ks_offset = sm * LDK + sn;
   const short Vs_offset = sm * LDV + sn;
 
-  const AccumType scale = AccumType(params->scale * M_LOG2E_F);
+  const AccumType scale = AccumType(params->scale);
 
   constexpr short rows_per_thread = decltype(Stile)::kRowsPerThread;
   AccumType max_score[rows_per_thread];
@@ -145,8 +145,7 @@ template <
   for (short i = 0; i < rows_per_thread; ++i) {
     const int head = int(tm + sm + i * kFragSize);
     if (head < params->H) {
-      max_score[i] = AccumType(M_LOG2E_F) * AccumType(Sinks[head]);
-      sum_score[i] = AccumType(1);
+      max_score[i] = AccumType(-1e30f);
     } else {
       max_score[i] = Limits<AccumType>::finite_min;
     }
@@ -167,33 +166,26 @@ template <
       metal::min(params->localL, local_offset + q_pos + 1);
   const int local_start =
       metal::max(0, local_end - params->local_window);
-  const int local_count = metal::max(0, local_end - local_start);
-  const int local_tiles = (local_count + BK - 1) / BK;
-  const int pooled_tiles = (params->topk + BK - 1) / BK;
+  // Tile the concatenated index list, including masked window slots.
+  const int window_slots = params->q_offset == 0
+      ? metal::min(params->local_window, params->qL) : params->local_window;
+  const int window_first = params->q_offset == 0
+      ? local_start : local_end - window_slots;
   const int pooled_valid = metal::min(
       params->pooledL,
       (params->q_offset + q_pos + 1) / params->compress_ratio);
-  const int total_tiles = local_tiles + pooled_tiles;
+  const int total_tiles = (window_slots + params->topk + BK - 1) / BK;
 
   for (int ktile = 0; ktile < total_tiles; ++ktile) {
-    const bool is_pooled_tile = ktile >= local_tiles;
-    const int tile_slot = is_pooled_tile ? (ktile - local_tiles) : ktile;
-    const int slot_base = tile_slot * BK;
-
     for (int k = lane; k < BK; k += tgp_size) {
-      const int slot = slot_base + k;
+      const int slot = ktile * BK + k;
       int k_pos = -1;
-      if (is_pooled_tile) {
-        if (slot < params->topk) {
-          const int pooled_pos = int(topk_base[slot]);
-          if (pooled_pos >= 0 && pooled_pos < pooled_valid) {
-            k_pos = pooled_pos;
-          }
-        }
-      } else {
-        if (slot < local_count) {
-          k_pos = local_start + slot;
-        }
+      if (slot < window_slots) {
+        const int row = window_first + slot;
+        if (row >= 0 && row < local_end) k_pos = row;
+      } else if (slot < window_slots + params->topk) {
+        const int row = int(topk_base[slot - window_slots]);
+        if (row >= 0 && row < pooled_valid) k_pos = params->localL + row;
       }
       selected[k] = k_pos;
     }
@@ -219,9 +211,11 @@ template <
         const int k_pos = selected[k];
         T value = T(0);
         if (k_pos >= 0) {
+          const bool is_pooled_tile = k_pos >= params->localL;
+          const int source_pos = is_pooled_tile ? k_pos - params->localL : k_pos;
           const device uchar* row = is_pooled_tile
-              ? pooled_base + size_t(k_pos) * params->Pooled_strides[1]
-              : local_base + size_t(k_pos) * params->Local_strides[2];
+              ? pooled_base + size_t(source_pos) * params->Pooled_strides[1]
+              : local_base + size_t(source_pos) * params->Local_strides[2];
           value = T(deepseek_v41_packed_value(row, dbase + d, is_pooled_tile));
         }
         KVs[k + d * LDK] = value;
@@ -274,24 +268,29 @@ template <
       new_max[i] = max_score[i];
     }
 
-    Stile.template row_reduce<DeepseekV4SparseMaxOp>(new_max);
-    Stile.template row_bin_op<DeepseekV4SparseExpSubOp>(new_max);
+    Stile.template row_reduce<DeepseekV41SparseMaxOp>(new_max);
+    Stile.template row_bin_op<DeepseekV41SparseExpSubOp>(new_max);
 
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < rows_per_thread; ++i) {
-      factor[i] = fast::exp2(max_score[i] - new_max[i]);
+      factor[i] = metal::exp(max_score[i] - new_max[i]);
       max_score[i] = new_max[i];
     }
 
     AccumType sum_score_tmp[rows_per_thread] = {0};
-    Stile.template row_reduce<DeepseekV4SparseSumOp>(sum_score_tmp);
+    Stile.template row_reduce<DeepseekV41SparseSumOp>(sum_score_tmp);
 
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < rows_per_thread; ++i) {
       sum_score[i] = sum_score[i] * factor[i] + sum_score_tmp[i];
     }
 
-    Otile.template row_bin_op<DeepseekV4SparseMulOp>(factor);
+    // The denominator retains FP32 probabilities; only PV rounds to BF16.
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < decltype(Stile)::kElemsPerTile; ++i)
+      Stile.elems()[i] = AccumType(T(Stile.elems()[i]));
+
+    Otile.template row_bin_op<DeepseekV41SparseMulOp>(factor);
 
     STEEL_PRAGMA_UNROLL
     for (short vchunk = 0; vchunk < D_CHUNKS; ++vchunk) {
@@ -303,9 +302,11 @@ template <
         const int k_pos = selected[k];
         T value = T(0);
         if (k_pos >= 0) {
+          const bool is_pooled_tile = k_pos >= params->localL;
+          const int source_pos = is_pooled_tile ? k_pos - params->localL : k_pos;
           const device uchar* row = is_pooled_tile
-              ? pooled_base + size_t(k_pos) * params->Pooled_strides[1]
-              : local_base + size_t(k_pos) * params->Local_strides[2];
+              ? pooled_base + size_t(source_pos) * params->Pooled_strides[1]
+              : local_base + size_t(source_pos) * params->Local_strides[2];
           value = T(deepseek_v41_packed_value(row, dbase + d, is_pooled_tile));
         }
         KVs[k * LDV + d] = value;
@@ -336,7 +337,13 @@ template <
     }
   }
 
-  Otile.template row_bin_op<DeepseekV4SparseDivOp>(sum_score);
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < rows_per_thread; ++i) {
+    const int head = int(tm + sm + i * kFragSize);
+    if (head < params->H)
+      sum_score[i] += metal::exp(AccumType(Sinks[head]) - max_score[i]);
+  }
+  Otile.template row_bin_op<DeepseekV41SparseDivOp>(sum_score);
 
   device T* out = O + size_t(b) * params->O_strides[0] +
       size_t(q_pos) * params->O_strides[2] +

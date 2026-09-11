@@ -118,7 +118,7 @@ class DeepseekV41PackedAttentionPrimitive : public Primitive {
     const auto& sinks = inputs[4];
     auto& o = outputs[0];
 
-    constexpr int bk = 128;
+    constexpr int bk = 64;
     constexpr int dc = 32;
     constexpr int h = 64;
     constexpr int dim = 512;

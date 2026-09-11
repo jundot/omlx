@@ -287,7 +287,11 @@ class Attention(nn.Module):
             verify_state["window"] = kv
         cache[1] = kv[:, -c.window_size :]
         # List only the causal local window, including the current token.
-        local = positions[:, None] - c.window_size + 1 + mx.arange(c.window_size)
+        if start == 0:
+            local = mx.maximum(positions[:, None] - c.window_size + 1, 0)
+            local = local + mx.arange(min(length, c.window_size))
+        else:
+            local = positions[:, None] - c.window_size + 1 + mx.arange(c.window_size)
         valid = (local >= max(0, start - old_len)) & (local <= positions[:, None])
         idx = mx.where(valid, local - (start - old_len), -1)[None]
         pooled = mx.zeros((1, 0, c.head_dim // 2 + c.head_dim // 16), mx.uint8)
