@@ -1111,7 +1111,8 @@ class ModelSettingsManager:
                 conflicts.append(str(error))
         if conflicts:
             raise InvalidProfileSettingsError(
-                "Settings would invalidate saved profiles: " + "; ".join(conflicts)
+                "Cannot save settings: saved profiles conflict with the resulting "
+                "configuration: " + "; ".join(conflicts)
             )
 
     def validate_profiles_for_settings(

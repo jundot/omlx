@@ -29,9 +29,13 @@ these changes. Global defaults remain unchanged. Profiles and model loading
 revalidate adapter availability; a stale profile cannot replace working settings.
 
 Profile creation and updates validate the effective base-plus-profile settings.
-A base save or profile application that would invalidate saved profiles is rejected
-with their names and conflicts. A profile can explicitly set `uno_enabled: false`
-to use ordinary decoding with its own sampling settings.
+Every base-model save and profile application validates all saved profiles against
+the resulting base settings. The operation is rejected if any profile remains
+incompatible, including conflicts that existed before the change; the error lists
+the affected profiles and conflicts. This also applies to pin, favorite and alias
+changes. Repair or delete the conflicting profiles, or choose base settings that
+make them compatible, before saving. A profile can explicitly set
+`uno_enabled: false` to use ordinary decoding with its own sampling settings.
 Already-invalid exposed profiles remain in `/v1/models` and `/v1/models/status`
 with `invalid: true` and an `invalid_reason`; the server logs a warning. Requests
 to those aliases return a 400 naming the conflict. Repairing the profile clears
