@@ -127,6 +127,33 @@ class TestResolveBlockExtraKeys:
 
         assert resolve_block_extra_keys(4, extra_key_ranges=ranges) == ("image-1",)
 
+    def test_unsorted_ranges_fall_back_to_legacy_keys(self):
+        """Non-monotonic boundaries must not raise; they resolve unsalted."""
+        ranges = [
+            (9, ("image-1", "image-2")),
+            (5, ("image-1",)),
+        ]
+
+        assert resolve_block_extra_keys(12, extra_key_ranges=ranges) is None
+        assert (
+            resolve_block_extra_keys(
+                12,
+                extra_key_token_start=16,
+                extra_keys=("legacy-image",),
+                extra_key_ranges=ranges,
+            )
+            is None
+        )
+
+    def test_unsorted_ranges_do_not_raise_without_legacy_keys(self):
+        """The scheduler lookup path must survive compacted VLM histories."""
+        ranges = [
+            (20, ("image-1",)),
+            (10, ("image-1", "image-2")),
+        ]
+
+        assert resolve_block_extra_keys(24, extra_key_ranges=ranges) is None
+
 
 class TestCacheBlock:
     """Tests for CacheBlock dataclass."""
