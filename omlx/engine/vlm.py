@@ -64,6 +64,7 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
 # unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
@@ -1830,7 +1831,35 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                    # Single predicate shared with EnginePool and the
+                    # converter (engine/batched.py carries the same call).
+                    #
+                    # The old two-element tuple left every supported MoE VLM
+                    # except these two (glm_moe_dsa, deepseek_v4, ...) fully
+                    # materializing its banks at load — with expert streaming
+                    # enabled that is the OOM path, since the converter only
+                    # reaches the banks on a lazy model.
+                    #
+                    # Still not gated on expert_streaming_enabled: lazy
+                    # loading is a peak-memory win on its own for these
+                    # checkpoints, and dropping it would regress loads with
+                    # the feature turned off. Because that makes this run on
+                    # EVERY VLM load, the cheap allowlist test short-circuits
+                    # the header scan for everything else — the estimate would
+                    # reject those anyway (it requires the same allowlist), so
+                    # this is an optimization, not a second opinion.
+                    from ..patches.expert_streaming import is_supported_model_type
+                    from ..patches.expert_streaming.residency import (
+                        expert_streaming_estimate,
+                    )
+
+                    if is_supported_model_type(model_type) and expert_streaming_estimate(
+                        self._model_name
+                    ).supported:
+                        # Lazy-load so giant MoE checkpoints (Qwen3.8-Flash-Next
+                        # 99G, GLM-5.3-Flash-oQ4e 190G) stream from SSD instead of
+                        # materializing fully in RAM; expert streaming replaces
+                        # the MoE projections afterwards.
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
@@ -1867,8 +1896,50 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_name,
                 )
 
+        # Expert streaming (SSD): keep hot experts resident, stream the rest.
+        # Runs BEFORE materialize_lazy_state on purpose. On lazy-loaded
+        # checkpoints (qwen4_exp, glm5_next) every tensor is a plain mx.array
+        # and materialize_lazy_state would evaluate the entire tree — including
+        # the multi-hundred-GB MoE expert banks (OOM). Converting to streaming
+        # first drops those arrays (GC'd), so the materialize that follows only
+        # evaluates dense weights, RoPE freqs and vision/audio towers.
+        # Also runs before gate+up fusion (fusion would change the stacked
+        # layout).
+        if getattr(self._model_settings, "expert_streaming_enabled", False):
+            try:
+                from ..patches.expert_streaming import convert_model_to_streaming
+
+                def _do_vlm_streaming():
+                    _, backing = convert_model_to_streaming(
+                        self._vlm_model, self._model_name, self._model_settings
+                    )
+                    if backing is not None:
+                        self._expert_streaming_backing = backing
+                        try:
+                            self._vlm_model._expert_streaming_backing = backing  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    return backing
+
+                await loop.run_in_executor(get_mlx_executor(), _do_vlm_streaming)
+                logger.info("Expert streaming enabled for VLM %s", self._model_name)
+            except Exception as e:
+                # Fail clean: streaming was explicitly enabled, so a backing
+                # failure must fail the load — continuing to materialize
+                # would retain all expert banks in RAM (OOM).
+                logger.error(
+                    "Expert streaming conversion failed for VLM %s: %s",
+                    self._model_name,
+                    e,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"Expert streaming conversion failed for VLM {self._model_name}: {e}"
+                ) from e
+
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
+        # Post-streaming: the MoE banks are gone, so this stays bounded.
         from ..utils.model_loading import materialize_lazy_state
 
         await loop.run_in_executor(
@@ -1895,10 +1966,12 @@ class VLMBatchedEngine(BaseEngine):
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
-        # the MLX executor because it rewrites weights in place.
+        # the MLX executor because it rewrites weights in place. Skip when
+        # expert streaming is active — streaming already handles the projection layout.
         if (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
+            and not getattr(self._model_settings, "expert_streaming_enabled", False)
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (
@@ -2402,6 +2475,22 @@ class VLMBatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        # Persist the learned expert-pin profile while the backing is still
+        # reachable (teardown below drops it with the model).
+        from omlx.patches.expert_streaming import (
+            save_expert_pin_profile,
+            shutdown_expert_streaming,
+        )
+
+        save_expert_pin_profile(self)
+        try:
+            shutdown_expert_streaming(getattr(self, "_expert_streaming_backing", None))
+        except Exception:
+            pass
+        try:
+            self._expert_streaming_backing = None
+        except Exception:
+            pass
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
@@ -3819,6 +3908,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
+    
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -3852,6 +3942,48 @@ class VLMBatchedEngine(BaseEngine):
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await engine.abort_request(request_id)
+            else:
+                self._log_streaming_summary()
+
+    def _log_streaming_summary(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """Parity with BatchedEngine: one-line MoE streaming health log.
+
+        No-op unless expert streaming is active (VLM wrappers serve the
+        largest streaming checkpoints — qwen4_exp/glm5_next).
+        """
+        try:
+            backing = getattr(self, "_expert_streaming_backing", None)
+            if backing is None:
+                return
+            # Dynamic residency: parity with BatchedEngine (opt-in).
+            governor = getattr(backing, "governor", None)
+            if governor is not None:
+                governor.observe()
+            from ..patches.expert_streaming import expert_streaming_summary
+
+            cache = getattr(backing, "_streaming_cache", None)
+            summary = expert_streaming_summary(cache, backing)
+            if not summary:
+                return
+            logger.info(
+                "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
+                "(h=%d m=%d evict=%d size=%d/%d) advised=%d "
+                "ctx_fallbacks=%s",
+                prompt_tokens,
+                completion_tokens,
+                summary.get("lru_hit_rate", 0.0),
+                summary.get("lru_hits", 0),
+                summary.get("lru_misses", 0),
+                summary.get("lru_evictions", 0),
+                summary.get("lru_size", 0),
+                summary.get("lru_capacity", 0),
+                summary.get("advised", 0),
+                summary.get("ctx_fallbacks", {}),
+            )
+        except Exception:
+            pass
 
     async def chat(
         self,

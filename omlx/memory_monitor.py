@@ -1409,14 +1409,152 @@ def _make_qwen4_exp_prefill_memory_profile(
     )
 
 
+@dataclass(frozen=True)
+class _Glm5NextPrefillMemoryProfile:
+    """Prefill estimator for GLM-5.x hybrid linear + sparse (DSA) attention.
+
+    Linear layers keep a fixed recurrent state (priced by the monitor's
+    measured fixed-state term, not here). Each sparse layer keeps a latent
+    MLA cache (``kv_lora_rank + qk_rope_head_dim`` per token, single head)
+    plus indexer keys pooled by ``index_kpool``. The sparse core attends at
+    most ``index_topk`` gathered tokens per query: dense ``Q x kv_len`` SDPA
+    is the wrong price for that core (at 200k context it over-predicts by
+    ~50x and the guard rejects prompts that fit).
+
+    Converted GLM decoders honor the streaming per-layer eval boundary
+    unconditionally (inline ``_stream_eval``), so only one sparse layer's
+    working set is live at a time: the transient prices a single layer,
+    consistent with the scheduler's ``min(2, projections)`` bank charge.
+    A hypothetical full-weight (non-streaming) load keeps every layer's
+    transient live and this single-layer price under-counts it — acceptable:
+    a 95 GB checkpoint cannot load on Apple Silicon any other way, and the
+    measured-signal terms still guard that regime.
+    """
+
+    sparse_layers: int
+    num_attention_heads: int
+    v_head_dim: int
+    kv_latent_dim: int
+    index_head_dim: int
+    index_topk: int
+    index_kpool: int
+    dtype_size: float
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int:
+        if num_tokens <= 0 or self.sparse_layers <= 0:
+            return 0
+        num_tokens = int(num_tokens)
+        # Latent MLA key (+ zero-width values) plus pooled indexer keys.
+        # Every sparse layer's caches stay resident simultaneously.
+        per_token = self.kv_latent_dim + (
+            self.index_head_dim / max(self.index_kpool, 1)
+        )
+        return int(
+            self.sparse_layers * per_token * num_tokens * self.dtype_size
+        )
+
+    def estimate_prefill_transient_bytes(
+        self, query_tokens: int, kv_len: int
+    ) -> int:
+        if query_tokens <= 0 or kv_len <= 0:
+            return 0
+        query_tokens = int(query_tokens)
+        kv_len = int(kv_len)
+        pooled = max(kv_len // max(self.index_kpool, 1), 1)
+        # Indexer scores every pooled block in fp32 and materializes the
+        # selected top-k indices (int32, plus the kpool tail).
+        indexer = int(
+            query_tokens * pooled * 4
+            + query_tokens * self.index_head_dim * 4
+            + query_tokens * (self.index_topk + self.index_kpool) * 4
+        )
+        # Gathered core attends at most topk (+kpool tail) tokens per query,
+        # never the full kv_len.
+        core_kv = min(kv_len, self.index_topk + self.index_kpool - 1)
+        core = estimate_unfused_sdpa_call_bytes(
+            self.num_attention_heads,
+            query_tokens,
+            core_kv,
+            self.v_head_dim,
+            self.dtype_size,
+        )
+        return indexer + core
+
+
+def _make_glm5_next_prefill_memory_profile(
+    config: Any,
+    *,
+    compute_dtype_size: float,
+    num_kv_cache_layers: int | None = None,
+) -> _Glm5NextPrefillMemoryProfile | None:
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    num_attention_heads = _cfg_get(config, "num_attention_heads")
+    kv_lora_rank = _cfg_get(config, "kv_lora_rank")
+    rope_dim = _cfg_get(config, "qk_rope_head_dim")
+    nope_dim = _cfg_get(config, "qk_nope_head_dim")
+    v_head_dim = _cfg_get(config, "v_head_dim")
+    index_head_dim = _cfg_get(config, "index_head_dim")
+    index_topk = _cfg_get(config, "index_topk")
+    index_kpool = _cfg_get(config, "index_kpool") or 4
+    if not isinstance(compute_dtype_size, (int, float)) or compute_dtype_size <= 0:
+        return None
+    required = (
+        num_layers,
+        num_attention_heads,
+        kv_lora_rank,
+        nope_dim,
+        v_head_dim,
+        index_head_dim,
+        index_topk,
+    )
+    if not all(_pos_int(value) for value in required):
+        return None
+    if not _nonnegative_int(rope_dim):
+        return None
+    # Sparse layers are the non-linear entries of layer_types
+    # ("deepseek_sparse_attention" vs "linear_attention"). Fall back to
+    # the classified full-KV layer count when the config omits the list.
+    sparse_layers = 0
+    layer_types = _cfg_get(config, "layer_types") or ()
+    if isinstance(layer_types, Sequence) and not isinstance(
+        layer_types, (str, bytes)
+    ):
+        sparse_layers = sum(
+            1 for kind in layer_types if str(kind) != "linear_attention"
+        )
+    if sparse_layers <= 0 and _pos_int(num_kv_cache_layers):
+        sparse_layers = int(num_kv_cache_layers)
+    if sparse_layers <= 0:
+        return None
+    return _Glm5NextPrefillMemoryProfile(
+        sparse_layers=int(sparse_layers),
+        num_attention_heads=int(num_attention_heads),
+        v_head_dim=int(v_head_dim),
+        kv_latent_dim=int(kv_lora_rank) + int(rope_dim),
+        index_head_dim=int(index_head_dim),
+        index_topk=int(index_topk),
+        index_kpool=int(index_kpool),
+        dtype_size=float(compute_dtype_size),
+    )
+
+
 def make_prefill_memory_profile(
     config: Any,
     *,
     compute_dtype_size: float,
     wsdpa_dtype_supported: bool = False,
+    num_kv_cache_layers: int | None = None,
 ) -> PrefillMemoryProfile | None:
     """Build a model-specific prefill strategy when the uniform formulas fail."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
+    if model_type.startswith("glm5_next"):
+        return _make_glm5_next_prefill_memory_profile(
+            config,
+            compute_dtype_size=compute_dtype_size,
+            num_kv_cache_layers=num_kv_cache_layers,
+        )
     if model_type.startswith("qwen4_exp"):
         return _make_qwen4_exp_prefill_memory_profile(
             config, compute_dtype_size=compute_dtype_size
@@ -1715,8 +1853,11 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         head_dim = _cfg_get(config, "head_dim")
         hidden_size = _cfg_get(config, "hidden_size") or _cfg_get(config, "n_embd")
 
-        # Calculate head_dim if not directly available
-        if head_dim is None and hidden_size and num_kv_heads:
+        # Calculate head_dim if not directly available. Some MLA configs
+        # (e.g. glm5_next TextConfig) spell an unset head_dim as 0 instead
+        # of omitting it — 0 is not a usable dimension, so treat it exactly
+        # like a missing value and derive it (mirrors the scheduler path).
+        if (head_dim is None or head_dim == 0) and hidden_size and num_kv_heads:
             num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
             head_dim = hidden_size // num_heads
 
@@ -1761,6 +1902,14 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             config, cache_list, dtype_size
         ) or estimate_mla_kv_bytes_per_token(config, cache_list, dtype_size)
 
+        prefill_memory_profile = make_prefill_memory_profile(
+            config,
+            compute_dtype_size=dtype_size,
+            num_kv_cache_layers=(
+                num_kv_cache_layers if isinstance(num_kv_cache_layers, int) else None
+            ),
+        )
+
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
@@ -1778,6 +1927,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
+                prefill_memory_profile=prefill_memory_profile,
                 ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
             )
             logger.debug(
