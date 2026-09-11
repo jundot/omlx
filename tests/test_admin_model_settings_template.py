@@ -31,7 +31,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     turboquant = _section(
         html,
         "<!-- TurboQuant KV Cache -->",
-        "<!-- IndexCache (DSA models only) -->",
+        "<!-- MoE Expert Offload -->",
     )
     lightning_mtp = _section(
         html,
@@ -307,3 +307,77 @@ def test_js_embedded_translations_escape_apostrophes():
         r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
     )
     assert unsafe == []
+
+
+def test_oq_a8_toggle_is_gated_to_qwen35_models():
+    """The kernels only exist for this checkpoint family, so the UI hides them."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert 'x-if="isQwenOqA8Model(selectedModel)"' in section
+    assert "modelSettings.qwen35_oq_a8_enabled" in section
+    # The detail controls only appear once the feature is on.
+    assert 'x-show="modelSettings.qwen35_oq_a8_enabled"' in section
+    assert "modelSettings.qwen35_oq_a8_min_tokens" in section
+
+
+def test_oq_a8_offers_no_kernel_choice():
+    """The tile is not a user-facing choice: the dispatcher picks it per bit
+    width from a measured default, so the modal exposes only the toggle and
+    the token floor."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert "modelSettings.qwen35_oq_a8_variant" not in section
+
+
+def test_oq_a8_settings_are_registered_in_the_dashboard_script():
+    js = _dashboard_script()
+    for field in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+        # Profile-field registry, modal defaults, server load, and save payload.
+        assert js.count(field) >= 4, field
+    assert "validateQwenOqA8Settings()" in js
+    # The modal has to explain the ANE clash itself rather than let the save
+    # come back as a bare 400 with the toggle already flipped.
+    validator = js.split("validateQwenOqA8Settings()", 1)[1].split("},", 1)[0]
+    assert "qwen35_ane_prefill_enabled" in validator
+    # The tile must not leak into any of those four places, not even as a
+    # hidden default the modal never renders.
+    assert "qwen35_oq_a8_variant" not in js
+
+
+def test_oq_a8_labels_use_i18n_keys():
+    html = _model_settings_template()
+    assert "{{ t('modal.model_settings.qwen_oq_a8') }}" in html
+    assert ">Qwen INT8 Activation Prefill<" not in html
+
+
+def test_oq_a8_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    keys = {
+        "modal.model_settings.qwen_oq_a8",
+        "modal.model_settings.qwen_oq_a8_hint",
+        "modal.model_settings.qwen_oq_a8_min_tokens",
+    }
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        missing = keys - set(catalog)
+        assert not missing, f"{path.name} is missing {sorted(missing)}"
+
+
+def test_moe_expert_offload_toggle_blocks_speculative_decoding():
+    """Offload is incompatible with speculative verification paths."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "modelSettings.moe_expert_offload_enabled" in section
+    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert ":disabled" in section
+    for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
+        assert f"modelSettings.{key}" in section

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import re
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -217,6 +218,9 @@ def progressive_sharded_load(
             )
         _eval_values(mx_module, fixed)
         mx_module.clear_cache()
+        del flat, fixed
+        gc.collect()
+        mx_module.clear_cache()
         strategy = apply_tensor_strategy(
             model,
             tensor_group,
@@ -232,6 +236,9 @@ def progressive_sharded_load(
             if _layer_index(path) is None
         ]
         _eval_values(mx_module, sharded_fixed)
+        mx_module.clear_cache()
+        del sharded_fixed
+        gc.collect()
         mx_module.clear_cache()
         if progress is not None:
             progress({"phase": "tensor_ready", "strategy": strategy})

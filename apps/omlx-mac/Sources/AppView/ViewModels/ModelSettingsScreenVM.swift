@@ -37,6 +37,7 @@ final class ModelSettingsScreenVM {
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
         case qwen35AnePrefillSharedFraction
+        case qwen35OqA8Enabled, qwen35OqA8MinTokens
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
         case qwen35AnePrefillTailPaddingMinTokens
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
@@ -268,6 +269,13 @@ final class ModelSettingsScreenVM {
     var turboquantKvEnabled: Bool = false
     var turboquantKvBits: String = "4"
 
+    // Experimental: oQ mixed-bit INT8-activation prefill kernels. There is no
+    // layout to choose: the kernel reads the checkpoint's own packed weight
+    // stream, so it is both the fastest option and the one that costs no extra
+    // memory. The tile is picked per bit width by the dispatcher.
+    var qwen35OqA8Enabled: Bool = false
+    var qwen35OqA8MinTokens: String = "128"
+
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
     // These defaults are the measured M3 Ultra optimum for the 2,048-token
     // benchmark path. The feature itself remains opt-in.
@@ -408,7 +416,8 @@ final class ModelSettingsScreenVM {
             return true
         case .turboquantKvEnabled, .turboquantKvBits:
             return true
-        case .qwen35AnePrefillSharedFraction:
+        case .qwen35AnePrefillSharedFraction,
+             .qwen35OqA8Enabled, .qwen35OqA8MinTokens:
             return true
         case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength,
              .qwen35AnePrefillTailPaddingMinTokens:
@@ -557,6 +566,8 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
+                self.qwen35OqA8Enabled = s?.qwen35OqA8Enabled ?? false
+                self.qwen35OqA8MinTokens = s?.qwen35OqA8MinTokens.map(String.init) ?? "128"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
                 self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
@@ -713,6 +724,13 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillSharedFraction:
             guard validateAneWorkingSettings() else { return }
             patch.qwen35AnePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
+        case .qwen35OqA8Enabled:  patch.qwen35OqA8Enabled = qwen35OqA8Enabled
+        case .qwen35OqA8MinTokens:
+            guard let value = Int(qwen35OqA8MinTokens), value >= 1 else {
+                lastError = "oQ A8 minimum prompt tokens must be a positive integer."
+                return
+            }
+            patch.qwen35OqA8MinTokens = value
         case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
             guard validateAneWorkingSettings() else { return }
@@ -901,6 +919,12 @@ final class ModelSettingsScreenVM {
     func applyANETuningRecommendation() {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
         qwen35AnePrefillEnabled = recommendation.enabled
+        if recommendation.enabled {
+            // The two prefill accelerators are mutually exclusive, and the
+            // tuner's recommendation is the more specific answer here: it was
+            // measured on this model's own layers.
+            qwen35OqA8Enabled = false
+        }
         qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
         if let fraction = recommendation.mlpFraction { qwen35AnePrefillFraction = String(fraction) }
         if recommendation.backend == "k2" {
@@ -1030,6 +1054,11 @@ final class ModelSettingsScreenVM {
         return Self.dsaConfigModelTypes.contains(type)
     }
 
+    var isQwenOqA8Model: Bool {
+        let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
+    }
+
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
     /// Native Lightning MTP can't co-exist with the other speculative
@@ -1047,6 +1076,25 @@ final class ModelSettingsScreenVM {
                           comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
         return nil
+    }
+
+    /// The oQ INT8-activation kernels and ANE prefill both wrap the same
+    /// Qwen3.5 MLP call, so enabling both leaves whichever patched last in
+    /// charge and the other silently inert. The server rejects the pair; these
+    /// mirror that so the losing toggle disables itself and says why instead
+    /// of the save returning a 400 with the switch already flipped.
+    var qwen35OqA8ConflictReason: String? {
+        guard qwen35AnePrefillEnabled else { return nil }
+        return String(localized: "settings.qwen_oq_a8.conflict.ane",
+                      defaultValue: "Disable Qwen ANE Prefill before enabling INT8 activation prefill.",
+                      comment: "Tooltip / sublabel shown when INT8 activation prefill can't be enabled because ANE prefill is on")
+    }
+
+    var qwen35AnePrefillConflictReason: String? {
+        guard qwen35OqA8Enabled else { return nil }
+        return String(localized: "settings.qwen_ane.conflict.oq_a8",
+                      defaultValue: "Disable Qwen INT8 Activation Prefill before enabling ANE prefill.",
+                      comment: "Tooltip / sublabel shown when ANE prefill can't be enabled because INT8 activation prefill is on")
     }
 
     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
@@ -1174,6 +1222,10 @@ final class ModelSettingsScreenVM {
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
+            }
+            putBool(ProfileSettingsKey.qwen35OqA8Enabled, qwen35OqA8Enabled)
+            if qwen35OqA8Enabled {
+                putInt(ProfileSettingsKey.qwen35OqA8MinTokens, qwen35OqA8MinTokens)
             }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {

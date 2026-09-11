@@ -1421,7 +1421,9 @@ def make_prefill_memory_profile(
         return _make_qwen4_exp_prefill_memory_profile(
             config, compute_dtype_size=compute_dtype_size
         )
-    if not model_type.startswith("deepseek_v4"):
+    if not model_type.startswith("deepseek_v4") or model_type.startswith(
+        "deepseek_v41"
+    ):
         return None
 
     num_layers = _cfg_get(config, "num_hidden_layers")

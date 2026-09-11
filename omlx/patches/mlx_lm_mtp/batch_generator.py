@@ -2502,13 +2502,19 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.depth = depth
         state.head_clone = head_clone
         if depth > 1:
-            state.controller = _DepthController(
-                depth,
-                marginal_ms=getattr(
-                    gen_batch.model, "_omlx_mtp_marginal_ms", None
-                ),
-                exit_margin=_effective_loop_tax(gen_batch.model),
+            factory = getattr(
+                _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
             )
+            if factory is not None:
+                state.controller = factory(depth)
+            else:
+                state.controller = _DepthController(
+                    depth,
+                    marginal_ms=getattr(
+                        gen_batch.model, "_omlx_mtp_marginal_ms", None
+                    ),
+                    exit_margin=_effective_loop_tax(gen_batch.model),
+                )
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok
         )

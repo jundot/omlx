@@ -30,6 +30,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1819,6 +1820,29 @@ class VLMBatchedEngine(BaseEngine):
                     return model, processor
 
                 model_type = _read_config_model_type(self._model_name)
+                if model_type == "deepseek_v41":
+                    from ..patches.deepseek_v41.loading import load
+
+                    return load(
+                        self._model_name,
+                        moe_expert_offload_resident_fraction=(
+                            self._model_settings.moe_expert_offload_resident_fraction
+                            if getattr(
+                                self._model_settings,
+                                "moe_expert_offload_enabled",
+                                False,
+                            )
+                            and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+                            else None
+                        ),
+                        engram_ssd_offload=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_v41_engram_ssd_offload",
+                                False,
+                            )
+                        ),
+                    )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
@@ -1831,6 +1855,14 @@ class VLMBatchedEngine(BaseEngine):
                         "trust_remote_code": self._trust_remote_code,
                     }
                     if model_type == QWEN4_EXP_MODEL_TYPE:
+                        load_kwargs["lazy"] = True
+                    # Expert offload wraps BEFORE materialization so non-resident
+                    # experts never load; keep the load lazy only when the feature
+                    # is on. Threads into main's load_kwargs path (lazy is idempotent
+                    # with the QWEN4_EXP case above).
+                    if getattr(
+                        self._model_settings, "moe_expert_offload_enabled", False
+                    ):
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
@@ -1867,6 +1899,46 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_name,
                 )
 
+        # MoE expert offload for the VLM path: Gemma 4 checkpoints are
+        # detected as VLMs, so this — not BatchedEngine — is their default
+        # engine. Same sequence as batched.py: wrap on the MLX executor
+        # BEFORE materialize so non-resident experts never load.
+        moe_offload_wrapped = 0
+        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
+            from ..patches.moe_expert_offload import (
+                apply_moe_expert_offload,
+                materialize_offload_state,
+            )
+
+            fraction = float(
+                getattr(
+                    self._model_settings,
+                    "moe_expert_offload_resident_fraction",
+                    0.25,
+                )
+            )
+            moe_offload_wrapped = await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_moe_expert_offload,
+                self._vlm_model,
+                self._model_name,
+                fraction,
+            )
+            if moe_offload_wrapped:
+                # The caches' slot maps and resident slots live on plain
+                # attributes outside the module tree, so the lazy-state
+                # materialization below never reaches them; left lazy they
+                # stay bound to the loader stream and the first request from
+                # an inference thread dies with "There is no Stream(gpu, N)
+                # in current thread". Same executor as the apply, so the
+                # arrays realize on the stream that created them.
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    materialize_offload_state,
+                    self._vlm_model,
+                )
+        self._moe_offload_wrapped = moe_offload_wrapped
+
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
@@ -1896,7 +1968,13 @@ class VLMBatchedEngine(BaseEngine):
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
         # the MLX executor because it rewrites weights in place.
-        if (
+        if getattr(self, "_moe_offload_wrapped", 0):
+            logger.info(
+                "moe expert offload active (%d layers): skipping gate/up "
+                "fusion on the VLM path",
+                self._moe_offload_wrapped,
+            )
+        elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
         ):
@@ -2120,6 +2198,25 @@ class VLMBatchedEngine(BaseEngine):
             apply_qwen35_moe_router_patch()
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
+
+        # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
+        # because it quantizes activations to INT8, which changes numerics;
+        # the patch itself falls through for anything it cannot route.
+        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+            try:
+                from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
+
+                # The model itself is what gets opted in: the patch tags its
+                # modules, so a model loaded with the setting off is never
+                # routed even though the class wrapper is process-wide.
+                apply_qwen35_oq_a8_patch(
+                    self._vlm_model,
+                    min_tokens=int(
+                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                    ),
+                )
+            except Exception:
+                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
 
         if (
             getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
@@ -2561,6 +2658,13 @@ class VLMBatchedEngine(BaseEngine):
         )
         if not model_type:
             raise ValueError("Missing VLM model_type for chat template formatting")
+
+        if model_type == "deepseek_v41":
+            if num_audios:
+                raise ValueError("DeepSeek V4.1 supports text and images, not audio")
+            from ..patches.deepseek_v41.processing import format_messages
+
+            return format_messages(messages, num_images)
 
         image_part_types = {"image", "image_url", "input_image"}
         audio_part_types = {"input_audio"}

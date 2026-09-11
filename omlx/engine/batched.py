@@ -308,6 +308,13 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                # With expert offload the load stays lazy so the wrap below
+                # can drop non-resident expert tensors BEFORE anything
+                # materializes them; materialize_lazy_state then evaluates
+                # what remains. Without offload, load eagerly as before.
+                lazy=bool(
+                    getattr(self._model_settings, "moe_expert_offload_enabled", False)
+                ),
             )
 
         loop = asyncio.get_running_loop()
@@ -323,6 +330,44 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
+        # MoE expert offload: replace covered SwitchGLU layers with a
+        # fetch-on-miss LRU cache streaming experts from the checkpoint's
+        # own safetensors. Must run BEFORE materialize_lazy_state — the load
+        # above stayed lazy when this is enabled, and dropping the stock
+        # modules here is what keeps non-resident experts from ever
+        # materializing. Runs on the MLX executor because it allocates the
+        # resident slot tensors (#1304).
+        moe_offload_wrapped = 0
+        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
+            from ..patches.moe_expert_offload import (
+                apply_moe_expert_offload,
+                materialize_offload_state,
+            )
+
+            fraction = float(
+                getattr(
+                    self._model_settings,
+                    "moe_expert_offload_resident_fraction",
+                    0.25,
+                )
+            )
+            moe_offload_wrapped = await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_moe_expert_offload,
+                self._model,
+                self._model_name,
+                fraction,
+            )
+            if moe_offload_wrapped:
+                # The caches' slot maps and resident slots live on plain
+                # attributes outside the module tree, so materialize_lazy_state
+                # below never reaches them; left lazy they stay bound to this
+                # loader stream and the first request from an inference thread
+                # dies with "There is no Stream(gpu, N) in current thread".
+                await loop.run_in_executor(
+                    get_mlx_executor(), materialize_offload_state, self._model
+                )
+
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
         await loop.run_in_executor(
@@ -333,7 +378,16 @@ class BatchedEngine(BaseEngine):
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
         # executor because it rewrites weights in place.
-        if (
+        if moe_offload_wrapped:
+            # Fusion concatenates the stock SwitchGLU gate/up weights in RAM,
+            # which cannot apply to experts that were never materialized; the
+            # offloaded modules aren't stock SwitchGLU anyway, so fusion
+            # would find nothing. Skip it explicitly and say why.
+            logger.info(
+                "moe expert offload active (%d layers): skipping gate/up fusion",
+                moe_offload_wrapped,
+            )
+        elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
         ):
@@ -430,6 +484,25 @@ class BatchedEngine(BaseEngine):
                 apply_qwen35_q4_lm_prefill_linear_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+
+        # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
+        # because it quantizes activations to INT8, which changes numerics;
+        # the patch itself falls through for anything it cannot route.
+        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+            try:
+                from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
+
+                # The model itself is what gets opted in: the patch tags its
+                # modules, so a model loaded with the setting off is never
+                # routed even though the class wrapper is process-wide.
+                apply_qwen35_oq_a8_patch(
+                    self._model,
+                    min_tokens=int(
+                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                    ),
+                )
+            except Exception:
+                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
 
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
@@ -586,9 +659,7 @@ class BatchedEngine(BaseEngine):
 
                 apply_qwen35_moe_weighted_sum_patch()
             except Exception:
-                logger.debug(
-                    "Qwen MoE weighted-sum patch not applied", exc_info=True
-                )
+                logger.debug("Qwen MoE weighted-sum patch not applied", exc_info=True)
 
         if (
             getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)

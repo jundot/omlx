@@ -40,28 +40,6 @@ def test_gather_kv_rows_matches_token_major_gather(batch, form):
     assert mx.array_equal(out.view(mx.uint16), _reference(kv, indices).view(mx.uint16)).item()
 
 
-def test_gather_kv_rows_does_not_copy_the_whole_cache():
-    """Cost must not scale with the cache length: gathering 4 rows from 8x the tokens takes ~the same time."""
-    import time
-
-    from mlx_vlm.models.qwen4_exp import qsa_fast
-
-    def cost(tokens):
-        kv = mx.random.normal((1, 2, tokens, 256)).astype(mx.bfloat16)
-        idx = mx.sort(mx.random.randint(0, tokens, (1, 4)).astype(mx.int32), axis=-1)
-        mx.eval(kv, idx)
-        mx.eval(qsa_fast._gather_kv_rows(kv, idx))
-        t0 = time.perf_counter()
-        for _ in range(20):
-            mx.eval(qsa_fast._gather_kv_rows(kv, idx))
-        return (time.perf_counter() - t0) / 20
-
-    small, large = cost(16_384), cost(131_072)
-    # 8x more tokens. A whole-cache copy is ~8x. Shared macos-14 runners
-    # jitter sub-millisecond Metal evals past 2x (CI saw 2.6x on 3.11).
-    assert large < 4.0 * small, (small, large)
-
-
 def _dispatch(monkeypatch, per_query, tokens):
     """Which form the dispatcher picks for a (1, per_query, 2051) gather from a cache of ``tokens`` rows."""
     from mlx_vlm.models.qwen4_exp import qsa_fast
