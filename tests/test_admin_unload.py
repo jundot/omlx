@@ -5,7 +5,8 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from omlx import server
 from omlx.admin import routes as admin_routes
@@ -51,6 +52,128 @@ async def test_idle_model_unload_returns_completed():
         "model_id": "model-a",
         "message": "Unloaded model-a",
     }
+
+
+def _idle_only_client():
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    settings = MagicMock()
+    settings.auth.skip_api_key_verification = False
+    settings.auth.api_key = "test-admin-key"
+    settings.auth.sub_keys = []
+    return app, settings
+
+
+def test_idle_only_unload_accepts_valid_bearer_and_returns_exact_model():
+    pool = MagicMock()
+    pool.get_entry.return_value = MagicMock()
+    pool.unload_if_idle_unpinned = AsyncMock(return_value=True)
+    app, settings = _idle_only_client()
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_global_settings", return_value=settings),
+        patch.object(admin_routes, "verify_session", return_value=False),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/admin/api/models/model-a/unload-if-idle",
+            headers={"Authorization": "Bearer test-admin-key"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "model_id": "model-a",
+        "message": "Unloaded idle model model-a",
+    }
+    pool.unload_if_idle_unpinned.assert_awaited_once_with("model-a")
+
+
+def test_idle_only_unload_accepts_valid_admin_session():
+    pool = MagicMock()
+    pool.get_entry.return_value = MagicMock()
+    pool.unload_if_idle_unpinned = AsyncMock(return_value=True)
+    app, settings = _idle_only_client()
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_global_settings", return_value=settings),
+        patch.object(admin_routes, "verify_session", return_value=True),
+        TestClient(app) as client,
+    ):
+        response = client.post("/admin/api/models/model-a/unload-if-idle")
+
+    assert response.status_code == 200
+    assert response.json()["model_id"] == "model-a"
+    pool.unload_if_idle_unpinned.assert_awaited_once_with("model-a")
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong-key"])
+def test_idle_only_unload_rejects_missing_or_invalid_bearer(authorization):
+    pool = MagicMock()
+    pool.unload_if_idle_unpinned = AsyncMock(return_value=False)
+    app, settings = _idle_only_client()
+    headers = {} if authorization is None else {"Authorization": authorization}
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_global_settings", return_value=settings),
+        patch.object(admin_routes, "verify_session", return_value=False),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/admin/api/models/model-a/unload-if-idle", headers=headers
+        )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    pool.get_entry.assert_not_called()
+    pool.unload_if_idle_unpinned.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "state, expected_status", [("unavailable", 503), ("missing", 404)]
+)
+def test_idle_only_unload_reports_unavailable_or_missing(state, expected_status):
+    pool = None if state == "unavailable" else MagicMock()
+    if state == "missing":
+        pool.get_entry.return_value = None
+    app, settings = _idle_only_client()
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_global_settings", return_value=settings),
+        patch.object(admin_routes, "verify_session", return_value=False),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/admin/api/models/model-a/unload-if-idle",
+            headers={"Authorization": "Bearer test-admin-key"},
+        )
+
+    assert response.status_code == expected_status
+
+
+def test_idle_only_unload_reports_conflict_without_unloading():
+    pool = MagicMock()
+    pool.get_entry.return_value = MagicMock()
+    pool.unload_if_idle_unpinned = AsyncMock(return_value=False)
+    app, settings = _idle_only_client()
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_global_settings", return_value=settings),
+        patch.object(admin_routes, "verify_session", return_value=False),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/admin/api/models/model-a/unload-if-idle",
+            headers={"Authorization": "Bearer test-admin-key"},
+        )
+
+    assert response.status_code == 409
+    pool.unload_if_idle_unpinned.assert_awaited_once_with("model-a")
 
 
 @pytest.mark.asyncio

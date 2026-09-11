@@ -1897,11 +1897,10 @@ class EnginePool:
                 or entry.engine is None
                 or entry.is_loading
                 or entry.is_pinned
-                or entry.in_use > 0
             ):
                 return False
 
-            if self._entry_has_active_requests(entry):
+            if not self._entry_is_quiescent(entry):
                 entry.last_access = time.time()
                 return False
 

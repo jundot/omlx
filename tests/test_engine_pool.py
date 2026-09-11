@@ -3766,6 +3766,58 @@ class TestEnginePoolInUseLease:
         assert entry.engine.abort_all_requests.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_idle_only_unload_rechecks_under_lock_without_aborting(self):
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("model-a")
+        entry.engine.abort_all_requests = AsyncMock(return_value=1)
+        pool._entries = {"model-a": entry}
+        pool._unload_engine = AsyncMock()
+
+        await pool._lock.acquire()
+        unload = asyncio.create_task(pool.unload_if_idle_unpinned("model-a"))
+        await asyncio.sleep(0)
+        entry.in_use = 1  # A lease won before the idle-only operation got the lock.
+        pool._lock.release()
+
+        assert await unload is False
+        assert entry.pending_unload_reason is None
+        assert entry.abort_requested is False
+        entry.engine.abort_all_requests.assert_not_awaited()
+        pool._unload_engine.assert_not_awaited()
+
+        entry.in_use = 0
+        assert await pool.unload_if_idle_unpinned("model-a") is True
+        pool._unload_engine.assert_awaited_once_with("model-a")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state", ["missing", "nonresident", "loading", "pinned", "active", "scheduler"]
+    )
+    async def test_idle_only_unload_refuses_every_non_quiescent_state(self, state):
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("model-a")
+        if state == "missing":
+            pool._entries = {}
+        else:
+            pool._entries = {"model-a": entry}
+            if state == "nonresident":
+                entry.engine = None
+            elif state == "loading":
+                entry.is_loading = True
+            elif state == "pinned":
+                entry.is_pinned = True
+            elif state == "active":
+                entry.engine.has_active_requests.return_value = True
+            elif state == "scheduler":
+                scheduler = MagicMock()
+                scheduler.has_requests.return_value = True
+                entry.engine.scheduler = scheduler
+        pool._unload_engine = AsyncMock()
+
+        assert await pool.unload_if_idle_unpinned("model-a") is False
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_acquire_leases_then_releases_on_success(self):
         """acquire() leases on enter and releases in finally on normal exit."""
         pool = _make_pool(ceiling=0)

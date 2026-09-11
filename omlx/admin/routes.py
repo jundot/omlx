@@ -2286,6 +2286,32 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     )
 
 
+@router.post("/api/models/{model_id}/unload-if-idle")
+async def unload_model_if_idle(
+    model_id: str,
+    is_admin: bool = Depends(_require_admin_or_bearer),
+):
+    """Unload an unpinned model only when it is atomically observed idle."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    if engine_pool.get_entry(model_id) is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    if not await engine_pool.unload_if_idle_unpinned(model_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Model is not loaded, idle, and unpinned: {model_id}",
+        )
+
+    logger.info("Safely unloaded idle model: %s", model_id)
+    return {
+        "status": "ok",
+        "model_id": model_id,
+        "message": f"Unloaded idle model {model_id}",
+    }
+
+
 @router.post("/api/models/{model_id}/load")
 async def load_model(
     model_id: str,
