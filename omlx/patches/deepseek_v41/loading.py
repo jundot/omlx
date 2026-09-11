@@ -18,6 +18,12 @@ from .model import Model
 from .processing import Processor
 from .quantization import QuantizedProjection
 from .storage import DiskEngramEmbedding, EngramPrefetch, TensorFile, decode_array
+from .engram_cache import (
+    QuantHotRowCache,
+    engram_cache_gb,
+    engram_cache_policy,
+    _quant_cache_rows_per_layer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +144,38 @@ def load(
             # Keep the GPU submission boundaries in both modes. Resident tables
             # are excluded by submit(), so RAM mode schedules no disk reads.
             model.language_model._engram_prefetch = EngramPrefetch()
+            if engram_ssd_offload and engram_cache_gb() > 0:
+                n_tables = len(format_spec["engram_tables"])
+                # Head dim from first table header once modules are bound.
+                capacity = None
+                for layer in model.language_model.layers:
+                    if "engram" not in layer:
+                        continue
+                    embed = layer.engram.embed
+                    if not isinstance(embed, DiskEngramEmbedding):
+                        continue
+                    embed._row_meta()
+                    if capacity is None:
+                        capacity = _quant_cache_rows_per_layer(
+                            n_tables, embed._head_dim, block_size=32
+                        )
+                    if capacity > 0:
+                        embed.bind_hot_cache(
+                            QuantHotRowCache(
+                                capacity,
+                                embed._head_dim,
+                                block_size=32,
+                                policy=engram_cache_policy(),
+                            )
+                        )
+                if capacity:
+                    logger.info(
+                        "DeepSeek V4.1 Engram hot-row cache: %.1f GiB budget, "
+                        "%d rows/table, policy=%s",
+                        engram_cache_gb(),
+                        capacity,
+                        engram_cache_policy(),
+                    )
         expected_shapes = {
             name: value.shape for name, value in tree_flatten(model.parameters())
         }
