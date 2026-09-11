@@ -27,6 +27,7 @@ import omlx.scheduler as scheduler_mod
 from omlx.api.thinking import ThinkingBudgetProcessor
 from omlx.scheduler import Scheduler
 from omlx.speculative.processing_sampler import (
+    MTPProcessorContractError,
     MTPProcessingSampler,
     supports_vlm_mtp_processing,
 )
@@ -179,15 +180,22 @@ class TestMTPProcessingSampler:
         assert not hasattr(proc, "_accepted_up_to")
         assert sampler._history == PROMPT
 
-    def test_missing_positions_degrades_loudly(self, caplog):
+    def test_missing_positions_fails_closed(self, caplog):
         _, sampler, _ = self._fresh(budget=4)
         with caplog.at_level(
-            logging.WARNING, logger="omlx.speculative.processing_sampler"
+            logging.ERROR, logger="omlx.speculative.processing_sampler"
         ):
-            out = sampler.sample_target(_positioned_logprobs(2))
+            with pytest.raises(MTPProcessorContractError):
+                sampler.sample_target(_positioned_logprobs(2))
         assert sampler._degraded
-        assert "NOT enforced" in caplog.text
-        assert [int(t) for t in out.tolist()] == [THINK, THINK]
+        assert "continuing would bypass" in caplog.text
+
+        # A caller cannot catch the first error and silently reuse the
+        # degraded sampler without its processors.
+        with pytest.raises(MTPProcessorContractError):
+            sampler.sample_target(
+                _positioned_logprobs(1), row_ids=[0], positions=[1]
+            )
 
 
 # ---------------------------------------------------------------------------
