@@ -7215,3 +7215,398 @@ class TestEstimateBpwPostSanitizeNames:
         # Experts dominate the parameter count; a raw-name scan reports
         # ~15-16 bpw because none of them end in ".weight".
         assert est["effective_bpw"] < 8.0, est
+
+
+class TestAttentionBitsCap:
+    """The attention bit ceiling: opt-in, and the default preserves today.
+
+    The oQ recipe is all floors (see ``bits()`` in universal_quant_predicate:
+    every path is ``max(n, base)``), so on a large MoE the sensitivity boost
+    takes the whole dense attention to 8 bits. The ceiling is the one rule
+    that lowers, and it must not touch experts, embeddings, the DSA indexer
+    or conv1d.
+    """
+
+    @staticmethod
+    def _config(cap=0):
+        return {
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_local_experts": 288,
+            },
+            "hidden_size": 64,
+            "num_local_experts": 288,
+            "_oq_use_budget_plan": False,
+            "_oq_attention_bits_cap": cap,
+        }
+
+    TARGETS = (
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.self_attn.b_proj",
+        "model.layers.0.self_attn.forget_gate.f_a_proj",
+        "model.layers.1.self_attn.q_a_proj",
+        "model.layers.1.self_attn.q_b_proj",
+        "model.layers.1.self_attn.kv_a_proj_with_mqa",
+        "model.layers.1.self_attn.embed_q",
+        "model.layers.0.linear_attn.out_proj",
+    )
+    UNTOUCHED = (
+        "model.layers.0.self_attn.conv1d",
+        "model.layers.1.self_attn.indexer.wk",
+        "model.layers.1.self_attn.indexer.wq_b",
+        "model.layers.0.mlp.switch_mlp.gate_proj",
+        "model.layers.0.mlp.shared_experts.gate_proj",
+        "lm_head",
+        "model.embed_tokens",
+    )
+
+    def test_an_absent_cap_is_the_same_as_no_cap(self):
+        """A config without the key must answer exactly what it used to."""
+        with_zero = self._config(0)
+        without_key = {
+            k: v for k, v in with_zero.items() if k != "_oq_attention_bits_cap"
+        }
+        for path in self.TARGETS + self.UNTOUCHED:
+            assert universal_quant_predicate(
+                path, None, without_key, 2
+            ) == universal_quant_predicate(path, None, with_zero, 2), path
+
+    def test_the_cap_lowers_attention_and_only_attention(self):
+        capped = self._config(4)
+        uncapped = self._config(0)
+        for path in self.TARGETS:
+            pred = universal_quant_predicate(path, None, capped, 2)
+            if isinstance(pred, dict):
+                assert pred["bits"] <= 4, f"{path} above the cap: {pred}"
+        for path in self.UNTOUCHED:
+            assert universal_quant_predicate(
+                path, None, capped, 2
+            ) == universal_quant_predicate(path, None, uncapped, 2), path
+
+    def test_the_cap_beats_a_protection_floor(self):
+        """MLA q_a_proj has a written 6-bit floor; the ceiling wins."""
+        path = "model.layers.1.self_attn.q_a_proj"
+        assert universal_quant_predicate(path, None, self._config(0), 2)["bits"] == 6
+        assert universal_quant_predicate(path, None, self._config(4), 2)["bits"] == 4
+
+    def test_the_whole_plan_respects_the_cap(self):
+        """Neither the greedy boost nor the fallback takes attention above it."""
+        shapes = {p: (64, 64) for p in self.TARGETS + self.UNTOUCHED}
+        shapes["model.layers.0.mlp.switch_mlp.gate_proj"] = (288, 64, 64)
+        shapes["model.layers.0.mlp.switch_mlp.down_proj"] = (288, 64, 64)
+
+        cfg = self._config(4)
+        cfg["_oq_use_budget_plan"] = True
+        cfg["_oq_sensitivity_map"] = {"0": 1.0, "1": 0.9}
+        plan = _build_quant_plan(shapes, cfg, 2, target_bpw=2.8, hard_cap_bpw=8.0)
+        for path in self.TARGETS:
+            entry = plan.boost_map.get(path)
+            if entry is not None:
+                assert entry["bits"] <= 4, f"{path} above the cap: {entry}"
+
+        # Without the cap the same plan takes attention above 4 bits — the
+        # proof that this test fails without the fix.
+        cfg_uncapped = self._config(0)
+        cfg_uncapped["_oq_use_budget_plan"] = True
+        cfg_uncapped["_oq_sensitivity_map"] = {"0": 1.0, "1": 0.9}
+        plan_uncapped = _build_quant_plan(
+            shapes, cfg_uncapped, 2, target_bpw=2.8, hard_cap_bpw=8.0
+        )
+        assert any(
+            plan_uncapped.boost_map.get(p, {}).get("bits", 0) > 4 for p in self.TARGETS
+        ), "without the cap the plan should go above 4 bits on some projection"
+
+
+class TestVisionDtypeByFamily:
+    """The vision tower dtype: auto by measured family, or forced."""
+
+    def test_auto_keeps_float32_on_an_unmeasured_family(self):
+        from omlx.oq import _resolve_vision_dtype
+
+        assert _resolve_vision_dtype({"model_type": "gemma4"}, mx.float16) == mx.float32
+
+    def test_auto_gives_float16_on_glm5_next(self):
+        from omlx.oq import _resolve_vision_dtype
+
+        assert (
+            _resolve_vision_dtype({"model_type": "glm5_next"}, mx.float16)
+            == mx.float16
+        )
+        # and also when the family only shows up in text_config
+        cfg = {"model_type": "", "text_config": {"model_type": "glm5_next_text"}}
+        assert _resolve_vision_dtype(cfg, mx.float16) == mx.float16
+
+    def test_forcing_beats_the_family_both_ways(self):
+        from omlx.oq import _resolve_vision_dtype
+
+        assert (
+            _resolve_vision_dtype({"model_type": "glm5_next"}, mx.float16, "float32")
+            == mx.float32
+        )
+        assert (
+            _resolve_vision_dtype({"model_type": "gemma4"}, mx.float16, "float16")
+            == mx.float16
+        )
+
+    def test_in_bfloat16_the_rule_does_not_exist(self):
+        from omlx.oq import _resolve_vision_dtype
+
+        for requested in ("auto", "float16", "float32"):
+            assert (
+                _resolve_vision_dtype(
+                    {"model_type": "glm5_next"}, mx.bfloat16, requested
+                )
+                == mx.bfloat16
+            )
+
+    def test_an_invalid_value_is_refused(self):
+        from omlx.oq import _resolve_vision_dtype
+
+        with pytest.raises(ValueError, match="Invalid vision_dtype"):
+            _resolve_vision_dtype({"model_type": "glm5_next"}, mx.float16, "fp8")
+
+    def test_the_passthrough_cast_follows_the_resolved_dtype(self):
+        from omlx.oq import _cast_passthrough_tensor
+
+        w = mx.zeros((4, 4), dtype=mx.bfloat16)
+        name = "visual.blocks.0.attn.qkv.weight"
+        assert _cast_passthrough_tensor(name, w, mx.float16).dtype == mx.float32
+        assert (
+            _cast_passthrough_tensor(name, w, mx.float16, mx.float16).dtype
+            == mx.float16
+        )
+
+
+class TestResolveOutputNameWithCap:
+    def test_the_cap_rides_in_the_name(self):
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash",
+                2,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+                attention_bits_cap=4,
+            )
+            == "GLM-5.3-Flash-oQ2e-a4-fp16-mtp"
+        )
+
+    def test_a_name_carrying_the_cap_is_stripped_next_time(self):
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash-oQ2e-a4-fp16-mtp",
+                2,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+            )
+            == "GLM-5.3-Flash-oQ2e-fp16-mtp"
+        )
+
+    def test_without_a_cap_the_name_is_unchanged(self):
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash",
+                2,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+                attention_bits_cap=0,
+            )
+            == "GLM-5.3-Flash-oQ2e-fp16-mtp"
+        )
+
+
+class TestExpertGroupSizeInName:
+    """The group size rides in the name because it changes the weights.
+
+    The form used to send 64 unconditionally while the predicate's own rule
+    asks for 128 above 150 experts. At 2 bits that is 2.5 bpw against 2.25.
+    """
+
+    def test_the_default_group_stays_out_of_the_name(self):
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash",
+                2,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+                group_size=64,
+            )
+            == "GLM-5.3-Flash-oQ2e-fp16-mtp"
+        )
+
+    def test_a_non_default_group_rides_in_the_name(self):
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash",
+                2,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+                attention_bits_cap=4,
+                group_size=128,
+            )
+            == "GLM-5.3-Flash-oQ2e-a4-g128-fp16-mtp"
+        )
+
+    def test_a_name_carrying_the_group_is_stripped_next_time(self):
+        assert (
+            resolve_output_name("GLM-5.3-Flash-oQ2e-a4-g128-fp16-mtp", 2, "bfloat16")
+            == "GLM-5.3-Flash-oQ2"
+        )
+
+
+class TestMtpHeadBitsFloor:
+    """The draft head's floor becomes a choice, and dropping it frees memory.
+
+    The head is held at 4 bits while the trunk goes lower, because more bits
+    there buy draft acceptance cheaply. Dropping it is the only bit reduction
+    that cannot cost answer quality: the trunk does not move one bit and it
+    verifies every emitted token, so only draft acceptance changes.
+    """
+
+    @staticmethod
+    def _config(floor=None):
+        cfg = {
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_local_experts": 288,
+            },
+            "hidden_size": 64,
+            "num_local_experts": 288,
+            "_oq_use_budget_plan": False,
+        }
+        if floor is not None:
+            cfg["_oq_mtp_bits_floor"] = floor
+        return cfg
+
+    HEAD = (
+        "mtp.layers.0.mlp.switch_mlp.gate_proj",
+        "mtp.layers.0.mlp.switch_mlp.down_proj",
+        "mtp.layers.0.self_attn.q_proj",
+    )
+    TRUNK = (
+        "model.layers.0.mlp.switch_mlp.gate_proj",
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.1.self_attn.q_a_proj",
+        "lm_head",
+        "model.embed_tokens",
+    )
+
+    def test_the_default_floor_holds_the_head_above_the_trunk(self):
+        from omlx.oq import _MTP_MIN_BITS, _get_predicate_bits
+
+        cfg = self._config(_MTP_MIN_BITS)
+        for path in self.HEAD:
+            bits, _, _ = _get_predicate_bits(path, cfg, 2, 64)
+            assert bits == _MTP_MIN_BITS, path
+
+    def test_an_absent_floor_is_the_default_floor(self):
+        """A config without the key must answer exactly what it used to."""
+        from omlx.oq import _MTP_MIN_BITS, _get_predicate_bits
+
+        without_key = self._config(None)
+        default = self._config(_MTP_MIN_BITS)
+        for path in self.HEAD + self.TRUNK:
+            assert _get_predicate_bits(path, without_key, 2, 64) == _get_predicate_bits(
+                path, default, 2, 64
+            ), path
+
+    def test_dropping_the_floor_takes_the_head_down_to_the_trunk(self):
+        from omlx.oq import _MTP_MIN_BITS, _get_predicate_bits
+
+        dropped = self._config(0)
+        for path in self.HEAD:
+            bits, _, _ = _get_predicate_bits(path, dropped, 2, 64)
+            assert bits == 2, path
+            assert bits < _MTP_MIN_BITS
+
+    def test_dropping_the_floor_does_not_touch_the_trunk(self):
+        """Why perplexity cannot move: the trunk is bit-identical."""
+        from omlx.oq import _MTP_MIN_BITS, _get_predicate_bits
+
+        default = self._config(_MTP_MIN_BITS)
+        dropped = self._config(0)
+        for path in self.TRUNK:
+            assert _get_predicate_bits(path, dropped, 2, 64) == _get_predicate_bits(
+                path, default, 2, 64
+            ), path
+
+    def test_the_floor_never_lowers_what_is_already_above_it(self):
+        from omlx.oq import _MTP_MIN_BITS, _get_predicate_bits
+
+        default = self._config(_MTP_MIN_BITS)
+        for path in self.HEAD:
+            bits, _, _ = _get_predicate_bits(path, default, 8, 64)
+            assert bits >= _MTP_MIN_BITS, path
+
+    def test_an_invalid_value_falls_back_to_the_default_floor(self):
+        from omlx.oq import _MTP_MIN_BITS, _mtp_head_bits_floor
+
+        assert _mtp_head_bits_floor(None) == _MTP_MIN_BITS
+        assert _mtp_head_bits_floor({}) == _MTP_MIN_BITS
+        assert _mtp_head_bits_floor({"_oq_mtp_bits_floor": "nothing"}) == _MTP_MIN_BITS
+        assert _mtp_head_bits_floor({"_oq_mtp_bits_floor": -3}) == 0
+        assert _mtp_head_bits_floor({"_oq_mtp_bits_floor": 0}) == 0
+
+    def test_a_dropped_floor_rides_in_the_name(self):
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash",
+                2,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+                mtp_bits_floor=0,
+            )
+            == "GLM-5.3-Flash-oQ2e-fp16-mtp2"
+        )
+
+    def test_the_default_floor_leaves_the_name_as_it_always_was(self):
+        from omlx.oq import _MTP_MIN_BITS
+
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash",
+                2,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+                mtp_bits_floor=_MTP_MIN_BITS,
+            )
+            == "GLM-5.3-Flash-oQ2e-fp16-mtp"
+        )
+
+    def test_without_the_head_the_floor_stays_out_of_the_name(self):
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash", 2, "float16", preserve_mtp=False, mtp_bits_floor=0
+            )
+            == "GLM-5.3-Flash-oQ2-fp16"
+        )
+
+    def test_a_dropped_floor_that_lowers_nothing_leaves_the_name_alone(self):
+        """At an 8-bit level dropping the floor changes neither head nor name."""
+        assert (
+            resolve_output_name(
+                "GLM-5.3-Flash", 8, "float16", preserve_mtp=True, mtp_bits_floor=0
+            )
+            == "GLM-5.3-Flash-oQ8-fp16-mtp"
+        )
+
+    def test_a_name_carrying_the_floor_is_stripped_next_time(self):
+        assert (
+            resolve_output_name("GLM-5.3-Flash-oQ2e-fp16-mtp2", 2, "bfloat16")
+            == "GLM-5.3-Flash-oQ2"
+        )

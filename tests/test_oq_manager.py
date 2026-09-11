@@ -631,6 +631,64 @@ class TestOQManagerEnhanced:
         assert task.imatrix_cache_path.endswith("-s8-l128.npz")
 
 
+class TestOQManagerMemoryOptions:
+    """The four memory options reach the job and the checkpoint name.
+
+    They are options, not a fixed change: with the factory values the job has
+    to come out identical to what it was before they existed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_defaults_change_neither_the_job_nor_the_name(
+        self, fp_model_dir, monkeypatch
+    ):
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+        task = await manager.start_quantization(str(fp_model_dir / "Llama-3B"), 4)
+        await manager._active_tasks[task.task_id]
+
+        assert task.attention_bits_cap == 0
+        assert task.vision_dtype == "auto"
+        assert task.mtp_bits_floor == 4
+        assert task.group_size == 64
+        assert task.output_name == "Llama-3B-oQ4"
+
+    @pytest.mark.asyncio
+    async def test_the_options_reach_the_job_and_the_name(
+        self, fp_model_dir, monkeypatch
+    ):
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+        task = await manager.start_quantization(
+            str(fp_model_dir / "Llama-3B"),
+            2,
+            group_size=128,
+            attention_bits_cap=4,
+            vision_dtype="float16",
+            mtp_bits_floor=0,
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.attention_bits_cap == 4
+        assert task.vision_dtype == "float16"
+        assert task.mtp_bits_floor == 0
+        assert task.group_size == 128
+        assert task.output_name == "Llama-3B-oQ2-a4-g128"
+        # and the dashboard sees all four through to_dict
+        d = task.to_dict()
+        assert d["attention_bits_cap"] == 4
+        assert d["vision_dtype"] == "float16"
+        assert d["mtp_bits_floor"] == 0
+
+
 class TestOQManagerHfCacheDiscovery:
     """HF cache models (non-MLX) should appear as quantization sources."""
 
