@@ -525,6 +525,8 @@ def test_attention_patch_keeps_short_prefill_fast_path(monkeypatch):
 
 
 def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
+    """#3090: when quantized_attention fails, the dense fallback must still
+    run (and produce the right shape) via the chunked path, not crash."""
     from mlx_lm.models import base as mlx_base
 
     from omlx.patches import turboquant_attention as tq_attention
@@ -550,11 +552,11 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
         return None
 
     original_dequantize = TurboQuantKVCache.dequantize
-    dequant_kwargs = {}
+    dequant_calls = []
 
     def spy_dequantize(self, *args, **kwargs):
         calls["dequantize"] += 1
-        dequant_kwargs.update(kwargs)
+        dequant_calls.append(kwargs)
         return original_dequantize(self, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -576,8 +578,122 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     mx.eval(out)
 
     assert out.shape == queries.shape
-    assert calls == {"quantized": 1, "prefill": 1, "dequantize": 1}
-    assert dequant_kwargs == {"keys_state": ks, "values_state": vs}
+    assert calls["quantized"] == 1
+    # prefill_attention() is still tried first (its own upstream fast path,
+    # unchanged by #3090) and declines (returns None) before the chunked
+    # dense fallback below ever runs.
+    assert calls["prefill"] == 1
+    assert calls["dequantize"] >= 1
+    # #3090: every dequantize call must be scoped to this call's own KV
+    # chunk, never the unsliced full-cache state dequantize() defaults to
+    # when keys_state/values_state are omitted (the bug jundot found: the
+    # PR's own "fix" passed the caller's views, but those views ARE the
+    # full-cache state proxy -- no narrowing happened).
+    for kwargs in dequant_calls:
+        from omlx.turboquant_kv import _state_length
+
+        assert _state_length(kwargs["keys_state"]) <= _state_length(ks)
+
+
+def test_dense_fallback_chunked_matches_single_shot_reference(monkeypatch):
+    """#3090: the chunked dense fallback must produce the same attention
+    output as the old single-shot dequantize()+SDPA it replaces (not just
+    the same shape) -- correctness, not just a smaller transient. Forces
+    multiple query blocks AND multiple KV chunks so the online-softmax
+    accumulation across both axes is actually exercised, on a causal call
+    with a cached prefix (kv_len > q_len, the offset-alignment case)."""
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    # Small tile sizes force >1 query block and >1 KV chunk at these
+    # cache/query sizes, instead of degrading to the single-iteration
+    # (old-behavior-equivalent) case.
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUERY_BLOCK_SIZE", 5)
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_KEY_CHUNK_SIZE", 7)
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 8192)
+
+    prefix_len, new_len = 20, 12
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, prefix_len, 32)),
+        mx.random.normal((1, 2, prefix_len, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    tq.update_and_fetch(
+        mx.random.normal((1, 2, new_len, 32)),
+        mx.random.normal((1, 2, new_len, 32)),
+    )
+    ks, vs = tq.state
+
+    queries = mx.random.normal((1, 4, new_len, 32))
+    scale = 32**-0.5
+
+    # Reference: the single-shot path this fallback replaces.
+    ref_keys, ref_values = tq.dequantize(keys_state=ks, values_state=vs)
+    reference = mx.fast.scaled_dot_product_attention(
+        queries,
+        ref_keys.astype(queries.dtype),
+        ref_values.astype(queries.dtype),
+        scale=scale,
+        mask="causal",
+    )
+    mx.eval(reference)
+
+    chunked = tq_attention._chunked_dense_fallback_attention(
+        tq, queries, ks, vs, scale, "causal"
+    )
+    mx.eval(chunked)
+
+    assert chunked.shape == reference.shape
+    assert mx.allclose(chunked, reference, atol=1e-3, rtol=1e-3).item()
+
+
+def test_dense_fallback_chunked_never_dequantizes_the_full_cache(monkeypatch):
+    """#3090 discrimination: with tile sizes smaller than the resident
+    cache, every dequantize call in the chunked fallback must be scoped to
+    one KV chunk -- proving this is a genuine tiled implementation, not a
+    passthrough of the full state (the bug jundot found in the original
+    'fix')."""
+    from omlx.patches import turboquant_attention as tq_attention
+    from omlx.turboquant_kv import _state_length
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUERY_BLOCK_SIZE", 5)
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_KEY_CHUNK_SIZE", 7)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 20, 32)),
+        mx.random.normal((1, 2, 20, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    total = _state_length(ks)
+    assert total == 20
+
+    original_dequantize = TurboQuantKVCache.dequantize
+    seen_lengths = []
+
+    def spy_dequantize(self, *args, **kwargs):
+        seen_lengths.append(_state_length(kwargs["keys_state"]))
+        return original_dequantize(self, *args, **kwargs)
+
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
+
+    queries = mx.random.normal((1, 4, 20, 32))
+    out = tq_attention._chunked_dense_fallback_attention(
+        tq, queries, ks, vs, 32**-0.5, "causal"
+    )
+    mx.eval(out)
+
+    assert seen_lengths, "dequantize was never called"
+    assert all(length <= 7 for length in seen_lengths)
+    assert any(length < total for length in seen_lengths)
+    # Multiple KV chunks (7-token tiles over 20 tokens) x multiple query
+    # blocks (5-token tiles over 20 tokens) -> more than one dequantize call.
+    assert len(seen_lengths) > 1
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 9])
