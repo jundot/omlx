@@ -367,6 +367,22 @@ class ProcessMemoryEnforcer:
         self._memory_guard_custom_ceiling_bytes = max(
             0, int(memory_guard_custom_ceiling_gb * 1024**3)
         )
+        if (
+            memory_guard_custom_ceiling_gb > 0
+            and self._memory_guard_tier != "custom"
+        ):
+            # Users editing settings.json directly have no way to discover
+            # that the custom ceiling only applies to tier == "custom" (it
+            # is documented only in this __init__ docstring), so a mis-set
+            # ceiling silently no-ops and the enforcer runs on its computed
+            # limit instead (issue #2928). Warn loudly at construction.
+            logger.warning(
+                "Custom ceiling %.1f GB is set but ignored because "
+                "memory_guard_tier is '%s' (custom ceiling is only used "
+                "when tier='custom')",
+                memory_guard_custom_ceiling_gb,
+                self._memory_guard_tier,
+            )
         self._active_poll_interval = poll_interval
         self._loaded_idle_poll_interval = 10.0
         self._unloaded_idle_poll_interval = 30.0
