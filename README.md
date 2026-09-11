@@ -191,6 +191,8 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 - **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
 - **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
 
+Optional [cache inspection files](docs/cache-inspection.md) save token IDs and an annotated text view beside SSD blocks. Capture is off by default, exposes prompt content when enabled, and follows the cache's eviction lifecycle.
+
 <p align="center">
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>

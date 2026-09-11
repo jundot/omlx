@@ -1278,6 +1278,46 @@ class TestProcessChatMessages:
 class TestPrepareVisionInputs:
     """Tests for VLMBatchedEngine._prepare_vision_inputs()."""
 
+    @pytest.mark.parametrize("enabled", [False, True])
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_inspection_reuses_existing_image_metadata(self, prepare, enabled):
+        from PIL import Image
+
+        from omlx.utils.image import compute_image_hash
+
+        engine = self._setup_engine_for_vision()
+        engine._scheduler_config = SimpleNamespace(
+            cache_inspection=enabled, hot_cache_only=False
+        )
+        engine._vision_cache = None
+        engine._vlm_model.config.image_token_id = 2
+        engine._vlm_model.language_model = None
+        embedding = mx.zeros((1, 3, 4))
+        engine._vlm_model.get_input_embeddings.return_value = SimpleNamespace(
+            inputs_embeds=embedding
+        )
+        prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": mx.zeros((1, 3, 4, 4)),
+        }
+        images = [Image.new("RGB", (4, 6), "red")]
+        messages = [{"role": "user", "content": "Describe this"}]
+        with patch(
+            "omlx.engine.vlm.compute_image_hash", wraps=compute_image_hash
+        ) as hashes:
+            result = engine._prepare_vision_inputs(messages, images)
+        # Existing cumulative key + existing whole-request key, no new hash.
+        assert hashes.call_count == 2
+        assert prepare.call_count == 1
+        assert engine._vlm_model.get_input_embeddings.call_count == 1
+        if enabled:
+            media = result[2]["_cache_inspection_media"]
+            assert media[0]["input_dimensions"] == [[4, 6]]
+            assert media[0]["fingerprint"] == "sha256:" + result[3]
+            assert media[0]["token_span"] is None
+        else:
+            assert "_cache_inspection_media" not in result[2]
+
     def _setup_engine_for_vision(self, model_type="qwen2_5_vl"):
         """Create engine with mocked VLM internals for vision input testing."""
         engine = _make_loaded_engine(model_type=model_type)
