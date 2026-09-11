@@ -296,6 +296,35 @@ async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
 
 
 @pytest.mark.asyncio
+async def test_deepseek_v41_engram_ssd_offload_is_persisted_for_v41_only():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v41"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(deepseek_v41_engram_ssd_offload=True),
+    )
+
+    assert settings.deepseek_v41_engram_ssd_offload is True
+
+
+@pytest.mark.asyncio
+async def test_deepseek_v41_engram_ssd_offload_is_ignored_for_other_models():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(deepseek_v41_engram_ssd_offload=True),
+    )
+
+    assert settings.deepseek_v41_engram_ssd_offload is False
+
+
+@pytest.mark.asyncio
 async def test_qwen4_mtp_setting_accepts_embedded_head(tmp_path):
     _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=True)
     pool, entry = _failed_pool()

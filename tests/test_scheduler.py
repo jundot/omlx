@@ -24,9 +24,11 @@ from unittest.mock import MagicMock, call, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import CacheList, KVCache
 
 import omlx.scheduler as scheduler_module
 from omlx.cache.stats import PrefixCacheStats
+from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
@@ -3701,6 +3703,36 @@ class TestSchedulerRotatingBlockAlignment:
 
 class TestSchedulerArraysCacheBlockAlignment:
     """ArraysCache boundaries must match the effective prefill chunk."""
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_deepseek_v41_subclass_uses_2048_boundaries(
+        self, mock_tokenizer, tmp_path, nested
+    ):
+        model = self._hybrid_model(model_type="deepseek_v41")
+        model.make_cache = lambda: [
+            CacheList(KVCache(), DeepseekV41Cache(4))
+            if nested
+            else DeepseekV41Cache(4)
+        ]
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=256,
+                prefill_step_size=2048,
+            ),
+        )
+        try:
+            assert scheduler._model_has_arrays_cache()
+            assert scheduler._qwen35_prefill_floor == 0
+            assert scheduler.config.paged_cache_block_size == 2048
+            assert scheduler._prefill_step_size_for_progress(0, 9216) == 2048
+        finally:
+            scheduler.shutdown()
+
+    def test_plain_kv_cache_is_not_arrays_cache(self):
+        assert not Scheduler._cache_tree_has_arrays_cache(KVCache())
 
     @staticmethod
     def _hybrid_model(model_type="qwen3_5"):

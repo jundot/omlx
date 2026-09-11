@@ -206,7 +206,7 @@ class EngineEntry:
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     runtime_estimated_size: int | None = None  # Includes active load-time variants
-    runtime_settle_size: int | None = None  # Excludes K2 ANE admission headroom
+    runtime_settle_size: int | None = None  # Excludes K2 ANE storage
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -355,7 +355,7 @@ class EnginePool:
         base_size: int | None = None,
         include_ane_reservation: bool = True,
     ) -> int:
-        """Include runtime storage and optional K2 ANE admission headroom."""
+        """Include Engram runtime storage and optional K2 ANE reservations."""
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
@@ -365,6 +365,15 @@ class EnginePool:
         )
         if qwen4_offload and qwen4_estimate is not None:
             base = min(base, qwen4_estimate.mmap_bytes)
+        v41_offload, _, v41_estimate = self._deepseek_v41_engram_offload_status(
+            entry, runtime_settings
+        )
+        if v41_estimate is not None:
+            base = (
+                v41_estimate.mmap_bytes
+                if v41_offload
+                else v41_estimate.resident_bytes
+            )
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -469,6 +478,80 @@ class EnginePool:
             return settings
         effective = copy.copy(settings)
         setattr(effective, "qwen4_ple_ssd_offload", True)
+        return effective
+
+    def _deepseek_v41_engram_offload_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced DeepSeek V4.1 Engram mmap mode for this process."""
+
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "deepseek_v41":
+            return False, False, None
+        try:
+            from .patches.deepseek_v41.residency import (
+                deepseek_v41_residency_estimate,
+            )
+
+            estimate = deepseek_v41_residency_estimate(entry.model_path)
+        except (KeyError, OSError, TypeError, ValueError):
+            logger.debug(
+                "Could not inspect DeepSeek V4.1 Engram residency for %s",
+                entry.model_id,
+                exc_info=True,
+            )
+            return False, False, None
+        # Normal residency calls use the stable ceiling so a post-unload
+        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
+        # pass its earlier live ceiling explicitly when only mmap fits.
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB).",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
+        requested = bool(
+            settings is not None
+            and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
+        )
+        return requested or forced, forced, estimate if estimate.supported else None
+
+    def _effective_deepseek_v41_model_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> object | None:
+        """Apply a forced mmap decision without mutating persisted settings."""
+
+        enabled, forced, _ = self._deepseek_v41_engram_offload_status(
+            entry,
+            settings,
+            ceiling=ceiling,
+        )
+        if not enabled or not forced:
+            return settings
+        if settings is None:
+            from .model_settings import ModelSettings
+
+            settings = ModelSettings()
+        effective = copy.copy(settings)
+        effective.deepseek_v41_engram_ssd_offload = True
         return effective
 
     @property
@@ -662,6 +745,10 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+            v41_offload, _, _ = self._deepseek_v41_engram_offload_status(
+                entry, settings
+            )
+            add("deepseek_v41_engram_ssd_offload", v41_offload)
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -1586,16 +1673,16 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
-            qwen4_admission_ceiling = None
-            if (
-                (entry.config_model_type or "").replace("-", "_").lower()
-                == "qwen4_exp"
-            ):
+            ngram_admission_ceiling = None
+            if (entry.config_model_type or "").replace("-", "_").lower() in {
+                "qwen4_exp",
+                "deepseek_v41",
+            }:
                 candidate = self._current_ceiling()
                 if candidate <= 0:
                     candidate = self._fallback_admission_ceiling()
                 if candidate > 0:
-                    qwen4_admission_ceiling = candidate
+                    ngram_admission_ceiling = candidate
             unloaded_for_admission = False
 
             # Already loaded - just update access time
@@ -1686,11 +1773,14 @@ class EnginePool:
             load_settings = self._effective_qwen4_model_settings(
                 entry,
                 admission_settings,
-                ceiling=qwen4_admission_ceiling,
+                ceiling=ngram_admission_ceiling,
             )
-            qwen4_admission_override = load_settings is not admission_settings
+            load_settings = self._effective_deepseek_v41_model_settings(
+                entry, load_settings, ceiling=ngram_admission_ceiling
+            )
+            ngram_admission_override = load_settings is not admission_settings
             runtime_load_settings = (
-                load_settings if qwen4_admission_override else runtime_settings
+                load_settings if ngram_admission_override else runtime_settings
             )
             admission_size = self._entry_runtime_resident_size(
                 entry,
@@ -1842,7 +1932,7 @@ class EnginePool:
             )
 
             loaded = self._entries[model_id]
-            if qwen4_admission_override and expected_signature is not None:
+            if ngram_admission_override and expected_signature is not None:
                 # Automatic mmap is local to this admission attempt. Keep the
                 # user's requested variant as the reuse key so the next request
                 # does not reload the model merely because pressure recovered.
@@ -2489,6 +2579,8 @@ class EnginePool:
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
 
+        # RAM Engram tables share MLX buffers with CPU views, so their packed
+        # bytes are included in both admission and Metal unload settlement.
         # Memory settle barrier: poll actual freed memory instead of
         # trusting the cumulative _current_model_memory estimate.
         # Scale tolerance with model size: estimated_size includes a 5%
@@ -2695,6 +2787,9 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            model_settings = self._effective_deepseek_v41_model_settings(
+                entry, model_settings
+            )
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 

@@ -513,6 +513,12 @@ class DeepSeekV4OutputParserSession:
 
     def __init__(self, tokenizer: Any, model_path: str | None = None):
         self._tokenizer = tokenizer
+        self._tool_start = (
+            getattr(tokenizer, "tool_call_start", None) or _DEEPSEEK_V4_TOOL_CALL_START
+        )
+        self._tool_end = (
+            getattr(tokenizer, "tool_call_end", None) or _DEEPSEEK_V4_TOOL_CALL_END
+        )
         self._raw_text = ""
         self._stopped = False
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
@@ -545,13 +551,13 @@ class DeepSeekV4OutputParserSession:
         return tool_filter.finish()
 
     def _trim_at_first_tool_block_end(self, text: str) -> tuple[str, bool]:
-        start_idx = text.find(_DEEPSEEK_V4_TOOL_CALL_START)
+        start_idx = text.find(self._tool_start)
         if start_idx < 0:
             return text, False
-        end_idx = text.find(_DEEPSEEK_V4_TOOL_CALL_END, start_idx)
+        end_idx = text.find(self._tool_end, start_idx)
         if end_idx < 0:
             return text, False
-        cutoff = end_idx + len(_DEEPSEEK_V4_TOOL_CALL_END)
+        cutoff = end_idx + len(self._tool_end)
         return text[:cutoff], True
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
@@ -1394,6 +1400,18 @@ def detect_output_parser(
                 _TOOL_RESPONSE_OPEN,
                 _TOOL_RESPONSE_CLOSE,
             ),
+        )
+
+    if getattr(tokenizer, "tool_call_start", None) == "<｜DSML｜ calls>":
+        from ..patches.deepseek_v41.output_parser import DeepSeekV41OutputParserSession
+
+        return OutputParserFactory(
+            kind="deepseek_v41",
+            create_session=lambda session_tokenizer: DeepSeekV41OutputParserSession(
+                session_tokenizer, model_path=session_model_path
+            ),
+            stop_token_ids=set(),
+            protocol_marker_texts=("<｜DSML｜ calls>", "</｜DSML｜ calls>"),
         )
 
     if _is_deepseek_v4_model(model_name, tokenizer, model_config):

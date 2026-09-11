@@ -513,7 +513,15 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
-    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
+    if model_type == "deepseek_v41":
+        from ..patches.deepseek_v41 import apply_patch
+
+        apply_patch()
+    if (
+        isinstance(model_type, str)
+        and model_type.startswith("deepseek_v4")
+        and not model_type.startswith("deepseek_v41")
+    ):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
 
         if apply_deepseek_v4_patch():

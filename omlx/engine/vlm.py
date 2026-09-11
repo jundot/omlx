@@ -1819,6 +1819,19 @@ class VLMBatchedEngine(BaseEngine):
                     return model, processor
 
                 model_type = _read_config_model_type(self._model_name)
+                if model_type == "deepseek_v41":
+                    from ..patches.deepseek_v41.loading import load
+
+                    return load(
+                        self._model_name,
+                        engram_ssd_offload=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_v41_engram_ssd_offload",
+                                False,
+                            )
+                        ),
+                    )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
@@ -2580,6 +2593,13 @@ class VLMBatchedEngine(BaseEngine):
         )
         if not model_type:
             raise ValueError("Missing VLM model_type for chat template formatting")
+
+        if model_type == "deepseek_v41":
+            if num_audios:
+                raise ValueError("DeepSeek V4.1 supports text and images, not audio")
+            from ..patches.deepseek_v41.processing import format_messages
+
+            return format_messages(messages, num_images)
 
         image_part_types = {"image", "image_url", "input_image"}
         audio_part_types = {"input_audio"}

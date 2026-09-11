@@ -645,7 +645,7 @@ def _store_nstate_elements_flat(
             arrays[elem_key] = mx.zeros((1,))
             cache_list_meta[f"{elem_key}_none"] = "1"
         elif _has_zero_dim(elem):
-            arrays[elem_key] = mx.zeros((1,))
+            arrays[elem_key] = mx.zeros((1,), dtype=elem.dtype)
             cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(elem.shape)
         elif (
             isinstance(elem, tuple)
@@ -732,7 +732,12 @@ def _load_nstate_flat(
                 logger.error(f"Missing {elem_key} in arrays")
                 return None
             if file_metadata and zd_marker in file_metadata:
-                elements.append(mx.zeros(_decode_shape(file_metadata[zd_marker])))
+                elements.append(
+                    mx.zeros(
+                        _decode_shape(file_metadata[zd_marker]),
+                        dtype=arrays[elem_key].dtype,
+                    )
+                )
             else:
                 elements.append(arrays[elem_key])
     else:

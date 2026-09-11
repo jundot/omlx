@@ -730,6 +730,101 @@ class TestQwenCpuShareMemoryEstimate:
         signature = dict(entry.runtime_settings_signature or ())
         assert signature["qwen4_ple_ssd_offload"] == "False"
 
+    def test_v41_ple_offload_reduces_resident_projection(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.deepseek_v41.residency import (
+            EngramResidencyEstimate,
+        )
+
+        model = tmp_path / "v41"
+        model.mkdir()
+        settings = ModelSettings(deepseek_v41_engram_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="v41",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="deepseek_v41",
+            estimated_size=1000,
+        )
+        estimate = EngramResidencyEstimate(
+            supported=True,
+            engram_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._entries[entry.model_id] = entry
+
+        with patch(
+            "omlx.patches.deepseek_v41.residency." "deepseek_v41_residency_estimate",
+            return_value=estimate,
+        ):
+            projected = pool._entry_runtime_resident_size(entry, settings)
+            effective = pool._effective_deepseek_v41_model_settings(entry, settings)
+            signature = dict(pool._engine_runtime_signature("v41", settings))
+
+        assert projected == 400
+        assert settings.deepseek_v41_engram_ssd_offload is False
+        assert effective.deepseek_v41_engram_ssd_offload is True
+        assert signature["deepseek_v41_engram_ssd_offload"] == "True"
+
+    @pytest.mark.asyncio
+    async def test_v41_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
+        """Real pressure may select mmap without making that override sticky."""
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.deepseek_v41.residency import (
+            EngramResidencyEstimate,
+        )
+
+        model = tmp_path / "v41"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+        settings = ModelSettings(deepseek_v41_engram_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="v41",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="deepseek_v41",
+            estimated_size=1000,
+        )
+        estimate = EngramResidencyEstimate(
+            supported=True,
+            engram_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._get_admission_soft_target = lambda: 500
+        pool._get_residency_ceiling = lambda: 1000
+        pool._entries[entry.model_id] = entry
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_engine) as cls,
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch(
+                "omlx.patches.deepseek_v41.residency."
+                "deepseek_v41_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            loaded = await pool.get_engine("v41", runtime_settings=settings)
+            reused = await pool.get_engine("v41", runtime_settings=settings)
+
+        assert loaded is mock_engine
+        assert reused is mock_engine
+        cls.assert_called_once()
+        effective = cls.call_args.kwargs["model_settings"]
+        assert effective.deepseek_v41_engram_ssd_offload is True
+        assert settings.deepseek_v41_engram_ssd_offload is False
+        assert entry.runtime_estimated_size == 400
+        signature = dict(entry.runtime_settings_signature or ())
+        assert signature["deepseek_v41_engram_ssd_offload"] == "False"
+
 
 class TestApplySettingsOverrides:
     """Tests for apply_settings_overrides method."""
@@ -3148,6 +3243,52 @@ class TestMemorySettleBarrier:
 
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == initial_memory - est_size
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("offload", [False, True])
+    async def test_v41_settle_tracks_metal_engram_and_admission(
+        self, pool_with_loaded_model, offload, caplog
+    ):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.deepseek_v41.residency import EngramResidencyEstimate
+
+        pool = pool_with_loaded_model
+        entry = pool._entries["model-a"]
+        entry.config_model_type = "deepseek_v41"
+        gib = 1024**3
+        estimate = EngramResidencyEstimate(True, 80 * gib, 50 * gib, 30 * gib)
+        settings = ModelSettings(deepseek_v41_engram_ssd_offload=offload)
+        with patch(
+            "omlx.patches.deepseek_v41.residency.deepseek_v41_residency_estimate",
+            return_value=estimate,
+        ):
+            entry.runtime_estimated_size = pool._entry_runtime_resident_size(
+                entry, settings
+            )
+            entry.runtime_settle_size = pool._entry_runtime_resident_size(
+                entry, settings, include_ane_reservation=False,
+            )
+        charge = (50 if offload else 80) * gib
+        assert entry.runtime_estimated_size == charge
+        assert entry.runtime_settle_size == charge
+        pool._current_model_memory = charge
+
+        def active_memory():
+            assert pool._current_model_memory == charge
+            return next(readings)
+
+        readings = iter([charge + gib, gib])
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            mock_mx.get_active_memory.side_effect = active_memory
+            await pool._unload_engine("model-a")
+        assert pool._current_model_memory == 0
+        assert "Settle barrier timed out" not in caplog.text
+        assert mock_mx.get_active_memory.call_count == 2
+        assert not any(call.args == (0.1,) for call in sleep.call_args_list)
 
     @pytest.mark.asyncio
     async def test_settle_takes_multiple_rounds(self, pool_with_loaded_model):
