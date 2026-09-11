@@ -395,7 +395,21 @@ class MCPClient:
             if hasattr(item, "text"):
                 contents.append(item.text)
             elif hasattr(item, "data"):
-                contents.append(item.data)
+                # Image/audio blocks: keep the media type next to the payload.
+                # Flattened to a bare base64 string it is indistinguishable
+                # from text, so a caller has no way to render it -- and ends up
+                # handing ~1MB of base64 to the model instead of an image.
+                mime = _sdk_attr(item, "mime_type", "mimeType")
+                if mime:
+                    contents.append(
+                        {
+                            "type": _sdk_attr(item, "type", default="image"),
+                            "mime_type": mime,
+                            "data": item.data,
+                        }
+                    )
+                else:
+                    contents.append(item.data)
             else:
                 contents.append(str(item))
 
