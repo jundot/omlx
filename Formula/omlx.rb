@@ -25,11 +25,15 @@ class Omlx < Formula
     skip_clean "libexec" if MacOS.version >= "27"
   end
 
-  # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
-  # mlx-lm. Fetch source separately so we can patch the pin before install.
+  # mlx-audio is installed from a pinned commit instead of omlx's [audio]
+  # extra (brew installs omlx without extras): the pin must include
+  # voxtral_realtime create_streaming_session (upstream f679861) or the
+  # realtime STT WebSocket rejects every session while /v1/models/status
+  # advertises it (#3231). 40bc168 is the newest commit whose declared deps
+  # stay compatible with omlx's transformers<5.13 pin.
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
+      revision: "40bc1680eaa47b8f3d5992bbb2913f08c3d1a123"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
@@ -110,11 +114,20 @@ class Omlx < Formula
       end
     end
 
-    # Install mlx-audio with patched mlx-lm pin to avoid version conflict
+    # Install mlx-audio from the pinned commit. Its declared mlx-lm>=0.31.1
+    # is satisfied by omlx's git-pinned 0.31.3, so no pin patching needed.
     resource("mlx-audio").stage do
-      inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system(*pip_install, ".[all]")
     end
+
+    # Since upstream 40bc168, misaki/spacy & co are optional installs that
+    # mlx-audio no longer pulls transitively. Install the G2P and
+    # audio-analysis deps omlx needs at runtime explicitly (mirrors omlx's
+    # [bundle] extra; the spacy model wheel below completes the Kokoro path).
+    system(*pip_install,
+           "misaki>=0.9.4", "num2words>=0.5.14", "spacy>=3.8.4",
+           "phonemizer-fork>=3.3.2", "espeakng-loader>=0.2.4",
+           "librosa>=0.10.0", "numba>=0.59.0", "pyloudnorm>=0.1.0")
 
     # Install the spaCy English model required by misaki for Kokoro TTS.
     # Homebrew's cached resource path is hash-prefixed, which pip rejects
