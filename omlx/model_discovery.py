@@ -1452,6 +1452,52 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     return False
 
 
+def _gemma4_text_only_wants_vlm_engine(config: dict) -> bool:
+    """True for a text-only Gemma 4 checkpoint carrying a merged MTP head.
+
+    ``gemma4_unified`` already routes to mlx-vlm whatever its vision state,
+    but a plain ``gemma4`` checkpoint with no vision sub-config is classed
+    text-only and served by mlx-lm -- where the merged assistant head has no
+    binding site, so MTP is advertised and never drafts.
+
+    mlx-vlm drives that head today (#2683). The condition is deliberately
+    narrow: reaching the VLM engine costs memory, measurably, so a text-only
+    Gemma 4 checkpoint with no head has nothing to gain and stays where it is.
+    """
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type != "gemma4":
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return _has_merged_mtp_head(config)
+
+
+def _has_merged_mtp_head(config: dict) -> bool:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    return isinstance(text_config.get("mtp_assistant_config"), dict)
+
+
+def _gemma4_text_only_prefers_llm_engine(config: dict) -> bool:
+    """True for a text-only Gemma 4 checkpoint with no head to drive.
+
+    ``gemma4_unified`` is routed to mlx-vlm on its model_type alone, so a
+    text-only export of one lands on the VLM engine. Until the text-only load
+    was fixed it failed there and fell back to mlx-lm; fixing the load means
+    it now stays, and pays the VLM engine's overhead -- measured at +0.31 GB
+    on the 12B -- for a head it does not have.
+
+    Keep those on mlx-lm deliberately, rather than by way of a failed load.
+    """
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in ("gemma4", "gemma4_unified"):
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return not _has_merged_mtp_head(config)
+
+
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
@@ -1508,14 +1554,43 @@ def _register_model(
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
         is_helper = False
+        # Defaulted alongside the other two, because the routing below reads it
+        # outside this block: an unparseable config.json must leave a config
+        # the predicates can answer False for, not an unbound name. Raising
+        # here would be caught as a failed discovery and drop the model, which
+        # is how a malformed config used to reach the repo-name heuristic.
+        _config: dict = {}
         try:
             import json
             with open(model_dir / "config.json") as f:
-                _config = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _config = loaded
             config_model_type = _config.get("model_type", "")
             is_helper = is_helper_model_config(_config)
         except Exception:
             pass
+
+        # Engine, not identity: the model is still text-only and is reported
+        # that way, it is only served by the engine that can drive its head.
+        if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
+            engine_type = "vlm"
+            logger.info(
+                "%s is text-only Gemma 4 with a merged MTP head; serving it "
+                "on the VLM engine, which can drive that head",
+                model_id,
+            )
+        elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
+            # `supports_images` is `model_type == "vlm"`, so moving only the
+            # engine would leave a text-only checkpoint advertising images.
+            engine_type = "batched"
+            model_type = "llm"
+            text_only_size = 0
+            logger.info(
+                "%s is text-only Gemma 4 with no merged MTP head; serving it "
+                "on the LLM engine, which carries less overhead",
+                model_id,
+            )
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
