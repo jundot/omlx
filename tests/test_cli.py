@@ -1207,6 +1207,310 @@ class TestServeCommandFunctions:
         assert captured["socket_name"][1] > 0
 
 
+class TestPsCommand:
+    """Tests for the `omlx ps` command."""
+
+    @staticmethod
+    def _status_payload(**overrides):
+        models = overrides.pop(
+            "models",
+            [
+                {
+                    "id": "qwen-tts",
+                    "model_type": "audio_tts",
+                    "loaded": True,
+                    "is_loading": False,
+                    "actual_size": 3_000_000_000,
+                    "estimated_size": 2_500_000_000,
+                    "max_context_window": 131072,
+                    "last_access": 1_000_000.0,
+                    "pinned": False,
+                },
+                {
+                    "id": "qwen-asr",
+                    "model_type": "audio_stt",
+                    "loaded": False,
+                    "is_loading": False,
+                    "estimated_size": 2_400_000_000,
+                    "max_context_window": 131072,
+                    "last_access": None,
+                    "pinned": False,
+                },
+                {
+                    "id": "qwen-llm-pinned",
+                    "model_type": "llm",
+                    "loaded": True,
+                    "is_loading": False,
+                    "actual_size": 4_000_000_000,
+                    "estimated_size": 3_800_000_000,
+                    "max_context_window": 65536,
+                    "last_access": 1_000_000.0,
+                    "pinned": True,
+                },
+            ],
+        )
+        payload = {
+            "final_ceiling": 12_000_000_000,
+            "current_model_memory": 2_500_000_000,
+            "model_count": 3,
+            "loaded_count": 2,
+            "models": models,
+        }
+        payload.update(overrides)
+        return payload
+
+    @staticmethod
+    def _make_args(**overrides):
+        defaults = {
+            "host": None,
+            "port": None,
+            "api_key": None,
+            "json": False,
+        }
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    @staticmethod
+    def _mock_response(payload, status_code=200):
+        response = MagicMock()
+        response.status_code = status_code
+        response.ok = status_code < 400
+        response.json.return_value = payload
+        return response
+
+    @staticmethod
+    def _patch_settings(monkeypatch, host="127.0.0.1", port=8000):
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host=host, port=port),
+            auth=SimpleNamespace(api_key=None),
+        )
+        monkeypatch.setattr(
+            "omlx.settings.GlobalSettings.load", lambda: settings
+        )
+
+    def test_ps_table_output(self, monkeypatch, capsys):
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, port=8000)
+        response = self._mock_response(self._status_payload())
+
+        with patch("requests.get", return_value=response) as mock_get:
+            assert cli.ps_command(self._make_args(port=8000)) == 0
+
+        url = mock_get.call_args.args[0]
+        assert url == "http://127.0.0.1:8000/v1/models/status"
+
+        out = capsys.readouterr().out
+        assert "Memory: 2.5 GB / 12.0 GB (guard ceiling)" in out
+        assert "NAME" in out and "TYPE" in out and "SIZE" in out
+        assert "CONTEXT" in out and "STATUS" in out and "LAST USED" in out
+        assert "PINNED" in out
+        assert "qwen-tts" in out
+        assert "audio_tts" in out
+        assert "3.0 GB" in out
+        assert "128k" in out
+        assert "loaded" in out
+        assert "audio_stt" in out
+        assert "never" in out
+        assert "qwen-llm-pinned" in out
+        assert "4.0 GB" in out
+        assert "64k" in out
+
+    def test_ps_format_context_human_readable(self):
+        from omlx import cli
+
+        assert cli._format_context(131072) == "128k"
+        assert cli._format_context(65536) == "64k"
+        assert cli._format_context(4096) == "4k"
+        assert cli._format_context(262144) == "256k"
+        assert cli._format_context(1500) == "2k"
+        assert cli._format_context(999) == "999"
+        assert cli._format_context(0) == "-"
+        assert cli._format_context(None) == "-"
+
+    def test_ps_json_output(self, monkeypatch, capsys):
+        import json
+
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, port=8000)
+        payload = self._status_payload()
+        response = self._mock_response(payload)
+
+        with patch("requests.get", return_value=response):
+            assert cli.ps_command(self._make_args(port=8000, json=True)) == 0
+
+        out = capsys.readouterr().out
+        assert json.loads(out) == payload
+
+    def test_ps_server_down_exits_1(self, monkeypatch, capsys):
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, port=8000)
+
+        with patch("requests.get", side_effect=ConnectionError()):
+            assert cli.ps_command(self._make_args(port=8000)) == 1
+
+        out = capsys.readouterr().out
+        assert "oMLX server is not running at http://127.0.0.1:8000" in out
+        assert "Start the server first: omlx start" in out
+
+    def test_ps_sends_bearer_header_when_api_key(self, monkeypatch, capsys):
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, port=8000)
+        response = self._mock_response(self._status_payload(models=[]))
+
+        with patch("requests.get", return_value=response) as mock_get:
+            assert cli.ps_command(
+                self._make_args(port=8000, api_key="secret-key")
+            ) == 0
+
+        headers = mock_get.call_args.kwargs.get("headers", {})
+        assert headers.get("Authorization") == "Bearer secret-key"
+
+    def test_ps_unauthorized_suggests_api_key(self, monkeypatch, capsys):
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, port=8000)
+        response = self._mock_response({}, status_code=401)
+
+        with patch("requests.get", return_value=response):
+            assert cli.ps_command(self._make_args(port=8000)) == 1
+
+        out = capsys.readouterr().out
+        assert "Authentication required" in out
+        assert "--api-key" in out
+
+    def test_ps_wildcard_host_falls_back_to_localhost(self, monkeypatch, capsys):
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, host="0.0.0.0", port=8000)
+        response = self._mock_response(self._status_payload(models=[]))
+
+        with patch("requests.get", return_value=response) as mock_get:
+            assert cli.ps_command(self._make_args()) == 0
+
+        assert mock_get.call_args.args[0] == (
+            "http://127.0.0.1:8000/v1/models/status"
+        )
+
+    def test_ps_pinned_flag_parsing(self, monkeypatch, capsys):
+        """Pin column parses varied /v1/models/status payloads."""
+        from omlx import cli
+
+        scenarios = [
+            # (model payload, whether "pinned" should appear in the row)
+            (
+                {"pinned": True, "loaded": True},
+                True,
+            ),  # pinned and loaded
+            (
+                {"pinned": True, "loaded": False},
+                True,
+            ),  # pinned but unloaded: still visible
+            (
+                {"pinned": False, "loaded": True},
+                False,
+            ),  # unpinned and loaded
+            (
+                {"pinned": None, "loaded": False},
+                False,
+            ),  # explicit null renders as "-"
+        ]
+        for index, (extra, expect_pinned) in enumerate(scenarios):
+            model = {
+                "id": f"pin-model-{index}",
+                "model_type": "llm",
+                "is_loading": False,
+                "estimated_size": 1_000_000_000,
+                "max_context_window": 131072,
+                "last_access": None,
+            }
+            model.update(extra)
+            payload = self._status_payload(models=[model])
+
+            self._patch_settings(monkeypatch, port=8000)
+            response = self._mock_response(payload)
+            with patch("requests.get", return_value=response):
+                assert cli.ps_command(self._make_args(port=8000)) == 0
+
+            out = capsys.readouterr().out
+            assert f"pin-model-{index}" in out
+            if expect_pinned:
+                assert "pinned" in out
+            else:
+                assert "pinned" not in out
+
+    def test_ps_pinned_key_missing_is_tolerated(self, monkeypatch, capsys):
+        """Older servers may omit the pinned field entirely; render as '-'."""
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, port=8000)
+        payload = self._status_payload(
+            models=[
+                {
+                    "id": "legacy-model",
+                    "model_type": "llm",
+                    "loaded": True,
+                    "is_loading": False,
+                    "estimated_size": 2_000_000_000,
+                    "max_context_window": 131072,
+                    "last_access": None,
+                }
+            ]
+        )
+        response = self._mock_response(payload)
+
+        with patch("requests.get", return_value=response):
+            assert cli.ps_command(self._make_args(port=8000)) == 0
+
+        out = capsys.readouterr().out
+        assert "legacy-model" in out
+        assert "PINNED" in out
+        assert "pinned" not in out.replace("PINNED", "")
+
+    def test_ps_loading_state_shown(self, monkeypatch, capsys):
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, port=8000)
+        payload = self._status_payload(
+            models=[
+                {
+                    "id": "big-model",
+                    "model_type": "llm",
+                    "loaded": False,
+                    "is_loading": True,
+                    "estimated_size": 7_000_000_000,
+                    "max_context_window": 65536,
+                    "last_access": None,
+                    "pinned": False,
+                }
+            ]
+        )
+        response = self._mock_response(payload)
+
+        with patch("requests.get", return_value=response):
+            assert cli.ps_command(self._make_args(port=8000)) == 0
+
+        out = capsys.readouterr().out
+        assert "big-model" in out
+        assert "loading" in out
+
+    def test_ps_cli_args_override_settings(self, monkeypatch, capsys):
+        from omlx import cli
+
+        self._patch_settings(monkeypatch, host="127.0.0.1", port=8000)
+        response = self._mock_response(self._status_payload(models=[]))
+
+        with patch("requests.get", return_value=response) as mock_get:
+            assert cli.ps_command(self._make_args(host="10.0.0.5", port=9000)) == 0
+
+        assert mock_get.call_args.args[0] == (
+            "http://10.0.0.5:9000/v1/models/status"
+        )
+
+
 class TestHasCliOverrides:
     """Tests for _has_cli_overrides() — detects explicitly passed CLI args."""
 
