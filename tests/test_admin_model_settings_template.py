@@ -256,10 +256,12 @@ def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
     script = _dashboard_script()
 
     assert "validateQwenAneSettings()" in script
-    assert "ANE prompt block must be a multiple of 64." in script
-    assert "MLP ANE and CPU fractions must total less than 1.0." in script
-    assert "GDN ANE and CPU fractions must total less than 1.0." in script
-    assert "CPU worker count must be between 0 and 64." in script
+    # The messages are localised now, so assert the keys the validator returns
+    # rather than the English copy.
+    assert "window.t('js.error.ane_prompt_block_multiple')" in script
+    assert "window.t('js.error.mlp_ane_cpu_total')" in script
+    assert "window.t('js.error.gdn_ane_cpu_total')" in script
+    assert "window.t('js.error.cpu_workers_range')" in script
     assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
     assert "qwen35_ane_prefill_fraction: Number(" in script
 
@@ -387,11 +389,16 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+// The dashboard resolves its copy through window.t, so feed the component the
+// shipped English catalog exactly as base.html does; the assertions below then
+// read the strings the app really renders.
+const catalog = JSON.parse(fs.readFileSync('omlx/admin/i18n/en.json', 'utf8'));
 function setup(fetch) {
     const context = {
         localStorage: {getItem: () => null},
         THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
-        window: {}, navigator: {language: 'en'}, document: {}, fetch,
+        window: {t: key => (catalog[key] !== undefined ? catalog[key] : key)},
+        navigator: {language: 'en'}, document: {}, fetch,
     };
     const state = vm.runInNewContext(source + '\n dashboard;', context)();
     state.selectedModel = {id: 'model-a'};
