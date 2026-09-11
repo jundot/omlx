@@ -3338,15 +3338,30 @@ class VLMBatchedEngine(BaseEngine):
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
                 ]
 
+                # Per-image entries are keyed by the image alone, but the
+                # number of soft tokens an image encodes to depends on the
+                # resize regime, which depends on the *other* images in the
+                # request (Gemma 4 per-image resize: 1024x1024 -> 256 tokens,
+                # 1536x640 -> 250). Entries cached from separate single-image
+                # requests can therefore disagree, and mx.concatenate raises
+                # before _vision_features_match_image_tokens below ever gets to
+                # reject them. Check the shapes agree first and fall through to
+                # the whole-request entry (and then a recompute) when they do
+                # not.
+                per_image_usable = (
+                    all(f is not None for f in cached_per_image)
+                    and len({f.shape[1:] for f in cached_per_image}) == 1
+                )
+
                 cached_whole = None
-                if not all(f is not None for f in cached_per_image):
+                if not per_image_usable:
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
                     cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
                 used_cached_features = False
-                if all(f is not None for f in cached_per_image):
+                if per_image_usable:
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
                     if self._vision_features_match_image_tokens(
