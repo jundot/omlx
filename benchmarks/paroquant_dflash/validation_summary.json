@@ -1,0 +1,279 @@
+{
+  "date": "2026-09-08",
+  "base_commit": "5f62b09f",
+  "target": "z-lab/Qwen3.8-27B-PARO",
+  "draft": "z-lab/Qwen3.8-27B-DFlash2",
+  "draft_revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+  "versions": {
+    "mlx": "0.32.2",
+    "mlx-lm": "0.31.3",
+    "dflash-mlx": "0.1.10+omlx.7",
+    "paroquant": "0.1.16"
+  },
+  "device": {
+    "device_name": "Apple M3 Max",
+    "max_recommended_working_set_size": 55662788608,
+    "memory_size": 68719476736,
+    "architecture": "applegpu_g15s",
+    "max_buffer_length": 41747087360,
+    "resource_limit": 499000
+  },
+  "weight_audit": {
+    "missing": [],
+    "extra": [],
+    "shape_mismatch": []
+  },
+  "forward_max_abs": 0.0,
+  "rollback": [
+    {
+      "width": 3,
+      "accepted": 0,
+      "max_abs": 0.03125,
+      "same_argmax": true
+    },
+    {
+      "width": 3,
+      "accepted": 1,
+      "max_abs": 0.033203125,
+      "same_argmax": true
+    },
+    {
+      "width": 3,
+      "accepted": 2,
+      "max_abs": 0.02734375,
+      "same_argmax": true
+    },
+    {
+      "width": 5,
+      "accepted": 0,
+      "max_abs": 0.03125,
+      "same_argmax": true
+    },
+    {
+      "width": 5,
+      "accepted": 1,
+      "max_abs": 0.033203125,
+      "same_argmax": true
+    },
+    {
+      "width": 5,
+      "accepted": 2,
+      "max_abs": 0.02734375,
+      "same_argmax": true
+    },
+    {
+      "width": 5,
+      "accepted": 3,
+      "max_abs": 0.029296875,
+      "same_argmax": true
+    },
+    {
+      "width": 5,
+      "accepted": 4,
+      "max_abs": 0.02734375,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 0,
+      "max_abs": 0.0234375,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 1,
+      "max_abs": 0.0283203125,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 2,
+      "max_abs": 0.029296875,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 3,
+      "max_abs": 0.03125,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 4,
+      "max_abs": 0.021484375,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 5,
+      "max_abs": 0.02734375,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 6,
+      "max_abs": 0.03125,
+      "same_argmax": true
+    },
+    {
+      "width": 8,
+      "accepted": 7,
+      "max_abs": 0.03125,
+      "same_argmax": true
+    }
+  ],
+  "greedy": [
+    {
+      "prompt": "The capital of France is",
+      "block_size": 3,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "a26f852cad3ac157d95856d37f641d9b09310eb73e31c10c25ed7b30aac34cfd",
+      "acceptance_ratio": 0.625
+    },
+    {
+      "prompt": "The capital of France is",
+      "block_size": 5,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "a26f852cad3ac157d95856d37f641d9b09310eb73e31c10c25ed7b30aac34cfd",
+      "acceptance_ratio": 0.734375
+    },
+    {
+      "prompt": "The capital of France is",
+      "block_size": 8,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "a26f852cad3ac157d95856d37f641d9b09310eb73e31c10c25ed7b30aac34cfd",
+      "acceptance_ratio": 0.75
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "block_size": 3,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "188cf187f615db5e089a0f047ebd78b00c804d97a9ea806d4fa278bd47293200",
+      "acceptance_ratio": 0.609375
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "block_size": 5,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "188cf187f615db5e089a0f047ebd78b00c804d97a9ea806d4fa278bd47293200",
+      "acceptance_ratio": 0.765625
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "block_size": 8,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "188cf187f615db5e089a0f047ebd78b00c804d97a9ea806d4fa278bd47293200",
+      "acceptance_ratio": 0.8125
+    },
+    {
+      "prompt": "Count from one to twenty: one,",
+      "block_size": 3,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "7c1176e581dfe16b8ea945cb0fb7e1f45e4a39d4a9b2cd3f9ae42f72865cb174",
+      "acceptance_ratio": 0.65625
+    },
+    {
+      "prompt": "Count from one to twenty: one,",
+      "block_size": 5,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "7c1176e581dfe16b8ea945cb0fb7e1f45e4a39d4a9b2cd3f9ae42f72865cb174",
+      "acceptance_ratio": 0.78125
+    },
+    {
+      "prompt": "Count from one to twenty: one,",
+      "block_size": 8,
+      "tokens": 64,
+      "same_tokens": true,
+      "token_sha256": "7c1176e581dfe16b8ea945cb0fb7e1f45e4a39d4a9b2cd3f9ae42f72865cb174",
+      "acceptance_ratio": 0.859375
+    }
+  ],
+  "serving": [
+    {
+      "case": "cold_4096",
+      "prompt_tokens": 4096,
+      "cached_tokens": 0,
+      "output_tokens": 32,
+      "text": "five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty,"
+    },
+    {
+      "case": "warm_4096",
+      "prompt_tokens": 4096,
+      "cached_tokens": 4096,
+      "output_tokens": 32,
+      "text": "five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty,"
+    },
+    {
+      "case": "cold_16384",
+      "prompt_tokens": 16384,
+      "cached_tokens": 0,
+      "output_tokens": 32,
+      "text": "five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty,"
+    },
+    {
+      "case": "warm_16384",
+      "prompt_tokens": 16384,
+      "cached_tokens": 16384,
+      "output_tokens": 32,
+      "text": "five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty,"
+    },
+    {
+      "case": "cold_32768",
+      "prompt_tokens": 32768,
+      "cached_tokens": 0,
+      "output_tokens": 32,
+      "text": "five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty,"
+    },
+    {
+      "case": "warm_32768",
+      "prompt_tokens": 32768,
+      "cached_tokens": 32768,
+      "output_tokens": 32,
+      "text": "five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty,"
+    },
+    {
+      "case": "after_cancel",
+      "prompt_tokens": 5,
+      "cached_tokens": 0,
+      "output_tokens": 32,
+      "text": "Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is"
+    },
+    {
+      "case": "after_reload",
+      "prompt_tokens": 5,
+      "cached_tokens": 0,
+      "output_tokens": 32,
+      "text": "Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is"
+    }
+  ],
+  "seeded_sampling_reproducible": true,
+  "regression_tests_passed": 309,
+  "final_focused_tests_passed": 24,
+  "scope": "Correctness and integration validation; not a controlled speed comparison. Image routing covered by existing unit tests, not a live image run.",
+  "vision_followup": {
+    "implementation_commit": "10c0f050",
+    "image_fallback": {
+      "text_before_image": "five, six, seven, eight, nine, ten, eleven, twelve,",
+      "image_response": "Red",
+      "in_vlm_fallback": true,
+      "vision_tower_present": true
+    },
+    "direct_vlm_adapter_probe": {
+      "model_class": "mlx_vlm.models.qwen3_5.qwen3_5",
+      "language_model_class": "mlx_vlm.models.qwen3_5.language",
+      "adapter_resolves": true,
+      "ordinary_forward_finite": true,
+      "exception_type": "TypeError",
+      "error": "_install_speculative_linear_cache_hook.<locals>.speculative_call() got an unexpected keyword argument 'gdn_sink'"
+    },
+    "scope": "Real full-checkpoint text-to-image fallback; direct adapter interface tested on a small mlx-vlm model."
+  }
+}
