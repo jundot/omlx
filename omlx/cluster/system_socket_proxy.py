@@ -10,6 +10,7 @@ normal socket API and no model data crosses this helper.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import select
 import socket
@@ -19,6 +20,8 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 20.0
 _PROXY_PROGRAM = r"""
@@ -67,13 +70,13 @@ def main():
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         print("PORT %d" % listener.getsockname()[1], flush=True)
-        remote = connect(host, port, timeout)
-        print("READY", flush=True)
         local, _ = listener.accept()
     finally:
         listener.close()
+    remote = connect(host, port, timeout)
     thread = threading.Thread(target=copy, args=(remote, local), daemon=True)
     thread.start()
+    print("READY", flush=True)
     copy(local, remote)
     thread.join(timeout=1.0)
     local.close()
@@ -90,10 +93,14 @@ if __name__ == "__main__":
 
 def _system_python() -> str | None:
     candidate = Path(
-        os.environ.get("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", "/usr/bin/python3")
+        os.environ.get("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", sys.executable or "/usr/bin/python3")
     )
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
+    for fallback in ("/usr/bin/python3", "/usr/local/bin/python3"):
+        candidate = Path(fallback)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
     return None
 
 
@@ -106,16 +113,24 @@ def should_proxy_control_socket(host: str) -> bool:
             "OMLX_CLUSTER_CONTROL_TRANSPORT must be auto, direct, or system-proxy"
         )
     if mode == "direct":
+        logger.info("control transport: direct (forced by env)")
         return False
     if mode == "system-proxy":
         if _system_python() is None:
             raise RuntimeError("system Python control proxy is unavailable")
+        logger.info("control transport: system-proxy (forced by env)")
         return True
     try:
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:
         loopback = host.strip().lower() in {"localhost", "localhost.local"}
-    return sys.platform == "darwin" and not loopback and _system_python() is not None
+    use_proxy = sys.platform == "darwin" and not loopback and _system_python() is not None
+    logger.info(
+        "control transport: %s (auto: platform=%s loopback=%s system_python=%s)",
+        "system-proxy" if use_proxy else "direct",
+        sys.platform, loopback, _system_python() is not None,
+    )
+    return use_proxy
 
 
 @dataclass

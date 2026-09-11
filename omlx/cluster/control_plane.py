@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
+import logging
 import pickle
 import secrets
 import socket
@@ -20,6 +22,8 @@ from .system_socket_proxy import (
     open_system_tcp_proxy,
     should_proxy_control_socket,
 )
+
+logger = logging.getLogger(__name__)
 
 _HANDSHAKE_MAGIC = b"OC2H"
 _HANDSHAKE_CHALLENGE_MAGIC = b"OC2C"
@@ -131,6 +135,10 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         listener.listen(self.world_size - 1)
         listener.settimeout(min(1.0, self._connect_timeout))
         self._listener = listener
+        logger.info(
+            "[ControlPlane R0] listening on %s:%d (world_size=%d)",
+            self.host, self.port, self.world_size,
+        )
         deadline = time.monotonic() + self._connect_timeout
         while len(self._peers) < self.world_size - 1:
             if time.monotonic() >= deadline:
@@ -140,8 +148,11 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             except TimeoutError:
                 continue
             remaining = max(0.1, deadline - time.monotonic())
-            stream.settimeout(min(5.0, remaining))
+            stream.settimeout(min(30.0, remaining))
             try:
+                logger.debug(
+                    "[ControlPlane R0] accepted connection from %s", _address,
+                )
                 challenge = secrets.token_bytes(32)
                 stream.sendall(
                     _HANDSHAKE_CHALLENGE.pack(
@@ -150,6 +161,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                         challenge,
                     )
                 )
+                logger.debug("[ControlPlane R0] sent challenge, waiting for response")
                 magic, version, rank, observed_tag = _HANDSHAKE.unpack(
                     _recv_exact(stream, _HANDSHAKE.size)
                 )
@@ -165,6 +177,13 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                     or rank in self._peers
                     or not hmac.compare_digest(observed_tag, expected_tag)
                 ):
+                    logger.warning(
+                        "[ControlPlane R0] handshake rejected from %s"
+                        " (magic=%r version=%d rank=%d dup=%s hmac_ok=%s)",
+                        _address, magic, version, rank,
+                        rank in self._peers,
+                        hmac.compare_digest(observed_tag, expected_tag),
+                    )
                     stream.close()
                     continue
                 self._configure(stream)
@@ -180,7 +199,15 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                     )
                 )
                 self._peers[rank] = stream
-            except (OSError, TimeoutError, ConnectionError, struct.error):
+                logger.info(
+                    "[ControlPlane R0] rank %d authenticated (%d/%d peers)",
+                    rank, len(self._peers), self.world_size - 1,
+                )
+            except (OSError, TimeoutError, ConnectionError, struct.error) as exc:
+                logger.debug(
+                    "[ControlPlane R0] handshake failed from %s: %s",
+                    _address, exc,
+                )
                 stream.close()
                 continue
 
@@ -193,6 +220,9 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             or challenge_version != _VERSION
         ):
             raise RuntimeError("rank-control challenge is invalid")
+        logger.debug(
+            "[ControlPlane R%d] received challenge, sending response", self.rank,
+        )
         stream.sendall(
             _HANDSHAKE.pack(
                 _HANDSHAKE_MAGIC,
@@ -219,24 +249,33 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             or not hmac.compare_digest(ack_tag, expected_ack)
         ):
             raise RuntimeError("rank-control handshake was not acknowledged")
+        logger.info("[ControlPlane R%d] handshake complete", self.rank)
 
-    def _connect_to_coordinator(self) -> None:
-        if should_proxy_control_socket(self.host):
-            proxy = open_system_tcp_proxy(
-                self.host,
-                self.port,
-                timeout=self._connect_timeout,
-            )
-            stream = proxy.stream
-            try:
-                self._configure(stream)
-                self._authenticate_worker_stream(stream)
-            except BaseException:
-                proxy.close()
-                raise
-            self._stream_proxy = proxy
-            self._stream = stream
-            return
+    def _connect_via_proxy(self) -> None:
+        logger.info(
+            "[ControlPlane R%d] transport=system-proxy -> %s:%d",
+            self.rank, self.host, self.port,
+        )
+        proxy = open_system_tcp_proxy(
+            self.host,
+            self.port,
+            timeout=self._connect_timeout,
+        )
+        stream = proxy.stream
+        try:
+            self._configure(stream)
+            self._authenticate_worker_stream(stream)
+        except BaseException:
+            proxy.close()
+            raise
+        self._stream_proxy = proxy
+        self._stream = stream
+
+    def _connect_direct(self) -> None:
+        logger.info(
+            "[ControlPlane R%d] transport=direct -> %s:%d",
+            self.rank, self.host, self.port,
+        )
         deadline = time.monotonic() + self._connect_timeout
         last_error: OSError | None = None
         while time.monotonic() < deadline:
@@ -256,6 +295,25 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 stream.close()
                 time.sleep(0.05)
         raise TimeoutError(f"rank-control coordinator was unreachable: {last_error}")
+
+    def _connect_to_coordinator(self) -> None:
+        mode = os.environ.get("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto").strip().lower()
+        if mode == "system-proxy":
+            self._connect_via_proxy()
+            return
+
+        try:
+            self._connect_direct()
+            return
+        except (PermissionError, TimeoutError, OSError) as exc:
+            if mode == "auto" and should_proxy_control_socket(self.host):
+                logger.warning(
+                    "[ControlPlane R%d] direct connection failed (%s); falling back to system-proxy",
+                    self.rank, exc,
+                )
+                self._connect_via_proxy()
+                return
+            raise
 
     def broadcast_object(self, obj: Any) -> Any:
         """Broadcast one rank-zero-owned Python object in strict sequence."""
