@@ -35,6 +35,8 @@ import mlx.nn as nn
 import mlx_lm.utils as _utils
 from mlx.utils import tree_map
 
+from omlx.patches.deepseek_v41.predicates import is_deepseek_v4, is_deepseek_v41
+
 logger = logging.getLogger(__name__)
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
@@ -179,7 +181,7 @@ def _build_patched_load_model() -> Callable:
             if "quantization_config" in text_config:
                 config["quantization_config"] = text_config["quantization_config"]
 
-        if str(config.get("model_type", "")).startswith("deepseek_v4"):
+        if is_deepseek_v4(str(config.get("model_type", ""))):
             config["use_native_ratio128_attention"] = bool(
                 config.get("use_native_ratio128_attention", True)
             ) and _native_ratio128_attention_enabled(config)
@@ -231,10 +233,21 @@ def _build_patched_load_model() -> Callable:
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
                 _quantize(quantization)
-            elif quant_method == "fp8" and str(config.get("model_type", "")).startswith(
-                "deepseek_v4"
+            elif quant_method == "fp8" and is_deepseek_v4(
+                str(config.get("model_type", ""))
             ):  # PR 1192 new branch
                 from mlx_lm.models.deepseek_v4 import make_quantization_config
+
+                quantization = make_quantization_config(model)
+                config["quantization"] = quantization
+                config["quantization_config"] = quantization
+                _quantize(quantization)
+            elif quant_method == "fp8" and is_deepseek_v41(
+                str(config.get("model_type", ""))
+            ):
+                # Must use V4.1 config (includes engram.wkv as mxfp8). V4's
+                # config leaves those as affine → strict load wants biases.
+                from mlx_lm.models.deepseek_v41 import make_quantization_config
 
                 quantization = make_quantization_config(model)
                 config["quantization"] = quantization

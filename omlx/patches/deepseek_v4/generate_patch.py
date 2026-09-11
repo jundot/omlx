@@ -66,27 +66,35 @@ def apply_generate_patch() -> bool:
         batch-aware caches.
         """
 
+        memo = {}
+
         def to_batch_cache(c):
+            # Preserve shared PoolingCache identity across layers (CSA2).
+            cid = id(c)
+            if cid in memo:
+                return memo[cid]
             model_owned_to_batch = getattr(c, "to_batch", None)
             if callable(model_owned_to_batch):
-                return model_owned_to_batch(left_padding)
+                out = model_owned_to_batch(left_padding)
             elif type(c) is KVCache:
-                return BatchKVCache(left_padding)
+                out = BatchKVCache(left_padding)
             elif isinstance(c, ArraysCache):
                 c.left_padding = mx.array(left_padding)
-                return c
+                out = c
             elif isinstance(c, PoolingCache):
-                return BatchPoolingCache(c.ratio, left_padding)
+                out = BatchPoolingCache(c.ratio, left_padding)
             elif isinstance(c, RotatingKVCache):
                 if c.keep > 0:
                     raise ValueError(
                         "RotatingKVCache with keep tokens is not supported."
                     )
-                return BatchRotatingKVCache(c.max_size, left_padding)
+                out = BatchRotatingKVCache(c.max_size, left_padding)
             elif isinstance(c, CacheList):
-                return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+                out = CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
             else:
                 raise ValueError(f"{type(c)} does not yet support batching")
+            memo[cid] = out
+            return out
 
         if hasattr(model, "make_cache"):
             cache = model.make_cache()
