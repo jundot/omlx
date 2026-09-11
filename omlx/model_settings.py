@@ -1046,7 +1046,6 @@ class ModelSettingsManager:
         # vlm_mtp base model would make __post_init__ raise on this
         # request-time merge; drop vlm_mtp for the merged view instead.
         merged, _ = resolve_vlm_mtp_conflicts(merged)
-        merged, _ = resolve_qwen35_prefill_conflicts(merged)
         return merged
 
     def _settings_with_profile_locked(
@@ -1059,6 +1058,9 @@ class ModelSettingsManager:
         merged = self._merged_profile_settings_locked(
             model_id, profile, runtime=runtime
         )
+        # Preserve legacy-profile recovery on reads. Save validation must see
+        # both requested accelerators so it can reject the incompatible pair.
+        merged, _ = resolve_qwen35_prefill_conflicts(merged)
         try:
             return ModelSettings.from_dict(merged)
         except ValueError as error:

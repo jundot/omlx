@@ -422,6 +422,32 @@ class TestProfileFieldFiltering:
         assert applied.qwen35_ane_prefill_gdn_fraction == 0.50
         assert applied.qwen35_ane_prefill_gdn_max_layers == 48
 
+    def test_qwen_prefill_profile_reads_preserve_legacy_recovery(self, mgr):
+        mgr.set_settings("m", ModelSettings(qwen35_ane_prefill_enabled=True))
+        # A profile saved before the exclusivity rule can still carry A8.
+        mgr.save_profile(
+            "m",
+            "a8",
+            "A8",
+            None,
+            {"qwen35_oq_a8_enabled": True},
+            expose_as_model=True,
+        )
+        before = mgr.settings_file.read_bytes(), mgr.profiles_file.read_bytes()
+
+        request = mgr.get_settings_for_request("m:a8")
+        _, runtime = mgr.get_exposed_profile_runtime_settings_for_request("m:a8")
+        for settings in (request, runtime):
+            assert settings.qwen35_ane_prefill_enabled
+            assert not settings.qwen35_oq_a8_enabled
+        [profile] = mgr.list_exposed_profile_models()
+        assert not profile["invalid"]
+        assert (
+            mgr.settings_file.read_bytes(),
+            mgr.profiles_file.read_bytes(),
+        ) == before
+        assert mgr.get_profile("m", "a8")["settings"]["qwen35_oq_a8_enabled"]
+
     def test_save_template_drops_none_and_empty_string_values(self, mgr):
         mgr.save_template(
             "t",
