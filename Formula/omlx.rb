@@ -138,6 +138,8 @@ class Omlx < Formula
   # relocation pass. Anything patched inside `def install` is either wiped
   # or invalidated before the user sees it.
   def post_install
+    restart_running_server
+
     return if build.without?("grammar") && build.without?("custom-kernel")
 
     python = libexec/"bin/python"
@@ -145,6 +147,53 @@ class Omlx < Formula
                                  "import site; print(site.getsitepackages()[0])").chomp
     patch_xgrammar(python, site) if build.with?("grammar")
     fix_custom_kernel_rpaths(python, site) if build.with?("custom-kernel")
+  end
+
+  # `brew upgrade` replaces the keg but leaves a previous-keg omlx-server
+  # running, so the dashboard 404s templates from the old Cellar path.
+  # Restart only if something is already serving. Never call `brew` from
+  # post_install (Homebrew forbids nesting brew), and never start a server
+  # the user had stopped. Bare `omlx serve` reloads ~/.omlx/settings.json.
+  def restart_running_server
+    return unless OS.mac?
+
+    if Utils::Service.running?(self)
+      target = "gui/#{Process.euid}/#{plist_name}"
+      ohai "Restarting running oMLX Homebrew service"
+      unless quiet_system "/bin/launchctl", "kickstart", "-k", target
+        opoo "Failed to restart #{target}"
+      end
+      return
+    end
+
+    pids = homebrew_omlx_server_pids
+    return if pids.empty?
+
+    ohai "Restarting leftover oMLX server (pid #{pids.join(", ")}) to pick up #{version}"
+    pids.each { |pid| quiet_system "/bin/kill", "-TERM", pid }
+    20.times do
+      sleep 0.25
+      break if homebrew_omlx_server_pids.empty?
+    end
+    homebrew_omlx_server_pids.each { |pid| quiet_system "/bin/kill", "-KILL", pid }
+
+    (var/"log").mkpath
+    log = var/"log/omlx.log"
+    pid = spawn(opt_bin/"omlx".to_s, "serve",
+                [:out, :err] => [log.to_s, "a"],
+                in: :close,
+                pgroup: true)
+    Process.detach(pid)
+    ohai "Started omlx serve (pid #{pid}); log: #{log}"
+  end
+
+  def homebrew_omlx_server_pids
+    pids = Utils.safe_popen_read("/usr/bin/pgrep", "-x", "omlx-server").split
+    prefix = HOMEBREW_PREFIX.to_s
+    pids.select do |pid|
+      txt = Utils.safe_popen_read("/usr/sbin/lsof", "-Fn", "-a", "-d", "txt", "-p", pid)
+      txt.include?("n#{prefix}/Cellar/omlx/") || txt.include?("n#{prefix}/opt/omlx/")
+    end
   end
 
   # Patch the macOS arm64 xgrammar wheel so its native binding loads.
