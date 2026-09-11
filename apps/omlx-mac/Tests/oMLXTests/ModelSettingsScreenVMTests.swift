@@ -417,20 +417,18 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         ]
         XCTAssertTrue(vm.thinkingForced)
         XCTAssertFalse(vm.unoEnabled)
-        XCTAssertNil(vm.unoUnavailableReason)
         XCTAssertEqual(vm.unoAdapterModelOptions().map(\.0), ["", "Uno", "Uno-Q4"])
         XCTAssertEqual(vm.currentSettingsDict()["uno_enabled"]?.value as? Bool, false)
-        vm.unoEnabled = true
         vm.unoAdapterModel = "Uno-Q4"
         XCTAssertTrue(vm.validateUnoWorkingSettings())
         XCTAssertEqual(vm.currentSettingsDict()["uno_adapter_model"]?.value as? String, "Uno-Q4")
         vm.unoAdapterModel = "7B-Uno"
         XCTAssertFalse(vm.validateUnoWorkingSettings())
-        vm.unoEnabled = false
+        vm.unoAdapterModel = ""
         XCTAssertTrue(vm.validateUnoWorkingSettings())
         vm.model = makeModel(id: "MoVA", configModelType: "k2_horizon")
         XCTAssertTrue(vm.thinkingForced)
-        XCTAssertNotNil(vm.unoUnavailableReason)
+        XCTAssertFalse(vm.model?.unoCompatible ?? false)
         vm.model = makeModel(id: "Qwen", configModelType: "qwen3_5")
         XCTAssertFalse(vm.thinkingForced)
         XCTAssertTrue(vm.unoAdapterCandidates.isEmpty)
@@ -459,18 +457,24 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(vm.unoConflictReason)
     }
 
-    func testUnoConstraintsFollowServerValuesAndWorkingEdits() {
+    func testUnoInheritedPenaltyAndExplicitRepair() {
         let vm = ModelSettingsScreenVM()
-        vm.model = makeModel(id: "future", configModelType: "future_model", unoAdapters: ["adapter"])
-        vm.model?.unoRequiredSettings = ["temperature": 0.5, "thinking_budget_enabled": 0]
-        vm.unoEnabled = true
-        vm.temperature = "0.7"
-        XCTAssertNotNil(vm.unoConflictReason)
+        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoAdapters: ["adapter"])
+        vm.unoAdapterModel = "adapter"
+        vm.serverDefaultSampling = .init(maxContextWindow: 4096, maxTokens: 256,
+                                         temperature: 0.7, topP: 0.9, topK: 40, repetitionPenalty: 1.1)
+        vm.guidedGrammarEnabled = true
+        XCTAssertEqual(Set(vm.unoConflicts.map(\.key)), ["repetition_penalty", "guided_grammar_enabled"])
+        XCTAssertTrue(vm.unoConflicts.first { $0.key == "repetition_penalty" }!.inherited)
         XCTAssertFalse(vm.thinkingBudgetAvailable)
-        vm.temperature = "0.5"
+        vm.applyUnoSettings()
         XCTAssertNil(vm.unoConflictReason)
-        vm.model?.unoRequiredSettings?.removeValue(forKey: "thinking_budget_enabled")
+        XCTAssertEqual(vm.repetitionPenalty, "1")
+        XCTAssertEqual(vm.serverDefaultSampling?.repetitionPenalty, 1.1)
+        XCTAssertEqual(vm.currentSettingsDict()["guided_grammar_enabled"]?.value as? Bool, false)
+        vm.unoAdapterModel = ""
         XCTAssertTrue(vm.thinkingBudgetAvailable)
+        XCTAssertFalse(vm.unoEnabled)
     }
 
     func testUnoWireFieldsAndModelProfileRoundtrip() throws {
@@ -483,18 +487,19 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(model.settings?.unoAdapterModel, "Uno-Q4")
         let vm = ModelSettingsScreenVM()
         vm.model = model
+        vm.guidedGrammarEnabled = model.settings?.guidedGrammarEnabled ?? false
         XCTAssertNotNil(vm.unoConflictReason)
         var patch = ModelSettingsPatch()
         patch.unoEnabled = true
         patch.unoAdapterModel = "Uno-Q4"
+        patch.guidedGrammarEnabled = false
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let encoded = try encoder.encode(patch)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
-        XCTAssertEqual(Set(object.keys), ["uno_enabled", "uno_adapter_model"])
+        XCTAssertEqual(Set(object.keys), ["uno_enabled", "uno_adapter_model", "guided_grammar_enabled"])
         XCTAssertEqual(object["uno_enabled"] as? Bool, true)
         XCTAssertEqual(object["uno_adapter_model"] as? String, "Uno-Q4")
-        vm.unoEnabled = true
         vm.unoAdapterModel = "Uno-Q4"
         let snapshot = try encoder.encode(vm.currentSettingsDict())
         let settings = try decoder.decode(ModelSettingsDTO.self, from: snapshot)

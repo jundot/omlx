@@ -2821,6 +2821,18 @@ class EnginePool:
         self._failed_load_reclaim_tasks.add(task)
         task.add_done_callback(self._finish_failed_load_reclaim_task)
 
+    def get_uno_adapter(self, entry, settings):
+        """Validate the selected local pair at settings and load boundaries."""
+        from .model_settings import validate_uno_settings
+        from .uno_bundle import resolve_uno_bundle
+
+        validate_uno_settings(settings)
+        adapter = self.get_entry(settings.get("uno_adapter_model"))
+        if adapter is None or adapter.config_model_type != "k2_horizon_uno":
+            raise ValueError("Select an available Uno adapter.")
+        resolve_uno_bundle(entry.model_path, adapter.model_path)
+        return adapter
+
     async def _load_engine(
         self,
         model_id: str,
@@ -2998,7 +3010,7 @@ class EnginePool:
                 if uno_enabled:
                     from .engine.uno import UnoEngine
 
-                    adapter = self._entries[model_settings.uno_adapter_model]
+                    adapter = self.get_uno_adapter(entry, model_settings.to_dict())
                     engine = UnoEngine(
                         model_name=entry.model_path,
                         adapter_path=adapter.model_path,

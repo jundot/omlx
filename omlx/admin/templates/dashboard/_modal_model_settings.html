@@ -531,7 +531,7 @@
                                            class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
                                     </div>
                                     <button type="button" @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.guided_grammar_enabled = !modelSettings.guided_grammar_enabled; if (!modelSettings.guided_grammar_enabled) modelSettings.guided_grammar = ''; }"
-                                            :disabled="modelSettings.vlm_mtp_enabled"
+                                            :disabled="modelSettings.vlm_mtp_enabled || unoLocks('guided_grammar_enabled')"
                                             :class="[
                                                 modelSettings.guided_grammar_enabled ? 'bg-black' : 'bg-neutral-200',
                                                 modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''
@@ -720,8 +720,27 @@
                                 <!-- Acceleration -->
                                 <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.acceleration_label') }}</h4>
 
+                                <div x-show="selectedModel?.uno_compatible" class="mb-4 space-y-2">
+                                    <div class="flex items-center justify-between gap-3">
+                                        <label for="uno-adapter" class="text-sm font-medium text-neutral-700">Uno</label>
+                                        <select id="uno-adapter" x-model="unoSelection" class="min-w-0 max-w-[75%] px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white">
+                                            <option value="">{{ t('settings.resource.off') }}</option>
+                                            <template x-for="m in unoAdapterCandidates()" :key="m.id">
+                                                <option :value="m.id" x-text="m.display_name || m.id"></option>
+                                            </template>
+                                        </select>
+                                    </div>
+                                    <p class="text-xs text-neutral-500">{{ t('modal.model_settings.uno_hint') }}</p>
+                                    <a x-show="!unoAdapterCandidates().length" :href="'https://huggingface.co/' + selectedModel.uno_adapter_repo" target="_blank" rel="noopener noreferrer"
+                                            class="text-xs underline">{{ t('modal.model_settings.uno_get_adapter') }}</a>
+                                    <div x-show="modelSettings.uno_enabled && unoConflicts().length > 0" class="text-xs text-amber-600 space-y-1">
+                                        <p x-text="unoConflictText()"></p>
+                                        <button type="button" @click="applyUnoSettings()" class="underline">{{ t('modal.model_settings.uno_apply') }}</button>
+                                    </div>
+                                </div>
+
                                 <!-- Lightning MTP (built-in MTP head speculative decoding) -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-6">
+                                <div x-show="!selectedModel?.uno_compatible || modelSettings.mtp_enabled" class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-6">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.lightning_mtp') }}</span>
@@ -741,7 +760,7 @@
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.moe_expert_offload_enabled && ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled)) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
-                                                :disabled="modelSettings.moe_expert_offload_enabled || (!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled"
+                                                :disabled="modelSettings.moe_expert_offload_enabled || (!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled || unoLocks('mtp_enabled')"
                                                 :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
                                                             ? (modelSettings.mtp_compatibility_reason || 'Unsupported model')
                                                             : (modelSettings.dflash_enabled
@@ -1098,7 +1117,7 @@
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
-                                                :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
+                                                :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled || unoLocks('turboquant_kv_enabled')"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
@@ -1193,7 +1212,7 @@
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
-                                                :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
+                                                :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled || unoLocks('specprefill_enabled')"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
                                                 :class="[
                                                     modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200',
@@ -1238,7 +1257,7 @@
                                 </div>
 
                                 <!-- DFlash -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                                <div x-show="!selectedModel?.uno_compatible || modelSettings.dflash_enabled" class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash') }}</span>
@@ -1249,7 +1268,7 @@
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.moe_expert_offload_enabled && (modelSettings.dflash_compatible && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled)) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
-                                                :disabled="modelSettings.moe_expert_offload_enabled || !modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
+                                                :disabled="modelSettings.moe_expert_offload_enabled || !modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled || unoLocks('dflash_enabled')"
                                                 :title="modelSettings.dflash_compatible
                                                             ? (modelSettings.mtp_enabled
                                                                 ? '{{ t('modal.model_settings.mtp_conflict_dflash')|replace('\\', '\\\\')|replace("'", "\\'") }}'
@@ -1412,39 +1431,8 @@
                                     </div>
                                 </div>
 
-                                <div x-show="selectedModel?.uno_compatible"
-                                     class="p-4 bg-neutral-50 rounded-xl space-y-3 mt-3">
-                                    <div class="flex items-start justify-between gap-3">
-                                        <div>
-                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.uno') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.uno_hint') }}</p>
-                                            <p x-show="!unoAdapterCandidates().length" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.uno_missing') }}</p>
-                                            <p x-show="unoConflict()" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.uno_conflict') }}</p>
-                                        </div>
-                                        <button type="button" role="switch" :aria-checked="!!modelSettings.uno_enabled"
-                                                aria-label="{{ t('modal.model_settings.uno') }}"
-                                                @click="modelSettings.uno_enabled = !modelSettings.uno_enabled"
-                                                :disabled="!modelSettings.uno_enabled && (!unoAdapterCandidates().length || unoConflict())"
-                                                :class="modelSettings.uno_enabled ? 'bg-black' : 'bg-neutral-200'"
-                                                class="relative flex-shrink-0 w-11 h-6 rounded-full disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-black">
-                                            <span :class="modelSettings.uno_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform absolute top-0.5 left-0.5"></span>
-                                        </button>
-                                    </div>
-                                    <div x-show="modelSettings.uno_enabled">
-                                        <label for="uno-adapter" class="block text-xs font-medium text-neutral-600">{{ t('modal.model_settings.uno_adapter') }}</label>
-                                        <select id="uno-adapter" x-model="modelSettings.uno_adapter_model"
-                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-black bg-white">
-                                            <option value="">{{ t('modal.model_settings.uno_select') }}</option>
-                                            <template x-for="m in unoAdapterCandidates()" :key="m.id">
-                                                <option :value="m.id" x-text="m.id"></option>
-                                            </template>
-                                        </select>
-                                    </div>
-                                </div>
-
                                 <!-- VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter) -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mt-3">
+                                <div x-show="!selectedModel?.uno_compatible || modelSettings.vlm_mtp_enabled" class="p-4 bg-neutral-50 rounded-xl space-y-3 mt-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.vlm_mtp') }}</span>
@@ -1456,7 +1444,7 @@
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.moe_expert_offload_enabled && (!modelSettings.is_paroquant && !modelSettings.dflash_enabled && !modelSettings.specprefill_enabled && !modelSettings.mtp_enabled && !modelSettings.turboquant_kv_enabled && !vlmMtpProcessorConflict())) modelSettings.vlm_mtp_enabled = !modelSettings.vlm_mtp_enabled"
-                                                :disabled="modelSettings.moe_expert_offload_enabled || modelSettings.is_paroquant || modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled || vlmMtpProcessorConflict()"
+                                                :disabled="modelSettings.moe_expert_offload_enabled || modelSettings.is_paroquant || modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled || vlmMtpProcessorConflict() || unoLocks('vlm_mtp_enabled')"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
                                                 :class="[
                                                     modelSettings.vlm_mtp_enabled ? 'bg-black' : 'bg-neutral-200',
@@ -1497,7 +1485,7 @@
                         {{ t('modal.model_settings.cancel') }}
                     </button>
                     <button @click="saveModelSettings"
-                            :disabled="savingModelSettings"
+                            :disabled="savingModelSettings || (modelSettings.uno_enabled && unoConflicts().length > 0)"
                             class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full
                                    hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:ring-offset-2
                                    transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed">

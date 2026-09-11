@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Uno setup and request validation for the continuous batching engine."""
 
+from pathlib import Path
+
 import mlx.core as mx
 
 from ..exceptions import InvalidRequestError
+from ..model_settings import uno_conflicts
 from ..uno_bundle import resolve_uno_bundle
 from .batched import BatchedEngine
 
@@ -62,6 +65,18 @@ class UnoEngine(BatchedEngine):
         install_cache_hooks()
         self._bundle = bundle
 
+    def get_stats(self):
+        stats = super().get_stats()
+        if self._bundle is not None:
+            stats["uno"] = {
+                "base": str(Path(self._model_name).resolve()),
+                "adapter": str(self._bundle.adapter_path.resolve()),
+                "compiled": bool(getattr(self._model, "_omlx_k2_compiled", False)),
+                "ane_layers": getattr(self._model, "_omlx_k2_ane_prefill_count", 0),
+                **dict(getattr(self._model, "_omlx_uno_stats", {})),
+            }
+        return stats
+
     def _validate_request(self, prompt=None, **options) -> None:
         self._validate_options(**options)
         if options.get("compiled_grammar") is not None and not options.get("tools"):
@@ -103,38 +118,23 @@ class UnoEngine(BatchedEngine):
             raise InvalidRequestError("Uno top_p must be in (0, 1]")
         if type(top_k) is not int or top_k < 0:
             raise InvalidRequestError("Uno top_k must be a nonnegative integer")
-        for name, value, default in (
-            ("min_p", min_p, 0),
-            ("repetition_penalty", repetition_penalty, 1),
-            ("presence_penalty", presence_penalty, 0),
-            ("frequency_penalty", kwargs.get("frequency_penalty", 0), 0),
-            ("xtc_probability", kwargs.get("xtc_probability", 0), 0),
-        ):
-            if value != default:
-                if name == "repetition_penalty":
-                    raise InvalidRequestError(
-                        "Uno requires repetition_penalty=1.0. "
-                        "Check request, model, and global sampling settings."
-                    )
-                raise InvalidRequestError(f"Uno requires {name}={default}.")
-        accepted = {
-            "seed",
-            "tools",
-            "request_id",
-            "frequency_penalty",
-            "xtc_probability",
-            "xtc_threshold",
-            "repetition_context_size",
-            "compiled_grammar",
-            "chat_template_kwargs",
-            "is_partial",
-            "skip_cache_store",
-            "benchmark_trace",
-            "benchmark_ane_sequence_length",
-        }
-        for name, value in kwargs.items():
-            if name not in accepted and value is not None:
-                raise InvalidRequestError(f"Uno does not support request option {name}")
+        for name, neutral in uno_conflicts(
+            dict(
+                kwargs,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+            )
+        ).items():
+            raise InvalidRequestError(
+                f"Uno requires {name}={neutral}. Check request, model, and global sampling settings."
+            )
+        # Only decoding restrictions belong here. Shared engine metadata such
+        # as preserve_reasoning must retain BatchedEngine's normal semantics.
+        if kwargs.get("thinking_budget") is not None or kwargs.get("specprefill"):
+            raise InvalidRequestError(
+                "Uno does not support thinking_budget or specprefill"
+            )
         seed = kwargs.get("seed")
         if seed is not None and (type(seed) is not int or not 0 <= seed < 2**32):
             raise InvalidRequestError("Uno seed must be an integer in [0, 2**32)")

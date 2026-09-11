@@ -15,20 +15,25 @@ _BASES = {
 }
 
 
+def uno_adapter_base(config: dict) -> str | None:
+    base = config.get("base_model_name_or_path")
+    return (
+        base
+        if (
+            config.get("peft_type") == "LORA"
+            and isinstance(base, str)
+            and base.startswith("IFM/K2-Horizon-")
+        )
+        else None
+    )
+
+
 def uno_base_id(path: str | Path) -> str | None:
     path = Path(path)
     try:
         adapter = path / "adapter_config.json"
         if adapter.is_file():
-            config = json.loads(adapter.read_text())
-            base = config.get("base_model_name_or_path")
-            return (
-                base
-                if config.get("peft_type") == "LORA"
-                and isinstance(base, str)
-                and base.startswith("IFM/K2-Horizon-")
-                else None
-            )
+            return uno_adapter_base(json.loads(adapter.read_text()))
         config = json.loads((path / "config.json").read_text())
         if config.get("model_type") != "k2_horizon" or config.get("num_experts", 0):
             return None

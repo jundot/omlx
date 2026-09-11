@@ -39,8 +39,6 @@ def acceptance_and_residual(p, q, proposals, uniforms):
 class UnoCycle:
     tokens: tuple[int, ...]
     accepted_proposals: int
-    cache_length: int
-    finish_reason: str | None
 
 
 class UnoDecoder:
@@ -153,26 +151,13 @@ class UnoDecoder:
         else:
             output.append(int(targets[-1].item()))
         output = output[:max_tokens]
-        finish = None
         for i, token in enumerate(output):
             if token in self.eos:
                 output = output[: i + 1]
-                finish = "stop"
                 break
         if cancelled is not None and cancelled():
             return
         if self.constraint is not None:
             self.constraint.commit(output)
         self._trim(cache, frontier + len(output) - 1)
-        if finish is None and len(output) == max_tokens:
-            finish = "length"
-        # Reuse small allocations and reclaim retired KV buffers.
-        if mx.get_cache_memory() > 64 * 1024**2:
-            mx.synchronize()
-            mx.clear_cache()
-        return UnoCycle(
-            tuple(output),
-            min(accepted, len(output) - 1),
-            frontier + len(output) - 1,
-            finish,
-        )
+        return UnoCycle(tuple(output), min(accepted, len(output) - 1))

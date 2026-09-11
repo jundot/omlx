@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Use Uno for singleton decoding and reconcile KV before a batch grows."""
+"""GenerationBatch compatibility boundary for singleton Uno decoding.
 
-from collections import deque
+``tokens`` contains emitted rows; ``_next_tokens`` is the uncached next row.
+Uno may hold verified, unconsumed rows beyond that frontier. Snapshots copy and
+trim them; merges discard them; final EOS/budget rows use the ordinary lifecycle.
+The scheduler calls ``step`` after accepting the current grammar token. Only
+this module touches private batch/grammar state on behalf of Uno.
+"""
+
+from collections import Counter, deque
 from dataclasses import dataclass, field
+from time import perf_counter
 
 import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache, KVCache
@@ -59,10 +67,33 @@ def _constraint(batch):
 def step(batch, ordinary_step):
     """Emit one token through GenerationBatch's existing response lifecycle."""
     enabled = getattr(batch.model, "_omlx_uno_enabled", False)
-    allowed = getattr(batch.model, "_omlx_uno_singleton", False)
-    if not enabled or not allowed or len(batch.uids) != 1 or not batch._next_logprobs:
+    if not enabled:
         reconcile(batch)
         return ordinary_step(batch)
+    stats = getattr(batch.model, "_omlx_uno_stats", None)
+    if stats is None:
+        stats = batch.model._omlx_uno_stats = Counter()
+
+    def ordinary():
+        reconcile(batch)
+        started = perf_counter()
+        result = ordinary_step(batch)
+        stats["ordinary_seconds"] += perf_counter() - started
+        stats["ordinary_tokens"] += len(batch.uids)
+        return result
+
+    allowed = getattr(batch.model, "_omlx_uno_singleton", False)
+    if not allowed or len(batch.uids) != 1 or not batch._next_logprobs:
+        return ordinary()
+    token = int(batch._next_tokens[0].item())
+    # _step consumes the next token before GenerationBatch checks termination.
+    # Do not speculate past EOS (whose grammar matcher is already terminated)
+    # or the output budget. The ordinary step materializes the final KV row.
+    if (
+        token in batch.model._omlx_uno_eos
+        or batch._num_tokens[0] + 1 >= batch.max_tokens[0]
+    ):
+        return ordinary()
     if not all(
         isinstance(cache, (BatchKVCache, KVCache)) for cache in batch.prompt_cache
     ):
@@ -74,7 +105,6 @@ def step(batch, ordinary_step):
         batch._omlx_uno_state = state
     if batch.uids != [state.uid]:
         raise RuntimeError("Uno state lost its request owner")
-    token = int(batch._next_tokens[0].item())
     logprobs = batch._next_logprobs
     if not state.queued:
         caches = [
@@ -91,18 +121,24 @@ def step(batch, ordinary_step):
             seed=seed,
             constraint=_constraint(batch),
         )
-        remaining = batch.max_tokens[0] - batch._num_tokens[0]
+        remaining = batch.max_tokens[0] - batch._num_tokens[0] - 1
+        started = perf_counter()
         cycle = decoder.cycle(
             token,
             cache=caches,
             frontier=len(batch.tokens[0]) + 1,
-            max_tokens=max(1, remaining),
+            max_tokens=remaining,
         )
+        stats["cycle_seconds"] += perf_counter() - started
+        stats["cycles"] += 1
+        stats["proposals"] += min(decoder.block_size, remaining) - 1
+        stats["accepted_proposals"] += cycle.accepted_proposals
         state.queued.extend(cycle.tokens)
         batch.prompt_cache = [
             BatchKVCache.merge([cache]) if isinstance(original, BatchKVCache) else cache
             for original, cache in zip(batch.prompt_cache, caches)
         ]
+    stats["uno_tokens"] += 1
     batch._current_tokens = batch._next_tokens
     batch._current_logprobs = logprobs
     batch.tokens[0].append(token)

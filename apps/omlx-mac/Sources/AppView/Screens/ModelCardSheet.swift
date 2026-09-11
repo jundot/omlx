@@ -183,7 +183,7 @@ struct ModelCardSheet: View {
             errorView(message: message)
         case .loaded(let dto):
             metadataRow(dto: dto)
-            if dto.isAdapter == true {
+            if dto.isAdapter == true && dto.isUnoAdapter != true {
                 loraBanner
             }
             tabBar
@@ -473,10 +473,7 @@ struct ModelCardSheet: View {
                 .buttonStyle(.plain)
             }
             Spacer()
-            if dto.isAdapter != true {
-                // Adapters can't be downloaded as a runnable model;
-                // hide the action entirely so the user doesn't kick
-                // off a download that won't load.
+            if dto.isAdapter != true || dto.isUnoAdapter == true {
                 Button {
                     onDownload(target.repoId)
                     dismiss()

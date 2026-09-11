@@ -235,6 +235,7 @@ class _FeatureFlagSpec:
 # `mtp_enabled` is surfaced as "Lightning MTP" everywhere in the UI, so the
 # upload key follows the user-facing name rather than the settings field.
 _FEATURE_FLAG_SPECS = (
+    _FeatureFlagSpec("uno_enabled", "uno", "uno", "Uno"),
     _FeatureFlagSpec("dflash_enabled", "dflash", "dflash", "DFlash"),
     _FeatureFlagSpec(
         "specprefill_enabled", "specprefill", "specprefill", "SpecPrefill"
@@ -362,6 +363,8 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_draft_sink_size",
     "dflash_block_size",
     "dflash_verify_mode",
+    "uno_enabled",
+    "uno_adapter_model",
     "mtp_enabled",
     "mtp_num_draft_tokens",
     "vlm_mtp_enabled",
@@ -391,6 +394,7 @@ _PATH_VALUED_SETTING_FIELDS = frozenset(
         "specprefill_draft_model",
         "dflash_draft_model",
         "vlm_mtp_draft_model",
+        "uno_adapter_model",
     }
 )
 
@@ -1970,6 +1974,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "tg": request.generation_length,
                 **metrics,
             }
+            if getattr(engine, "is_uno_model", False):
+                result["uno"] = engine.get_stats()["uno"]
             run.results.append(result)
 
             await _send_event(run, {"type": "result", "data": result})
@@ -2023,6 +2029,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "tg": request.generation_length,
                 **batch_metrics,
             }
+            if getattr(engine, "is_uno_model", False):
+                result["uno"] = engine.get_stats()["uno"]
             run.results.append(result)
             await _send_event(run, {"type": "result", "data": result})
 

@@ -37,9 +37,30 @@ UNO_REQUIRED_SETTINGS = {
     "guided_grammar_enabled": False,
     "thinking_budget_enabled": False,
     "min_p": 0,
-    "repetition_penalty": 1,
+    "repetition_penalty": 1.0,
     "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "xtc_probability": 0,
 }
+
+
+def uno_conflicts(settings: dict, defaults: dict | None = None) -> dict:
+    """Required overrides, after resolving unset values through global defaults."""
+    effective = {
+        **(defaults or {}),
+        **{k: v for k, v in settings.items() if v is not None},
+    }
+    return {k: v for k, v in UNO_REQUIRED_SETTINGS.items() if effective.get(k, v) != v}
+
+
+def validate_uno_settings(settings: dict, defaults: dict | None = None) -> None:
+    if not settings.get("uno_enabled"):
+        return
+    if not settings.get("uno_adapter_model"):
+        raise ValueError("Select a Uno adapter before enabling Uno.")
+    for name, neutral in uno_conflicts(settings, defaults).items():
+        raise ValueError(f"Uno requires {name}={neutral}.")
+
 
 SETTINGS_VERSION = 1
 
@@ -492,14 +513,7 @@ class ModelSettings:
                 "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
                 "both be True; choose one Qwen3.5 prefill accelerator per model"
             )
-        if self.uno_enabled:
-            if not self.uno_adapter_model:
-                raise ValueError("Select a Uno adapter before enabling Uno.")
-            for name, neutral in UNO_REQUIRED_SETTINGS.items():
-                if getattr(self, name) not in (None, neutral):
-                    if isinstance(neutral, bool):
-                        raise ValueError(f"Uno cannot be combined with {name}.")
-                    raise ValueError(f"Uno requires {name}={neutral}.")
+        validate_uno_settings(vars(self))
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is
@@ -1004,6 +1018,11 @@ class ModelSettingsManager:
         # get_exposed_profile_runtime_settings_for_request(), which can
         # trigger an engine variant reload without persisting base settings.
         merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
+        # Uno validation must see the engine selected by this profile, including
+        # an ordinary-decoding profile on a Uno-enabled base.
+        for key in ("uno_enabled", "uno_adapter_model"):
+            if key in (profile.get("settings") or {}):
+                merged[key] = profile["settings"][key]
         # A profile overriding penalties / grammar / thinking budget on a
         # vlm_mtp base model would make __post_init__ raise on this
         # request-time merge; drop vlm_mtp for the merged view instead.

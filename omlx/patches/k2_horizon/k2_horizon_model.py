@@ -304,13 +304,8 @@ class Attention(nn.Module):
         routed = nn.silu(routed) * weights.astype(routed.dtype)[..., None]
         return routed.sum(axis=-2)
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: mx.array | None = None,
-        cache: Any = None,
-        lora_mask=None,
-    ) -> mx.array:
+    def project(self, x: mx.array, offset=0, lora_mask=None):
+        """Pure projection/RoPE region shared by ordinary and compiled execution."""
         batch, length, _ = x.shape
         queries = (
             _project(self.q_proj, x, lora_mask)
@@ -328,17 +323,10 @@ class Attention(nn.Module):
             .transpose(0, 2, 1, 3)
         )
 
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+        return self.rope(queries, offset=offset), self.rope(keys, offset=offset), values
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+    def project_output(self, output, x, lora_mask=None):
+        batch, length, _ = x.shape
         output = output.transpose(0, 2, 1, 3)
         if "gate_proj" in self:
             gate = softplus_beta_ln2(self.gate_proj(x)).reshape(
@@ -346,6 +334,17 @@ class Attention(nn.Module):
             )
             output = output * gate
         return _project(self.o_proj, output.reshape(batch, length, -1), lora_mask)
+
+    def __call__(self, x, mask=None, cache=None, lora_mask=None):
+        queries, keys, values = self.project(
+            x, cache.offset if cache is not None else 0, lora_mask
+        )
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        return self.project_output(output, x, lora_mask)
 
 
 class MLP(nn.Module):
@@ -422,6 +421,13 @@ class DecoderLayer(nn.Module):
             args.hidden_size, args.layernorm_num_groups, args.rms_norm_eps
         )
 
+    def residual(self, x, attention_output):
+        h = x + attention_output
+        return h, self.post_attention_layernorm(h)
+
+    def mlp_output(self, h, norm, lora_mask=None):
+        return h + self.mlp(norm, lora_mask=lora_mask)
+
     def __call__(
         self,
         x: mx.array,
@@ -429,8 +435,10 @@ class DecoderLayer(nn.Module):
         cache: Any = None,
         lora_mask=None,
     ) -> mx.array:
-        h = x + self.self_attn(self.input_layernorm(x), mask, cache, lora_mask)
-        return h + self.mlp(self.post_attention_layernorm(h), lora_mask=lora_mask)
+        h, norm = self.residual(
+            x, self.self_attn(self.input_layernorm(x), mask, cache, lora_mask)
+        )
+        return self.mlp_output(h, norm, lora_mask)
 
 
 class K2HorizonModel(nn.Module):

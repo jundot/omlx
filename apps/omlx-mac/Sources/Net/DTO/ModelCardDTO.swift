@@ -40,6 +40,7 @@ struct ModelCardDTO: Decodable, Equatable, Sendable {
     /// Download button so the user doesn't accidentally pull an adapter
     /// they can't run standalone.
     let isAdapter: Bool?
+    var isUnoAdapter: Bool? = nil
 
     /// Per-file listing — name + size in bytes + server-formatted size.
     /// Drives the Files tab. Always present for HF; MS returns the same

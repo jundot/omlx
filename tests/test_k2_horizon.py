@@ -235,7 +235,7 @@ def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(reject_at):
     )
     assert list(cycle.tokens) == expected
     assert cycle.accepted_proposals == (7 if reject_at is None else reject_at)
-    assert cycle.cache_length == 3 + len(expected) - 1
+    assert all(c.offset == 3 + len(expected) - 1 for c in cache)
     keys = model.cache[0].state[0]
     assert keys[0, 0, :, 0].tolist() == [2, 3, 4] + expected[:-1]
 
@@ -250,7 +250,7 @@ def run_uno_cycles(decoder, prompt, max_tokens, cache=None):
             seed, cache=cache, frontier=frontier, max_tokens=max_tokens
         )
         yield cycle
-        if cycle.finish_reason:
+        if cycle.tokens[-1] in decoder.eos:
             break
         seed = cycle.tokens[-1]
         frontier += len(cycle.tokens)
@@ -267,7 +267,6 @@ def test_eos_at_every_committed_slot_excludes_later_draft_tokens(eos_slot):
     assert len(cycles) == 1
     assert list(cycles[0].tokens) == list(range(10, 11 + eos_slot))
     assert cycles[0].accepted_proposals == min(7, eos_slot)
-    assert cycles[0].finish_reason == "stop"
     assert model.cache[0].state[0][0, 0, :, 0].tolist() == [2, 3, 4] + list(
         range(10, 10 + eos_slot)
     )
@@ -282,7 +281,6 @@ def test_budget_shorter_than_block_is_exact(budget):
     assert [token for cycle in cycles for token in cycle.tokens] == list(
         range(10, 10 + budget)
     )
-    assert cycles[-1].finish_reason == "length"
 
 
 def test_mova_router_preserves_source_partition_rounding():

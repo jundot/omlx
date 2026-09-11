@@ -2255,9 +2255,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         model_data.update(
             uno_compatible=uno_base is not None,
             uno_adapters=uno_adapters.get(uno_base, []),
-            uno_required_settings={
-                key: int(value) for key, value in UNO_REQUIRED_SETTINGS.items()
-            } if uno_base is not None else {},
+            uno_adapter_repo=f"{uno_base}-Uno" if uno_base else None,
+            uno_required_settings=(
+                {key: int(value) for key, value in UNO_REQUIRED_SETTINGS.items()}
+                if uno_base is not None
+                else {}
+            ),
         )
 
         # Add settings if available
@@ -3094,17 +3097,6 @@ async def update_model_settings(
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
     _validate_model_settings(entry, current_settings.to_dict())
-    if current_settings.uno_enabled:
-        from ..uno_bundle import resolve_uno_bundle
-
-        try:
-            current_settings.__post_init__()
-            adapter = engine_pool.get_entry(current_settings.uno_adapter_model)
-            if adapter is None or adapter.config_model_type != "k2_horizon_uno":
-                raise ValueError("Select an available Uno adapter.")
-            resolve_uno_bundle(entry.model_path, adapter.model_path)
-        except (ValueError, OSError) as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
 
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
@@ -3393,6 +3385,16 @@ def _validate_model_settings(entry, settings):
                 status_code=400,
                 detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
             )
+    if settings.get("uno_enabled"):
+        from ..model_settings import validate_uno_settings
+
+        global_settings = _get_global_settings() if _get_global_settings else None
+        defaults = global_settings.sampling.to_dict() if global_settings else {}
+        try:
+            validate_uno_settings(settings, defaults)
+            _get_engine_pool().get_uno_adapter(entry, settings)
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
     if any(key.startswith("qwen35_ane_prefill_") for key in settings):
         try:
             validate_ane_prefill(settings, entry.config_model_type)

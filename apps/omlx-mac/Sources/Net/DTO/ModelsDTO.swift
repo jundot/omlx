@@ -33,8 +33,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// Lower-level config-derived model class (e.g. `deepseek_v32`,
     /// `glm_moe_dsa`). Used to gate the IndexCache row to DSA models.
     let configModelType: String?
+    var isHelper: Bool? = nil
     var unoCompatible: Bool? = nil
     var unoAdapters: [String]? = nil
+    var unoAdapterRepo: String? = nil
     var unoRequiredSettings: [String: Double]? = nil
     /// Native context window from the model's config.json. The Context
     /// Bench target selector hides presets beyond it.
@@ -195,6 +197,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
+    var guidedGrammarEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
     var forceSampling: Bool? = nil

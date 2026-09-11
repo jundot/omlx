@@ -2,15 +2,15 @@
 
 import mlx.core as mx
 import pytest
-from mlx_lm.generate import BatchGenerator, GenerationBatch
-
-from omlx.patches.k2_horizon.k2_horizon_model import Model, ModelArgs
-from omlx.patches.k2_horizon.uno_batch import install_cache_hooks
-from omlx.patches.k2_horizon.uno_adapter import ConditionalLoRALinear, TARGETS
-from omlx.patches.k2_horizon.compiled import install_compiled_blocks
-from omlx.scheduler import Scheduler, SchedulerConfig
-from omlx.utils.sampling import make_sampler
+from mlx_lm.generate import BatchGenerator
 from test_k2_horizon import small_config
+
+import omlx.scheduler  # noqa: F401 — install shared batch and grammar hooks
+from omlx.patches.k2_horizon.compiled import install_compiled_blocks
+from omlx.patches.k2_horizon.k2_horizon_model import Model, ModelArgs
+from omlx.patches.k2_horizon.uno_adapter import TARGETS, ConditionalLoRALinear
+from omlx.patches.k2_horizon.uno_batch import install_cache_hooks
+from omlx.utils.sampling import make_sampler
 
 
 @pytest.mark.parametrize("late_join", [False, True])
@@ -140,3 +140,69 @@ def test_uno_target_matches_ordinary_sampler(
     ordinary = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)(logprobs)
     uno = probabilities(logits, temperature, top_p, top_k or None)
     assert mx.array_equal(ordinary, uno).item()
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("native_tools", [False, True])
+def test_uno_natural_eos_preserves_completion_cache(compiled, native_tools):
+    xgr = pytest.importorskip("xgrammar")
+    import mlx.nn as nn
+    from test_k2_tool_grammar import STOP, VOCAB, tools_for
+
+    from omlx.api.grammar import GrammarConstraintProcessor
+    from omlx.patches.k2_horizon.tool_grammar import compile_tool_grammar
+
+    vocab = VOCAB if native_tools else [bytes([i]) for i in range(128)]
+    stop = STOP if native_tools else 0
+    info = xgr.TokenizerInfo(vocab, xgr.VocabType.RAW, stop_token_ids=[stop])
+    compiler = xgr.GrammarCompiler(info)
+    grammar = (
+        compile_tool_grammar(compiler, tools_for("read_file"))
+        if native_tools
+        else compiler.compile_grammar('root ::= "abc"')
+    )
+    model = Model(ModelArgs.from_dict(small_config(vocab_size=len(vocab))))
+
+    class EosHead(nn.Module):
+        def __call__(self, inputs):
+            return mx.broadcast_to(
+                mx.where(mx.arange(len(vocab)) == stop, 10.0, -10.0),
+                (*inputs.shape[:-1], len(vocab)),
+            )
+
+    model.lm_head = EosHead()
+    model._uno_adapter_loaded = True
+    model._omlx_uno_enabled = model._omlx_uno_singleton = True
+    model._omlx_uno_eos = [stop]
+    if compiled:
+        install_compiled_blocks(model)
+    install_cache_hooks()
+    batch = BatchGenerator(
+        model,
+        max_tokens=24,
+        sampler=make_sampler(temp=0),
+        stop_tokens=[[stop]],
+        prefill_batch_size=1,
+    )
+    batch.insert(
+        [[1, 2, 3]],
+        logits_processors=[[GrammarConstraintProcessor(grammar, len(vocab))]],
+    )
+    output = []
+    for _ in range(25):
+        responses = batch.next_generated()
+        if not responses:
+            break
+        for response in responses:
+            output.append(response.token)
+            if response.finish_reason:
+                assert response.finish_reason == "stop"
+                assert all(c.offset == 3 + len(output) for c in response.prompt_cache)
+                cached = model(mx.array([[19]]), cache=response.prompt_cache)[:, -1]
+                reference = model(mx.array([[1, 2, 3] + output + [19]]))[:, -1]
+                assert mx.allclose(cached, reference, atol=1e-4).item()
+    assert output == ([stop] if native_tools else [97, 98, 99, stop])
+    stats = model._omlx_uno_stats
+    assert stats["ordinary_tokens"] >= 1
+    assert (stats["cycles"] == 0) == native_tools
+    assert stats["accepted_proposals"] <= stats["proposals"]

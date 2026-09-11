@@ -285,6 +285,46 @@ def test_mova_prefill_preserves_routes_and_gpu_decode():
     ).item()
 
 
+@pytest.mark.skipif(os.environ.get("OMLX_TEST_K2_ANE") != "1", reason="requires ANE")
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("rows,tiles", [(30, 0), (31, 1), (32, 1), (63, 2)])
+def test_ane_near_full_tail_preserves_cache_and_decode(compiled, rows, tiles):
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    model = make_model()
+    ids = mx.array([[i % 100 for i in range(rows)]])
+    reference_cache = make_prompt_cache(model)
+    model(ids, cache=reference_cache)
+    mx.eval([c.state for c in reference_cache])
+    expected = model(mx.array([[43]]), cache=reference_cache)
+    mx.eval(expected)
+    if compiled:
+        install_compiled_blocks(model)
+    prefill = enable_ane_prefill(model, fraction=0.5, width=32)
+    cache = make_prompt_cache(model)
+    fast.qwen35_ane_profile_set_enabled(True)
+    fast.qwen35_ane_profile_reset()
+    try:
+        prefill(ids, cache=cache)
+        ops = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        assert ops == tiles * (len(model.layers) - 1)
+        assert all(c.offset == rows for c in cache)
+        actual = model(mx.array([[43]]), cache=cache)
+        mx.eval(actual)
+        close(expected, actual)
+        assert all(c.offset == rows + 1 for c in cache)
+        for actual_cache, ref_cache in zip(cache, reference_cache):
+            for a, b in zip(actual_cache.state, ref_cache.state):
+                close(b, a)
+            actual_cache.trim(1)
+        repeated = model(mx.array([[43]]), cache=cache)
+        assert mx.array_equal(actual, repeated).item()
+        assert fast.qwen35_ane_profile_snapshot()["mlp"]["operations"] == ops
+        assert all(not l.mlp._omlx_ane_prefill.active for l in model.layers[:-1])
+    finally:
+        fast.qwen35_ane_profile_set_enabled(False)
+
+
 def test_family_partitions_use_checkpoint_dimensions():
     from omlx.patches.k2_horizon.ane_prefill import (
         partition_channels,

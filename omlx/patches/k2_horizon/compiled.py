@@ -5,40 +5,18 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
 
-from .k2_horizon_model import _project
-
 
 def make_regions(layer):
     attention = layer.self_attn
 
     def pre(x, offset, mask):
-        norm = layer.input_layernorm(x)
-        batch, rows, _ = x.shape
-        q = (
-            _project(attention.q_proj, norm, mask)
-            .reshape(batch, rows, attention.n_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
-        k = (
-            _project(attention.k_proj, norm, mask)
-            .reshape(batch, rows, attention.n_kv_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
-        v = (
-            _project(attention.v_proj, norm, mask)
-            .reshape(batch, rows, attention.n_kv_heads, -1)
-            .transpose(0, 2, 1, 3)
-        )
-        return attention.rope(q, offset=offset), attention.rope(k, offset=offset), v
+        return attention.project(layer.input_layernorm(x), offset, mask)
 
     def prefix(x, out, mask):
-        out = out.transpose(0, 2, 1, 3).reshape(*x.shape[:-1], -1)
-        h = x + _project(attention.o_proj, out, mask)
-        return h, layer.post_attention_layernorm(h)
+        return layer.residual(x, attention.project_output(out, x, mask))
 
     def post(x, out, mask):
-        h, norm = prefix(x, out, mask)
-        return h + layer.mlp(norm, lora_mask=mask)
+        return layer.mlp_output(*prefix(x, out, mask), lora_mask=mask)
 
     # Separate traces keep clean and conditional projection paths distinct.
     return {

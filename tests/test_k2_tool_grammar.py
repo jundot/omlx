@@ -207,7 +207,6 @@ def test_uno_commits_constrained_tokens_and_keeps_kv(compiler, temperature, bloc
     )
     cycles = list(run_uno_cycles(decoder, [10, 11], 10))
     assert [token for cycle in cycles for token in cycle.tokens] == [97, 98, 99, STOP]
-    assert cycles[-1].finish_reason == "stop"
     assert model.cache[0].state[0][0, 0, :, 0].tolist() == [10, 11, 97, 98, 99]
 
 

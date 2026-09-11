@@ -1575,17 +1575,45 @@
                 return (this.models || []).filter(model => ids.includes(model.id));
             },
 
-            thinkingBudgetAvailable() {
-                return !this.modelSettings.uno_enabled
-                    || !('thinking_budget_enabled' in (this.selectedModel?.uno_required_settings || {}));
+            get unoSelection() { return this.modelSettings.uno_enabled ? this.modelSettings.uno_adapter_model : ''; },
+            set unoSelection(adapter) {
+                this.modelSettings.uno_adapter_model = adapter;
+                this.modelSettings.uno_enabled = !!adapter;
             },
 
-            unoConflict() {
+            thinkingBudgetAvailable() {
+                return !this.modelSettings.uno_enabled;
+            },
+
+            unoConflicts() {
                 const settings = {...this.modelSettings,
                     thinking_budget_enabled: this.modelSettings.enableThinkingBudget};
                 return Object.entries(this.selectedModel?.uno_required_settings || {})
-                    .some(([key, neutral]) => settings[key] !== '' && settings[key] != null
-                        && Number(settings[key]) !== neutral);
+                    .flatMap(([key, neutral]) => {
+                        const inherited = settings[key] === '' || settings[key] == null;
+                        const value = inherited ? (this.globalSettings.sampling[key] ?? neutral) : settings[key];
+                        return Number(value) === neutral ? [] : [{key, neutral, value, inherited}];
+                    });
+            },
+
+            unoConflictText() {
+                return this.unoConflicts().map(({key, neutral, value, inherited}) => {
+                    const label = window.t('modal.model_settings.' + (key === 'mtp_enabled' ? 'lightning_mtp' : key.replace('_enabled', '')));
+                    const source = inherited ? ` (${window.t('modal.model_settings.profiles.scope_global')})` : '';
+                    return `${label}: ${Number(value)}${source} → ${key.endsWith('_enabled') ? window.t('settings.resource.off') : neutral}`;
+                }).join('; ');
+            },
+
+            applyUnoSettings() {
+                for (const [key, neutral] of Object.entries(this.selectedModel.uno_required_settings)) {
+                    this.modelSettings[key] = key.endsWith('_enabled') ? !!neutral : neutral;
+                }
+                this.modelSettings.enableThinkingBudget = false;
+            },
+
+            unoLocks(key) {
+                return this.modelSettings.uno_enabled && !this.modelSettings[key]
+                    && key in (this.selectedModel?.uno_required_settings || {});
             },
 
             vlmMtpDraftModelCandidates() {
@@ -1697,7 +1725,7 @@
                         model?.deepseek_v41_engram_ssd_offload_supported === true,
                     deepseek_v41_engram_ssd_offload_forced:
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
-                    enableThinkingBudget: !!(s.thinking_budget_tokens),
+                    enableThinkingBudget: s.thinking_budget_enabled || false,
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
                     guided_grammar: s.guided_grammar || '',

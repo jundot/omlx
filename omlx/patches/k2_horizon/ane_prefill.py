@@ -30,9 +30,7 @@ class _Blob:
         self.data.extend(bytes((-len(self.data)) % 64))
         offset = len(self.data)
         header = bytearray(64)
-        struct.pack_into(
-            "<IIQQ", header, 0, 0xDEADBEEF, 1, len(raw), offset + 64
-        )
+        struct.pack_into("<IIQQ", header, 0, 0xDEADBEEF, 1, len(raw), offset + 64)
         self.data.extend(header)
         self.data.extend(raw)
         self.count += 1
@@ -337,6 +335,8 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
         model.model._prefill_mlps = programs
 
     model_ref = weakref.ref(model)
+    # Only pad near-full tails: at most 1/32 of a tile (64 rows at 2048).
+    min_ane_rows = width - width // 32
 
     def prefill(inputs, *, cache):
         target = model_ref()
@@ -347,10 +347,11 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
         try:
             for start in range(0, inputs.shape[1], width):
                 chunk = inputs[:, start : start + width]
+                use_ane = chunk.shape[1] >= min_ane_rows
                 for program in programs:
-                    program.active = chunk.shape[1] == width
+                    program.active = use_ane
                 if isinstance(target.model, CompiledBody):
-                    target.model(chunk, cache=cache, prefill=chunk.shape[1] == width)
+                    target.model(chunk, cache=cache, prefill=use_ane)
                 else:
                     target(chunk, cache=cache)
                 mx.eval([c.state for c in cache])
@@ -360,7 +361,7 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
 
     model._omlx_prefill = prefill
     model._omlx_k2_ane_signature = (
-        f"k2-ane-v2-{fraction:.17g}-{shared_fraction:.17g}-{width}"
+        f"k2-ane-v3-tail31of32-{fraction:.17g}-{shared_fraction:.17g}-{width}"
         + ("-compiled" if isinstance(model.model, CompiledBody) else "")
     )
     model._omlx_k2_ane_prefill_count = len(programs)
