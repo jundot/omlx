@@ -1037,48 +1037,6 @@ def convert_model_to_streaming(
                         )
             except Exception:
                 logger.debug("Expert streaming: spill absorb skipped", exc_info=True)
-            # Expert-packed bank (v1): per-expert contiguous records for the
-            # demand path — one preadv per expert per projection instead of
-            # three component reads (validation bench 2026-09-10: 0.322 MiB
-            # average per preadv, 92.6% single-expert runs, fixed ~0.5-0.75 ms
-            # per-command latency — command SIZE is decode throughput on this
-            # device). Single-tier v1: the HOBBIT split and spill stacking
-            # keep the source layout; a stale or missing bank refuses with a
-            # reason, never silently.
-            _bank_mode = os.environ.get("OMLX_EXPERT_STREAMING_BANK", "").strip()
-            if _bank_mode:
-                if _bank_mode != "expert_packed":
-                    logger.warning(
-                        "Expert streaming: OMLX_EXPERT_STREAMING_BANK=%r not "
-                        "understood (want 'expert_packed') — ignored",
-                        _bank_mode,
-                    )
-                elif cold_root is not None:
-                    logger.warning(
-                        "Expert streaming: expert bank ignored — incompatible "
-                        "with the active cold tier (single-tier v1)"
-                    )
-                elif _spill_absorbed:
-                    logger.warning(
-                        "Expert streaming: expert bank ignored — incompatible "
-                        "with spill-stacked banks (v1)"
-                    )
-                else:
-                    _bank_ok, _bank_why, _bank_n = backing.attach_expert_bank()
-                    if _bank_ok:
-                        logger.info(
-                            "Expert streaming: expert bank attached (%d packed "
-                            "tensors) — demand reads use per-expert records",
-                            _bank_n,
-                        )
-                    else:
-                        logger.warning(
-                            "Expert streaming: expert bank not attached: %s "
-                            "(convert: python -m "
-                            "omlx.patches.expert_streaming.expert_bank_pack "
-                            "<model_dir>)",
-                            _bank_why,
-                        )
             # HOBBIT per-expert hot/cold split (Fase I6): with a cold tier
             # active, the top fraction of experts per layer (by learned
             # pin-profile frequency) keeps the ORIGINAL packing while the
