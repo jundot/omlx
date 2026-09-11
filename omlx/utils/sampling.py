@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""omlx sampling utilities — mx.compile-free re-implementation of mlx-lm samplers.
+"""omlx sampling utilities — mlx-lm samplers, compiled only where RNG-free.
 
 mlx-lm 0.31.x decorates ``categorical_sampling`` and the apply_* helpers with
 ``@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)``. In
@@ -8,20 +8,27 @@ the first call: all subsequent samples reuse the same state, so identical
 prompts produce character-identical output even at temperature > 1. Direct
 calls to the underlying primitives advance the state correctly.
 
-This module mirrors the mlx-lm implementation but drops the ``mx.compile``
-wrappers, keeping behavior identical otherwise. ``make_sampler`` matches
-``mlx_lm.sample_utils.make_sampler`` so it can replace the import in scheduler
-without further changes.
+This module mirrors the mlx-lm implementation but compiles only the RNG-free
+filters (``apply_top_p`` / ``apply_min_p`` / ``apply_top_k``) with plain
+``mx.compile`` — no RNG-state capture, so the frozen-state bug cannot recur —
+and keeps the RNG-using functions (``categorical_sampling``, ``apply_xtc``)
+uncompiled. ``make_sampler`` matches ``mlx_lm.sample_utils.make_sampler`` so
+it can replace the import in scheduler without further changes.
 """
 
 from __future__ import annotations
 
 import math
+from functools import partial
 from typing import Callable, List
 
 import mlx.core as mx
 
 
+# RNG-free, so compiling cannot retrigger the frozen-RNG bug. mx.cumsum cannot
+# infer output shapes under shapeless=True, so this uses the default
+# shape-specialized compile (recompiles are bounded: vocab is fixed per model).
+@mx.compile
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """Top-p (nucleus) filtering — keep the smallest set of tokens whose
     cumulative probability mass is at least ``top_p``."""
@@ -46,6 +53,9 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     )
 
 
+# RNG-free; elementwise/reduction ops only, so shapeless=True avoids
+# recompiles across varying batch rows and vocab sizes.
+@partial(mx.compile, shapeless=True)
 def apply_min_p(
     logprobs: mx.array,
     min_p: float,
@@ -79,6 +89,9 @@ def apply_min_p(
     return mx.where(tokens_to_remove, -float("inf"), logprobs)
 
 
+# RNG-free. The [..., top_k:] slice cannot infer output shapes under
+# shapeless=True, so this uses the default shape-specialized compile.
+@mx.compile
 def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
     """Top-k filtering — keep only the ``top_k`` highest-probability tokens."""
     vocab_size = logprobs.shape[-1]
@@ -94,6 +107,7 @@ def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
     return masked_logprobs
 
 
+# Uses mx.random — MUST stay uncompiled (see module docstring).
 def apply_xtc(
     logits: mx.array,
     xtc_probability: float,
@@ -123,6 +137,7 @@ def apply_xtc(
     )
 
 
+# Uses mx.random — MUST stay uncompiled (see module docstring).
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
     """Sample a token id from the categorical distribution defined by
     ``logits / temp``. RNG state is advanced through ``mx.random.categorical``."""
