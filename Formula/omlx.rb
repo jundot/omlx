@@ -72,10 +72,9 @@ class Omlx < Formula
       no_binary += ",tokenizers"
       ENV["CARGO_PROFILE_RELEASE_STRIP"] = "false"
       ENV["MATURIN_STRIP"] = "false"
-      # Pip reuses locally built wheels even under --no-binary, so a wheel
-      # cached before the strip guards existed stays corrupted. Bypass the
-      # cache entirely.
-      pip_flags << "--no-cache-dir"
+      # The wheel cache is safe again: Homebrew's pip cache
+      # (~/Library/Caches/Homebrew/pip_cache) is separate from the user's, and
+      # only ever contains wheels built here, with the strip guards applied.
     end
 
     # Every pip step must share these flags; a later step without --no-binary
