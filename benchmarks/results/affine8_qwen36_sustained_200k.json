@@ -1,0 +1,102 @@
+{
+  "model": "Qwen3.6-35B-A3B-oQ4e-mtp",
+  "mode": "affine8",
+  "settings": {
+    "turboquant_kv_enabled": true,
+    "turboquant_kv_scheme": "affine8",
+    "turboquant_kv_bits": 8,
+    "turboquant_skip_last": true,
+    "mtp_enabled": false,
+    "vlm_mtp_enabled": false,
+    "dflash_enabled": false,
+    "specprefill_enabled": false,
+    "qwen35_ane_prefill_enabled": false,
+    "qwen35_oq_a8_enabled": false,
+    "max_context_window": 262144,
+    "max_tokens": 8192
+  },
+  "request": {
+    "model_id": "Qwen3.6-35B-A3B-oQ4e-mtp",
+    "prompt_lengths": [
+      200000
+    ],
+    "generation_length": 4096,
+    "batch_sizes": [],
+    "warmup_mode": "ane_2048",
+    "align_prompt_to_ane": true,
+    "force_lm_engine": false,
+    "context_profile": "code_python"
+  },
+  "bench_id": "bench-f51698e951c6",
+  "started_at": 1789134067.98446,
+  "result": {
+    "bench_id": "bench-f51698e951c6",
+    "status": "completed",
+    "context_profile": "code_python",
+    "results": [
+      {
+        "test_type": "single",
+        "pp": 200001,
+        "tg": 4096,
+        "ttft_ms": 225897.2,
+        "tpot_ms": 26.51,
+        "gen_tps": 37.7,
+        "processing_tps": 885.4,
+        "e2e_latency_s": 334.546,
+        "total_throughput": 610.1,
+        "peak_memory_bytes": 24632866202,
+        "peak_memory_source": "mlx_active",
+        "prompt_tokens": 200001,
+        "completion_tokens": 4096,
+        "cached_tokens": 0,
+        "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+        "output_sample": {
+          "sha256": "d62c14667e6d2eecd05c3a7061d553aa2ef8c3ce21769d06c22be06c013625b3",
+          "head": "Build ResponseUsage with reasoning_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),\n        output_tokens_deta",
+          "tail": "id: str) -> Optional[str]:\n    \"\"\"Get model from a response chain.\n\n    Returns the model from the last response in the chain.\n    \"\"\"\n    chain = _load_response_chain(response_id)\n    return chain[-1].get(\"model\")\n\n\ndef _get_chain_object(response_id: str)"
+        },
+        "finish_reason": "length",
+        "generation_policy": "suppress_termination",
+        "system_metrics": {
+          "sample_count": 1318,
+          "interval_s": 0.25,
+          "cpu": {
+            "total_avg": 3.6,
+            "total_max": 23.7,
+            "p_avg": 6.4,
+            "e_avg": 2.2
+          },
+          "memory": {
+            "phys_footprint_peak": 26.67,
+            "mlx_active_peak": 22.75,
+            "mlx_cache_peak": 4.3,
+            "system_used_peak": 40.29,
+            "system_wired_peak": 29.28,
+            "total_ram": 48
+          },
+          "gpu": {
+            "util_avg": 99.0,
+            "util_max": 100.0
+          },
+          "thermal": {
+            "start": 0,
+            "max": 0
+          }
+        }
+      }
+    ],
+    "error": null,
+    "upload_state": {
+      "phase": "skipped",
+      "results": [],
+      "total": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "owner_hash": null,
+      "skipped_reason": "ane_aligned_prompt",
+      "skipped_features": [],
+      "feature_flags": []
+    }
+  },
+  "finished_at": 1789134408.414861
+}

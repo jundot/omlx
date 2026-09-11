@@ -1,0 +1,102 @@
+{
+  "model": "Qwen3.8-27B-oQ4e-mtp",
+  "mode": "affine8",
+  "settings": {
+    "turboquant_kv_enabled": true,
+    "turboquant_kv_scheme": "affine8",
+    "turboquant_kv_bits": 8,
+    "turboquant_skip_last": true,
+    "mtp_enabled": false,
+    "vlm_mtp_enabled": false,
+    "dflash_enabled": false,
+    "specprefill_enabled": false,
+    "qwen35_ane_prefill_enabled": false,
+    "qwen35_oq_a8_enabled": false,
+    "max_context_window": 262144,
+    "max_tokens": 8192
+  },
+  "request": {
+    "model_id": "Qwen3.8-27B-oQ4e-mtp",
+    "prompt_lengths": [
+      50000
+    ],
+    "generation_length": 128,
+    "batch_sizes": [],
+    "warmup_mode": "ane_2048",
+    "align_prompt_to_ane": true,
+    "force_lm_engine": false,
+    "context_profile": "code_python"
+  },
+  "bench_id": "bench-bd6a084a0157",
+  "started_at": 1789130021.6050508,
+  "result": {
+    "bench_id": "bench-bd6a084a0157",
+    "status": "completed",
+    "context_profile": "code_python",
+    "results": [
+      {
+        "test_type": "single",
+        "pp": 50001,
+        "tg": 128,
+        "ttft_ms": 121871.1,
+        "tpot_ms": 70.51,
+        "gen_tps": 14.3,
+        "processing_tps": 410.3,
+        "e2e_latency_s": 130.869,
+        "total_throughput": 383.0,
+        "peak_memory_bytes": 20374947882,
+        "peak_memory_source": "mlx_active",
+        "prompt_tokens": 50001,
+        "completion_tokens": 128,
+        "cached_tokens": 0,
+        "prompt_sha256": "e3b8e4b5ef21f6fd7cf21e1bff8343d21d523418ca0b267e0265ae8247f7155b",
+        "output_sample": {
+          "sha256": "a511a0e0c07a3f3aa40da5f61c6b255b27dbdde60092d4cd19bcaa452723e947",
+          "head": "_runs:\n        for bid, _ in completed[:-max_runs]:\n            del _context_runs[bid]\n\n\ndef _band(phase: str) -> tuple[float, float]:\n    return _PROGRESS_BANDS.get(phase, (0.0, 100.0))\n\n\ndef _progress_for(phase: str, fraction: float) -> float:\n    lo, hi",
+          "tail": " return _PROGRESS_BANDS.get(phase, (0.0, 100.0))\n\n\ndef _progress_for(phase: str, fraction: float) -> float:\n    lo, hi = _band(phase)\n    return round(lo + (hi - lo) * max(0.0, min(1.0, fraction)), 1)\n\n\nasync def _send_event(run: ContextBenchmarkRun, event"
+        },
+        "finish_reason": "length",
+        "generation_policy": "suppress_termination",
+        "system_metrics": {
+          "sample_count": 510,
+          "interval_s": 0.25,
+          "cpu": {
+            "total_avg": 3.4,
+            "total_max": 9.2,
+            "p_avg": 4.4,
+            "e_avg": 2.9
+          },
+          "memory": {
+            "phys_footprint_peak": 21.71,
+            "mlx_active_peak": 18.82,
+            "mlx_cache_peak": 2.14,
+            "system_used_peak": 38.64,
+            "system_wired_peak": 24.65,
+            "total_ram": 48
+          },
+          "gpu": {
+            "util_avg": 96.5,
+            "util_max": 100.0
+          },
+          "thermal": {
+            "start": 0,
+            "max": 0
+          }
+        }
+      }
+    ],
+    "error": null,
+    "upload_state": {
+      "phase": "skipped",
+      "results": [],
+      "total": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "owner_hash": null,
+      "skipped_reason": "ane_aligned_prompt",
+      "skipped_features": [],
+      "feature_flags": []
+    }
+  },
+  "finished_at": 1789130161.848023
+}

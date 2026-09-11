@@ -1,0 +1,102 @@
+{
+  "model": "Qwen3.8-27B-oQ4e-mtp",
+  "mode": "affine8",
+  "settings": {
+    "turboquant_kv_enabled": true,
+    "turboquant_kv_scheme": "affine8",
+    "turboquant_kv_bits": 8,
+    "turboquant_skip_last": true,
+    "mtp_enabled": false,
+    "vlm_mtp_enabled": false,
+    "dflash_enabled": false,
+    "specprefill_enabled": false,
+    "qwen35_ane_prefill_enabled": false,
+    "qwen35_oq_a8_enabled": false,
+    "max_context_window": 262144,
+    "max_tokens": 8192
+  },
+  "request": {
+    "model_id": "Qwen3.8-27B-oQ4e-mtp",
+    "prompt_lengths": [
+      200000
+    ],
+    "generation_length": 128,
+    "batch_sizes": [],
+    "warmup_mode": "ane_2048",
+    "align_prompt_to_ane": true,
+    "force_lm_engine": false,
+    "context_profile": "code_python"
+  },
+  "bench_id": "bench-d6c40647436c",
+  "started_at": 1789130851.2468538,
+  "result": {
+    "bench_id": "bench-d6c40647436c",
+    "status": "completed",
+    "context_profile": "code_python",
+    "results": [
+      {
+        "test_type": "single",
+        "pp": 200001,
+        "tg": 128,
+        "ttft_ms": 770619.8,
+        "tpot_ms": 108.31,
+        "gen_tps": 9.3,
+        "processing_tps": 259.5,
+        "e2e_latency_s": 784.496,
+        "total_throughput": 255.1,
+        "peak_memory_bytes": 26264815658,
+        "peak_memory_source": "mlx_active",
+        "prompt_tokens": 200001,
+        "completion_tokens": 128,
+        "cached_tokens": 0,
+        "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+        "output_sample": {
+          "sha256": "1048816ac55b7d1f27332ca861a573b1f482ef89b3f9b3075e516daf7d7089a8",
+          "head": "Build a ResponseUsage object.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        total_tokens=input_tokens + output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_token",
+          "tail": "nse State Persistence\n# =============================================================================\n\n\ndef _state_dir(base_path: Path) -> Path:\n    return base_path / \"cache\" / \"response-state\"\n\n\ndef _state_path(base_path: Path, response_id: str) -> Path:"
+        },
+        "finish_reason": "length",
+        "generation_policy": "suppress_termination",
+        "system_metrics": {
+          "sample_count": 3084,
+          "interval_s": 0.25,
+          "cpu": {
+            "total_avg": 3.6,
+            "total_max": 35.3,
+            "p_avg": 4.4,
+            "e_avg": 3.2
+          },
+          "memory": {
+            "phys_footprint_peak": 31.98,
+            "mlx_active_peak": 24.16,
+            "mlx_cache_peak": 9.09,
+            "system_used_peak": 44.99,
+            "system_wired_peak": 34.8,
+            "total_ram": 48
+          },
+          "gpu": {
+            "util_avg": 98.3,
+            "util_max": 100.0
+          },
+          "thermal": {
+            "start": 0,
+            "max": 0
+          }
+        }
+      }
+    ],
+    "error": null,
+    "upload_state": {
+      "phase": "skipped",
+      "results": [],
+      "total": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "owner_hash": null,
+      "skipped_reason": "ane_aligned_prompt",
+      "skipped_features": [],
+      "feature_flags": []
+    }
+  },
+  "finished_at": 1789131647.1364732
+}

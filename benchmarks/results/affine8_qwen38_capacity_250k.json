@@ -1,0 +1,51 @@
+{
+  "model": "Qwen3.8-27B-oQ4e-mtp",
+  "mode": "affine8",
+  "settings": {
+    "turboquant_kv_enabled": true,
+    "turboquant_kv_scheme": "affine8",
+    "turboquant_kv_bits": 8,
+    "turboquant_skip_last": true,
+    "mtp_enabled": false,
+    "vlm_mtp_enabled": false,
+    "dflash_enabled": false,
+    "specprefill_enabled": false,
+    "qwen35_ane_prefill_enabled": false,
+    "qwen35_oq_a8_enabled": false,
+    "max_context_window": 262144,
+    "max_tokens": 8192
+  },
+  "request": {
+    "model_id": "Qwen3.8-27B-oQ4e-mtp",
+    "prompt_lengths": [
+      250000
+    ],
+    "generation_length": 128,
+    "batch_sizes": [],
+    "warmup_mode": "ane_2048",
+    "align_prompt_to_ane": true,
+    "force_lm_engine": false,
+    "context_profile": "code_python"
+  },
+  "bench_id": "bench-c3137b59942e",
+  "started_at": 1789131737.368961,
+  "result": {
+    "bench_id": "bench-c3137b59942e",
+    "status": "error",
+    "context_profile": "code_python",
+    "results": [],
+    "error": "Prefill would require ~35.33 GB peak (current 22.77 GB + KV+SDPA 12.56 GB) but dynamic ceiling is 34.79 GB. Close other apps to free RAM (static cap is 42.00 GB but only 13.86 GB is reclaimable right now), raise memory_guard_tier (safe \u2192 balanced \u2192 aggressive), or reduce context length.",
+    "upload_state": {
+      "phase": "idle",
+      "results": [],
+      "total": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "owner_hash": null,
+      "skipped_reason": null,
+      "skipped_features": [],
+      "feature_flags": []
+    }
+  },
+  "finished_at": 1789132533.329014
+}

@@ -1,0 +1,102 @@
+{
+  "model": "Qwen3.8-27B-oQ4e-mtp",
+  "mode": "affine8",
+  "settings": {
+    "turboquant_kv_enabled": true,
+    "turboquant_kv_scheme": "affine8",
+    "turboquant_kv_bits": 8,
+    "turboquant_skip_last": true,
+    "mtp_enabled": false,
+    "vlm_mtp_enabled": false,
+    "dflash_enabled": false,
+    "specprefill_enabled": false,
+    "qwen35_ane_prefill_enabled": false,
+    "qwen35_oq_a8_enabled": false,
+    "max_context_window": 262144,
+    "max_tokens": 8192
+  },
+  "request": {
+    "model_id": "Qwen3.8-27B-oQ4e-mtp",
+    "prompt_lengths": [
+      200000
+    ],
+    "generation_length": 4096,
+    "batch_sizes": [],
+    "warmup_mode": "ane_2048",
+    "align_prompt_to_ane": true,
+    "force_lm_engine": false,
+    "context_profile": "code_python"
+  },
+  "bench_id": "bench-5bea375eb02a",
+  "started_at": 1789132640.063814,
+  "result": {
+    "bench_id": "bench-5bea375eb02a",
+    "status": "completed",
+    "context_profile": "code_python",
+    "results": [
+      {
+        "test_type": "single",
+        "pp": 200001,
+        "tg": 4096,
+        "ttft_ms": 783484.4,
+        "tpot_ms": 106.01,
+        "gen_tps": 9.4,
+        "processing_tps": 255.3,
+        "e2e_latency_s": 1217.732,
+        "total_throughput": 167.6,
+        "peak_memory_bytes": 26264815658,
+        "peak_memory_source": "mlx_active",
+        "prompt_tokens": 200001,
+        "completion_tokens": 4096,
+        "cached_tokens": 0,
+        "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+        "output_sample": {
+          "sha256": "592f0fd8fbfb3e3284c6f1a1b65822dc5173e97742c628325249e653f900292c",
+          "head": "Build a ResponseUsage object.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        total_tokens=input_tokens + output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_token",
+          "tail": "put_item_output_item_output_item_output_status\",\n        {},\n    )\n\n\ndef _state_tool_call_item_output_item_output_item_output_item_output_item_output_item_output_item_output_item_output_order(\n    state: Dict[str, Any],\n) -> List[str]:\n    return state.get"
+        },
+        "finish_reason": "length",
+        "generation_policy": "suppress_termination",
+        "system_metrics": {
+          "sample_count": 4799,
+          "interval_s": 0.25,
+          "cpu": {
+            "total_avg": 5.3,
+            "total_max": 39.4,
+            "p_avg": 6.3,
+            "e_avg": 4.8
+          },
+          "memory": {
+            "phys_footprint_peak": 36.13,
+            "mlx_active_peak": 24.04,
+            "mlx_cache_peak": 13.34,
+            "system_used_peak": 46.79,
+            "system_wired_peak": 39.0,
+            "total_ram": 48
+          },
+          "gpu": {
+            "util_avg": 97.7,
+            "util_max": 100.0
+          },
+          "thermal": {
+            "start": 0,
+            "max": 0
+          }
+        }
+      }
+    ],
+    "error": null,
+    "upload_state": {
+      "phase": "skipped",
+      "results": [],
+      "total": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "owner_hash": null,
+      "skipped_reason": "ane_aligned_prompt",
+      "skipped_features": [],
+      "feature_flags": []
+    }
+  },
+  "finished_at": 1789133866.3645172
+}
