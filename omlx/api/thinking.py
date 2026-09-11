@@ -28,6 +28,13 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
 # (scheduler prepends <think>\n but the tag may be split)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
+# Collapse the blank-line gap left after an orphan </think> tag is removed
+# (the forced close is written as ``\n</think>\n\n``).  Deliberately a simple
+# ``\n{3,}`` and NOT a pattern with a leading ``[ \t]*``/``\s*`` quantifier:
+# an unbounded whitespace prefix makes re.sub O(n^2) on a long run (quadratic
+# ReDoS), and model output is untrusted and can degenerate into whitespace
+# repetition. ``\n{3,}`` has no backtracking ambiguity and scans linearly.
+_COLLAPSE_BLANK_LINES = re.compile(r'\n{3,}')
 
 
 def _safe_tokenizer_attr(tokenizer, attr: str, default=None):
@@ -142,6 +149,26 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
+def _strip_orphan_close_tags(content: str) -> str:
+    """Remove stray ``</think>`` tags left in answer content.
+
+    Called only after the thinking block(s) have already been extracted, so
+    any ``</think>`` still present is an orphan — most often the close the
+    model emits on its own after a budget-forced close (#1864).
+
+    Implemented as a linear ``str.replace`` plus a blank-line collapse rather
+    than a single regex: ``content`` is untrusted model output, and a regex
+    that tries to absorb the surrounding whitespace with a leading quantifier
+    backtracks quadratically on long whitespace runs (ReDoS).  Dropping the
+    literal tag turns the forced-close wrapper ``\\n</think>\\n\\n`` into a
+    ``\\n\\n\\n`` gap, which the collapse trims back to a paragraph break; a
+    bare inline ``</think>`` simply vanishes with no stray newline.
+    """
+    if '</think>' not in content:
+        return content
+    return _COLLAPSE_BLANK_LINES.sub('\n\n', content.replace('</think>', ''))
+
+
 def extract_thinking(text: str) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
@@ -191,14 +218,14 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
     if thinking_parts:
         thinking = "\n".join(thinking_parts).strip()
-        return (thinking, remaining.strip())
+        return (thinking, _strip_orphan_close_tags(remaining).strip())
 
     # Handle partial: content before </think> without <think> tag
     if '</think>' in text and '<think>' not in text:
         match = _THINKING_TAIL_PATTERN.match(text)
         if match:
             thinking = match.group(1).strip()
-            remaining = text[match.end():].strip()
+            remaining = _strip_orphan_close_tags(text[match.end():]).strip()
             return (thinking, remaining)
 
     # Malformed: <think> opened but never closed. Drop the open tag and
@@ -392,8 +419,10 @@ class ThinkingBudgetProcessor:
     """Logits processor that enforces a thinking token budget.
 
     Counts tokens generated while in thinking mode.  When the budget is
-    exceeded, forces the close-think token(s) one at a time, then becomes
-    a no-op for the rest of generation.
+    exceeded, forces the close-think token(s) one at a time.  Afterwards,
+    for a single-token close, it masks that close token for the rest of
+    generation so the cut-off model cannot emit a second, literal
+    ``</think>`` into the answer (issue #1864); otherwise it is a no-op.
 
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
@@ -432,6 +461,14 @@ class ThinkingBudgetProcessor:
         self._force_idx: int = 0
         self._done: bool = False
         self._first_call: bool = True
+        # After a *forced* close, the model has been cut off mid-thought and
+        # tends to keep reasoning and then emit its own ``</think>``.  That
+        # second close leaks into the answer as a literal tag (issue #1864).
+        # Once we force the close, suppress further close-tag tokens until the
+        # model re-enters a thinking block, so it cannot emit a duplicate.
+        # Only set after a forced close — a natural close means the model
+        # finished on its own and needs no muzzle.
+        self._suppress_reclose: bool = False
         # Sliding window for multi-token end detection
         self._recent_tokens: List[int] = []
         self._last_token_utf8_complete: bool = True
@@ -453,6 +490,23 @@ class ThinkingBudgetProcessor:
 
         # If state changed by _update_state, handle immediately
         if self._done:
+            # After a forced close, mask the close-tag token so the model
+            # cannot emit a second, literal ``</think>`` into the answer
+            # (issue #1864).  Skip this if the model has re-entered thinking,
+            # where a legitimate close is expected again.
+            #
+            # Only for a single-token close: that token is a dedicated </think>
+            # sentinel, safe to ban for the rest of generation.  A multi-token
+            # close decomposes into ordinary subwords (e.g. "</", "think", ">")
+            # that recur in normal text, so masking them would corrupt the
+            # answer — those models fall back to the parser-side orphan strip
+            # in extract_thinking() instead.
+            if (
+                self._suppress_reclose
+                and not self._in_thinking
+                and len(self._think_end_ids) == 1
+            ):
+                return self._suppress_reclose_tokens(logits, mx)
             return logits
 
         if self._forcing:
@@ -484,6 +538,8 @@ class ThinkingBudgetProcessor:
                 self._done = False
                 self._thinking_tokens = 0
                 self._recent_tokens = []
+                # Re-entered thinking: a future close is legitimate again.
+                self._suppress_reclose = False
             return
 
         if self._forcing:
@@ -492,6 +548,9 @@ class ThinkingBudgetProcessor:
                 self._in_thinking = False
                 self._forcing = False
                 self._done = True
+                # Forced close finished — muzzle any further close tags so the
+                # model cannot leak a second ``</think>`` into the answer (#1864).
+                self._suppress_reclose = True
             return
 
         # Detect natural close-think via sliding window
@@ -521,6 +580,7 @@ class ThinkingBudgetProcessor:
         if not self._in_thinking and self._think_start_id and token_id == self._think_start_id:
             self._in_thinking = True
             self._done = False
+            self._suppress_reclose = False
             self._thinking_tokens = 0
             self._recent_tokens = []
 
@@ -557,6 +617,20 @@ class ThinkingBudgetProcessor:
         forced[..., target_id] = 0.0
         return forced
 
+    def _suppress_reclose_tokens(self, logits, mx):
+        """Mask the close-think token so a forced-closed block stays closed.
+
+        Sets only the close-tag id(s) to -inf (not the leading/trailing
+        whitespace tokens), leaving the rest of the distribution untouched so
+        the model still picks its real answer tokens normally.  Only reached
+        for a single-token close (see ``__call__``), so this never bans an
+        ordinary subword.  The assignment is in-place: the mlx-lm processor
+        chain passes a fresh logits array per step and does not alias it.
+        """
+        for tid in self._think_end_ids:
+            logits[..., tid] = float("-inf")
+        return logits
+
     # -- Speculative-decoding (vlm_mtp) support -----------------------------
     #
     # The vlm_mtp decode path applies this processor inside mlx-vlm's
@@ -575,6 +649,12 @@ class ThinkingBudgetProcessor:
         "_force_idx",
         "_done",
         "_first_call",
+        # Part of the post-forced-close muzzle (#1864): if this were left out
+        # of the snapshot, a rejected draft suffix would rewind every other
+        # field but keep the muzzle state from the discarded positions, so a
+        # forced close inside the rejected suffix would keep suppressing the
+        # close tag after the rewind (or vice versa).
+        "_suppress_reclose",
         "_recent_tokens",
         "_last_token_utf8_complete",
         "_pending_utf8",
