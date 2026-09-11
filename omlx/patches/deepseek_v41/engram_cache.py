@@ -284,9 +284,15 @@ def engram_cache_stats(model: Any = None) -> Dict[int, Dict[str, Any]]:
                 eng = None
         if eng is None:
             continue
+        hot = None
         embed = getattr(eng, "embed", None)
-        hot = getattr(embed, "_hot_cache", None) if embed is not None else None
-        if hot is None or not hot.enabled:
+        if embed is not None:
+            hot = getattr(embed, "_hot_cache", None) or getattr(embed, "hot_cache", None)
+        if hot is None:
+            table = getattr(eng, "_mmap_table", None)
+            if table is not None:
+                hot = getattr(table, "hot_cache", None)
+        if hot is None or not getattr(hot, "enabled", False):
             continue
         layer_id = int(getattr(eng, "layer_id", i))
         out[layer_id] = hot.stats()
