@@ -46,7 +46,8 @@ def test_kv_compression_copy_is_loaded_from_each_locale():
     keys = (
         "kv_compression", "kv_compression_hint", "kv_compression_format",
         "kv_compression_turboquant", "kv_compression_affine4",
-        "kv_compression_affine4_hint", "vlm_mtp_compression_conflict",
+        "kv_compression_affine4_hint", "kv_compression_affine8",
+        "kv_compression_affine8_hint", "vlm_mtp_compression_conflict",
     )
     english = admin_routes._load_locale("en")
     for path in admin_routes._i18n_dir.glob("*.json"):

@@ -55,10 +55,10 @@ def quantized_cache_class(scheme: str = "turboquant"):
     """Resolve the packed cache format without loading native kernels."""
     if scheme == "turboquant":
         return TurboQuantKVCache
-    if scheme == "affine4":
-        from .affine4 import Affine4KVCache
+    if scheme in ("affine4", "affine8"):
+        from .affine4 import Affine4KVCache, Affine8KVCache
 
-        return Affine4KVCache
+        return Affine8KVCache if scheme == "affine8" else Affine4KVCache
     raise ValueError(f"Unknown KV cache quantization scheme: {scheme}")
 
 

@@ -678,6 +678,8 @@
   "modal.model_settings.kv_compression_turboquant": "TurboQuant",
   "modal.model_settings.kv_compression_affine4": "Affine4 (4비트)",
   "modal.model_settings.kv_compression_affine4_hint": "프롬프트를 처리하는 동안 KV 캐시를 4비트 Affine4로 압축합니다. 지원되는 경우 M5 가속을 자동으로 선택하며, 다른 하드웨어나 지원되지 않는 텐서 형상에서는 범용 구현을 사용합니다.",
+  "modal.model_settings.kv_compression_affine8": "Affine8 (8비트)",
+  "modal.model_settings.kv_compression_affine8_hint": "프롬프트 처리 중 KV 캐시를 8비트 Affine8로 압축하여 Affine4보다 높은 정밀도를 제공하며, 동일한 증분 긴 컨텍스트 경로를 사용합니다.",
   "modal.model_settings.vlm_mtp_compression_conflict": "먼저 DFlash / SpecPrefill / MTP / KV 캐시 압축을 비활성화하세요. VLM MTP가 추측 디코딩 경로를 제어합니다.",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",

@@ -21,12 +21,17 @@ from .turboquant_kv import BatchTurboQuantKVCache
 logger = logging.getLogger(__name__)
 
 AFFINE4_SCHEME = "affine4"
+AFFINE8_SCHEME = "affine8"
 
 __all__ = [
     "AFFINE4_SCHEME",
+    "AFFINE8_SCHEME",
     "Affine4Codec",
+    "Affine8Codec",
     "Affine4KVCache",
+    "Affine8KVCache",
     "BatchAffine4KVCache",
+    "BatchAffine8KVCache",
 ]
 
 _BITS = 4
@@ -40,44 +45,61 @@ _DEQUANTIZE_LAUNCHABLE = {}
 
 
 @cache
-def _dequantize_rotated_kernel():
+def _dequantize_rotated_kernel(bits: int = _BITS):
     if not (hasattr(mx, "metal") and mx.metal.is_available()):
         return None
+    values_per_word = 32 // bits
+    mask = (1 << bits) - 1
+    sign = 1 << (bits - 1)
     return mx.fast.metal_kernel(
-        name="affine4_dequantize_rotated",
+        name=f"affine{bits}_dequantize_rotated",
         input_names=["packed", "scales"],
         output_names=["output"],
         ensure_row_contiguous=False,
-        source=r"""
+        source=f"""
             uint index = thread_position_in_grid.x;
             uint size = Dim;
             for (int axis = 0; axis < Rank; ++axis) size *= scales_shape[axis];
             if (index >= size) return;
             uint row = index / Dim;
             uint dimension = index % Dim;
-            long packed_offset = long(dimension / 8) * long(packed_strides[Rank]);
+            long packed_offset = long(dimension / {values_per_word}) * long(packed_strides[Rank]);
             long scale_offset = 0;
-            for (int axis = Rank - 1; axis >= 0; --axis) {
+            for (int axis = Rank - 1; axis >= 0; --axis) {{
                 uint coordinate = row % scales_shape[axis];
                 row /= scales_shape[axis];
                 packed_offset += long(coordinate) * long(packed_strides[axis]);
                 scale_offset += long(coordinate) * long(scales_strides[axis]);
-            }
-            uint nibble = (packed[packed_offset] >> (4 * (dimension % 8))) & 15u;
-            int code = int(nibble ^ 8u) - 8;
+            }}
+            uint encoded = (packed[packed_offset] >> ({bits} * (dimension % {values_per_word}))) & {mask}u;
+            int code = int(encoded ^ {sign}u) - {sign};
             output[index] = static_cast<Output>(float(code) * float(scales[scale_offset]));
         """,
     )
 
 
 class Affine4Codec:
-    """Signed int4 codec with deterministic orthonormal rotation."""
+    """Signed affine codec with deterministic orthonormal rotation."""
 
     bits = _BITS
 
+    @property
+    def values_per_word(self) -> int:
+        return 32 // self.bits
+
+    @property
+    def minimum_code(self) -> int:
+        return -(1 << (self.bits - 1))
+
+    @property
+    def maximum_code(self) -> int:
+        return (1 << (self.bits - 1)) - 1
+
     def __init__(self, dim: int, seed: int = 0):
         if int(dim) != dim or dim <= 0:
-            raise ValueError(f"affine4 requires a positive head dimension, got {dim}")
+            raise ValueError(
+                f"affine{self.bits} requires a positive head dimension, got {dim}"
+            )
         self.dim = int(dim)
         self.seed = int(seed)
         dim = self.dim
@@ -107,31 +129,52 @@ class Affine4Codec:
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
         rotated = self._rotate_forward(vectors)
         scales = mx.maximum(
-            mx.max(rotated, axis=-1) / 7.0,
-            -mx.min(rotated, axis=-1) / 8.0,
+            mx.max(rotated, axis=-1) / self.maximum_code,
+            -mx.min(rotated, axis=-1) / -self.minimum_code,
         )
         divisor = mx.where(scales > 0, scales, 1)[..., None]
-        codes = mx.clip(mx.round(rotated / divisor), -8, 7).astype(mx.int8)
-        nibbles = codes.astype(mx.uint32) & 15
+        codes = mx.clip(
+            mx.round(rotated / divisor), self.minimum_code, self.maximum_code
+        ).astype(mx.int8)
+        encoded = codes.astype(mx.uint32) & ((1 << self.bits) - 1)
         if mx.default_device() == mx.cpu:
-            width = (self.dim + 7) // 8
-            nibbles = mx.pad(
-                nibbles, [(0, 0)] * (nibbles.ndim - 1) + [(0, width * 8 - self.dim)]
+            width = (self.dim + self.values_per_word - 1) // self.values_per_word
+            encoded = mx.pad(
+                encoded,
+                [(0, 0)] * (encoded.ndim - 1)
+                + [(0, width * self.values_per_word - self.dim)],
             )
-            words = nibbles.reshape(*nibbles.shape[:-1], width, 8)
-            packed = mx.sum(words << (mx.arange(8, dtype=mx.uint32) * 4), axis=-1)
+            words = encoded.reshape(
+                *encoded.shape[:-1], width, self.values_per_word
+            )
+            packed = mx.sum(
+                words
+                << (
+                    mx.arange(self.values_per_word, dtype=mx.uint32) * self.bits
+                ),
+                axis=-1,
+            )
         else:
-            packed = _pack_lowbit(nibbles, _BITS)
+            packed = _pack_lowbit(encoded, self.bits)
         return TurboQuantMSEState(scales, packed)
 
     def _codes(self, state: TurboQuantMSEState) -> mx.array:
         if mx.default_device() == mx.cpu:
             dimensions = mx.arange(self.dim, dtype=mx.uint32)
-            words = mx.take(state.indices, dimensions // 8, axis=-1)
-            nibbles = ((words >> ((dimensions % 8) * 4)) & 15).astype(mx.int16)
+            words = mx.take(state.indices, dimensions // self.values_per_word, axis=-1)
+            encoded = (
+                (
+                    words
+                    >> ((dimensions % self.values_per_word) * self.bits)
+                )
+                & ((1 << self.bits) - 1)
+            ).astype(mx.int16)
         else:
-            nibbles = _unpack_lowbit(state.indices, _BITS, self.dim).astype(mx.int16)
-        return ((nibbles ^ 8) - 8).astype(mx.float32)
+            encoded = _unpack_lowbit(
+                state.indices, self.bits, self.dim
+            ).astype(mx.int16)
+        sign = 1 << (self.bits - 1)
+        return ((encoded ^ sign) - sign).astype(mx.float32)
 
     def dequantize_rotated(
         self, state: TurboQuantMSEState, dtype=mx.float32
@@ -139,14 +182,22 @@ class Affine4Codec:
         if state.norms.ndim == 0:
             expanded = TurboQuantMSEState(state.norms[None], state.indices[None])
             return self.dequantize_rotated(expanded, dtype)[0]
-        signature = (self.dim, state.norms.ndim, state.norms.dtype, dtype)
+        signature = (
+            (self.dim, state.norms.ndim, state.norms.dtype, dtype)
+            if self.bits == 4
+            else (self.dim, self.bits, state.norms.ndim, state.norms.dtype, dtype)
+        )
         if (
             mx.default_device() == mx.gpu
             and _DEQUANTIZE_LAUNCHABLE.get(signature) is not False
             and state.norms.size
         ):
             try:
-                kernel = _dequantize_rotated_kernel()
+                kernel = (
+                    _dequantize_rotated_kernel()
+                    if self.bits == 4
+                    else _dequantize_rotated_kernel(self.bits)
+                )
                 if kernel is not None:
                     output = kernel(
                         inputs=[state.indices, state.norms],
@@ -177,7 +228,18 @@ class Affine4Codec:
         return self._rotate_forward(queries)
 
 
+class Affine8Codec(Affine4Codec):
+    """Signed int8 codec with deterministic orthonormal rotation."""
+
+    bits = 8
+
+
 _FUSED_QUANTIZE_SOURCE = r"""
+    constexpr int kBits = Bits;
+    constexpr int kValuesPerWord = 32 / Bits;
+    constexpr uint kCodeMask = (1u << Bits) - 1u;
+    constexpr int kMinCode = -(1 << (Bits - 1));
+    constexpr int kMaxCode = (1 << (Bits - 1)) - 1;
     uint d = thread_position_in_threadgroup.x;
     uint row = threadgroup_position_in_grid.x;
     uint is_value = threadgroup_position_in_grid.y;
@@ -216,7 +278,7 @@ _FUSED_QUANTIZE_SOURCE = r"""
     positive = simd_max(positive);
     negative = simd_max(negative);
     if (sg == 0 && lane == 0)
-        extrema[0] = max(positive / 7.0f, negative / 8.0f);
+        extrema[0] = max(positive / float(kMaxCode), negative / float(-kMinCode));
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float quant_scale = extrema[0];
@@ -226,16 +288,16 @@ _FUSED_QUANTIZE_SOURCE = r"""
     }
     float divisor = quant_scale;
     int code = divisor > 0.0f
-        ? int(rint(clamp(value / divisor, -8.0f, 7.0f)))
+        ? int(rint(clamp(value / divisor, float(kMinCode), float(kMaxCode))))
         : 0;
     threadgroup uint codes[Dim];
-    codes[d] = uint(code) & 15u;
+    codes[d] = uint(code) & kCodeMask;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (d < PackedWidth) {
         uint word = 0u;
-        for (int i = 0; i < 8; ++i)
-            word |= codes[d * 8 + i] << (i * 4);
+        for (int i = 0; i < kValuesPerWord; ++i)
+            word |= codes[d * kValuesPerWord + i] << (i * kBits);
         if (is_value) value_packed[row * PackedWidth + d] = word;
         else key_packed[row * PackedWidth + d] = word;
     }
@@ -243,7 +305,7 @@ _FUSED_QUANTIZE_SOURCE = r"""
 
 
 @cache
-def _fused_quantize_kernel(dim: int):
+def _fused_quantize_kernel(dim: int, bits: int = _BITS):
     if (
         not hasattr(mx, "metal")
         or not mx.metal.is_available()
@@ -254,7 +316,7 @@ def _fused_quantize_kernel(dim: int):
     ):
         return None
     return mx.fast.metal_kernel(
-        name=f"affine4_fused_kv_quantize_d{dim}",
+        name=f"affine{bits}_fused_kv_quantize_d{dim}",
         input_names=["keys", "values", "key_signs", "value_signs"],
         output_names=[
             "key_scales",
@@ -272,8 +334,9 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 
 template <int Dim, int Repeats, int QueryLength, int PaddedRows, int Warps,
-          int NumKvHeads, typename Accumulator, bool HasMask, typename ScalePtr>
-METAL_FUNC void affine4_attention_impl(
+          int NumKvHeads, int Bits, int ValuesPerWord, typename Accumulator,
+          bool HasMask, typename ScalePtr>
+METAL_FUNC void affine_attention_impl(
     device uchar* keys,
     ScalePtr key_scales,
     device uchar* values,
@@ -338,13 +401,17 @@ METAL_FUNC void affine4_attention_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     using QTensor = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
-    using KVTensor = tensor<device int4b_format, dextents<int, 2>, tensor_inline>;
+    using KVFormat = metal::conditional_t<Bits == 4, int4b_format, int8_t>;
+    using KVStorage = metal::conditional_t<Bits == 4, uchar, int8_t>;
+    using KVTensor = tensor<device KVFormat, dextents<int, 2>, tensor_inline>;
     using PTensor = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
     QTensor q_tensor(q_tile, dextents<int, 2>{Dim, PaddedRows});
-    KVTensor k_tensor(keys, dextents<int, 2>{Dim, tokens},
-        array<int, 2>{1, key_token_stride * 8});
-    KVTensor v_tensor(values, dextents<int, 2>{Dim, tokens},
-        array<int, 2>{1, value_token_stride * 8});
+    auto key_data = reinterpret_cast<device KVStorage*>(keys);
+    auto value_data = reinterpret_cast<device KVStorage*>(values);
+    KVTensor k_tensor(key_data, dextents<int, 2>{Dim, tokens},
+        array<int, 2>{1, key_token_stride * ValuesPerWord});
+    KVTensor v_tensor(value_data, dextents<int, 2>{Dim, tokens},
+        array<int, 2>{1, value_token_stride * ValuesPerWord});
     PTensor p_tensor(probabilities, dextents<int, 2>{BK, PaddedRows});
 
     constexpr auto av_desc = matmul2d_descriptor(
@@ -527,8 +594,9 @@ _MPP_ATTENTION_SOURCE = r"""
         kv_head * int(key_scales_strides[1]);
     int value_scale_offset = batch * int(value_scales_strides[0]) +
         kv_head * int(value_scales_strides[1]);
-    affine4_attention_impl<
-        Dim, Repeats, QueryLength, PaddedRows, Warps, NumKvHeads, Accumulator, HasMask>(
+    affine_attention_impl<
+        Dim, Repeats, QueryLength, PaddedRows, Warps, NumKvHeads, Bits,
+        ValuesPerWord, Accumulator, HasMask>(
         (device uchar*)(keys + key_word_offset),
         key_scales + key_scale_offset,
         (device uchar*)(values + value_word_offset),
@@ -608,10 +676,11 @@ def _mpp_attention_kernel(
     padded_rows: int,
     warps: int,
     kv_heads: int,
+    bits: int = _BITS,
 ):
     return mx.fast.metal_kernel(
         name=(
-            f"affine4_mpp_d{dim}_r{repeats}_l{query_length}_"
+            f"affine{bits}_mpp_d{dim}_r{repeats}_l{query_length}_"
             f"m{padded_rows}_w{warps}_h{kv_heads}"
         ),
         input_names=[
@@ -636,7 +705,7 @@ def _mpp_attention_kernel(
 @cache
 def _mpp_reduce_kernel(dim: int):
     return mx.fast.metal_kernel(
-        name=f"affine4_mpp_reduce_d{dim}",
+        name=f"affine_mpp_reduce_d{dim}",
         input_names=["partials", "sums", "maxs", "params"],
         output_names=["output"],
         header="using namespace metal;\n",
@@ -696,8 +765,9 @@ def _native_attention(
     ):
         return None
     if (
-        not isinstance(cache.key_codec, Affine4Codec)
-        or not isinstance(cache.value_codec, Affine4Codec)
+        not isinstance(cache.key_codec, (Affine4Codec, Affine8Codec))
+        or not isinstance(cache.value_codec, (Affine4Codec, Affine8Codec))
+        or cache.key_codec.bits != cache.value_codec.bits
         or not isinstance(keys_state, TurboQuantMSEState)
         or not isinstance(values_state, TurboQuantMSEState)
         or keys_state.indices.ndim != 4
@@ -716,7 +786,9 @@ def _native_attention(
         or values_state.norms.shape != keys_state.norms.shape
         or keys_state.indices.shape[:3] != keys_state.norms.shape
         or values_state.indices.shape != keys_state.indices.shape
-        or keys_state.indices.shape[-1] != dim // 8
+        or keys_state.indices.shape[-1]
+        != (dim + cache.key_codec.values_per_word - 1)
+        // cache.key_codec.values_per_word
         or keys_state.indices.dtype != mx.uint32
         or values_state.indices.dtype != mx.uint32
         or keys_state.norms.dtype not in (mx.float16, mx.float32)
@@ -741,7 +813,7 @@ def _native_attention(
     ):
         return None
 
-    is_batch = isinstance(cache, BatchAffine4KVCache)
+    is_batch = isinstance(cache, (BatchAffine4KVCache, BatchAffine8KVCache))
     valid_starts = (
         cache.left_padding.astype(mx.int32)
         if is_batch
@@ -761,9 +833,12 @@ def _native_attention(
 
     blocks = _attention_blocks(tokens, kv_heads, dim, padded_rows if batch == 1 else 1)
     partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks
-    # Normalized probabilities are <= 1 and signed codes have magnitude <= 8.
-    # Limit half partials to 49,152, leaving headroom for accumulation rounding.
-    accumulator = mx.float16 if partition_tiles <= 96 else mx.float32
+    # Normalized probabilities are <= 1. Keep FP16 partials only when the
+    # signed-code bound leaves headroom below 65,504.
+    max_code = -cache.value_codec.minimum_code
+    accumulator = (
+        mx.float16 if partition_tiles * 64 * max_code <= 49_152 else mx.float32
+    )
     params = mx.array(
         [tokens, blocks, _float_bits(float(scale)), int(causal)], dtype=mx.uint32
     )
@@ -771,12 +846,18 @@ def _native_attention(
     rotated = cache.key_codec.prepare_queries(grouped)
     rows = batch * query_heads * query_length
     geometry = (dim, repeats, query_length, padded_rows, warps, kv_heads)
-    signature = (*geometry, keys_state.norms.dtype, accumulator, has_mask)
+    signature = (
+        *geometry,
+        cache.key_codec.bits,
+        keys_state.norms.dtype,
+        accumulator,
+        has_mask,
+    )
     if _NATIVE_LAUNCHABLE.get(signature) is False:
         return None
 
     try:
-        pass1 = _mpp_attention_kernel(*geometry)
+        pass1 = _mpp_attention_kernel(*geometry, cache.key_codec.bits)
         partials, sums, maxs = pass1(
             inputs=[
                 rotated.reshape(batch, query_heads, query_length, dim),
@@ -796,6 +877,8 @@ def _native_attention(
                 ("PaddedRows", padded_rows),
                 ("Warps", warps),
                 ("NumKvHeads", kv_heads),
+                ("Bits", cache.key_codec.bits),
+                ("ValuesPerWord", cache.key_codec.values_per_word),
                 ("Accumulator", accumulator),
                 ("HasMask", has_mask),
             ],
@@ -824,7 +907,8 @@ def _native_attention(
             mx.eval(output)
             _NATIVE_LAUNCHABLE[signature] = True
             logger.info(
-                "Affine4 native M5 attention active (d=%d, repeats=%d, rows=%d)",
+                "Affine%d native M5 attention active (d=%d, repeats=%d, rows=%d)",
+                cache.key_codec.bits,
                 dim,
                 repeats,
                 query_length,
@@ -833,7 +917,8 @@ def _native_attention(
     except (RuntimeError, ValueError):
         _NATIVE_LAUNCHABLE[signature] = False
         logger.warning(
-            "Affine4 M5 kernel rejected geometry d=%d r=%d l=%d; using fallback",
+            "Affine%d M5 kernel rejected geometry d=%d r=%d l=%d; using fallback",
+            cache.key_codec.bits,
             dim,
             repeats,
             query_length,
@@ -843,7 +928,7 @@ def _native_attention(
 
 
 class Affine4KVCache(TurboQuantKVCache):
-    """Rotated signed-int4 cache using TurboQuant's packed-state lifecycle.
+    """Rotated signed-affine cache using TurboQuant's packed-state lifecycle.
 
     Float32 scales preserve the range of BF16 and float32 activations. Native
     specializations are evaluated on first use so deferred compilation failures
@@ -851,17 +936,23 @@ class Affine4KVCache(TurboQuantKVCache):
     from those calls propagate at the caller's evaluation boundary.
     """
 
+    bits = 4
+    codec_class = Affine4Codec
     quantization_scheme = AFFINE4_SCHEME
 
-    def __init__(self, bits: float = 4, seed: int = 0):
-        if float(bits) != 4:
-            raise ValueError(f"affine4 requires exactly 4 bits, got {bits}")
-        super().__init__(bits=4, seed=int(seed))
+    def __init__(self, bits: float | None = None, seed: int = 0):
+        bits = self.bits if bits is None else bits
+        if float(bits) != self.bits:
+            raise ValueError(
+                f"{self.quantization_scheme} requires exactly {self.bits} bits, "
+                f"got {bits}"
+            )
+        super().__init__(bits=self.bits, seed=int(seed))
         self._key_dim = self._value_dim = 0
 
-    @staticmethod
-    def _contiguous_packed_state(state):
-        state = Affine4KVCache._unwrap(state)
+    @classmethod
+    def _contiguous_packed_state(cls, state):
+        state = cls._unwrap(state)
         if state is None:
             return None
         return TurboQuantMSEState(state.norms, mx.contiguous(state.indices))
@@ -873,14 +964,14 @@ class Affine4KVCache(TurboQuantKVCache):
         TurboQuantKVCache.state.fset(self, value)
 
     @classmethod
-    def from_cache(cls, cache, bits: float = 4, seed: int = 0):
+    def from_cache(cls, cache, bits: float | None = None, seed: int = 0):
         result = cls(bits=bits, seed=seed)
         if cache.empty():
             return result
         keys, values = cache.state
         if keys is None:
             return result
-        if isinstance(cache, Affine4KVCache) and cache.seed == result.seed:
+        if type(cache) is cls and cache.seed == result.seed:
             result.meta_state = cache.meta_state
             result.state = (cls._unwrap(keys), cls._unwrap(values))
             result.rebuild_codecs(*result.state)
@@ -892,11 +983,16 @@ class Affine4KVCache(TurboQuantKVCache):
 
     @classmethod
     def merge(cls, caches):
-        return BatchAffine4KVCache.merge(caches)
+        batch_class = (
+            BatchAffine8KVCache if cls is Affine8KVCache else BatchAffine4KVCache
+        )
+        return batch_class.merge(caches)
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if keys.ndim != 4 or values.ndim != 4 or keys.shape[:3] != values.shape[:3]:
-            raise ValueError("affine4 keys and values must have matching B,H,T axes")
+            raise ValueError(
+                f"{self.quantization_scheme} keys and values must have matching B,H,T axes"
+            )
         for name, tensor, seed in (
             ("key", keys, self.seed),
             ("value", values, self.seed + 1),
@@ -906,11 +1002,15 @@ class Affine4KVCache(TurboQuantKVCache):
             if codec is None:
                 stored_dim = getattr(self, f"_{name}_dim", 0)
                 if stored_dim and stored_dim != dim:
-                    raise ValueError(f"affine4 {name} dimension differs from metadata")
-                setattr(self, f"{name}_codec", Affine4Codec(dim, seed))
+                    raise ValueError(
+                        f"{self.quantization_scheme} {name} dimension differs from metadata"
+                    )
+                setattr(self, f"{name}_codec", self.codec_class(dim, seed))
                 setattr(self, f"_{name}_dim", dim)
             elif codec.dim != dim:
-                raise ValueError(f"affine4 {name} head dimension changed")
+                raise ValueError(
+                    f"{self.quantization_scheme} {name} head dimension changed"
+                )
 
     @property
     def meta_state(self):
@@ -935,22 +1035,24 @@ class Affine4KVCache(TurboQuantKVCache):
 
     @meta_state.setter
     def meta_state(self, value):
-        if len(value) != 6 or value[3] != AFFINE4_SCHEME:
+        if len(value) != 6 or value[3] != self.quantization_scheme:
             raise ValueError(
-                "affine4 metadata requires scheme and key/value dimensions"
+                f"{self.quantization_scheme} metadata requires scheme and key/value dimensions"
             )
         offset, bits, seed = int(value[0]), float(value[1]), int(value[2])
         key_dim, value_dim = int(value[4]), int(value[5])
-        if bits != 4 or offset < 0 or min(key_dim, value_dim) < 0:
-            raise ValueError("Invalid affine4 cache metadata")
+        if bits != self.bits or offset < 0 or min(key_dim, value_dim) < 0:
+            raise ValueError(f"Invalid {self.quantization_scheme} cache metadata")
         if (offset > 0 and min(key_dim, value_dim) == 0) or bool(key_dim) != bool(
             value_dim
         ):
-            raise ValueError("affine4 nonempty metadata requires positive dimensions")
+            raise ValueError(
+                f"{self.quantization_scheme} nonempty metadata requires positive dimensions"
+            )
         self.bits, self.seed = bits, seed
         self._key_dim, self._value_dim = key_dim, value_dim
-        self.key_codec = Affine4Codec(key_dim, seed) if key_dim else None
-        self.value_codec = Affine4Codec(value_dim, seed + 1) if value_dim else None
+        self.key_codec = self.codec_class(key_dim, seed) if key_dim else None
+        self.value_codec = self.codec_class(value_dim, seed + 1) if value_dim else None
         if hasattr(self, "left_padding"):
             self._phys_end = offset
             self.offset = offset - self.left_padding
@@ -973,38 +1075,54 @@ class Affine4KVCache(TurboQuantKVCache):
             ("key", "value"), (keys_state, values_state), dimensions
         ):
             if dim <= 0:
-                raise ValueError(f"affine4 {name} dimension is missing from metadata")
+                raise ValueError(
+                    f"{self.quantization_scheme} {name} dimension is missing from metadata"
+                )
             if not isinstance(state, TurboQuantMSEState):
                 raise ValueError(
-                    f"affine4 {name} state must contain scales and packed int4"
+                    f"{self.quantization_scheme} {name} state must contain scales "
+                    f"and packed int{self.bits}"
                 )
+            values_per_word = 32 // self.bits
+            packed_width = (dim + values_per_word - 1) // values_per_word
             if (
                 state.norms.ndim != 3
-                or state.indices.shape != (*state.norms.shape, (dim + 7) // 8)
+                or state.indices.shape != (*state.norms.shape, packed_width)
                 or state.indices.dtype != mx.uint32
                 or state.norms.dtype not in (mx.float16, mx.float32)
             ):
                 raise ValueError(
-                    f"affine4 {name} state shape/dtype disagrees with metadata"
+                    f"{self.quantization_scheme} {name} state shape/dtype disagrees "
+                    "with metadata"
                 )
         if keys_state.norms.shape != values_state.norms.shape:
-            raise ValueError("affine4 key/value state axes disagree")
+            raise ValueError(
+                f"{self.quantization_scheme} key/value state axes disagree"
+            )
         self._key_dim, self._value_dim = dimensions
-        self.key_codec = Affine4Codec(dimensions[0], self.seed)
-        self.value_codec = Affine4Codec(dimensions[1], self.seed + 1)
+        self.key_codec = self.codec_class(dimensions[0], self.seed)
+        self.value_codec = self.codec_class(dimensions[1], self.seed + 1)
 
     def _try_fused_kv_quantize(self, keys, values):
         self._ensure_codecs(keys, values)
         if mx.default_device() != mx.gpu:
             return None, None
         dim = keys.shape[-1]
-        signature = (dim, keys.dtype, values.dtype)
+        signature = (
+            (dim, keys.dtype, values.dtype)
+            if self.bits == 4
+            else (dim, self.bits, keys.dtype, values.dtype)
+        )
         if _FUSED_QUANTIZE_LAUNCHABLE.get(signature) is False:
             return None, None
         if values.shape != keys.shape:
             return None, None
         try:
-            kernel = _fused_quantize_kernel(dim)
+            kernel = (
+                _fused_quantize_kernel(dim)
+                if self.bits == 4
+                else _fused_quantize_kernel(dim, self.key_codec.bits)
+            )
         except (RuntimeError, ValueError):
             _FUSED_QUANTIZE_LAUNCHABLE[signature] = False
             return None, None
@@ -1013,7 +1131,7 @@ class Affine4KVCache(TurboQuantKVCache):
         flat_keys = keys.reshape(-1, dim)
         flat_values = values.reshape(-1, dim)
         rows = flat_keys.shape[0]
-        packed_width = dim // 8
+        packed_width = (dim + self.key_codec.values_per_word - 1) // self.key_codec.values_per_word
         try:
             outputs = kernel(
                 inputs=[
@@ -1026,6 +1144,7 @@ class Affine4KVCache(TurboQuantKVCache):
                     ("Dim", dim),
                     ("SimdGroups", (dim + 31) // 32),
                     ("PackedWidth", packed_width),
+                    ("Bits", self.key_codec.bits),
                 ],
                 output_shapes=[
                     (rows,),
@@ -1063,7 +1182,9 @@ class Affine4KVCache(TurboQuantKVCache):
 
     def _attention_mask(self, mask, query_length, tokens):
         if isinstance(mask, str) and mask != "causal":
-            raise ValueError(f"Unsupported affine4 attention mask: {mask}")
+            raise ValueError(
+                f"Unsupported {self.quantization_scheme} attention mask: {mask}"
+            )
         return mask
 
     def _portable_attention(self, queries, keys, values, scale, mask, sinks):
@@ -1123,7 +1244,9 @@ class Affine4KVCache(TurboQuantKVCache):
                 values_state = self._contiguous_packed_state(values_state)
         keys_state, values_state = self._unwrap(keys_state), self._unwrap(values_state)
         if keys_state is None or values_state is None:
-            raise ValueError("Cannot attend to an empty affine4 cache")
+            raise ValueError(
+                f"Cannot attend to an empty {self.quantization_scheme} cache"
+            )
         if self.key_codec is None or self.value_codec is None:
             self.rebuild_codecs(keys_state, values_state)
         if sinks is None:
@@ -1176,12 +1299,23 @@ class Affine4KVCache(TurboQuantKVCache):
     quantized_attention = attention
 
 
-class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
-    """Affine4 cache with oMLX continuous-batching operations."""
+class Affine8KVCache(Affine4KVCache):
+    """Rotated signed-int8 cache with incremental prefill compression."""
 
-    def __init__(self, left_padding, bits: float = 4, seed: int = 0):
+    bits = 8
+    codec_class = Affine8Codec
+    quantization_scheme = AFFINE8_SCHEME
+
+
+class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
+    """Signed-affine cache with oMLX continuous-batching operations."""
+
+    def __init__(self, left_padding, bits: float | None = None, seed: int = 0):
         if not left_padding:
-            raise ValueError("affine4 batch requires at least one row")
+            raise ValueError(
+                f"{self.quantization_scheme} batch requires at least one row"
+            )
+        bits = self.bits if bits is None else bits
         super().__init__(left_padding, bits=bits, seed=seed)
         self.offset = -self.left_padding
 
@@ -1191,16 +1325,18 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
         self._phys_end = self.offset
         self.offset = self._phys_end - self.left_padding
 
-    @staticmethod
-    def _validate_dimensions(caches):
+    @classmethod
+    def _validate_dimensions(cls, caches):
         dimensions = {
             c.meta_state[4:]
             for c in caches
-            if isinstance(c, Affine4KVCache) and c.key_codec is not None
+            if getattr(c, "quantization_scheme", None) == cls.quantization_scheme
+            and c.key_codec is not None
         }
         if len(dimensions) > 1:
             raise ValueError(
-                "Cannot batch affine4 caches with different key/value dimensions"
+                f"Cannot batch {cls.quantization_scheme} caches with different "
+                "key/value dimensions"
             )
 
     @classmethod
@@ -1213,12 +1349,15 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
         return super().extend(other)
 
     def _new_single_cache(self):
-        return Affine4KVCache(bits=self.bits, seed=self.seed)
+        cache_class = Affine8KVCache if self.bits == 8 else Affine4KVCache
+        return cache_class(bits=self.bits, seed=self.seed)
 
     def _attention_mask(self, mask, query_length, tokens):
         causal = isinstance(mask, str) and mask == "causal"
         if isinstance(mask, str) and not causal:
-            raise ValueError(f"Unsupported affine4 attention mask: {mask}")
+            raise ValueError(
+                f"Unsupported {self.quantization_scheme} attention mask: {mask}"
+            )
         columns = mx.arange(tokens)
         allowed = columns[None, None, None, :] >= self.left_padding[:, None, None, None]
         if causal:
@@ -1230,3 +1369,13 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
         if mask.dtype == mx.bool_:
             return allowed & mask
         return mx.where(allowed, mask, -float("inf"))
+
+
+class BatchAffine8KVCache(BatchAffine4KVCache, Affine8KVCache):
+    """Affine8 cache with oMLX continuous-batching operations."""
+
+    @BatchTurboQuantKVCache.state.setter
+    def state(self, value):
+        Affine8KVCache.state.fset(self, value)
+        self._phys_end = self.offset
+        self.offset = self._phys_end - self.left_padding

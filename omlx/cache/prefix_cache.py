@@ -38,10 +38,12 @@ from .paged_cache import (
 )
 from .paged_ssd_cache import (
     _AFFINE4_CACHE_TYPES,
+    _AFFINE8_CACHE_TYPES,
+    _AFFINE_CACHE_TYPES,
     _PACKED_CACHE_TYPES,
     _PM_SLICEABLE_SUB_CLASSES,
     PagedSSDCacheManager,
-    _validate_affine4_meta,
+    _validate_affine_meta,
 )
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
@@ -851,10 +853,10 @@ class BlockAwarePrefixCache(CacheManager):
         if not block_table:
             block_table = self.paged_cache.create_block_table(request_id)
 
-        stores_affine4 = any(
-            name in _AFFINE4_CACHE_TYPES for name in layer_cache_types or []
+        stores_affine = any(
+            name in _AFFINE_CACHE_TYPES for name in layer_cache_types or []
         )
-        if stores_affine4 and any(
+        if stores_affine and any(
             not self._block_layer_types_match(
                 self.paged_cache.allocated_blocks.get(bid), layer_cache_types
             )
@@ -1052,7 +1054,7 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_keys=block_extra_keys,
                 )
                 if (
-                    stores_affine4
+                    stores_affine
                     and existing_block is not None
                     and not self._block_layer_types_match(
                         existing_block, layer_cache_types
@@ -1290,7 +1292,7 @@ class BlockAwarePrefixCache(CacheManager):
                         for lidx in range(len(layer_meta_states)):
                             if (
                                 lidx < len(snapshot_cache_data)
-                                and layer_cache_types[lidx] not in _AFFINE4_CACHE_TYPES
+                                and layer_cache_types[lidx] not in _AFFINE_CACHE_TYPES
                                 and isinstance(snapshot_cache_data[lidx], dict)
                                 and snapshot_cache_data[lidx].get("meta_state")
                                 and snapshot_cache_data[lidx]["meta_state"] != ()
@@ -2228,14 +2230,14 @@ class BlockAwarePrefixCache(CacheManager):
                         continue
                     ks = _slice_state_range(k_state, start_idx, actual_end)
                     vs = _slice_state_range(v_state, start_idx, actual_end)
-                    block_slices.append(
-                        (
-                            "__affine4__"
-                            if cache_type_name in _AFFINE4_CACHE_TYPES
-                            else "__turboquant_v2__",
-                            (ks, vs),
-                        )
+                    marker = (
+                        "__affine4__"
+                        if cache_type_name in _AFFINE4_CACHE_TYPES
+                        else "__affine8__"
+                        if cache_type_name in _AFFINE8_CACHE_TYPES
+                        else "__turboquant_v2__"
                     )
+                    block_slices.append((marker, (ks, vs)))
                 elif handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
                     state = layer_state["state"]
@@ -3454,23 +3456,36 @@ class BlockAwarePrefixCache(CacheManager):
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
-                affine_payload = any(
-                    layer_idx < len(block_data)
+                affine_markers = {
+                    block_data[layer_idx][0]
+                    for block_data in all_block_data
+                    if layer_idx < len(block_data)
                     and isinstance(block_data[layer_idx], tuple)
                     and len(block_data[layer_idx]) == 2
-                    and isinstance(block_data[layer_idx][0], str)
-                    and block_data[layer_idx][0] == "__affine4__"
-                    for block_data in all_block_data
-                )
-                if cache_type_name in _AFFINE4_CACHE_TYPES or affine_payload:
-                    if cache_type_name not in _AFFINE4_CACHE_TYPES:
+                    and block_data[layer_idx][0] in ("__affine4__", "__affine8__")
+                }
+                if cache_type_name in _AFFINE_CACHE_TYPES or affine_markers:
+                    expected_scheme = (
+                        "affine4"
+                        if cache_type_name in _AFFINE4_CACHE_TYPES
+                        else "affine8"
+                        if cache_type_name in _AFFINE8_CACHE_TYPES
+                        else None
+                    )
+                    expected_marker = (
+                        f"__{expected_scheme}__" if expected_scheme else None
+                    )
+                    if affine_markers != {expected_marker}:
                         logger.warning(
-                            "Affine4 layer %d: class/payload mismatch", layer_idx
+                            "Affine layer %d: class/payload mismatch", layer_idx
                         )
                         return None
-                    from ..affine4 import Affine4KVCache
+                    from ..affine4 import Affine4KVCache, Affine8KVCache
                     from ..turboquant_kv import _concat_state_token_axis, _state_length
 
+                    cache_class = (
+                        Affine8KVCache if expected_scheme == "affine8" else Affine4KVCache
+                    )
                     parts = []
                     affine_meta = None
                     for block_idx, block_data in enumerate(all_block_data):
@@ -3478,18 +3493,20 @@ class BlockAwarePrefixCache(CacheManager):
                         if not (
                             isinstance(bd, tuple)
                             and len(bd) == 2
-                            and isinstance(bd[0], str)
-                            and bd[0] == "__affine4__"
+                            and bd[0] == expected_marker
                         ):
                             logger.warning(
-                                "Affine4 layer %d: mixed block formats", layer_idx
+                                "Affine layer %d: mixed block formats", layer_idx
                             )
                             return None
                         metas = all_block_meta_states[block_idx]
-                        meta = _validate_affine4_meta(metas[layer_idx] if metas else None)
+                        meta = _validate_affine_meta(
+                            metas[layer_idx] if metas else None,
+                            expected_scheme,
+                        )
                         if affine_meta is not None and meta[1:] != affine_meta[1:]:
                             logger.warning(
-                                "Affine4 layer %d: codec metadata mismatch", layer_idx
+                                "Affine layer %d: codec metadata mismatch", layer_idx
                             )
                             return None
                         affine_meta = meta
@@ -3503,13 +3520,13 @@ class BlockAwarePrefixCache(CacheManager):
                             or ks.norms.shape[0] != 1
                         ):
                             logger.warning(
-                                "Affine4 layer %d: invalid block shape", layer_idx
+                                "Affine layer %d: invalid block shape", layer_idx
                             )
                             return None
                         parts.append((ks, vs))
                     keys = _concat_state_token_axis([ks for ks, _ in parts])
                     values = _concat_state_token_axis([vs for _, vs in parts])
-                    cache = Affine4KVCache()
+                    cache = cache_class()
                     cache.meta_state = (str(block_table.num_tokens), *affine_meta[1:])
                     cache.rebuild_codecs(keys, values)
                     cache.keys, cache.values = keys, values
@@ -4483,7 +4500,7 @@ class BlockAwarePrefixCache(CacheManager):
             candidates.append(first_block_meta_states[layer_idx])
         for ms in candidates:
             if isinstance(ms, (list, tuple)) and len(ms) >= 3:
-                if len(ms) > 3 and ms[3] == "affine4":
+                if len(ms) > 3 and ms[3] in ("affine4", "affine8"):
                     return None
                 try:
                     return float(ms[1]), int(ms[2])
@@ -4747,6 +4764,10 @@ class BlockAwarePrefixCache(CacheManager):
             "BatchKVCache",
             "TurboQuantKVCache",
             "BatchTurboQuantKVCache",
+            "Affine4KVCache",
+            "BatchAffine4KVCache",
+            "Affine8KVCache",
+            "BatchAffine8KVCache",
             "MiniMaxM3KVCache",
         }
         non_sliceable_types = {

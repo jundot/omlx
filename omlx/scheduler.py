@@ -1007,7 +1007,7 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         _TQ_SINGLETON_CACHE_TYPE is not None
         and (
             type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
-            or type(cache_obj).__name__ == "Affine4KVCache"
+            or type(cache_obj).__name__ in ("Affine4KVCache", "Affine8KVCache")
         )
     ):
         return cache_obj.merge([cache_obj])
@@ -1251,6 +1251,8 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "Affine4KVCache",
         "BatchAffine4KVCache",
+        "Affine8KVCache",
+        "BatchAffine8KVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
         # Both QSA handlers support block slicing, so their growing KV and
@@ -1267,6 +1269,8 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "Affine4KVCache",
         "BatchAffine4KVCache",
+        "Affine8KVCache",
+        "BatchAffine8KVCache",
     }
 )
 
@@ -3369,7 +3373,8 @@ class Scheduler:
         if self._model_uses_mla():
             return False
         if (
-            getattr(self, "_turboquant_kv_scheme", "turboquant") != "affine4"
+            getattr(self, "_turboquant_kv_scheme", "turboquant")
+            not in ("affine4", "affine8")
             and self._model_uses_attention_sinks()
         ):
             return False
@@ -3390,6 +3395,8 @@ class Scheduler:
                 "BatchTurboQuantKVCache",
                 "Affine4KVCache",
                 "BatchAffine4KVCache",
+                "Affine8KVCache",
+                "BatchAffine8KVCache",
             ):
                 return True
             if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
@@ -3468,8 +3475,8 @@ class Scheduler:
         """Convert native full-attention caches to the selected packed format.
 
         TurboQuant converts after cold prefill to preserve its hidden states.
-        Affine4 also converts at prefill entry so subsequent updates retain
-        compressed history throughout the request.
+        Affine formats also convert at prefill entry so subsequent updates
+        retain compressed history throughout the request.
         """
         from mlx_lm.models.cache import CacheList, KVCache
 
@@ -3522,11 +3529,12 @@ class Scheduler:
         """
         return text_only is True and Scheduler._qwen4_prefill_accounting_enabled(self)
 
-    def _prepare_affine4_prefill_cache(self, prompt_cache: list[Any]) -> None:
-        """Keep full-attention history packed throughout Affine4 prefill."""
+    def _prepare_affine_prefill_cache(self, prompt_cache: list[Any]) -> None:
+        """Keep full-attention history packed throughout affine prefill."""
         if (
             self._turboquant_kv_bits is not None
-            and getattr(self, "_turboquant_kv_scheme", "turboquant") == "affine4"
+            and getattr(self, "_turboquant_kv_scheme", "turboquant")
+            in ("affine4", "affine8")
             and self._turboquant_eligible(prompt_cache)
         ):
             with mx.stream(self._stream):
@@ -3598,9 +3606,9 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        self._prepare_affine4_prefill_cache(prompt_cache)
+        self._prepare_affine_prefill_cache(prompt_cache)
 
-        # Affine4 packs each layer's new KV during prefill. TurboQuant requests
+        # Affine formats pack each layer's new KV during prefill. TurboQuant requests
         # run in full precision during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
         # quantized while pre-filling the uncached suffix, then keep using TQ for
@@ -5442,7 +5450,7 @@ class Scheduler:
             if existing_cache is not None
             else make_prompt_cache(self.model)
         )
-        self._prepare_affine4_prefill_cache(prompt_cache)
+        self._prepare_affine_prefill_cache(prompt_cache)
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (
@@ -13239,7 +13247,7 @@ class Scheduler:
                 except Exception:
                     pass
 
-            affine4_prefill = False
+            affine_prefill = False
             prefill_kv_dtype_size = base_dtype_size
             if (
                 self._turboquant_kv_bits is not None
@@ -13256,12 +13264,14 @@ class Scheduler:
                     )
                 )
             ):
-                affine4_prefill = (
-                    getattr(self, "_turboquant_kv_scheme", "turboquant") == "affine4"
-                )
+                scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+                affine_prefill = scheme in ("affine4", "affine8")
                 tq_dtype_size = (
-                    (((head_dim + 7) // 8) * 4 + 4) / head_dim
-                    if affine4_prefill
+                    (
+                        ((head_dim * int(self._turboquant_kv_bits) + 31) // 32 * 4 + 4)
+                        / head_dim
+                    )
+                    if affine_prefill
                     else float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
                 )
                 if (
@@ -13274,7 +13284,7 @@ class Scheduler:
                     ) / actual_kv_cache_layers
                 else:
                     dtype_size = tq_dtype_size
-                if affine4_prefill:
+                if affine_prefill:
                     prefill_kv_dtype_size = dtype_size
 
             kv_bytes_per_token = None
@@ -13320,7 +13330,7 @@ class Scheduler:
                     head_dim=head_dim,
                     dtype_size=dtype_size,
                     prefill_kv_dtype_size=prefill_kv_dtype_size,
-                    affine4_prefill=affine4_prefill,
+                    affine_prefill=affine_prefill,
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
                     # SDPA scores are materialized at the compute/activation
@@ -13445,13 +13455,14 @@ class Scheduler:
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        packed_type = {
+            "affine4": "Affine4KVCache",
+            "affine8": "Affine8KVCache",
+        }.get(scheme, "TurboQuantKVCache")
         for idx in kv_indices:
             if idx != last_kv_idx and idx < len(layer_cache_types):
-                layer_cache_types[idx] = (
-                    "Affine4KVCache"
-                    if getattr(self, "_turboquant_kv_scheme", "turboquant") == "affine4"
-                    else "TurboQuantKVCache"
-                )
+                layer_cache_types[idx] = packed_type
 
         # The depth is keyed off the same eligibility gate the request path
         # uses, not the rewritten names: models whose convertible caches sit

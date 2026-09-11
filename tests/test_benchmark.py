@@ -1019,6 +1019,17 @@ class TestDeriveFeatureFlags:
             {"key": "affine4_kv_4bit", "label": "Affine4 KV 4-bit"}
         ]
 
+    def test_affine8_has_its_own_feature_label(self):
+        settings = SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_kv_scheme="affine8",
+            turboquant_kv_bits=8,
+        )
+        assert _detect_experimental_features(settings) == ["affine8"]
+        assert _derive_feature_flags(settings) == [
+            {"key": "affine8_kv_8bit", "label": "Affine8 KV 8-bit"}
+        ]
+
     def test_qwen_ane_prefill_is_reported_as_acceleration(self):
         settings = SimpleNamespace(qwen35_ane_prefill_enabled=True)
         assert _derive_feature_flags(settings) == [

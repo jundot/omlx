@@ -678,6 +678,8 @@
   "modal.model_settings.kv_compression_turboquant": "TurboQuant",
   "modal.model_settings.kv_compression_affine4": "Affine4（4 位）",
   "modal.model_settings.kv_compression_affine4_hint": "在处理提示词时将 KV 缓存压缩为 4 位 Affine4。支持时自动启用 M5 加速；其他硬件或不支持的张量形状使用通用实现。",
+  "modal.model_settings.kv_compression_affine8": "Affine8（8 位）",
+  "modal.model_settings.kv_compression_affine8_hint": "处理提示词时将 KV 缓存压缩为 8 位 Affine8，通过相同的长上下文增量路径提供比 Affine4 更高的精度。",
   "modal.model_settings.vlm_mtp_compression_conflict": "请先禁用 DFlash / SpecPrefill / MTP / KV 缓存压缩：VLM MTP 控制推测解码路径。",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",

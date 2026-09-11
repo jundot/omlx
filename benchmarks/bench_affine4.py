@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark oMLX attention dispatch over fixed FP16, TQ4, and affine4 caches.
+"""Benchmark oMLX attention dispatch over native, TurboQuant, and affine caches.
 
 Run with the server and other GPU workloads stopped:
     python benchmarks/bench_affine4.py --fallbacks > attention.json
@@ -87,7 +87,9 @@ def _case(dim, query_heads, tokens, query_length, args):
     factories = (
         ("fp16", KVCache),
         ("tq4", lambda: TurboQuantKVCache(bits=4, seed=args.seed)),
+        ("tq8", lambda: TurboQuantKVCache(bits=8, seed=args.seed)),
         ("affine4", lambda: affine4.Affine4KVCache(bits=4, seed=args.seed)),
+        ("affine8", lambda: affine4.Affine8KVCache(bits=8, seed=args.seed)),
     )
     order = -1 if args.order == "reverse" else 1
     for scheme, factory in factories[::order]:
@@ -156,7 +158,7 @@ def _case(dim, query_heads, tokens, query_length, args):
             )
 
         calls = [(scheme, dispatch)]
-        if scheme == "affine4" and args.fallbacks:
+        if scheme in ("affine4", "affine8") and args.fallbacks:
             packed_keys, packed_values = (
                 cache._unwrap(key_state),
                 cache._unwrap(value_state),
@@ -196,26 +198,32 @@ def _case(dim, query_heads, tokens, query_length, args):
 
             calls.extend(
                 [
-                    ("affine4_portable_dispatch", dispatch),
-                    ("affine4_portable_reference", partial(rotated, mx.float32, True)),
-                    ("affine4_rotated_fp16", partial(rotated, mx.float16)),
-                    ("affine4_dequant_fp16", dequant_fp16),
+                    (f"{scheme}_portable_dispatch", dispatch),
+                    (f"{scheme}_portable_reference", partial(rotated, mx.float32, True)),
+                    (f"{scheme}_rotated_fp16", partial(rotated, mx.float16)),
+                    (f"{scheme}_dequant_fp16", dequant_fp16),
                 ]
             )
         for method, call in calls[::order]:
             context = (
                 patch.object(affine4, "_m5_mpp_available", lambda: False)
-                if method == "affine4_portable_dispatch"
+                if method.endswith("_portable_dispatch")
                 else nullcontext()
             )
             with context:
-                record(method, call, observe_native=method == "affine4")
+                record(
+                    method,
+                    call,
+                    observe_native=method in ("affine4", "affine8"),
+                )
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tokens", type=int, nargs="+", default=[8192, 32768])
+    parser.add_argument(
+        "--tokens", type=int, nargs="+", default=[8192, 32768, 131072, 250000]
+    )
     parser.add_argument(
         "--dims", type=int, nargs="+", choices=[128, 256], default=[128, 256]
     )

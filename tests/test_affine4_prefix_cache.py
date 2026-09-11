@@ -6,7 +6,11 @@ import mlx.core as mx
 import pytest
 from mlx_vlm.turboquant import TurboQuantKVCache
 
-from omlx.affine4 import Affine4KVCache, BatchAffine4KVCache
+from omlx.affine4 import (
+    Affine4KVCache,
+    Affine8KVCache,
+    BatchAffine4KVCache,
+)
 from omlx.cache.hybrid_cache import ModelCacheConfig
 from omlx.cache.paged_cache import BlockTable, PagedCacheManager
 from omlx.cache.paged_ssd_cache import (
@@ -20,7 +24,7 @@ from omlx.turboquant_kv import _slice_state_range
 
 
 def _cache(length=8, key_dim=13, value_dim=21, cls=Affine4KVCache):
-    cache = cls(bits=4, seed=7)
+    cache = cls(bits=getattr(cls, "bits", 4), seed=7)
     keys = mx.random.normal((1, 2, length, key_dim)).astype(mx.float16)
     values = mx.random.normal((1, 2, length, value_dim)).astype(mx.float16)
     cache.update_and_fetch(keys, values)
@@ -408,3 +412,38 @@ def test_corrupt_ssd_payload_is_rejected(manager_factory, mutation):
     arrays, metadata = mx.load(str(path), return_metadata=True)
     mx.eval(arrays)
     assert manager._reconstruct_cache_data(arrays, metadata, 1, classes) is None
+
+
+def test_affine8_prefix_and_ssd_roundtrip(manager_factory):
+    manager = manager_factory(types=["Affine8KVCache"])
+    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
+    prefix, _ = _prefix(manager)
+    cache = _cache(cls=Affine8KVCache)
+    data = _data(cache)
+    assert prefix.store_cache("store", list(range(8)), [data]) is not None
+    manager.close()
+    prefix.release_cache("store")
+    table, remaining = prefix.fetch_cache("reuse", list(range(8)) + [99])
+    assert table is not None and remaining == [99]
+    restored = prefix.reconstruct_cache(table)
+    assert restored is not None and type(restored[0]) is Affine8KVCache
+    assert restored[0].meta_state == cache.meta_state
+    _assert_state_equal(_state(cache), _state(restored[0]))
+
+
+def test_affine_formats_do_not_share_prefix_signatures(manager_factory):
+    manager = manager_factory(types=["Affine8KVCache"])
+    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
+    signature = _cache_compat_signature(
+        model_name="affine-test",
+        num_layers=1,
+        block_size=4,
+        layer_cache_types=["Affine4KVCache"],
+        turboquant_kv_bits=4,
+    )
+    assert not manager.is_signature_compatible(signature)
+    assert _canonicalize_layer_cache_types(
+        ["BatchAffine8KVCache", "BatchAffine4KVCache"]
+    ) == ["Affine8KVCache", "Affine4KVCache"]
+    for name in ("Affine8KVCache", "BatchAffine8KVCache"):
+        assert CacheTypeRegistry.get_handler_by_class_name(name).supports_block_slicing

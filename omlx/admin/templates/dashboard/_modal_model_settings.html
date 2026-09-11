@@ -1113,13 +1113,15 @@
                                         <div>
                                             <label for="kv-compression-format" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.kv_compression_format') }}</label>
                                             <select id="kv-compression-format" x-model="modelSettings.turboquant_kv_scheme"
-                                                    @change="if (modelSettings.turboquant_kv_scheme === 'affine4') modelSettings.turboquant_kv_bits = 4"
+                                                    @change="if (modelSettings.turboquant_kv_scheme === 'affine4') modelSettings.turboquant_kv_bits = 4; else if (modelSettings.turboquant_kv_scheme === 'affine8') modelSettings.turboquant_kv_bits = 8"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="turboquant">{{ t('modal.model_settings.kv_compression_turboquant') }}</option>
                                                 <option value="affine4">{{ t('modal.model_settings.kv_compression_affine4') }}</option>
+                                                <option value="affine8">{{ t('modal.model_settings.kv_compression_affine8') }}</option>
                                             </select>
                                         </div>
                                         <p x-show="modelSettings.turboquant_kv_scheme === 'affine4'" class="text-xs text-neutral-500">{{ t('modal.model_settings.kv_compression_affine4_hint') }}</p>
+                                        <p x-show="modelSettings.turboquant_kv_scheme === 'affine8'" class="text-xs text-neutral-500">{{ t('modal.model_settings.kv_compression_affine8_hint') }}</p>
                                         <div x-show="modelSettings.turboquant_kv_scheme === 'turboquant'">
                                             <label for="kv-compression-bits" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.turboquant_kv_bits_label') }}</label>
                                             <select id="kv-compression-bits" x-model.number="modelSettings.turboquant_kv_bits"

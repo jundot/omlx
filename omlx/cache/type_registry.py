@@ -72,6 +72,8 @@ class CacheTypeRegistry:
         "BatchTurboQuantKVCache": CacheType.KVCACHE,
         "Affine4KVCache": CacheType.KVCACHE,
         "BatchAffine4KVCache": CacheType.KVCACHE,
+        "Affine8KVCache": CacheType.KVCACHE,
+        "BatchAffine8KVCache": CacheType.KVCACHE,
         # DeepSeek V4 compressed-attention pool. Handlers live in
         # patches/deepseek_v4/cache_handlers.py and register on patch apply.
         "PoolingCache": CacheType.POOLING_CACHE,

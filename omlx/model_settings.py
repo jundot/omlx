@@ -103,10 +103,13 @@ def validate_ane_prefill(settings: dict, model_type: str | None) -> None:
 
 def validate_kv_compression_settings(scheme: str, bits: float) -> None:
     """Validate the persisted KV cache format and bit depth."""
-    if scheme not in ("turboquant", "affine4"):
-        raise ValueError("turboquant_kv_scheme must be 'turboquant' or 'affine4'")
-    if scheme == "affine4" and bits != 4:
-        raise ValueError("affine4 requires turboquant_kv_bits=4")
+    affine_bits = {"affine4": 4, "affine8": 8}
+    if scheme not in ("turboquant", *affine_bits):
+        raise ValueError(
+            "turboquant_kv_scheme must be 'turboquant', 'affine4', or 'affine8'"
+        )
+    if scheme in affine_bits and bits != affine_bits[scheme]:
+        raise ValueError(f"{scheme} requires turboquant_kv_bits={affine_bits[scheme]}")
     if bits not in (2, 2.5, 3, 3.5, 4, 6, 8):
         raise ValueError("turboquant_kv_bits must be one of 2, 2.5, 3, 3.5, 4, 6, 8")
 
@@ -208,8 +211,8 @@ class ModelSettings:
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
         turboquant_kv_enabled: Enable KV cache compression.
-        turboquant_kv_scheme: Cache format: "turboquant" or "affine4".
-        turboquant_kv_bits: Cache bit depth (2/2.5/3/3.5/4/6/8); affine4 requires 4.
+        turboquant_kv_scheme: Cache format: "turboquant", "affine4", or "affine8".
+        turboquant_kv_bits: Cache bit depth (2/2.5/3/3.5/4/6/8); affine formats require their named depth.
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
         qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
             supported model. Model metadata selects the implementation.

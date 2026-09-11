@@ -68,7 +68,9 @@ def test_kv_compression_format_controls():
     assert 'x-model="modelSettings.turboquant_kv_scheme"' in section
     assert '<option value="turboquant">' in section
     assert '<option value="affine4">' in section
+    assert '<option value="affine8">' in section
     assert "if (modelSettings.turboquant_kv_scheme === 'affine4') modelSettings.turboquant_kv_bits = 4" in section
+    assert "else if (modelSettings.turboquant_kv_scheme === 'affine8') modelSettings.turboquant_kv_bits = 8" in section
     assert 'x-show="modelSettings.turboquant_kv_scheme === \'turboquant\'"' in section
     assert 'x-model.number="modelSettings.turboquant_kv_bits"' in section
     assert "modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled" in section
@@ -97,6 +99,9 @@ for (const model of [{is_paroquant: true}, {config_model_type: 'diffusion_gemma'
     assert.equal(state.turboquant_kv_scheme, 'turboquant');
     assert.equal(state.turboquant_kv_bits, 4);
 }
+const affine8 = {turboquant_kv_enabled: true, turboquant_kv_scheme: 'affine8', turboquant_kv_bits: 8};
+app.modelSettings = app.buildModelSettingsState({}, affine8);
+assert.deepEqual(app.formValuesForProfile(), affine8);
 assert.equal(app.isDiffusionUnsupportedProfileField('turboquant_kv_scheme'), true);
 """
     result = subprocess.run([node], input=script, cwd=root, capture_output=True, text=True)
@@ -106,7 +111,8 @@ assert.equal(app.isDiffusionUnsupportedProfileField('turboquant_kv_scheme'), tru
 def test_kv_compression_scheme_is_saved_and_reset():
     script = _dashboard_script()
     assert "turboquant_kv_scheme: this.modelSettings.turboquant_kv_scheme" in script
-    assert "&& this.modelSettings.turboquant_kv_scheme !== 'affine4'" in script
+    assert "&& this.modelSettings.turboquant_kv_scheme === 'affine8'" in script
+    assert "&& this.modelSettings.turboquant_kv_scheme === 'turboquant'" in script
     assert "turboquant_kv_scheme: 'turboquant'" in script
     assert "this.modelSettings.turboquant_kv_scheme = 'turboquant';" in script
 
@@ -194,6 +200,8 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.specprefill",
         "modal.model_settings.dflash",
         "status.active_models.dflash_label",
+        "modal.model_settings.kv_compression_affine8",
+        "modal.model_settings.kv_compression_affine8_hint",
         "modal.model_settings.qwen_ane",
         "modal.model_settings.qwen_ane_hint",
         "modal.model_settings.qwen_ane_prompt_block",

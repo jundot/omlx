@@ -1434,10 +1434,17 @@ private struct ExperimentalSection: View {
                 HStack(spacing: 8) {
                     if vm.turboquantKvEnabled {
                         Popup(
-                            selection: vm.bindProfile($vm.turboquantKvBits),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.turboquantKvBitsOptions
+                            selection: vm.bindProfile($vm.turboquantKvScheme),
+                            width: .controlMedium,
+                            options: ModelSettingsScreenVM.turboquantKvSchemeOptions
                         )
+                        if vm.turboquantKvScheme == "turboquant" {
+                            Popup(
+                                selection: vm.bindProfile($vm.turboquantKvBits),
+                                width: .controlCompact,
+                                options: ModelSettingsScreenVM.turboquantKvBitsOptions
+                            )
+                        }
                     }
                     RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .disabled(vm.vlmMtpEnabled)

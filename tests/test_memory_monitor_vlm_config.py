@@ -374,9 +374,18 @@ class TestSetModelInfoTurboQuantDtype:
 
     @pytest.mark.parametrize("dim", [63, 256])
     @pytest.mark.parametrize("skip_last", [False, True])
-    def test_affine4_prefill_prices_packed_words_and_fp32_scales(self, dim, skip_last):
+    @pytest.mark.parametrize(
+        "scheme,bits,cache_class",
+        [
+            ("affine4", 4, "Affine4KVCache"),
+            ("affine8", 8, "Affine8KVCache"),
+        ],
+    )
+    def test_affine_prefill_prices_packed_words_and_fp32_scales(
+        self, dim, skip_last, scheme, bits, cache_class
+    ):
         from mlx_lm.models.cache import ArraysCache, KVCache
-        from omlx.affine4 import Affine4KVCache
+        from omlx import affine4
 
         config = SimpleNamespace(
             num_hidden_layers=64,
@@ -388,8 +397,8 @@ class TestSetModelInfoTurboQuantDtype:
         sched.model.make_cache.return_value = [
             KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2) for i in range(64)
         ]
-        sched._turboquant_kv_bits = 4.0
-        sched._turboquant_kv_scheme = "affine4"
+        sched._turboquant_kv_bits = float(bits)
+        sched._turboquant_kv_scheme = scheme
         sched._turboquant_skip_last = skip_last
         sched.memory_monitor = MemoryMonitor(None, eviction_enabled=False)
         sched._set_model_info_for_monitor()
@@ -398,7 +407,7 @@ class TestSetModelInfoTurboQuantDtype:
             mx.ones((1, 4, 256, dim), mx.bfloat16),
             mx.ones((1, 4, 256, dim), mx.bfloat16),
         )
-        packed = Affine4KVCache.from_cache(native)
+        packed = getattr(affine4, cache_class).from_cache(native)
         expected = (
             (15 * packed.nbytes + native.nbytes) if skip_last else 16 * packed.nbytes
         )

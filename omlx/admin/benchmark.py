@@ -38,7 +38,19 @@ logger = logging.getLogger(__name__)
 _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 
 # Valid prompt lengths for single request tests
-VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
+VALID_PROMPT_LENGTHS = [
+    1024,
+    4096,
+    8192,
+    16384,
+    32768,
+    50000,
+    65536,
+    131072,
+    150000,
+    200000,
+    250000,
+]
 
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
@@ -274,9 +286,10 @@ def _detect_experimental_features(model_settings: Any) -> list[str]:
     """Return benchmark-skewing model features enabled in settings."""
     return [
         (
-            "affine4"
+            getattr(model_settings, "turboquant_kv_scheme", "turboquant")
             if spec.attr == "turboquant_kv_enabled"
-            and getattr(model_settings, "turboquant_kv_scheme", "turboquant") == "affine4"
+            and getattr(model_settings, "turboquant_kv_scheme", "turboquant")
+            in ("affine4", "affine8")
             else spec.legacy
         )
         for spec in _FEATURE_FLAG_SPECS
@@ -307,10 +320,12 @@ def _derive_feature_flags(model_settings: Any) -> list[dict]:
         if not getattr(model_settings, spec.attr, False):
             continue
         key, label = spec.key, spec.label
-        if spec.attr == "turboquant_kv_enabled" and getattr(
-            model_settings, "turboquant_kv_scheme", "turboquant"
-        ) == "affine4":
-            key, label = "affine4_kv", "Affine4 KV"
+        if spec.attr == "turboquant_kv_enabled":
+            scheme = getattr(
+                model_settings, "turboquant_kv_scheme", "turboquant"
+            )
+            if scheme in ("affine4", "affine8"):
+                key, label = f"{scheme}_kv", f"Affine{scheme[-1]} KV"
         if spec.detail_attr:
             bits = _format_bits(getattr(model_settings, spec.detail_attr, None))
             if bits:

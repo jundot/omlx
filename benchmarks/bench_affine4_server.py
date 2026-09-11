@@ -28,10 +28,10 @@ def save(path, data):
 
 def plan(models):
     for model in models:
-        for mode in ("native16", "tq4", "affine4"):
+        for mode in ("native16", "tq4", "tq8", "affine4", "affine8"):
             yield model, mode, "forward", [4096, 8192, 32768, 65536], 1024
             yield model, mode, "endurance", [8192], 4096
-        for mode in ("affine4", "tq4", "native16"):
+        for mode in ("affine8", "affine4", "tq8", "tq4", "native16"):
             yield model, mode, "reverse", [8192, 32768], 1024
 
 
@@ -90,7 +90,7 @@ def main():
         ]
         data = {
             "started_at": datetime.now(UTC).isoformat(),
-            "scope": "Local server; identical oQ4e weights; native BF16 KV vs TQ4 vs Affine4",
+            "scope": "Local server; identical oQ4e weights; native BF16 KV vs TQ4/TQ8 vs Affine4/Affine8",
             "method": {
                 "context_profile": "code_python",
                 "prompt_alignment": "N+1 prompt tokens, N prefill rows",
@@ -136,10 +136,10 @@ def main():
                         unloaded.raise_for_status()
                 settings = {
                     "turboquant_kv_enabled": mode != "native16",
-                    "turboquant_kv_scheme": "affine4"
-                    if mode == "affine4"
-                    else "turboquant",
-                    "turboquant_kv_bits": 4,
+                    "turboquant_kv_scheme": (
+                        mode if mode in ("affine4", "affine8") else "turboquant"
+                    ),
+                    "turboquant_kv_bits": 8 if mode in ("tq8", "affine8") else 4,
                     "turboquant_skip_last": True,
                     "mtp_enabled": False,
                     "vlm_mtp_enabled": False,

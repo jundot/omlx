@@ -7,7 +7,14 @@ from mlx_lm.models.cache import KVCache
 from mlx_vlm.turboquant import TurboQuantKVCache, TurboQuantMSEState
 
 import omlx.affine4 as affine4
-from omlx.affine4 import Affine4Codec, Affine4KVCache, BatchAffine4KVCache
+from omlx.affine4 import (
+    Affine4Codec,
+    Affine4KVCache,
+    Affine8Codec,
+    Affine8KVCache,
+    BatchAffine4KVCache,
+    BatchAffine8KVCache,
+)
 
 
 def random(shape, dtype=mx.float16, seed=0):
@@ -37,8 +44,12 @@ def dense(cache, queries, mask=None, sinks=None, states=None):
 
 
 @pytest.mark.parametrize("dim", [1, 3, 7, 32, 63, 64, 80, 96, 128, 256, 512])
-def test_codec_orthogonal_and_quantization(dim):
-    codec = Affine4Codec(dim, seed=17)
+@pytest.mark.parametrize(
+    "codec_class,max_error",
+    [(Affine4Codec, 0.03), (Affine8Codec, 2e-4)],
+)
+def test_codec_orthogonal_and_quantization(dim, codec_class, max_error):
+    codec = codec_class(dim, seed=17)
     vectors = random((2, 3, 5, dim), mx.float32)
     if codec.rotation is not None:
         rotation = np.array(codec.rotation)
@@ -46,22 +57,29 @@ def test_codec_orthogonal_and_quantization(dim):
     close(codec._rotate_inverse(codec._rotate_forward(vectors)), vectors, 8e-3, 3e-3)
     state = codec.quantize(vectors)
     assert isinstance(state, TurboQuantMSEState)
-    assert state.indices.shape == (2, 3, 5, (dim + 7) // 8)
+    values_per_word = 32 // codec.bits
+    assert state.indices.shape == (
+        2,
+        3,
+        5,
+        (dim + values_per_word - 1) // values_per_word,
+    )
     assert state.indices.dtype == mx.uint32
     assert state.norms.dtype == mx.float32
     error = mx.mean(mx.square(codec.dequantize(state) - vectors)).item()
-    assert error < 0.03
-    other = Affine4Codec(dim, seed=17).quantize(vectors)
+    assert error < max_error
+    other = codec_class(dim, seed=17).quantize(vectors)
     assert mx.array_equal(state.indices, other.indices).item()
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
 @pytest.mark.parametrize("magnitude", [0, 1e-8, 1000, 1e6])
-def test_finite_scale_range(dtype, magnitude):
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+def test_finite_scale_range(dtype, magnitude, cache_class):
     if dtype == mx.float16 and magnitude > 65504:
         pytest.skip("Magnitude exceeds the input dtype")
     vectors = mx.full((1, 2, 5, 64), magnitude, dtype=dtype)
-    cache = Affine4KVCache(seed=4)
+    cache = cache_class(seed=4)
     cache.update_and_fetch(vectors, vectors)
     decoded, _ = cache.dequantize()
     assert mx.all(mx.isfinite(decoded)).item()
@@ -79,6 +97,14 @@ def test_reject_non_four_bits(bits):
         BatchAffine4KVCache([0], bits)
 
 
+@pytest.mark.parametrize("bits", [3, 4, 7.5, 8.00001, float("nan")])
+def test_reject_non_eight_bits(bits):
+    with pytest.raises(ValueError, match="exactly 8"):
+        Affine8KVCache(bits)
+    with pytest.raises(ValueError, match="exactly 8"):
+        BatchAffine8KVCache([0], bits)
+
+
 @pytest.mark.parametrize("dim", [0, -1, 2.5])
 def test_reject_invalid_dimension(dim):
     with pytest.raises(ValueError):
@@ -90,10 +116,11 @@ def test_reject_invalid_dimension(dim):
     [(1, 1, 1, 32), (2, 3, 7, 64), (1, 2, 9, 128), (2, 1, 3, 256), (1, 1, 2, 512)],
 )
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
-def test_actual_fused_quantize_matches_portable(shape, dtype):
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+def test_actual_fused_quantize_matches_portable(shape, dtype, cache_class):
     if not mx.metal.is_available():
         pytest.skip("Fused quantization requires Metal")
-    cache = Affine4KVCache(seed=13)
+    cache = cache_class(seed=13)
     keys, values = random(shape, dtype), random(shape, dtype, 1)
     cache._ensure_codecs(keys, values)
     ks, vs = cache._try_fused_kv_quantize(keys, values)
@@ -165,12 +192,13 @@ def test_portable_attention_masks_sinks_and_dimensions(
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
 def test_actual_native_matches_portable(
-    monkeypatch, batch, heads, repeats, rows, dim, tokens, dtype
+    monkeypatch, batch, heads, repeats, rows, dim, tokens, dtype, cache_class
 ):
     if not affine4._m5_mpp_available():
-        pytest.skip("Signed-int4 attention requires M5")
-    cache = Affine4KVCache()
+        pytest.skip("Signed-affine attention requires M5")
+    cache = cache_class()
     cache.update_and_fetch(
         random((batch, heads, tokens, dim), dtype),
         random((batch, heads, tokens, dim), dtype, 1),
@@ -184,33 +212,52 @@ def test_actual_native_matches_portable(
     close(native, portable, atol=6e-3 if dtype == mx.bfloat16 else 2e-3)
 
 
-@pytest.mark.parametrize("tokens", [24576, 24832, 32768])
-def test_native_long_uniform_attention_stays_finite(tokens):
+@pytest.mark.parametrize(
+    "cache_class,codec_class,packed_code,decoded_code,tokens",
+    [
+        (Affine4KVCache, Affine4Codec, 0x88888888, -8.0, 24576),
+        (Affine4KVCache, Affine4Codec, 0x88888888, -8.0, 24832),
+        (Affine8KVCache, Affine8Codec, 0x80808080, -128.0, 1536),
+        (Affine8KVCache, Affine8Codec, 0x80808080, -128.0, 1537),
+    ],
+)
+def test_native_long_uniform_attention_stays_finite(
+    cache_class, codec_class, packed_code, decoded_code, tokens
+):
     if not affine4._m5_mpp_available():
-        pytest.skip("Signed-int4 attention requires M5")
+        pytest.skip("Signed-affine attention requires M5")
     heads, dim = 64, 32
-    cache = Affine4KVCache()
-    cache.key_codec = Affine4Codec(dim, 0)
-    cache.value_codec = Affine4Codec(dim, 1)
+    cache = cache_class()
+    cache.key_codec = codec_class(dim, 0)
+    cache.value_codec = codec_class(dim, 1)
     scales = mx.ones((1, heads, tokens))
-    keys = TurboQuantMSEState(scales, mx.zeros((1, heads, tokens, dim // 8), mx.uint32))
+    packed_width = dim // cache.key_codec.values_per_word
+    keys = TurboQuantMSEState(
+        scales, mx.zeros((1, heads, tokens, packed_width), mx.uint32)
+    )
     values = TurboQuantMSEState(
-        scales, mx.full((1, heads, tokens, dim // 8), 0x88888888, mx.uint32)
+        scales,
+        mx.full((1, heads, tokens, packed_width), packed_code, mx.uint32),
     )
     queries = mx.zeros((1, heads, 1, dim), mx.bfloat16)
     output = affine4._native_attention(cache, queries, keys, values, dim**-0.5, None)
     assert output is not None
     assert mx.all(mx.isfinite(output)).item()
-    expected = cache.value_codec._rotate_inverse(mx.full(queries.shape, -8.0))
+    expected = cache.value_codec._rotate_inverse(
+        mx.full(queries.shape, decoded_code)
+    )
     close(output, expected.astype(queries.dtype), atol=0.02)
 
 
 @pytest.mark.parametrize("dim", [64, 72, 80, 96, 128, 256])
 @pytest.mark.parametrize("mask", [None, "causal"])
-def test_bf16_fused_prefill_matches_reference(monkeypatch, dim, mask):
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+def test_bf16_fused_prefill_matches_reference(
+    monkeypatch, dim, mask, cache_class
+):
     if not mx.metal.is_available():
         pytest.skip("Fused prefill requires Metal")
-    cache = Affine4KVCache()
+    cache = cache_class()
     cache.update_and_fetch(
         random((1, 2, 513, dim), mx.bfloat16),
         random((1, 2, 513, dim), mx.bfloat16, 1),
@@ -229,10 +276,11 @@ def test_bf16_fused_prefill_matches_reference(monkeypatch, dim, mask):
     close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
 
 
-def test_native_large_values():
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+def test_native_large_values(cache_class):
     if not affine4._m5_mpp_available():
-        pytest.skip("Signed-int4 attention requires M5")
-    cache = Affine4KVCache()
+        pytest.skip("Signed-affine attention requires M5")
+    cache = cache_class()
     cache.update_and_fetch(
         mx.zeros((1, 2, 257, 64), mx.bfloat16),
         mx.full((1, 2, 257, 64), 1e6, mx.bfloat16),
@@ -244,10 +292,11 @@ def test_native_large_values():
 
 
 @pytest.mark.parametrize("magnitude", [60000, 1e6])
-def test_native_large_queries(magnitude):
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+def test_native_large_queries(magnitude, cache_class):
     if not affine4._m5_mpp_available():
-        pytest.skip("Signed-int4 attention requires M5")
-    cache = Affine4KVCache()
+        pytest.skip("Signed-affine attention requires M5")
+    cache = cache_class()
     cache.update_and_fetch(random((1, 2, 257, 64)), random((1, 2, 257, 64), seed=1))
     q = mx.full((1, 8, 1, 64), magnitude, mx.bfloat16)
     output = affine4._native_attention(cache, q, *cache.state, 0.125, None)
@@ -385,6 +434,23 @@ def test_batch_native_standard_mask_and_padding(monkeypatch, rows):
 def test_scheme_merge_guard():
     with pytest.raises(ValueError, match="config"):
         Affine4KVCache.merge([Affine4KVCache(), TurboQuantKVCache(bits=4)])
+    with pytest.raises(ValueError, match="config"):
+        Affine4KVCache.merge([Affine4KVCache(), Affine8KVCache()])
+    with pytest.raises(ValueError, match="config"):
+        Affine8KVCache.merge([Affine8KVCache(), Affine4KVCache()])
+
+
+def test_affine8_batch_and_metadata_lifecycle():
+    cache = Affine8KVCache(seed=21)
+    cache.update_and_fetch(random((1, 2, 9, 63)), random((1, 2, 9, 79)))
+    assert cache.meta_state == ("9", "8.0", "21", "affine8", "63", "79")
+    assert cache.state[0].indices.shape[-1] == 16
+    clone = Affine8KVCache.from_state(cache.state, cache.meta_state)
+    close(clone.dequantize()[0], cache.dequantize()[0], 0, 0)
+    batch = BatchAffine8KVCache.merge([cache, clone])
+    assert type(batch) is BatchAffine8KVCache
+    assert type(batch.extract(0)) is Affine8KVCache
+    assert batch.extract(0).meta_state == cache.meta_state
 
 
 def test_matching_packed_width_does_not_allow_different_dimensions():
@@ -520,14 +586,21 @@ def test_warm_execution_errors_propagate_at_evaluation(monkeypatch):
 @pytest.mark.parametrize("dim", [1, 7, 63, 80, 128, 257])
 @pytest.mark.parametrize("shape", [(), (3,), (2, 3, 9)])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_fused_rotated_dequantize_arbitrary_dimensions(dim, shape, dtype):
+@pytest.mark.parametrize("codec_class", [Affine4Codec, Affine8Codec])
+def test_fused_rotated_dequantize_arbitrary_dimensions(
+    dim, shape, dtype, codec_class
+):
     if not mx.metal.is_available():
         pytest.skip("Fused unpack requires Metal")
-    codec = Affine4Codec(dim)
+    codec = codec_class(dim)
     state = codec.quantize(random((*shape, dim), mx.float32))
     reference = codec._codes(state) * state.norms[..., None]
     close(codec.dequantize_rotated(state, dtype), reference.astype(dtype), 0, 0)
-    signature = (dim, max(1, len(shape)), mx.float32, dtype)
+    signature = (
+        (dim, max(1, len(shape)), mx.float32, dtype)
+        if codec.bits == 4
+        else (dim, codec.bits, max(1, len(shape)), mx.float32, dtype)
+    )
     assert affine4._DEQUANTIZE_LAUNCHABLE[signature] is True
 
 

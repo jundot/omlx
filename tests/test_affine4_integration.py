@@ -9,7 +9,12 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
-from omlx.affine4 import Affine4KVCache, BatchAffine4KVCache
+from omlx.affine4 import (
+    Affine4KVCache,
+    Affine8KVCache,
+    BatchAffine4KVCache,
+    BatchAffine8KVCache,
+)
 from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, _is_turboquant_kv_family_cache
@@ -50,6 +55,11 @@ def test_scheduler_signature_matches_selected_format(scheduler):
     types, bits, _ = scheduler._infer_live_layer_cache_types()
     assert types == ["Affine4KVCache", "KVCache"]
     assert bits == 4
+    scheduler._turboquant_kv_scheme = "affine8"
+    scheduler._turboquant_kv_bits = 8
+    types, bits, _ = scheduler._infer_live_layer_cache_types()
+    assert types == ["Affine8KVCache", "KVCache"]
+    assert bits == 8
     scheduler._turboquant_kv_scheme = "turboquant"
     types, bits, _ = scheduler._infer_live_layer_cache_types()
     assert types == ["TurboQuantKVCache", "KVCache"]
@@ -89,35 +99,48 @@ def test_attention_dispatch_bypasses_turboquant_codebook_kernels(module):
 
 
 def test_batch_rejects_same_width_different_codecs():
-    affine = Affine4KVCache()
-    turbo = TurboQuantKVCache(bits=4)
-    for cache in (affine, turbo):
+    affine4 = Affine4KVCache()
+    affine8 = Affine8KVCache()
+    turbo4 = TurboQuantKVCache(bits=4)
+    turbo8 = TurboQuantKVCache(bits=8)
+    for cache in (affine4, affine8, turbo4, turbo8):
         cache.update_and_fetch(mx.ones((1, 2, 8, 64)), mx.ones((1, 2, 8, 64)))
+    for batch_class, caches in (
+        (BatchAffine4KVCache, (affine4, turbo4)),
+        (BatchAffine4KVCache, (affine4, affine8)),
+        (BatchAffine8KVCache, (affine8, turbo8)),
+        (BatchAffine8KVCache, (affine8, affine4)),
+        (BatchTurboQuantKVCache, (turbo4, affine4)),
+        (BatchTurboQuantKVCache, (turbo8, affine8)),
+    ):
+        with pytest.raises(ValueError, match="mixed quantization"):
+            batch_class.merge(list(caches))
+    a4_batch = BatchAffine4KVCache.merge([affine4])
+    a8_batch = BatchAffine8KVCache.merge([affine8])
     with pytest.raises(ValueError, match="mixed quantization"):
-        BatchAffine4KVCache.merge([affine, turbo])
+        a4_batch.extend(a8_batch)
     with pytest.raises(ValueError, match="mixed quantization"):
-        BatchTurboQuantKVCache.merge([turbo, affine])
-    with pytest.raises(ValueError, match="mixed quantization"):
-        BatchTurboQuantKVCache.merge([affine])
-    with pytest.raises(ValueError, match="mixed quantization"):
-        BatchAffine4KVCache.merge([turbo])
-    a_batch = BatchAffine4KVCache.merge([affine])
-    t_batch = BatchTurboQuantKVCache.merge([turbo])
-    with pytest.raises(ValueError, match="mixed quantization"):
-        a_batch.extend(t_batch)
-    with pytest.raises(ValueError, match="mixed quantization"):
-        t_batch.extend(a_batch)
+        a8_batch.extend(a4_batch)
 
 
-def test_singleton_cache_converts_when_another_request_joins():
+@pytest.mark.parametrize(
+    "cache_class,batch_class",
+    [
+        (Affine4KVCache, BatchAffine4KVCache),
+        (Affine8KVCache, BatchAffine8KVCache),
+    ],
+)
+def test_singleton_cache_converts_when_another_request_joins(
+    cache_class, batch_class
+):
     generate = importlib.import_module("mlx_lm.generate")
-    caches = [Affine4KVCache(), Affine4KVCache()]
+    caches = [cache_class(), cache_class()]
     for cache in caches:
         cache.update_and_fetch(mx.ones((1, 2, 8, 64)), mx.ones((1, 2, 8, 64)))
     single = generate._merge_caches([[caches[0]]])
     assert single[0] is caches[0]
     joined = generate._extend_cache(single, [caches[1]])
-    assert type(joined[0]) is BatchAffine4KVCache
+    assert type(joined[0]) is batch_class
     assert joined[0].left_padding.shape == (2,)
 
 
@@ -128,14 +151,34 @@ def test_format_change_requires_engine_reload():
     pool = EnginePool.__new__(EnginePool)
     pool._entries = {}
     turbo = ModelSettings(turboquant_kv_enabled=True)
-    affine = ModelSettings(turboquant_kv_enabled=True, turboquant_kv_scheme="affine4")
-    assert pool._engine_runtime_signature(
-        "model", turbo
-    ) != pool._engine_runtime_signature("model", affine)
+    affine4 = ModelSettings(
+        turboquant_kv_enabled=True, turboquant_kv_scheme="affine4"
+    )
+    affine8 = ModelSettings(
+        turboquant_kv_enabled=True,
+        turboquant_kv_scheme="affine8",
+        turboquant_kv_bits=8,
+    )
+    signatures = {
+        pool._engine_runtime_signature("model", settings)
+        for settings in (turbo, affine4, affine8)
+    }
+    assert len(signatures) == 3
 
 
 @pytest.mark.parametrize("architecture", ["llama", "qwen2"])
-def test_real_model_prefill_convert_and_batched_decode(architecture, scheduler):
+@pytest.mark.parametrize(
+    "scheme,bits,cache_class,batch_class",
+    [
+        ("affine4", 4, Affine4KVCache, BatchAffine4KVCache),
+        ("affine8", 8, Affine8KVCache, BatchAffine8KVCache),
+    ],
+)
+def test_real_model_prefill_convert_and_batched_decode(
+    architecture, scheduler, scheme, bits, cache_class, batch_class
+):
+    scheduler._turboquant_kv_scheme = scheme
+    scheduler._turboquant_kv_bits = bits
     module = importlib.import_module(f"mlx_lm.models.{architecture}")
     model = module.Model(
         module.ModelArgs(
@@ -159,12 +202,12 @@ def test_real_model_prefill_convert_and_batched_decode(architecture, scheduler):
         requests.append(caches)
     generate = importlib.import_module("mlx_lm.generate")
     batch = generate._merge_caches(requests)
-    assert type(batch[0]) is BatchAffine4KVCache
+    assert type(batch[0]) is batch_class
     logits = model(mx.ones((2, 1), dtype=mx.int32), cache=batch)
     mx.eval(logits)
     assert logits.shape == (2, 1, 64)
     assert bool(mx.all(mx.isfinite(logits)))
-    assert type(batch[0].extract(1)) is Affine4KVCache
+    assert type(batch[0].extract(1)) is cache_class
     assert batch[0].extract(1).offset == 257
     for cache in batch:
         cache.filter([1])
@@ -176,8 +219,15 @@ def test_real_model_prefill_convert_and_batched_decode(architecture, scheduler):
 
 @pytest.mark.parametrize("architecture", ["llama", "qwen2", "qwen3_5"])
 @pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize(
+    "scheme,bits,cache_class",
+    [
+        ("affine4", 4, Affine4KVCache),
+        ("affine8", 8, Affine8KVCache),
+    ],
+)
 def test_incremental_prefill_matches_explicit_cache_updates(
-    architecture, chunked, scheduler, monkeypatch
+    architecture, chunked, scheme, bits, cache_class, scheduler, monkeypatch
 ):
     from mlx_lm.models.cache import make_prompt_cache
 
@@ -205,25 +255,27 @@ def test_incremental_prefill_matches_explicit_cache_updates(
         model = module.Model(module.ModelArgs(**args))
     model.set_dtype(mx.bfloat16)
     scheduler.model = model
+    scheduler._turboquant_kv_scheme = scheme
+    scheduler._turboquant_kv_bits = bits
     scheduler.config.prefill_step_size = 128
     scheduler.config.paged_cache_block_size = 0
     apply_turboquant_attention_patch()
     prompt = [i % 64 for i in range(513)]
     request = Request("incremental", prompt=prompt, sampling_params=SamplingParams())
     reference = make_prompt_cache(model)
-    scheduler._prepare_affine4_prefill_cache(reference)
+    scheduler._prepare_affine_prefill_cache(reference)
     for start in range(0, 512, 128):
         mx.eval(model(mx.array([prompt[start : start + 128]]), cache=reference))
     expected = model(mx.array([prompt[-1:]]), cache=reference)
     mx.eval(expected)
     updates = []
-    original = Affine4KVCache.update_and_fetch
+    original = cache_class.update_and_fetch
 
     def record(self, keys, values):
         updates.append((self.offset, keys.shape[-2]))
         return original(self, keys, values)
 
-    monkeypatch.setattr(Affine4KVCache, "update_and_fetch", record)
+    monkeypatch.setattr(cache_class, "update_and_fetch", record)
     if chunked:
         state = scheduler._begin_prefill(request, prompt, None)
         while not scheduler._step_prefill_chunk(state):
@@ -231,7 +283,7 @@ def test_incremental_prefill_matches_explicit_cache_updates(
         caches, last = state.cache, state.last_token
     else:
         caches, last = scheduler._do_external_prefill(request, prompt, None)
-    packed = [cache for cache in caches if isinstance(cache, Affine4KVCache)]
+    packed = [cache for cache in caches if type(cache) is cache_class]
     assert packed
     assert all(cache.offset == 512 for cache in packed)
     assert {offset for offset, _ in updates} == {0, 128, 256, 384}
@@ -239,7 +291,7 @@ def test_incremental_prefill_matches_explicit_cache_updates(
     if architecture == "qwen3_5":
         assert [type(cache) for cache in caches] == [
             ArraysCache,
-            Affine4KVCache,
+            cache_class,
             ArraysCache,
             KVCache,
         ]

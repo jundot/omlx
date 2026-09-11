@@ -559,9 +559,9 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
-            from ..affine4 import Affine4KVCache
+            from ..affine4 import Affine4KVCache, Affine8KVCache
 
-            if isinstance(real_cache, Affine4KVCache):
+            if isinstance(real_cache, (Affine4KVCache, Affine8KVCache)):
                 return real_cache.attention(
                     queries,
                     keys_state=keys,

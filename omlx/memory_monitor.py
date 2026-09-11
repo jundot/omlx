@@ -246,7 +246,7 @@ class MemoryMonitor:
         # KV storage width; may be fractional with TurboQuant.
         self._dtype_size: float = 2
         self._prefill_kv_dtype_size: float = 2
-        self._affine4_prefill: bool = False
+        self._affine_prefill: bool = False
         self._kv_bytes_per_token_override: float | None = None
         # SDPA score-matrix width = model compute/activation dtype, distinct from
         # _dtype_size (which the scheduler may override to a fractional TurboQuant
@@ -461,7 +461,7 @@ class MemoryMonitor:
         prefill_memory_profile: PrefillMemoryProfile | None = None,
         ane_prefill_transient_bytes: int = 0,
         prefill_kv_dtype_size: float | None = None,
-        affine4_prefill: bool = False,
+        affine_prefill: bool = False,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -495,8 +495,8 @@ class MemoryMonitor:
                 represent.
             prefill_kv_dtype_size: KV width while prefill runs, before any
                 conversion for decode. Defaults to the stored KV width.
-            affine4_prefill: Reserve one unpacked FP32 layer and bounded
-                attention scores for incremental Affine4 prefill.
+            affine_prefill: Reserve one unpacked FP32 layer and bounded
+                attention scores for incremental signed-affine prefill.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -505,7 +505,7 @@ class MemoryMonitor:
         self._prefill_kv_dtype_size = (
             dtype_size if prefill_kv_dtype_size is None else prefill_kv_dtype_size
         )
-        self._affine4_prefill = affine4_prefill
+        self._affine_prefill = affine_prefill
         self._score_dtype_size = (
             compute_dtype_size
             if compute_dtype_size and compute_dtype_size > 0
@@ -911,7 +911,7 @@ class MemoryMonitor:
                 )
             return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
         transient = self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
-        if self._affine4_prefill and n_tokens > 0 and kv_len > 0:
+        if self._affine_prefill and n_tokens > 0 and kv_len > 0:
             from .affine4 import _MAX_SCORE_ELEMENTS
 
             heads = self._num_attention_heads or self._num_kv_heads or 0

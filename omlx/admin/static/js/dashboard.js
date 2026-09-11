@@ -2647,9 +2647,12 @@
                                 turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
                                 turboquant_kv_scheme: this.modelSettings.turboquant_kv_scheme,
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    && this.modelSettings.turboquant_kv_scheme !== 'affine4'
-                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
-                                    : 4,
+                                    && this.modelSettings.turboquant_kv_scheme === 'affine8'
+                                    ? 8
+                                    : this.modelSettings.turboquant_kv_enabled
+                                        && this.modelSettings.turboquant_kv_scheme === 'turboquant'
+                                        ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
+                                        : 4,
                                 moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
                                 moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
                                 qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
