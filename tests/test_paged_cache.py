@@ -144,6 +144,15 @@ class TestResolveBlockExtraKeys:
             )
             is None
         )
+        assert (
+            resolve_block_extra_keys(
+                20,
+                extra_key_token_start=16,
+                extra_keys=("legacy-image",),
+                extra_key_ranges=ranges,
+            )
+            == ("legacy-image",)
+        )
 
     def test_unsorted_ranges_do_not_raise_without_legacy_keys(self):
         """The scheduler lookup path must survive compacted VLM histories."""
