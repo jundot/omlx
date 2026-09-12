@@ -472,30 +472,25 @@ final class ModelSettingsScreenVM {
     }
 
     /// Read-only one-line YaRN readout under the Context Window row.
+    /// Deliberately terse — "YaRN scale factor = 2 (524,288 / 262,144)";
+    /// the recipe constants live in yarn_rope.py for anyone who cares.
     var yarnScalingSummary: String {
         switch yarnScaling {
         case .none:
             return ""
-        case .off(let native):
+        case .off:
             return String(localized: "settings.basic.context_window.yarn.off",
-                          defaultValue: "YaRN: off (native \(Self.grouped(native)) horizon, rope unscaled)",
+                          defaultValue: "YaRN scale factor = off",
                           comment: "Read-only YaRN state when the context window does not exceed the native window")
         case .scaled(let factor, let target, let native):
             return String(localized: "settings.basic.context_window.yarn.factor",
-                          defaultValue: "YaRN factor: \(Self.factor(factor))× (\(Self.grouped(target)) ÷ \(Self.grouped(native))) — derived, not editable",
+                          defaultValue: "YaRN scale factor = \(Self.factor(factor)) (\(Self.grouped(target)) / \(Self.grouped(native)))",
                           comment: "Read-only YaRN factor derived from the context window override; placeholders are the factor, the target window, and the native window")
         case .overCeiling(let factor, let target, let native):
             return String(localized: "settings.basic.context_window.yarn.over_ceiling",
-                          defaultValue: "YaRN factor: \(Self.factor(factor))× (\(Self.grouped(target)) ÷ \(Self.grouped(native))) — past Qwen's published 4× recipe; quality there is unvalidated",
+                          defaultValue: "YaRN scale factor = \(Self.factor(factor)) (\(Self.grouped(target)) / \(Self.grouped(native))) — over 4× cap",
                           comment: "Read-only YaRN factor when the context window asks for more than Qwen's published 4x recipe ceiling")
         }
-    }
-
-    /// Footnote spelling out the derivation + Qwen's fixed recipe constants.
-    var yarnScalingFormula: String {
-        String(localized: "settings.basic.context_window.yarn.formula",
-               defaultValue: "factor = context window ÷ native max_position_embeddings · static YaRN per Qwen's official recipe (original_max_position_embeddings = native, beta_fast 32, beta_slow 1, attention temperature 0.1·ln(factor)+1) · values at or below native serve unscaled · ceiling 4× native",
-               comment: "Footnote under the Context Window row explaining how the derived YaRN factor is computed and the fixed recipe constants")
     }
 
     /// Grouped integer for display ("524,288" in en).
@@ -503,9 +498,9 @@ final class ModelSettingsScreenVM {
         value.formatted(.number)
     }
 
-    /// Two-decimal factor for display ("2.00").
+    /// Trimmed factor for display ("2", "1.5", "2.25").
     static func factor(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(2)))
+        value.formatted(.number.precision(.fractionLength(0...2)))
     }
 
     /// Derived YaRN rope state; see `yarnScaling`.

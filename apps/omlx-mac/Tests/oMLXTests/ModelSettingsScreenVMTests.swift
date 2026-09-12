@@ -371,7 +371,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
         // Unset / at / below native: nothing scales, the row says so.
         XCTAssertEqual(vm.yarnScaling, .off(native: 262144))
-        XCTAssertTrue(vm.yarnScalingSummary.contains(ModelSettingsScreenVM.grouped(262144)))
+        XCTAssertTrue(vm.yarnScalingSummary.contains("off"))
         vm.contextLength = "262144"
         XCTAssertEqual(vm.yarnScaling, .off(native: 262144))
         vm.contextLength = "131072"
@@ -398,9 +398,6 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.yarnScaling?.isOverCeiling, true)
         XCTAssertTrue(vm.yarnScalingSummary.contains(ModelSettingsScreenVM.factor(5.0)))
 
-        // The footnote carries the constants the server applies.
-        XCTAssertTrue(vm.yarnScalingFormula.contains("max_position_embeddings"))
-        XCTAssertTrue(vm.yarnScalingFormula.contains("beta_fast 32"))
 
         // Whitespace in the field must not change the derivation.
         vm.contextLength = "  524288  "

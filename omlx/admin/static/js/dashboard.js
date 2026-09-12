@@ -2800,22 +2800,19 @@
             },
 
             yarnFactorDisplay() {
-                // Read-only mirror of the loader derivation so the operator
-                // sees the same factor the rope table will be built with.
+                // Read-only mirror of the loader derivation, deliberately
+                // terse: "2 (524,288 / 262,144)". The recipe math lives in
+                // omlx/patches/mlx_vlm_qwen4_exp_compat/yarn_rope.py.
                 const native = Number(this.selectedModel?.model_context_length || 0);
                 if (!this.modelSettings.yarn_rope_supported || !(native > 0)) return '';
                 const raw = this.modelSettings.max_context_window;
-                if (raw === null || raw === undefined || raw === '') {
-                    return `off — native ${native.toLocaleString()} tokens`;
-                }
+                if (raw === null || raw === undefined || raw === '') return 'off';
                 const value = Number(raw);
                 if (!Number.isFinite(value) || value <= 0) return '';
-                if (value <= native) {
-                    return `off — clamps below native ${native.toLocaleString()}`;
-                }
+                if (value <= native) return 'off';
                 const factor = (value / native).toLocaleString(undefined, {maximumFractionDigits: 2});
-                const over = value > native * 4 ? ' — beyond the validated 4× maximum' : '';
-                return `${factor}× = ${value.toLocaleString()} ÷ ${native.toLocaleString()}${over}`;
+                const over = value > native * 4 ? ' — over 4× cap' : '';
+                return `${factor} (${value.toLocaleString()} / ${native.toLocaleString()})${over}`;
             },
 
             async saveModelSettings() {

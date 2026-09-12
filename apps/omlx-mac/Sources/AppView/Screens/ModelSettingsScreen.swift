@@ -978,24 +978,18 @@ private struct BasicTab: View {
             // Read-only YaRN readout. There is no YaRN control: on a
             // YaRN-capable checkpoint (Qwen4-Exp) the server derives rope
             // scaling from the value above, so the derived factor is echoed
-            // back here plus a footnote spelling out the formula.
+            // back here as one terse line.
             if let yarn = vm.yarnScaling {
                 FreeRow(isLast: false) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Image(systemName: yarn.isOverCeiling
-                                          ? "exclamationmark.triangle.fill"
-                                          : "arrow.up.forward.app")
-                                .font(.system(size: 10))
-                                .foregroundStyle(yarn.isOverCeiling ? theme.amberDot : theme.textTertiary)
-                            Text(vm.yarnScalingSummary)
-                                .font(.omlxMono(11))
-                                .foregroundStyle(yarn.isOverCeiling ? theme.amberDot : theme.textSecondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Text(vm.yarnScalingFormula)
-                            .font(.omlxText(10.5))
-                            .foregroundStyle(theme.textTertiary)
+                    HStack(spacing: 6) {
+                        Image(systemName: yarn.isOverCeiling
+                                      ? "exclamationmark.triangle.fill"
+                                      : "arrow.up.forward.app")
+                            .font(.system(size: 10))
+                            .foregroundStyle(yarn.isOverCeiling ? theme.amberDot : theme.textTertiary)
+                        Text(vm.yarnScalingSummary)
+                            .font(.omlxMono(11))
+                            .foregroundStyle(yarn.isOverCeiling ? theme.amberDot : theme.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)

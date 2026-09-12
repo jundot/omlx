@@ -21161,43 +21161,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "YaRN factor: %@× (%@ ÷ %@) — derived, not editable"
+            "value" : "YaRN scale factor = %@ (%@ / %@)"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Коэффициент YaRN: %@× (%@ ÷ %@) — вычисляется автоматически, не редактируется"
+            "value" : "Коэффициент YaRN = %@ (%@ / %@)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "YaRN 系数：%@×（%@ ÷ %@）— 自动推导，不可编辑"
-          }
-        }
-      }
-    },
-    "settings.basic.context_window.yarn.formula" : {
-      "comment" : "Footnote under the Context Window row explaining how the derived YaRN factor is computed and the fixed recipe constants",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "factor = context window ÷ native max_position_embeddings · static YaRN per Qwen's official recipe (original_max_position_embeddings = native, beta_fast 32, beta_slow 1, attention temperature 0.1·ln(factor)+1) · values at or below native serve unscaled · ceiling 4× native"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "коэффициент = контекст ÷ нативный max_position_embeddings · статический YaRN по официальному рецепту Qwen (original_max_position_embeddings = native, beta_fast 32, beta_slow 1, температура внимания 0.1·ln(factor)+1) · значения ≤ native обслуживаются без масштабирования · лимит 4× нативного"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "系数 = 上下文窗口 ÷ 原生 max_position_embeddings · 按 Qwen 官方配方使用静态 YaRN（original_max_position_embeddings = native，beta_fast 32，beta_slow 1，注意力温度 0.1·ln(factor)+1）· 不超过原生长度的值不缩放 · 上限为原生的 4 倍"
+            "value" : "YaRN 缩放系数 = %@（%@ / %@）"
           }
         }
       }
@@ -21209,19 +21185,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "YaRN: off (native %@ horizon, rope unscaled)"
+            "value" : "YaRN scale factor = off"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "YaRN: выключен (нативный горизонт %@ токенов, rope немасштабированный)"
+            "value" : "Коэффициент YaRN = выкл."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "YaRN：关闭（原生 %@ Token 范围，rope 未缩放）"
+            "value" : "YaRN 缩放系数 = 关闭"
           }
         }
       }
@@ -21233,19 +21209,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "YaRN factor: %@× (%@ ÷ %@) — past Qwen's published 4× recipe; quality there is unvalidated"
+            "value" : "YaRN scale factor = %@ (%@ / %@) — over 4× cap"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Коэффициент YaRN: %@× (%@ ÷ %@) — выше опубликованного лимита 4×; качество на такой длине не проверено"
+            "value" : "Коэффициент YaRN = %@ (%@ / %@) — свыше лимита 4×"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "YaRN 系数：%@×（%@ ÷ %@）— 超过公布的 4× 上限；该长度下的质量未经验证"
+            "value" : "YaRN 缩放系数 = %@（%@ / %@）— 超过 4× 上限"
           }
         }
       }

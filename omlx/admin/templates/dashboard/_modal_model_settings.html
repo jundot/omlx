@@ -358,18 +358,11 @@
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <div x-show="modelSettings.yarn_rope_supported" x-cloak x-data="{ yarnInfoOpen: false }" class="mt-1">
+                                            <div x-show="modelSettings.yarn_rope_supported" x-cloak class="mt-1">
                                                 <p class="text-xs text-neutral-500">
-                                                    {{ t('modal.model_settings.yarn_factor_label') }}:
+                                                    {{ t('modal.model_settings.yarn_factor_label') }} =
                                                     <span class="font-mono" x-text="yarnFactorDisplay()"></span>
-                                                    <button type="button"
-                                                            class="underline text-neutral-400 hover:text-neutral-600"
-                                                            @click="yarnInfoOpen = !yarnInfoOpen">
-                                                        <span x-show="!yarnInfoOpen">{{ t('modal.model_settings.yarn_factor_more') }}</span>
-                                                        <span x-show="yarnInfoOpen" x-cloak>{{ t('modal.model_settings.yarn_factor_less') }}</span>
-                                                    </button>
                                                 </p>
-                                                <p x-show="yarnInfoOpen" x-cloak class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.yarn_factor_formula') }}</p>
                                             </div>
                                         </div>
                                         <div>

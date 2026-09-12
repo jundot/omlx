@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Dashboard contract for single-knob YaRN: Max Context Window doubles as the
-// rope-scaling target on qwen4_exp models. Covers the read-only factor
-// display, the 4x client validator, payload hygiene (no separate field), and
+// rope-scaling target on qwen4_exp models. Covers the terse read-only factor
+// readout, the 4x client validator, payload hygiene (no separate field), and
 // the gated hint under the Ctx Window input.
 const fs = require('fs');
 const vm = require('vm');
@@ -27,22 +27,21 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
         return {ok: true, json: async () => ({})};
     };
 
-    // Factor display mirrors the loader derivation.
+    // Terse factor readout mirrors the loader derivation.
     app.modelSettings = app.buildModelSettingsState(app.selectedModel, {});
-    assert.match(app.yarnFactorDisplay(), /^off — native 262,144 tokens$/);
+    assert.equal(app.yarnFactorDisplay(), 'off');
     app.modelSettings.max_context_window = 131072;
-    assert.match(app.yarnFactorDisplay(), /^off — clamps below native/);
+    assert.equal(app.yarnFactorDisplay(), 'off');
     app.modelSettings.max_context_window = 524288;
-    assert.match(app.yarnFactorDisplay(), /^2× = 524,288 ÷ 262,144$/);
+    assert.equal(app.yarnFactorDisplay(), '2 (524,288 / 262,144)');
     app.modelSettings.max_context_window = 393216;
-    assert.match(app.yarnFactorDisplay(), /^1\.5× = 393,216 ÷ 262,144$/);
+    assert.equal(app.yarnFactorDisplay(), '1.5 (393,216 / 262,144)');
     app.modelSettings.max_context_window = 262144 * 4 + 1;
-    assert.match(app.yarnFactorDisplay(), /beyond the validated 4× maximum/);
+    assert.match(app.yarnFactorDisplay(), /\d \(1,048,577 \/ 262,144\) — over 4× cap/);
 
     // Validator: 4x cap only; above-native values are the feature, not an error.
     app.modelSettings.max_context_window = 524288;
     assert.equal(app.validateYarnSettings(), null);
-    assert.match(app.validateYarnSettings() ?? '', /^$/);
     app.modelSettings.max_context_window = 262144 * 4 + 1;
     assert.match(app.validateYarnSettings(), /4x the native context/);
     // Save aborts on the over-cap value (alert throws in this context).
@@ -55,7 +54,7 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
     assert.match(String(alerted), /4x the native context/);
 
     // Valid value saves through the plain max_context_window field — and the
-    // retired separate setting must not reappear in the payload.
+    // retired separate setting must not reappear anywhere.
     app.modelSettings.max_context_window = 524288;
     await app.saveModelSettings();
     assert.equal(payload.max_context_window, 524288);
@@ -69,13 +68,16 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
     assert.equal(app.yarnFactorDisplay(), '');
     assert.equal(app.validateYarnSettings(), null);
 
-    // The hint lives under the Ctx Window input and is flag-gated.
+    // The readout lives under the Ctx Window input, is flag-gated, and the
+    // formula disclosure is gone (terse-by-design).
     const html = fs.readFileSync(
         path.join(root, 'omlx/admin/templates/dashboard/_modal_model_settings.html'), 'utf8');
-    assert.match(html, /x-show="modelSettings\.yarn_rope_supported"[^>]*x-data="\{ yarnInfoOpen: false \}"/);
+    assert.match(html, /x-show="modelSettings\.yarn_rope_supported"/);
     assert.match(html, /x-text="yarnFactorDisplay\(\)"/);
-    assert.match(html, /modal\.model_settings\.yarn_factor_formula/);
+    assert.match(html, /modal\.model_settings\.yarn_factor_label/);
+    assert.equal(html.includes('yarnInfoOpen'), false);
+    assert.equal(html.includes('yarn_factor_formula'), false);
     assert.equal(html.includes('yarn_context_length'), false);
 
-    console.log('PASS: single-knob YaRN display, validator, payload, and gated hint');
+    console.log('PASS: single-knob YaRN terse readout, validator, payload, and gated hint');
 })().catch(error => {console.error(error); process.exitCode = 1});
