@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import struct
 import subprocess
@@ -261,6 +262,7 @@ class NodeBudget:
     # the per-rank plan for the same reason as ``role``: mlx.launch sends one
     # common argv to every host.
     memory_guard_tier: str = "balanced"
+    memory_guard_custom_ceiling_gb: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", normalize_node_role(self.role))
@@ -269,6 +271,12 @@ class NodeBudget:
             "memory_guard_tier",
             normalize_memory_guard_tier(self.memory_guard_tier),
         )
+        custom_ceiling_gb = float(self.memory_guard_custom_ceiling_gb)
+        if not math.isfinite(custom_ceiling_gb) or custom_ceiling_gb < 0:
+            raise ValueError(
+                "memory guard custom ceiling must be finite and non-negative"
+            )
+        object.__setattr__(self, "memory_guard_custom_ceiling_gb", custom_ceiling_gb)
         if not self.node_id:
             raise ValueError("node_id is required")
         if self.capacity_bytes <= 0:
@@ -328,6 +336,7 @@ class PipelineAssignment:
     # the guard reads as headless.
     role: str = ""
     memory_guard_tier: str = "balanced"
+    memory_guard_custom_ceiling_gb: float = 0.0
     tensor_parallel_rank: int = 0
     tensor_parallel_size: int = 1
     sharded_weight_bytes: int = 0
@@ -356,6 +365,12 @@ class PipelineAssignment:
             "memory_guard_tier",
             normalize_memory_guard_tier(self.memory_guard_tier),
         )
+        custom_ceiling_gb = float(self.memory_guard_custom_ceiling_gb)
+        if not math.isfinite(custom_ceiling_gb) or custom_ceiling_gb < 0:
+            raise ValueError(
+                "memory guard custom ceiling must be finite and non-negative"
+            )
+        object.__setattr__(self, "memory_guard_custom_ceiling_gb", custom_ceiling_gb)
 
     @property
     def layer_count(self) -> int:
@@ -394,6 +409,7 @@ class PipelineAssignment:
             "utilization": self.utilization,
             "role": self.role,
             "memory_guard_tier": self.memory_guard_tier,
+            "memory_guard_custom_ceiling_gb": self.memory_guard_custom_ceiling_gb,
             "tensor_parallel_rank": self.tensor_parallel_rank,
             "tensor_parallel_size": self.tensor_parallel_size,
             "sharded_weight_bytes": self.sharded_weight_bytes,
@@ -615,6 +631,8 @@ def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     """
 
     model_type = config.get("model_type")
+    if not model_type and isinstance(config.get("text_config"), dict):
+        model_type = config["text_config"].get("model_type")
     if not isinstance(model_type, str):
         return False
     if supports_model_type(model_type):
@@ -640,7 +658,9 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     values = [heads, kv_heads]
     model_type = config.get("model_type")
-    if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe"}:
+    if not model_type and isinstance(config.get("text_config"), dict):
+        model_type = config["text_config"].get("model_type")
+    if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "qwen4_exp_text"}:
         values.extend(
             (
                 _config_int(config, "linear_num_key_heads", 1),
@@ -748,6 +768,8 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     """
 
     model_type = config.get("model_type")
+    if not model_type and isinstance(config.get("text_config"), dict):
+        model_type = config["text_config"].get("model_type")
     if not isinstance(model_type, str):
         return False
     # An architecture oMLX explicitly vouches for wins, even a VLM: the
@@ -1002,6 +1024,18 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     layer_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
+    model_cfg = _model_config(root)
+    mtype = (model_cfg.get("model_type") or "").replace("-", "_").lower()
+    text_cfg = model_cfg.get("text_config") or {}
+    text_mtype = (
+        (text_cfg.get("model_type") or "").replace("-", "_").lower()
+        if isinstance(text_cfg, dict)
+        else ""
+    )
+    is_qwen4_exp = (
+        mtype in ("qwen4_exp", "qwen4_exp_text")
+        or text_mtype in ("qwen4_exp", "qwen4_exp_text")
+    )
     for weight_file in _model_weight_files(root):
         header, payload_bytes = _safetensors_header(weight_file)
         intervals: list[tuple[int, int, str]] = []
@@ -1029,6 +1063,8 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
             tensor_bytes = offsets[1] - offsets[0]
+            if is_qwen4_exp and ".ngram_embedding." in name:
+                tensor_bytes = 0
             layer_index = _tensor_layer_index(name)
             if layer_index is None:
                 fixed_bytes += tensor_bytes
@@ -1657,6 +1693,7 @@ def _finish_pipeline_plan(
                 manual_memory_limit=node.manual_memory_limit,
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
+                memory_guard_custom_ceiling_gb=node.memory_guard_custom_ceiling_gb,
                 kv_cache_bytes=kv_bytes,
                 kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
                 max_context_tokens=_max_context_for_stage(
@@ -1705,6 +1742,7 @@ def _finish_pipeline_plan(
                 # workstation plan look identical to every staleness check.
                 "role": item.role,
                 "memory_guard_tier": item.memory_guard_tier,
+                "memory_guard_custom_ceiling_gb": item.memory_guard_custom_ceiling_gb,
             }
             for item in assignments
         ],
@@ -2106,6 +2144,7 @@ def plan_hybrid(
                     manual_memory_limit=node.manual_memory_limit,
                     role=node.role,
                     memory_guard_tier=node.memory_guard_tier,
+                    memory_guard_custom_ceiling_gb=node.memory_guard_custom_ceiling_gb,
                     tensor_parallel_rank=tp_rank,
                     tensor_parallel_size=tensor_parallel_size,
                     kv_cache_bytes=kv_bytes,

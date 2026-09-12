@@ -118,3 +118,165 @@ def test_uneven_switch_mlp_shard_shapes():
     assert rank1.fc2.weight.shape[-1] == 112
     # No dropped groups.
     assert rank0.fc2.scales.shape[-1] + rank1.fc2.scales.shape[-1] == 29
+
+
+
+
+def test_qwen4_exp_strategy_registration():
+    from omlx.cluster.tensor_strategies import (
+        QWEN4_EXP,
+        registered_model_types,
+        supports_model_type,
+    )
+
+    assert QWEN4_EXP.name == "qwen4_exp"
+    assert "qwen4_exp" in QWEN4_EXP.model_types
+    assert "qwen4_exp_text" in QWEN4_EXP.model_types
+    assert "qwen4_exp" in registered_model_types()
+    assert "qwen4_exp_text" in registered_model_types()
+    assert supports_model_type("qwen4_exp")
+    assert supports_model_type("qwen4_exp_text")
+
+
+def test_qwen4_exp_planner_divisors_and_support():
+    from omlx.cluster.planner import (
+        _supports_tensor_parallel,
+        _tensor_parallel_divisors,
+    )
+
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+        },
+    }
+    assert _supports_tensor_parallel(config)
+    divisors = _tensor_parallel_divisors(config)
+    assert 24 in divisors
+    assert 2 in divisors
+    assert 16 in divisors
+    assert 48 in divisors
+
+
+class _MockGroup:
+    def __init__(self, rank: int, size: int):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+def test_shard_qwen4_exp_linear_attention_dimensions():
+    import mlx.nn as nn
+    from omlx.cluster.tensor_strategies import _shard_qwen4_exp
+
+    class MockGatedDeltaNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dk = 128
+            self.dv = 128
+            self.n_k = 2
+            self.n_v = 4
+            self.key_dim = self.dk * self.n_k  # 256
+            self.value_dim = self.dv * self.n_v  # 512
+            self.conv_dim = self.key_dim * 2 + self.value_dim  # 1024
+            d = 512
+            self.conv1d = nn.Conv1d(
+                self.conv_dim, self.conv_dim, kernel_size=4, groups=self.conv_dim, bias=False
+            )
+            self.in_proj_qkv = nn.Linear(d, self.conv_dim, bias=False)
+            self.in_proj_z = nn.Linear(d, self.value_dim, bias=False)
+            self.in_proj_b = nn.Linear(d, self.n_v, bias=False)
+            self.in_proj_a = nn.Linear(d, self.n_v, bias=False)
+            self.dt_bias = mx.ones(self.n_v)
+            self.A_log = mx.zeros(self.n_v)
+            self.out_proj = nn.Linear(self.value_dim, d, bias=False)
+
+    class MockMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(512, 512, bias=False)
+            self.up_proj = nn.Linear(512, 512, bias=False)
+            self.down_proj = nn.Linear(512, 512, bias=False)
+
+    class MockDecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_type = "linear_attention"
+            self.linear_attn = MockGatedDeltaNet()
+            self.mlp = MockMLP()
+
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [MockDecoderLayer()]
+
+    model = MockModel()
+    group = _MockGroup(rank=0, size=2)
+    _shard_qwen4_exp(model, group, mx, None)
+
+    attn = model.layers[0].linear_attn
+    assert attn.n_k == 1
+    assert attn.n_v == 2
+    assert attn.key_dim == 128
+    assert attn.value_dim == 256
+    assert attn.conv_dim == 512
+    assert attn.conv1d.groups == 512
+    assert attn.conv1d.weight.shape[0] == 512
+    assert attn.in_proj_qkv.weight.shape[0] == 512
+    assert attn.in_proj_z.weight.shape[0] == 256
+    assert attn.in_proj_b.weight.shape[0] == 2
+    assert attn.in_proj_a.weight.shape[0] == 2
+    assert attn.A_log.shape[0] == 2
+    assert attn.dt_bias.shape[0] == 2
+
+
+def test_shard_qwen4_exp_self_attention_dimensions():
+    import mlx.nn as nn
+    from omlx.cluster.tensor_strategies import _shard_qwen4_exp
+
+    class MockAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_attention_heads = 24
+            self.num_key_value_heads = 2
+            d = 512
+            self.q_proj = nn.Linear(d, d, bias=False)
+            self.k_proj = nn.Linear(d, 128, bias=False)
+            self.v_proj = nn.Linear(d, 128, bias=False)
+            self.o_proj = nn.Linear(d, d, bias=False)
+
+    class MockMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(512, 512, bias=False)
+            self.up_proj = nn.Linear(512, 512, bias=False)
+            self.down_proj = nn.Linear(512, 512, bias=False)
+
+    class MockDecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_type = "full_attention"
+            self.self_attn = MockAttention()
+            self.mlp = MockMLP()
+
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [MockDecoderLayer()]
+
+    model = MockModel()
+    group = _MockGroup(rank=1, size=2)
+    _shard_qwen4_exp(model, group, mx, None)
+
+    attn = model.layers[0].self_attn
+    assert attn.num_attention_heads == 12
+    assert attn.num_key_value_heads == 1
