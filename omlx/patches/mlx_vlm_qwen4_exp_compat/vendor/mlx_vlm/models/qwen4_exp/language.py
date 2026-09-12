@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+_PLE_EARLY_GATHER = os.environ.get("OMLX_QWEN4_PLE_EARLY_GATHER", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 # Identity cache: keep the array alive so CPython cannot recycle id().
 _TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
@@ -1996,8 +2002,9 @@ class _SafeTensorMMap:
     @staticmethod
     def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
-            values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
-            return mx.array(values).astype(mx.bfloat16)
+            # The host buffer already contains BF16 bits. A view preserves them
+            # directly and avoids a host expansion plus a GPU conversion.
+            return mx.array(copied).view(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
@@ -2663,7 +2670,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         history = mx.concatenate([previous_context.astype(mx.int64), next_ids], axis=-1)
         prefetch(self._ngram_indices(history, next_ids.shape[1]))
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+    def prepare_indices(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+        """Start the current lookup without advancing the committed token history."""
+        input_ids = input_ids.astype(mx.int64)
+        history = mx.concatenate(
+            [self._previous_context(input_ids, cache), input_ids], axis=-1
+        )
+        indices = self._ngram_indices(history, input_ids.shape[1])
+        self.ngram_embedding.prefetch(indices)
+        return indices
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache],
+        prepared_indices: Optional[mx.array] = None,
+    ):
         input_ids = input_ids.astype(mx.int64)
         previous_context = self._previous_context(input_ids, cache)
 
@@ -2671,7 +2693,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if cache is not None:
             cache[3] = mx.contiguous(token_history[:, -self.context_len :])
 
-        ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
+        ngram_ids = (
+            self._ngram_indices(token_history, input_ids.shape[1])
+            if prepared_indices is None
+            else prepared_indices
+        )
         embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
@@ -2735,6 +2761,7 @@ class Qwen4ExpPLELayer(nn.Module):
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
         target_verify: bool = False,
+        prepared_indices: Optional[mx.array] = None,
     ):
         capture_speculative_state = target_verify and input_ids.shape[1] > 1
         if cache is not None:
@@ -2744,7 +2771,9 @@ class Qwen4ExpPLELayer(nn.Module):
             history = self.ple_embedding._previous_context(
                 input_ids.astype(mx.int64), cache
             )
-        embeddings = self.ple_embedding(input_ids, cache)
+        embeddings = self.ple_embedding(
+            input_ids, cache, prepared_indices=prepared_indices
+        )
         keys = self.norm_key(
             _target_verify_linear(self.key_proj, embeddings, target_verify)
         ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
@@ -2801,6 +2830,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         position_ids: Optional[mx.array],
         gdn_sink=None,
         target_verify: bool = False,
+        ple_indices: Optional[mx.array] = None,
     ):
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
@@ -2809,6 +2839,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 cache,
                 mask,
                 target_verify=target_verify,
+                prepared_indices=ple_indices,
             )
 
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
@@ -2880,6 +2911,17 @@ class Qwen4ExpModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        # Token IDs and the PLE history are already known before the first layer.
+        # Start disk reads here; pass the same indices through so the PLE layer
+        # does not repeat the hash or mutate speculative history prematurely.
+        ple_indices = {}
+        if _PLE_EARLY_GATHER and 0 < inputs.shape[0] * inputs.shape[1] <= 64:
+            for layer_id in self.args.ple_layer_ids:
+                index = layer_id - 1
+                embedding = self.layers[index].ple.ple_embedding
+                if isinstance(embedding.ngram_embedding, DiskBackedShardedEmbedding):
+                    ple_indices[index] = embedding.prepare_indices(inputs, cache[index])
+
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
@@ -2896,6 +2938,7 @@ class Qwen4ExpModel(nn.Module):
                 position_ids=position_ids,
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
+                ple_indices=ple_indices.get(index),
             )
             if (
                 _EAGER_DISPATCH
