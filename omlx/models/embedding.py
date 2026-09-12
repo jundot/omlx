@@ -57,6 +57,9 @@ class EmbeddingOutput:
     dimensions: int = 0
     """Dimension of each embedding vector."""
 
+    token_counts: Optional[List[int]] = None
+    """Per-input token counts, used to split dynamically batched requests."""
+
 
 class MLXEmbeddingModel:
     """
@@ -791,6 +794,7 @@ class MLXEmbeddingModel:
 
         embeddings_array = None
         total_tokens: Optional[int] = None
+        token_counts: Optional[List[int]] = None
 
         if self._using_native:
             if hasattr(processor, "__call__"):
@@ -825,8 +829,15 @@ class MLXEmbeddingModel:
             embeddings_array = self._extract_embeddings_array(
                 outputs, attention_mask
             )
-            total_tokens = self._count_prepared_tokens(
-                {"attention_mask": attention_mask, "input_ids": input_ids}
+            prepared_inputs = {
+                "attention_mask": attention_mask,
+                "input_ids": input_ids,
+            }
+            token_counts = self._count_prepared_tokens_per_input(prepared_inputs)
+            total_tokens = (
+                sum(token_counts)
+                if token_counts is not None
+                else self._count_prepared_tokens(prepared_inputs)
             )
         else:
             if self._is_compiled and self._compiled_embed is not None:
@@ -840,7 +851,12 @@ class MLXEmbeddingModel:
                     )
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
-                    total_tokens = self._count_prepared_tokens(inputs)
+                    token_counts = self._count_prepared_tokens_per_input(inputs)
+                    total_tokens = (
+                        sum(token_counts)
+                        if token_counts is not None
+                        else self._count_prepared_tokens(inputs)
+                    )
                     embeddings_array = self._compiled_embed(inputs)
                 except Exception as e:
                     logger.warning(
@@ -850,6 +866,7 @@ class MLXEmbeddingModel:
                     self._is_compiled = False
                     self._compiled_embed = None
                     total_tokens = None
+                    token_counts = None
 
             if embeddings_array is None:
                 # Both eager paths must carry the prepared mask the compiled
@@ -866,7 +883,12 @@ class MLXEmbeddingModel:
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
                     outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
-                    total_tokens = self._count_prepared_tokens(inputs)
+                    token_counts = self._count_prepared_tokens_per_input(inputs)
+                    total_tokens = (
+                        sum(token_counts)
+                        if token_counts is not None
+                        else self._count_prepared_tokens(inputs)
+                    )
                     eager_mask = inputs.get("attention_mask")
                 else:
                     outputs, eager_mask = self._eager_forward_with_mask(
@@ -881,47 +903,117 @@ class MLXEmbeddingModel:
 
         mx.eval(embeddings_array)
         embeddings = embeddings_array.tolist()
+        if token_counts is None:
+            token_counts = self._count_tokens_per_input(normalized_inputs)
+        if len(token_counts) != len(normalized_inputs):
+            token_counts = None
         if total_tokens is None:
-            total_tokens = self._count_tokens(normalized_inputs)
+            total_tokens = (
+                sum(token_counts)
+                if token_counts is not None
+                else self._count_tokens(normalized_inputs)
+            )
         dimensions = len(embeddings[0]) if embeddings else 0
 
         return EmbeddingOutput(
             embeddings=embeddings,
             total_tokens=total_tokens,
             dimensions=dimensions,
+            token_counts=token_counts,
         )
 
-    def _count_tokens(
+    def _count_tokens_per_input(
         self, inputs: Union[List[str], List[Dict[str, str]]]
-    ) -> int:
-        """Count total tokens in input texts."""
-        total = 0
+    ) -> List[int]:
+        """Count tokens separately for each input without changing their order."""
+        counts: List[int] = []
         processor = self.processor
 
         for item in self._normalize_embedding_inputs(inputs):
             text = item.get("text")
             if not text:
+                counts.append(0)
                 continue
             if hasattr(processor, "encode"):
                 tokens = processor.encode(text, add_special_tokens=True)
                 if isinstance(tokens, list):
-                    total += len(tokens)
+                    count = len(tokens)
                 elif hasattr(tokens, "shape"):
-                    total += tokens.shape[-1] if tokens.ndim > 0 else 1
+                    count = tokens.shape[-1] if tokens.ndim > 0 else 1
                 elif hasattr(tokens, "ids"):
-                    total += len(tokens.ids)
+                    count = len(tokens.ids)
                 else:
-                    total += len(tokens)
+                    count = len(tokens)
             elif hasattr(processor, "tokenizer"):
                 tokens = processor.tokenizer.encode(text, add_special_tokens=True)
-                total += len(tokens) if isinstance(tokens, list) else len(list(tokens))
+                count = len(tokens) if isinstance(tokens, list) else len(list(tokens))
             elif hasattr(processor, "_tokenizer"):
                 tokens = processor._tokenizer.encode(text, add_special_tokens=True)
-                total += len(tokens) if isinstance(tokens, list) else len(list(tokens))
+                count = len(tokens) if isinstance(tokens, list) else len(list(tokens))
             else:
-                total += len(text.split()) + 2
+                count = len(text.split()) + 2
+            counts.append(int(count))
 
-        return total
+        return counts
+
+    def _count_tokens(
+        self, inputs: Union[List[str], List[Dict[str, str]]]
+    ) -> int:
+        """Count total tokens in input texts."""
+        return sum(self._count_tokens_per_input(inputs))
+
+    def _count_prepared_tokens_per_input(
+        self, prepared_inputs: Dict[str, Any]
+    ) -> Optional[List[int]]:
+        """Extract per-input token counts from a prepared model batch."""
+
+        def _tolist(value: Any) -> Any:
+            if hasattr(value, "tolist"):
+                return value.tolist()
+            return value
+
+        def _sum_nested(value: Any) -> int:
+            if isinstance(value, (list, tuple)):
+                return sum(_sum_nested(item) for item in value)
+            return int(value)
+
+        attention_mask = prepared_inputs.get("attention_mask")
+        if attention_mask is not None:
+            shape = getattr(attention_mask, "shape", None)
+            if shape is not None:
+                try:
+                    if len(shape) <= 1:
+                        return [int(mx.sum(attention_mask).item())]
+                    axes = tuple(range(1, len(shape)))
+                    values = mx.sum(attention_mask, axis=axes).tolist()
+                    return [int(value) for value in values]
+                except (TypeError, ValueError):
+                    pass
+            values = _tolist(attention_mask)
+            if isinstance(values, (list, tuple)):
+                if values and isinstance(values[0], (list, tuple)):
+                    return [_sum_nested(row) for row in values]
+                return [_sum_nested(values)]
+
+        input_ids = prepared_inputs.get("input_ids")
+        if input_ids is None:
+            return None
+        shape = getattr(input_ids, "shape", None)
+        if shape is not None:
+            if len(shape) == 0:
+                return [1]
+            if len(shape) == 1:
+                return [int(shape[0])]
+            per_input = 1
+            for size in shape[1:]:
+                per_input *= int(size)
+            return [per_input] * int(shape[0])
+        values = _tolist(input_ids)
+        if isinstance(values, (list, tuple)):
+            if values and isinstance(values[0], (list, tuple)):
+                return [len(row) for row in values]
+            return [len(values)]
+        return [1]
 
     def _count_prepared_tokens(self, prepared_inputs: Dict[str, Any]) -> int:
         """Count tokens from prepared model inputs, including multimodal tokens."""
