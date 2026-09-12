@@ -273,8 +273,6 @@ def test_no_unreachable_functions_in_the_cluster_package():
         ("registry.py", "reset_configured_device_registry"),
         ("pairing.py", "reset_pairing_manager"),
         ("pairing_routes.py", "set_pairing_manager_getter"),
-        # Convenience wrapper around probe_remote_admission_details returning int ceiling.
-        ("launch.py", "probe_remote_admission_ceiling"),
     }
 
     sources = {path: path.read_text() for path in (_REPO / "omlx").rglob("*.py")}
