@@ -841,6 +841,17 @@
                                         </button>
                                         <span x-show="claudeDesktop.message" x-cloak class="text-xs text-neutral-500" x-text="claudeDesktop.message"></span>
                                     </div>
+                                    <div class="mt-2 flex items-center gap-2 min-w-0">
+                                        <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="claudeDesktopCommand"></code>
+                                        <button x-data="{ copied: false }"
+                                                @click="copyToClipboard(claudeDesktopCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                class="p-2 rounded-lg transition-all flex-shrink-0"
+                                                :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                                :title="window.t('status.integrations.copy_command_tooltip')">
+                                            <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                            <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
