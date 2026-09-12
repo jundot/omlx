@@ -100,6 +100,10 @@ class ModelConfig:
     image_token_id: int = 129264
     # Draft weights and standalone forward are separate from server verification.
     preserve_mtp: bool = False
+    # CED prefill skip: the decoder half forwards only the trailing
+    # window-size tokens; its global KV is produced by the midpoint CSA2
+    # layer projecting the encoder-final hidden states.
+    ced_prefill: bool = False
     dspark_block_size: int = 0
     dspark_noise_token_id: int = 0
     dspark_target_layer_ids: tuple[int, ...] = ()
@@ -208,3 +212,23 @@ class ModelConfig:
                 raise ValueError(f"Layer {i} has no compatible KV/index source")
         if len(self.engram_layer_ids) != len(self.engram_num_embeddings):
             raise ValueError("Engram layer/table counts differ")
+        if self.ced_prefill and not self.ced_layout_supported():
+            raise ValueError("CED prefill is not supported by this layer layout")
+
+    def ced_layout_supported(self) -> bool:
+        # CED requires an even split whose midpoint CSA2 layer owns the whole
+        # ratio-1 decoder half: it projects global KV from encoder-final
+        # hidden states while decoder queries attend from the SWA tail.
+        mid = self.n_layers // 2
+        return (
+            self.n_layers % 2 == 0
+            and self.window_size > 0
+            and mid in self.kv_source_layers
+            and mid in self.index_source_layers
+            and self.compress_ratios[mid] == 1
+            and all(r == 1 for r in self.compress_ratios[mid + 1 : self.n_layers])
+            and not any(
+                i in self.kv_source_layers for i in range(mid + 1, self.n_layers)
+            )
+            and all(i < mid for i in self.engram_layer_ids)
+        )

@@ -95,10 +95,18 @@ class DSparkContextCache:
             if self.keys is None:
                 self.offset = start
             elif self.offset != start:
-                raise ValueError(
-                    "DSpark context is not contiguous: "
-                    f"cache={self.offset}, append={start}"
-                )
+                if start > self.offset and length >= self.max_size:
+                    # CED bounded replay: the decoder only forwards the
+                    # trailing window, so a fresh full window legitimately
+                    # replaces the stale ring. RoPE is baked at append time
+                    # and attention is non-causal, so slot order is free.
+                    self.keys = None
+                    self.offset = start
+                else:
+                    raise ValueError(
+                        "DSpark context is not contiguous: "
+                        f"cache={self.offset}, append={start}"
+                    )
         if self.keys is None:
             next_keys = keys
         else:
@@ -160,7 +168,8 @@ def capture_prompt(
     offset_after = _target_cache_offset(target_cache)
     if offset_after is None:
         return
-    seq_len = int(inputs.shape[1])
+    # CED captures only the decoder tail; the appended rows define the span.
+    seq_len = int(aux_hidden.shape[1])
     start_offset = offset_after - seq_len
     ctx = getattr(host, _PRIME_CTX_ATTR, None)
     if not isinstance(ctx, _DSparkPrimeContext) or (

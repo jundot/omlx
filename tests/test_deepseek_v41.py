@@ -911,3 +911,102 @@ def test_load_preserves_bf16_head_without_changing_prefill_logits(tmp_path):
             np.testing.assert_array_equal(actual, reference)
         finally:
             model.close()
+
+
+# ---------------------------------------------------------------------------
+# CED prefill: the decoder half forwards only the trailing window tokens.
+# ---------------------------------------------------------------------------
+
+
+def tiny_ced(**kwargs):
+    values = dict(
+        n_layers=6,
+        compress_ratios=(0, 2, 2, 1, 1, 1),
+        kv_source_layers=(1, 3),
+        index_source_layers=(1, 3, 4, 5),
+        candidate_source_layer=3,
+        window_size=4,
+        ced_prefill=True,
+    )
+    values.update(kwargs)
+    return tiny(**values)
+
+
+def ced_pair():
+    off, on = LanguageModel(tiny_ced(ced_prefill=False)), LanguageModel(tiny_ced())
+    load_reference_weights(off)
+    load_reference_weights(on)
+    return off, on
+
+
+def test_ced_layout_supported():
+    assert tiny_ced(ced_prefill=False).ced_layout_supported()
+    assert not tiny_ced(n_layers=5).ced_layout_supported()
+    assert not tiny_ced(window_size=0).ced_layout_supported()
+    assert not tiny_ced(kv_source_layers=(1, 3, 5)).ced_layout_supported()
+    assert not tiny_ced(compress_ratios=(0, 2, 2, 1, 1, 2)).ced_layout_supported()
+    assert not tiny_ced(engram_layer_ids=(4,)).ced_layout_supported()
+    with pytest.raises(ValueError, match="CED"):
+        tiny_ced(kv_source_layers=(1, 3, 5), ced_prefill=True).validate()
+
+
+def test_ced_preserves_encoder_and_global_kv_bitwise():
+    off, on = ced_pair()
+    ids = mx.array([[5, 9, 3, 12, 20, 7, 33, 41, 2, 18]])
+    co, cn = off.make_cache(), on.make_cache()
+    off(ids, cache=co)
+    ln = np.asarray(on(ids, cache=cn)[:, -1])
+    # Determinism: two CED runs are bit-identical.
+    ln2 = np.asarray(on(ids, cache=on.make_cache())[:, -1])
+    np.testing.assert_array_equal(ln, ln2)
+    # Encoder caches are untouched by CED.
+    for i in range(3):
+        np.testing.assert_array_equal(np.asarray(co[i][1]), np.asarray(cn[i][1]))
+    # The midpoint CSA2 layer sees the identical encoder-final hidden
+    # states, so its global KV and index K are bit-identical.
+    np.testing.assert_array_equal(np.asarray(co[3][2]), np.asarray(cn[3][2]))
+    np.testing.assert_array_equal(np.asarray(co[3][3]), np.asarray(cn[3][3]))
+    np.testing.assert_array_equal(np.asarray(co[3][1]), np.asarray(cn[3][1]))
+    assert co[3].size() == cn[3].size() == ids.shape[1]
+    # Decoder window KV may legitimately differ (bounded replay), but the
+    # stored window still covers exactly the last window_size positions.
+    for i in (4, 5):
+        assert cn[i][1].shape[1] == min(ids.shape[1], 4)
+
+
+def test_ced_inactive_within_window_is_bitwise_full_compute():
+    off, on = ced_pair()
+    ids = mx.array([[5, 9, 3, 12, 20, 7]])
+    ln = np.asarray(on(ids, cache=on.make_cache()))
+    # Length 6 > window 4: CED is active. Skipped positions carry zero
+    # logits; the tail is finite and differs from full compute (bounded
+    # replay truncates early tail queries' windows by design).
+    np.testing.assert_array_equal(ln[:, :2], np.zeros((1, 2, ln.shape[-1])))
+    assert np.isfinite(ln[:, 2:]).all()
+    lo = np.asarray(off(ids, cache=off.make_cache()))
+    assert not np.allclose(lo[:, -1], ln[:, -1])
+    # A sequence within the window stays on the full-compute path bitwise.
+    short = mx.array([[5, 9, 3, 12]])
+    np.testing.assert_array_equal(
+        np.asarray(off(short, cache=off.make_cache())),
+        np.asarray(on(short, cache=on.make_cache())),
+    )
+
+
+def test_ced_chunked_continuity_and_decode_seam():
+    _, on = ced_pair()
+    full = mx.array([[5, 9, 3, 12, 20, 7, 33, 41, 2, 18]])
+    ca = on.make_cache()
+    first = np.asarray(on(full[:, :6], cache=ca))
+    second = np.asarray(on(full[:, 6:], cache=ca))
+    assert first.shape[1] == 6 and second.shape[1] == 4
+    decoded = np.asarray(on(mx.array([[11]]), cache=ca))[:, -1]
+    assert np.isfinite(decoded).all()
+    for i in (3, 4, 5):
+        assert ca[i].size() == 11
+        assert ca[i][1].shape[1] == 4
+    # Chunked CED ends with the same trailing window as one CED pass.
+    cb = on.make_cache()
+    on(full, cache=cb)
+    solo = np.asarray(on(mx.array([[11]]), cache=cb))[:, -1]
+    np.testing.assert_array_equal(decoded, solo)

@@ -61,6 +61,7 @@ def load(
     engram_ssd_offload=False,
     preserve_mtp=None,
     moe_expert_offload_resident_fraction=None,
+    ced_prefill=False,
 ):
     path = Path(path)
     if (path / "conversion.inprogress.json").exists():
@@ -91,6 +92,16 @@ def load(
             raise ValueError("MoE expert offload cannot enable DSpark MTP")
         # Retained draft weights need not consume RAM when speculation is forbidden.
         config.preserve_mtp = False
+    if ced_prefill:
+        if config.ced_layout_supported():
+            config.ced_prefill = True
+            logger.info("DeepSeek V4.1 CED prefill enabled: decoder tail %d", config.window_size)
+        else:
+            config.ced_prefill = False
+            logger.warning(
+                "DeepSeek V4.1 CED prefill requested but layer layout is "
+                "unsupported; falling back to full decoder prefill"
+            )
     model = Model(config)
     if config.engram_layer_ids:
         logger.info(

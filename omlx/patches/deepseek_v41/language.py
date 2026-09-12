@@ -176,20 +176,28 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(c.index_head_dim, c.norm_eps)
         self._config, self._layer = c, layer
 
-    def __call__(self, x, qr, latent, cache, shared, start, ratio):
+    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None):
         c, layer = self._config, self._layer
         end = start + x.shape[1]
         if layer in c.kv_source_layers:
+            # CED keeps the query path on the tail while the key path still
+            # spans the full chunk; latent_start marks that wider key origin.
+            kv_start = start if latent_start is None else int(latent_start)
+            kv_end = (
+                end
+                if latent_start is None
+                else kv_start + (0 if latent is None else latent.shape[1])
+            )
             previous = cache[3]
             previous = (
-                previous[:, : start // ratio]
+                previous[:, : kv_start // ratio]
                 if previous is not None
                 else pack_activation(
                     mx.zeros((1, 0, c.index_head_dim), x.dtype), bits=4
                 )
             )
             if latent is not None:
-                pos = mx.arange(start // ratio, end // ratio) * ratio
+                pos = mx.arange(kv_start // ratio, kv_end // ratio) * ratio
                 key = pack_activation(
                     rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
                 )
@@ -266,7 +274,7 @@ class Attention(nn.Module):
             )
         return self.wq_a(x), self.wkv(x)
 
-    def __call__(self, x, cache, shared, start):
+    def __call__(self, x, cache, shared, start, ced_kv=None, ced_kv_start=None):
         c, layer = self._config, self._layer
         ratio, length = c.compress_ratios[layer], x.shape[1]
         positions = mx.arange(start, start + length)
@@ -280,7 +288,8 @@ class Attention(nn.Module):
         )
         new = pack_activation(rope(self.kv_norm(kv_input), positions, c, bool(ratio)))
         old = cache[1]
-        old_len = min(start, c.window_size)
+        # CED clears the stale window whenever bounded replay skips tokens.
+        old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
         kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
         verify_state = getattr(cache, "_mtp_verify_state", None)
         if verify_state is not None:
@@ -299,7 +308,11 @@ class Attention(nn.Module):
         if ratio:
             latent = None
             if layer in c.kv_source_layers:
-                latent = self.compressor(x, cache, start)
+                # CED: global KV projects the full encoder-final hidden state
+                # (ced_kv) even though queries only attend from the tail.
+                kv_x = x if ced_kv is None else ced_kv
+                kv_start = start if ced_kv_start is None else int(ced_kv_start)
+                latent = self.compressor(kv_x, cache, kv_start)
                 if cache[2] is None:
                     cache[2] = pack_activation(
                         mx.zeros((1, 0, c.head_dim), x.dtype),
@@ -307,13 +320,16 @@ class Attention(nn.Module):
                         group_size=16,
                         e4m3_scale=True,
                     )
-                shared["kv"] = cache[2][:, : start // ratio]
+                shared["kv"] = cache[2][:, : kv_start // ratio]
             if layer in c.index_source_layers:
-                shared["idx"] = self.indexer(x, qr, latent, cache, shared, start, ratio)
+                shared["idx"] = self.indexer(
+                    x, qr, latent, cache, shared, start, ratio, latent_start=ced_kv_start
+                )
             if latent is not None:
                 compressed = rope(
                     latent,
-                    mx.arange(start // ratio, (start + length) // ratio) * ratio,
+                    mx.arange(kv_start // ratio, (kv_start + kv_x.shape[1]) // ratio)
+                    * ratio,
                     c,
                     True,
                 )
@@ -753,17 +769,53 @@ class Block(nn.Module):
         if layer in c.engram_layer_ids:
             self.engram = Engram(c, list(c.engram_layer_ids).index(layer))
 
-    def __call__(self, h, pre, cache, shared, start, image_mask):
-        ap, ao, ac = hc_mixes(
-            h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self._config
-        )
+    def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
+        ced_kv = ced_kv_start = None
+        if ced_tail is not None:
+            # CED bounded replay: queries, SWA KV and MoE run on the tail
+            # only. The midpoint CSA2 layer still projects global KV from the
+            # full encoder-final hidden states it receives as ced_kv.
+            tail = min(int(ced_tail), h.shape[1])
+            full_len = h.shape[1]
+            if hasattr(self.attn, "compressor"):
+                ap, ao, ac = hc_mixes(
+                    h,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self._config,
+                )
+                x = hc_pre_norm(
+                    h, pre, self.attn_norm.weight, self.attn_norm.eps
+                )
+                ced_kv, ced_kv_start = x, start
+                ap, ao, ac = ap[:, -tail:], ao[:, -tail:], ac[:, -tail:]
+            else:
+                h, pre = h[:, -tail:], pre[:, -tail:]
+                ap, ao, ac = hc_mixes(
+                    h,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self._config,
+                )
+                x = hc_pre_norm(
+                    h, pre, self.attn_norm.weight, self.attn_norm.eps
+                )
+            # Bounded replay skipped every position before the tail, so the
+            # stored window is non-contiguous with these queries: drop it.
+            cache[1] = None
+            h, pre, x = h[:, -tail:], pre[:, -tail:], x[:, -tail:]
+            if image_mask is not None:
+                image_mask = image_mask[:, -tail:]
+            start = start + full_len - tail
+        else:
+            ap, ao, ac = hc_mixes(
+                h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self._config
+            )
+            x = hc_pre_norm(h, pre, self.attn_norm.weight, self.attn_norm.eps)
         h = hc_post(
-            self.attn(
-                hc_pre_norm(h, pre, self.attn_norm.weight, self.attn_norm.eps),
-                cache,
-                shared,
-                start,
-            ),
+            self.attn(x, cache, shared, start, ced_kv=ced_kv, ced_kv_start=ced_kv_start),
             h,
             ao,
             ac,
@@ -895,6 +947,20 @@ class LanguageModel(DSparkMixin, nn.Module):
                 (mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]
             )
             shared = {}
+            # CED prefill: the decoder half replays only the trailing
+            # window of the sequence. The gate is absolute (cache offset +
+            # chunk length) so chunk boundaries never leak stale decoder
+            # windows; decode steps and DSpark verify blocks stay on the
+            # normal path.
+            ced_tail = (
+                c.window_size
+                if c.ced_prefill
+                and verify_states is None
+                and end - begin > 1
+                and start + end - begin > c.window_size
+                else None
+            )
+            ced_mid = c.n_layers // 2
             prefetch = getattr(self, "_engram_prefetch", None)
             with prefetch.forward() if prefetch is not None else nullcontext():
                 if prefetch is not None and c.engram_layer_ids:
@@ -913,7 +979,19 @@ class LanguageModel(DSparkMixin, nn.Module):
                             )
                     if capture and i in c.dspark_target_layer_ids:
                         captured[i] = mx.mean(h, axis=2)
-                    h, pre = layer(h, pre, rc[i], shared, start, image_mask)
+                    query_start = start
+                    if ced_tail is not None and i > ced_mid:
+                        # The midpoint layer already advanced h to the tail.
+                        query_start = start + end - begin - ced_tail
+                    h, pre = layer(
+                        h,
+                        pre,
+                        rc[i],
+                        shared,
+                        query_start,
+                        image_mask,
+                        ced_tail=ced_tail if ced_tail is not None and i >= ced_mid else None,
+                    )
                     if prefetch is not None and "engram" in layer:
                         mx.async_eval(h, pre)
                     rc[i][0] = mx.array([start + end - begin], mx.int32)
@@ -934,8 +1012,17 @@ class LanguageModel(DSparkMixin, nn.Module):
                             )
                     rows[i].append(rc[i])
             logits = project_logits(self.norm(hc_pre(h, pre)), self.head.weight)
+            # CED skipped decoder positions keep zero logits; they are never
+            # sampled (only the final position of the final chunk is used).
             results.append(
-                mx.pad(logits, [(0, 0), (begin, input_ids.shape[1] - end), (0, 0)])
+                mx.pad(
+                    logits,
+                    [
+                        (0, 0),
+                        (end - logits.shape[1], input_ids.shape[1] - end),
+                        (0, 0),
+                    ],
+                )
             )
         for i, item in enumerate(cache):
             merged = DeepseekV41Cache.merge(rows[i])

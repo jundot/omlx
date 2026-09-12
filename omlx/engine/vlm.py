@@ -1842,6 +1842,13 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
+                        ced_prefill=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_v41_ced_prefill_enabled",
+                                False,
+                            )
+                        ),
                     )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(

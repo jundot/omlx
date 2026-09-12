@@ -213,6 +213,28 @@ def test_dspark_context_cache_keeps_reference_physical_ring_order(dsv4):
     assert cache.keys.reshape(-1).tolist() == [8, 9, 10, 11]
 
 
+def test_dspark_context_cache_ced_gap_replaces_full_window(dsv4):
+    # CED bounded replay appends only the trailing window, so a fresh
+    # full-size block may legitimately start past the ring offset.
+    cache = dsv4.DSparkContextCache(4)
+
+    def append(start, *positions):
+        values = mx.array(positions, dtype=mx.float32).reshape(1, 1, -1, 1)
+        cache.append(values, start_offset=start)
+        mx.eval(cache.keys)
+
+    append(2, 0, 1, 2, 3)
+    assert cache.offset == 6
+    # Gap with a full window: replace the stale ring.
+    append(10, 4, 5, 6, 7)
+    assert cache.offset == 14
+    chronological = cache._chronological(cache.keys).reshape(-1).tolist()
+    assert chronological == [4, 5, 6, 7]
+    # Gap with a partial block stays a contiguity error.
+    with pytest.raises(ValueError, match="not contiguous"):
+        append(20, 8, 9)
+
+
 def test_dspark_sanitize_keeps_direct_stage_layout(dsv4):
     fake = SimpleNamespace(
         args=SimpleNamespace(

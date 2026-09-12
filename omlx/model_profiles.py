@@ -111,6 +111,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
         "deepseek_v41_engram_ssd_offload",
+        # Architecture-level prefill strategy; explicit per model.
+        "deepseek_v41_ced_prefill_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

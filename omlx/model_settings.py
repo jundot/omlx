@@ -320,6 +320,10 @@ class ModelSettings:
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
     deepseek_v41_engram_ssd_offload: bool = False
+    # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
+    # last window-size tokens; decoder global KV is the encoder-final
+    # projection already produced by the midpoint CSA2 layer.
+    deepseek_v41_ced_prefill_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
