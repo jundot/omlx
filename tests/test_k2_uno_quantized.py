@@ -41,25 +41,31 @@ def shell(linear):
         ({"bits": 4}, 0),
         ({"group": 128}, 0),
         ({"dtype": mx.float16}, 0),
-        ({"k": 2048}, 0),
+        ({"k": 2048}, 8),
+        ({"k": 768, "n": 16}, 8),
+        ({"k": 64, "n": 8}, 8),
         ({"n": 1025}, 0),
     ],
 )
 def test_q8_block_marks_only_eligible_weights(monkeypatch, changes, expected):
-    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": "applegpu_g16s"})
     monkeypatch.setattr(mx, "default_device", lambda: mx.Device(mx.gpu))
     linear = qlinear(**changes)
     assert quantized.enable_q8_blocks(shell(linear)) == expected
     assert bool(getattr(linear, "_omlx_uno_q8_block", False)) == bool(expected)
 
 
-@pytest.mark.parametrize(
-    "enabled,arch", [(False, "applegpu_g16s"), (True, "applegpu_g17s")]
-)
-def test_q8_block_requires_uno_and_validated_gpu(monkeypatch, enabled, arch):
-    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": arch})
+def test_q8_block_does_not_restrict_gpu_architecture(monkeypatch):
+    def architecture_not_needed():
+        raise AssertionError("GPU architecture must not gate Uno Q8")
+
+    monkeypatch.setattr(mx, "device_info", architecture_not_needed)
+    monkeypatch.setattr(mx, "default_device", lambda: mx.Device(mx.gpu))
+    assert quantized.enable_q8_blocks(shell(qlinear())) == 8
+
+
+def test_q8_block_requires_uno():
     model = shell(qlinear())
-    model._uno_adapter_loaded = enabled
+    model._uno_adapter_loaded = False
     assert quantized.enable_q8_blocks(model) == 0
 
 
@@ -147,12 +153,21 @@ def test_q8_block_leaves_other_calls_on_native_path(monkeypatch, shape, dtype):
     native.assert_called_once_with(x)
 
 
-@pytest.mark.skipif(
-    mx.device_info().get("architecture") != "applegpu_g16s",
-    reason="exact kernel parity is validated on M4 Max",
-)
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize(
-    "k,n", [(4096, 1024), (4096, 4096), (4096, 12288), (12288, 4096), (4096, 65536)]
+    "k,n",
+    [
+        (64, 8),
+        (128, 8),
+        (192, 16),
+        (768, 16),
+        (2048, 1024),
+        (4096, 1024),
+        (4096, 4096),
+        (4096, 12288),
+        (12288, 4096),
+        (4096, 65536),
+    ],
 )
 @pytest.mark.parametrize("bias", [False, True])
 def test_q8_block_matches_mlx_and_conditional_clean_row(k, n, bias):
@@ -183,10 +198,7 @@ def test_q8_block_matches_mlx_and_conditional_clean_row(k, n, bias):
     assert mx.array_equal(adapted[:, :1], expected[:, :1]).item()
 
 
-@pytest.mark.skipif(
-    mx.device_info().get("architecture") != "applegpu_g16s",
-    reason="exact kernel parity is validated on M4 Max",
-)
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("compiled", [False, True])
 def test_q8_block_preserves_full_model_logits_and_kv(compiled):
     from mlx_lm.models.cache import make_prompt_cache

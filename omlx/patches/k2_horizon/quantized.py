@@ -18,7 +18,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Eight-row affine Q8 projections for Uno on the validated M4 Max GPU."""
+"""Eight-row affine Q8 projections for Uno on Metal GPUs."""
 
 from functools import cache
 
@@ -100,7 +100,6 @@ def enable_q8_blocks(model):
     if (
         not getattr(model, "_uno_adapter_loaded", False)
         or mx.default_device().type != mx.gpu
-        or mx.device_info().get("architecture") != "applegpu_g16s"
     ):
         return 0
     projections = [
@@ -124,10 +123,10 @@ def enable_q8_blocks(model):
             and linear.bits == 8
             and linear.group_size == 64
             and linear.scales.dtype == linear.biases.dtype == mx.bfloat16
-            and linear.weight.shape[0] >= 1024
+            and linear.weight.shape[0] > 0
             and linear.weight.shape[0] % 8 == 0
-            and linear.weight.shape[1] * 4 >= 4096
-            and linear.weight.shape[1] * 4 % 512 == 0
+            and linear.weight.shape[1] > 0
+            and linear.weight.shape[1] * 4 % 64 == 0
         ):
             linear._omlx_uno_q8_block = True
             count += 1

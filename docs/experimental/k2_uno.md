@@ -66,12 +66,13 @@ subtract snapshots to isolate a workload. They are not per-request GPU profiler
 measurements. Resolved Hugging Face snapshot paths identify revisions; locally
 converted models need a separate revision/conversion manifest.
 
-On M4 Max (`applegpu_g16s`), Uno enables a specialized eight-row kernel for
+On Metal GPUs, Uno enables a specialized eight-row kernel for
 affine Q8 base projections with group size 64 and BF16 scales/biases. Eligible
-matrices have at least 1,024 output features (a multiple of 8) and at least 4,096
-input features (a multiple of 512). It runs on singleton eight-token calls with
-BF16 activations. Other shapes, precisions and devices retain the native MLX
-projection. The runtime snapshot reports `q8_block_projections`; the all-Q8 7B
+matrices have positive output widths divisible by 8 and input widths divisible
+by 64. It runs on singleton eight-token calls with BF16 activations. These
+checks reflect the kernel's layout and arithmetic; there is no GPU architecture
+allowlist or minimum model size. Other shapes, precisions and CPU calls use native
+MLX projection. The runtime snapshot reports `q8_block_projections`; the all-Q8 7B
 conversion activates 253 projections, including the vocabulary head. The adapter
 stays conditional and retains its loaded precision. No dequantized weight copy
 is retained.
@@ -81,7 +82,8 @@ kernel shares each decoded weight across all eight rows while preserving its
 group, sub-chunk and reduction order. This saves repeated weight/dequantization
 work without changing block length, sampling or KV rollback. The implementation
 is adapted from [MLX's affine QMV kernel](https://github.com/ml-explore/mlx/blob/v0.32.2/mlx/backend/metal/kernels/quantized.h).
-The M4 Max path is the only hardware-specific enablement validated here.
+The measurements below were collected on M4 Max; performance on other GPUs
+has not been measured here.
 
 A local comparison of clean target passes over six 1,024-token corpus slices
 (English, Python and mixed code), processed in eight-token chunks, found identical
