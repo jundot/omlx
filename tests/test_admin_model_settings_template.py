@@ -62,7 +62,10 @@ def test_apply_profile_surfaces_server_validation_error():
 
     assert "this.profileError = '';" in method
     assert "const data = await r.json().catch(() => ({}));" in method
-    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
+    assert (
+        "this.profileError = data.detail || window.t('js.error.apply_profile_failed');"
+        in method
+    )
     assert "this.profileError = String(e);" in method
 
 
@@ -264,10 +267,12 @@ def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
     script = _dashboard_script()
 
     assert "validateQwenAneSettings()" in script
-    assert "ANE prompt block must be a multiple of 64." in script
-    assert "MLP ANE and CPU fractions must total less than 1.0." in script
-    assert "GDN ANE and CPU fractions must total less than 1.0." in script
-    assert "CPU worker count must be between 0 and 64." in script
+    # The messages are localised now, so assert the keys the validator returns
+    # rather than the English copy.
+    assert "window.t('js.error.ane_prompt_block_multiple')" in script
+    assert "window.t('js.error.mlp_ane_cpu_total')" in script
+    assert "window.t('js.error.gdn_ane_cpu_total')" in script
+    assert "window.t('js.error.cpu_workers_range')" in script
     assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
     assert "qwen35_ane_prefill_fraction: Number(" in script
 

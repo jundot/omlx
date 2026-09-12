@@ -59,7 +59,9 @@ struct OMLXApp: App {
         // terminate.
         .commands {
             CommandGroup(replacing: .appTermination) {
-                Button("Close Window") {
+                Button(String(localized: "app.command.close_window",
+                              defaultValue: "Close Window",
+                              comment: "App menu command that hides all windows and drops the Dock icon")) {
                     appDelegate.hideWindowsAndDropDockIcon()
                 }
                 .keyboardShortcut("q", modifiers: .command)

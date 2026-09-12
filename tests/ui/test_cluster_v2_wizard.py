@@ -221,7 +221,7 @@ def test_version_mismatch_banner_is_actionable_and_keeps_the_device():
     javascript = _read(JAVASCRIPT)
 
     assert "data-cluster-v2-version-mismatch" in template
-    assert "Version mismatch across your Macs" in template
+    assert "cluster.v2.version_mismatch.title" in template
     assert "brew upgrade omlx" in template
     assert "versionMismatches()" in javascript
     # The banner compares peer vs self versions and names both.
@@ -241,7 +241,7 @@ def test_multicast_self_test_stub_degrades_gracefully():
     assert "/api/cluster/discovery/health" in javascript
     assert "discoveryHealthUnsupported" in javascript
     assert "error?.status === 404" in javascript
-    assert "Local Network" in template
+    assert "cluster.v2.discovering.local_network" in template
     # The fixture pins the stub contract for whoever implements it.
     health = _fixtures()["discovery_health_ok.json"]
     assert "multicast_rx_within_5s" in health
@@ -318,9 +318,9 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
     assert "changeClusterModel" in javascript
     assert "unloadDeploymentWeights" in javascript
     assert "loadDeploymentWeights" in javascript
-    assert "Tailscale control" in javascript
-    assert "Inference: JACCL over Thunderbolt RDMA" in javascript
-    assert "device links below are control/discovery routes" in template
+    assert "cluster.v2.link.tailscale_control" in javascript
+    assert "cluster.v2.deploy.fabric_jaccl" in javascript
+    assert "cluster.v2.active.fabric_note" in template
     assert re.search(
         r"`/admin/api/cluster/deployments/\$\{encodeURIComponent\(id\)\}`",
         javascript,
@@ -986,7 +986,7 @@ process.stdout.write(JSON.stringify({
 
     assert result["active"] == {
         "ids": [41, 42],
-        "phases": ["Prefill", "Decode"],
+        "phases": ["prefill", "decode"],
         "prefill": ["812 tok/s", "905 tok/s"],
         "decode": ["—", "44.3 tok/s"],
         "count": "2 active",
@@ -994,7 +994,7 @@ process.stdout.write(JSON.stringify({
     assert result["completed"] == {
         "id": 42,
         "history": True,
-        "phase": "Complete",
+        "phase": "complete",
         "count": "Last completed request",
     }
     assert result["cached"] == {
@@ -1059,8 +1059,8 @@ component.apiFetch = async (url, options) => {
     assert "data-cluster-v2-serving-profile" in template
     assert "data-cluster-v2-serving-profile-option" in template
     assert "data-cluster-v2-context-reservation" in template
-    assert 'aria-label="Distributed context reservation"' in template
-    assert "There is no separate batching switch" in template
+    assert "cluster.v2.plan.context_aria" in template
+    assert "cluster.v2.plan.batching_note" in template
 
 
 def test_active_serving_status_uses_resolved_runtime_limits_and_batch_evidence():
@@ -1280,7 +1280,7 @@ def test_joiner_poll_drives_approval_and_survives_reloads():
     assert "joined" in approved
     assert "this.refreshDevices()" in approved
     denied = javascript.split("snapshot.state === 'denied'", 1)[1]
-    assert "denied the join request" in denied
+    assert "cluster.v2.toast.join_denied" in denied
     # Denied is terminal server-side; the UI clears it via the cancel endpoint.
     assert "/api/cluster/pair/join/cancel" in javascript
 
@@ -1338,8 +1338,17 @@ def _run_wizard(body: str) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to execute the wizard component")
+    # The component resolves its copy through window.t(...); give the sandbox
+    # the real English catalog so runtime assertions still read the shipped
+    # strings. A missing key falls through as the key itself, which makes a
+    # forgotten catalog entry visible rather than silently blank.
+    catalog = json.loads(
+        (ROOT / "omlx/admin/i18n/en.json").read_text(encoding="utf-8")
+    )
     script = f"""
 {_read(JAVASCRIPT)}
+const __catalog = {json.dumps(catalog, ensure_ascii=False)};
+global.window = {{ t: (key) => (key in __catalog ? __catalog[key] : key) }};
 const component = clusterV2Wizard();
 {body}
 """
@@ -1371,9 +1380,9 @@ component.roleOptions = roles;
 def test_advanced_cuda_tools_use_selected_pair_and_one_time_join_contract():
     result = _run_wizard(
         """
-global.window = {
+Object.assign(global.window, {
   location: { hostname: '192.168.1.20', protocol: 'http:', port: '8000' },
-};
+});
 global.setTimeout = () => 0;
 const calls = [];
 const nodes = [
@@ -1470,7 +1479,7 @@ def test_fit_failure_banner_is_actionable_and_never_silent():
 
     assert "data-cluster-v2-fit-banner" in template
     assert "data-cluster-v2-fit-switch-headless" in template
-    assert "Switch all to Headless and retry" in template
+    assert "cluster.v2.plan.switch_headless" in template
     assert "parseFitFailure" in javascript
     assert r"at least (\d+) additional bytes" in javascript
     assert "canFixWithHeadless" in javascript
@@ -1609,7 +1618,7 @@ def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
     assert "promptCacheSsdMaxGiB: 20" in javascript
     assert "prompt_cache_ssd: this.promptCacheSsd" in javascript
     assert "prompt_cache_ssd_max_bytes" in javascript
-    assert "Snapshots are written during request processing" in template
+    assert "cluster.v2.plan.prompt_reuse_blurb" in template
 
     result = _run_wizard(
         _WIZARD_TWO_MACS + """

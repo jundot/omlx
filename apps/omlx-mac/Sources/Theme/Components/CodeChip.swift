@@ -31,7 +31,9 @@ struct CodeChip: View {
             .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
         }
         .buttonStyle(.plain)
-        .help("Click to copy")
+        .help(String(localized: "common.copy.help",
+                     defaultValue: "Click to copy",
+                     comment: "Tooltip on the code chip explaining that clicking copies the value"))
     }
 
     private func copy() {

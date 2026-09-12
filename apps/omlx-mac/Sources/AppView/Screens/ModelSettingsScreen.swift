@@ -1200,17 +1200,36 @@ private struct ExperimentalSection: View {
                                   comment: "Row label for the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
                         if !vm.aneTuningIsRunning && vm.model?.anePrefillBackend != "k2" {
-                            Menu("Tuner overrides") {
-                                Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
-                                Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
+                            Menu(String(localized: "settings.experimental.qwen_ane.tuner.menu",
+                                        defaultValue: "Tuner overrides",
+                                        comment: "Menu label for hardware overrides in the ANE split tuner")) {
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_offload",
+                                              defaultValue: "Allow CPU offload",
+                                              comment: "ANE tuner override: allow offloading work to the CPU"),
+                                       isOn: $vm.aneTuningAllowCPU)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_gate",
+                                              defaultValue: "Allow CPU gate/up",
+                                              comment: "ANE tuner override: allow the gate and up projections on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUGate)
                                     .disabled(!vm.aneTuningAllowCPU)
-                                Toggle("Allow CPU down projection", isOn: $vm.aneTuningAllowCPUDown)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_down",
+                                              defaultValue: "Allow CPU down projection",
+                                              comment: "ANE tuner override: allow the down projection on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUDown)
                                     .disabled(!vm.aneTuningAllowCPU)
-                                Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
-                                Toggle("Allow GDN on CPU", isOn: $vm.aneTuningAllowCPUGDN)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_ane_gdn",
+                                              defaultValue: "Allow GDN on ANE",
+                                              comment: "ANE tuner override: allow GDN layers on the ANE"),
+                                       isOn: $vm.aneTuningAllowANEGDN)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_gdn",
+                                              defaultValue: "Allow GDN on CPU",
+                                              comment: "ANE tuner override: allow GDN layers on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUGDN)
                                     .disabled(!vm.aneTuningAllowCPU || !vm.aneTuningAllowANEGDN)
                                 Toggle(
-                                    "Allow performance-aware CPU scheduling",
+                                    String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_shared",
+                                           defaultValue: "Allow performance-aware CPU scheduling",
+                                           comment: "ANE tuner override: allow performance-aware CPU scheduling"),
                                     isOn: $vm.aneTuningAllowCPUSharedResource
                                 )
                                 .disabled(!vm.aneTuningAllowCPU)
@@ -1234,7 +1253,9 @@ private struct ExperimentalSection: View {
                                 ProgressView()
                                     .controlSize(.small)
                             }
-                            Button("Cancel") {
+                            Button(String(localized: "common.cancel",
+                                          defaultValue: "Cancel",
+                                          comment: "Generic Cancel button label")) {
                                 Task { await vm.cancelANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.destructive, size: .small))
@@ -1244,16 +1265,22 @@ private struct ExperimentalSection: View {
                                 .foregroundStyle(theme.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .multilineTextAlignment(.trailing)
-                            Button("Use result") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.use_result",
+                                          defaultValue: "Use result",
+                                          comment: "Button that applies the ANE tuner recommendation")) {
                                 vm.applyANETuningRecommendation()
                             }
                             .buttonStyle(.omlx(.primary, size: .small))
-                            Button("Tune again") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_again",
+                                          defaultValue: "Tune again",
+                                          comment: "Button that re-runs the ANE split tuner")) {
                                 Task { await vm.startANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         } else {
-                            Button("Tune for this Mac") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_for_mac",
+                                          defaultValue: "Tune for this Mac",
+                                          comment: "Button that starts ANE split tuning for the current Mac")) {
                                 Task { await vm.startANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.normal, size: .small))

@@ -595,44 +595,44 @@
             accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
             accBenchmarkGroups: [
                 {
-                    name: 'Knowledge',
+                    name: window.t('acc_bench.benchmarks.group_knowledge'),
                     benchmarks: [
-                        { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: 'Hard knowledge · 14 subjects (10-way)', fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu', label: 'MMLU', desc: window.t('acc_bench.benchmarks.mmlu_desc'), fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: window.t('acc_bench.benchmarks.mmlu_pro_desc'), fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
                 {
-                    name: 'Commonsense & Reasoning',
+                    name: window.t('acc_bench.benchmarks.group_commonsense'),
                     benchmarks: [
-                        { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'hellaswag', label: 'HellaSwag', desc: window.t('acc_bench.benchmarks.hellaswag_desc'), fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'arc_challenge', label: 'ARC-C', desc: window.t('acc_bench.benchmarks.arc_desc'), fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'winogrande', label: 'Winogrande', desc: window.t('acc_bench.benchmarks.winogrande_desc'), fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'truthfulqa', label: 'TruthfulQA', desc: window.t('acc_bench.benchmarks.truthfulqa_desc'), fullSize: 817, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Math',
+                    name: window.t('acc_bench.benchmarks.group_math'),
                     benchmarks: [
-                        { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'mathqa', label: 'MathQA', desc: 'Quantitative reasoning · 5-way', fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
+                        { key: 'gsm8k', label: 'GSM8K', desc: window.t('acc_bench.benchmarks.gsm8k_desc'), fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'mathqa', label: 'MathQA', desc: window.t('acc_bench.benchmarks.mathqa_desc'), fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
                     ],
                 },
                 {
-                    name: 'Coding',
+                    name: window.t('acc_bench.benchmarks.group_coding'),
                     benchmarks: [
-                        { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
-                        { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'humaneval', label: 'HumanEval', desc: window.t('acc_bench.benchmarks.humaneval_desc'), fullSize: 164, sizes: [30, 50, 100] },
+                        { key: 'mbpp', label: 'MBPP', desc: window.t('acc_bench.benchmarks.mbpp_desc'), fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'livecodebench', label: 'LiveCodeBench', desc: window.t('acc_bench.benchmarks.livecodebench_desc'), fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Safety & Alignment',
+                    name: window.t('acc_bench.benchmarks.group_safety'),
                     benchmarks: [
-                        { key: 'bbq', label: 'BBQ', desc: 'Social bias · 11 categories', fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'safetybench', label: 'SafetyBench', desc: 'Safety · 7 categories', fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'bbq', label: 'BBQ', desc: window.t('acc_bench.benchmarks.bbq_desc'), fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'safetybench', label: 'SafetyBench', desc: window.t('acc_bench.benchmarks.safetybench_desc'), fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
             ],
@@ -984,17 +984,17 @@
                 // Validate required fields
                 const errors = [];
                 const s = this.globalSettings;
-                if (!s.server.host) errors.push('Host');
-                if (!s.server.port) errors.push('Port');
-                if (!s.server.max_audio_upload_size) errors.push('Maximum Audio Upload Size');
-                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
-                if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
-                if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
-                if (!s.sampling.max_context_window) errors.push('Max Context Window');
-                if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (!s.server.host) errors.push(window.t('settings.server.host'));
+                if (!s.server.port) errors.push(window.t('settings.server.port'));
+                if (!s.server.max_audio_upload_size) errors.push(window.t('settings.advanced.max_audio_upload_size'));
+                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push(window.t('js.error.model_directory'));
+                if (!s.scheduler.max_concurrent_requests) errors.push(window.t('settings.resource.max_concurrent_requests'));
+                if (!s.scheduler.embedding_batch_size) errors.push(window.t('settings.resource.embedding_batch_size'));
+                if (!s.cache.ssd_cache_max_size) errors.push(window.t('js.error.max_cache_size'));
+                if (!s.sampling.max_context_window) errors.push(window.t('js.error.max_context_window'));
+                if (!s.sampling.max_tokens) errors.push(window.t('settings.generation.max_tokens'));
                 if (s.cache.gdn_snapshot_storage === 'ssd_sidecar' && s.cache.hot_cache_only) {
-                    errors.push('GDN SSD sidecar requires Hot Cache Only to be disabled');
+                    errors.push(window.t('js.error.gdn_sidecar_hot_cache_conflict'));
                 }
 
                 if (errors.length > 0) {
@@ -1087,7 +1087,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.saveSuccess = true;
-                        this.saveMessage = data.message || 'Settings saved successfully';
+                        this.saveMessage = data.message || window.t('js.success.settings_saved');
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
@@ -1891,7 +1891,7 @@
                 this.profileError = '';
                 const displayName = (this.newProfile.display_name || '').trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const apiName = (this.newProfile.api_name || this.slugifyProfileApiName(displayName)).trim();
@@ -1924,7 +1924,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save profile';
+                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -1962,7 +1962,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to apply profile';
+                        this.profileError = data.detail || window.t('js.error.apply_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2041,7 +2041,7 @@
                 const description = (p._editDescription ?? p.description ?? '').trim();
                 const exposeAsModel = !!(p._editExposeAsModel ?? p.expose_as_model);
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 if (!this.isValidProfileName(apiName)) {
@@ -2084,7 +2084,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update profile';
+                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2094,7 +2094,7 @@
                 this.profileError = '';
                 const displayName = this.newTemplate.display_name.trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const autoId = 't-' + Date.now().toString(36) + '-' +
@@ -2120,7 +2120,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save template';
+                        this.profileError = data.detail || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2141,7 +2141,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update template';
+                        this.profileError = data.detail || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2189,34 +2189,60 @@
                     ? ` · ${speed} prompt tok/s`
                     : '';
                 if (!recommendation.enabled) {
-                    return `Winner: GPU only${speedSuffix}`;
+                    return window.t('js.ane_tune.winner_gpu_only') + speedSuffix;
                 }
                 if (recommendation.backend === 'k2') {
-                    return `Winner: ANE dense ${Math.round(recommendation.mlp_fraction * 100)}% · shared expert ${Math.round(recommendation.shared_fraction * 100)}%${speedSuffix}`;
+                    return window.t('js.ane_tune.winner_ane_dense')
+                        .replace('{mlp}', Math.round(recommendation.mlp_fraction * 100))
+                        .replace('{shared}', Math.round(recommendation.shared_fraction * 100))
+                        + speedSuffix;
                 }
                 const parts = [
-                    `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
+                    (recommendation.fused_down
+                        ? window.t('js.ane_tune.fused_mlp')
+                        : window.t('js.ane_tune.mlp')
+                    ).replace(
+                        '{pct}',
+                        Math.round(Number(recommendation.mlp_fraction) * 100),
+                    ),
                 ];
                 if (recommendation.gdn_enabled) {
                     parts.push(
-                        `GDN ${Math.round(Number(recommendation.gdn_fraction) * 100)}%`
+                        window.t('js.ane_tune.gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.gdn_fraction) * 100),
+                        )
                     );
                 } else {
-                    parts.push('GDN off');
+                    parts.push(window.t('modal.model_settings.ane_gdn_off'));
                 }
                 if (recommendation.cpu_enabled) {
                     parts.push(
-                        `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
-                        `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
-                        `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
+                        window.t('js.ane_tune.cpu_gate').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_down').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_down_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100),
+                        ),
                     );
                 }
                 if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
                     parts.push(
-                        `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
+                        window.t('js.ane_tune.pad_tails').replace(
+                            '{n}',
+                            Number(recommendation.tail_padding_min_tokens),
+                        )
                     );
                 }
-                return `Winner: ${parts.join(' · ')}${speedSuffix}`;
+                return window.t('js.ane_tune.winner_parts')
+                    .replace('{parts}', parts.join(' · '))
+                    + speedSuffix;
             },
 
             _scheduleANETuningPoll() {
@@ -2277,7 +2303,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to start ANE tuning.');
+                        throw new Error(data.detail || window.t('js.error.start_ane_tuning_failed'));
                     }
                     this.aneTuning.tuningId = data.tuning_id;
                     this.aneTuning.total = Number(data.total || 0);
@@ -2301,11 +2327,11 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to read ANE tuning progress.');
+                        throw new Error(data.detail || window.t('js.error.read_ane_tuning_progress_failed'));
                     }
                     if (this.aneTuning.tuningId !== tuningId) return;
                     if (!data.termination_reason && data.status === 'error') {
-                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
+                        data.termination_reason = data.error || data.message || window.t('js.error.ane_tuning_failed');
                     }
                     this.aneTuning.status = data;
                     this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
@@ -2339,7 +2365,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to cancel ANE tuning.');
+                        throw new Error(data.detail || window.t('js.error.cancel_ane_tuning_failed'));
                     }
                     await this.pollANETuning();
                 } catch (error) {
@@ -2413,7 +2439,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to apply ANE tuning result.');
+                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -2511,12 +2537,11 @@
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
                 if (this.modelSettings.qwen35_ane_prefill_enabled) {
-                    return 'ANE prefill and INT8 activation prefill cannot both be '
-                        + 'enabled; they accelerate the same projections. Turn one off.';
+                    return window.t('js.error.ane_oq_a8_conflict');
                 }
                 const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
                 if (!Number.isInteger(minTokens) || minTokens < 1) {
-                    return 'oQ A8 minimum prompt tokens must be a positive integer.';
+                    return window.t('js.error.oq_a8_min_tokens_positive');
                 }
                 return null;
             },
@@ -2527,72 +2552,72 @@
 
                 const integer = (value, label, minimum) => {
                     if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
+                        return window.t('js.error.field_required').replace('{field}', label);
                     }
                     const number = Number(value);
-                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
-                    if (number < minimum) return `${label} must be at least ${minimum}.`;
+                    if (!Number.isInteger(number)) return window.t('js.error.field_integer').replace('{field}', label);
+                    if (number < minimum) return window.t('js.error.field_min').replace('{field}', label).replace('{min}', minimum);
                     return null;
                 };
                 const fraction = (value, label, minimum, maximum) => {
                     if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
+                        return window.t('js.error.field_required').replace('{field}', label);
                     }
                     const number = Number(value);
-                    if (!Number.isFinite(number)) return `${label} must be a number.`;
+                    if (!Number.isFinite(number)) return window.t('js.error.field_number').replace('{field}', label);
                     if (number < minimum || number > maximum) {
-                        return `${label} must be between ${minimum} and ${maximum}.`;
+                        return window.t('js.error.field_range').replace('{field}', label).replace('{min}', minimum).replace('{max}', maximum);
                     }
                     return null;
                 };
 
                 const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
-                let error = integer(sequenceLength, 'ANE prompt block', 1024);
+                let error = integer(sequenceLength, window.t('js.error.field.ane_prompt_block'), 1024);
                 if (!error && sequenceLength % 64 !== 0) {
-                    error = 'ANE prompt block must be a multiple of 64.';
+                    error = window.t('js.error.ane_prompt_block_multiple');
                 }
                 if (error) return error;
                 error = integer(
                     this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
-                    'ANE tail padding threshold',
+                    window.t('js.error.field.ane_tail_padding'),
                     0,
                 );
                 if (error) return error;
                 if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
-                    return 'ANE tail padding threshold must be less than the prompt block.';
+                    return window.t('js.error.ane_tail_padding_lt_prompt_block');
                 }
-                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, window.t('js.error.field.mlp_ane_fraction'), 0.05, 0.90);
                 if (error) return error;
-                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, window.t('js.error.field.ane_mlp_layers'), 1);
                 if (error) return error;
 
                 if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, 'CPU MLP fraction', 0, 0.25);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, window.t('js.error.field.cpu_mlp_fraction'), 0, 0.25);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, window.t('js.error.field.cpu_mlp_down_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, 'CPU GDN fraction', 0, 0.50);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, window.t('js.error.field.cpu_gdn_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
+                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, window.t('js.error.field.cpu_workers'), 0);
                     if (error) return error;
                     if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
-                        return 'CPU worker count must be between 0 and 64.';
+                        return window.t('js.error.cpu_workers_range');
                     }
                     if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
                         + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
-                        return 'MLP ANE and CPU fractions must total less than 1.0.';
+                        return window.t('js.error.mlp_ane_cpu_total');
                     }
                 }
 
                 if (this.modelSettings.qwen35_ane_prefill_gdn) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, window.t('js.error.field.gdn_ane_fraction'), 0.05, 0.90);
                     if (error) return error;
                     if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
                         && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
                         + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
-                        return 'GDN ANE and CPU fractions must total less than 1.0.';
+                        return window.t('js.error.gdn_ane_cpu_total');
                     }
-                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, window.t('js.error.field.ane_gdn_layers'), 0);
                     if (error) return error;
                 }
                 return null;
@@ -3539,7 +3564,7 @@
 
             formatActivityAge(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '';
-                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+                return window.t('status.active_models.last_token_ago').replace('{age}', this.formatDurationShort(seconds));
             },
 
             formatActivityMetadata(activity) {
@@ -3607,7 +3632,10 @@
                 if (!mp || !mp.enabled || !mp.hard_bytes) {
                     return window.t('status.active_models.enforcer_disabled');
                 }
-                return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
+                return window.t('status.active_models.pressure_label')
+                    .replace('{current}', this.formatSizeBytes(mp.current_bytes))
+                    .replace('{soft}', this.formatSizeBytes(mp.soft_bytes))
+                    .replace('{hard}', this.formatSizeBytes(mp.hard_bytes));
             },
 
             modelSizeLabel(model) {
@@ -3624,9 +3652,12 @@
                     return estimated;
                 }
                 if (!estimated || estimated === actual) {
-                    return `~${actual} obs`;
+                    return window.t('status.active_models.size_observed')
+                        .replace('{size}', actual);
                 }
-                return `~${actual} obs / ${estimated} est`;
+                return window.t('status.active_models.size_observed_estimated')
+                    .replace('{size}', actual)
+                    .replace('{estimated}', estimated);
             },
 
             clusterBadgeLabel(cluster) {
@@ -3881,7 +3912,7 @@
                             this.benchUploading = true;
                             this.benchProgress = {
                                 phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
+                                message: window.t('bench.uploading_community'),
                                 current: 0,
                                 total: 0,
                             };
@@ -4147,9 +4178,14 @@
                 const requested = this.benchRequestedPp(result);
                 const actual = result?.pp;
                 if (requested !== actual) {
-                    return `pp${actual} (requested pp${requested})/tg${result.tg}`;
+                    return window.t('bench.results.test.requested')
+                        .replace('{actual}', actual)
+                        .replace('{requested}', requested)
+                        .replace('{tg}', result.tg);
                 }
-                return `pp${actual}/tg${result.tg}`;
+                return window.t('bench.results.test.plain')
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
             },
 
             benchBatchPromptSummary() {
@@ -4161,9 +4197,14 @@
                 const minimum = result.prompt_tokens_min ?? result.pp;
                 const maximum = result.prompt_tokens_max ?? result.pp;
                 const actual = minimum === maximum
-                    ? `actual pp${minimum}`
-                    : `actual pp${minimum}-${maximum}`;
-                return `requested pp${requested} / ${actual} / tg${result.tg}`;
+                    ? window.t('bench.results.batch.actual_pp').replace('{pp}', minimum)
+                    : window.t('bench.results.batch.actual_pp_range')
+                        .replace('{min}', minimum)
+                        .replace('{max}', maximum);
+                return window.t('bench.results.batch.requested_summary')
+                    .replace('{requested}', requested)
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
             },
 
             // Unmeasured metrics (tpot_ms/gen_tps/tg_tps, plus ttft/pp when
@@ -4194,24 +4235,39 @@
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
 
-                lines.push('oMLX - LLM inference, optimized for your Mac');
+                lines.push(
+                    window.t('bench.results.text_export.title')
+                        .replace('{tagline}', window.t('app.tagline'))
+                );
                 lines.push('https://github.com/jundot/omlx');
                 if (this.benchRunExternal) {
-                    lines.push(`Benchmark Model: ${this.benchRunExternal.model} @ ${this.benchRunExternal.base_url}`);
-                    lines.push('Engine: External OpenAI-compatible endpoint');
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model_endpoint')
+                            .replace('{model}', this.benchRunExternal.model)
+                            .replace('{url}', this.benchRunExternal.base_url)
+                    );
+                    lines.push(window.t('bench.results.text_export.engine_external'));
                 } else {
-                    lines.push(`Benchmark Model: ${this.benchModelId}`);
-                    lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model')
+                            .replace('{model}', this.benchModelId)
+                    );
+                    lines.push(this.benchForceLmEngine
+                        ? window.t('bench.results.text_export.engine_force_lm')
+                        : window.t('bench.results.text_export.engine_auto'));
                 }
-                lines.push(`Context: ${this.benchContextLabel(this.benchContextProfile)}`);
+                lines.push(
+                    window.t('bench.results.text_export.context')
+                        .replace('{context}', this.benchContextLabel(this.benchContextProfile))
+                );
                 lines.push('='.repeat(80));
 
                 // Single Request Results
                 if (this.benchSingleResults.length > 0) {
                     lines.push('');
-                    lines.push('Single Request Results');
+                    lines.push(window.t('bench.results.single.section_label'));
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Test', 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad('Throughput', 12), pad('Peak Mem', 10)];
+                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
                     lines.push(hdr.join('  '));
                     for (const r of this.benchSingleResults) {
                         const row = [
@@ -4236,7 +4292,7 @@
                     lines.push(`${title}`);
                     lines.push(subtitle);
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Batch', 8), pad('tg TPS', 12), pad('Speedup', 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
+                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('tg TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
                     lines.push(hdr.join('  '));
                     if (baseline) {
                         const row = [
@@ -4255,7 +4311,7 @@
                         const row = [
                             rpad(r.batch_size + 'x', 8),
                             pad(this.benchFmtNum(r.tg_tps, 1, ' tok/s'), 12),
-                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : 'N/A', 8),
+                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : window.t('bench.results.text_export.not_available'), 8),
                             pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
@@ -4266,7 +4322,7 @@
                 };
 
                 buildBatchText(
-                    'Continuous Batching',
+                    window.t('bench.results.batch.title'),
                     this.benchBatchPromptSummary(),
                     this.benchBatchResults
                 );
@@ -4522,7 +4578,7 @@
                     });
                     if (!resp.ok) {
                         const err = await resp.json();
-                        throw new Error(err.detail || 'Failed to add to queue');
+                        throw new Error(err.detail || window.t('js.error.add_to_queue_failed'));
                     }
                     const data = await resp.json();
                     this.accQueue = data.queue || [];
@@ -4723,11 +4779,11 @@
                 const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
 
                 let lines = [];
-                lines.push('Intelligence Benchmark Comparison');
+                lines.push(window.t('acc_bench.results.comparison_title'));
                 lines.push('');
 
                 // Header row
-                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
+                let header = rpad('', benchWidth) + rpad(window.t('acc_bench.results.text_export.mode'), modeW) + rpad(window.t('acc_bench.results.text_export.sampled'), sampledW);
                 for (const m of models) header += pad(m, modelWidth);
                 lines.push(header);
                 lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
@@ -4739,7 +4795,9 @@
                     const total = sample?.total || 0;
                     const full = fullSizes[b] || 0;
                     const isFull = total >= full;
-                    const mode = isFull ? 'Full' : 'Sample';
+                    const mode = isFull
+                        ? window.t('acc_bench.results.text_export.full')
+                        : window.t('acc_bench.results.text_export.sample');
                     const sampledStr = isFull ? String(full) : (total + '/' + full);
 
                     let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
@@ -4752,11 +4810,14 @@
 
                 // Detail section per model
                 lines.push('');
-                lines.push('--- Detail ---');
+                lines.push(window.t('acc_bench.results.text_export.detail'));
                 for (const m of models) {
                     lines.push('');
-                    lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
+                    lines.push(
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', m)
+                    );
+                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
                     lines.push('-'.repeat(62));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
@@ -4765,20 +4826,24 @@
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
                             pad(r.time_s, 10) +
-                            pad(r.thinking_used ? 'Yes' : 'No', 8)
+                            pad(r.thinking_used
+                                ? window.t('acc_bench.results.text_export.yes')
+                                : window.t('acc_bench.results.text_export.no'), 8)
                         );
                         if (r.external) {
                             lines.push(
-                                `  Valid responses: ${r.valid_response_count}/${r.total}` +
-                                ` (${(r.valid_response_rate * 100).toFixed(1)}%)` +
-                                ` · Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%` +
-                                ` · Empty: ${r.empty_content_count}` +
-                                ` · Truncated: ${r.truncated_count}` +
-                                ` · Timeout: ${r.timeout_count}` +
-                                ` · HTTP: ${r.http_error_count}` +
-                                ` · Connection: ${r.connection_error_count}` +
-                                ` · Invalid: ${r.invalid_response_count}` +
-                                ` · Parse: ${r.parse_error_count}`
+                                window.t('acc_bench.results.text_export.external_detail')
+                                    .replace('{valid}', r.valid_response_count)
+                                    .replace('{total}', r.total)
+                                    .replace('{rate}', (r.valid_response_rate * 100).toFixed(1))
+                                    .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1))
+                                    .replace('{empty}', r.empty_content_count)
+                                    .replace('{truncated}', r.truncated_count)
+                                    .replace('{timeout}', r.timeout_count)
+                                    .replace('{http}', r.http_error_count)
+                                    .replace('{connection}', r.connection_error_count)
+                                    .replace('{invalid}', r.invalid_response_count)
+                                    .replace('{parse}', r.parse_error_count)
                             );
                         }
                     }
@@ -4862,31 +4927,88 @@
                     mime = 'text/csv';
                 } else {
                     const lines = [
-                        `Model: ${r.model_id}`,
-                        `Benchmark: ${r.benchmark.toUpperCase()}`,
-                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
-                        `Time: ${r.time_s}s`,
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', r.model_id),
+                        window.t('acc_bench.results.text_export.benchmark_line')
+                            .replace('{benchmark}', r.benchmark.toUpperCase()),
+                        window.t('acc_bench.results.text_export.accuracy_line')
+                            .replace('{accuracy}', (r.accuracy * 100).toFixed(1))
+                            .replace('{correct}', r.correct)
+                            .replace('{total}', r.total),
+                        window.t('acc_bench.results.text_export.time_line')
+                            .replace('{seconds}', r.time_s),
                         '',
                     ];
                     if (r.external) {
                         lines.splice(4, 0,
-                            `Valid responses: ${r.valid_response_count}/${r.total} (${(r.valid_response_rate * 100).toFixed(1)}%)`,
-                            `Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%`,
-                            `Empty: ${r.empty_content_count}; Truncated: ${r.truncated_count}; Timeout: ${r.timeout_count}; HTTP errors: ${r.http_error_count}; Connection errors: ${r.connection_error_count}; Invalid responses: ${r.invalid_response_count}; Parse errors: ${r.parse_error_count}`
+                            window.t('acc_bench.results.text_export.valid_responses_line')
+                                .replace('{valid}', r.valid_response_count)
+                                .replace('{total}', r.total)
+                                .replace('{rate}', (r.valid_response_rate * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.valid_answer_accuracy_line')
+                                .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.external_summary')
+                                .replace('{empty}', r.empty_content_count)
+                                .replace('{truncated}', r.truncated_count)
+                                .replace('{timeout}', r.timeout_count)
+                                .replace('{http}', r.http_error_count)
+                                .replace('{connection}', r.connection_error_count)
+                                .replace('{invalid}', r.invalid_response_count)
+                                .replace('{parse}', r.parse_error_count)
                         );
                     }
                     for (const q of qr) {
                         const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
-                        lines.push(`--- Q${q.id} [${label}] ---`);
-                        if (q.category) lines.push(`Category: ${q.category}`);
-                        if (r.external && q.finish_reason) lines.push(`Finish reason: ${q.finish_reason}`);
-                        if (r.external && (q.reasoning_fields_nonempty || []).length) lines.push(`Reasoning fields: ${q.reasoning_fields_nonempty.join(', ')}`);
-                        if (r.external && q.error_message) lines.push(`Error: ${q.error_message}`);
-                        lines.push(`Question: ${q.question || ''}`);
-                        lines.push(`Expected: ${q.expected}`);
-                        lines.push(`Predicted: ${q.predicted}`);
-                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
-                        lines.push(`Time: ${q.time_s}s`);
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_header')
+                                .replace('{id}', q.id)
+                                .replace('{label}', label)
+                        );
+                        if (q.category) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.category_line')
+                                    .replace('{category}', q.category)
+                            );
+                        }
+                        if (r.external && q.finish_reason) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.finish_reason_line')
+                                    .replace('{reason}', q.finish_reason)
+                            );
+                        }
+                        if (r.external && (q.reasoning_fields_nonempty || []).length) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.reasoning_fields_line')
+                                    .replace('{fields}', q.reasoning_fields_nonempty.join(', '))
+                            );
+                        }
+                        if (r.external && q.error_message) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.error_line')
+                                    .replace('{error}', q.error_message)
+                            );
+                        }
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_line')
+                                .replace('{question}', q.question || '')
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.expected_line')
+                                .replace('{expected}', q.expected)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.predicted_line')
+                                .replace('{predicted}', q.predicted)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.raw_response_line')
+                                .replace('{response}', q.raw_response
+                                    || window.t('acc_bench.results.text_export.empty_value'))
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.time_line')
+                                .replace('{seconds}', q.time_s)
+                        );
                         lines.push('');
                     }
                     content = lines.join('\n');
@@ -5538,7 +5660,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || 'Failed to save'));
+                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -5586,7 +5708,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
                         this.hfError = window.t('js.error.start_download_connection');
                     }
@@ -5664,7 +5786,7 @@
                         this.startHFRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Retry failed';
+                        this.hfError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -5777,15 +5899,15 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}${this.oqEnhanced ? 'e' : ''}`;
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
                     } else {
-                        this.oqError = data.detail || 'Failed to start quantization';
+                        this.oqError = data.detail || window.t('js.error.start_quantization_failed');
                     }
                 } catch (err) {
-                    this.oqError = 'Connection error. Server may be unavailable.';
+                    this.oqError = window.t('js.error.connection_error');
                 } finally {
                     this.oqStarting = false;
                 }
@@ -6004,7 +6126,7 @@
                         this.uploadTokenValidated = false;
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadTokenValidating = false;
                 }
@@ -6057,15 +6179,15 @@
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         this.uploadModalOpen = false;
-                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        this.uploadSuccess = window.t('models.uploader.upload_queued').replace('{name}', this.uploadModalModelName);
                         await this.loadUploadTasks();
                         this.startUploadRefresh();
                         setTimeout(() => { this.uploadSuccess = ''; }, 5000);
                     } else {
-                        this.uploadError = data.detail || 'Failed to start upload';
+                        this.uploadError = data.detail || window.t('js.error.start_upload_failed');
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadStarting = false;
                 }
@@ -6157,14 +6279,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to load recommended models';
+                        this.hfError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to load recommended models:', err);
@@ -6317,14 +6439,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Search failed';
+                        this.hfError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Search failed:', err);
@@ -6395,14 +6517,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to fetch model info';
+                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to fetch model info:', err);
@@ -6491,7 +6613,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
                         this.msError = window.t('js.error.start_download_connection');
                     }
@@ -6552,7 +6674,7 @@
                         this.startMSRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Retry failed';
+                        this.msError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -6609,14 +6731,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to load recommended models';
+                        this.msError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to load MS recommended models:', err);
@@ -6674,14 +6796,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Search failed';
+                        this.msError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('MS search failed:', err);
@@ -6736,14 +6858,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to fetch model info';
+                        this.msError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to fetch MS model info:', err);

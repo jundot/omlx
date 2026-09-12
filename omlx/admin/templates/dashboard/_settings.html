@@ -756,7 +756,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.usage.section_label') }}</span>
                                 </div>
                                 <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    Live
+                                    {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -783,41 +783,41 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Network</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.network.section_label') }}</span>
                                 </div>
                                 <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    Live
+                                    {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTP Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.http_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.proxy_example')|replace('{url}', 'http://proxy.company.com:8080') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.http_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTPS Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.https_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.proxy_example')|replace('{url}', 'http://proxy.company.com:8080') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.https_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">No Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Comma-separated hosts to bypass proxy</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.no_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.no_proxy_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.no_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">CA Bundle</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Path to PEM file for corporate TLS interception</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.ca_bundle') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.ca_bundle_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.ca_bundle"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
@@ -1142,7 +1142,7 @@
                                     <i data-lucide="file-text" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.markitdown.section_label') }}</span>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">PDF · DOCX · PPTX</span>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">{{ t('settings.integrations.markitdown.formats_badge') }}</span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
@@ -1212,7 +1212,7 @@
                                     <select x-model="globalSettings.integrations.markitdown_pdf_processing_engine"
                                             @change="saveIntegrationSettings()"
                                             class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                        <option value="markitdown">MarkItDown</option>
+                                        <option value="markitdown">{{ t('settings.integrations.markitdown.section_label') }}</option>
                                         <template x-for="model in markitdownOcrModels" :key="model.id">
                                             <option :value="model.id" x-text="model.id"></option>
                                         </template>
@@ -1226,7 +1226,7 @@
                                     <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.websearch.section_label') }}</span>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">DDGS · duckduckgo · brave · searxng</span>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">{{ t('settings.integrations.websearch.providers_badge') }}</span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
@@ -1237,11 +1237,11 @@
                                     <select x-model="globalSettings.integrations.web_search_provider"
                                             @change="saveIntegrationSettings()"
                                             class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                        <option value="ddgs">DDGS Total</option>
-                                        <option value="ddgs_custom">DDGS Custom</option>
-                                        <option value="duckduckgo">DuckDuckGo</option>
-                                        <option value="brave">Brave Search</option>
-                                        <option value="searxng">SearXNG</option>
+                                        <option value="ddgs">{{ t('settings.integrations.websearch.provider_ddgs_total') }}</option>
+                                        <option value="ddgs_custom">{{ t('settings.integrations.websearch.provider_ddgs_custom') }}</option>
+                                        <option value="duckduckgo">{{ t('settings.integrations.websearch.provider_duckduckgo') }}</option>
+                                        <option value="brave">{{ t('settings.integrations.websearch.provider_brave') }}</option>
+                                        <option value="searxng">{{ t('settings.integrations.websearch.provider_searxng') }}</option>
                                     </select>
                                 </div>
                                 <div x-show="globalSettings.integrations.web_search_provider === 'ddgs_custom'"

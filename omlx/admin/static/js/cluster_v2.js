@@ -92,13 +92,13 @@ function clusterV2Wizard() {
     const CLUSTER_V2_FAILURE_GRACE = 3;
 
     const CLUSTER_V2_LINK_META = {
-        tb: { label: 'Thunderbolt', icon: 'zap' },
-        ethernet: { label: 'Ethernet', icon: 'cable' },
-        wifi: { label: 'Wi-Fi', icon: 'wifi' },
+        tb: { label: window.t('cluster.v2.link.thunderbolt'), icon: 'zap' },
+        ethernet: { label: window.t('cluster.v2.link.ethernet'), icon: 'cable' },
+        wifi: { label: window.t('cluster.v2.link.wifi'), icon: 'wifi' },
         // This is the address used to find/control the peer. It is not the
         // collective fabric selected by the signed deployment.
-        tailscale: { label: 'Tailscale control', icon: 'globe' },
-        unknown: { label: 'Network', icon: 'help-circle' },
+        tailscale: { label: window.t('cluster.v2.link.tailscale_control'), icon: 'globe' },
+        unknown: { label: window.t('cluster.v2.link.network'), icon: 'help-circle' },
     };
 
     // Offline mirror of omlx/cluster/node_role.py (NodeRole.reserve_for):
@@ -110,13 +110,13 @@ function clusterV2Wizard() {
     const CLUSTER_V2_ROLE_FALLBACK = {
         workstation: {
             key: 'workstation',
-            label: 'Workstation',
+            label: window.t('cluster.v2.role.workstation'),
             reserve_bytes: 32 * 1024 ** 3,
             reserve_fraction: 0.5,
         },
         headless: {
             key: 'headless',
-            label: 'Headless',
+            label: window.t('cluster.v2.role.headless'),
             reserve_bytes: 0,
             reserve_fraction: 0.1,
         },
@@ -383,7 +383,7 @@ function clusterV2Wizard() {
             });
             if (response.status === 401) {
                 window.location.href = '/admin';
-                throw new Error('Sign-in required');
+                throw new Error(window.t('cluster.v2.err.sign_in_required'));
             }
             if (!response.ok) {
                 let detail = `${response.status} ${response.statusText}`;
@@ -416,7 +416,7 @@ function clusterV2Wizard() {
                 this.devicesUnreachable = false;
             } catch (error) {
                 this.devicesFailureCount += 1;
-                this.devicesError = error?.message || 'Cluster API unreachable';
+                this.devicesError = error?.message || window.t('cluster.v2.err.api_unreachable');
                 // 404 means the v2 discovery backend is not serving — that is
                 // a hard, actionable failure, not network noise.
                 if (
@@ -440,7 +440,7 @@ function clusterV2Wizard() {
                 if (this.deploymentsLoaded) {
                     this.notify(
                         'warning',
-                        error?.message || 'Could not refresh deployments',
+                        error?.message || window.t('cluster.v2.err.refresh_deployments'),
                     );
                 }
             }
@@ -462,7 +462,7 @@ function clusterV2Wizard() {
                 this.runtimePayload = null;
                 this.runtimeLoaded = false;
                 this.runtimeError =
-                    error?.message || 'Cluster runtime status is unavailable';
+                    error?.message || window.t('cluster.v2.err.runtime_unavailable');
             }
         },
 
@@ -503,7 +503,7 @@ function clusterV2Wizard() {
                     this.joinApprovedNotified = true;
                     this.notify(
                         'success',
-                        `This Mac joined ${this.joinTargetName()}'s cluster.`,
+                        window.t('cluster.v2.toast.joined_cluster').replace('{name}', this.joinTargetName()),
                     );
                     await this.refreshDevices();
                     this.startChecks();
@@ -515,7 +515,7 @@ function clusterV2Wizard() {
                     this.joinDeniedNotified = true;
                     this.notify(
                         'error',
-                        `${this.joinTargetName()} denied the join request.`,
+                        window.t('cluster.v2.toast.join_denied').replace('{name}', this.joinTargetName()),
                     );
                     // Denied is terminal server-side; reset locally so the
                     // panel clears instead of sticking on the refusal.
@@ -528,7 +528,7 @@ function clusterV2Wizard() {
                 if (error?.status !== 404) {
                     this.join = {
                         ...this.join,
-                        error: error?.message || 'Join status unavailable',
+                        error: error?.message || window.t('cluster.v2.err.join_status_unavailable'),
                     };
                 }
             }
@@ -715,33 +715,33 @@ function clusterV2Wizard() {
             );
             if (capability?.active === false) {
                 return {
-                    label: 'Unavailable',
+                    label: window.t('cluster.v2.batch.label_unavailable'),
                     detail:
                         capability.reason ||
-                        'This model cannot merge its request caches.',
+                        window.t('cluster.v2.batch.unavailable_reason'),
                     tone: 'bg-amber-50 border-amber-200 text-amber-700',
                     target,
                 };
             }
             if (target <= 1 || capability?.enabled === false) {
                 return {
-                    label: 'Sequential',
-                    detail: 'The resolved batch target is one request.',
+                    label: window.t('cluster.v2.batch.label_sequential'),
+                    detail: window.t('cluster.v2.batch.sequential_detail'),
                     tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
                     target,
                 };
             }
             if (lastSize > 1) {
                 return {
-                    label: `Batched ${lastSize}`,
-                    detail: `Last scheduler step coalesced ${lastSize} of ${target} possible requests.`,
+                    label: window.t('cluster.v2.batch.label_batched').replace('{n}', String(lastSize)),
+                    detail: window.t('cluster.v2.batch.batched_detail').replace('{last}', String(lastSize)).replace('{target}', String(target)),
                     tone: 'bg-green-50 border-green-200 text-green-700',
                     target,
                 };
             }
             return {
-                label: 'Automatic',
-                detail: `Enabled for overlapping compatible requests, up to ${target} per scheduler step.`,
+                label: window.t('cluster.v2.batch.label_automatic'),
+                detail: window.t('cluster.v2.batch.automatic_detail').replace('{target}', String(target)),
                 tone: 'bg-green-50 border-green-200 text-green-700',
                 target,
             };
@@ -777,25 +777,28 @@ function clusterV2Wizard() {
                 Number(metrics?.active_request_metrics_truncated || 0),
             );
             if (active > 0) {
-                return `${active} active${hidden ? ` · ${hidden} not shown` : ''}`;
+                return `${window.t('cluster.v2.req.active_count').replace('{n}', String(active))}${hidden ? ` · ${window.t('cluster.v2.req.not_shown').replace('{n}', String(hidden))}` : ''}`;
             }
-            return metrics?.last_request ? 'Last completed request' : 'Waiting';
+            return metrics?.last_request ? window.t('cluster.v2.req.last_completed') : window.t('cluster.v2.req.waiting');
         },
 
         requestPhaseLabel(request) {
+            // Stable, untranslated identifier. The display site localises it
+            // via window.t('cluster.v2.phase.<id>'); requestPhaseTone() switches
+            // on the same identifiers, so the two never drift apart.
             if (request?._history) {
-                return request?.status === 'failed' ? 'Failed' : 'Complete';
+                return request?.status === 'failed' ? 'failed' : 'complete';
             }
-            if (request?.prefill_progress?.active) return 'Prefill';
-            if (Number(request?.completion_tokens || 0) > 0) return 'Decode';
-            return 'Queued';
+            if (request?.prefill_progress?.active) return 'prefill';
+            if (Number(request?.completion_tokens || 0) > 0) return 'decode';
+            return 'queued';
         },
 
         requestPhaseTone(request) {
             const phase = this.requestPhaseLabel(request);
-            if (phase === 'Prefill') return 'bg-blue-50 border-blue-200 text-blue-700';
-            if (phase === 'Decode') return 'bg-green-50 border-green-200 text-green-700';
-            if (phase === 'Failed') return 'bg-red-50 border-red-200 text-red-700';
+            if (phase === 'prefill') return 'bg-blue-50 border-blue-200 text-blue-700';
+            if (phase === 'decode') return 'bg-green-50 border-green-200 text-green-700';
+            if (phase === 'failed') return 'bg-red-50 border-red-200 text-red-700';
             return 'bg-neutral-50 border-neutral-200 text-neutral-600';
         },
 
@@ -818,7 +821,7 @@ function clusterV2Wizard() {
                 cached > 0 &&
                 uncached <= Math.max(16, Math.floor(prompt * 0.01))
             ) {
-                return 'Cache hit';
+                return window.t('cluster.v2.req.cache_hit');
             }
             // The last progress sample freezes at the compute boundary. Keep
             // its average after decode begins; TTFT also includes queueing and
@@ -830,24 +833,23 @@ function clusterV2Wizard() {
         },
 
         requestPrefillDetail(request) {
-            if (request?.prefill_progress?.active) return 'live average';
+            if (request?.prefill_progress?.active) return window.t('cluster.v2.req.live_average');
             const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
             const cached = Math.min(
                 prompt,
                 Math.max(0, Number(request?.cached_tokens || 0)),
             );
             if (cached > 0) {
-                return `${cached.toLocaleString()} reused · ${Math.max(
-                    0,
-                    prompt - cached,
-                ).toLocaleString()} new`;
+                return window.t('cluster.v2.req.prefill_reuse')
+                .replace('{cached}', cached.toLocaleString())
+                .replace('{new}', Math.max(0, prompt - cached).toLocaleString());
             }
-            return 'prompt average';
+            return window.t('cluster.v2.req.prompt_average');
         },
 
         requestDecodeRate(request) {
             const tokens = Math.max(0, Number(request?.completion_tokens || 0));
-            if (!request?._history && tokens === 1) return 'Measuring…';
+            if (!request?._history && tokens === 1) return window.t('cluster.v2.req.measuring');
             return this.formatRequestRate(request?.decode_tps);
         },
 
@@ -861,15 +863,15 @@ function clusterV2Wizard() {
             if (progress?.active) {
                 const processed = Math.max(0, Number(progress.processed || 0));
                 const total = Math.max(0, Number(progress.total || 0));
-                return `${processed.toLocaleString()} / ${total.toLocaleString()} new`;
+                return window.t('cluster.v2.req.prefill_progress').replace('{processed}', processed.toLocaleString()).replace('{total}', total.toLocaleString());
             }
             const uncached = Math.max(0, prompt - cached);
-            return `${uncached.toLocaleString()} new${cached ? ` · ${cached.toLocaleString()} cached` : ''}`;
+            return `${window.t('cluster.v2.req.new_tokens').replace('{n}', uncached.toLocaleString())}${cached ? ` · ${window.t('cluster.v2.req.cached_tokens').replace('{n}', cached.toLocaleString())}` : ''}`;
         },
 
         requestDecodeDetail(request) {
             const tokens = Math.max(0, Number(request?.completion_tokens || 0));
-            return `${tokens.toLocaleString()} generated`;
+            return window.t('cluster.v2.req.generated').replace('{n}', tokens.toLocaleString());
         },
 
         deploymentRuntimeLauncher(deployment = this.configuredDeployment()) {
@@ -966,7 +968,7 @@ function clusterV2Wizard() {
                 : '';
             return tail
                 ? String(tail)
-                : 'The worker stopped reporting a live ready state.';
+                : window.t('cluster.v2.deploy.worker_stopped');
         },
 
         deploymentStatus(deployment = this.configuredDeployment()) {
@@ -974,10 +976,10 @@ function clusterV2Wizard() {
             if (state === 'ready') {
                 return {
                     state,
-                    eyebrow: 'Cluster running',
-                    label: 'Ready',
+                    eyebrow: window.t('cluster.v2.deploy.status_running'),
+                    label: window.t('cluster.v2.deploy.status_ready'),
                     detail:
-                        'The distributed weights are resident and available through oMLX.',
+                        window.t('cluster.v2.deploy.status_running_detail'),
                     tone: 'bg-green-50 border-green-200 text-green-700',
                     pulse: true,
                 };
@@ -985,10 +987,10 @@ function clusterV2Wizard() {
             if (state === 'loading') {
                 return {
                     state,
-                    eyebrow: 'Starting cluster',
-                    label: 'Loading',
+                    eyebrow: window.t('cluster.v2.deploy.status_starting'),
+                    label: window.t('cluster.v2.deploy.status_loading'),
                     detail:
-                        'oMLX is loading and validating the model across your Macs.',
+                        window.t('cluster.v2.deploy.status_starting_detail'),
                     tone: 'bg-blue-50 border-blue-200 text-blue-700',
                     pulse: true,
                 };
@@ -996,8 +998,8 @@ function clusterV2Wizard() {
             if (state === 'failed') {
                 return {
                     state,
-                    eyebrow: 'Cluster needs attention',
-                    label: 'Failed',
+                    eyebrow: window.t('cluster.v2.deploy.status_attention'),
+                    label: window.t('cluster.v2.deploy.status_failed'),
                     detail: this.deploymentFailureReason(deployment),
                     tone: 'bg-red-50 border-red-200 text-red-700',
                     pulse: false,
@@ -1006,21 +1008,20 @@ function clusterV2Wizard() {
             if (state === 'unknown') {
                 return {
                     state,
-                    eyebrow: 'Cluster configured',
-                    label: 'Checking',
+                    eyebrow: window.t('cluster.v2.deploy.status_configured'),
+                    label: window.t('cluster.v2.deploy.status_checking'),
                     detail: this.runtimeError
-                        ? `Runtime status unavailable: ${this.runtimeError}`
-                        : 'Checking whether the distributed weights are resident.',
+                        ? window.t('cluster.v2.deploy.status_runtime_unavailable').replace('{message}', this.runtimeError)
+                        : window.t('cluster.v2.deploy.status_checking_detail'),
                     tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
                     pulse: true,
                 };
             }
             return {
                 state: 'configured',
-                eyebrow: 'Cluster configured',
-                label: 'Not loaded',
-                detail:
-                    'The placement is saved, but no model weights are resident. This is expected after an unload or reboot.',
+                eyebrow: window.t('cluster.v2.deploy.status_configured'),
+                label: window.t('cluster.v2.deploy.status_not_loaded'),
+                detail: window.t('cluster.v2.deploy.status_not_loaded_detail'),
                 tone: 'bg-amber-50 border-amber-200 text-amber-700',
                 pulse: false,
             };
@@ -1032,9 +1033,11 @@ function clusterV2Wizard() {
                     deployment?.prompt_cache_ssd,
             );
             return enabled
-                ? 'Prompt reuse · memory + persistent SSD snapshots · ' +
-                    `${Math.round(Number(deployment?.execution?.prompt_cache_ssd_max_bytes || 20 * (1024 ** 3)) / (1024 ** 3))} GiB per rank`
-                : 'Prompt reuse · memory only (SSD snapshots off)';
+                ? window.t('cluster.v2.deploy.cache_memory_ssd').replace(
+                      '{gib}',
+                      String(Math.round(Number(deployment?.execution?.prompt_cache_ssd_max_bytes || 20 * (1024 ** 3)) / (1024 ** 3))),
+                  )
+                : window.t('cluster.v2.deploy.cache_memory_only');
         },
 
         // =====================================================================
@@ -1078,11 +1081,11 @@ function clusterV2Wizard() {
             // to mix Plan and Active semantics during activation.
             const wizard = this.wizardState();
             const steps = [
-                { key: 'discover', title: 'Find devices', hint: 'Automatic on your network' },
-                { key: 'pair', title: 'Pair', hint: 'One code, both Macs' },
-                { key: 'checks', title: 'Check', hint: 'SSH · model · RDMA' },
-                { key: 'plan', title: 'Split the model', hint: this.planStepHint() },
-                { key: 'active', title: 'Activate', hint: 'Run across the pool' },
+                { key: 'discover', title: window.t('cluster.v2.steps.discover_title'), hint: window.t('cluster.v2.steps.discover_hint') },
+                { key: 'pair', title: window.t('cluster.v2.steps.pair_title'), hint: window.t('cluster.v2.steps.pair_hint') },
+                { key: 'checks', title: window.t('cluster.v2.steps.checks_title'), hint: window.t('cluster.v2.steps.checks_hint') },
+                { key: 'plan', title: window.t('cluster.v2.steps.plan_title'), hint: this.planStepHint() },
+                { key: 'active', title: window.t('cluster.v2.steps.active_title'), hint: window.t('cluster.v2.steps.active_hint') },
             ];
             // Map the 8 UI states onto the 5 step slots.
             const slotFor = {
@@ -1202,19 +1205,19 @@ function clusterV2Wizard() {
 
         activationProgressLabel() {
             const labels = {
-                staging: 'Syncing model files across the pool',
-                starting: 'Starting cluster activation',
-                preflight: 'Verifying the signed deployment',
-                initializing: 'Starting rank processes',
-                initializing_full_replica: 'Initializing full model replicas',
-                loading_weights: 'Loading model weights',
-                materializing_fixed: 'Materializing shared weights',
-                materializing_layers: 'Materializing model layers',
-                tensor_ready: 'Finalizing tensor shards',
-                weights_resident: 'Model weights are resident',
-                validating: 'Validating every rank',
-                warming_prefill_shape: 'Warming the prefill path',
-                ready: 'Cluster ready',
+                staging: window.t('cluster.v2.progress.staging'),
+                starting: window.t('cluster.v2.progress.starting'),
+                preflight: window.t('cluster.v2.progress.preflight'),
+                initializing: window.t('cluster.v2.progress.initializing'),
+                initializing_full_replica: window.t('cluster.v2.progress.initializing_full_replica'),
+                loading_weights: window.t('cluster.v2.progress.loading_weights'),
+                materializing_fixed: window.t('cluster.v2.progress.materializing_fixed'),
+                materializing_layers: window.t('cluster.v2.progress.materializing_layers'),
+                tensor_ready: window.t('cluster.v2.progress.tensor_ready'),
+                weights_resident: window.t('cluster.v2.progress.weights_resident'),
+                validating: window.t('cluster.v2.progress.validating'),
+                warming_prefill_shape: window.t('cluster.v2.progress.warming_prefill_shape'),
+                ready: window.t('cluster.v2.progress.ready'),
             };
             const stage = this.activationLoadStage();
             return labels[stage] || labels.starting;
@@ -1226,7 +1229,7 @@ function clusterV2Wizard() {
             }
             const jobs = this.activationRuntimeJobs();
             if (!jobs.length) {
-                return 'Preparing the launcher and waiting for rank heartbeats.';
+                return window.t('cluster.v2.progress.preparing_launcher');
             }
             const ready = jobs.filter(
                 (job) => job?.phase === 'ready' && job?.live === true,
@@ -1235,7 +1238,7 @@ function clusterV2Wizard() {
                 jobs.length,
                 ...jobs.map((job) => Math.max(0, Number(job?.world_size || 0))),
             );
-            return `${ready} of ${expected} ranks ready · readiness canary runs last`;
+            return window.t('cluster.v2.progress.ranks_ready').replace('{ready}', String(ready)).replace('{expected}', String(expected));
         },
 
         // Step-4 hint is strategy-aware: a tensor split gives every Mac every
@@ -1243,7 +1246,7 @@ function clusterV2Wizard() {
         planStepHint() {
             return this.planStrategy === 'tensor'
                 ? t('cluster.v2.steps.plan_hint_tensor')
-                : 'Layers per Mac';
+                : window.t('cluster.v2.steps.plan_hint_pipeline');
         },
 
         // =====================================================================
@@ -1273,7 +1276,7 @@ function clusterV2Wizard() {
             return (
                 device?.friendly_name ||
                 device?.node_id?.slice(0, 8) ||
-                'Unknown device'
+                window.t('cluster.v2.device.unknown')
             );
         },
 
@@ -1284,11 +1287,11 @@ function clusterV2Wizard() {
 
         deviceRamLabel(device) {
             const ram = this.deviceRamGb(device);
-            return ram ? `${ram} GB` : 'Memory unknown';
+            return ram ? `${ram} GB` : window.t('cluster.v2.device.memory_unknown');
         },
 
         deviceChipLabel(device) {
-            return device?.caps?.chip || 'Apple silicon';
+            return device?.caps?.chip || window.t('cluster.v2.device.apple_silicon');
         },
 
         deviceLinkMeta(device) {
@@ -1309,12 +1312,12 @@ function clusterV2Wizard() {
         },
 
         deviceStateLabel(device) {
-            if (device?.is_self) return 'This Mac';
-            if (device?.state === 'awaiting_approval') return 'Wants to join';
-            if (device?.paired) return 'Paired';
-            if (device?.state === 'dead') return 'Unreachable';
-            if (device?.state === 'suspect') return 'Connection shaky';
-            return 'Found nearby';
+            if (device?.is_self) return window.t('cluster.v2.device.this_mac');
+            if (device?.state === 'awaiting_approval') return window.t('cluster.v2.device.wants_to_join');
+            if (device?.paired) return window.t('cluster.v2.device.paired');
+            if (device?.state === 'dead') return window.t('cluster.v2.device.unreachable');
+            if (device?.state === 'suspect') return window.t('cluster.v2.device.connection_shaky');
+            return window.t('cluster.v2.device.found_nearby');
         },
 
         combinedMemoryLabel() {
@@ -1322,7 +1325,7 @@ function clusterV2Wizard() {
                 (sum, device) => sum + (this.deviceRamGb(device) || 0),
                 0,
             );
-            return total ? `${total} GB combined` : '';
+            return total ? window.t('cluster.v2.device.combined').replace('{n}', String(total)) : '';
         },
 
         // =====================================================================
@@ -1345,7 +1348,7 @@ function clusterV2Wizard() {
             const code = (this.pairing.code || '').trim();
             if (!device || this.pairing.busy) return;
             if (!/^\d{6}$/.test(code)) {
-                this.pairing.error = 'The code is the 6 digits shown on the other Mac.';
+                this.pairing.error = window.t('cluster.v2.pair.code_hint');
                 return;
             }
             this.pairing.busy = true;
@@ -1357,7 +1360,7 @@ function clusterV2Wizard() {
                 });
                 this.notify(
                     'success',
-                    `${this.deviceName(device)} joined the cluster.`,
+                    window.t('cluster.v2.toast.peer_joined').replace('{name}', this.deviceName(device)),
                 );
                 this.cancelPairing();
                 if (this.membershipPanelOpen) {
@@ -1383,14 +1386,14 @@ function clusterV2Wizard() {
             } catch (error) {
                 if (error?.status === 404 || error?.status === 409) {
                     this.pairing.error =
-                        'No join request from this Mac yet. On the other Mac, open its oMLX dashboard and press Pair first — then type its code here.';
+                        window.t('cluster.v2.pair.no_request');
                 } else if (error?.status === 403 || error?.status === 429) {
                     this.pairing.error =
                         error.message ||
-                        'Wrong code too many times — wait for the lockout to lift and try a fresh code.';
+                        window.t('cluster.v2.pair.lockout');
                 } else {
                     this.pairing.error =
-                        error?.message || 'Pairing failed. Try again.';
+                        error?.message || window.t('cluster.v2.err.pairing_failed');
                 }
             } finally {
                 this.pairing.busy = false;
@@ -1406,12 +1409,12 @@ function clusterV2Wizard() {
                 });
                 this.notify(
                     'info',
-                    `Join request from ${this.deviceName(device)} denied.`,
+                    window.t('cluster.v2.toast.join_request_denied').replace('{name}', this.deviceName(device)),
                 );
             } catch (error) {
                 this.notify(
                     'error',
-                    error?.message || 'Could not deny the join request',
+                    error?.message || window.t('cluster.v2.err.deny_join'),
                 );
             }
             if (this.pairing.target?.node_id === device?.node_id) {
@@ -1433,13 +1436,13 @@ function clusterV2Wizard() {
                 });
                 this.notify(
                     'info',
-                    `${this.deviceName(device)} was removed from the cluster.`,
+                    window.t('cluster.v2.toast.device_removed').replace('{name}', this.deviceName(device)),
                 );
                 await this.refreshDevices();
             } catch (error) {
                 this.notify(
                     'error',
-                    error?.message || 'Could not unpair this device',
+                    error?.message || window.t('cluster.v2.err.unpair'),
                 );
             }
         },
@@ -1458,7 +1461,7 @@ function clusterV2Wizard() {
                 this.join.target_name ||
                 this.join.coordinator_name ||
                 this.join.coordinator_addr ||
-                'the other Mac'
+                window.t('cluster.v2.join.other_mac')
             );
         },
 
@@ -1503,7 +1506,7 @@ function clusterV2Wizard() {
             if (!target) {
                 this.notify(
                     'error',
-                    `No usable address for ${this.deviceName(device)} yet — try Add by IP.`,
+                    window.t('cluster.v2.toast.no_address').replace('{name}', this.deviceName(device)),
                 );
                 return;
             }
@@ -1534,7 +1537,7 @@ function clusterV2Wizard() {
                 this.join.busy = false;
                 this.notify(
                     'error',
-                    error?.message || 'Could not reach that Mac',
+                    error?.message || window.t('cluster.v2.err.reach_mac'),
                 );
             }
         },
@@ -1565,8 +1568,8 @@ function clusterV2Wizard() {
                     this.notify(
                         snapshot?.cleanup_pending ? 'warning' : 'info',
                         snapshot?.cleanup_pending
-                            ? 'Join cancelled on this Mac. Cleanup on the other Mac is pending.'
-                            : 'Join cancelled.',
+                            ? window.t('cluster.v2.toast.join_cancelled_pending')
+                            : window.t('cluster.v2.toast.join_cancelled'),
                     );
                 }
             } catch (error) {
@@ -1575,7 +1578,7 @@ function clusterV2Wizard() {
                 if (!options.silent) {
                     this.notify(
                         'error',
-                        error?.message || 'Could not cancel the join',
+                        error?.message || window.t('cluster.v2.err.cancel_join'),
                     );
                 }
             }
@@ -1590,14 +1593,14 @@ function clusterV2Wizard() {
             const raw = (this.manualAddr || '').trim();
             const match = raw.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
             if (!match) {
-                this.manualError = 'Enter an IPv4 address like 192.168.1.50 or 192.168.1.50:8000.';
+                this.manualError = window.t('cluster.v2.manual.invalid_addr');
                 return;
             }
             const ip = match[1];
             const port = match[2] ? parseInt(match[2], 10) : 8000;
             const octetsOk = ip.split('.').every((part) => Number(part) <= 255);
             if (!octetsOk || !(port >= 1 && port <= 65535)) {
-                this.manualError = 'That address or port is out of range.';
+                this.manualError = window.t('cluster.v2.manual.out_of_range');
                 return;
             }
             this.manualBusy = true;
@@ -1610,7 +1613,7 @@ function clusterV2Wizard() {
                 await this.refreshDevices();
                 if (result && result.verified) {
                     const name = result.peer?.friendly_name || ip;
-                    this.notify('success', `Found ${name} at ${ip}.`);
+                    this.notify('success', window.t('cluster.v2.toast.found_peer').replace('{name}', name).replace('{ip}', ip));
                     if (options.beginJoin !== false) {
                         // First-cluster setup may join in either direction.
                         // An existing coordinator only discovers here: the
@@ -1620,13 +1623,13 @@ function clusterV2Wizard() {
                 } else {
                     this.notify(
                         'warning',
-                        'No oMLX node answered at that address yet — it stays on the list while we keep trying.',
+                        window.t('cluster.v2.toast.no_node_answered'),
                     );
                 }
                 this.manualAddr = '';
             } catch (error) {
                 this.manualError =
-                    error?.message || 'Could not add that address';
+                    error?.message || window.t('cluster.v2.err.add_address');
             } finally {
                 this.manualBusy = false;
             }
@@ -1688,7 +1691,7 @@ function clusterV2Wizard() {
                     [peer.node_id]: {
                         ok: false,
                         ssh,
-                        error: error?.message || 'Probe failed',
+                        error: error?.message || window.t('cluster.v2.err.probe_failed'),
                     },
                 };
             }
@@ -1700,7 +1703,7 @@ function clusterV2Wizard() {
                 this.checks.benchmark = {
                     ok: false,
                     error:
-                        'Choose a downloaded model first. Calibration measures that real model on this exact cluster.',
+                        window.t('cluster.v2.checks.bench_need_model'),
                 };
                 return;
             }
@@ -1713,13 +1716,13 @@ function clusterV2Wizard() {
                 if (!proposal) {
                     this.checks.benchmark = {
                         ok: false,
-                        error: this.planError || 'Calibration failed',
+                        error: this.planError || window.t('cluster.v2.err.calibration_failed'),
                     };
                 }
             } catch (error) {
                 this.checks.benchmark = {
                     ok: false,
-                    error: error?.message || 'Benchmark failed',
+                    error: error?.message || window.t('cluster.v2.err.benchmark_failed'),
                 };
             } finally {
                 this.checks.benchmarkRunning = false;
@@ -1747,7 +1750,7 @@ function clusterV2Wizard() {
                 );
                 rows.push({
                     key: 'ssh',
-                    label: 'SSH connection',
+                    label: window.t('cluster.v2.checks.ssh_label'),
                     status: !this.checks.started
                         ? 'pending'
                         : running
@@ -1760,16 +1763,15 @@ function clusterV2Wizard() {
                         ? 'fail'
                         : 'running',
                     detail: failures.length
-                        ? `Can't reach ${failures
-                              .map((peer) => this.deviceName(peer))
-                              .join(', ')} over SSH.`
+                        ? window.t('cluster.v2.checks.ssh_fail')
+                              .replace('{names}', failures.map((peer) => this.deviceName(peer)).join(', '))
                         : warnings.length
                         ? warnings.join(' ')
-                        : 'Each Mac accepts the cluster key.',
+                        : window.t('cluster.v2.checks.ssh_ok'),
                     fix: failures.length
-                        ? `On the failing Mac: System Settings → General → Sharing → turn on Remote Login, then press Re-run checks.`
+                        ? window.t('cluster.v2.checks.ssh_fix')
                         : warnings.length
-                        ? 'The connection works, but the remote runtime reported this advisory. Review it before activating a performance-sensitive cluster.'
+                        ? window.t('cluster.v2.checks.warn_fix')
                         : '',
                 });
             }
@@ -1779,7 +1781,7 @@ function clusterV2Wizard() {
             {
                 const model = this.selectedModel();
                 let status = 'skipped';
-                let detail = 'Checked automatically when you pick a model.';
+                let detail = window.t('cluster.v2.checks.model_skipped');
                 if (model) {
                     const holders = new Set(
                         (model.locations || []).map((loc) => loc.node_id),
@@ -1793,22 +1795,20 @@ function clusterV2Wizard() {
                     );
                     if (missing.length) {
                         status = 'fail';
-                        detail = `${this.shortModelName(
-                            model,
-                        )} is missing on ${missing
-                            .map((device) => this.deviceName(device))
-                            .join(', ')}.`;
+                        detail = window.t('cluster.v2.checks.model_missing')
+                        .replace('{model}', this.shortModelName(model))
+                        .replace('{names}', missing.map((device) => this.deviceName(device)).join(', '));
                     } else {
                         status = 'pass';
-                        detail = `${this.shortModelName(model)} is on every Mac.`;
+                        detail = window.t('cluster.v2.checks.model_on_every').replace('{model}', this.shortModelName(model));
                     }
                 }
                 rows.push({
                     key: 'model',
-                    label: 'Model on every Mac',
+                    label: window.t('cluster.v2.checks.model_label'),
                     status,
                     detail,
-                    fix: 'Open the model on the missing Mac and download it there, or let activation stage the files for you.',
+                    fix: window.t('cluster.v2.checks.model_fix'),
                 });
             }
 
@@ -1817,17 +1817,17 @@ function clusterV2Wizard() {
                 const mismatches = this.versionMismatches();
                 rows.push({
                     key: 'version',
-                    label: 'Matching oMLX versions',
+                    label: window.t('cluster.v2.checks.version_label'),
                     status: mismatches.length ? 'fail' : 'pass',
                     detail: mismatches.length
                         ? mismatches
                               .map(
                                   (m) =>
-                                      `${m.name} runs v${m.peerVersion}, this Mac runs v${m.selfVersion}.`,
+                                      window.t('cluster.v2.checks.version_mismatch').replace('{name}', m.name).replace('{peer}', String(m.peerVersion)).replace('{self}', String(m.selfVersion)),
                               )
                               .join(' ')
-                        : 'Every Mac runs the same build.',
-                    fix: 'Update the older Mac to the same oMLX build. App: it auto-updates. Brew: brew upgrade omlx. Source: pull the same commit on both Macs.',
+                        : window.t('cluster.v2.checks.version_ok'),
+                    fix: window.t('cluster.v2.checks.version_fix'),
                 });
             }
 
@@ -1839,10 +1839,10 @@ function clusterV2Wizard() {
                 if (!fabricMembers.length && !this.selfDevice()?.caps?.jaccl) {
                     rows.push({
                         key: 'rdma',
-                        label: 'Thunderbolt RDMA (rdma_ctl)',
+                        label: window.t('cluster.v2.checks.rdma_label'),
                         status: 'skipped',
                         detail:
-                            'No Thunderbolt fabric detected — the TCP ring transport will be used instead.',
+                            window.t('cluster.v2.checks.rdma_skipped'),
                         fix: '',
                     });
                 } else {
@@ -1856,18 +1856,17 @@ function clusterV2Wizard() {
                     });
                     rows.push({
                         key: 'rdma',
-                        label: 'Thunderbolt RDMA (rdma_ctl)',
+                        label: window.t('cluster.v2.checks.rdma_label'),
                         status: this.checks.running
                             ? 'running'
                             : failing.length
                             ? 'fail'
                             : 'pass',
                         detail: failing.length
-                            ? `RDMA is not enabled on ${failing
-                                  .map((peer) => this.deviceName(peer))
-                                  .join(', ')}.`
-                            : 'rdma_ctl reports devices on every Thunderbolt Mac.',
-                        fix: 'Connect the Thunderbolt cable and run `rdma_ctl status` on every Mac. If you are not on macOS 27 and it reports disabled: shut down, hold the power button to enter Recovery, open Utilities → Terminal, run `rdma_ctl enable`, then restart and Re-run checks. Without RDMA the cluster falls back to the slower TCP ring.',
+                            ? window.t('cluster.v2.checks.rdma_fail')
+                                  .replace('{names}', failing.map((peer) => this.deviceName(peer)).join(', '))
+                            : window.t('cluster.v2.checks.rdma_ok'),
+                        fix: window.t('cluster.v2.checks.rdma_fix'),
                     });
                 }
             }
@@ -1877,7 +1876,7 @@ function clusterV2Wizard() {
                 const bench = this.checks.benchmark;
                 rows.push({
                     key: 'benchmark',
-                    label: 'Speed benchmark',
+                    label: window.t('cluster.v2.checks.bench_label'),
                     status: this.checks.benchmarkRunning
                         ? 'running'
                         : bench
@@ -1889,12 +1888,12 @@ function clusterV2Wizard() {
                         : 'pending',
                     detail: bench
                         ? bench.ok
-                            ? 'Measured compute and link speeds shape the layer split.'
+                            ? window.t('cluster.v2.checks.bench_ok')
                             : bench.error
                         : !this.selectedModelPath
-                        ? 'Runs automatically after you choose a model.'
-                        : 'Measuring the selected model so the split matches real speeds.',
-                    fix: 'Calibration requires a selected model and awake peers. Choose the model, wake every Mac, then run it again.',
+                        ? window.t('cluster.v2.checks.bench_runs_auto')
+                        : window.t('cluster.v2.checks.bench_measuring'),
+                    fix: window.t('cluster.v2.checks.bench_fix'),
                 });
             }
 
@@ -1906,22 +1905,22 @@ function clusterV2Wizard() {
             {
                 const health = this.discoveryHealth;
                 let status = 'pending';
-                let detail = 'Checks whether discovery beacons are arriving.';
+                let detail = window.t('cluster.v2.checks.beacon_checking');
                 let fix =
-                    'macOS is blocking local-network beacons. System Settings → Privacy & Security → Local Network → allow oMLX, then restart oMLX. Pairing still works via Add by IP while this is amber.';
+                    window.t('cluster.v2.checks.beacon_fix');
                 if (health) {
                     if (health.multicast_rx_within_5s) {
                         status = 'pass';
-                        detail = 'Discovery beacons are flowing on this network.';
+                        detail = window.t('cluster.v2.checks.beacon_ok');
                     } else {
                         status = 'warn';
                         detail =
-                            'No discovery beacons received in the last 5 seconds.';
+                            window.t('cluster.v2.checks.beacon_none');
                     }
                 } else if (this.discoveryHealthUnsupported) {
                     status = 'skipped';
                     detail =
-                        'This build does not report discovery health. Discovery itself may still work.';
+                        window.t('cluster.v2.checks.beacon_unsupported');
                     fix = '';
                 } else if (this.checks.running) {
                     status = 'running';
@@ -2033,7 +2032,7 @@ function clusterV2Wizard() {
                 0,
                 capacity - this.reserveBytesFor(role, capacity),
             );
-            return `${Math.round(usable / 1024 ** 3)} GB usable as ${this.roleLabel(role)}`;
+            return window.t('cluster.v2.role.usable').replace('{gb}', String(Math.round(usable / 1024 ** 3))).replace('{role}', this.roleLabel(role));
         },
 
         // What flipping every workstation node to headless would free up.
@@ -2112,7 +2111,7 @@ function clusterV2Wizard() {
                 this.modelOptions = payload?.models || [];
             } catch (error) {
                 this.modelsError =
-                    error?.message || 'Could not list downloaded models';
+                    error?.message || window.t('cluster.v2.err.list_models');
             } finally {
                 this.modelsLoading = false;
             }
@@ -2159,7 +2158,7 @@ function clusterV2Wizard() {
                 segments.pop();
             }
             if (segments[segments.length - 1] === 'snapshots') segments.pop();
-            let name = segments.pop() || raw || 'this model';
+            let name = segments.pop() || raw || window.t('cluster.v2.model.this_model');
             const hub = /^models--([^/]+?)--(.+)$/.exec(name);
             if (hub) name = `${hub[1]}/${hub[2]}`;
             return name;
@@ -2211,21 +2210,21 @@ function clusterV2Wizard() {
             return [
                 {
                     key: 'interactive',
-                    label: 'Interactive',
-                    limits: '4 decode · 2 prompt · batch 2',
-                    detail: 'Lower queueing and memory use',
+                    label: window.t('cluster.v2.exec.interactive'),
+                    limits: window.t('cluster.v2.exec.interactive_limits'),
+                    detail: window.t('cluster.v2.exec.interactive_detail'),
                 },
                 {
                     key: 'balanced',
-                    label: 'Balanced',
-                    limits: '8 decode · 4 prompt · batch 4',
-                    detail: 'Default mix of latency and throughput',
+                    label: window.t('cluster.v2.exec.balanced'),
+                    limits: window.t('cluster.v2.exec.balanced_limits'),
+                    detail: window.t('cluster.v2.exec.balanced_detail'),
                 },
                 {
                     key: 'throughput',
-                    label: 'Throughput',
-                    limits: '16 decode · 8 prompt · batch 8',
-                    detail: 'Wider automatic batches when requests overlap',
+                    label: window.t('cluster.v2.exec.throughput'),
+                    limits: window.t('cluster.v2.exec.throughput_limits'),
+                    detail: window.t('cluster.v2.exec.throughput_detail'),
                 },
             ];
         },
@@ -2551,7 +2550,7 @@ function clusterV2Wizard() {
                     typeof proposal.activation !== 'object'
                 ) {
                     throw new Error(
-                        'Automatic setup did not return a signed activation proposal.',
+                        window.t('cluster.v2.err.plan_missing_signature'),
                     );
                 }
                 if (
@@ -2559,7 +2558,7 @@ function clusterV2Wizard() {
                     proposal.plan.placement_signature
                 ) {
                     throw new Error(
-                        'Automatic setup returned a plan and activation with different signatures.',
+                        window.t('cluster.v2.err.plan_signature_mismatch'),
                     );
                 }
                 this.planProposal = proposal;
@@ -2573,13 +2572,13 @@ function clusterV2Wizard() {
                               result: probe || null,
                               error:
                                   probe?.reason ||
-                                  'The server did not complete performance calibration.',
+                                  window.t('cluster.v2.err.calibration_incomplete'),
                           };
                 return proposal;
             } catch (error) {
                 if (revision !== this.planRequestRevision) return null;
                 this.planError =
-                    error?.message || 'Could not build the layer split';
+                    error?.message || window.t('cluster.v2.err.build_layer_split');
                 this.planFitFailure = this.parseFitFailure(this.planError);
                 this.checks.benchmark = {
                     ok: false,
@@ -2611,7 +2610,7 @@ function clusterV2Wizard() {
             );
             return device
                 ? this.deviceName(device)
-                : assignment.node_id || `Rank ${assignment.rank}`;
+                : assignment.node_id || window.t('cluster.v2.plan.rank').replace('{n}', String(assignment.rank));
         },
 
         resolvedBackend() {
@@ -2632,8 +2631,8 @@ function clusterV2Wizard() {
 
         backendLabel() {
             return this.resolvedBackend().startsWith('jaccl')
-                ? 'JACCL · Thunderbolt RDMA'
-                : 'TCP ring';
+                ? window.t('cluster.v2.backend.jaccl')
+                : window.t('cluster.v2.backend.ring');
         },
 
         deploymentFabricLabel() {
@@ -2641,8 +2640,8 @@ function clusterV2Wizard() {
                 this.configuredDeployment()?.backend || this.resolvedBackend(),
             );
             return backend.startsWith('jaccl')
-                ? 'Inference: JACCL over Thunderbolt RDMA'
-                : 'Inference: TCP ring';
+                ? window.t('cluster.v2.deploy.fabric_jaccl')
+                : window.t('cluster.v2.deploy.fabric_ring');
         },
 
         deploymentHosts() {
@@ -2734,12 +2733,12 @@ function clusterV2Wizard() {
             const measured = result?.nodes;
             if (!Array.isArray(measured) || measured.length !== nodes.length ||
                 new Set(measured.map((node) => node.node_id)).size !== nodes.length) {
-                throw new Error('The memory probe did not return every selected Mac.');
+                throw new Error(window.t('cluster.v2.err.memory_probe_incomplete'));
             }
             const resolved = nodes.map((node) => {
                 const budget = measured.find((item) => item.node_id === node.node_id);
                 if (!budget || budget.unusable || !(Number(budget.capacity_bytes) > 0)) {
-                    throw new Error(`Memory budget unavailable for ${node.node_id}.`);
+                    throw new Error(window.t('cluster.v2.err.memory_budget_unavailable').replace('{node}', node.node_id));
                 }
                 return {...node, capacity_bytes: Number(budget.capacity_bytes), reserve_bytes: Number(budget.reserve_bytes || 0)};
             });
@@ -2786,7 +2785,7 @@ function clusterV2Wizard() {
                     // handling to activation's 409 below.
                     this.notify(
                         'warning',
-                        'The plan changed since you reviewed it — rebuilding it now.',
+                        window.t('cluster.v2.toast.plan_changed'),
                     );
                     this.activateBusy = false;
                     this.stagingActivation = null;
@@ -2849,7 +2848,7 @@ function clusterV2Wizard() {
             if (snapshot.status === 'completed') {
                 if (snapshot.ready !== true) {
                     this.stopStagingPoll();
-                    this.failStaging('Staging completed without confirming model readiness.');
+                    this.failStaging(window.t('cluster.v2.err.staging_not_ready'));
                     this.activateBusy = false;
                     return;
                 }
@@ -2957,7 +2956,7 @@ function clusterV2Wizard() {
             const generation = this.stagingGeneration;
             if (!activation) {
                 this.activateBusy = false;
-                this.notify('error', 'The signed activation proposal is missing.');
+                this.notify('error', window.t('cluster.v2.err.activation_missing'));
                 return;
             }
             try {
@@ -2968,7 +2967,7 @@ function clusterV2Wizard() {
                 if (generation !== this.stagingGeneration) return;
                 this.notify(
                     'success',
-                    'Cluster activated. The distributed readiness check passed.',
+                    window.t('cluster.v2.toast.activated'),
                 );
                 this.stage = null;
                 this.choosingModel = false;
@@ -2987,14 +2986,14 @@ function clusterV2Wizard() {
                 if (error?.status === 409) {
                     this.notify(
                         'warning',
-                        'The plan changed since you reviewed it — rebuilding it now.',
+                        window.t('cluster.v2.toast.plan_changed'),
                     );
                     this.stagingActivation = null;
                     await this.refreshActivationProposal(purpose);
                 } else {
                     this.notify(
                         'error',
-                        error?.message || 'Activation failed',
+                        error?.message || window.t('cluster.v2.err.activation_failed'),
                     );
                 }
             } finally {
@@ -3049,14 +3048,14 @@ function clusterV2Wizard() {
                 });
                 const signature = preview?.plan?.placement_signature;
                 if (typeof signature !== 'string' || signature.length < 16) {
-                    throw new Error('The re-plan preview was not signed.');
+                    throw new Error(window.t('cluster.v2.err.replan_unsigned'));
                 }
                 this.executionReplan = { profile, body, preview };
             } catch (error) {
                 this.executionReplan = null;
                 this.notify(
                     'error',
-                    error?.message || 'Could not preview the serving profile.',
+                    error?.message || window.t('cluster.v2.err.preview_profile'),
                 );
             } finally {
                 this.executionReplanBusy = false;
@@ -3080,7 +3079,7 @@ function clusterV2Wizard() {
                 this.executionReplan = null;
                 this.notify(
                     'success',
-                    'Serving profile applied and distributed readiness re-checked.',
+                    window.t('cluster.v2.toast.profile_applied'),
                 );
                 await this.refreshDeployments();
                 await this.refreshRuntime();
@@ -3088,7 +3087,7 @@ function clusterV2Wizard() {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
                     error?.message ||
-                        'Could not apply the signed serving-profile re-plan.',
+                        window.t('cluster.v2.err.apply_replan'),
                 );
             } finally {
                 this.executionReplanBusy = false;
@@ -3197,9 +3196,14 @@ function clusterV2Wizard() {
                 if (unavailable.length) {
                     throw new Error(
                         unavailable
-                            .map(
-                                (node) =>
-                                    `${node.node_id}: ${node.error || 'memory probe unavailable'}`,
+                            .map((node) =>
+                                window.t('cluster.v2.err.node_probe')
+                                    .replace('{node}', node.node_id)
+                                    .replace(
+                                        '{message}',
+                                        node.error
+                                            || window.t('cluster.v2.err.memory_probe_unavailable'),
+                                    ),
                             )
                             .join(' · '),
                     );
@@ -3261,11 +3265,11 @@ function clusterV2Wizard() {
                     this.membershipError =
                         proposal?.fabric_blocker ||
                         proposal?.preflight ||
-                        'The expanded pool is not ready to activate.';
+                        window.t('cluster.v2.membership.not_ready');
                 }
             } catch (error) {
                 this.membershipError =
-                    error?.message || 'Could not preview the expanded cluster.';
+                    error?.message || window.t('cluster.v2.err.preview_expanded');
             } finally {
                 this.membershipBusy = false;
             }
@@ -3282,15 +3286,15 @@ function clusterV2Wizard() {
             );
             return device
                 ? this.deviceName(device)
-                : assignment?.node_id || `Rank ${assignment?.rank ?? '?'}`;
+                : assignment?.node_id || window.t('cluster.v2.plan.rank').replace('{n}', String(assignment?.rank ?? '?'));
         },
 
         membershipPlanDetail(assignment) {
             const gib = Number(assignment?.planned_weight_bytes || 0) / (1024 ** 3);
             const tp = Number(assignment?.tensor_parallel_size || 1);
             return tp > 1
-                ? `Tensor rank ${Number(assignment?.tensor_parallel_rank || 0) + 1}/${tp} · ${gib.toFixed(1)} GiB planned`
-                : `Layers ${assignment?.start_layer ?? 0}–${assignment?.end_layer ?? 0} · ${gib.toFixed(1)} GiB planned`;
+                ? window.t('cluster.v2.membership.tensor_rank').replace('{rank}', String(Number(assignment?.tensor_parallel_rank || 0) + 1)).replace('{tp}', String(tp)).replace('{gib}', gib.toFixed(1))
+                : window.t('cluster.v2.membership.layers').replace('{start}', String(assignment?.start_layer ?? 0)).replace('{end}', String(assignment?.end_layer ?? 0)).replace('{gib}', gib.toFixed(1));
         },
 
         async applyMembershipExpansion() {
@@ -3376,14 +3380,14 @@ function clusterV2Wizard() {
                 });
                 this.notify(
                     'success',
-                    'Cluster weights unloaded. The signed setup is still ready to load again.',
+                    window.t('cluster.v2.toast.weights_unloaded'),
                 );
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
-                    error?.message || 'Could not unload the cluster weights.',
+                    error?.message || window.t('cluster.v2.err.unload_failed'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3400,14 +3404,14 @@ function clusterV2Wizard() {
                 });
                 this.notify(
                     'success',
-                    'Cluster weights loaded and every rank passed readiness.',
+                    window.t('cluster.v2.toast.weights_loaded'),
                 );
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
-                    error?.message || 'Could not load the cluster weights.',
+                    error?.message || window.t('cluster.v2.err.load_failed'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3449,12 +3453,12 @@ function clusterV2Wizard() {
                 this.enterPlan();
                 this.notify(
                     'info',
-                    'Previous shards unloaded. Choose the next model; current serving and memory settings are prefilled.',
+                    window.t('cluster.v2.toast.model_changed'),
                 );
             } catch (error) {
                 this.notify(
                     error?.status === 409 ? 'warning' : 'error',
-                    error?.message || 'Could not switch the clustered model.',
+                    error?.message || window.t('cluster.v2.err.change_model'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3476,13 +3480,13 @@ function clusterV2Wizard() {
                 await this.apiFetch(CLUSTER_V2_API.deployment(id), {
                     method: 'DELETE',
                 });
-                this.notify('info', 'Cluster deactivated.');
+                this.notify('info', window.t('cluster.v2.toast.deactivated'));
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     'error',
-                    error?.message || 'Could not deactivate',
+                    error?.message || window.t('cluster.v2.err.deactivate'),
                 );
             } finally {
                 this.clusterLifecycleBusy = false;
@@ -3544,9 +3548,9 @@ function clusterV2Wizard() {
             if (!this.cudaJoin.command) return '';
             const state = this.cudaJoinState();
             if (state?.status === 'used') {
-                return 'Used · worker is finishing setup';
+                return window.t('cluster.v2.cuda.used');
             }
-            if (state?.status === 'revoked') return 'Revoked';
+            if (state?.status === 'revoked') return window.t('cluster.v2.cuda.revoked');
             const remaining = Math.ceil(
                 (Number(state?.expires_at || this.cudaJoin.expiresAt || 0) *
                     1000 -
@@ -3554,8 +3558,8 @@ function clusterV2Wizard() {
                     60000,
             );
             return remaining > 0
-                ? `Single use · expires in ${remaining} min`
-                : 'Expired · generate a new command';
+                ? window.t('cluster.v2.cuda.expires_in').replace('{n}', String(remaining))
+                : window.t('cluster.v2.cuda.expired');
         },
 
         async loadCudaJoinStatus() {
@@ -3578,7 +3582,7 @@ function clusterV2Wizard() {
                 this.cudaJoin.error = payload?.load_error || '';
             } catch (error) {
                 this.cudaJoin.error =
-                    error?.message || 'Could not read CUDA worker status';
+                    error?.message || window.t('cluster.v2.err.cuda_status');
             }
         },
 
@@ -3601,7 +3605,7 @@ function clusterV2Wizard() {
                     return;
                 }
                 this.cudaJoin.error =
-                    error?.message || 'Could not revoke the join command';
+                    error?.message || window.t('cluster.v2.err.revoke_join');
             }
         },
 
@@ -3610,7 +3614,7 @@ function clusterV2Wizard() {
             const controllerIp = this.cudaJoinSuggestedIp();
             if (!controllerIp) {
                 this.cudaJoin.error =
-                    'Enter this oMLX Mac’s LAN IPv4 address first.';
+                    window.t('cluster.v2.cuda.controller_ip_required');
                 return;
             }
             this.cudaJoin.controllerIp = controllerIp;
@@ -3639,7 +3643,7 @@ function clusterV2Wizard() {
                 await this.loadCudaJoinStatus();
             } catch (error) {
                 this.cudaJoin.error =
-                    error?.message || 'Could not generate the CUDA join command';
+                    error?.message || window.t('cluster.v2.err.cuda_join');
             } finally {
                 this.cudaJoin.loading = false;
             }
@@ -3684,11 +3688,11 @@ function clusterV2Wizard() {
                         }),
                     },
                 );
-                this.notify('success', 'CUDA direct link verified.');
+                this.notify('success', window.t('cluster.v2.toast.cuda_verified'));
                 await this.refreshDevices();
             } catch (error) {
                 this.cudaFabricError =
-                    error?.message || 'Could not verify the CUDA direct link';
+                    error?.message || window.t('cluster.v2.err.cuda_verify');
             } finally {
                 this.cudaFabricLoading = false;
             }
@@ -3718,7 +3722,7 @@ function clusterV2Wizard() {
                 URL.revokeObjectURL(url);
             } catch (error) {
                 this.diagnosticsError =
-                    error?.message || 'Could not build the diagnostic report';
+                    error?.message || window.t('cluster.v2.err.diagnostics');
             } finally {
                 this.diagnosticsLoading = false;
             }
