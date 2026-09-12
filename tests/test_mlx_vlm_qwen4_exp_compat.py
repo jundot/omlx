@@ -1257,6 +1257,105 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     embedding.close()
 
 
+def test_disk_bf16_upload_preserves_every_bit_pattern():
+    import numpy as np
+    from mlx_vlm.models.qwen4_exp.language import _SafeTensorMMap
+
+    bits = np.arange(65536, dtype=np.uint16).reshape(256, 256)
+    uploaded = _SafeTensorMMap.to_mx(bits, "BF16")
+    assert uploaded.dtype == mx.bfloat16
+    assert np.array_equal(np.asarray(uploaded.view(mx.uint16)), bits)
+
+
+@pytest.fixture
+def early_gather_model(tmp_path):
+    config = _tiny_config()
+    config.text_config.num_hidden_layers = 3
+    config.text_config.layer_types = ["linear_attention", "linear_attention", "full_attention"]
+    config.text_config.ple_layer_ids = [2]
+    from mlx_vlm.models.qwen4_exp.language import (
+        DiskBackedShardedEmbedding,
+        LanguageModel,
+    )
+
+    mx.random.seed(1789194451)
+    model = LanguageModel(config.text_config, config)
+    embedding = model.model.layers[1].ple.ple_embedding
+    resident = embedding.ngram_embedding
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors = {
+        f"{prefix}.shard_{index}.weight": shard.weight.astype(mx.bfloat16)
+        for index, shard in enumerate(resident.shards)
+    }
+    filename = "ple.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: filename for name in tensors}})
+    )
+    disk = DiskBackedShardedEmbedding(
+        tmp_path, prefix, resident.shard_offsets[-1], resident.dims, len(resident.shards)
+    )
+    embedding.ngram_embedding = disk
+    mx.eval(model.parameters())
+    try:
+        yield model, embedding, disk
+    finally:
+        disk.close()
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 3])
+def test_early_ple_gather_matches_late_gather_across_rollback(early_gather_model, monkeypatch, accepted):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, _, disk = early_gather_model
+    early_cache, late_cache = model.make_cache(), model.make_cache()
+    prefix = mx.array([[2, 1, 3]], dtype=mx.int32)
+    verify_ids = mx.array([[4, 5, 1, 6]], dtype=mx.int32)
+    outputs = []
+    for enabled, cache in ((True, early_cache), (False, late_cache)):
+        monkeypatch.setattr(language, "_PLE_EARLY_GATHER", enabled)
+        model(prefix, cache=cache)
+        verified = model(verify_ids, cache=cache, return_hidden=True)
+        assert disk.last_prefetch_hit is enabled
+        mx.eval(verified.logits)
+        model.rollback_speculative_cache(cache, verified.gdn_states, accepted=accepted, block_size=4)
+        resumed = model(mx.array([[7]], dtype=mx.int32), cache=cache)
+        mx.eval(resumed.logits)
+        outputs.append((verified.logits, resumed.logits))
+    for component in (0, 1):
+        assert mx.array_equal(outputs[0][component], outputs[1][component]).item()
+    _assert_ple_state_matches(early_cache[1], late_cache[1])
+
+
+def test_early_ple_gather_starts_before_first_layer_without_advancing_history(early_gather_model, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, embedding, disk = early_gather_model
+    cache = model.make_cache()
+    monkeypatch.setattr(language, "_PLE_EARLY_GATHER", True)
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    mx.eval(model(prefix, cache=cache).logits)
+    history = cache[1][3]
+    next_ids = mx.array([[5, 1, 6]], dtype=mx.int32)
+    prepared = embedding.prepare_indices(next_ids, cache[1])
+    assert cache[1][3] is history
+    assert disk._pending
+    observed = []
+    original = language.Qwen4ExpDecoderLayer.__call__
+
+    def traced(layer, *args, **kwargs):
+        if layer is model.model.layers[0]:
+            observed.append(bool(disk._pending))
+        return original(layer, *args, **kwargs)
+
+    monkeypatch.setattr(language.Qwen4ExpDecoderLayer, "__call__", traced)
+    mx.eval(model(next_ids, cache=cache).logits)
+    assert prepared.shape == (1, 3, embedding.ngram_heads)
+    assert observed == [True]
+    assert disk.last_prefetch_hit
+    assert not disk._pending
+
+
 @pytest.fixture
 def disk_ple_reader(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
