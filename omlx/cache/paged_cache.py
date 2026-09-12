@@ -787,40 +787,6 @@ class PagedCacheManager(CacheManager):
 
             return False
 
-    def free_blocks(self, blocks: Iterable[CacheBlock]) -> None:
-        """
-        Free multiple blocks (vLLM style).
-
-        Blocks with ref_count=0 are added to the free queue.
-
-        Args:
-            blocks: Blocks to free (in eviction order)
-        """
-        with self._lock:
-            blocks_list = list(blocks)
-            to_free = []
-
-            for block in blocks_list:
-                if block.is_null:
-                    continue
-
-                block.ref_count -= 1
-
-                if block.ref_count <= 0:
-                    # Remove from hash cache
-                    if block.block_hash is not None:
-                        self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
-                        self._notify_hash_dropped(block.block_hash)
-
-                    del self.allocated_blocks[block.block_id]
-                    to_free.append(block)
-                    self.stats.allocated_blocks -= 1
-                    self.stats.free_blocks += 1
-                    self.stats.total_tokens_cached -= block.token_count
-
-            # Add to free queue (back = MRU, evicted last)
-            self.free_block_queue.append_n(to_free)
-
     def touch(self, blocks: Iterable[CacheBlock]) -> None:
         """
         Touch blocks to prevent eviction (cache hit, vLLM style).
