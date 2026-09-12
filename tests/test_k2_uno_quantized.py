@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Q8 block arithmetic and eligibility for the Uno projection path."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -79,7 +80,9 @@ def test_uno_engine_enables_q8_before_compilation_and_reports_it(monkeypatch):
     engine._model_name = "base"
     engine._adapter_path = "adapter"
     engine._tokenizer = SimpleNamespace(eos_token_ids=[0])
-    bundle = SimpleNamespace(adapter_path="adapter", base_model_id="IFM/K2-Horizon-7B")
+    bundle = SimpleNamespace(
+        adapter_path=Path("adapter"), base_model_id="IFM/K2-Horizon-7B"
+    )
     monkeypatch.setattr("omlx.engine.uno.resolve_uno_bundle", lambda *args: bundle)
     monkeypatch.setattr(
         uno_adapter, "load_uno_adapter", lambda *a, **kw: events.append("adapter")
