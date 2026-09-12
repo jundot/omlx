@@ -158,6 +158,7 @@ class RuntimeTelemetry:
         self._pending_transport_cancels: set[str] = set()
         self._cancel_requested_requests: set[int] = set()
         self._pending_uid = threading.local()
+        self._sequential_state = threading.local()
         self._last_completed: dict[str, Any] | None = None
         self._last_publish_at = float("-inf")
         self._requests_completed = 0
@@ -555,6 +556,12 @@ class RuntimeTelemetry:
                 queue.put(None)
             except Exception as exc:
                 logger.debug("Could not terminate cancelled response queue: %s", exc)
+
+    def is_sequential_active(self) -> bool:
+        return bool(getattr(self._sequential_state, "active", False))
+
+    def set_sequential_active(self, active: bool) -> None:
+        self._sequential_state.active = bool(active)
 
     def register_batch_generator(self, generator: Any) -> None:
         """Remember the live BatchGenerator so force-cancel can reach it."""
@@ -1088,6 +1095,14 @@ class _TelemetryQueue:
                 self._telemetry.register_context(self._request_id, item)
             elif hasattr(item, "token") and hasattr(item, "finish_reason"):
                 self._telemetry.observe_token(self._request_id)
+            elif isinstance(item, tuple) and len(item) == 2:
+                if self._telemetry.is_sequential_active():
+                    self._telemetry.poll_cancel_requests(min_interval=0.0)
+                    context = self._telemetry._request_contexts.get(self._request_id)
+                    if context is not None and getattr(context, "_should_stop", False):
+                        raise InterruptedError(
+                            f"Request {self._request_id} aborted during sequential prefill"
+                        )
         return self._queue.put(item, *args, **kwargs)
 
 
@@ -1659,13 +1674,16 @@ def install_server_telemetry(
             # agreement; model collectives remain distributed.
             was_distributed = self._is_distributed
             previous = getattr(cancellation_state, "sequential", False)
+            previous_seq = telemetry.is_sequential_active()
             cancellation_state.sequential = was_distributed
+            telemetry.set_sequential_active(True)
             self._is_distributed = False
             try:
                 return super()._serve_single(request)
             finally:
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous
+                telemetry.set_sequential_active(previous_seq)
 
     original_stream_generate = mlx_server.stream_generate
 
