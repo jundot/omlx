@@ -100,6 +100,19 @@ _SOURCE = """
             conv_out[state_base + i] = qkv[raw_base + i];
         }
     }
+    if constexpr (S < NKEEP) {
+        // Narrow verification retains part of the previous convolution
+        // window before the new rows written above.
+        if (row == 0) {
+            for (uint old = 0; old < uint(NKEEP - S); ++old) {
+                uint channel = channel_base + lane * 4;
+                for (uint i = 0; i < 4; ++i) {
+                    conv_out[old * uint(C) + channel + i] =
+                        conv_state[(old + uint(S)) * uint(C) + channel + i];
+                }
+            }
+        }
+    }
 """
 
 
@@ -581,7 +594,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
         if gdn_sink is None or cache is None:
             return False
-        if inputs.shape[0] != 1 or not (3 <= s_len <= 9):
+        qwen4 = (
+            type(self).__name__ == "Qwen4ExpGatedDeltaNet"
+            and type(self).__module__ == "mlx_vlm.models.qwen4_exp.language"
+        )
+        if inputs.shape[0] != 1 or not ((2 if qwen4 else 3) <= s_len <= 9):
             return False
         if mask is not None:
             return False
@@ -779,7 +796,27 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                     "[gdn-prework] fused verify prework engaged (S=%d)", S
                 )
 
-            out = self.norm(out, z)
+            if (
+                type(self).__name__ == "Qwen4ExpGatedDeltaNet"
+                and type(self).__module__ == "mlx_vlm.models.qwen4_exp.language"
+                and self.head_v_dim == 128
+                and getattr(self.norm, "activation", None) == "sigmoid"
+                and self.norm.weight.shape == (128,)
+                and self.norm.weight.dtype == mx.bfloat16
+            ):
+                # RMS normalization and gating are independent per token/head.
+                # Flatten those two axes into the existing decode kernel's
+                # row grid, preserving its BF16 materialization boundaries.
+                out = qwen4_decode_norm_gate_fused(
+                    mx.contiguous(out),
+                    mx.contiguous(z),
+                    self.norm.weight,
+                    hv=S * self.num_v_heads,
+                    dv=self.head_v_dim,
+                    eps=self.norm.eps,
+                ).reshape(B, S, -1)
+            else:
+                out = self.norm(out, z)
             result = q35._target_verify_linear(
                 self.out_proj, out.reshape(B, S, -1), True
             )
