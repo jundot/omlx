@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Metal reduction and precision structure adapted from mlx-vlm #2105.
 # Copyright © 2025 Prince Canuma. Used under the MIT License.
 #
@@ -11,7 +12,9 @@ qualify exact output, recurrent state and every rollback snapshot against the
 current deployed generic prework route. The opt-in hook below admits only
 the separately qualified B1/S3..4 regime. Input/output projections are outside this boundary.
 """
-from functools import lru_cache
+
+from functools import cache
+
 import mlx.core as mx
 
 NUM_KEY_HEADS = 16
@@ -23,10 +26,12 @@ CONV_DIM = 10240
 CONV_KERNEL = 4
 MAX_VERIFY_STEPS = 8  # candidate bound; exactness requires its own gate
 _THREADGROUP_Y_CANDIDATES = (32, 16, 8, 4)
-DONOR_BASE_SHA256 = 'e6a52ffb3c0aaeb493beaf061b2956d254a2d5056442ea1668eaca4ebb68d5aa'
-DONOR_VERIFY_SHA256 = 'a30a9b35ae95119cf2432016ca54d32425f454939a58352eda1dc9b5c63a7fb0'
-DONOR_KERNEL_SHA256 = '2d5d84dc1869b7d74115605f2391e6a8e0767916db4f2214df19321641c90842'
-NONNORMALIZATION_SHA256 = '9c9f767cbffff7062911cf3f10bb0268bdf8e1e97b6be77a24e8250925b4d010'
+DONOR_BASE_SHA256 = "e6a52ffb3c0aaeb493beaf061b2956d254a2d5056442ea1668eaca4ebb68d5aa"
+DONOR_VERIFY_SHA256 = "a30a9b35ae95119cf2432016ca54d32425f454939a58352eda1dc9b5c63a7fb0"
+DONOR_KERNEL_SHA256 = "2d5d84dc1869b7d74115605f2391e6a8e0767916db4f2214df19321641c90842"
+NONNORMALIZATION_SHA256 = (
+    "9c9f767cbffff7062911cf3f10bb0268bdf8e1e97b6be77a24e8250925b4d010"
+)
 NORMALIZATION_START = 3520
 NORMALIZATION_END = 4941
 
@@ -240,7 +245,8 @@ _SOURCE = r"""
   }
 """
 
-@lru_cache(maxsize=None)
+
+@cache
 def _kernel():
     return mx.fast.metal_kernel(
         name="omlx_qwen4_unified_gdn_verify_rms",
@@ -269,6 +275,7 @@ def _kernel():
         ensure_row_contiguous=True,
     )
 
+
 def qwen4_unified_gdn_verify_rms(
     qkv,
     z,
@@ -276,7 +283,7 @@ def qwen4_unified_gdn_verify_rms(
     a,
     conv_state,
     conv_weight,
-    A_log,
+    A_log,  # noqa: N803 - checkpoint ABI uses this canonical name
     dt_bias,
     recurrent_state,
     norm_weight,
@@ -303,8 +310,7 @@ def qwen4_unified_gdn_verify_rms(
     # build the graph.
     if not 3 <= steps <= MAX_VERIFY_STEPS:
         raise ValueError(
-            f"unsupported verify width {steps}; "
-            f"expected 3..{MAX_VERIFY_STEPS}"
+            f"unsupported verify width {steps}; expected 3..{MAX_VERIFY_STEPS}"
         )
     outputs = _kernel()(
         inputs=[
@@ -356,8 +362,12 @@ def reset_receipt():
 
 
 def receipt():
-    return {"calls": _RECEIPT["calls"], "declines": dict(_RECEIPT["declines"]),
-            "failures": _RECEIPT["failures"], "exception_fuse": _DISABLED}
+    return {
+        "calls": _RECEIPT["calls"],
+        "declines": dict(_RECEIPT["declines"]),
+        "failures": _RECEIPT["failures"],
+        "exception_fuse": _DISABLED,
+    }
 
 
 def _decline(reason):
@@ -373,37 +383,61 @@ def _admission(module, inputs, mask, cache, gdn_sink):
         return "not Qwen4ExpGatedDeltaNet"
     if module.training or getattr(module, "sharding_group", None) is not None:
         return "training or sharding"
-    if tuple(inputs.shape) not in ((1, 3, 2560), (1, 4, 2560)) or inputs.dtype != mx.bfloat16:
+    if (
+        tuple(inputs.shape) not in ((1, 3, 2560), (1, 4, 2560))
+        or inputs.dtype != mx.bfloat16
+    ):
         return "input not BF16 B1/S3..4/D2560"
     if mask is not None or gdn_sink is None or cache is None:
         return "mask or missing rollback sink/cache"
     from mlx_lm.models.cache import ArraysCache as LMArrayCache
     from mlx_vlm.models.qwen4_exp.cache import ArraysCache as Qwen4ArrayCache
+
     from omlx.cache.type_handlers import SizedArraysCache
+
     qualified_inner = (LMArrayCache, Qwen4ArrayCache)
     # Prefix restoration adds this concrete size-tracking wrapper. Admit only
     # one exact wrapper over an already qualified concrete cache, and retain
     # the outer object for all reads, commits and metadata advancement below.
     # Subclasses, unknown inners and nested wrappers keep the existing route.
-    if not (type(cache) in qualified_inner or
-            (type(cache) is SizedArraysCache and type(cache._inner) in qualified_inner)):
+    if not (
+        type(cache) in qualified_inner
+        or (type(cache) is SizedArraysCache and type(cache._inner) in qualified_inner)
+    ):
         return "cache is outside qualified concrete ArraysCache ABI"
-    if getattr(cache, "lengths", None) is not None or getattr(cache, "left_padding", None) is not None:
+    if (
+        getattr(cache, "lengths", None) is not None
+        or getattr(cache, "left_padding", None) is not None
+    ):
         return "padded cache"
-    if tuple(getattr(module, name, None) for name in
-             ("num_k_heads", "num_v_heads", "head_k_dim", "head_v_dim", "conv_kernel_size")) != (16, 48, 128, 128, 4):
+    if tuple(
+        getattr(module, name, None)
+        for name in (
+            "num_k_heads",
+            "num_v_heads",
+            "head_k_dim",
+            "head_v_dim",
+            "conv_kernel_size",
+        )
+    ) != (16, 48, 128, 128, 4):
         return "unsupported head/convolution geometry"
     if module.norm.activation != "sigmoid" or module.norm.eps != 1e-6:
         return "unqualified norm activation/epsilon"
     if getattr(module.conv1d, "bias", None) is not None:
         return "convolution bias"
-    values = ((cache[0], (1, 3, 10240), mx.bfloat16),
-              (cache[1], (1, 48, 128, 128), mx.float32),
-              (module.conv1d.weight, (10240, 4, 1), mx.bfloat16),
-              (module.A_log, (48,), mx.bfloat16), (module.dt_bias, (48,), mx.bfloat16),
-              (module.norm.weight, (128,), mx.bfloat16))
-    if any(tuple(getattr(value, "shape", ())) != shape or getattr(value, "dtype", None) != dtype
-           for value, shape, dtype in values):
+    values = (
+        (cache[0], (1, 3, 10240), mx.bfloat16),
+        (cache[1], (1, 48, 128, 128), mx.float32),
+        (module.conv1d.weight, (10240, 4, 1), mx.bfloat16),
+        (module.A_log, (48,), mx.bfloat16),
+        (module.dt_bias, (48,), mx.bfloat16),
+        (module.norm.weight, (128,), mx.bfloat16),
+    )
+    if any(
+        tuple(getattr(value, "shape", ())) != shape
+        or getattr(value, "dtype", None) != dtype
+        for value, shape, dtype in values
+    ):
         return "state/parameter shape or dtype"
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
         return "Metal GPU unavailable"
@@ -423,38 +457,80 @@ def try_fused_rms(module, inputs, mask, cache, gdn_sink):
     reason = _admission(module, inputs, mask, cache, gdn_sink)
     if reason:
         return _decline(reason)
-    from mlx_vlm.models.qwen3_5 import language as q35
-    from . import qwen35_gdn_prework as generic
     import logging
+
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    from . import qwen35_gdn_prework as generic
+
     steps = inputs.shape[1]
     conv_state, recurrent_state = cache[0], cache[1]
     try:
         qkv, z, b, a = q35._target_verify_linears(
-            (module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a), inputs, True)
-        if any(tuple(value.shape) != shape or value.dtype != mx.bfloat16 for value, shape in
-               ((qkv, (1, steps, 10240)), (z, (1, steps, 6144)),
-                (a, (1, steps, 48)), (b, (1, steps, 48)))):
+            (module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a),
+            inputs,
+            True,
+        )
+        if any(
+            tuple(value.shape) != shape or value.dtype != mx.bfloat16
+            for value, shape in (
+                (qkv, (1, steps, 10240)),
+                (z, (1, steps, 6144)),
+                (a, (1, steps, 48)),
+                (b, (1, steps, 48)),
+            )
+        ):
             return _decline("projected shape or dtype")
-        flat, next_conv, next_state, snapshots, _conv_snapshots = qwen4_unified_gdn_verify_rms(
-            qkv, z, b, a, conv_state, module.conv1d.weight, module.A_log,
-            module.dt_bias, recurrent_state, module.norm.weight, module.norm.eps,
-            threadgroup_y=32)
+        flat, next_conv, next_state, snapshots, _conv_snapshots = (
+            qwen4_unified_gdn_verify_rms(
+                qkv,
+                z,
+                b,
+                a,
+                conv_state,
+                module.conv1d.weight,
+                module.A_log,
+                module.dt_bias,
+                recurrent_state,
+                module.norm.weight,
+                module.norm.eps,
+                threadgroup_y=32,
+            )
+        )
         # Preserve all legacy replay operands without evaluating their graph.
         q_scale, k_scale = generic._qwen4_scales(module)
-        q, k, v, _ = generic.gdn_prework_fused(qkv, conv_state, module.conv1d.weight,
-            q_scale, k_scale, 16, 48, 128, 128)
+        q, k, v, _ = generic.gdn_prework_fused(
+            qkv, conv_state, module.conv1d.weight, q_scale, k_scale, 16, 48, 128, 128
+        )
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         result = q35._target_verify_linear(module.out_proj, flat, True)
     except Exception:
         _DISABLED = True
         _RECEIPT["failures"] += 1
-        logging.getLogger(__name__).warning("RMS-compatible Qwen4 GDN candidate failed; retaining existing route", exc_info=True)
+        logging.getLogger(__name__).warning(
+            "RMS-compatible Qwen4 GDN candidate failed; retaining existing route",
+            exc_info=True,
+        )
         return _decline("graph construction exception")
     # Commit lies outside the recoverable graph-construction catch. If a
     # custom sink/cache setter fails here, fail-stop the request; falling
     # through after partial ownership transfer would process the slab twice.
-    gdn_sink.append((q, k, v, a, b, module.A_log, module.dt_bias, recurrent_state,
-                     None, conv_input, 4, snapshots))
+    gdn_sink.append(
+        (
+            q,
+            k,
+            v,
+            a,
+            b,
+            module.A_log,
+            module.dt_bias,
+            recurrent_state,
+            None,
+            conv_input,
+            4,
+            snapshots,
+        )
+    )
     cache[0], cache[1] = next_conv, next_state
     # Match the existing route's commit order, including its cache metadata.
     # These concrete ArraysCache methods are no-ops for the admitted unpadded
