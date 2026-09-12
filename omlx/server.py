@@ -746,6 +746,16 @@ set_admin_getters(
 )
 app.include_router(admin_router)
 
+# Cache artifact export/import (issue #3612): admin-gated like the rest of
+# the cache admin surface.
+from .admin import cache_artifacts as cache_artifact_routes
+
+cache_artifact_routes.set_cache_artifact_getters(
+    get_engine_pool,
+    lambda: _server_state.settings_manager,
+)
+app.include_router(cache_artifact_routes.router)
+
 _cluster_routes_registered = False
 
 

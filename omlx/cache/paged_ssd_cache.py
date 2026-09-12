@@ -5152,3 +5152,8 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
+
+    @property
+    def hot_cache_only(self) -> bool:
+        """True when retention is RAM-only (no SSD I/O is performed)."""
+        return self._hot_cache_only
