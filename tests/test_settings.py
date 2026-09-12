@@ -2762,8 +2762,8 @@ class TestClaudeCodeValidation:
 class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
 
-    def test_claude_code_to_dict_has_four_keys(self):
-        """to_dict must include all four keys so GlobalSettings.save() persists them."""
+    def test_claude_code_to_dict_has_five_keys(self):
+        """to_dict must include all five keys so GlobalSettings.save() persists them."""
         s = ClaudeCodeSettings(
             mode="local",
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
@@ -2776,6 +2776,7 @@ class TestClaudeCodeRouteIntegration:
             "opus_model",
             "sonnet_model",
             "haiku_model",
+            "desktop_enabled",
         }
         assert set(d.keys()) == expected_keys
 
@@ -2786,12 +2787,14 @@ class TestClaudeCodeRouteIntegration:
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
             sonnet_model="mlx-community/Qwen3-14B-4bit",
             haiku_model="mlx-community/Qwen3-4B-4bit",
+            desktop_enabled=True,
         )
         reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
         assert reloaded.mode == "local"
         assert reloaded.opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
         assert reloaded.sonnet_model == "mlx-community/Qwen3-14B-4bit"
         assert reloaded.haiku_model == "mlx-community/Qwen3-4B-4bit"
+        assert reloaded.desktop_enabled is True
 
     def test_claude_code_round_trip_null_models(self):
         """Null model fields survive the round-trip."""

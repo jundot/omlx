@@ -2,6 +2,7 @@
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -905,10 +906,11 @@ class TestExposedProfileModels:
 
         response = await server_module.list_models(True)
 
-        model_ids = {model.id for model in response.data}
+        data = json.loads(bytes(response.body))["data"]
+        model_ids = {model["id"] for model in data}
         assert "qwen-base:thinking" in model_ids
-        profile_model = next(m for m in response.data if m.id == "qwen-base:thinking")
-        assert profile_model.max_model_len == 4096
+        profile_model = next(m for m in data if m["id"] == "qwen-base:thinking")
+        assert profile_model["max_model_len"] == 4096
 
     @pytest.mark.asyncio
     async def test_v1_models_status_includes_exposed_profile_capabilities(
@@ -956,12 +958,13 @@ class TestExposedProfileModels:
 
         response = await server_module.list_models(True)
 
-        model_ids = {model.id for model in response.data}
+        data = json.loads(bytes(response.body))["data"]
+        model_ids = {model["id"] for model in data}
         assert "gpt-4" in model_ids
         assert "gpt-4:thinking" in model_ids
         assert "qwen-base:thinking" not in model_ids
-        profile_model = next(m for m in response.data if m.id == "gpt-4:thinking")
-        assert profile_model.max_model_len == 4096
+        profile_model = next(m for m in data if m["id"] == "gpt-4:thinking")
+        assert profile_model["max_model_len"] == 4096
 
     def test_sampling_params_use_exposed_profile_settings(self, manager):
         """Runtime settings come from the requested profile model, not its source."""
