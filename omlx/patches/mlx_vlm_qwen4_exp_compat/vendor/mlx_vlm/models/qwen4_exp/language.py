@@ -9,7 +9,7 @@ import struct
 import time
 import weakref
 from bisect import bisect_right
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
@@ -1988,6 +1988,10 @@ class _SafeTensorMMap:
                 shape[1] * item_size,
             )
             gather_start = time.perf_counter() if fully_seen else None
+        else:
+            # Small gathers can have been prefetched across shards. Notice
+            # later page eviction here too, without scheduling extra I/O.
+            gather_start = time.perf_counter()
         view = np.ndarray(
             shape,
             dtype=np_dtype,
@@ -2012,8 +2016,7 @@ class _SafeTensorMMap:
     def rows(self, key: str, rows: list[int]) -> mx.array:
         return self.to_mx(*self.rows_np(key, rows))
 
-    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
-        """Prefetch unmarked pages; return whether all were already marked."""
+    def _missing_pages(self, row_indices, base_offset, row_bytes):
         offsets = base_offset + row_indices * row_bytes
         needed_pages = np.unique(
             np.concatenate(
@@ -2021,23 +2024,31 @@ class _SafeTensorMMap:
             )
         )
         seen = np.frombuffer(self._seen_pages, dtype=np.uint8)
-        fresh = needed_pages[seen[needed_pages] == 0]
+        return needed_pages[seen[needed_pages] == 0]
+
+    def _touch_page(self, page: int) -> None:
+        offset = int(page) * _PLE_PAGE_SIZE
+        remaining = _PLE_PAGE_SIZE
+        while remaining > 0:
+            chunk = os.pread(
+                self._file.fileno(), remaining, offset + (_PLE_PAGE_SIZE - remaining)
+            )
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        self._seen_pages[page] = 1
+
+    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
+        """Prefetch unmarked pages; return whether all were already marked."""
+        fresh = self._missing_pages(row_indices, base_offset, row_bytes)
         if fresh.size == 0:
             return True
-        fd = self._file.fileno()
-
-        def touch(page: int) -> None:
-            offset = int(page) * _PLE_PAGE_SIZE
-            remaining = _PLE_PAGE_SIZE
-            while remaining > 0:
-                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-
-        list(_PLE_IO_POOL.map(touch, (int(page) for page in fresh.tolist())))
-        for page in fresh.tolist():
-            self._seen_pages[page] = 1
+        futures = [_PLE_IO_POOL.submit(self._touch_page, int(page)) for page in fresh]
+        # Drain reads before propagating a failure: closing the mapping must
+        # never leave an outstanding read using a descriptor that can be reused.
+        wait(futures)
+        for future in futures:
+            future.result()
         return False
 
     def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
@@ -2108,6 +2119,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         self._shard_specs: dict[
             int, tuple[str, str | None, str | None, int | None, int | None]
         ] = {}
+        self._page_specs: dict[int, tuple] = {}
 
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
@@ -2231,6 +2243,17 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
+        for shard_index, spec in self._shard_specs.items():
+            pages = []
+            for key in spec[:1] if spec[3] is None else spec[:3]:
+                reader = self._tensor_readers[key]
+                entry = reader._header[key]
+                start, end = entry["data_offsets"]
+                pages.append(
+                    (reader, reader._data_start + start, (end - start) // entry["shape"][0])
+                )
+            self._page_specs[shard_index] = tuple(pages)
+
     def _plan(self, host: np.ndarray):
         """Shards, local rows and tensor families for a chunk; None when the touched shards differ."""
         offsets = np.asarray(self.shard_offsets, dtype=np.int64)
@@ -2255,6 +2278,25 @@ class DiskBackedShardedEmbedding(nn.Module):
     def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
         shard, local, touched, specs, families, _, _, _ = plan
+        if 8 < host.size <= 256:
+            # A decode/verify call touches many shards but often only one row
+            # in each. Batch their page faults, rather than serializing these
+            # reads below the per-shard prefetch threshold.
+            requests = set()
+            for shard_index, row in zip(shard.tolist(), local.tolist()):
+                for reader, start, row_bytes in self._page_specs[shard_index]:
+                    offset = start + row * row_bytes
+                    first = offset // _PLE_PAGE_SIZE
+                    last = (offset + row_bytes - 1) // _PLE_PAGE_SIZE
+                    if not reader._seen_pages[first]:
+                        requests.add((reader, first))
+                    if last != first and not reader._seen_pages[last]:
+                        requests.add((reader, last))
+            if len(requests) > 8:
+                futures = [_PLE_IO_POOL.submit(reader._touch_page, page) for reader, page in requests]
+                wait(futures)
+                for future in futures:
+                    future.result()
         buffers: dict[int, np.ndarray] = {}
         for shard_index, spec in zip(touched, specs):
             positions = np.flatnonzero(shard == shard_index)
