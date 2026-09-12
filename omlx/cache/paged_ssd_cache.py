@@ -381,6 +381,18 @@ _CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
 
 _ARRAYS_SUB_CLASSES = frozenset({"ArraysCache", "SizedArraysCache"})
 _POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
+# Non-sliceable CacheList members accepted as per-member "boundary" subs in
+# addition to ArraysCache (see ``cachelist_pm_member_plan``). Kept separate
+# from ``_ARRAYS_SUB_CLASSES`` so signature descriptors
+# (``_block_cachelist_subtypes`` / ``cachelist_subtypes_from_cache_list``)
+# still route pooling members through the pooling branch
+# (``PoolingCache:N`` / ``BatchPoolingCache:N``) instead of mis-stamping
+# them as an ArraysCache slot count. Must stay in sync with
+# ``prefix_cache._PM_SAFE_NON_SLICEABLE_SUBS``: boundary members are
+# self-contained at their boundary and restore last-block-wins; pooling
+# members that compact_pooling_cache_snapshot does NOT cover
+# (BatchPoolingCache) simply persist their cumulative boundary state.
+_PM_BOUNDARY_SUB_CLASSES = _ARRAYS_SUB_CLASSES | _POOLING_SUB_CLASSES
 # Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
 # Shared with prefix_cache.cachelist_pm_member_plan (single source so the
 # class-level expectation and the shape-level store plan cannot drift).
@@ -401,18 +413,18 @@ _PM_LAYOUT_TOKEN = "@pm"
 def cachelist_pm_class_eligible(sub_class_names: list[str]) -> bool:
     """Class-level eligibility for per-member CacheList block storage.
 
-    True when every member is either a sliceable KV class or an
-    ArraysCache-style class, with at least one of each. Must stay in sync
-    with ``prefix_cache.cachelist_pm_member_plan`` (which additionally
-    checks live tensor shapes at store time).
+    True when every member is either a sliceable KV class or a boundary
+    class (ArraysCache-style or PoolingCache), with at least one of each.
+    Must stay in sync with ``prefix_cache.cachelist_pm_member_plan`` (which
+    additionally checks live tensor shapes at store time).
     """
     if not sub_class_names:
         return False
     names = [str(n) for n in sub_class_names]
     has_slice = any(n in _PM_SLICEABLE_SUB_CLASSES for n in names)
-    has_boundary = any(n in _ARRAYS_SUB_CLASSES for n in names)
+    has_boundary = any(n in _PM_BOUNDARY_SUB_CLASSES for n in names)
     all_known = all(
-        n in _PM_SLICEABLE_SUB_CLASSES or n in _ARRAYS_SUB_CLASSES for n in names
+        n in _PM_SLICEABLE_SUB_CLASSES or n in _PM_BOUNDARY_SUB_CLASSES for n in names
     )
     return has_slice and has_boundary and all_known
 
