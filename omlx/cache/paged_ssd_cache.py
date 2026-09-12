@@ -3891,8 +3891,11 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             try:
                 file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove corrupted SSD cache file at %s: %s",
+                    file_path, e,
+                )
             return None
 
     def load_block_with_metadata(
@@ -4096,8 +4099,12 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             try:
                 file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove corrupted SSD cache file %s: %s",
+                    file_path,
+                    e,
+                )
             return None, None
 
     def get_block_metadata(self, block_hash: bytes) -> PagedSSDBlockMetadata | None:
