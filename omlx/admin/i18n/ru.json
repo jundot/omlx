@@ -36,6 +36,7 @@
   "navbar.tab.logs": "Журналы",
   "navbar.tab.bench": "Бенчмарк",
   "navbar.tab.chat": "Чат",
+  "navbar.tablist_label": "Разделы панели управления",
   "navbar.dropdown.manager": "Менеджер",
   "navbar.dropdown.downloader": "Загрузчик",
   "navbar.dropdown.quantizer": "oQ квантование",

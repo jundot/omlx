@@ -36,6 +36,7 @@
   "navbar.tab.logs": "記錄",
   "navbar.tab.bench": "基準",
   "navbar.tab.chat": "聊天",
+  "navbar.tablist_label": "儀表板區段",
   "navbar.dropdown.manager": "管理器",
   "navbar.dropdown.downloader": "下載工具",
   "navbar.dropdown.quantizer": "oQ量化",

@@ -4,7 +4,7 @@
      States: empty / discovering / device_card / pairing / checks / plan /
      active / error. Feedback is toasts and banners, never modals. -->
 <div x-data="clusterV2Wizard()"
-     x-show="mainTab === 'cluster'" x-cloak
+     x-show="mainTab === 'cluster'" x-cloak role="tabpanel" id="panel-cluster" aria-labelledby="tab-cluster"
      data-cluster-v2-wizard>
     <div class="animate-fade-in-up">
 

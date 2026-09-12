@@ -49,9 +49,11 @@
         <div class="fixed inset-0 bg-black/50" @click="showHfMirrorModal = false"></div>
         <div class="flex min-h-full items-center justify-center p-4">
             <div class="relative bg-white rounded-2xl shadow-2xl max-w-md w-[28rem] overflow-hidden"
+                 role="dialog" aria-modal="true"
+                 aria-labelledby="hf-mirror-modal-title"
                  @click.stop>
                 <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-200">
-                    <h3 class="text-base font-semibold text-neutral-900">{{ t('models.downloader.mirror_settings') }}</h3>
+                    <h3 id="hf-mirror-modal-title" class="text-base font-semibold text-neutral-900">{{ t('models.downloader.mirror_settings') }}</h3>
                     <button @click="showHfMirrorModal = false"
                             class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
                         <i data-lucide="x" class="w-4 h-4"></i>

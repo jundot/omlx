@@ -36,7 +36,7 @@ def test_cluster_navigation_exists_for_desktop_and_mobile():
     ).read_text(encoding="utf-8")
 
     assert navbar.count("setMainTab('cluster')") == 2
-    assert navbar.count("mainTab === 'cluster'") == 2
+    assert navbar.count("mainTab === 'cluster'") == 3
     assert navbar.count("navbar.tab.cluster") == 2
 
 

@@ -31,9 +31,14 @@
             </button>
 
             <!-- Center Navigation -->
-            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
+            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2"
+                 role="tablist" aria-label="{{ t('navbar.tablist_label') }}">
                 <button
                     @click="setMainTab('status')"
+                    id="tab-status"
+                    :aria-selected="mainTab === 'status'"
+                    role="tab"
+                    aria-controls="panel-status"
                     :class="mainTab === 'status'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -46,6 +51,10 @@
                     x-show="globalSettings.server.distributed_inference_active"
                     x-cloak
                     @click="setMainTab('cluster')"
+                    role="tab"
+                    id="tab-cluster"
+                    aria-controls="panel-cluster"
+                    :aria-selected="mainTab === 'cluster'"
                     :class="mainTab === 'cluster'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -57,6 +66,10 @@
                 <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
                     <button
                         @click="setMainTab('models')"
+                        role="tab"
+                        id="tab-models"
+                        aria-controls="panel-models"
+                        :aria-selected="mainTab === 'models'"
                         :class="mainTab === 'models'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -127,6 +140,10 @@
                 <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
                     <button
                         @click="setMainTab('settings')"
+                        role="tab"
+                        id="tab-settings"
+                        aria-controls="panel-settings"
+                        :aria-selected="mainTab === 'settings'"
                         :class="mainTab === 'settings'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -181,6 +198,10 @@
                 </div>
                 <button
                     @click="setMainTab('logs')"
+                    role="tab"
+                    id="tab-logs"
+                    aria-controls="panel-logs"
+                    :aria-selected="mainTab === 'logs'"
                     :class="mainTab === 'logs'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -192,6 +213,10 @@
                 <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false">
                     <button
                         @click="setMainTab('bench')"
+                        role="tab"
+                        id="tab-bench"
+                        aria-controls="panel-bench"
+                        :aria-selected="mainTab === 'bench'"
                         :class="mainTab === 'bench'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
