@@ -2,7 +2,7 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 3..9).
+"""Fused GDN prework for Qwen3.5/3.6 and Qwen4 MTP verification.
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
@@ -17,10 +17,10 @@ donor kernel: the in-kernel sigmoid uses MLX's own unary formula
 inputs; the RMS applies the ones-weight rounding then the separate scalar
 multiply's rounding — the composed chain's two casts.
 
-S >= 3 is a HARD gate: the next conv state is copied from qkv rows only,
-which is wrong when a state row would still come from the OLD conv state.
-Only the target-verify arm routes here; decode (S=1) and prefill keep the
-stock path.
+Qwen3.5/3.6 verification keeps its S in 3..9 envelope. Qwen4 also supports
+S=2 by retaining the required prefix from the old convolution state. Qwen4
+verification reuses the per-row norm/gate kernel below; the separately
+guarded Qwen4 single-token path retains its existing eligibility checks.
 """
 
 from __future__ import annotations
