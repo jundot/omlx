@@ -2758,6 +2758,37 @@ async def _json_response_or_keepalive(
             )
         return Response(content=result, media_type=media_type, headers=headers)
 
+    global_settings = _server_state.global_settings
+    keepalive_mode = "chunk"
+    if global_settings is not None:
+        keepalive_mode = getattr(
+            global_settings.server, "sse_keepalive_mode", "chunk"
+        )
+
+    if keepalive_mode == "off":
+        try:
+            result = await task
+        except PrefillMemoryExceededError as e:
+            logger.warning(f"JSON keepalive prefill rejected: {e}")
+            return JSONResponse(
+                status_code=400,
+                content=_prefill_memory_openai_error_body(e),
+                headers=headers,
+            )
+        except HTTPException as e:
+            logger.warning(
+                "JSON keepalive request failed (%d): %s", e.status_code, e.detail
+            )
+            return JSONResponse(
+                status_code=e.status_code,
+                content=_openai_error_body(e.detail, e.status_code),
+                headers=headers,
+            )
+        finally:
+            if lease is not None:
+                await lease.release()
+        return Response(content=result, media_type=media_type, headers=headers)
+
     generator = _with_json_keepalive(http_request, task)
     if lease is not None:
         generator = _release_after_stream(generator, lease)
