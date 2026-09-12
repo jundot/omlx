@@ -3,7 +3,7 @@
 
 The fused kernel must be BIT-exact to the composed chain (conv-state concat
 + depthwise conv1d + SiLU + split + ones-weight RMS norms + scalar scales +
-next conv-state slice) at every verify width it claims (S in 3..9).
+next conv-state slice) at every verify width it claims (S in 2..9).
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _composed(qkv, conv_state, conv1d):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("seq", [3, 4, 5, 7, 9])
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
 def test_fused_prework_bit_exact(seq):
     mx.random.seed(11)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
@@ -108,7 +108,8 @@ def test_qwen4_decode_prework_is_bit_exact_including_fp32_gate():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_decode_norm_gate_is_bit_exact():
+@pytest.mark.parametrize("seq", [1, 2, 3, 4, 6, 9])
+def test_qwen4_decode_norm_gate_is_bit_exact(seq):
     from omlx.patches.mlx_vlm_qwen4_exp_compat import (
         apply_mlx_vlm_qwen4_exp_compat_patch,
     )
@@ -117,20 +118,20 @@ def test_qwen4_decode_norm_gate_is_bit_exact():
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpRMSNormGated
 
     mx.random.seed(31)
-    y = (mx.random.normal((1, 1, HV, DV)) * 0.25).astype(mx.bfloat16)
-    z = (mx.random.normal((1, 1, HV, DV)) * 0.25).astype(mx.bfloat16)
+    y = (mx.random.normal((1, seq, HV, DV)) * 0.25).astype(mx.bfloat16)
+    z = (mx.random.normal((1, seq, HV, DV)) * 0.25).astype(mx.bfloat16)
     norm = Qwen4ExpRMSNormGated(DV, eps=1e-6, activation="sigmoid")
     norm.weight = (1 + mx.random.normal((DV,)) * 0.1).astype(mx.bfloat16)
 
-    expected = norm(y, z).reshape(1, 1, HV * DV)
+    expected = norm(y, z).reshape(1, seq, HV * DV)
     observed = qwen4_decode_norm_gate_fused(
         y,
         z,
         norm.weight,
-        hv=HV,
+        hv=seq * HV,
         dv=DV,
         eps=norm.eps,
-    )
+    ).reshape(1, seq, HV * DV)
     mx.eval(expected, observed)
     assert mx.array_equal(expected, observed).item()
 
