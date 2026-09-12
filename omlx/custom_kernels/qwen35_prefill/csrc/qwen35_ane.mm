@@ -2655,6 +2655,27 @@ public:
     }
     encoder.dispatch_threads(MTL::Size(output_n, M, 1),
                              MTL::Size(16, 16, 1));
+    // The merge encoder reads this program's single output IOSurface. MLX
+    // commits this command buffer lazily, so without draining it here the
+    // next dispatch to the same program (the next 2K tile of one chunk on
+    // hosts with 4K prefill chunks) can begin its ANE evaluation and overwrite
+    // the surface before the merge kernel has executed. begin() only orders
+    // against the previous evaluation, not the previous merge. Commit and
+    // wait: the ANE and qmm branches were already joined on the host above,
+    // so the only added latency is the merge kernel itself.
+    {
+      encoder.end_encoding();
+      auto *merge_buffer = encoder.get_command_buffer();
+      merge_buffer->retain();
+      encoder.commit();
+      merge_buffer->waitUntilCompleted();
+      if (merge_buffer->status() == MTL::CommandBufferStatusError) {
+        merge_buffer->release();
+        throw std::runtime_error("ANE hybrid merge command buffer failed");
+      }
+      merge_buffer->release();
+    }
+
 
     // This primitive deliberately commits intermediate command buffers. MLX's
     // evaluator retains the original buffer and only switches to its safe
@@ -2979,6 +3000,27 @@ public:
     }
     encoder.dispatch_threads(MTL::Size(output_n, M, 1),
                              MTL::Size(16, 16, 1));
+    // The merge encoder reads this program's single output IOSurface. MLX
+    // commits this command buffer lazily, so without draining it here the
+    // next dispatch to the same program (the next 2K tile of one chunk on
+    // hosts with 4K prefill chunks) can begin its ANE evaluation and overwrite
+    // the surface before the merge kernel has executed. begin() only orders
+    // against the previous evaluation, not the previous merge. Commit and
+    // wait: the ANE and qmm branches were already joined on the host above,
+    // so the only added latency is the merge kernel itself.
+    {
+      encoder.end_encoding();
+      auto *merge_buffer = encoder.get_command_buffer();
+      merge_buffer->retain();
+      encoder.commit();
+      merge_buffer->waitUntilCompleted();
+      if (merge_buffer->status() == MTL::CommandBufferStatusError) {
+        merge_buffer->release();
+        throw std::runtime_error("ANE hybrid merge command buffer failed");
+      }
+      merge_buffer->release();
+    }
+
 
     if (!encoder.needs_commit()) {
       auto guard = device.get_kernel("qwen35_ane_commit_guard", library);
@@ -3332,6 +3374,27 @@ public:
     }
     encoder.dispatch_threads(MTL::Size(output_dim, M, 1),
                              MTL::Size(16, 16, 1));
+    // The merge encoder reads this program's single output IOSurface. MLX
+    // commits this command buffer lazily, so without draining it here the
+    // next dispatch to the same program (the next 2K tile of one chunk on
+    // hosts with 4K prefill chunks) can begin its ANE evaluation and overwrite
+    // the surface before the merge kernel has executed. begin() only orders
+    // against the previous evaluation, not the previous merge. Commit and
+    // wait: the ANE and qmm branches were already joined on the host above,
+    // so the only added latency is the merge kernel itself.
+    {
+      encoder.end_encoding();
+      auto *merge_buffer = encoder.get_command_buffer();
+      merge_buffer->retain();
+      encoder.commit();
+      merge_buffer->waitUntilCompleted();
+      if (merge_buffer->status() == MTL::CommandBufferStatusError) {
+        merge_buffer->release();
+        throw std::runtime_error("ANE hybrid merge command buffer failed");
+      }
+      merge_buffer->release();
+    }
+
 
     if (!encoder.needs_commit()) {
       auto guard = device.get_kernel("qwen35_ane_commit_guard", library);
