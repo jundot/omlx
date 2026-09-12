@@ -611,7 +611,13 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
-
+    if model_type == "spark2_5":
+        from ..patches.spark2_5 import apply_spark2_5_patch
+        if apply_spark2_5_patch():
+            logger.info(
+                "Spark-X2.5 pre-load patch applied for %s",
+                model_name,
+            )
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if not for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
