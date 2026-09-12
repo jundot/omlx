@@ -3,7 +3,8 @@
 
 Fuses per-stream RMS norm, down/inject projections with activation, and the up
 projection with stream mixing. Supports at most 16 BF16 rows, four streams,
-and affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
+and affine group-size-64 projections with 4/5/6/8-bit weights. The small block
+injection projection may also use its original BF16 weights. FP32 epilogues
 can round differently from the canonical BF16 operations.
 
 Each kernel specialization is evaluated once inside the failure handler to
@@ -137,39 +138,52 @@ _D_SOURCE = r"""
     }
     if (INJ == 0 || rg != 0) return;
     {
-        constexpr int PF = hc_pack_factor<BITS_I>();
-        constexpr int BP = hc_bytes_per_pack<BITS_I>();
-        constexpr int ROW_BYTES = K * BP / PF;
-        constexpr int PPT = 1;
-        constexpr int VPT = PF;
-        constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
-        const device uint8_t* wp = (const device uint8_t*)inject_w
-            + ks * (SLICE * BP / PF) + int(lane) * BP;
-        const device T* sp = inject_s + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
-        const device T* bp = inject_b + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
-        const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[HC] = {0.0f};
-        float xv[VPT];
-        constexpr int TAIL = SLICE % BLOCK;
-        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
-            float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
-            for (int r = 0; r < HC; ++r) {
-                result[r] += hc_qdot<VPT, BITS_I>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+        if constexpr (DENSE_I) {
+            // Four output rows are small enough to share the down projection's
+            // dispatch without quantizing precision-sensitive injection weights.
+            const device T* wp = (const device T*)inject_w;
+            for (int k = int(lane); k < SLICE; k += 32) {
+                const int col = ks * SLICE + k;
+                const float xv = float(x[col]);
+                for (int r = 0; r < HC; ++r) {
+                    result[r] += xv * float(wp[r * K + col]);
+                }
             }
-            wp += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
-            xp += BLOCK;
-        }
-        if (TAIL > 0 && int(lane) * VPT < TAIL) {
-            float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
-            for (int r = 0; r < HC; ++r) {
-                result[r] += hc_qdot<VPT, BITS_I>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+        } else {
+            constexpr int PF = hc_pack_factor<BITS_I>();
+            constexpr int BP = hc_bytes_per_pack<BITS_I>();
+            constexpr int ROW_BYTES = K * BP / PF;
+            constexpr int PPT = 1;
+            constexpr int VPT = PF;
+            constexpr int BLOCK = VPT * 32;
+            constexpr int SCALE_STEP = 64 / VPT;
+            const device uint8_t* wp = (const device uint8_t*)inject_w
+                + ks * (SLICE * BP / PF) + int(lane) * BP;
+            const device T* sp = inject_s + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
+            const device T* bp = inject_b + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
+            const device T* xp = x + ks * SLICE + int(lane) * VPT;
+            float xv[VPT];
+            constexpr int TAIL = SLICE % BLOCK;
+            for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
+                float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
+                for (int r = 0; r < HC; ++r) {
+                    result[r] += hc_qdot<VPT, BITS_I>(
+                        wp + r * ROW_BYTES, xv,
+                        float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+                }
+                wp += BLOCK * BP / PF;
+                sp += BLOCK / 64;
+                bp += BLOCK / 64;
+                xp += BLOCK;
+            }
+            if (TAIL > 0 && int(lane) * VPT < TAIL) {
+                float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
+                for (int r = 0; r < HC; ++r) {
+                    result[r] += hc_qdot<VPT, BITS_I>(
+                        wp + r * ROW_BYTES, xv,
+                        float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+                }
             }
         }
         for (int r = 0; r < HC; ++r) {
@@ -264,6 +278,16 @@ def _quantized_ok(projection) -> bool:
     )
 
 
+def _dense_inject_ok(projection, hc: int, width: int) -> bool:
+    return (
+        type(projection) is nn.Linear
+        and "bias" not in projection
+        and isinstance(getattr(projection, "weight", None), mx.array)
+        and projection.weight.dtype == mx.bfloat16
+        and projection.weight.shape == (hc, width)
+    )
+
+
 def _ineligible(reason: str) -> bool:
     """Log the first unsupported model layout per process."""
     global _INELIGIBLE_LOGGED
@@ -344,10 +368,13 @@ def _layout_compatible(module, hyper_input) -> bool:
         return _ineligible(
             "projection quantisation (need affine group-size-64 4/5/6/8-bit with bf16 scales)"
         )
-    if "block_inject_weight" in module and not _quantized_ok(
-        module.block_inject_weight
-    ):
-        return _ineligible("block_inject_weight quantisation")
+    if "block_inject_weight" in module:
+        inject = module.block_inject_weight
+        if not (
+            _quantized_ok(inject)
+            or _dense_inject_ok(inject, hc_count, hc_count * hidden)
+        ):
+            return _ineligible("block_inject_weight layout (need affine or dense BF16)")
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
@@ -362,9 +389,7 @@ def _eps_array(module) -> mx.array:
 
 def _kernel_norm(module, flat, rows, hc, hidden, dtype):
     width = hc * hidden
-    return _kernel(
-        "omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE
-    )(
+    return _kernel("omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE)(
         inputs=[flat, module.hc_norm.weight, _eps_array(module)],
         template=[("T", dtype), ("K", width), ("H", hidden)],
         grid=(256, hc, rows),
@@ -406,7 +431,14 @@ def prefill_forward(module, hyper_input):
         mixed = _tail(hc, hidden)(module.input_mix_weight_up(mix), normed)
         inject = module.block_inject_weight if "block_inject_weight" in module else None
         injection = None if inject is None else 2 * mx.sigmoid(inject(normed) / hc)
-        signature = ("prefill", dtype, hc, hidden, module.hc_lowrank, module.input_mix_weight_down.bits)
+        signature = (
+            "prefill",
+            dtype,
+            hc,
+            hidden,
+            module.hc_lowrank,
+            module.input_mix_weight_down.bits,
+        )
         if signature not in _VALIDATED:
             mx.eval(mixed) if injection is None else mx.eval(mixed, injection)
             _VALIDATED.add(signature)
@@ -435,10 +467,17 @@ def fused_forward(module, hyper_input):
         rows = batch * seq
         down, up = module.input_mix_weight_down, module.input_mix_weight_up
         inject = module.block_inject_weight if "block_inject_weight" in module else None
+        dense_inject = inject is not None and type(inject) is nn.Linear
+        inject_bits = (
+            16 if dense_inject else (inject.bits if inject is not None else None)
+        )
         flat = hyper_input.reshape(rows, width)
         dtype = hyper_input.dtype
         normed = _kernel_norm(module, flat, rows, hc, hidden, dtype)
-        if inject is not None:
+        if dense_inject:
+            # Scale/bias arguments are unused in the dense specialization.
+            inject_tensors = (inject.weight, down.scales, down.biases)
+        elif inject is not None:
             inject_tensors = (inject.weight, inject.scales, inject.biases)
         else:
             inject_tensors = (down.weight, down.scales, down.biases)
@@ -453,7 +492,15 @@ def fused_forward(module, hyper_input):
             template=[
                 ("T", dtype),
                 ("BITS_D", down.bits),
-                ("BITS_I", inject.bits if inject is not None else down.bits),
+                (
+                    "BITS_I",
+                    (
+                        inject_bits
+                        if inject is not None and not dense_inject
+                        else down.bits
+                    ),
+                ),
+                ("DENSE_I", dense_inject),
                 ("K", width),
                 ("R", lowrank),
                 ("HC", hc),
@@ -496,7 +543,7 @@ def fused_forward(module, hyper_input):
             rows,
             down.bits,
             up.bits,
-            inject.bits if inject is not None else None,
+            inject_bits,
         )
         if signature not in _VALIDATED:
             # Metal compilation is lazy. Validate once, without synchronizing
@@ -522,4 +569,11 @@ def fused_forward(module, hyper_input):
         return None
 
 
-__all__ = ["MAX_ROWS", "compatible", "enabled", "fused_forward", "prefill_compatible", "prefill_forward"]
+__all__ = [
+    "MAX_ROWS",
+    "compatible",
+    "enabled",
+    "fused_forward",
+    "prefill_compatible",
+    "prefill_forward",
+]
