@@ -140,17 +140,27 @@ def configure_qwen4_exp_runtime(
     mode: str | None = None,
     *,
     mtp_enabled: bool = False,
+    yarn_context_length: int | None = None,
 ) -> str:
-    """Select PLE storage and optional Lightning MTP before construction."""
+    """Select PLE storage, optional Lightning MTP, and YaRN before construction."""
     apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import (
         configure_mtp_runtime,
         configure_ple_runtime,
     )
 
+    from .yarn_rope import configure_yarn_runtime
+
     resolved = configure_ple_runtime(model_path, mode=mode)
     mtp_runtime = configure_mtp_runtime(model_path, enabled=mtp_enabled)
+    configure_yarn_runtime(yarn_context_length)
     logger.info("Qwen4-Exp PLE mode for %s: %s", model_path, resolved)
+    if yarn_context_length:
+        logger.info(
+            "Qwen4-Exp YaRN requested for %s: target context %d tokens",
+            model_path,
+            int(yarn_context_length),
+        )
     if mtp_enabled and not mtp_runtime.enabled:
         logger.warning(
             "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "

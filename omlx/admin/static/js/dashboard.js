@@ -1870,6 +1870,8 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    yarn_rope_supported:
+                        model?.yarn_rope_supported === true,
                     deepseek_v41_ced_prefill_enabled:
                         s.deepseek_v41_ced_prefill_enabled === true,
                     deepseek_v41_ced_prefill_supported:
@@ -2781,6 +2783,41 @@
                 return null;
             },
 
+            validateYarnSettings() {
+                // Single knob: Max Context Window doubles as the YaRN target
+                // on Qwen4-Exp models — above the native horizon it engages
+                // rope scaling (factor = value / native) at load, capped at
+                // Qwen's published 4x recipe maximum.
+                if (!this.modelSettings.yarn_rope_supported) return null;
+                const raw = this.modelSettings.max_context_window;
+                if (raw === null || raw === undefined || raw === '') return null;
+                const value = Number(raw);
+                const native = Number(this.selectedModel?.model_context_length || 0);
+                if (native > 0 && value > native * 4) {
+                    return `Max Context Window cannot exceed 4x the native context on Qwen4-Exp (${(native * 4).toLocaleString()} tokens — the published YaRN recipe maximum).`;
+                }
+                return null;
+            },
+
+            yarnFactorDisplay() {
+                // Read-only mirror of the loader derivation so the operator
+                // sees the same factor the rope table will be built with.
+                const native = Number(this.selectedModel?.model_context_length || 0);
+                if (!this.modelSettings.yarn_rope_supported || !(native > 0)) return '';
+                const raw = this.modelSettings.max_context_window;
+                if (raw === null || raw === undefined || raw === '') {
+                    return `off — native ${native.toLocaleString()} tokens`;
+                }
+                const value = Number(raw);
+                if (!Number.isFinite(value) || value <= 0) return '';
+                if (value <= native) {
+                    return `off — clamps below native ${native.toLocaleString()}`;
+                }
+                const factor = (value / native).toLocaleString(undefined, {maximumFractionDigits: 2});
+                const over = value > native * 4 ? ' — beyond the validated 4× maximum' : '';
+                return `${factor}× = ${value.toLocaleString()} ÷ ${native.toLocaleString()}${over}`;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
@@ -2793,6 +2830,12 @@
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
                     alert(qwenAneValidationError);
+                    return;
+                }
+
+                const yarnValidationError = this.validateYarnSettings();
+                if (yarnValidationError) {
+                    alert(yarnValidationError);
                     return;
                 }
 

@@ -721,6 +721,9 @@ class BatchedEngine(BaseEngine):
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
+            # qwen4_exp never loads through the text-only path; keep the SSD
+            # cache signature field defined and unscaled.
+            scheduler._yarn_context_length = None
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler

@@ -1353,12 +1353,23 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         super().__init__(config)
         # Qwen's long-context recipe (up to 1M tokens) is static YaRN in
         # rope_parameters; the pinned mlx-vlm rotary ignores the rope type,
-        # so correct the frequency table here. The indexer below shares this
-        # instance, and Qwen4ExpMTPModule builds its layer through this same
-        # class, so one hook covers main attention, QSA retrieval and MTP.
-        from omlx.patches.mlx_vlm_qwen4_exp_compat.yarn_rope import maybe_apply_yarn
+        # so correct the frequency table here. The operator setting
+        # yarn_context_length (bound via configure_yarn_runtime before
+        # construction) overrides the checkpoint recipe. The indexer below
+        # shares this instance, and Qwen4ExpMTPModule builds its layer
+        # through this same class, so one hook covers main attention, QSA
+        # retrieval and MTP.
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.yarn_rope import (
+            maybe_apply_yarn,
+            resolve_rope_parameters,
+        )
 
-        maybe_apply_yarn(self.rotary_emb, config.rope_parameters)
+        maybe_apply_yarn(
+            self.rotary_emb,
+            resolve_rope_parameters(
+                config.rope_parameters, config.max_position_embeddings
+            ),
+        )
         self.q_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)

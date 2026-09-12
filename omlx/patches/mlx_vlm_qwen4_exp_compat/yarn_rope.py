@@ -33,6 +33,15 @@ disabled so the eager path — which multiplies ``attention_scaling`` into
 cos/sin — handles every apply. With ``mscale_all_dim`` cancelling the
 temperature the fused kernel stays active.
 
+Operator override: the oMLX per-model setting ``yarn_context_length``
+takes precedence over the checkpoint config. ``configure_yarn_runtime``
+binds the target before model construction (set by the loader through
+``configure_qwen4_exp_runtime``); ``resolve_rope_parameters`` derives the
+recipe fields from the model's native ``max_position_embeddings`` —
+factor = target / native, original = native, betas/mscale at Qwen's
+defaults — without ever mutating the checkpoint on disk. With no override
+bound, the checkpoint's own ``rope_parameters`` pass through unchanged.
+
 Known interaction: ``omlx.patches.specprefill`` rebuilds positions with
 ``manual_rope(base=...)`` unless the wrapped rope stores a ``_freqs``
 table, which MRoPE modules do not. Keep SpecPrefill disabled for
@@ -54,6 +63,24 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 _REQUIRED_YARN_KEYS = ("factor", "original_max_position_embeddings")
+
+_YARN_RUNTIME_CONTEXT_LENGTH: int | None = None
+
+
+def configure_yarn_runtime(context_length: int | None) -> None:
+    """Bind the operator-selected YaRN target before model construction.
+
+    Mirrors the ``configure_ple_runtime`` / ``configure_mtp_runtime``
+    module-state pattern: the loader sets this once per model load (None
+    clears it) and every attention layer constructed afterwards resolves
+    against the same value.
+    """
+    global _YARN_RUNTIME_CONTEXT_LENGTH
+    _YARN_RUNTIME_CONTEXT_LENGTH = int(context_length) if context_length else None
+
+
+def get_yarn_runtime_context_length() -> int | None:
+    return _YARN_RUNTIME_CONTEXT_LENGTH
 
 
 def _correction_dim(
@@ -191,3 +218,54 @@ def maybe_apply_yarn(rotary_emb: Any, rope_parameters: dict | None) -> bool:
         scaling,
     )
     return True
+
+
+def resolve_rope_parameters(
+    rope_parameters: dict | None,
+    native_max_position_embeddings: int,
+) -> dict | None:
+    """Merge the operator YaRN override onto the checkpoint rope config.
+
+    Returns the rope-parameters mapping :func:`maybe_apply_yarn` should
+    consume: the runtime target (when bound) wins over any
+    checkpoint-declared scaling; with no target the checkpoint config
+    passes through unchanged. Checkpoint-provided beta/mscale keys are
+    preserved under the override.
+    """
+    target = _YARN_RUNTIME_CONTEXT_LENGTH
+    if not target:
+        return rope_parameters
+    native = int(native_max_position_embeddings or 0)
+    if native <= 0:
+        raise ValueError(
+            "YaRN override requires a positive native max_position_embeddings, "
+            f"got {native_max_position_embeddings!r}"
+        )
+    if not isinstance(rope_parameters, dict):
+        raise ValueError(
+            "YaRN override requires the checkpoint rope_parameters mapping "
+            "(rope_theta/mrope_section/partial_rotary_factor), got "
+            f"{rope_parameters!r}"
+        )
+    factor = target / native
+    if factor <= 1.0:
+        logger.warning(
+            "YaRN target %d does not exceed the native context %d; serving "
+            "the checkpoint rope configuration unscaled",
+            target,
+            native,
+        )
+        return rope_parameters
+    if factor > 4.0:
+        logger.warning(
+            "YaRN factor %.2f exceeds Qwen's published recipe maximum "
+            "(4.0 = 1M tokens over the native 262144 context); quality past "
+            "the published horizon is unvalidated",
+            factor,
+        )
+    resolved = dict(rope_parameters)
+    resolved.pop("rope_type", None)
+    resolved["type"] = "yarn"
+    resolved["factor"] = factor
+    resolved["original_max_position_embeddings"] = native
+    return resolved

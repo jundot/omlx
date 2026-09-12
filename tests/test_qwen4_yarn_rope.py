@@ -329,3 +329,82 @@ def test_apply_rotary_matches_reference(start, rtol, atol):
     # Passthrough lanes are bit-exact copies.
     assert mx.array_equal(q_out[..., ROTARY_DIM:], q[..., ROTARY_DIM:])
     assert mx.array_equal(k_out[..., ROTARY_DIM:], k[..., ROTARY_DIM:])
+
+
+# ---------------------------------------------------------------------------
+# Operator override: configure_yarn_runtime + resolve_rope_parameters
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_yarn_runtime():
+    yield
+    yarn_rope.configure_yarn_runtime(None)
+
+
+def test_runtime_override_scales_a_default_checkpoint():
+    """The setting alone turns a type=default checkpoint into factor-2 YaRN."""
+    yarn_rope.configure_yarn_runtime(524288)
+    attn = Qwen4ExpAttention(_text_config(DEFAULT_RECIPE))
+    expected = yarn_rope.yarn_inv_freq(ROTARY_DIM, ROPE_THETA, 2.0, NATIVE_CTX)
+    assert mx.array_equal(attn.rotary_emb.inv_freq, expected)
+    assert attn.rotary_emb.attention_scaling == pytest.approx(0.1 * math.log(2.0) + 1.0)
+    assert attn.indexer.rotary_emb is attn.rotary_emb
+
+
+def test_runtime_override_wins_over_checkpoint_yarn():
+    yarn_rope.configure_yarn_runtime(524288)
+    checkpoint_yarn = dict(QWEN_512K_RECIPE, factor=4.0)
+    attn = Qwen4ExpAttention(_text_config(checkpoint_yarn))
+    assert mx.array_equal(
+        attn.rotary_emb.inv_freq,
+        yarn_rope.yarn_inv_freq(ROTARY_DIM, ROPE_THETA, 2.0, NATIVE_CTX),
+    )
+
+
+def test_mtp_head_follows_runtime_override():
+    yarn_rope.configure_yarn_runtime(524288)
+    mtp = Qwen4ExpMTPModule(_text_config(DEFAULT_RECIPE))
+    assert mx.array_equal(
+        mtp.layers[0].self_attn.rotary_emb.inv_freq,
+        yarn_rope.yarn_inv_freq(ROTARY_DIM, ROPE_THETA, 2.0, NATIVE_CTX),
+    )
+
+
+def test_resolve_derives_recipe_from_native_context():
+    yarn_rope.configure_yarn_runtime(524288)
+    resolved = yarn_rope.resolve_rope_parameters(DEFAULT_RECIPE, NATIVE_CTX)
+    assert resolved["type"] == "yarn"
+    assert resolved["factor"] == 2.0
+    assert resolved["original_max_position_embeddings"] == NATIVE_CTX
+    # Checkpoint geometry keys survive the override.
+    assert resolved["rope_theta"] == ROPE_THETA
+    assert resolved["mrope_section"] == [11, 11, 10]
+    assert resolved["partial_rotary_factor"] == 0.5
+
+
+def test_resolve_preserves_checkpoint_betas():
+    yarn_rope.configure_yarn_runtime(524288)
+    tuned = dict(DEFAULT_RECIPE, beta_fast=16, beta_slow=2)
+    resolved = yarn_rope.resolve_rope_parameters(tuned, NATIVE_CTX)
+    assert resolved["beta_fast"] == 16
+    assert resolved["beta_slow"] == 2
+
+
+def test_resolve_passes_through_when_unset_or_not_extending():
+    assert yarn_rope.resolve_rope_parameters(DEFAULT_RECIPE, NATIVE_CTX) is (
+        DEFAULT_RECIPE
+    )
+    # A target at or below the native horizon is a no-op, not an error.
+    yarn_rope.configure_yarn_runtime(NATIVE_CTX)
+    assert yarn_rope.resolve_rope_parameters(DEFAULT_RECIPE, NATIVE_CTX) is (
+        DEFAULT_RECIPE
+    )
+
+
+def test_resolve_rejects_unusable_inputs():
+    yarn_rope.configure_yarn_runtime(524288)
+    with pytest.raises(ValueError, match="native"):
+        yarn_rope.resolve_rope_parameters(DEFAULT_RECIPE, 0)
+    with pytest.raises(ValueError, match="rope_parameters"):
+        yarn_rope.resolve_rope_parameters(None, NATIVE_CTX)

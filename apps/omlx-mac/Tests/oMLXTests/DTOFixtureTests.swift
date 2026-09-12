@@ -159,6 +159,9 @@ final class DTOFixtureTests: XCTestCase {
         if let first = list.models.first {
             XCTAssertFalse(first.id.isEmpty, "ModelDTO.id must be non-empty.")
             XCTAssertEqual(first.displayName, "deepsweet/Qwen3.6-27B-UD-MLX-4bit")
+            // The per-model gate flag for the read-only YaRN factor hint
+            // rides this payload; a server-side rename would hide it silently.
+            XCTAssertEqual(first.yarnRopeSupported, false)
         }
     }
 
@@ -169,6 +172,8 @@ final class DTOFixtureTests: XCTestCase {
         let resp = try Self.makeDecoder().decode(ProfileListResponse.self, from: data)
         XCTAssertNotNil(resp.profiles,
                         "Profiles array must be present even when empty.")
+        // YaRN has no profile field of its own: the context window override
+        // in `settings` is what drives the derived factor.
     }
 
     // MARK: - Profile templates

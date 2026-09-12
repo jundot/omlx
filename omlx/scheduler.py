@@ -1864,6 +1864,10 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
+        # Qwen4-Exp YaRN rope target (set by the engine from model_settings).
+        # Participates in the SSD cache compatibility signature: scaled
+        # rotary writes different KV content at identical layer layout.
+        self._yarn_context_length: int | None = None
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -13653,6 +13657,7 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
+                    yarn_context_length=self._yarn_context_length,
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)
