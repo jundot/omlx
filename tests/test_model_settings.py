@@ -261,6 +261,50 @@ class TestModelSettings:
         settings = ModelSettings()
         assert settings.turboquant_kv_bits == 4
 
+    @pytest.mark.parametrize("bits", [2, 2.5, 3, 3.5, 4, 6, 8])
+    def test_legacy_kv_compression_defaults_to_turboquant(self, bits):
+        settings = ModelSettings.from_dict(
+            {"turboquant_kv_enabled": True, "turboquant_kv_bits": bits}
+        )
+        assert settings.turboquant_kv_scheme == "turboquant"
+        assert settings.turboquant_kv_bits == bits
+        assert settings.turboquant_kv_enabled is True
+        assert ModelSettings().to_dict()["turboquant_kv_scheme"] == "turboquant"
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize(
+        "scheme,bits",
+        [("unknown", 4), ("", 4), (None, 4), ("affine4", 3),
+         ("affine4", 8), ("turboquant", 0), ("turboquant", 5)],
+    )
+    def test_invalid_kv_compression_rejected(self, enabled, scheme, bits):
+        with pytest.raises(ValueError, match="turboquant_kv_"):
+            ModelSettings(
+                turboquant_kv_enabled=enabled,
+                turboquant_kv_scheme=scheme,
+                turboquant_kv_bits=bits,
+            )
+
+    @pytest.mark.parametrize("scheme", ["turboquant", "affine4"])
+    def test_kv_compression_save_load(self, tmp_path, scheme):
+        manager = ModelSettingsManager(tmp_path)
+        settings = ModelSettings(turboquant_kv_enabled=True, turboquant_kv_scheme=scheme)
+        manager.set_settings("model", settings)
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored == settings
+        assert restored.to_dict()["turboquant_kv_scheme"] == scheme
+
+    def test_legacy_kv_compression_file_load(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        manager.settings_file.write_text(json.dumps({
+            "version": 1,
+            "models": {"model": {"turboquant_kv_enabled": True, "turboquant_kv_bits": 2.5}},
+        }))
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored.turboquant_kv_scheme == "turboquant"
+        assert restored.turboquant_kv_bits == 2.5
+        assert restored.turboquant_kv_enabled is True
+
     def test_turboquant_kv_bits_roundtrip(self):
         original = ModelSettings(turboquant_kv_bits=2.5)
         d = original.to_dict()
@@ -285,14 +329,21 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.turboquant_skip_last is False
 
-    def test_native_mtp_allows_turboquant(self):
-        settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+    @pytest.mark.parametrize("scheme", ["turboquant", "affine4"])
+    def test_native_mtp_allows_turboquant(self, scheme):
+        settings = ModelSettings(
+            mtp_enabled=True, turboquant_kv_enabled=True, turboquant_kv_scheme=scheme
+        )
         assert settings.mtp_enabled is True
         assert settings.turboquant_kv_enabled is True
 
-    def test_vlm_mtp_rejects_turboquant(self):
+    @pytest.mark.parametrize("scheme", ["turboquant", "affine4"])
+    def test_vlm_mtp_rejects_turboquant(self, scheme):
         with pytest.raises(ValueError, match="vlm_mtp_enabled.*turboquant"):
-            ModelSettings(vlm_mtp_enabled=True, turboquant_kv_enabled=True)
+            ModelSettings(
+                vlm_mtp_enabled=True, turboquant_kv_enabled=True,
+                turboquant_kv_scheme=scheme,
+            )
 
     def test_vlm_mtp_draft_model_default(self):
         settings = ModelSettings()

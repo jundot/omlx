@@ -1,0 +1,16 @@
+{
+  "core_source_unchanged": true,
+  "successful_long_server_requests": 4,
+  "fixed_length_generated_tokens": 512,
+  "failed_server_attempts": 4,
+  "paired_decode_runs": 7,
+  "native_continuation_replay": 128,
+  "reversed_order_repeat": true,
+  "range_check": {
+    "current_finite": true,
+    "half_probe_finite": false,
+    "vlm_pr_finite": false
+  },
+  "archive_entries": 24,
+  "archive_bytes": 82917
+}

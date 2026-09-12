@@ -1,0 +1,30 @@
+{
+  "geometry": {
+    "tokens": 32768,
+    "kv_heads": 64,
+    "query_heads": 64,
+    "dim": 32
+  },
+  "protocol": "Zero queries/keys, constant signed -8 value codes with scale 1: exact rotated attention output is -8.",
+  "blocks": 4,
+  "tokens_per_block": 8192,
+  "absolute_partial_sum": 65536,
+  "fp16_max": 65504,
+  "rows": [
+    {
+      "scheme": "current",
+      "all_finite": true,
+      "max_absolute_error": 0.0
+    },
+    {
+      "scheme": "half_accumulator_probe",
+      "all_finite": false,
+      "max_absolute_error": null
+    },
+    {
+      "scheme": "vlm_pr",
+      "all_finite": false,
+      "max_absolute_error": null
+    }
+  ]
+}

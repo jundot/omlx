@@ -174,6 +174,28 @@ def test_current_usage_subtracts_shared_hot_cache_bytes_from_phys_side():
         assert scheduler._current_usage_bytes() == 7 * 1024**3
 
 
+def test_prefill_memory_trace_separates_actual_components(caplog):
+    from mlx_lm.models.cache import KVCache
+
+    scheduler = _make_scheduler()
+    request = _make_request(7)
+    request.benchmark_trace = True
+    cache = KVCache()
+    cache.update_and_fetch(mx.ones((1, 1, 7, 3)), mx.ones((1, 1, 7, 3)))
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=6000),
+        patch("omlx.scheduler.mx.get_cache_memory", return_value=2000),
+        patch("omlx.scheduler.get_phys_footprint", return_value=10000),
+        patch.object(scheduler, "_hot_cache_cpu_bytes", return_value=1000),
+        caplog.at_level("INFO", logger="omlx.scheduler"),
+    ):
+        scheduler._trace_prefill_memory(request, [cache], "after_reclaim")
+    assert "context=7" in caplog.text
+    assert f"cache_bytes={cache.nbytes}" in caplog.text
+    assert "mlx_active_bytes=6000 mlx_pool_bytes=2000" in caplog.text
+    assert "phys_footprint_bytes=10000 hot_cache_cpu_bytes=1000" in caplog.text
+
+
 def test_current_usage_keeps_mlx_active_as_floor_after_hot_cache_subtract():
     scheduler = _make_scheduler()
     scheduler.config.hot_cache_budget = SimpleNamespace(total_bytes=9 * 1024**3)
@@ -768,9 +790,7 @@ def test_admission_estimate_is_the_single_formula():
     assert est.floor_chunk == floor
     assert est.kv_len == pre_chunk_kv_len
     assert est.kv_exact == int(
-        scheduler.memory_monitor.estimate_resident_kv_bytes(
-            32768, chunk_tokens=floor
-        )
+        scheduler.memory_monitor.estimate_resident_kv_bytes(32768, chunk_tokens=floor)
     )
     assert est.transient == int(
         scheduler._admission_transient_bound(floor, pre_chunk_kv_len)
@@ -1074,9 +1094,7 @@ def test_qwen4_preflight_doors_use_gathered_for_text_only():
         patch("omlx.scheduler.get_phys_footprint", return_value=current),
     ):
         with pytest.raises(PrefillMemoryExceededError):
-            scheduler.preflight_or_raise(
-                num_prompt_tokens=233_472, text_only=False
-            )
+            scheduler.preflight_or_raise(num_prompt_tokens=233_472, text_only=False)
         scheduler.preflight_or_raise(num_prompt_tokens=233_472, text_only=True)
         assert (
             scheduler.preflight_eviction_request(

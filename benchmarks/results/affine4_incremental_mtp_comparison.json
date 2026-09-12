@@ -1,0 +1,232 @@
+{
+  "started_at": "2026-09-07T12:45:10.455446+00:00",
+  "scope": "Local server; identical oQ4e weights; native BF16 KV vs TQ4 vs Affine4",
+  "method": {
+    "context_profile": "code_python",
+    "prompt_alignment": "N+1 prompt tokens, N prefill rows",
+    "warmup": "2048 prefill rows and up to eight generated tokens",
+    "sampling": "greedy; benchmark-only termination-token suppression",
+    "speculation": "Lightning MTP toggled in recorded settings; VLM MTP, DFlash, SpecPrefill and ANE disabled",
+    "quantized_skip_last": true,
+    "cold_cache": true,
+    "public_upload": false,
+    "peak_memory": "Peak active MLX allocations, including resident model; physical footprint is sampled separately",
+    "repeat": "Two cold 8K/128 generation controls: Lightning MTP disabled then enabled",
+    "implementation_commit": "99d314fd"
+  },
+  "source_sha256": {
+    "omlx/affine4.py": "ac60cf2f0cfc2d7ebe32fd832842a9d086a566218226e7330e76d8384d47dd13",
+    "omlx/turboquant_kv.py": "3cbd67ffe51807444f5a229e4016c7d813e0e2f6d6175efd2ab93123ded936df",
+    "omlx/scheduler.py": "a1cb5a129146ad8c6a6b167d4245755585109d974ceca9424ff89b2fc52dd64e",
+    "omlx/admin/benchmark.py": "543e0fce2346f2899f3149ae77145b7520d8729c8885c2596e9b020c26d37fe7",
+    "benchmarks/serve_affine4_benchmark.py": "d7c2843a053a72d8f9e3171645d85bb832b0ed4347f811b3ae1902f3628973b5",
+    "benchmarks/bench_affine4_server.py": "0c4c187f8c00692cdbd8ce517e3249dce714e611cfdfb7c693fe8df8f1c5e2ac"
+  },
+  "runs": [
+    {
+      "label": "Qwen3.8-27B/affine4/mtp_off",
+      "model": "Qwen3.8-27B",
+      "mode": "affine4",
+      "phase": "mtp_off",
+      "request": {
+        "model_id": "Qwen3.8-27B",
+        "prompt_lengths": [
+          8192
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 131072,
+        "max_tokens": 8192
+      },
+      "bench_id": "bench-f46b11407736",
+      "result": {
+        "bench_id": "bench-f46b11407736",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 8193,
+            "tg": 128,
+            "ttft_ms": 16940.3,
+            "tpot_ms": 59.77,
+            "gen_tps": 16.9,
+            "processing_tps": 483.6,
+            "e2e_latency_s": 24.55,
+            "total_throughput": 338.9,
+            "peak_memory_bytes": 18970937410,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 8193,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "d70c15dda0e382c1581763c2b052d330210eef5c2424e3a6e3d451391bbffe33",
+            "output_sample": {
+              "sha256": "4c25db36179286f7c5302f9407fa423088b58f29600bbf2d4bab940e8cbbeac2",
+              "head": "]\n\n    def _flush_buffer(self) -> None:\n        \"\"\"Flush any pending buffer content, suppressing markers if needed.\"\"\"\n        if not self._buffer:\n            return\n        text = self._buffer\n        self._buffer = \"\"\n        for marker in self._active_",
+              "tail": "n\n            if text.startswith(marker):\n                text = text[len(marker) :]\n                if not text:\n                    return\n        self._append_text(self._stream_parts, self._visible_parts, text)\n\n    def _process_text(self, text: str) ->"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 96,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 5.2,
+                "total_max": 11.6,
+                "p_avg": 3.6,
+                "e_avg": 6.0
+              },
+              "memory": {
+                "phys_footprint_peak": 19.43,
+                "mlx_active_peak": 17.56,
+                "mlx_cache_peak": 0.9,
+                "system_used_peak": 34.9,
+                "system_wired_peak": 21.48,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 86.4,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": []
+    },
+    {
+      "label": "Qwen3.8-27B/affine4/mtp_on",
+      "model": "Qwen3.8-27B",
+      "mode": "affine4",
+      "phase": "mtp_on",
+      "request": {
+        "model_id": "Qwen3.8-27B",
+        "prompt_lengths": [
+          8192
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": true,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 131072,
+        "max_tokens": 8192
+      },
+      "bench_id": "bench-2a9768e643ba",
+      "result": {
+        "bench_id": "bench-2a9768e643ba",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 8193,
+            "tg": 128,
+            "ttft_ms": 17326.7,
+            "tpot_ms": 27.89,
+            "gen_tps": 36.1,
+            "processing_tps": 472.9,
+            "e2e_latency_s": 20.891,
+            "total_throughput": 398.3,
+            "peak_memory_bytes": 21076841456,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 8193,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "d70c15dda0e382c1581763c2b052d330210eef5c2424e3a6e3d451391bbffe33",
+            "output_sample": {
+              "sha256": "deb9fb9991a55161d477057ef32a4eb7c346311253356ab0b8698e5e515fbdf6",
+              "head": "]\n\n    def _flush_buffer(self) -> None:\n        \"\"\"Flush the pending buffer, emitting any visible text.\n\n        Returns the list of stream parts and visible parts produced.\n        \"\"\"\n        stream_parts: list[str] = []\n        visible_parts: list[str] ",
+              "tail": "      return stream_parts, visible_parts\n\n        text = self._buffer\n        self._buffer = \"\"\n\n        # Strip any trailing partial marker prefix (e.g. \"<|chan\")\n        for marker in self._active_markers():\n            if text.endswith(marker[: len(text"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 82,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 4.6,
+                "total_max": 13.7,
+                "p_avg": 2.8,
+                "e_avg": 5.4
+              },
+              "memory": {
+                "phys_footprint_peak": 21.48,
+                "mlx_active_peak": 19.54,
+                "mlx_cache_peak": 2.64,
+                "system_used_peak": 36.61,
+                "system_wired_peak": 23.54,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.4,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": []
+    }
+  ],
+  "finished_at": "2026-09-07T12:46:16.124766+00:00"
+}

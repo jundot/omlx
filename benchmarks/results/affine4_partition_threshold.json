@@ -1,0 +1,48 @@
+{
+  "protocol": "Identical BF16 tensors, 10 warmups, 41 interleaved rounds. Target group count is an isolated dispatch override. Native range guard remains enabled.",
+  "source_sha256": "797fd2371536e07445144d5ab8a233bd508cf4f17bf4bcd0cb477bd1f37a01de",
+  "rows": [
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 131072,
+      "query_length": 4,
+      "milliseconds": {
+        "168": 3.493042,
+        "336": 2.91,
+        "vlm_pr": 3.132291
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        }
+      }
+    },
+    {
+      "query_heads": 32,
+      "kv_heads": 1,
+      "tokens": 131072,
+      "query_length": 1,
+      "milliseconds": {
+        "168": 1.605375,
+        "336": 1.8165,
+        "vlm_pr": 1.503875
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        }
+      }
+    }
+  ]
+}

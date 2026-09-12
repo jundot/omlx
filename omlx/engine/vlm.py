@@ -2108,11 +2108,18 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled for VLM: %s, %s bits",
+                    scheduler._turboquant_kv_scheme,
+                    tq_bits,
+                )
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.

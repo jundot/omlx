@@ -1,0 +1,84 @@
+{
+  "protocol": "200K with prefix caching disabled and adaptive prefill; same model, input, generation, and memory limits",
+  "request": {
+    "model_id": "Qwen3.8-27B",
+    "prompt_lengths": [
+      200000
+    ],
+    "generation_length": 128,
+    "batch_sizes": [],
+    "warmup_mode": "ane_2048",
+    "align_prompt_to_ane": true,
+    "force_lm_engine": false,
+    "context_profile": "code_python"
+  },
+  "bench_id": "bench-cc25e43966d7",
+  "policy_switch": {
+    "activity": {
+      "active_models": {
+        "models": [
+          {
+            "id": "Qwen3.8-27B",
+            "estimated_size": 17820265635,
+            "estimated_size_formatted": "16.60GB",
+            "actual_size": 16058133880,
+            "actual_size_formatted": "14.96GB",
+            "pinned": false,
+            "is_loading": false,
+            "loading_elapsed_seconds": null,
+            "loading_estimated_seconds": null,
+            "loading_remaining_seconds_estimate": null,
+            "active_requests": 0,
+            "waiting_requests": 0,
+            "waiting": [],
+            "activities": [],
+            "prefilling": [],
+            "generating": [],
+            "idle_seconds": 1.328084945678711,
+            "ttl_remaining_seconds": null,
+            "dflash": null
+          }
+        ],
+        "model_memory_used": 18124632760,
+        "model_memory_max": 40200896512,
+        "memory_pressure": {
+          "enabled": true,
+          "current_bytes": 18124632760,
+          "soft_bytes": 36180806860,
+          "hard_bytes": 38190851686,
+          "current_formatted": "16.9GB",
+          "soft_formatted": "33.7GB",
+          "hard_formatted": "35.6GB",
+          "pressure_level": "ok"
+        },
+        "total_active_requests": 0,
+        "total_waiting_requests": 0
+      }
+    },
+    "runtime_applied": [
+      "prefill_priority"
+    ]
+  },
+  "result": {
+    "bench_id": "bench-cc25e43966d7",
+    "status": "error",
+    "context_profile": "code_python",
+    "results": [],
+    "error": "Prefill context too large for available memory (pre-chunk guard at 22976 tokens, kv_len=22976): predicted peak would exceed prefill safety cap 33.7GB (90% of metal_cap ceiling 37.4GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.",
+    "upload_state": {
+      "phase": "idle",
+      "results": [],
+      "total": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "owner_hash": null,
+      "skipped_reason": null,
+      "skipped_features": [],
+      "feature_flags": []
+    }
+  },
+  "validation_errors": [
+    "Prefill context too large for available memory (pre-chunk guard at 22976 tokens, kv_len=22976): predicted peak would exceed prefill safety cap 33.7GB (90% of metal_cap ceiling 37.4GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.",
+    "Expected 1 rows, received 0"
+  ]
+}

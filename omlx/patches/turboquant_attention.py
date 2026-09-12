@@ -559,6 +559,17 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            from ..affine4 import Affine4KVCache
+
+            if isinstance(real_cache, Affine4KVCache):
+                return real_cache.attention(
+                    queries,
+                    keys_state=keys,
+                    values_state=values,
+                    scale=scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
             if sinks is not None:
                 # TurboQuant's quantized kernels do not implement attention
                 # sinks. Preserve correctness by falling back to MLX's

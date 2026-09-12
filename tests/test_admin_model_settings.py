@@ -126,6 +126,25 @@ async def test_sampling_setting_change_keeps_cached_failure():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_kv_format_change_reloads_only_when_compression_is_enabled(enabled):
+    pool, entry = _failed_pool()
+    entry.engine = MagicMock()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(turboquant_kv_enabled=enabled),
+        admin_routes.ModelSettingsRequest(turboquant_kv_scheme="affine4"),
+    )
+
+    assert result["settings"]["turboquant_kv_scheme"] == "affine4"
+    assert result["requires_reload"] is enabled
+    assert pool._unload_engine.await_count == int(enabled)
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_settings_are_persisted():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"

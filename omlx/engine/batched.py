@@ -426,7 +426,11 @@ class BatchedEngine(BaseEngine):
 
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled: %s, %s bits",
+                    getattr(self._model_settings, "turboquant_kv_scheme", "turboquant"),
+                    tq_bits,
+                )
 
         # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
         # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
@@ -717,6 +721,9 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )

@@ -36,7 +36,13 @@ from .paged_cache import (
     compute_block_hash,
     resolve_block_extra_keys,
 )
-from .paged_ssd_cache import _PM_SLICEABLE_SUB_CLASSES, PagedSSDCacheManager
+from .paged_ssd_cache import (
+    _AFFINE4_CACHE_TYPES,
+    _PACKED_CACHE_TYPES,
+    _PM_SLICEABLE_SUB_CLASSES,
+    PagedSSDCacheManager,
+    _validate_affine4_meta,
+)
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
@@ -552,6 +558,19 @@ class BlockAwarePrefixCache(CacheManager):
 
         return _canonicalize_layer_cache_types(layer_cache_types)
 
+    def _block_layer_types_match(
+        self, block: CacheBlock | None, layer_cache_types: list[str] | None
+    ) -> bool:
+        """Check persisted representation before reusing a block during store."""
+        if block is None or block.block_hash is None or self.paged_ssd_cache is None:
+            return False
+        metadata = self.paged_ssd_cache.get_block_metadata(block.block_hash)
+        return (
+            metadata is not None
+            and self._canonical_layer_cache_types(metadata.layer_cache_types)
+            == self._canonical_layer_cache_types(layer_cache_types)
+        )
+
     def _detect_window_padding_from_blocks(
         self,
         block_ids: list[int],
@@ -816,7 +835,7 @@ class BlockAwarePrefixCache(CacheManager):
                         "class_name", layer_state.get("cache_type", "KVCache")
                     )
                     if layer_state.get("class_name", "")
-                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
+                    in _PACKED_CACHE_TYPES
                     else layer_state.get("cache_type", "KVCache")
                 )
                 for layer_state in cache_data
@@ -830,6 +849,18 @@ class BlockAwarePrefixCache(CacheManager):
         # Get or create block table
         block_table = self.paged_cache.get_block_table(request_id)
         if not block_table:
+            block_table = self.paged_cache.create_block_table(request_id)
+
+        stores_affine4 = any(
+            name in _AFFINE4_CACHE_TYPES for name in layer_cache_types or []
+        )
+        if stores_affine4 and any(
+            not self._block_layer_types_match(
+                self.paged_cache.allocated_blocks.get(bid), layer_cache_types
+            )
+            for bid in block_table.block_ids
+        ):
+            self.paged_cache.delete_block_table(request_id)
             block_table = self.paged_cache.create_block_table(request_id)
 
         # Determine tokens we need to cache (not already in block_table)
@@ -1020,6 +1051,17 @@ class BlockAwarePrefixCache(CacheManager):
                     parent_hash,
                     extra_keys=block_extra_keys,
                 )
+                if (
+                    stores_affine4
+                    and existing_block is not None
+                    and not self._block_layer_types_match(
+                        existing_block, layer_cache_types
+                    )
+                ):
+                    self._forget_incompatible_ssd_block(
+                        existing_block.block_hash, existing_block.block_id
+                    )
+                    existing_block = None
                 if existing_block:
                     if split_gdn_layout and not self._has_split_gdn_checkpoint(
                         existing_block.block_hash, layer_cache_types
@@ -1248,6 +1290,7 @@ class BlockAwarePrefixCache(CacheManager):
                         for lidx in range(len(layer_meta_states)):
                             if (
                                 lidx < len(snapshot_cache_data)
+                                and layer_cache_types[lidx] not in _AFFINE4_CACHE_TYPES
                                 and isinstance(snapshot_cache_data[lidx], dict)
                                 and snapshot_cache_data[lidx].get("meta_state")
                                 and snapshot_cache_data[lidx]["meta_state"] != ()
@@ -1469,7 +1512,7 @@ class BlockAwarePrefixCache(CacheManager):
                         "class_name", layer_state.get("cache_type", "KVCache")
                     )
                     if layer_state.get("class_name", "")
-                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
+                    in _PACKED_CACHE_TYPES
                     else layer_state.get("cache_type", "KVCache")
                 )
                 for layer_state in cache_data
@@ -2160,9 +2203,11 @@ class BlockAwarePrefixCache(CacheManager):
                         layer_idx
                     ].class_name
 
+                if layer_state.get("class_name") in _PACKED_CACHE_TYPES:
+                    cache_type_name = layer_state["class_name"]
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
-                if cache_type_name in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
+                if cache_type_name in _PACKED_CACHE_TYPES:
                     # TurboQuant v2: NamedTuple state from mlx-vlm
                     from ..turboquant_kv import _slice_state_range, _state_length
 
@@ -2185,7 +2230,9 @@ class BlockAwarePrefixCache(CacheManager):
                     vs = _slice_state_range(v_state, start_idx, actual_end)
                     block_slices.append(
                         (
-                            "__turboquant_v2__",
+                            "__affine4__"
+                            if cache_type_name in _AFFINE4_CACHE_TYPES
+                            else "__turboquant_v2__",
                             (ks, vs),
                         )
                     )
@@ -3407,6 +3454,68 @@ class BlockAwarePrefixCache(CacheManager):
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
+                affine_payload = any(
+                    layer_idx < len(block_data)
+                    and isinstance(block_data[layer_idx], tuple)
+                    and len(block_data[layer_idx]) == 2
+                    and isinstance(block_data[layer_idx][0], str)
+                    and block_data[layer_idx][0] == "__affine4__"
+                    for block_data in all_block_data
+                )
+                if cache_type_name in _AFFINE4_CACHE_TYPES or affine_payload:
+                    if cache_type_name not in _AFFINE4_CACHE_TYPES:
+                        logger.warning(
+                            "Affine4 layer %d: class/payload mismatch", layer_idx
+                        )
+                        return None
+                    from ..affine4 import Affine4KVCache
+                    from ..turboquant_kv import _concat_state_token_axis, _state_length
+
+                    parts = []
+                    affine_meta = None
+                    for block_idx, block_data in enumerate(all_block_data):
+                        bd = block_data[layer_idx]
+                        if not (
+                            isinstance(bd, tuple)
+                            and len(bd) == 2
+                            and isinstance(bd[0], str)
+                            and bd[0] == "__affine4__"
+                        ):
+                            logger.warning(
+                                "Affine4 layer %d: mixed block formats", layer_idx
+                            )
+                            return None
+                        metas = all_block_meta_states[block_idx]
+                        meta = _validate_affine4_meta(metas[layer_idx] if metas else None)
+                        if affine_meta is not None and meta[1:] != affine_meta[1:]:
+                            logger.warning(
+                                "Affine4 layer %d: codec metadata mismatch", layer_idx
+                            )
+                            return None
+                        affine_meta = meta
+                        ks, vs = bd[1]
+                        block = self.paged_cache.allocated_blocks[
+                            block_table.block_ids[block_idx]
+                        ]
+                        if (
+                            _state_length(ks) != block.token_count
+                            or _state_length(vs) != block.token_count
+                            or ks.norms.shape[0] != 1
+                        ):
+                            logger.warning(
+                                "Affine4 layer %d: invalid block shape", layer_idx
+                            )
+                            return None
+                        parts.append((ks, vs))
+                    keys = _concat_state_token_axis([ks for ks, _ in parts])
+                    values = _concat_state_token_axis([vs for _, vs in parts])
+                    cache = Affine4KVCache()
+                    cache.meta_state = (str(block_table.num_tokens), *affine_meta[1:])
+                    cache.rebuild_codecs(keys, values)
+                    cache.keys, cache.values = keys, values
+                    reconstructed_caches.append(cache)
+                    continue
+
                 # === CacheList: dedicated branch (before standard 2-tuple unpack) ===
                 if cache_type_name == "CacheList":
                     last_block_layer_data = all_block_data[-1][layer_idx]
@@ -4374,6 +4483,8 @@ class BlockAwarePrefixCache(CacheManager):
             candidates.append(first_block_meta_states[layer_idx])
         for ms in candidates:
             if isinstance(ms, (list, tuple)) and len(ms) >= 3:
+                if len(ms) > 3 and ms[3] == "affine4":
+                    return None
                 try:
                     return float(ms[1]), int(ms[2])
                 except (TypeError, ValueError):

@@ -1,0 +1,529 @@
+{
+  "protocol": {
+    "mode": "affine4",
+    "generation_tokens": 128,
+    "MTP": false,
+    "context": "100000/150000/200000 prefill rows plus one prompt token",
+    "cold_cache": true,
+    "memory_guard": "balanced, unchanged",
+    "public_upload": false,
+    "fixed_chunk_prefill": "Admin benchmark pins speed priority (2048-token minimum) except annotated adaptive request"
+  },
+  "source_sha256": {
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/affine4.py": "a93c081aa17f5962a8255d57637d75f6b2fb650584faa402e70e909f11b6bf81",
+    "/private/tmp/serve_affine4_long.py": "ef7f020f85832b33fc669caa1c5ced4e1f619daf79bb4e6b82febab84bb5ada0",
+    "/private/tmp/run_affine4_long.py": "e09beb8fdf80387d027fc4c03008c67474c1aeb2b77441ceb3a3a35228d37d29"
+  },
+  "runs": [
+    {
+      "model": "Qwen3.6-35B-A3B",
+      "context": 100000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          100000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-725b5ccb1bd7",
+      "result": {
+        "bench_id": "bench-725b5ccb1bd7",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 100001,
+            "tg": 128,
+            "ttft_ms": 89269.5,
+            "tpot_ms": 23.31,
+            "gen_tps": 43.2,
+            "processing_tps": 1120.2,
+            "e2e_latency_s": 92.275,
+            "total_throughput": 1085.1,
+            "peak_memory_bytes": 24277939662,
+            "prompt_tokens": 100001,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "7df525d4fcba55c13d909c6777ba466b9cde124210508ac4c0c0d903667c158b",
+            "output_sample": {
+              "sha256": "33d044c12bb9c3285018cf2983ea141098751669c38c544351c4f394a504caa7",
+              "head": "wired_limit_request_bytes\", 0)\n            )\n    except Exception:\n        pass\n\n    return {\n        \"total_bytes\": total_bytes,\n        \"total_formatted\": format_size(total_bytes),\n        \"auto_limit_bytes\": auto_limit_bytes,\n        \"auto_limit_formatt",
+              "tail": "ytes),\n        \"available_bytes\": available_bytes,\n        \"available_formatted\": format_size(available_bytes),\n        \"omlx_phys_footprint_bytes\": omlx_phys_footprint_bytes,\n        \"omlx_phys_footprint_formatted\": format_size(omlx_phys_footprint_bytes),"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 359,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 7.8,
+                "total_max": 36.3,
+                "p_avg": 8.0,
+                "e_avg": 7.6
+              },
+              "memory": {
+                "phys_footprint_peak": 25.18,
+                "mlx_active_peak": 22.47,
+                "mlx_cache_peak": 2.37,
+                "system_used_peak": 40.3,
+                "system_wired_peak": 28.7,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.9,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "effective_prefill_policy": "fixed 2048-token minimum"
+    },
+    {
+      "model": "Qwen3.6-35B-A3B",
+      "context": 150000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          150000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-2708557bbcef",
+      "result": {
+        "bench_id": "bench-2708557bbcef",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 150001,
+            "tg": 128,
+            "ttft_ms": 170013.4,
+            "tpot_ms": 26.83,
+            "gen_tps": 37.6,
+            "processing_tps": 882.3,
+            "e2e_latency_s": 173.531,
+            "total_throughput": 865.1,
+            "peak_memory_bytes": 26595874078,
+            "prompt_tokens": 150001,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "cb8ed5f096062f201f21e5749c8ae9b15ca168f249b46991715651495e8e53df",
+            "output_sample": {
+              "sha256": "f8c5c3b7c1897f2369d33014c408d5fd76353567da95567c79b9cd7b64e50cc3",
+              "head": "6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;\n}}\"\"\")\n    css_path.write_text(\"\\n\\n\".join(css_parts))\n\n\n# =========================================================================\n# Main\n# ==========",
+              "tail": "s_path.write_text(\"\\n\\n\".join(css_parts))\n\n\n# =========================================================================\n# Main\n# =========================================================================\nif __name__ == \"__main__\":\n    print(\"=== Downloading"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 676,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 7.4,
+                "total_max": 24.7,
+                "p_avg": 8.0,
+                "e_avg": 7.1
+              },
+              "memory": {
+                "phys_footprint_peak": 27.92,
+                "mlx_active_peak": 24.61,
+                "mlx_cache_peak": 3.72,
+                "system_used_peak": 42.01,
+                "system_wired_peak": 31.4,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 99.3,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "effective_prefill_policy": "fixed 2048-token minimum"
+    },
+    {
+      "model": "Qwen3.6-35B-A3B",
+      "context": 200000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-c070676f089c",
+      "result": {
+        "bench_id": "bench-c070676f089c",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 128,
+            "ttft_ms": 273549.5,
+            "tpot_ms": 30.93,
+            "gen_tps": 32.6,
+            "processing_tps": 731.1,
+            "e2e_latency_s": 277.605,
+            "total_throughput": 720.9,
+            "peak_memory_bytes": 26515961242,
+            "prompt_tokens": 200001,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "99f680122513816f65c7d518ba93fbb42104045bddd93a5faec2476a9351bfca",
+              "head": "Build ResponseUsage with reasoning_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),\n        output_tokens_deta",
+              "tail": "okens=reasoning_tokens),\n    )\n\n\ndef build_response_object(\n    model: str,\n    output_items: List[OutputItem],\n    usage: Optional[ResponseUsage] = None,\n    status: str = \"completed\",\n    error: Optional[Dict[str, Any]] = None,\n    text_config: Optional["
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 1081,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 7.0,
+                "total_max": 21.3,
+                "p_avg": 7.3,
+                "e_avg": 6.8
+              },
+              "memory": {
+                "phys_footprint_peak": 29.17,
+                "mlx_active_peak": 24.47,
+                "mlx_cache_peak": 5.52,
+                "system_used_peak": 42.99,
+                "system_wired_peak": 32.52,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 99.2,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "effective_prefill_policy": "fixed 2048-token minimum"
+    },
+    {
+      "model": "Qwen3.8-27B",
+      "context": 100000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.8-27B",
+        "prompt_lengths": [
+          100000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-57f7c40bf31d",
+      "result": {
+        "bench_id": "bench-57f7c40bf31d",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 100001,
+            "tg": 128,
+            "ttft_ms": 356521.9,
+            "tpot_ms": 97.36,
+            "gen_tps": 10.4,
+            "processing_tps": 280.5,
+            "e2e_latency_s": 369.018,
+            "total_throughput": 271.3,
+            "peak_memory_bytes": 25485330474,
+            "prompt_tokens": 100001,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "7df525d4fcba55c13d909c6777ba466b9cde124210508ac4c0c0d903667c158b",
+            "output_sample": {
+              "sha256": "2aaefddff073faf62f050526750d6e03d65a31b58d03193c01acb62604179340",
+              "head": "wired_limit_request_bytes\", 0) or 0\n            )\n    except Exception:\n        pass\n\n    return {\n        \"total_bytes\": total_bytes,\n        \"total_formatted\": format_size(total_bytes),\n        \"auto_limit_bytes\": auto_limit_bytes,\n        \"auto_limit_fo",
+              "tail": "_bytes),\n        \"available_bytes\": available_bytes,\n        \"available_formatted\": format_size(available_bytes),\n        \"omlx_phys_footprint_bytes\": omlx_phys_footprint_bytes,\n        \"omlx_phys_footprint_formatted\": format_size(omlx_phys_footprint_bytes"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 1438,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 7.1,
+                "total_max": 48.1,
+                "p_avg": 7.5,
+                "e_avg": 6.9
+              },
+              "memory": {
+                "phys_footprint_peak": 30.42,
+                "mlx_active_peak": 23.45,
+                "mlx_cache_peak": 7.76,
+                "system_used_peak": 43.55,
+                "system_wired_peak": 33.56,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 99.3,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 2
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "effective_prefill_policy": "fixed 2048-token minimum"
+    },
+    {
+      "model": "Qwen3.8-27B",
+      "context": 150000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.8-27B",
+        "prompt_lengths": [
+          150000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-f9271826fd80",
+      "result": {
+        "bench_id": "bench-f9271826fd80",
+        "status": "error",
+        "context_profile": "code_python",
+        "results": [],
+        "error": "Prefill context too large for available memory (preflight safety guard, kv_len=147952, min_chunk=2048): predicted peak would require ~34.83 GB (current 30.17 GB + KV 771.65 MB + min-chunk transient 3.91 GB) but prefill safety cap is 33.70 GB (90% of metal_cap ceiling 37.44 GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.",
+        "upload_state": {
+          "phase": "idle",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": null,
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [
+        "Prefill context too large for available memory (preflight safety guard, kv_len=147952, min_chunk=2048): predicted peak would require ~34.83 GB (current 30.17 GB + KV 771.65 MB + min-chunk transient 3.91 GB) but prefill safety cap is 33.70 GB (90% of metal_cap ceiling 37.44 GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.",
+        "Expected 1 rows, received 0"
+      ],
+      "effective_prefill_policy": "fixed 2048-token minimum"
+    },
+    {
+      "model": "Qwen3.8-27B",
+      "context": 200000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.8-27B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-1b6a7c553306",
+      "result": {
+        "bench_id": "bench-1b6a7c553306",
+        "status": "error",
+        "context_profile": "code_python",
+        "results": [],
+        "error": "Prefill context too large for available memory (pre-chunk guard at 14336 tokens, kv_len=133120): predicted peak would exceed prefill safety cap 33.7GB (90% of metal_cap ceiling 37.4GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.",
+        "upload_state": {
+          "phase": "idle",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": null,
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [
+        "Prefill context too large for available memory (pre-chunk guard at 14336 tokens, kv_len=133120): predicted peak would exceed prefill safety cap 33.7GB (90% of metal_cap ceiling 37.4GB). Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 37.44 GB), or reduce context length.",
+        "Expected 1 rows, received 0"
+      ],
+      "effective_prefill_policy": "adaptive after 59392 processed tokens; see affine4_large_context_adaptive_switch.json"
+    }
+  ],
+  "runner_revisions": [
+    "e47425f3e9db13cd9c508ff07c08c4cbb4e4367b974e8a16fda95a8928edbcab"
+  ],
+  "log_path": "/private/tmp/omlx-affine4-comparison-20260907/large-server.log"
+}

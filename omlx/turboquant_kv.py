@@ -51,6 +51,21 @@ __all__ = [
 ]
 
 
+def quantized_cache_class(scheme: str = "turboquant"):
+    """Resolve the packed cache format without loading native kernels."""
+    if scheme == "turboquant":
+        return TurboQuantKVCache
+    if scheme == "affine4":
+        from .affine4 import Affine4KVCache
+
+        return Affine4KVCache
+    raise ValueError(f"Unknown KV cache quantization scheme: {scheme}")
+
+
+def _quantization_config(cache):
+    return (getattr(cache, "quantization_scheme", "turboquant"), cache.bits, cache.seed)
+
+
 # ---------------------------------------------------------------------------
 # Codec rebuild for SSD cache reconstruction
 # ---------------------------------------------------------------------------
@@ -409,6 +424,8 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 "BatchTurboQuantKVCache.extend expected BatchTurboQuantKVCache, "
                 f"got {type(other).__name__}"
             )
+        if _quantization_config(self) != _quantization_config(other):
+            raise ValueError("Cannot extend caches with mixed quantization configs")
         self._ensure_array_offset()
         other._ensure_array_offset()
         max_off = max(self.offset.max().item(), other.offset.max().item())
@@ -460,6 +477,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.key_codec = other.key_codec
             self.value_codec = other.value_codec
 
+    def _new_single_cache(self):
+        return TurboQuantKVCache(bits=self.bits, seed=self.seed)
+
     def extract(self, idx: int) -> TurboQuantKVCache:
         padding = self.left_padding[idx].item()
         total = (
@@ -469,7 +489,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         )
         end = padding + total
 
-        tq = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        tq = self._new_single_cache()
         if self.keys is not None:
             ks = _slice_state_range(self.keys, padding, end)
             vs = _slice_state_range(self.values, padding, end)
@@ -490,8 +510,10 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 )
         bits = caches[0].bits
         seed = caches[0].seed
-        configs = {(c.bits, c.seed) for c in caches}
-        if len(configs) > 1:
+        configs = {_quantization_config(c) for c in caches}
+        if len(configs) > 1 or _quantization_config(caches[0])[0] != getattr(
+            cls, "quantization_scheme", "turboquant"
+        ):
             # Packed state width is ceil(head_dim * bits / 32) and codecs are
             # rebuilt from (head_dim, bits, seed), so members quantized under
             # different configs cannot share a batch. Without this guard the

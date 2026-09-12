@@ -29,29 +29,25 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         mx.ones((1, 128, 8)),
         mx.arange(128)[None],
     )
-    ns = SimpleNamespace(
-        model=object(),
-        config=SimpleNamespace(paged_cache_block_size=64),
-        block_aware_cache=object() if snapshots_enabled else None,
-        _stream=mx.default_stream(mx.gpu),
-    )
-    state = Scheduler._begin_prefill(
-        ns,
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.model = object()
+    scheduler.config = SimpleNamespace(paged_cache_block_size=64)
+    scheduler.block_aware_cache = object() if snapshots_enabled else None
+    scheduler._stream = mx.default_stream(mx.gpu)
+    scheduler._turboquant_kv_bits = None
+    state = scheduler._begin_prefill(
         SimpleNamespace(cached_tokens=128, request_id="reservation"),
         [1] * 129,
         [cache, SimpleNamespace(offset=128)],
     )
-    ns._prefill_step_size_for_progress = lambda *a: 64
-    ns._reserve_qsa_index_capacity = (
-        lambda caches, tokens: Scheduler._reserve_qsa_index_capacity(ns, caches, tokens)
-    )
+    scheduler._prefill_step_size_for_progress = lambda *a: 64
 
     def stop(*args, **kwargs):
         raise RuntimeError("reservation complete")
 
-    ns._adaptive_chunk_size = stop
+    scheduler._adaptive_chunk_size = stop
     with pytest.raises(RuntimeError, match="reservation complete"):
-        Scheduler._step_prefill_chunk(ns, state)
+        scheduler._step_prefill_chunk(state)
     assert cache._index_reserved_tokens >= 256
 
 
