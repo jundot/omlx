@@ -587,12 +587,14 @@ final class MenubarControllerPortTests: XCTestCase {
     //
     // The "Open Web Dashboard" menubar item routes through the server's
     // /admin/auto-login endpoint so the dashboard opens without the manual
-    // login form. The action method itself needs a live NSStatusBar, so we
-    // test the pure URL builder it delegates to.
+    // login form. The main API key is exchanged (POST) for a short-lived
+    // token before the URL is built; the URL carries only that token. The
+    // action method itself needs a live NSStatusBar, so we test the pure
+    // URL builder it delegates to.
 
     func testWebAdminURLUsesAutoLoginWithRedirect() throws {
         let url = try XCTUnwrap(
-            MenubarController.webAdminURL(host: "127.0.0.1", port: 8000, apiKey: "secret")
+            MenubarController.webAdminURL(host: "127.0.0.1", port: 8000, token: "secret")
         )
         let comps = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
         XCTAssertEqual(comps.scheme, "http")
@@ -601,38 +603,40 @@ final class MenubarControllerPortTests: XCTestCase {
         XCTAssertEqual(comps.path, "/admin/auto-login")
         let items = comps.queryItems ?? []
         XCTAssertEqual(items.first { $0.name == "redirect" }?.value, "/admin/dashboard")
-        XCTAssertEqual(items.first { $0.name == "key" }?.value, "secret")
+        XCTAssertEqual(items.first { $0.name == "token" }?.value, "secret")
+        XCTAssertNil(items.first { $0.name == "key" }, "permanent key must never appear in the URL")
     }
 
     func testWebAdminURLBuildsIPv6Host() throws {
         let url = try XCTUnwrap(
-            MenubarController.webAdminURL(host: "[::1]", port: 8000, apiKey: nil)
+            MenubarController.webAdminURL(host: "[::1]", port: 8000, token: nil)
         )
         XCTAssertTrue(url.absoluteString.hasPrefix("http://[::1]:8000/admin/auto-login"))
     }
 
-    func testWebAdminURLPercentEncodesKey() throws {
-        // A key with URL-reserved characters must survive intact — raw
+    func testWebAdminURLPercentEncodesToken() throws {
+        // A token with URL-reserved characters must survive intact — raw
         // string interpolation would corrupt it; URLComponents encodes it.
         let url = try XCTUnwrap(
-            MenubarController.webAdminURL(host: "127.0.0.1", port: 8000, apiKey: "a+b/c&d")
+            MenubarController.webAdminURL(host: "127.0.0.1", port: 8000, token: "a+b/c&d")
         )
-        // The decoded query item value round-trips to the original key.
+        // The decoded query item value round-trips to the original token.
         let comps = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
-        XCTAssertEqual(comps.queryItems?.first { $0.name == "key" }?.value, "a+b/c&d")
+        XCTAssertEqual(comps.queryItems?.first { $0.name == "token" }?.value, "a+b/c&d")
         // And the raw URL string carries the encoded form, not the literal.
-        XCTAssertTrue(url.absoluteString.contains("key=a%2Bb/c%26d"),
-                      "key should be percent-encoded in the URL string, got \(url.absoluteString)")
+        XCTAssertTrue(url.absoluteString.contains("token=a%2Bb/c%26d"),
+                      "token should be percent-encoded in the URL string, got \(url.absoluteString)")
     }
 
-    func testWebAdminURLOmitsKeyWhenMissing() throws {
-        for key in [nil, ""] as [String?] {
+    func testWebAdminURLOmitsTokenWhenMissing() throws {
+        for token in [nil, ""] as [String?] {
             let url = try XCTUnwrap(
-                MenubarController.webAdminURL(host: "127.0.0.1", port: 8000, apiKey: key)
+                MenubarController.webAdminURL(host: "127.0.0.1", port: 8000, token: token)
             )
             let comps = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
-            XCTAssertNil(comps.queryItems?.first { $0.name == "key" },
-                         "empty/nil key must not emit a key= param (server redirects to login instead)")
+            XCTAssertNil(comps.queryItems?.first { $0.name == "token" },
+                         "empty/nil token must not emit a token= param (server redirects to login instead)")
+            XCTAssertNil(comps.queryItems?.first { $0.name == "key" })
             XCTAssertEqual(comps.queryItems?.first { $0.name == "redirect" }?.value,
                            "/admin/dashboard")
         }

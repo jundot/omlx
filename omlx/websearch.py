@@ -31,6 +31,7 @@ import urllib.parse
 from typing import Any
 
 import httpx
+import httpcore  # transitive dependency of httpx, guaranteed present
 
 from .api.markitdown import convert_html_to_markdown
 
@@ -528,14 +529,24 @@ async def _resolve_host(host: str) -> list[str]:
     return [info[4][0] for info in infos]
 
 
-async def _assert_public_host(host: str) -> None:
-    """SSRF guard: refuse hosts that resolve to non-global addresses.
+def _is_global_ip(raw: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return ip.is_global
 
-    Blocks loopback, RFC1918, link-local (169.254.169.254 metadata),
-    IPv6 ULA, and IPv4-mapped variants so the fetch tool cannot be
-    pointed at localhost admin endpoints or LAN services. The window
-    between this resolution and httpx's own connect is accepted for a
-    local single-user server (no DNS rebinding defense).
+
+async def _resolve_public_ips(host: str) -> list[str]:
+    """Resolve a host and return its validated global (public) IPs.
+
+    Raises ``WebSearchError`` when the host is unresolvable or resolves
+    to any non-global address (loopback, RFC1918, link-local, IPv6 ULA,
+    IPv4-mapped variants, ...) so the fetch tool cannot be pointed at
+    localhost admin endpoints or LAN services.
     """
     try:
         addresses = await _resolve_host(host)
@@ -545,21 +556,73 @@ async def _assert_public_host(host: str) -> None:
         ) from exc
     if not addresses:
         raise WebSearchError("request_failed", f"Could not resolve host {host!r}.")
+    public: list[str] = []
     for raw in addresses:
-        try:
-            ip = ipaddress.ip_address(raw.split("%", 1)[0])
-        except ValueError as exc:
-            raise WebSearchError(
-                "request_failed", f"Could not resolve host {host!r}."
-            ) from exc
-        mapped = getattr(ip, "ipv4_mapped", None)
-        if mapped is not None:
-            ip = mapped
-        if not ip.is_global:
+        if not _is_global_ip(raw):
             raise WebSearchError(
                 "invalid_arguments",
                 "Fetching private or local network addresses is not allowed.",
             )
+        public.append(raw)
+    return public
+
+
+async def _assert_public_host(host: str) -> None:
+    """SSRF guard: raise unless ``host`` resolves only to public addresses."""
+    await _resolve_public_ips(host)
+
+
+class _SSRFGuardBackend(httpcore.AsyncNetworkBackend):
+    """Network backend that pins every outbound TCP connect to a public IP.
+
+    httpcore resolves the request hostname again at connect time; by
+    resolving and validating inside ``connect_tcp`` and handing the
+    validated IP to the inner backend, validation and connection use the
+    same resolution, closing the DNS-rebinding window that a
+    resolve-then-request check would otherwise leave open. TLS/SNI is
+    layered on afterwards by httpcore against the original hostname, so
+    certificate verification is unaffected.
+    """
+
+    def __init__(self, inner: httpcore.AsyncNetworkBackend):
+        self._inner = inner
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: list[tuple[int, int, int]] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        public = await _resolve_public_ips(host)
+        return await self._inner.connect_tcp(
+            public[0], port, timeout, local_address, socket_options
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: list[tuple[int, int, int]] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        return await self._inner.connect_unix_socket(path, timeout, socket_options)
+
+    async def sleep(self, seconds: float) -> None:
+        return await self._inner.sleep(seconds)
+
+
+class _SSRFGuardTransport(httpx.AsyncHTTPTransport):
+    """``AsyncHTTPTransport`` whose connection pool pins DNS at connect time."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        # httpx keeps its pool on the transport; swap the backend so every
+        # fresh connection goes through the SSRF guard. httpx is pinned <1,
+        # so the private attribute is stable.
+        self._pool._network_backend = _SSRFGuardBackend(
+            self._pool._network_backend  # type: ignore[arg-type]
+        )
 
 
 def _validate_fetch_url(url: str) -> urllib.parse.SplitResult:
@@ -606,7 +669,7 @@ async def run_fetch_url(
     try:
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT_SECONDS,
-            transport=transport,
+            transport=transport or _SSRFGuardTransport(),
             follow_redirects=False,
             headers={"User-Agent": _USER_AGENT},
         ) as client:
@@ -614,7 +677,7 @@ async def run_fetch_url(
             # URL validation and the SSRF guard again.
             for _ in range(MAX_REDIRECTS + 1):
                 parts = _validate_fetch_url(current)
-                await _assert_public_host(parts.hostname)
+                await _resolve_public_ips(parts.hostname)
                 async with client.stream("GET", current) as response:
                     if response.status_code in _REDIRECT_STATUSES:
                         location = response.headers.get("location")

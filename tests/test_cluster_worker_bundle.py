@@ -31,10 +31,13 @@ def test_copy_command_pins_the_program_and_keeps_secret_out_of_the_url():
     assert "--max-filesize 1048576" in command
     assert "sudo apt-get install -y ca-certificates curl python3" in command
     assert "curl |" not in command
-    assert "| sudo" not in command
-    assert f"--join-key {key}" in command
+    assert "--join-key-stdin" in command
+    assert "--join-key " not in command
+    # The one-time secret is piped via stdin, not placed on the bootstrap
+    # process argv (so it never shows up in `ps` during the join).
+    assert f"printf '%s' {key}" in command
+    assert "| sudo python3" in command
     assert "--source-digest " + "b" * 64 in command
-    assert key not in command.split("--join-key", 1)[0]
     assert "bootstrap.py?" not in command
     assert "; exit " not in command
     assert subprocess.run(
