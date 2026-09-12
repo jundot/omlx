@@ -9,7 +9,7 @@ import struct
 import time
 import weakref
 from bisect import bisect_right
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
@@ -36,12 +36,19 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa_decode,
     pool_completed_index_keys,
 )
+from .qsa_mask import fused_block_mask
 from . import hc_fused
 
 logger = logging.getLogger(__name__)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+_PLE_EARLY_GATHER = os.environ.get("OMLX_QWEN4_PLE_EARLY_GATHER", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 # Identity cache: keep the array alive so CPython cannot recycle id().
 _TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
@@ -1228,6 +1235,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
             mx.array(True),
             axis=-1,
         )
+        fused_mask = fused_block_mask(
+            block_hits, complete_counts, query_ends,
+            self.compress_ratio, self.block_topk, key_len,
+        )
+        if fused_mask is not None:
+            return fused_mask
         selected_tokens = mx.repeat(block_hits, self.compress_ratio, axis=-1)
         if complete_key_len < key_len:
             selected_tokens = mx.concatenate(
@@ -1982,6 +1995,10 @@ class _SafeTensorMMap:
                 shape[1] * item_size,
             )
             gather_start = time.perf_counter() if fully_seen else None
+        else:
+            # Small gathers can have been prefetched across shards. Notice
+            # later page eviction here too, without scheduling extra I/O.
+            gather_start = time.perf_counter()
         view = np.ndarray(
             shape,
             dtype=np_dtype,
@@ -1996,8 +2013,9 @@ class _SafeTensorMMap:
     @staticmethod
     def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
-            values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
-            return mx.array(values).astype(mx.bfloat16)
+            # The host buffer already contains BF16 bits. A view preserves them
+            # directly and avoids a host expansion plus a GPU conversion.
+            return mx.array(copied).view(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
@@ -2005,8 +2023,7 @@ class _SafeTensorMMap:
     def rows(self, key: str, rows: list[int]) -> mx.array:
         return self.to_mx(*self.rows_np(key, rows))
 
-    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
-        """Prefetch unmarked pages; return whether all were already marked."""
+    def _missing_pages(self, row_indices, base_offset, row_bytes):
         offsets = base_offset + row_indices * row_bytes
         needed_pages = np.unique(
             np.concatenate(
@@ -2014,23 +2031,31 @@ class _SafeTensorMMap:
             )
         )
         seen = np.frombuffer(self._seen_pages, dtype=np.uint8)
-        fresh = needed_pages[seen[needed_pages] == 0]
+        return needed_pages[seen[needed_pages] == 0]
+
+    def _touch_page(self, page: int) -> None:
+        offset = int(page) * _PLE_PAGE_SIZE
+        remaining = _PLE_PAGE_SIZE
+        while remaining > 0:
+            chunk = os.pread(
+                self._file.fileno(), remaining, offset + (_PLE_PAGE_SIZE - remaining)
+            )
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        self._seen_pages[page] = 1
+
+    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
+        """Prefetch unmarked pages; return whether all were already marked."""
+        fresh = self._missing_pages(row_indices, base_offset, row_bytes)
         if fresh.size == 0:
             return True
-        fd = self._file.fileno()
-
-        def touch(page: int) -> None:
-            offset = int(page) * _PLE_PAGE_SIZE
-            remaining = _PLE_PAGE_SIZE
-            while remaining > 0:
-                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-
-        list(_PLE_IO_POOL.map(touch, (int(page) for page in fresh.tolist())))
-        for page in fresh.tolist():
-            self._seen_pages[page] = 1
+        futures = [_PLE_IO_POOL.submit(self._touch_page, int(page)) for page in fresh]
+        # Drain reads before propagating a failure: closing the mapping must
+        # never leave an outstanding read using a descriptor that can be reused.
+        wait(futures)
+        for future in futures:
+            future.result()
         return False
 
     def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
@@ -2101,6 +2126,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         self._shard_specs: dict[
             int, tuple[str, str | None, str | None, int | None, int | None]
         ] = {}
+        self._page_specs: dict[int, tuple] = {}
 
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
@@ -2224,6 +2250,17 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
+        for shard_index, spec in self._shard_specs.items():
+            pages = []
+            for key in spec[:1] if spec[3] is None else spec[:3]:
+                reader = self._tensor_readers[key]
+                entry = reader._header[key]
+                start, end = entry["data_offsets"]
+                pages.append(
+                    (reader, reader._data_start + start, (end - start) // entry["shape"][0])
+                )
+            self._page_specs[shard_index] = tuple(pages)
+
     def _plan(self, host: np.ndarray):
         """Shards, local rows and tensor families for a chunk; None when the touched shards differ."""
         offsets = np.asarray(self.shard_offsets, dtype=np.int64)
@@ -2248,6 +2285,25 @@ class DiskBackedShardedEmbedding(nn.Module):
     def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
         shard, local, touched, specs, families, _, _, _ = plan
+        if 8 < host.size <= 256:
+            # A decode/verify call touches many shards but often only one row
+            # in each. Batch their page faults, rather than serializing these
+            # reads below the per-shard prefetch threshold.
+            requests = set()
+            for shard_index, row in zip(shard.tolist(), local.tolist()):
+                for reader, start, row_bytes in self._page_specs[shard_index]:
+                    offset = start + row * row_bytes
+                    first = offset // _PLE_PAGE_SIZE
+                    last = (offset + row_bytes - 1) // _PLE_PAGE_SIZE
+                    if not reader._seen_pages[first]:
+                        requests.add((reader, first))
+                    if last != first and not reader._seen_pages[last]:
+                        requests.add((reader, last))
+            if len(requests) > 8:
+                futures = [_PLE_IO_POOL.submit(reader._touch_page, page) for reader, page in requests]
+                wait(futures)
+                for future in futures:
+                    future.result()
         buffers: dict[int, np.ndarray] = {}
         for shard_index, spec in zip(touched, specs):
             positions = np.flatnonzero(shard == shard_index)
@@ -2487,6 +2543,13 @@ class ShardedEmbedding(nn.Module):
         if total_rows != self.shard_offsets[-1] or first.dims != self.dims:
             return False
 
+        if len(shards) == 1:
+            # A checkpoint can already store the table as one packed shard.
+            # Alias it directly: no join or temporary second table is needed.
+            self.fused = first
+            self.shards = []
+            return True
+
         fused = nn.QuantizedEmbedding(
             1,
             self.dims,
@@ -2515,13 +2578,11 @@ def fuse_resident_ple_embeddings(
     *,
     minimum_physical_memory: int = 192 * 1024**3,
 ) -> int:
-    """Fuse resident affine PLE shards only where the temporary peak is safe."""
+    """Fuse resident affine PLE, admitting a single packed shard without a join."""
 
     if get_ple_runtime_mode() != "resident":
         return 0
     physical_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    if physical_memory < minimum_physical_memory:
-        return 0
 
     fused = 0
     language_model = getattr(model, "language_model", None)
@@ -2533,7 +2594,11 @@ def fuse_resident_ple_embeddings(
             "ngram_embedding",
             None,
         )
-        if type(embedding) is ShardedEmbedding and embedding.fuse_quantized_shards():
+        if type(embedding) is not ShardedEmbedding:
+            continue
+        if physical_memory < minimum_physical_memory and len(embedding.shards) != 1:
+            continue
+        if embedding.fuse_quantized_shards():
             fused += 1
     return fused
 
@@ -2663,7 +2728,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         history = mx.concatenate([previous_context.astype(mx.int64), next_ids], axis=-1)
         prefetch(self._ngram_indices(history, next_ids.shape[1]))
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+    def prepare_indices(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+        """Start the current lookup without advancing the committed token history."""
+        input_ids = input_ids.astype(mx.int64)
+        history = mx.concatenate(
+            [self._previous_context(input_ids, cache), input_ids], axis=-1
+        )
+        indices = self._ngram_indices(history, input_ids.shape[1])
+        self.ngram_embedding.prefetch(indices)
+        return indices
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache],
+        prepared_indices: Optional[mx.array] = None,
+    ):
         input_ids = input_ids.astype(mx.int64)
         previous_context = self._previous_context(input_ids, cache)
 
@@ -2671,7 +2751,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if cache is not None:
             cache[3] = mx.contiguous(token_history[:, -self.context_len :])
 
-        ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
+        ngram_ids = (
+            self._ngram_indices(token_history, input_ids.shape[1])
+            if prepared_indices is None
+            else prepared_indices
+        )
         embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
@@ -2735,6 +2819,7 @@ class Qwen4ExpPLELayer(nn.Module):
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
         target_verify: bool = False,
+        prepared_indices: Optional[mx.array] = None,
     ):
         capture_speculative_state = target_verify and input_ids.shape[1] > 1
         if cache is not None:
@@ -2744,7 +2829,9 @@ class Qwen4ExpPLELayer(nn.Module):
             history = self.ple_embedding._previous_context(
                 input_ids.astype(mx.int64), cache
             )
-        embeddings = self.ple_embedding(input_ids, cache)
+        embeddings = self.ple_embedding(
+            input_ids, cache, prepared_indices=prepared_indices
+        )
         keys = self.norm_key(
             _target_verify_linear(self.key_proj, embeddings, target_verify)
         ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
@@ -2801,6 +2888,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         position_ids: Optional[mx.array],
         gdn_sink=None,
         target_verify: bool = False,
+        ple_indices: Optional[mx.array] = None,
     ):
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
@@ -2809,6 +2897,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 cache,
                 mask,
                 target_verify=target_verify,
+                prepared_indices=ple_indices,
             )
 
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
@@ -2880,6 +2969,17 @@ class Qwen4ExpModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        # Token IDs and the PLE history are already known before the first layer.
+        # Start disk reads here; pass the same indices through so the PLE layer
+        # does not repeat the hash or mutate speculative history prematurely.
+        ple_indices = {}
+        if _PLE_EARLY_GATHER and 0 < inputs.shape[0] * inputs.shape[1] <= 64:
+            for layer_id in self.args.ple_layer_ids:
+                index = layer_id - 1
+                embedding = self.layers[index].ple.ple_embedding
+                if isinstance(embedding.ngram_embedding, DiskBackedShardedEmbedding):
+                    ple_indices[index] = embedding.prepare_indices(inputs, cache[index])
+
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
@@ -2896,6 +2996,7 @@ class Qwen4ExpModel(nn.Module):
                 position_ids=position_ids,
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
+                ple_indices=ple_indices.get(index),
             )
             if (
                 _EAGER_DISPATCH
@@ -2943,6 +3044,8 @@ class Qwen4ExpMTPModule(nn.Module):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.hc_count = args.hc_count
+        if args.mtp_use_dedicated_lm_head:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         hc_hidden_size = self.hc_count * self.hidden_size
         self.pre_fc_norm_embedding = Qwen4ExpRMSNorm(
             self.hidden_size,
@@ -3120,7 +3223,9 @@ class LanguageModel(Qwen3_5LanguageModel):
         logits_source = mtp_output
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.tie_word_embeddings:
+        if self.args.mtp_use_dedicated_lm_head:
+            logits = mtp.lm_head(logits_source)
+        elif self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(logits_source)
         else:
             logits = self.lm_head(logits_source)

@@ -181,6 +181,16 @@ class Model(Qwen3_5Model):
             normalized[key] = value
         weights = normalized
 
+        if (
+            mtp_enabled
+            and getattr(self.config.text_config, "mtp_use_dedicated_lm_head", False)
+            and "mtp.lm_head.weight" not in weights
+        ):
+            raise ValueError(
+                "mtp_use_dedicated_lm_head requires checkpoint weights for "
+                "mtp.lm_head.weight"
+            )
+
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 

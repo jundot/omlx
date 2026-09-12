@@ -257,6 +257,70 @@ def test_qwen4_resident_ple_fuses_packed_shards_exactly():
     assert mx.array_equal(actual, expected).item()
 
 
+def test_qwen4_single_packed_ple_aliases_without_join(monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    embedding = ShardedEmbedding(32, 64, 1)
+    packed = nn.QuantizedEmbedding.from_embedding(
+        embedding.shards[0], group_size=32, bits=4, mode="affine"
+    )
+    embedding.shards = [packed]
+    embedding.weight_scale = mx.array([0.5], dtype=mx.bfloat16)
+    indices = mx.array([[0, 31, 3, 3]], dtype=mx.int32)
+    expected = embedding(indices)
+    mx.eval(expected)
+
+    def unexpected_join(*args, **kwargs):
+        raise AssertionError("Single-shard fusion must not allocate a joined table")
+
+    monkeypatch.setattr(mx, "concatenate", unexpected_join)
+    assert embedding.fuse_quantized_shards() is True
+    assert embedding.fused is packed
+    assert embedding.shards == []
+    assert embedding.fuse_quantized_shards() is False
+    assert mx.array_equal(embedding(indices), expected).item()
+
+
+@pytest.mark.parametrize(
+    "memory_gib,mode,shards,quantized,expected",
+    [
+        (128, "resident", 1, True, 1),
+        (128, "resident", 4, True, 0),
+        (256, "resident", 4, True, 1),
+        (128, "resident", 1, False, 0),
+        (128, "mmap", 1, True, 0),
+    ],
+)
+def test_qwen4_resident_ple_join_memory_admission(
+    monkeypatch, memory_gib, mode, shards, quantized, expected
+):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding = language.ShardedEmbedding(32, 64, shards)
+    if quantized:
+        embedding.shards = [
+            nn.QuantizedEmbedding.from_embedding(
+                shard, group_size=32, bits=4, mode="affine"
+            )
+            for shard in embedding.shards
+        ]
+    layer = SimpleNamespace(
+        ple=SimpleNamespace(ple_embedding=SimpleNamespace(ngram_embedding=embedding))
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=SimpleNamespace(layers=[layer])))
+    sysconf = language.os.sysconf
+    values = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": memory_gib * 2**30 // 4096}
+    monkeypatch.setattr(language.os, "sysconf", lambda key: values[key] if key in values else sysconf(key))
+    monkeypatch.setattr(language, "get_ple_runtime_mode", lambda: mode)
+
+    assert language.fuse_resident_ple_embeddings(model) == expected
+    assert (getattr(embedding, "fused", None) is not None) == bool(expected)
+
+
 def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, caplog):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx.nn as nn
@@ -1257,6 +1321,105 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     embedding.close()
 
 
+def test_disk_bf16_upload_preserves_every_bit_pattern():
+    import numpy as np
+    from mlx_vlm.models.qwen4_exp.language import _SafeTensorMMap
+
+    bits = np.arange(65536, dtype=np.uint16).reshape(256, 256)
+    uploaded = _SafeTensorMMap.to_mx(bits, "BF16")
+    assert uploaded.dtype == mx.bfloat16
+    assert np.array_equal(np.asarray(uploaded.view(mx.uint16)), bits)
+
+
+@pytest.fixture
+def early_gather_model(tmp_path):
+    config = _tiny_config()
+    config.text_config.num_hidden_layers = 3
+    config.text_config.layer_types = ["linear_attention", "linear_attention", "full_attention"]
+    config.text_config.ple_layer_ids = [2]
+    from mlx_vlm.models.qwen4_exp.language import (
+        DiskBackedShardedEmbedding,
+        LanguageModel,
+    )
+
+    mx.random.seed(1789194451)
+    model = LanguageModel(config.text_config, config)
+    embedding = model.model.layers[1].ple.ple_embedding
+    resident = embedding.ngram_embedding
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors = {
+        f"{prefix}.shard_{index}.weight": shard.weight.astype(mx.bfloat16)
+        for index, shard in enumerate(resident.shards)
+    }
+    filename = "ple.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: filename for name in tensors}})
+    )
+    disk = DiskBackedShardedEmbedding(
+        tmp_path, prefix, resident.shard_offsets[-1], resident.dims, len(resident.shards)
+    )
+    embedding.ngram_embedding = disk
+    mx.eval(model.parameters())
+    try:
+        yield model, embedding, disk
+    finally:
+        disk.close()
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 3])
+def test_early_ple_gather_matches_late_gather_across_rollback(early_gather_model, monkeypatch, accepted):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, _, disk = early_gather_model
+    early_cache, late_cache = model.make_cache(), model.make_cache()
+    prefix = mx.array([[2, 1, 3]], dtype=mx.int32)
+    verify_ids = mx.array([[4, 5, 1, 6]], dtype=mx.int32)
+    outputs = []
+    for enabled, cache in ((True, early_cache), (False, late_cache)):
+        monkeypatch.setattr(language, "_PLE_EARLY_GATHER", enabled)
+        model(prefix, cache=cache)
+        verified = model(verify_ids, cache=cache, return_hidden=True)
+        assert disk.last_prefetch_hit is enabled
+        mx.eval(verified.logits)
+        model.rollback_speculative_cache(cache, verified.gdn_states, accepted=accepted, block_size=4)
+        resumed = model(mx.array([[7]], dtype=mx.int32), cache=cache)
+        mx.eval(resumed.logits)
+        outputs.append((verified.logits, resumed.logits))
+    for component in (0, 1):
+        assert mx.array_equal(outputs[0][component], outputs[1][component]).item()
+    _assert_ple_state_matches(early_cache[1], late_cache[1])
+
+
+def test_early_ple_gather_starts_before_first_layer_without_advancing_history(early_gather_model, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, embedding, disk = early_gather_model
+    cache = model.make_cache()
+    monkeypatch.setattr(language, "_PLE_EARLY_GATHER", True)
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    mx.eval(model(prefix, cache=cache).logits)
+    history = cache[1][3]
+    next_ids = mx.array([[5, 1, 6]], dtype=mx.int32)
+    prepared = embedding.prepare_indices(next_ids, cache[1])
+    assert cache[1][3] is history
+    assert disk._pending
+    observed = []
+    original = language.Qwen4ExpDecoderLayer.__call__
+
+    def traced(layer, *args, **kwargs):
+        if layer is model.model.layers[0]:
+            observed.append(bool(disk._pending))
+        return original(layer, *args, **kwargs)
+
+    monkeypatch.setattr(language.Qwen4ExpDecoderLayer, "__call__", traced)
+    mx.eval(model(next_ids, cache=cache).logits)
+    assert prepared.shape == (1, 3, embedding.ngram_heads)
+    assert observed == [True]
+    assert disk.last_prefetch_hit
+    assert not disk._pending
+
+
 @pytest.fixture
 def disk_ple_reader(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1670,6 +1833,113 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
     assert later_owner.mtp is not None
 
 
+@pytest.mark.parametrize("tied", [False, True])
+def test_qwen4_dedicated_mtp_head_preserves_target_and_hidden(tied):
+    """A proposal head may change logits, never the target or MTP cache math."""
+    config = _tiny_config()
+    config.text_config.tie_word_embeddings = tied
+    config.text_config.mtp_use_dedicated_lm_head = True
+    model, owner = _make_bound_qwen4_language_model(config)
+    tokens = mx.array([[2, 3, 4]], dtype=mx.int32)
+    before = model(tokens, cache=model.make_cache(), return_hidden=True)
+    hidden = before.hidden_states[-1]
+    next_ids = mx.array([[5, 6, 7]], dtype=mx.uint32)
+    mixed, expected_hidden = owner.mtp(
+        hidden, next_ids, model.model.embed_tokens, model.make_mtp_cache()
+    )
+    expected = owner.mtp.lm_head(mixed[:, -2:])
+    actual, actual_hidden = model.mtp_forward(
+        hidden, next_ids, model.make_mtp_cache(),
+        return_hidden=True, logits_keep=2,
+    )
+    mx.eval(before.logits, expected, actual, expected_hidden, actual_hidden)
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(actual_hidden, expected_hidden).item()
+
+    # A conspicuous proposal-only change must remain invisible to target logits.
+    owner.mtp.lm_head.weight = mx.zeros_like(owner.mtp.lm_head.weight)
+    proposal = model.mtp_forward(
+        hidden, next_ids, model.make_mtp_cache(), logits_keep=2
+    )
+    after = model(tokens, cache=model.make_cache(), return_hidden=True).logits
+    mx.eval(proposal, after)
+    assert mx.array_equal(proposal, mx.zeros_like(proposal)).item()
+    assert not mx.array_equal(actual, proposal).item()
+    assert mx.array_equal(before.logits, after).item()
+
+    # A declared head must not silently fall back if its module disappears.
+    del owner.mtp.lm_head
+    with pytest.raises(AttributeError):
+        model.mtp_forward(hidden, next_ids, model.make_mtp_cache())
+
+
+def test_qwen4_default_mtp_still_uses_target_head():
+    config = _tiny_config()
+    model, owner = _make_bound_qwen4_language_model(config)
+    assert not config.text_config.mtp_use_dedicated_lm_head
+    assert not hasattr(owner.mtp, "lm_head")
+    hidden = mx.ones((1, 1, 64))
+    tokens = mx.array([[7]], dtype=mx.uint32)
+    mixed, _ = owner.mtp(
+        hidden, tokens, model.model.embed_tokens, model.make_mtp_cache()
+    )
+    expected = model.lm_head(mixed)
+    actual = model.mtp_forward(hidden, tokens, model.make_mtp_cache())
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_qwen4_quantized_dedicated_mtp_head_roundtrip(tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpMTPModule
+
+    config = _tiny_config()
+    config.text_config.mtp_use_dedicated_lm_head = True
+    head = Qwen4ExpMTPModule(config.text_config)
+    nn.quantize(head, group_size=32, bits=4, class_predicate=lambda p, m: p == "lm_head")
+    weights = dict(tree_flatten(head.parameters()))
+    path = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(str(path), weights)
+    restored = Qwen4ExpMTPModule(config.text_config)
+    nn.quantize(restored, group_size=32, bits=4, class_predicate=lambda p, m: p == "lm_head")
+    restored.load_weights(list(mx.load(str(path)).items()), strict=True)
+    assert restored.lm_head.weight.dtype == mx.uint32
+    inputs = mx.random.normal((1, 3, 32))
+    before, after = head.lm_head(inputs), restored.lm_head(inputs)
+    mx.eval(before, after)
+    assert mx.array_equal(before, after).item()
+
+
+def test_qwen4_declared_draft_head_requires_checkpoint_weights(tmp_path):
+    config = _tiny_config()
+    config.text_config.mtp_use_dedicated_lm_head = True
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        model = Model(config)
+        with pytest.raises(ValueError, match="requires checkpoint weights"):
+            model.sanitize({"mtp.fc_hidden.weight": mx.eye(32)})
+        # Source-prefixed head keys are normalized before the requirement check.
+        sanitized = model.sanitize({
+            "model.language_model.mtp.lm_head.weight": mx.zeros((64, 32)),
+        })
+        assert "mtp.lm_head.weight" in sanitized
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+    # Turning MTP off still permits ordinary target-only serving of this file.
+    model = Model(config)
+    assert not hasattr(model, "mtp")
+    sanitized = model.sanitize({"mtp.lm_head.weight": mx.zeros((64, 32))})
+    assert "mtp.lm_head.weight" not in sanitized
+
+
 def _disk_ple(tmp_path, *, shards, rows, dims, bits=None):
     """Write a sharded PLE table (affine-packed when ``bits`` is set, else dense bf16) and open it from disk."""
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1718,6 +1988,78 @@ def test_disk_backed_ple_rejects_out_of_range_indices(tmp_path):
     with pytest.raises(IndexError):
         embedding(mx.array([[1, 8]], dtype=mx.int32))
     embedding.close()
+
+
+def test_small_ple_gather_reads_pages_in_parallel_across_shards(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple(tmp_path, shards=16, rows=128, dims=160)
+    indices = mx.arange(16, dtype=mx.int32)[None] * 128
+    original = language.os.pread
+    lock = threading.Lock()
+    counts = {"active": 0, "peak": 0, "calls": 0}
+
+    def traced(*args):
+        with lock:
+            counts["active"] += 1
+            counts["calls"] += 1
+            counts["peak"] = max(counts["peak"], counts["active"])
+        try:
+            time.sleep(0.005)  # Model independent SSD latency, not CPU work.
+            return original(*args)
+        finally:
+            with lock:
+                counts["active"] -= 1
+
+    monkeypatch.setattr(language.os, "pread", traced)
+    try:
+        actual = embedding(indices)
+        expected = mx.take(table, indices, axis=0)
+        mx.eval(actual, expected)
+        assert mx.array_equal(actual, expected).item()
+        assert counts["peak"] > 1
+        cold_calls = counts["calls"]
+        mx.eval(embedding(indices))
+        assert counts["calls"] == cold_calls
+    finally:
+        embedding.close()
+
+
+def test_cross_shard_ple_read_failure_drains_other_reads(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, _ = _disk_ple(tmp_path, shards=16, rows=128, dims=160)
+    original = language._SafeTensorMMap._touch_page
+    lock = threading.Lock()
+    counts = {"started": 0, "finished": 0}
+
+    def failing(reader, page):
+        with lock:
+            counts["started"] += 1
+            fail = counts["started"] == 1
+        try:
+            if fail:
+                raise OSError("injected read failure")
+            time.sleep(0.01)
+            original(reader, page)
+        finally:
+            with lock:
+                counts["finished"] += 1
+
+    monkeypatch.setattr(language._SafeTensorMMap, "_touch_page", failing)
+    try:
+        with pytest.raises(OSError, match="injected read failure"):
+            embedding(mx.arange(16, dtype=mx.int32)[None] * 128)
+        assert counts["started"] > 8
+        assert counts["started"] == counts["finished"]
+    finally:
+        embedding.close()
 
 
 def test_disk_backed_ple_prefetch_serves_the_matching_call(tmp_path):

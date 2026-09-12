@@ -3,8 +3,12 @@
 
 Fuses per-stream RMS norm, down/inject projections with activation, and the up
 projection with stream mixing. Supports at most 16 BF16 rows, four streams,
-and affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
+and affine group-size-64 projections with 4/5/6/8-bit weights. The small block
+injection projection may also use its original BF16 weights. FP32 epilogues
 can round differently from the canonical BF16 operations.
+
+The Q8/BF16 layout uses a compiled three-kernel call at widths 1..6. Weights
+remain explicit graph inputs so parameter replacement takes effect immediately.
 
 Each kernel specialization is evaluated once inside the failure handler to
 catch lazy compilation errors. Later calls stay lazy; errors during their
@@ -13,6 +17,7 @@ external evaluation propagate to the caller. Disable with OMLX_QWEN4_HC_FUSED=0.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -33,6 +38,7 @@ _DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
     "off",
 }
 _KERNELS: dict[str, object] = {}
+_FORWARDS: dict[tuple, object] = {}
 _VALIDATED: set[tuple] = set()
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
@@ -137,39 +143,52 @@ _D_SOURCE = r"""
     }
     if (INJ == 0 || rg != 0) return;
     {
-        constexpr int PF = hc_pack_factor<BITS_I>();
-        constexpr int BP = hc_bytes_per_pack<BITS_I>();
-        constexpr int ROW_BYTES = K * BP / PF;
-        constexpr int PPT = 1;
-        constexpr int VPT = PF;
-        constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
-        const device uint8_t* wp = (const device uint8_t*)inject_w
-            + ks * (SLICE * BP / PF) + int(lane) * BP;
-        const device T* sp = inject_s + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
-        const device T* bp = inject_b + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
-        const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[HC] = {0.0f};
-        float xv[VPT];
-        constexpr int TAIL = SLICE % BLOCK;
-        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
-            float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
-            for (int r = 0; r < HC; ++r) {
-                result[r] += hc_qdot<VPT, BITS_I>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+        if constexpr (DENSE_I) {
+            // Four output rows are small enough to share the down projection's
+            // dispatch without quantizing precision-sensitive injection weights.
+            const device T* wp = (const device T*)inject_w;
+            for (int k = int(lane); k < SLICE; k += 32) {
+                const int col = ks * SLICE + k;
+                const float xv = float(x[col]);
+                for (int r = 0; r < HC; ++r) {
+                    result[r] += xv * float(wp[r * K + col]);
+                }
             }
-            wp += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
-            xp += BLOCK;
-        }
-        if (TAIL > 0 && int(lane) * VPT < TAIL) {
-            float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
-            for (int r = 0; r < HC; ++r) {
-                result[r] += hc_qdot<VPT, BITS_I>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+        } else {
+            constexpr int PF = hc_pack_factor<BITS_I>();
+            constexpr int BP = hc_bytes_per_pack<BITS_I>();
+            constexpr int ROW_BYTES = K * BP / PF;
+            constexpr int PPT = 1;
+            constexpr int VPT = PF;
+            constexpr int BLOCK = VPT * 32;
+            constexpr int SCALE_STEP = 64 / VPT;
+            const device uint8_t* wp = (const device uint8_t*)inject_w
+                + ks * (SLICE * BP / PF) + int(lane) * BP;
+            const device T* sp = inject_s + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
+            const device T* bp = inject_b + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
+            const device T* xp = x + ks * SLICE + int(lane) * VPT;
+            float xv[VPT];
+            constexpr int TAIL = SLICE % BLOCK;
+            for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
+                float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
+                for (int r = 0; r < HC; ++r) {
+                    result[r] += hc_qdot<VPT, BITS_I>(
+                        wp + r * ROW_BYTES, xv,
+                        float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+                }
+                wp += BLOCK * BP / PF;
+                sp += BLOCK / 64;
+                bp += BLOCK / 64;
+                xp += BLOCK;
+            }
+            if (TAIL > 0 && int(lane) * VPT < TAIL) {
+                float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
+                for (int r = 0; r < HC; ++r) {
+                    result[r] += hc_qdot<VPT, BITS_I>(
+                        wp + r * ROW_BYTES, xv,
+                        float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+                }
             }
         }
         for (int r = 0; r < HC; ++r) {
@@ -189,7 +208,7 @@ _D_SOURCE = r"""
 _U_SOURCE = r"""
     const uint g = threadgroup_position_in_grid.y;
     const uint t = thread_index_in_threadgroup;
-    const int h = int(g) * 64 + int(t >> 2);
+    const int h = int(g) * TILE_H + int(t >> 2);
     const int s = int(t & 3);
     const int n = s * H + h;
     constexpr int PF = hc_pack_factor<BITS_U>();
@@ -261,6 +280,16 @@ def _quantized_ok(projection) -> bool:
         and isinstance(getattr(projection, "biases", None), mx.array)
         and projection.scales.dtype == mx.bfloat16
         and projection.biases.dtype == mx.bfloat16
+    )
+
+
+def _dense_inject_ok(projection, hc: int, width: int) -> bool:
+    return (
+        type(projection) is nn.Linear
+        and "bias" not in projection
+        and isinstance(getattr(projection, "weight", None), mx.array)
+        and projection.weight.dtype == mx.bfloat16
+        and projection.weight.shape == (hc, width)
     )
 
 
@@ -344,10 +373,13 @@ def _layout_compatible(module, hyper_input) -> bool:
         return _ineligible(
             "projection quantisation (need affine group-size-64 4/5/6/8-bit with bf16 scales)"
         )
-    if "block_inject_weight" in module and not _quantized_ok(
-        module.block_inject_weight
-    ):
-        return _ineligible("block_inject_weight quantisation")
+    if "block_inject_weight" in module:
+        inject = module.block_inject_weight
+        if not (
+            _quantized_ok(inject)
+            or _dense_inject_ok(inject, hc_count, hc_count * hidden)
+        ):
+            return _ineligible("block_inject_weight layout (need affine or dense BF16)")
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
@@ -360,12 +392,10 @@ def _eps_array(module) -> mx.array:
     return eps
 
 
-def _kernel_norm(module, flat, rows, hc, hidden, dtype):
+def _kernel_norm(norm_weight, eps, flat, rows, hc, hidden, dtype):
     width = hc * hidden
-    return _kernel(
-        "omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE
-    )(
-        inputs=[flat, module.hc_norm.weight, _eps_array(module)],
+    return _kernel("omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE)(
+        inputs=[flat, norm_weight, eps],
         template=[("T", dtype), ("K", width), ("H", hidden)],
         grid=(256, hc, rows),
         threadgroup=(256, 1, 1),
@@ -406,7 +436,14 @@ def prefill_forward(module, hyper_input):
         mixed = _tail(hc, hidden)(module.input_mix_weight_up(mix), normed)
         inject = module.block_inject_weight if "block_inject_weight" in module else None
         injection = None if inject is None else 2 * mx.sigmoid(inject(normed) / hc)
-        signature = ("prefill", dtype, hc, hidden, module.hc_lowrank, module.input_mix_weight_down.bits)
+        signature = (
+            "prefill",
+            dtype,
+            hc,
+            hidden,
+            module.hc_lowrank,
+            module.input_mix_weight_down.bits,
+        )
         if signature not in _VALIDATED:
             mx.eval(mixed) if injection is None else mx.eval(mixed, injection)
             _VALIDATED.add(signature)
@@ -425,6 +462,121 @@ def prefill_forward(module, hyper_input):
         return None
 
 
+def _launch_fused(
+    flat,
+    norm_weight,
+    eps,
+    down_w,
+    down_s,
+    down_b,
+    up_w,
+    up_s,
+    up_b,
+    inject_w,
+    inject_s,
+    inject_b,
+    *,
+    dtype,
+    hc,
+    hidden,
+    lowrank,
+    rows,
+    down_bits,
+    up_bits,
+    inject_bits,
+    dense_inject,
+    has_inject,
+    tile,
+):
+    """Pure array graph: weights stay explicit inputs to compiled calls."""
+    width = hc * hidden
+    normed = _kernel_norm(norm_weight, eps, flat, rows, hc, hidden, dtype)
+    act, injection = _kernel(
+        "omlx_qwen4_hc_fused_down",
+        ["xn", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"],
+        ["act", "inj"],
+        _D_SOURCE,
+        header=_HEADER,
+    )(
+        inputs=[normed, down_w, down_s, down_b, inject_w, inject_s, inject_b],
+        template=[
+            ("T", dtype),
+            ("BITS_D", down_bits),
+            (
+                "BITS_I",
+                (
+                    inject_bits
+                    if has_inject and not dense_inject
+                    else down_bits
+                ),
+            ),
+            ("DENSE_I", dense_inject),
+            ("K", width),
+            ("R", lowrank),
+            ("HC", hc),
+            ("INJ", 1 if has_inject else 0),
+        ],
+        grid=(32, 8 * (lowrank // 8 + 1), rows),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(rows, lowrank), (rows, hc)],
+        output_dtypes=[dtype, dtype],
+    )
+    mixed = _kernel(
+        "omlx_qwen4_hc_fused_up",
+        ["xn", "act", "up_w", "up_s", "up_b"],
+        ["mixed"],
+        _U_SOURCE,
+        header=_HEADER,
+    )(
+        inputs=[normed, act, up_w, up_s, up_b],
+        template=[
+            ("T", dtype),
+            ("BITS_U", up_bits),
+            ("K", width),
+            ("R", lowrank),
+            ("HC", hc),
+            ("H", hidden),
+            ("S", rows),
+            ("TILE_H", tile),
+        ],
+        grid=(4 * tile, hidden // tile, 1),
+        threadgroup=(4 * tile, 1, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[dtype],
+    )[0]
+    return mixed, injection
+
+
+def _fused_plan(dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits):
+    # Compile short Q8 calls; other layouts use eager kernel dispatch.
+    compiled = (
+        hidden == 2560
+        and lowrank == 320
+        and rows <= 6
+        and down_bits == up_bits == 8
+        and inject_bits in (None, 16)
+    )
+    # The fixed 16-column tile leaves room for tuning on newer GPU generations.
+    # TODO: Detect GPU capabilities and automatically tune/cache the tile size
+    # for each supported layout instead of relying on this hard-coded default.
+    tile = 16 if compiled else 64
+    signature = (
+        dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits, compiled,
+    )
+    forward = _FORWARDS.get(signature)
+    if forward is None:
+        forward = functools.partial(
+            _launch_fused, dtype=dtype, hc=hc, hidden=hidden, lowrank=lowrank,
+            rows=rows, down_bits=down_bits, up_bits=up_bits,
+            inject_bits=inject_bits, dense_inject=inject_bits == 16,
+            has_inject=inject_bits is not None, tile=tile,
+        )
+        if compiled:
+            forward = mx.compile(forward)
+        _FORWARDS[signature] = forward
+    return forward, signature
+
+
 def fused_forward(module, hyper_input):
     """Return fused outputs, or None on construction or first-evaluation failure."""
     global _RUNTIME_FAILED, _FAILURE_LOGGED
@@ -435,68 +587,26 @@ def fused_forward(module, hyper_input):
         rows = batch * seq
         down, up = module.input_mix_weight_down, module.input_mix_weight_up
         inject = module.block_inject_weight if "block_inject_weight" in module else None
+        dense_inject = inject is not None and type(inject) is nn.Linear
+        inject_bits = (
+            16 if dense_inject else (inject.bits if inject is not None else None)
+        )
         flat = hyper_input.reshape(rows, width)
         dtype = hyper_input.dtype
-        normed = _kernel_norm(module, flat, rows, hc, hidden, dtype)
-        if inject is not None:
+        if dense_inject:
+            # Scale/bias arguments are unused in the dense specialization.
+            inject_tensors = (inject.weight, down.scales, down.biases)
+        elif inject is not None:
             inject_tensors = (inject.weight, inject.scales, inject.biases)
         else:
             inject_tensors = (down.weight, down.scales, down.biases)
-        act, injection = _kernel(
-            "omlx_qwen4_hc_fused_down",
-            ["xn", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"],
-            ["act", "inj"],
-            _D_SOURCE,
-            header=_HEADER,
-        )(
-            inputs=[normed, down.weight, down.scales, down.biases, *inject_tensors],
-            template=[
-                ("T", dtype),
-                ("BITS_D", down.bits),
-                ("BITS_I", inject.bits if inject is not None else down.bits),
-                ("K", width),
-                ("R", lowrank),
-                ("HC", hc),
-                ("INJ", 1 if inject is not None else 0),
-            ],
-            grid=(32, 8 * (lowrank // 8 + 1), rows),
-            threadgroup=(32, 8, 1),
-            output_shapes=[(rows, lowrank), (rows, hc)],
-            output_dtypes=[dtype, dtype],
+        forward, signature = _fused_plan(
+            dtype, hc, hidden, lowrank, rows, down.bits, up.bits, inject_bits,
         )
-        mixed = _kernel(
-            "omlx_qwen4_hc_fused_up",
-            ["xn", "act", "up_w", "up_s", "up_b"],
-            ["mixed"],
-            _U_SOURCE,
-            header=_HEADER,
-        )(
-            inputs=[normed, act, up.weight, up.scales, up.biases],
-            template=[
-                ("T", dtype),
-                ("BITS_U", up.bits),
-                ("K", width),
-                ("R", lowrank),
-                ("HC", hc),
-                ("H", hidden),
-                ("S", rows),
-            ],
-            grid=(256, hidden // 64, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(rows, hidden)],
-            output_dtypes=[dtype],
-        )[
-            0
-        ]
-        signature = (
-            dtype,
-            hc,
-            hidden,
-            lowrank,
-            rows,
-            down.bits,
-            up.bits,
-            inject.bits if inject is not None else None,
+        mixed, injection = forward(
+            flat, module.hc_norm.weight, _eps_array(module),
+            down.weight, down.scales, down.biases,
+            up.weight, up.scales, up.biases, *inject_tensors,
         )
         if signature not in _VALIDATED:
             # Metal compilation is lazy. Validate once, without synchronizing
@@ -522,4 +632,11 @@ def fused_forward(module, hyper_input):
         return None
 
 
-__all__ = ["MAX_ROWS", "compatible", "enabled", "fused_forward", "prefill_compatible", "prefill_forward"]
+__all__ = [
+    "MAX_ROWS",
+    "compatible",
+    "enabled",
+    "fused_forward",
+    "prefill_compatible",
+    "prefill_forward",
+]
