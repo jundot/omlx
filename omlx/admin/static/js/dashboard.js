@@ -68,7 +68,9 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'uno_enabled',
         'qwen35_ane_prefill_shared_fraction',
+        'uno_adapter_model',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -1568,7 +1570,51 @@
                 return options;
             },
 
+            unoAdapterCandidates() {
+                const ids = this.selectedModel?.uno_adapters || [];
+                return (this.models || []).filter(model => ids.includes(model.id));
+            },
 
+            get unoSelection() { return this.modelSettings.uno_enabled ? this.modelSettings.uno_adapter_model : ''; },
+            set unoSelection(adapter) {
+                this.modelSettings.uno_adapter_model = adapter;
+                this.modelSettings.uno_enabled = !!adapter;
+            },
+
+            thinkingBudgetAvailable() {
+                return !this.modelSettings.uno_enabled;
+            },
+
+            unoConflicts() {
+                const settings = {...this.modelSettings,
+                    thinking_budget_enabled: this.modelSettings.enableThinkingBudget};
+                return Object.entries(this.selectedModel?.uno_required_settings || {})
+                    .flatMap(([key, neutral]) => {
+                        const inherited = settings[key] === '' || settings[key] == null;
+                        const value = inherited ? (this.globalSettings.sampling[key] ?? neutral) : settings[key];
+                        return Number(value) === neutral ? [] : [{key, neutral, value, inherited}];
+                    });
+            },
+
+            unoConflictText() {
+                return this.unoConflicts().map(({key, neutral, value, inherited}) => {
+                    const label = window.t('modal.model_settings.' + (key === 'mtp_enabled' ? 'lightning_mtp' : key.replace('_enabled', '')));
+                    const source = inherited ? ` (${window.t('modal.model_settings.profiles.scope_global')})` : '';
+                    return `${label}: ${Number(value)}${source} → ${key.endsWith('_enabled') ? window.t('settings.resource.off') : neutral}`;
+                }).join('; ');
+            },
+
+            applyUnoSettings() {
+                for (const [key, neutral] of Object.entries(this.selectedModel.uno_required_settings)) {
+                    this.modelSettings[key] = key.endsWith('_enabled') ? !!neutral : neutral;
+                }
+                this.modelSettings.enableThinkingBudget = false;
+            },
+
+            unoLocks(key) {
+                return this.modelSettings.uno_enabled && !this.modelSettings[key]
+                    && key in (this.selectedModel?.uno_required_settings || {});
+            },
 
             vlmMtpDraftModelCandidates() {
                 return this.draftModelCandidates(
@@ -1679,7 +1725,7 @@
                         model?.deepseek_v41_engram_ssd_offload_supported === true,
                     deepseek_v41_engram_ssd_offload_forced:
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
-                    enableThinkingBudget: !!(s.thinking_budget_tokens),
+                    enableThinkingBudget: s.thinking_budget_enabled || false,
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
                     guided_grammar: s.guided_grammar || '',
@@ -1744,6 +1790,8 @@
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
                     qwen35_ane_prefill_shared_fraction: s.qwen35_ane_prefill_shared_fraction ?? 1,
+                    uno_enabled: s.uno_enabled || false,
+                    uno_adapter_model: s.uno_adapter_model || '',
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
@@ -2734,6 +2782,8 @@
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
+                                uno_enabled: !!this.modelSettings.uno_enabled,
+                                uno_adapter_model: this.modelSettings.uno_adapter_model || null,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -2798,6 +2848,8 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    uno_enabled: false,
+                                    uno_adapter_model: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,

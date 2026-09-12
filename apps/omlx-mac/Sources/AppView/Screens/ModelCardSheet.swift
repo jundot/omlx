@@ -183,7 +183,9 @@ struct ModelCardSheet: View {
             errorView(message: message)
         case .loaded(let dto):
             metadataRow(dto: dto)
-            if dto.isAdapter == true {
+            if dto.unoVerificationFailed {
+                unoVerificationBanner(dto.unoAdapterError ?? "")
+            } else if dto.isAdapter == true && dto.isUnoAdapter != true {
                 loraBanner
             }
             tabBar
@@ -305,6 +307,31 @@ struct ModelCardSheet: View {
     }
 
     // MARK: LoRA warning (gap #4)
+
+    private func unoVerificationBanner(_ reason: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+            VStack(alignment: .leading, spacing: 4) {
+                Text(String(localized: "downloads.card.uno_unverified",
+                            defaultValue: "Uno adapter not verified",
+                            comment: "Warning when checking Uno adapter compatibility failed"))
+                    .font(.omlxText(12, weight: .semibold))
+                Text(reason)
+                    .font(.omlxText(11))
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            Button(String(localized: "downloads.card.retry", defaultValue: "Retry",
+                          comment: "Retry loading the model card")) {
+                Task { await load() }
+            }
+            .buttonStyle(.omlx(.normal))
+        }
+        .foregroundStyle(theme.textSecondary)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(theme.controlBg)
+    }
 
     private var loraBanner: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -473,10 +500,7 @@ struct ModelCardSheet: View {
                 .buttonStyle(.plain)
             }
             Spacer()
-            if dto.isAdapter != true {
-                // Adapters can't be downloaded as a runnable model;
-                // hide the action entirely so the user doesn't kick
-                // off a download that won't load.
+            if dto.canDownload || dto.unoVerificationFailed {
                 Button {
                     onDownload(target.repoId)
                     dismiss()
@@ -488,6 +512,7 @@ struct ModelCardSheet: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.omlx(.primary))
+                .disabled(!dto.canDownload)
                 .keyboardShortcut(.defaultAction)
             }
         }

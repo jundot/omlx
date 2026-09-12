@@ -3,22 +3,36 @@
 
 import gc
 import os
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx_lm.models.cache import make_prompt_cache
-from test_k2_horizon import small_config
 
 from omlx.patches.k2_horizon.ane_prefill import PrefillMLP, enable_ane_prefill
+from omlx.patches.k2_horizon.compiled import install_compiled_blocks, make_regions
 from omlx.patches.k2_horizon.k2_horizon_model import Model, ModelArgs
+from omlx.patches.k2_horizon.uno_adapter import ConditionalLoRALinear, TARGETS
+from omlx.patches.k2_horizon.uno_decode import UnoDecoder
+from test_k2_horizon import small_config
 
 
 def make_model():
     mx.random.seed(211)
     model = Model(ModelArgs.from_dict(small_config(head_dim=128)))
     model.set_dtype(mx.bfloat16)
+    for layer in model.layers:
+        for scope, names in TARGETS.items():
+            owner = getattr(layer, scope)
+            for name in names:
+                linear = getattr(owner, name)
+                n, k = linear.weight.shape
+                a = (mx.random.normal((4, k)) * 0.02).astype(mx.bfloat16)
+                b = (mx.random.normal((n, 4)) * 0.02).astype(mx.bfloat16)
+                setattr(owner, name, ConditionalLoRALinear(linear, a, b, 2.0))
+    model._uno_adapter_loaded = True
     mx.eval(model.parameters())
     return model
 
@@ -31,6 +45,145 @@ def close(a, b):
     )
 
 
+@pytest.mark.parametrize("conditional", [False, True])
+def test_compiled_cache_rollback_and_path_alternation(conditional):
+    model = make_model()
+    cache = make_prompt_cache(model)
+    model(mx.array([[2, 3, 5, 7]]), cache=cache)
+    mx.eval([c.state for c in cache])
+    clone = lambda: [type(c).from_state(c.state, c.meta_state) for c in cache]
+    ids = mx.array([[11, 13, 17]])
+    mask = mx.array([[0.0, 1.0, 1.0]]) if conditional else None
+    rc = clone()
+    expected = model(ids, cache=rc, lora_mask=mask)
+    mx.eval(expected)
+    weights = model.parameters()
+    install_compiled_blocks(model)
+    ac = clone()
+    actual = model(ids, cache=ac, lora_mask=mask)
+    mx.eval(actual)
+    close(expected, actual)
+    for r, c in zip(rc, ac):
+        assert r.offset == c.offset == 7
+        for a, b in zip(r.state, c.state):
+            close(a, b)
+        c.trim(3)
+    assert mx.array_equal(actual, model(ids, cache=ac, lora_mask=mask)).item()
+    assert mx.all(mx.isfinite(model(ids, cache=clone()))).item()
+    assert weights.keys() == model.parameters().keys()
+
+
+def test_compiled_default_rope_dynamic_long_offsets():
+    model = make_model()
+    layer = model.layers[0]
+    attn = layer.self_attn
+    regions = make_regions(layer)
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    q = (
+        attn.q_proj(layer.input_layernorm(x))
+        .reshape(1, 3, 4, 128)
+        .transpose(0, 2, 1, 3)
+    )
+    previous = None
+    for offset in (0, 2048, 4096, 8192, 8193):
+        actual, _, _ = regions["pre", False](x, mx.array(offset, dtype=mx.int32))
+        close(attn.rope(q, offset=offset), actual)
+        if previous is not None:
+            assert not mx.array_equal(actual, previous).item()
+        previous = actual
+
+
+def test_compiled_rejects_unsupported_rope_and_cache():
+    model = make_model()
+    model.args.rope_head_dim = 64
+    with pytest.raises(ValueError, match="full-head"):
+        install_compiled_blocks(model)
+    model.args.rope_head_dim = 128
+    install_compiled_blocks(model)
+    cache = make_prompt_cache(model)
+    model(mx.array([[2, 3]]), cache=cache)
+    mx.eval([c.state for c in cache])
+    cache[0].trim(1)
+    with pytest.raises(ValueError, match="aligned"):
+        model(mx.array([[5]]), cache=cache)
+    model.model_type = "unsupported"
+    with pytest.raises(ValueError, match="K2 model"):
+        enable_ane_prefill(model)
+
+
+@pytest.mark.parametrize("offset", [0, 2])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_scheduler_prefill_excludes_seed_drafts_and_verification(
+    mock_tokenizer, offset, chunked
+):
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, SchedulerConfig
+
+    model = make_model()
+    cache = make_prompt_cache(model)
+    prompt = [2, 3, 5, 7, 11, 13]
+    if offset:
+        model(mx.array([prompt[:offset]]), cache=cache)
+        mx.eval([c.state for c in cache])
+    calls = []
+
+    def prefill(ids, *, cache):
+        calls.append(ids.tolist()[0])
+        return model(ids, cache=cache)
+
+    model._omlx_prefill = prefill
+    scheduler = Scheduler(
+        model,
+        mock_tokenizer,
+        SchedulerConfig(prefill_step_size=2, paged_cache_block_size=0),
+    )
+    request = Request(
+        request_id="prefill", prompt=prompt, sampling_params=SamplingParams()
+    )
+    request.prompt_token_ids, request.num_prompt_tokens = prompt, len(prompt)
+    request.cached_tokens = offset
+    scheduler.requests[request.request_id] = request
+    try:
+        if chunked:
+            state = scheduler._begin_prefill(request, prompt[offset:], cache)
+            while not scheduler._step_prefill_chunk(state):
+                pass
+            cache, last = state.cache, state.last_token
+        else:
+            cache, last = scheduler._do_external_prefill(
+                request, prompt[offset:], cache
+            )
+        assert sum(calls, []) == prompt[offset:-1]
+        assert last == prompt[-1:]
+        assert all(c.offset == len(prompt) - 1 for c in cache)
+        calls.clear()
+        decoder = UnoDecoder(model, eos_token_ids=[], temperature=0)
+        cycle = decoder.cycle(last[0], cache=cache, frontier=len(prompt), max_tokens=12)
+        assert cycle.tokens and calls == []
+        assert all(c.offset == len(prompt) + len(cycle.tokens) - 1 for c in cache)
+    finally:
+        scheduler.shutdown()
+
+
+def test_compiled_prefill_is_explicit_and_skips_final_mlp():
+    model = make_model()
+    install_compiled_blocks(model)
+    mlp = model.layers[0].mlp
+    spy = Mock(side_effect=mlp)
+    model.model._prefill_mlps = (spy,)
+    ids = mx.array([[2, 3, 5]])
+    cache = make_prompt_cache(model)
+    model.model(ids, cache=cache, prefill=True)
+    mx.eval([c.state for c in cache])
+    assert spy.call_count == 1
+    model(ids, cache=cache)
+    model(ids, cache=cache, lora_mask=mx.array([[0.0, 1.0, 1.0]]))
+    mx.eval([c.state for c in cache])
+    assert spy.call_count == 1
+    with pytest.raises(ValueError, match="conditional"):
+        model.model(ids, lora_mask=mx.ones((1, 3)), prefill=True)
+
+
 @pytest.mark.skipif(os.environ.get("OMLX_TEST_K2_ANE") != "1", reason="requires ANE")
 @pytest.mark.parametrize("rows", [7, 32])
 @pytest.mark.parametrize("bits", [None, 4, 8])
@@ -41,19 +194,19 @@ def test_native_prefill_owns_weights_outputs_and_keeps_gpu_decode(rows, bits, dt
     ref = model.layers[0].mlp
     if bits is not None:
         for name in ("gate_proj", "up_proj", "down_proj"):
-            setattr(
-                ref,
-                name,
-                nn.QuantizedLinear.from_linear(
-                    getattr(ref, name), group_size=64, bits=bits
-                ),
+            wrapped = getattr(ref, name)
+            wrapped.linear = nn.QuantizedLinear.from_linear(
+                wrapped.linear, group_size=64, bits=bits
             )
-    weights = [getattr(ref, n).weight for n in ("gate_proj", "up_proj", "down_proj")]
+    weights = [
+        getattr(ref, n).linear.weight for n in ("gate_proj", "up_proj", "down_proj")
+    ]
     split = PrefillMLP(ref, cut=64, width=32)
     x = mx.random.normal((1, rows, 64)).astype(dtype)
-    target = ref(x)
+    mask = (mx.arange(rows)[None] % 2).astype(mx.float32)
+    target, draft = ref(x), ref(x, lora_mask=mask)
     before = split(x)
-    mx.eval(target, before)
+    mx.eval(target, draft, before)
     close(target, before)
     gc.collect()
     mx.clear_cache()
@@ -65,10 +218,11 @@ def test_native_prefill_owns_weights_outputs_and_keeps_gpu_decode(rows, bits, dt
     assert not mx.array_equal(before, changed).item()
     assert mx.array_equal(before, split(x)).item()
     assert all(
-        a is getattr(ref, n).weight
+        a is getattr(ref, n).linear.weight
         for a, n in zip(weights, ("gate_proj", "up_proj", "down_proj"))
     )
     assert mx.array_equal(target, ref(x)).item()
+    assert mx.array_equal(draft, ref(x, lora_mask=mask)).item()
 
 
 @pytest.mark.skipif(os.environ.get("OMLX_TEST_K2_ANE") != "1", reason="requires ANE")
@@ -98,8 +252,7 @@ def test_mova_prefill_preserves_routes_and_gpu_decode():
     expected = model(mx.array([[43]]), cache=reference_cache)
     mx.eval(expected)
     routers = [
-        (layer.mlp.gate.weight, layer.self_attn.v_router.weight)
-        for layer in model.layers[1:]
+        (l.mlp.gate.weight, l.self_attn.v_router.weight) for l in model.layers[1:]
     ]
     prefill = enable_ane_prefill(model, fraction=0.5, width=32)
     cache = make_prompt_cache(model)
@@ -130,6 +283,46 @@ def test_mova_prefill_preserves_routes_and_gpu_decode():
     assert mx.all(
         mx.isfinite(model(mx.array([[43]]), cache=make_prompt_cache(model)))
     ).item()
+
+
+@pytest.mark.skipif(os.environ.get("OMLX_TEST_K2_ANE") != "1", reason="requires ANE")
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("rows,tiles", [(30, 0), (31, 1), (32, 1), (63, 2)])
+def test_ane_near_full_tail_preserves_cache_and_decode(compiled, rows, tiles):
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    model = make_model()
+    ids = mx.array([[i % 100 for i in range(rows)]])
+    reference_cache = make_prompt_cache(model)
+    model(ids, cache=reference_cache)
+    mx.eval([c.state for c in reference_cache])
+    expected = model(mx.array([[43]]), cache=reference_cache)
+    mx.eval(expected)
+    if compiled:
+        install_compiled_blocks(model)
+    prefill = enable_ane_prefill(model, fraction=0.5, width=32)
+    cache = make_prompt_cache(model)
+    fast.qwen35_ane_profile_set_enabled(True)
+    fast.qwen35_ane_profile_reset()
+    try:
+        prefill(ids, cache=cache)
+        ops = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        assert ops == tiles * (len(model.layers) - 1)
+        assert all(c.offset == rows for c in cache)
+        actual = model(mx.array([[43]]), cache=cache)
+        mx.eval(actual)
+        close(expected, actual)
+        assert all(c.offset == rows + 1 for c in cache)
+        for actual_cache, ref_cache in zip(cache, reference_cache):
+            for a, b in zip(actual_cache.state, ref_cache.state):
+                close(b, a)
+            actual_cache.trim(1)
+        repeated = model(mx.array([[43]]), cache=cache)
+        assert mx.array_equal(actual, repeated).item()
+        assert fast.qwen35_ane_profile_snapshot()["mlp"]["operations"] == ops
+        assert all(not l.mlp._omlx_ane_prefill.active for l in model.layers[:-1])
+    finally:
+        fast.qwen35_ane_profile_set_enabled(False)
 
 
 def test_family_partitions_use_checkpoint_dimensions():
@@ -220,10 +413,23 @@ def test_mova_scheduler_prefill_and_restored_cache(mock_tokenizer, chunked, pref
         fast.qwen35_ane_profile_set_enabled(False)
 
 
+def test_ane_prefix_namespace_separates_compiled_gpu_math(monkeypatch):
+    from omlx.patches.k2_horizon import ane_prefill
+
+    monkeypatch.setattr(ane_prefill, "PrefillMLP", lambda *a, **k: SimpleNamespace())
+    model = make_model()
+    enable_ane_prefill(model, fraction=0.5, width=32)
+    ordinary = model._omlx_k2_ane_signature
+    install_compiled_blocks(model)
+    enable_ane_prefill(model, fraction=0.5, width=32)
+    assert model._omlx_k2_ane_signature != ordinary
+
+
 @pytest.mark.skipif(os.getenv("OMLX_TEST_K2_ANE") != "1", reason="requires local ANE")
 @pytest.mark.parametrize("prefix", [0, 32])
+@pytest.mark.parametrize("compiled", [False, True])
 def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
-    mock_tokenizer, monkeypatch, prefix
+    mock_tokenizer, monkeypatch, prefix, compiled
 ):
     from mlx_lm.generate import BatchGenerator, GenerationBatch
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -231,6 +437,10 @@ def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
     from omlx.scheduler import Scheduler, SchedulerConfig
 
     model = make_model()
+    if compiled:
+        from omlx.patches.k2_horizon.compiled import install_compiled_blocks
+
+        install_compiled_blocks(model)
     enable_ane_prefill(model, fraction=0.5, width=32)
     scheduler = Scheduler(
         model=model,

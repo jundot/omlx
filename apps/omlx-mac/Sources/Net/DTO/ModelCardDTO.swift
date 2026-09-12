@@ -40,6 +40,17 @@ struct ModelCardDTO: Decodable, Equatable, Sendable {
     /// Download button so the user doesn't accidentally pull an adapter
     /// they can't run standalone.
     let isAdapter: Bool?
+    /// nil with an error means verification failed, not an unsupported adapter.
+    var isUnoAdapter: Bool? = nil
+    var unoAdapterError: String? = nil
+
+    var unoVerificationFailed: Bool {
+        isAdapter == true && isUnoAdapter == nil && unoAdapterError != nil
+    }
+
+    var canDownload: Bool {
+        isAdapter != true || isUnoAdapter == true
+    }
 
     /// Per-file listing — name + size in bytes + server-formatted size.
     /// Drives the Files tab. Always present for HF; MS returns the same

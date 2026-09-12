@@ -16,7 +16,9 @@ from omlx.model_settings import ModelSettings
 def tuner_pool(monkeypatch, tmp_path):
     from omlx.custom_kernels.qwen35_prefill import fast
 
-    base = ModelSettings(qwen35_ane_prefill_enabled=True)
+    base = ModelSettings(
+        qwen35_ane_prefill_enabled=True, uno_enabled=True, uno_adapter_model="adapter"
+    )
     (tmp_path / "config.json").write_text(json.dumps(dict(num_hidden_layers=3)))
     pool = SimpleNamespace(
         base=base,
@@ -46,6 +48,7 @@ async def test_k2_recommendation_keeps_settings_unchanged(
 
     async def measure(run, pool, settings, candidate):
         transient = ane_tuning._settings_for_candidate(settings, run.request, candidate)
+        assert not transient.uno_enabled
         assert transient.qwen35_ane_prefill_enabled == candidate.enabled
         return {**ane_tuning._empty_result(candidate), "processing_tps": next(speeds)}
 

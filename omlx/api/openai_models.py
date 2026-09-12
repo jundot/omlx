@@ -529,6 +529,9 @@ class ModelInfo(BaseModel):
     # effective context window from the listing without a separate call
     # to /v1/models/status (see #1308).
     max_model_len: int | None = None
+    # Invalid profiles remain discoverable so clients can show the repair reason.
+    invalid: bool = False
+    invalid_reason: str | None = None
 
 
 class ModelsResponse(BaseModel):

@@ -397,6 +397,11 @@ class EnginePool:
                 format_size(extra),
                 entry.model_id,
             )
+        if getattr(runtime_settings, "uno_enabled", False):
+            adapter = self._entries.get(runtime_settings.uno_adapter_model)
+            if adapter is None or adapter.config_model_type != "k2_horizon_uno":
+                raise ValueError("Select an available Uno adapter.")
+            base = entry.estimated_size + adapter.estimated_size
         if (
             include_ane_reservation
             and getattr(runtime_settings, "qwen35_ane_prefill_enabled", False)
@@ -965,6 +970,9 @@ class EnginePool:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
             add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
 
+        add("uno_enabled", bool(data.get("uno_enabled", False)))
+        if data.get("uno_enabled"):
+            add("uno_adapter_model", data.get("uno_adapter_model"))
         return tuple(signature)
 
     @property
@@ -2827,6 +2835,18 @@ class EnginePool:
         self._failed_load_reclaim_tasks.add(task)
         task.add_done_callback(self._finish_failed_load_reclaim_task)
 
+    def get_uno_adapter(self, entry, settings):
+        """Validate the selected local pair at settings and load boundaries."""
+        from .model_settings import validate_uno_settings
+        from .uno_bundle import resolve_uno_bundle
+
+        validate_uno_settings(settings)
+        adapter = self.get_entry(settings.get("uno_adapter_model"))
+        if adapter is None or adapter.config_model_type != "k2_horizon_uno":
+            raise ValueError("Select an available Uno adapter.")
+        resolve_uno_bundle(entry.model_path, adapter.model_path)
+        return adapter
+
     async def _load_engine(
         self,
         model_id: str,
@@ -2858,6 +2878,8 @@ class EnginePool:
         pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
+            if entry.config_model_type == "k2_horizon_uno":
+                raise ValueError("Select a compatible K2 base. Enable Uno in its settings.")
             if force_lm and effective_type == "vlm":
                 effective_type = "batched"
                 logger.info(f"Loading model as LM (force_lm=True): {model_id}")
@@ -2876,6 +2898,9 @@ class EnginePool:
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)
+            uno_enabled = bool(getattr(model_settings, "uno_enabled", False))
+            if uno_enabled and deployment is not None:
+                raise ValueError("Uno does not support distributed deployment.")
             base_resident_size = self._entry_resident_size(entry)
             if (
                 deployment is None
@@ -2917,7 +2942,11 @@ class EnginePool:
             # since DFlash has its own model loading pipeline
             engine = None
             deployment = deployment if effective_type == "batched" else None
-            if deployment is None and model_settings is not None:
+            if (
+                not uno_enabled
+                and deployment is None
+                and model_settings is not None
+            ):
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if (
@@ -2992,7 +3021,18 @@ class EnginePool:
 
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
-                if deployment is not None:
+                if uno_enabled:
+                    from .engine.uno import UnoEngine
+
+                    adapter = self.get_uno_adapter(entry, model_settings.to_dict())
+                    engine = UnoEngine(
+                        model_name=entry.model_path,
+                        adapter_path=adapter.model_path,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                        prefill_eviction_callback=prefill_eviction_callback,
+                    )
+                elif deployment is not None:
                     from .engine.distributed import DistributedBatchedEngine
 
                     deployment = replace(

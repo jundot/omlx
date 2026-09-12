@@ -406,8 +406,106 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNotNil(vm.currentSettingsDict()["enable_thinking"])
     }
 
+    func testUnoDefaultsAndCompatibleVariants() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoAdapters: ["Uno", "Uno-Q4"])
+        vm.allModels = [
+            vm.model!,
+            makeModel(id: "Uno", configModelType: "k2_horizon_uno"),
+            makeModel(id: "Uno-Q4", configModelType: "k2_horizon_uno"),
+            makeModel(id: "7B-Uno", configModelType: "k2_horizon_uno"),
+        ]
+        XCTAssertTrue(vm.thinkingForced)
+        XCTAssertFalse(vm.unoEnabled)
+        XCTAssertEqual(vm.unoAdapterModelOptions().map(\.0), ["", "Uno", "Uno-Q4"])
+        XCTAssertEqual(vm.currentSettingsDict()["uno_enabled"]?.value as? Bool, false)
+        vm.unoAdapterModel = "Uno-Q4"
+        XCTAssertTrue(vm.validateUnoWorkingSettings())
+        XCTAssertEqual(vm.currentSettingsDict()["uno_adapter_model"]?.value as? String, "Uno-Q4")
+        vm.unoAdapterModel = "7B-Uno"
+        XCTAssertFalse(vm.validateUnoWorkingSettings())
+        vm.unoAdapterModel = ""
+        XCTAssertTrue(vm.validateUnoWorkingSettings())
+        vm.model = makeModel(id: "MoVA", configModelType: "k2_horizon")
+        XCTAssertTrue(vm.thinkingForced)
+        XCTAssertFalse(vm.model?.unoCompatible ?? false)
+        vm.model = makeModel(id: "Qwen", configModelType: "qwen3_5")
+        XCTAssertFalse(vm.thinkingForced)
+        XCTAssertTrue(vm.unoAdapterCandidates.isEmpty)
+        XCTAssertNil(vm.currentSettingsDict()["uno_enabled"])
+    }
 
+    func testUnoRejectsConflictingWorkingSettings() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoAdapters: ["Uno"])
+        for key in [\ModelSettingsScreenVM.mtpEnabled, \.vlmMtpEnabled, \.dflashEnabled,
+                    \.specprefillEnabled, \.turboquantKvEnabled,
+                    \.thinkingBudgetEnabled] {
+            vm[keyPath: key] = true
+            XCTAssertNotNil(vm.unoConflictReason)
+            vm[keyPath: key] = false
+        }
+        for key in [\ModelSettingsScreenVM.minP, \.repetitionPenalty, \.presencePenalty] {
+            vm[keyPath: key] = "0.2"
+            XCTAssertNotNil(vm.unoConflictReason)
+            vm[keyPath: key] = ""
+        }
+        vm.qwen35AnePrefillEnabled = true
+        vm.minP = "0"
+        vm.repetitionPenalty = "1"
+        vm.presencePenalty = "0"
+        XCTAssertNil(vm.unoConflictReason)
+    }
 
+    func testUnoInheritedPenaltyAndExplicitRepair() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoAdapters: ["adapter"])
+        vm.unoAdapterModel = "adapter"
+        vm.serverDefaultSampling = .init(maxContextWindow: 4096, maxTokens: 256,
+                                         temperature: 0.7, topP: 0.9, topK: 40, repetitionPenalty: 1.1)
+        vm.guidedGrammarEnabled = true
+        XCTAssertEqual(Set(vm.unoConflicts.map(\.key)), ["repetition_penalty", "guided_grammar_enabled"])
+        XCTAssertTrue(vm.unoConflicts.first { $0.key == "repetition_penalty" }!.inherited)
+        XCTAssertFalse(vm.thinkingBudgetAvailable)
+        vm.applyUnoSettings()
+        XCTAssertNil(vm.unoConflictReason)
+        XCTAssertEqual(vm.repetitionPenalty, "1")
+        XCTAssertEqual(vm.serverDefaultSampling?.repetitionPenalty, 1.1)
+        XCTAssertEqual(vm.currentSettingsDict()["guided_grammar_enabled"]?.value as? Bool, false)
+        vm.unoAdapterModel = ""
+        XCTAssertTrue(vm.thinkingBudgetAvailable)
+        XCTAssertFalse(vm.unoEnabled)
+    }
+
+    func testUnoWireFieldsAndModelProfileRoundtrip() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let data = Data(#"{"id":"base","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"k2_horizon","uno_compatible":true,"uno_adapters":["Uno-Q4"],"uno_required_settings":{"guided_grammar_enabled":0},"settings":{"uno_enabled":true,"uno_adapter_model":"Uno-Q4","guided_grammar_enabled":true}}"#.utf8)
+        let model = try decoder.decode(ModelDTO.self, from: data)
+        XCTAssertEqual(model.unoAdapters, ["Uno-Q4"])
+        XCTAssertEqual(model.settings?.unoEnabled, true)
+        XCTAssertEqual(model.settings?.unoAdapterModel, "Uno-Q4")
+        let vm = ModelSettingsScreenVM()
+        vm.model = model
+        vm.guidedGrammarEnabled = model.settings?.guidedGrammarEnabled ?? false
+        XCTAssertNotNil(vm.unoConflictReason)
+        var patch = ModelSettingsPatch()
+        patch.unoEnabled = true
+        patch.unoAdapterModel = "Uno-Q4"
+        patch.guidedGrammarEnabled = false
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let encoded = try encoder.encode(patch)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["uno_enabled", "uno_adapter_model", "guided_grammar_enabled"])
+        XCTAssertEqual(object["uno_enabled"] as? Bool, true)
+        XCTAssertEqual(object["uno_adapter_model"] as? String, "Uno-Q4")
+        vm.unoAdapterModel = "Uno-Q4"
+        let snapshot = try encoder.encode(vm.currentSettingsDict())
+        let settings = try decoder.decode(ModelSettingsDTO.self, from: snapshot)
+        XCTAssertEqual(settings.unoEnabled, true)
+        XCTAssertEqual(settings.unoAdapterModel, "Uno-Q4")
+    }
 
     func testThinkingPatchCanClearK2SettingWithoutChangingOtherWireValues() throws {
         let encoder = JSONEncoder()
@@ -445,7 +543,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
     }
 
-    private func makeModel(id: String, configModelType: String?) -> ModelDTO {
+    private func makeModel(id: String, configModelType: String?, unoAdapters: [String] = []) -> ModelDTO {
         var model = ModelDTO(
             id: id,
             displayName: nil,
@@ -484,6 +582,15 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         model.anePrefillDefaultFraction = model.anePrefillBackend == "k2" ? 1.0 / 3.0 : 0.53
         model.anePrefillMlpFractions = [1.0 / 3.0, 0.5]
         model.anePrefillSharedFractions = [0, 1.0 / 3.0, 1]
+        model.unoCompatible = !unoAdapters.isEmpty
+        model.unoAdapters = unoAdapters
+        model.unoRequiredSettings = [
+            "mtp_enabled": 0, "vlm_mtp_enabled": 0, "dflash_enabled": 0,
+            "specprefill_enabled": 0, "turboquant_kv_enabled": 0,
+            "guided_grammar_enabled": 0,
+            "thinking_budget_enabled": 0, "min_p": 0, "repetition_penalty": 1,
+            "presence_penalty": 0,
+        ]
         return model
     }
 }

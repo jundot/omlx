@@ -38,6 +38,7 @@ from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import (
+    InvalidProfileSettingsError,
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     ane_prefill_backend,
     ane_prefill_fraction,
@@ -297,6 +298,8 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
+    uno_enabled: bool | None = None
+    uno_adapter_model: str | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -1994,6 +1997,10 @@ def _model_options(model_info: dict, settings) -> dict:
     thinking_modes = ["auto", "on_limit"] if is_k2 else [
         "auto", "on_unlimit", "on_limit", "off"
     ]
+    from ..model_settings import UNO_REQUIRED_SETTINGS
+
+    if settings and settings.uno_enabled and "thinking_budget_enabled" in UNO_REQUIRED_SETTINGS:
+        thinking_modes.remove("on_limit")
     ane_backend = (
         None if model_info.get("is_helper") else ane_prefill_backend(model_type)
     )
@@ -2069,6 +2076,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             _ms.specprefill_draft_model,
             _ms.dflash_draft_model,
             _ms.vlm_mtp_draft_model,
+            _ms.uno_adapter_model,
         ):
             if ref:
                 referenced_drafts.add(ref)
@@ -2081,6 +2089,16 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         None,
     )
     dflash_ssd_cache_available = bool(ssd_cache_dir)
+
+    from ..model_settings import UNO_REQUIRED_SETTINGS
+    from ..uno_bundle import uno_base_id
+
+    uno_adapters = {}
+    for model in models_status:
+        if model.get("config_model_type") == "k2_horizon_uno":
+            base = uno_base_id(model.get("model_path", ""))
+            if base is not None:
+                uno_adapters.setdefault(base, []).append(model["id"])
 
     # Combine model info with settings
     models = []
@@ -2233,6 +2251,19 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         }
 
         model_data.update(_model_options(model_data, settings))
+        uno_base = None
+        if model_data["config_model_type"] == "k2_horizon" and not model_data["is_helper"]:
+            uno_base = uno_base_id(model_data["model_path"])
+        model_data.update(
+            uno_compatible=uno_base is not None,
+            uno_adapters=uno_adapters.get(uno_base, []),
+            uno_adapter_repo=f"{uno_base}-Uno" if uno_base else None,
+            uno_required_settings=(
+                {key: int(value) for key, value in UNO_REQUIRED_SETTINGS.items()}
+                if uno_base is not None
+                else {}
+            ),
+        )
 
         # Add settings if available
         if settings:
@@ -2458,6 +2489,7 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
+    entry_type_update = None
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
     )
@@ -2505,7 +2537,7 @@ async def update_model_settings(
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
         current_settings.model_type_override = override_value
-        # Update engine pool entry type immediately
+        # Stage the runtime update until the settings and profiles validate.
         type_to_engine = {
             "llm": "batched",
             "vlm": "vlm",
@@ -2516,8 +2548,10 @@ async def update_model_settings(
             "audio_sts": "audio_sts",
         }
         if override_value:
-            entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+            entry_type_update = (
+                override_value,
+                type_to_engine.get(override_value, "batched"),
+            )
         else:
             # Reset to auto-detected type
             from pathlib import Path
@@ -2525,8 +2559,10 @@ async def update_model_settings(
             from ..model_discovery import detect_model_type
 
             detected_type = detect_model_type(Path(entry.model_path))
-            entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+            entry_type_update = (
+                detected_type,
+                type_to_engine.get(detected_type, "batched"),
+            )
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:
@@ -3058,6 +3094,11 @@ async def update_model_settings(
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
+    if "uno_enabled" in sent:
+        current_settings.uno_enabled = bool(request.uno_enabled)
+    if "uno_adapter_model" in sent:
+        current_settings.uno_adapter_model = request.uno_adapter_model or None
+
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
     if "guided_grammar_enabled" in sent:
@@ -3068,6 +3109,13 @@ async def update_model_settings(
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
     _validate_model_settings(entry, current_settings.to_dict())
+    try:
+        settings_manager.validate_profiles_for_settings(
+            model_id, current_settings, _profile_settings_validator(entry)
+        )
+    except InvalidProfileSettingsError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -3139,6 +3187,8 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+    if entry_type_update is not None:
+        entry.model_type, entry.engine_type = entry_type_update
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective
@@ -3355,6 +3405,16 @@ def _validate_model_settings(entry, settings):
                 status_code=400,
                 detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
             )
+    if settings.get("uno_enabled"):
+        from ..model_settings import validate_uno_settings
+
+        global_settings = _get_global_settings() if _get_global_settings else None
+        defaults = global_settings.sampling.to_dict() if global_settings else {}
+        try:
+            validate_uno_settings(settings, defaults)
+            _get_engine_pool().get_uno_adapter(entry, settings)
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
     if any(key.startswith("qwen35_ane_prefill_") for key in settings):
         try:
             validate_ane_prefill(settings, entry.config_model_type)
@@ -3367,6 +3427,18 @@ def _validate_model_settings(entry, settings):
         if settings.get("enable_thinking") is not None:
             kwargs["enable_thinking"] = settings["enable_thinking"]
         validate_chat_template_kwargs(kwargs)
+
+
+def _profile_settings_validator(entry):
+    """Reuse model validation on effective profile settings under the manager lock."""
+
+    def validate(settings):
+        try:
+            _validate_model_settings(entry, settings)
+        except HTTPException as error:
+            raise ValueError(str(error.detail)) from error
+
+    return validate
 
 
 @router.get("/api/models/{model_id}/profiles")
@@ -3389,7 +3461,6 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3404,8 +3475,9 @@ async def create_model_profile(
             reserved_model_ids=(
                 set(engine_pool.get_model_ids()) if engine_pool is not None else None
             ),
+            settings_validator=_profile_settings_validator(entry),
         )
-    except InvalidProfileNameError as e:
+    except (InvalidProfileNameError, InvalidProfileSettingsError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -3434,7 +3506,6 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3450,8 +3521,9 @@ async def update_model_profile(
             reserved_model_ids=(
                 set(engine_pool.get_model_ids()) if engine_pool is not None else None
             ),
+            settings_validator=_profile_settings_validator(entry),
         )
-    except InvalidProfileNameError as e:
+    except (InvalidProfileNameError, InvalidProfileSettingsError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -3499,7 +3571,12 @@ async def apply_model_profile(
         _validate_model_settings(entry, settings)
 
     try:
-        applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
+        applied = mgr.apply_profile(
+            model_id,
+            name,
+            settings_sanitizer=sanitizer,
+            profile_settings_validator=_profile_settings_validator(entry),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if applied is None:

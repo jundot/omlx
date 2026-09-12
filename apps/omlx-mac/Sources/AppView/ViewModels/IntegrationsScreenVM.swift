@@ -173,7 +173,7 @@ final class IntegrationsScreenVM {
 
             // Available models
             let models = try await client.listModels().models
-            self.availableModels = models.map { $0.id }
+            self.availableModels = models.filter { $0.isHelper != true }.map { $0.id }
 
             // Stats — host/port/api_key/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the

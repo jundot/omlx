@@ -10,6 +10,23 @@ import XCTest
 
 final class ModelCardDTODecodeTests: XCTestCase {
 
+    func testUnoVerificationStatesControlDownloadWithoutLosingTheCard() throws {
+        for (verified, error, canDownload, verificationFailed) in [
+            ("true", "null", true, false),
+            ("false", "null", false, false),
+            ("null", "\"Verification timed out. Retry.\"", false, true),
+        ] {
+            let json = """
+            {"model_card":"# Retained card", "is_adapter":true,
+             "is_uno_adapter":\(verified), "uno_adapter_error":\(error)}
+            """.data(using: .utf8)!
+            let dto = try decoder.decode(ModelCardDTO.self, from: json)
+            XCTAssertEqual(dto.modelCard, "# Retained card")
+            XCTAssertEqual(dto.canDownload, canDownload)
+            XCTAssertEqual(dto.unoVerificationFailed, verificationFailed)
+        }
+    }
+
     /// Mirrors the `OMLXClient` decoder configuration so snake_case
     /// `model_card` maps to the camelCase `modelCard` property.
     private let decoder: JSONDecoder = {

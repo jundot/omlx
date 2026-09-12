@@ -2128,6 +2128,17 @@
                                         </div>
                                     </div>
                                 </div>
+                                <template x-if="hfModelDetail.uno_adapter_error">
+                                    <div role="alert" class="px-6 py-3 flex items-center gap-3 shrink-0 bg-amber-50 text-xs text-amber-800 border-t border-amber-200">
+                                        <div class="min-w-0 flex-1">
+                                            <p class="font-medium">{{ t('models.detail.uno_unverified') }}</p>
+                                            <p x-text="hfModelDetail.uno_adapter_error"></p>
+                                        </div>
+                                        <button @click="openModelDetail(hfModelDetail.repo_id)" class="px-3 py-2 border border-amber-300 rounded-lg shrink-0">
+                                            {{ t('models.detail.retry_verification') }}
+                                        </button>
+                                    </div>
+                                </template>
                                 <!-- Footer -->
                                 <div class="px-6 py-4 border-t border-neutral-200 flex items-center justify-between shrink-0 bg-neutral-50">
                                     <a :href="'https://huggingface.co/' + hfModelDetail.repo_id" target="_blank" rel="noopener noreferrer"
@@ -2140,15 +2151,15 @@
                                                 class="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
                                             {{ t('models.detail.close') }}
                                         </button>
-                                        <template x-if="hfModelDetail.is_adapter">
+                                        <template x-if="hfModelDetail.is_adapter && hfModelDetail.is_uno_adapter !== true && !hfModelDetail.uno_adapter_error">
                                             <span class="px-4 py-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-1.5">
                                                 <i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>
                                                 {{ t('models.detail.lora_warning') }}
                                             </span>
                                         </template>
-                                        <template x-if="!hfModelDetail.is_adapter">
+                                        <template x-if="!hfModelDetail.is_adapter || hfModelDetail.is_uno_adapter === true || hfModelDetail.uno_adapter_error">
                                             <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
-                                                    :disabled="hfDownloading"
+                                                    :disabled="hfDownloading || !!hfModelDetail.uno_adapter_error"
                                                     class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all
                                                            disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
                                                 <i data-lucide="download" class="w-3.5 h-3.5"></i>

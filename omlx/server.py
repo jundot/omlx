@@ -198,7 +198,11 @@ from .exceptions import (
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
-from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .model_settings import (
+    InvalidProfileSettingsError,
+    forced_ct_keys,
+    merge_chat_template_request_kwargs,
+)
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -914,6 +918,15 @@ async def invalid_request_error_handler(
     else:
         content = {"detail": str(exc)}
     return JSONResponse(status_code=400, content=content)
+
+
+@app.exception_handler(InvalidProfileSettingsError)
+async def invalid_profile_settings_handler(
+    request: FastAPIRequest, exc: InvalidProfileSettingsError
+):
+    return await invalid_request_error_handler(
+        request, InvalidRequestError(str(exc), field="model")
+    )
 
 
 @app.exception_handler(SchedulerQueueFullError)
@@ -3007,6 +3020,8 @@ def _with_exposed_profile_status(status: dict) -> dict:
                 "profile_name": profile.get("name"),
                 "profile_api_name": profile.get("api_name"),
                 "profile_display_name": profile.get("display_name"),
+                "invalid": profile.get("invalid", False),
+                "invalid_reason": profile.get("invalid_reason"),
             }
         )
         models.append(profile_status)
@@ -3220,6 +3235,9 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
         excluded_model_ids: set[str] = set()
         for m in status["models"]:
             model_id = m["id"]
+            if m.get("config_model_type") == "k2_horizon_uno":
+                excluded_model_ids.add(model_id)
+                continue
             display_id = model_id
             ms = None
             if settings_manager:
@@ -3265,7 +3283,13 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     ModelInfo(
                         id=profile_model_id,
                         owned_by="omlx",
-                        max_model_len=get_max_context_window(profile_model_id),
+                        max_model_len=(
+                            None
+                            if profile.get("invalid")
+                            else get_max_context_window(profile_model_id)
+                        ),
+                        invalid=profile.get("invalid", False),
+                        invalid_reason=profile.get("invalid_reason"),
                     )
                 )
                 existing_ids.add(profile_model_id)
@@ -3304,14 +3328,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
             continue
 
-        m["max_context_window"] = get_max_context_window(model_id)
+        invalid = m.get("invalid", False)
+        m["max_context_window"] = None if invalid else get_max_context_window(model_id)
         source_model_id = m.get("source_model_id") or model_id
 
         # Resolve effective max_tokens: model setting > global default
         max_tokens = _server_state.sampling.max_tokens
         if _server_state.settings_manager:
             sm = _server_state.settings_manager
-            if hasattr(sm, "get_settings_for_request"):
+            if invalid:
+                ms = None
+            elif hasattr(sm, "get_settings_for_request"):
                 ms = sm.get_settings_for_request(
                     model_id,
                     resolved_model_id=source_model_id,
@@ -3328,7 +3355,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         else:
             m["is_favorite"] = False
             m["is_hidden"] = False
-        m["max_tokens"] = max_tokens
+        m["max_tokens"] = None if invalid else max_tokens
     return status
 
 
@@ -3681,9 +3708,48 @@ async def create_completion(
         # log line and the FastAPI handler trace correlate with whatever
         # the client is using on its side.
         upstream_request_id = http_request.headers.get("x-request-id")
+        preflight_options = {}
+        if getattr(engine, "is_uno_model", False):
+            sampling = get_sampling_params(
+                request.temperature,
+                request.top_p,
+                request.model,
+                req_top_k=getattr(request, "top_k", None),
+                req_repetition_penalty=getattr(request, "repetition_penalty", None),
+                req_min_p=getattr(request, "min_p", None),
+                req_presence_penalty=getattr(request, "presence_penalty", None),
+                req_frequency_penalty=getattr(request, "frequency_penalty", None),
+                req_max_tokens=request.max_tokens,
+                req_xtc_probability=getattr(request, "xtc_probability", None),
+                req_xtc_threshold=getattr(request, "xtc_threshold", None),
+            )
+            preflight_options = dict(
+                zip(
+                    (
+                        "temperature",
+                        "top_p",
+                        "top_k",
+                        "repetition_penalty",
+                        "min_p",
+                        "presence_penalty",
+                        "frequency_penalty",
+                        "max_tokens",
+                        "xtc_probability",
+                        "xtc_threshold",
+                    ),
+                    sampling,
+                )
+            )
+            preflight_options.update(
+                stop=request.stop,
+                seed=request.seed,
+                thinking_budget=_resolve_thinking_budget(request, request.model),
+            )
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+            await engine.preflight_completion(
+                prompt, request_id=upstream_request_id, **preflight_options
+            )
         await _raise_if_llm_lease_abort_requested(lease)
         inference_request_id = _request_abort_id(engine)
 
@@ -4465,6 +4531,23 @@ def _reject_diffusion_structured_outputs(
     structured_outputs=None,
     guided_grammar: str | None = None,
 ) -> None:
+    if getattr(engine, "is_uno_model", False):
+        format_type = (
+            response_format.get("type")
+            if isinstance(response_format, dict)
+            else getattr(response_format, "type", None)
+        )
+        if (
+            structured_outputs is not None
+            or guided_grammar
+            or format_type not in (None, "text")
+        ):
+            raise InvalidRequestError(
+                "Uno does not support structured output or custom grammars. "
+                "Native K2 tool constraints remain available.",
+                field="response_format",
+            )
+        return
     if not getattr(engine, "is_diffusion_model", False):
         return
     # ``response_format`` (json_object / json_schema) is NOT rejected here:
@@ -6798,6 +6881,15 @@ async def create_response(
     try:
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
+
+        if getattr(engine, "is_uno_model", False) and (
+            request.top_logprobs is not None
+            or "message.output_text.logprobs" in (request.include or [])
+        ):
+            raise InvalidRequestError(
+                "Uno does not yet expose verified output logprobs",
+                field="top_logprobs",
+            )
 
         resolved_model = _serving_model_id(lease, request.model)
 

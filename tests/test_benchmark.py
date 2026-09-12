@@ -1149,6 +1149,7 @@ class TestFilterUploadedSettings:
         with patch("omlx.admin.benchmark._MAX_UPLOADED_SETTINGS_BYTES", 10):
             out = _filter_uploaded_settings(settings)
         assert out == {
+            "uno_enabled": False,
             "dflash_enabled": False,
             "specprefill_enabled": False,
             "turboquant_kv_enabled": True,
