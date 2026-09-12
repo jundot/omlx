@@ -5628,14 +5628,21 @@ async def get_server_stats(
 
     Args:
         model: Filter by model ID. Empty string returns global aggregate.
-        scope: "session" for current session, "alltime" for persisted totals.
+        scope: "session" for current session, "alltime" for persisted
+               totals, "12h"/"24h" for rolling windows from usage history.
     """
     from ..server import resolve_model_id
     from ..server_metrics import get_server_metrics
 
     metrics = get_server_metrics()
     resolved_model = resolve_model_id(model) or model if model else ""
-    snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
+    if scope in ("12h", "24h"):
+        # Usage history reads SQLite; keep disk I/O off the serving event loop.
+        snapshot = await asyncio.to_thread(
+            metrics.get_snapshot, model_id=resolved_model, scope=scope
+        )
+    else:
+        snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
 
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"

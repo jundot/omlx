@@ -1,0 +1,32 @@
+{# Token Usage by Day and Hour - split out of _usage.html so it can be
+   reordered independently on the Status tab. Reads the usageHistory
+   component through the Alpine store (single poller, two views). #}
+<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden"
+     x-data="{ get u() { return $store.usageHistory; } }">
+    <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+        <div class="flex items-center gap-3">
+            <i data-lucide="calendar-days" class="w-4 h-4 text-neutral-500"></i>
+            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('usage.heatmap') }}</span>
+        </div>
+    </div>
+    <div class="px-6 py-4">
+        <p class="text-xs text-neutral-500 mb-3">{{ t('usage.heatmap_note') }}</p>
+        <template x-if="u && u.data">
+            <div style="min-width: 600px">
+                <div class="overflow-auto" style="max-height: 300px">
+                    <div style="display:grid;grid-template-columns:90px repeat(24,minmax(0,1fr));gap:3px" class="text-xs text-neutral-500 mb-1">
+                        <span></span><template x-for="hour in 24" :key="hour"><span x-text="(hour - 1) % 3 === 0 ? String(hour - 1).padStart(2, '0') : ''"></span></template>
+                    </div>
+                    <template x-for="day in [...u.data.heatmap].reverse()" :key="day.date">
+                        <div style="display:grid;grid-template-columns:90px repeat(24,minmax(0,1fr));gap:3px" class="mb-1 items-center">
+                            <span class="text-xs text-neutral-500" x-text="day.date"></span>
+                            <template x-for="(tokens, hour) in day.tokens" :key="hour">
+                                <span role="img" :aria-label="day.date + ' ' + hour + ':00 · ' + tokens.toLocaleString() + ' tokens'" :title="day.date + ' ' + hour + ':00 · ' + tokens.toLocaleString() + ' tokens'" :style="{backgroundColor: u.shade(tokens), height: '14px', borderRadius: '2px'}"></span>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+    </div>
+</div>

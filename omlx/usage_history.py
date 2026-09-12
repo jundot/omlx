@@ -74,6 +74,13 @@ def _bounds(period: str, now: float) -> tuple[datetime, datetime]:
         start = today.replace(day=1)
     elif period in ("7d", "30d", "90d"):
         start = today - timedelta(days=int(period[:-1]) - 1)
+    elif period in ("12h", "24h"):
+        # Include the oldest overlapping hourly bucket in full. The actual
+        # coverage can exceed the requested duration by less than one hour;
+        # per-request timestamps are not retained.
+        hours = int(period[:-1])
+        start = datetime.fromtimestamp(_hour(now - hours * 3600))
+        end = datetime.fromtimestamp(now)
     else:
         raise ValueError("Unsupported usage range")
     return start, end
@@ -341,10 +348,14 @@ class UsageHistory:
         totals = [0] * len(_FIELDS)
         models: dict[str, list] = {}
         # 24 cells per calendar day, repeated DST hours combine; missing hours are zero.
+        # Day grid spans every date the window touches (rolling windows start
+        # and end mid-day). The -1µs keeps an exclusive midnight end from
+        # adding a spurious empty next-day row.
         heatmap = {}
-        day_cursor = start
-        while day_cursor < end:
-            heatmap[day_cursor.date().isoformat()] = [0] * 24
+        day_cursor = start.date()
+        last_day = (end - timedelta(microseconds=1)).date()
+        while day_cursor <= last_day:
+            heatmap[day_cursor.isoformat()] = [0] * 24
             day_cursor += timedelta(days=1)
         days = {day: [0] * len(_FIELDS) for day in heatmap} if include_details else {}
         hourly: dict[int, list] = {}
