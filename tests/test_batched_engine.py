@@ -917,6 +917,28 @@ class TestBatchedEngineSpecPrefillForwarding:
         assert engine._engine.generate.call_args.kwargs["preserve_reasoning"] is True
 
     @pytest.mark.asyncio
+    async def test_chat_passes_explicit_thinking_disable_to_sampling_params(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._preprocess_messages = lambda messages: messages
+        engine._apply_chat_template = lambda messages, *args, **kwargs: "PROMPT"
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.chat(
+            [{"role": "user", "content": "hello"}],
+            thinking_budget=128,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        params = engine._engine.generate.call_args.kwargs["sampling_params"]
+        assert params.thinking_budget == 128
+        assert params.enable_thinking is False
+
+    @pytest.mark.asyncio
     async def test_generate_forwards_tools(self):
         from omlx.engine.batched import BatchedEngine
 

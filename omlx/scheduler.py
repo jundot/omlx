@@ -6211,11 +6211,8 @@ class Scheduler:
         # Add thinking budget processor for reasoning models
         if (
             sampling_params.thinking_budget is not None
+            and sampling_params.enable_thinking is not False
             and request is not None
-            and (
-                getattr(request, "needs_think_prefix", False)
-                or self._get_output_parser_thinking_end_text() is not None
-            )
         ):
             request_think_end_id = getattr(request, "think_end_token_id", None)
             if request_think_end_id is not None:
