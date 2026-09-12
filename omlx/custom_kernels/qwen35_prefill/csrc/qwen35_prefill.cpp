@@ -539,7 +539,8 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       msg << "Unsupported Qwen affine qmm bits " << bits_ << ".";
       throw std::invalid_argument(msg.str());
     }
-    if (group_size_ != 64 && group_size_ != 128) {
+    if (group_size_ != 64 && group_size_ != 128 &&
+        !(group_size_ == 32 && bits_ == 4 && variant_ == 8)) {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm group_size " << group_size_ << ".";
       throw std::invalid_argument(msg.str());
@@ -565,7 +566,8 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
     if (!qwen_q_affine_bits_supported(bits)) {
       return true;
     }
-    if (group_size != 64 && group_size != 128) {
+    if (group_size != 64 && group_size != 128 &&
+        !(group_size == 32 && bits == 4 && variant == 8)) {
       return true;
     }
     if (x.dtype() != float16 && x.dtype() != bfloat16) {
@@ -684,7 +686,8 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
         kname,
         "qwen35_q",
         bits_,
-        group_size_ == 128 ? "_affine_qmm128_t_" : "_affine_qmm_t_",
+        group_size_ == 32 ? "_affine_qmm32_t_"
+            : (group_size_ == 128 ? "_affine_qmm128_t_" : "_affine_qmm_t_"),
         qwen_type_name(x.dtype()),
         "_bm_",
         cfg.bm,
@@ -939,7 +942,8 @@ array qwen35_q_affine_qmm_t(
         << "_affine_qmm_t] unsupported bits.";
     throw std::invalid_argument(msg.str());
   }
-  if (group_size != 64 && group_size != 128) {
+  if (group_size != 64 && group_size != 128 &&
+      !(group_size == 32 && bits == 4 && variant == 8)) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_q" << bits
         << "_affine_qmm_t] unsupported group_size " << group_size << ".";
@@ -996,7 +1000,7 @@ array qwen35_q_affine_qmm_t(
 
   // Demote rather than throwing when the NAX tile does not fit or the runtime
   // lacks tensor units / the separately built NAX metallib.
-  bool nax = use_nax && is_nax_available() && nax_qmm_kernels_built() &&
+  bool nax = group_size != 32 && use_nax && is_nax_available() && nax_qmm_kernels_built() &&
       nax_qmm_runtime_ok.load(std::memory_order_relaxed);
   if (nax) {
     const auto nax_cfg = qwen_q_affine_nax_variant(nax_variant);
