@@ -11,6 +11,8 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
+from .quantized import project_linear
+
 TARGETS = {
     "self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
     "mlp": ("gate_proj", "up_proj", "down_proj"),
@@ -37,16 +39,16 @@ class ConditionalLoRALinear(nn.Module):
         self.scale = scale
 
     def __call__(self, x):
-        return self.linear(x)
+        return project_linear(self.linear, x)
 
     def conditional_forward(self, x, row_mask):
         if row_mask is None:
-            return self.linear(x)
+            return project_linear(self.linear, x)
         if row_mask.shape != x.shape[:-1]:
             raise ValueError(
                 f"Uno row mask {row_mask.shape} does not match {x.shape[:-1]}"
             )
-        return self.linear(x) + _lora_delta(self.scale)(
+        return project_linear(self.linear, x) + _lora_delta(self.scale)(
             x, self.lora_a, self.lora_b, row_mask
         )
 

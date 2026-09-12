@@ -66,6 +66,80 @@ subtract snapshots to isolate a workload. They are not per-request GPU profiler
 measurements. Resolved Hugging Face snapshot paths identify revisions; locally
 converted models need a separate revision/conversion manifest.
 
+On M4 Max (`applegpu_g16s`), Uno enables a specialized eight-row kernel for
+affine Q8 base projections with group size 64 and BF16 scales/biases. Eligible
+matrices have at least 1,024 output features (a multiple of 8) and at least 4,096
+input features (a multiple of 512). It runs on singleton eight-token calls with
+BF16 activations. Other shapes, precisions and devices retain the native MLX
+projection. The runtime snapshot reports `q8_block_projections`; the all-Q8 7B
+conversion activates 253 projections, including the vocabulary head. The adapter
+stays conditional and retains its loaded precision. No dequantized weight copy
+is retained.
+
+MLX 0.32.2's wide QMV dispatch processes eight rows in two groups of four. This
+kernel shares each decoded weight across all eight rows while preserving its
+group, sub-chunk and reduction order. This saves repeated weight/dequantization
+work without changing block length, sampling or KV rollback. The implementation
+is adapted from [MLX's affine QMV kernel](https://github.com/ml-explore/mlx/blob/v0.32.2/mlx/backend/metal/kernels/quantized.h).
+The M4 Max path is the only hardware-specific enablement validated here.
+
+A local comparison of clean target passes over six 1,024-token corpus slices
+(English, Python and mixed code), processed in eight-token chunks, found identical
+full-vocabulary logits at all 6,144 positions and identical final KV states.
+Perplexity was 7.578289 in both lanes over 6,138 next-token positions; identical
+logits imply zero additional KL divergence for this sample. This compares the
+new kernel with the existing Q8 path, not Q8 with BF16, and does not establish
+equivalence for every input. Separate tests cover biased projections, noncontiguous
+inputs, conditional clean rows and compiled/native model passes. Grouped RMSNorm
+compilation is keyed by feature width so differently sized models cannot reuse an
+incompatible reshape trace.
+
+Quantization's decode benefit shrinks at Uno's block width. An initial fixed-2K-KV
+probe on the same M4 Max measured median clean one-row passes of 37.3 ms BF16 and
+21.4 ms Q8, but clean eight-row passes of 43.2 and 38.5 ms. With the conditional
+adapter, eight-row passes were 49.0 and 46.7 ms. Thus the two model passes account
+for most of an Uno cycle; the adapter contributes several milliseconds, while
+the largest loss of the Q8 advantage occurs in the base block projections.
+BF16 already amortizes weights across rows, and Q8 adds unpacking/dequantization
+and FP32 accumulation. Smaller weights alone do not halve that work.
+
+A Metal System Trace showed compute execution occupying approximately 88–91% of
+selected decode seconds. These are command-level busy intervals, not measurements
+of ALU utilization, memory bandwidth saturation or shader occupancy. Apple's
+[Metal profiling guidance](https://developer.apple.com/videos/play/tech-talks/111374/)
+distinguishes those quantities and explains why larger register tiles can lower
+occupancy. The investigation followed its reuse/occupancy tradeoff and the
+[CPU profiling guidance](https://developer.apple.com/videos/play/wwdc2025/308/)
+to separate execution from waiting. Padding the projections to force GEMM and
+staging quantized tiles through threadgroup memory were slower in local probes.
+The newer [MPP guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf)
+provides useful tiling principles, but its M5 GPU neural-accelerator examples do
+not establish an M4 fast path.
+
+The final Q8 kernel comparison measured median decode throughput:
+
+| Workload | Native Q8 block kernel | Uno Q8 block kernel | Gain |
+| --- | ---: | ---: | ---: |
+| Coding, 37 prompt tokens | 54.25 tok/s | 61.52 tok/s | 13.4% |
+| Migration-plan tool, 2,048 prompt tokens | 67.08 tok/s | 76.18 tok/s | 13.6% |
+
+Both lanes use Uno, compiled GPU regions, the same all-Q8/group64 7B conversion,
+the BF16 adapter, greedy sampling, fresh KV, an eight-token block and no ANE.
+Each workload has one warmup and three timed repetitions per lane in alternating
+order on MLX 0.32.2 / mlx-lm 0.31.3. Tokens and proposal acceptance match exactly:
+85 cycles and 215/585 accepted proposals for coding; 40 cycles and 217/280 for
+the tool request. Coding stops at the 384-token cap and is not a functional-code
+validation. The tool request reaches EOS at 296 tokens and matches the expected
+typed payload. Peak Metal allocations match at 9.674 and 10.587 GiB respectively.
+
+Including prefill, median direct-call times were 7.163→6.320 seconds for coding
+and 7.835→7.270 seconds for the tool request. HTTP, tokenization and model loading
+are excluded. Background desktop activity was not controlled; absolute rates
+varied across investigation runs. These comparisons establish a local improvement
+over the previous Uno Q8 path, not a universal advantage over ordinary decoding.
+Checkpoint revisions are the 7B revisions listed below; the conversion uses
+8-bit affine weights, group size 64, and unchanged BF16 normalization tensors.
+
 Compiled GPU regions share the native K2 attention and MLP math. They are enabled
 only for full-head default RoPE: the released 0.9B layout does not qualify; the 7B
 layout does. ANE prefill is optional. Compare ordinary, compiled ordinary, Uno and

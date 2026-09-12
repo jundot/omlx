@@ -48,6 +48,7 @@ class UnoEngine(BatchedEngine):
             can_compile_blocks,
             install_compiled_blocks,
         )
+        from ..patches.k2_horizon.quantized import enable_q8_blocks
         from ..patches.k2_horizon.uno_adapter import load_uno_adapter
         from ..patches.k2_horizon.uno_batch import install_cache_hooks
 
@@ -56,6 +57,7 @@ class UnoEngine(BatchedEngine):
             self._model, bundle.adapter_path, base_model_id=bundle.base_model_id
         )
         mx.eval(self._model.parameters())
+        self._model._omlx_uno_q8_block_projections = enable_q8_blocks(self._model)
         if can_compile_blocks(self._model):
             install_compiled_blocks(self._model)
             self._model._omlx_k2_compiled = True
@@ -73,6 +75,9 @@ class UnoEngine(BatchedEngine):
                 "adapter": str(self._bundle.adapter_path.resolve()),
                 "compiled": bool(getattr(self._model, "_omlx_k2_compiled", False)),
                 "ane_layers": getattr(self._model, "_omlx_k2_ane_prefill_count", 0),
+                "q8_block_projections": getattr(
+                    self._model, "_omlx_uno_q8_block_projections", 0
+                ),
                 **dict(getattr(self._model, "_omlx_uno_stats", {})),
             }
         return stats

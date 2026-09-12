@@ -148,9 +148,9 @@ class YarnRoPE(nn.Module):
 
 
 @lru_cache(None)
-def _grouped_norm(groups, eps):
+def _grouped_norm(groups, eps, width):
     def normalize(x, weight):
-        grouped = mx.unflatten(x.astype(mx.float32), -1, (groups, -1))
+        grouped = mx.unflatten(x.astype(mx.float32), -1, (groups, width // groups))
         normed = mx.flatten(mx.fast.rms_norm(grouped, None, eps), start_axis=-2)
         return (weight * normed).astype(x.dtype)
 
@@ -167,7 +167,9 @@ class GroupedRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return _grouped_norm(self.groups, self.eps)(x, self.weight)
+        # Shapeless compilation may vary token counts, but the feature reshape
+        # must not reuse a trace belonging to a different model width.
+        return _grouped_norm(self.groups, self.eps, self.weight.size)(x, self.weight)
 
 
 def router_logits(
@@ -473,7 +475,9 @@ class Model(nn.Module):
         out = self.model(inputs, cache, lora_mask)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+        from .quantized import project_linear
+
+        return project_linear(self.lm_head, out)
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         for layer_idx in range(self.args.num_hidden_layers):
