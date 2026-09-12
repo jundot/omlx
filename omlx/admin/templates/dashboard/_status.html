@@ -11,15 +11,25 @@
                                         class="px-3 py-1.5 text-xs font-medium transition-all">
                                     {{ t('status.scope_session') }}
                                 </button>
+                                <button @click="statsScope = '12h'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                        :class="statsScope === '12h' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                        class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200"
+                                        :title="window.t('status.scope_12h_tooltip')">
+                                    {{ t('status.scope_12h') }}
+                                </button>
+                                <button @click="statsScope = '24h'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                        :class="statsScope === '24h' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                        class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200"
+                                        :title="window.t('status.scope_24h_tooltip')">
+                                    {{ t('status.scope_24h') }}
+                                </button>
                                 <button @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
                                         :class="statsScope === 'alltime' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
                                         class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200">
                                     {{ t('status.scope_alltime') }}
                                 </button>
                             </div>
-                        </div>
-                        <div class="flex flex-wrap items-center gap-2">
-                            <!-- Clear button -->
+                            <!-- Clear button (belongs with the scope it clears) -->
                             <div class="flex items-center gap-1.5">
                                 <button x-show="(statsScope === 'session' && !showClearStatsConfirm) || (statsScope === 'alltime' && !showClearAlltimeConfirm)"
                                         @click="statsScope === 'session' ? showClearStatsConfirm = true : showClearAlltimeConfirm = true"
@@ -41,6 +51,47 @@
                                     </button>
                                 </div>
                             </div>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <!-- Rolling-scope hint: usage history disabled -->
+                            <span x-show="(statsScope === '12h' || statsScope === '24h') && scopedStats.history_available === false"
+                                  x-cloak class="text-xs text-amber-600"
+                                  :title="window.t('status.history_unavailable_tooltip')">
+                                {{ t('status.history_unavailable') }}
+                            </span>
+                            <!-- Layout settings popover -->
+                            <div class="relative" x-data="{ open: false }">
+                                <button @click="open = !open"
+                                        class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
+                                        :title="window.t('status.layout_settings_tooltip')">
+                                    <i data-lucide="sliders-horizontal" class="w-3.5 h-3.5"></i>
+                                    {{ t('status.layout_settings') }}
+                                </button>
+                                <div x-show="open" x-cloak @click.outside="open = false"
+                                     class="omlx-layout-popover" x-transition.opacity>
+                                    <p class="font-bold uppercase tracking-wider text-neutral-400 mb-2">{{ t('status.columns') }}</p>
+                                    <div class="omlx-seg mb-4">
+                                        <template x-for="n in [1, 2, 3, 4]" :key="n">
+                                            <button type="button"
+                                                    :class="layoutSettings.columns === n ? 'active' : ''"
+                                                    @click="setLayoutColumns(n)"
+                                                    x-text="n"></button>
+                                        </template>
+                                    </div>
+                                    <p class="font-bold uppercase tracking-wider text-neutral-400 mb-2">{{ t('status.page_width') }}</p>
+                                    <input type="range" min="1200" max="2560" step="20"
+                                           :value="layoutSettings.maxWidth"
+                                           @input="previewLayoutMaxWidth(parseInt($event.target.value))"
+                                           @change="setLayoutMaxWidth(parseInt($event.target.value))">
+                                    <div class="flex justify-between text-neutral-400 mt-1">
+                                        <span>1200</span>
+                                        <span class="text-neutral-600 font-medium"
+                                              x-text="layoutSettings.maxWidth + ' px'"></span>
+                                        <span>2560</span>
+                                    </div>
+                                    <p class="text-neutral-400 mt-3 leading-snug">{{ t('status.layout_settings_hint') }}</p>
+                                </div>
+                            </div>
                             <button @click="window.resetStatusLayout && window.resetStatusLayout()"
                                     class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
                                     title="{{ t('status.reset_layout_tooltip') }}">
@@ -59,9 +110,7 @@
                     </div>
 
                     <div id="status-layout" class="omlx-status-layout">
-                        <div data-zone="top" class="omlx-status-top">
-                            <div data-column="left" class="omlx-status-col">
-<div data-card="stats-cards" data-default-parent="left" class="omlx-card">
+                    <div data-card="stats-cards" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Three Stat Cards -->
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
@@ -69,29 +118,28 @@
                         <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
-                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
+                               :class="getStatFontClass(scopedStats.total_prompt_tokens)"
+                               x-text="formatNumber(scopedStats.total_prompt_tokens)"></p>
                         </div>
 
                         <!-- Cached Tokens Served -->
                         <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
-                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
+                               :class="getStatFontClass(scopedStats.total_cached_tokens)"
+                               x-text="formatNumber(scopedStats.total_cached_tokens)"></p>
                         </div>
 
                         <!-- Cache Efficiency -->
                         <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
-                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
-                               x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
+                               :class="getStatFontClass(scopedStats.cache_efficiency)"
+                               x-text="scopedStats.cache_efficiency.toFixed(1) + '%'"></p>
                         </div>
                     </div>
                             </div>
-
-                            <div data-card="speed" data-default-parent="left" class="omlx-card">
+                    <div data-card="speed" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Speed Stats -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
@@ -104,17 +152,16 @@
                         <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.prompt_processing') }} <span class="text-neutral-400">{{ t('status.speed.prompt_processing_note') }}</span></p>
-                                <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="scopedStats.avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
                             </div>
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.token_generation') }}</p>
-                                <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="scopedStats.avg_generation_tps.toFixed(1) + ' tok/s'"></p>
                             </div>
                         </div>
                     </div>
                             </div>
-
-                            <div data-card="active-models" data-default-parent="left" class="omlx-card">
+                    <div data-card="active-models" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Active Models -->
                     <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
@@ -409,10 +456,7 @@
                         </div>
                     </div>
                             </div>
-
-                            </div>
-                            <div data-column="right" class="omlx-status-col">
-                            <div data-card="runtime-cache" data-default-parent="right" class="omlx-card">
+                    <div data-card="runtime-cache" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Runtime Cache Observability / 运行时缓存可观测性 -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
@@ -668,21 +712,15 @@
                         </div>
                     </div>
                             </div>
-
-                            </div>
-                        </div>
-                        <div data-zone="below" class="omlx-status-below">
-                            <div data-card="usage-heatmap" data-default-parent="below" class="omlx-card">
+                    <div data-card="usage-heatmap" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                                 {% include 'dashboard/_usage_heatmap.html' %}
                             </div>
-
-                            <div data-card="usage" data-default-parent="below" class="omlx-card">
+                    <div data-card="usage" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                                 {% include 'dashboard/_usage.html' %}
                             </div>
-
-                            <div data-card="api-endpoints" data-default-parent="below" class="omlx-card">
+                    <div data-card="api-endpoints" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- API Endpoints -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
@@ -736,8 +774,7 @@
                         </div>
                     </div>
                             </div>
-
-                            <div data-card="claude-code" data-default-parent="below" class="omlx-card">
+                    <div data-card="claude-code" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Claude Code with oMLX -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
@@ -851,8 +888,7 @@
                         </div>
                     </div>
                             </div>
-
-                            <div data-card="applications" data-default-parent="below" class="omlx-card">
+                    <div data-card="applications" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Applications -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
@@ -1025,8 +1061,7 @@
                         </div>
                     </div>
                             </div>
-
-                            <div data-card="engines" data-default-parent="below" class="omlx-card">
+                    <div data-card="engines" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
                     <!-- Engine Versions -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
@@ -1057,7 +1092,6 @@
                     </div>
                             </div>
 
-                        </div>
                     </div>
                 </div>
             </div>

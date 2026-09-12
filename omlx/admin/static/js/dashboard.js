@@ -343,6 +343,27 @@
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
+            // Rolling-window snapshots from usage history (hour-bucketed).
+            rollingStats: {
+                '12h': {
+                    total_prompt_tokens: 0, total_cached_tokens: 0,
+                    cache_efficiency: 0.0, avg_prefill_tps: 0.0,
+                    avg_generation_tps: 0.0, total_requests: 0,
+                },
+                '24h': {
+                    total_prompt_tokens: 0, total_cached_tokens: 0,
+                    cache_efficiency: 0.0, avg_prefill_tps: 0.0,
+                    avg_generation_tps: 0.0, total_requests: 0,
+                },
+            },
+            // Status-tab layout prefs (localStorage only, see status-layout.js)
+            layoutSettings: (() => {
+                try {
+                    const s = JSON.parse(localStorage.getItem('omlx-status-settings-v4') || 'null');
+                    if (s && Number.isInteger(s.columns)) return s;
+                } catch (e) { /* defaults below */ }
+                return { columns: 2, maxWidth: 1740 };
+            })(),
             // Server connectivity info (from /admin/api/server-info)
             serverAliases: [],
             selectedAlias: '',
@@ -676,6 +697,10 @@
 
                 await this.handleMainTabChange(this.mainTab);
 
+                this.$watch('statsScope', (scope) => {
+                    if (scope === '12h' || scope === '24h') this.loadRollingStats(scope);
+                });
+
                 // Watch for main tab changes to manage refresh timers
                 this.$watch('mainTab', (value) => {
                     this.handleMainTabChange(value);
@@ -716,6 +741,18 @@
 
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
+                });
+
+                // Status-layout reset cleared localStorage: resync prefs so
+                // the settings popover shows restored defaults, not stale ones.
+                window.addEventListener('omlx-layout-reset', () => {
+                    try {
+                        const s = JSON.parse(localStorage.getItem('omlx-status-settings-v4') || 'null');
+                        this.layoutSettings = (s && Number.isInteger(s.columns))
+                            ? s : { columns: 2, maxWidth: 1740 };
+                    } catch (e) {
+                        this.layoutSettings = { columns: 2, maxWidth: 1740 };
+                    }
                 });
 
                 // Pause stats polling when tab is hidden to reduce server load
@@ -3086,6 +3123,38 @@
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
 
+            get scopedStats() {
+                if (this.statsScope === 'alltime') return this.alltimeStats;
+                if (this.statsScope === '12h' || this.statsScope === '24h')
+                    return this.rollingStats[this.statsScope];
+                return this.stats;
+            },
+
+            setLayoutColumns(n) {
+                this.layoutSettings.columns = n;
+                this.persistLayoutSettings();
+            },
+
+            previewLayoutMaxWidth(px) {
+                if (!Number.isFinite(px)) return;
+                this.layoutSettings.maxWidth = Math.max(1200, Math.min(2560, px));
+            },
+
+            setLayoutMaxWidth(px) {
+                this.previewLayoutMaxWidth(px);
+                this.persistLayoutSettings();
+            },
+
+            persistLayoutSettings() {
+                try {
+                    localStorage.setItem('omlx-status-settings-v4',
+                        JSON.stringify(this.layoutSettings));
+                } catch (e) { /* private mode: prefs just won't persist */ }
+                if (window.applyStatusLayoutSettings) {
+                    window.applyStatusLayoutSettings();
+                }
+            },
+
             shellQuote(value) {
                 const s = String(value ?? '');
                 if (!s) return "''";
@@ -3309,6 +3378,15 @@
                     }
 
                     if (!includeAlltime) {
+                        // While a rolling scope is displayed, refresh just
+                        // that window on a slow tick. History is flushed every
+                        // few seconds; it does not need the activity poll rate.
+                        if ((this.statsScope === '12h' || this.statsScope === '24h')) {
+                            this._rollingTick = (this._rollingTick || 0) + 1;
+                            if (this._rollingTick % 30 === 1) {
+                                await this.loadRollingStats(this.statsScope);
+                            }
+                        }
                         return;
                     }
 
@@ -3323,8 +3401,32 @@
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
+
+                    // Rolling windows (usage-history backed)
+                    await Promise.all([
+                        this.loadRollingStats('12h'),
+                        this.loadRollingStats('24h'),
+                    ]);
                 } catch (err) {
                     console.error('Failed to load stats:', err);
+                }
+            },
+
+            async loadRollingStats(scope) {
+                const model = this.selectedStatsModel;
+                try {
+                    const params = new URLSearchParams({ scope });
+                    if (model) params.set('model', model);
+                    const response = await fetch('/admin/api/stats?' + params);
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (model !== this.selectedStatsModel) return;
+                        this.rollingStats[scope] = {
+                            ...this.rollingStats[scope], ...data,
+                        };
+                    }
+                } catch (err) {
+                    console.error('Failed to load rolling stats:', err);
                 }
             },
 
