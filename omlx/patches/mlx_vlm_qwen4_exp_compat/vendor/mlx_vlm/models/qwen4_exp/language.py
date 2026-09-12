@@ -3035,6 +3035,8 @@ class Qwen4ExpMTPModule(nn.Module):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.hc_count = args.hc_count
+        if args.mtp_use_dedicated_lm_head:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         hc_hidden_size = self.hc_count * self.hidden_size
         self.pre_fc_norm_embedding = Qwen4ExpRMSNorm(
             self.hidden_size,
@@ -3212,7 +3214,9 @@ class LanguageModel(Qwen3_5LanguageModel):
         logits_source = mtp_output
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.tie_word_embeddings:
+        if self.args.mtp_use_dedicated_lm_head:
+            logits = mtp.lm_head(logits_source)
+        elif self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(logits_source)
         else:
             logits = self.lm_head(logits_source)
