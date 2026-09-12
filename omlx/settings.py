@@ -175,6 +175,10 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    # Drop the glm5_next vision tower after load (1.12 GB) and refuse image
+    # inputs — for agents that never send images. Off by default. Measured
+    # 05/09: the long-context prefill missed the guard's target by ~0.4 GB.
+    vision_tower_text_only: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
@@ -204,6 +208,7 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            vision_tower_text_only=bool(data.get("vision_tower_text_only", False)),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
                 False,
