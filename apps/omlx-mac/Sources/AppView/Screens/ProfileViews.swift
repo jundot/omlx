@@ -960,9 +960,14 @@ struct ProfileDetailCard: View {
     }
 
     private func turboquantLabel(_ s: [String: AnyCodable], on: Bool) -> String {
-        let baseName = String(localized: "profile.detail.acceleration.turboquant",
-                              defaultValue: "TurboQuant KV",
-                              comment: "Acceleration chip base name for TurboQuant KV-cache compression")
+        let scheme = s["turboquant_kv_scheme"]?.value as? String ?? "turboquant"
+        let baseName = scheme == "affine4"
+            ? "Affine4 KV"
+            : scheme == "affine8" ? "Affine8 KV" : String(
+                localized: "profile.detail.acceleration.turboquant",
+                defaultValue: "TurboQuant KV",
+                comment: "Acceleration chip base name for TurboQuant KV-cache compression"
+            )
         guard on else { return baseName }
         let bits = doubleOf(s["turboquant_kv_bits"])
         let skip = intOf(s["turboquant_skip_last"]) ?? 0
@@ -981,11 +986,13 @@ struct ProfileDetailCard: View {
                      comment: "TurboQuant skip-last-N suffix; placeholder is the layer count")
             : nil
         let parts = [bitsText, skipText].compactMap { $0 }
-        return parts.isEmpty
-            ? baseName
-            : String(localized: "profile.detail.acceleration.turboquant.with_parts",
-                     defaultValue: "TurboQuant KV · \(parts.joined(separator: " / "))",
-                     comment: "TurboQuant chip with detail suffix; placeholder is the joined detail parts")
+        guard !parts.isEmpty else { return baseName }
+        if scheme == "turboquant" {
+            return String(localized: "profile.detail.acceleration.turboquant.with_parts",
+                          defaultValue: "TurboQuant KV · \(parts.joined(separator: " / "))",
+                          comment: "TurboQuant chip with detail suffix; placeholder is the joined detail parts")
+        }
+        return "\(baseName) · \(parts.joined(separator: " / "))"
     }
 
     private func dflashLabel(_ s: [String: AnyCodable], on: Bool) -> String {

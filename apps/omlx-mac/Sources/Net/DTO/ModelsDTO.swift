@@ -115,6 +115,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let forcedCtKwargs: [String]?
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
+    let turboquantKvScheme: String?
     let turboquantKvBits: Double?
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil
@@ -202,6 +203,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var forcedCtKwargs: [String]? = nil
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
+    var turboquantKvScheme: String? = nil
     var turboquantKvBits: Double? = nil
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil

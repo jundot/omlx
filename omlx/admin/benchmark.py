@@ -38,7 +38,19 @@ logger = logging.getLogger(__name__)
 _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 
 # Valid prompt lengths for single request tests
-VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
+VALID_PROMPT_LENGTHS = [
+    1024,
+    4096,
+    8192,
+    16384,
+    32768,
+    50000,
+    65536,
+    131072,
+    150000,
+    200000,
+    250000,
+]
 
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
@@ -273,7 +285,13 @@ def _sample_window(run: "BenchmarkRun", window_start: float) -> Optional[dict]:
 def _detect_experimental_features(model_settings: Any) -> list[str]:
     """Return benchmark-skewing model features enabled in settings."""
     return [
-        spec.legacy
+        (
+            getattr(model_settings, "turboquant_kv_scheme", "turboquant")
+            if spec.attr == "turboquant_kv_enabled"
+            and getattr(model_settings, "turboquant_kv_scheme", "turboquant")
+            in ("affine4", "affine8")
+            else spec.legacy
+        )
         for spec in _FEATURE_FLAG_SPECS
         if getattr(model_settings, spec.attr, False)
     ]
@@ -302,6 +320,12 @@ def _derive_feature_flags(model_settings: Any) -> list[dict]:
         if not getattr(model_settings, spec.attr, False):
             continue
         key, label = spec.key, spec.label
+        if spec.attr == "turboquant_kv_enabled":
+            scheme = getattr(
+                model_settings, "turboquant_kv_scheme", "turboquant"
+            )
+            if scheme in ("affine4", "affine8"):
+                key, label = f"{scheme}_kv", f"Affine{scheme[-1]} KV"
         if spec.detail_attr:
             bits = _format_bits(getattr(model_settings, spec.detail_attr, None))
             if bits:
@@ -342,6 +366,7 @@ _UPLOADED_SETTING_FIELDS = (
     "model_type_override",
     "index_cache_freq",
     "turboquant_kv_enabled",
+    "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "specprefill_enabled",
@@ -427,6 +452,9 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
             for spec in _FEATURE_FLAG_SPECS
             if spec.attr in filtered
         }
+        for key in ("turboquant_kv_scheme", "turboquant_kv_bits"):
+            if key in raw:
+                filtered[key] = raw[key]
     return filtered
 
 
@@ -642,6 +670,7 @@ def _compute_single_metrics(
         "e2e_latency_s": round(e2e_duration, 3),
         "total_throughput": round(total_throughput, 1),
         "peak_memory_bytes": peak_memory,
+        "peak_memory_source": "mlx_active",
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
@@ -1150,6 +1179,7 @@ async def _run_batch_test(
         "e2e_latency_s": round(wall_time, 3),
         "peak_memory_bytes": peak_memory,
         "total_gen_tokens": total_gen_tokens,
+        "peak_memory_source": "mlx_active",
         "batch_size": batch_size,
     }
 
@@ -1187,6 +1217,7 @@ async def _run_external_single_test(
         timing_observed=stats.content_observed,
     )
     metrics["peak_memory_bytes"] = None
+    metrics["peak_memory_source"] = None
     return metrics
 
 
@@ -1923,7 +1954,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(runtime_scheduler, "_qwen35_prefill_floor", None),
             getattr(configured_scheduler, "paged_cache_block_size", None),
             getattr(effective_scheduler, "paged_cache_block_size", None),
-            bool(getattr(runtime_scheduler, "block_aware_cache", None)),
+            getattr(runtime_scheduler, "block_aware_cache", None) is not None,
             getattr(configured_scheduler, "chunked_prefill", None),
             getattr(effective_scheduler, "chunked_prefill", None),
             getattr(effective_scheduler, "prefill_speed_priority", None),

@@ -344,6 +344,7 @@ class TestComputeMetrics:
         assert metrics["completion_tokens"] == 128
         assert metrics["cached_tokens"] == 0
         assert metrics["peak_memory_bytes"] == 4 * 1024 * 1024 * 1024
+        assert metrics["peak_memory_source"] == "mlx_active"
 
         # Gen TPS = 128 / 1.28 = 100 tok/s
         assert metrics["gen_tps"] == pytest.approx(100.0, abs=0.1)
@@ -1007,6 +1008,28 @@ class TestDeriveFeatureFlags:
             {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"}
         ]
 
+    def test_affine4_has_its_own_feature_label(self):
+        settings = SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_kv_scheme="affine4",
+            turboquant_kv_bits=4,
+        )
+        assert _detect_experimental_features(settings) == ["affine4"]
+        assert _derive_feature_flags(settings) == [
+            {"key": "affine4_kv_4bit", "label": "Affine4 KV 4-bit"}
+        ]
+
+    def test_affine8_has_its_own_feature_label(self):
+        settings = SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_kv_scheme="affine8",
+            turboquant_kv_bits=8,
+        )
+        assert _detect_experimental_features(settings) == ["affine8"]
+        assert _derive_feature_flags(settings) == [
+            {"key": "affine8_kv_8bit", "label": "Affine8 KV 8-bit"}
+        ]
+
     def test_qwen_ane_prefill_is_reported_as_acceleration(self):
         settings = SimpleNamespace(qwen35_ane_prefill_enabled=True)
         assert _derive_feature_flags(settings) == [
@@ -1047,6 +1070,10 @@ class TestFilterUploadedSettings:
         from omlx.model_settings import ModelSettings
 
         return ModelSettings(**overrides)
+
+    def test_kv_compression_scheme_is_preserved(self):
+        settings = self._settings(turboquant_kv_enabled=True, turboquant_kv_scheme="affine4")
+        assert _filter_uploaded_settings(settings)["turboquant_kv_scheme"] == "affine4"
 
     def test_performance_fields_are_kept(self):
         out = _filter_uploaded_settings(
@@ -1142,16 +1169,21 @@ class TestFilterUploadedSettings:
     def test_non_settings_object_returns_none(self):
         assert _filter_uploaded_settings(SimpleNamespace()) is None
 
-    def test_oversized_snapshot_falls_back_to_accelerator_flags(self):
+    @pytest.mark.parametrize("scheme", ["turboquant", "affine4"])
+    def test_oversized_snapshot_falls_back_to_accelerator_flags(self, scheme):
         # The fallback keeps every accelerator toggle, disabled ones included:
         # knowing a feature was off is as useful as knowing it was on.
-        settings = self._settings(mtp_enabled=True, turboquant_kv_enabled=True)
+        settings = self._settings(
+            mtp_enabled=True, turboquant_kv_enabled=True, turboquant_kv_scheme=scheme
+        )
         with patch("omlx.admin.benchmark._MAX_UPLOADED_SETTINGS_BYTES", 10):
             out = _filter_uploaded_settings(settings)
         assert out == {
             "dflash_enabled": False,
             "specprefill_enabled": False,
             "turboquant_kv_enabled": True,
+            "turboquant_kv_scheme": scheme,
+            "turboquant_kv_bits": 4,
             "mtp_enabled": True,
             "vlm_mtp_enabled": False,
             "qwen35_ane_prefill_enabled": False,
@@ -1883,6 +1915,7 @@ class TestRunExternalBenchmark:
         assert result["prompt_tokens"] == 3900
         assert result["completion_tokens"] == 128
         assert result["peak_memory_bytes"] is None
+        assert result["peak_memory_source"] is None
         # gen duration 1.0s (first 0.5 → last 1.5) with 128 tokens
         assert result["gen_tps"] == 128.0
         assert result["ttft_ms"] == 500.0

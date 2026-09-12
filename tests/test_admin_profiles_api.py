@@ -94,7 +94,136 @@ def client(tmp_path, monkeypatch):
     return TestClient(app), mgr
 
 
+class TestKVCompressionSettings:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"turboquant_kv_scheme": "invalid"},
+            {"turboquant_kv_scheme": ""},
+            {"turboquant_kv_scheme": "affine4", "turboquant_kv_bits": 3},
+            {"turboquant_kv_scheme": "affine4", "turboquant_kv_bits": 8},
+            {"turboquant_kv_scheme": "affine8", "turboquant_kv_bits": 4},
+            {"turboquant_kv_scheme": "affine8", "turboquant_kv_bits": 6},
+            {"turboquant_kv_bits": 0},
+            {"turboquant_kv_bits": 5},
+        ],
+    )
+    def test_invalid_settings_do_not_mutate_or_persist(self, client, payload):
+        c, mgr = client
+        original = ModelSettings(temperature=0.5)
+        mgr.set_settings("model-a", original)
+        saved = mgr.settings_file.read_bytes()
+        r = c.put(
+            "/admin/api/models/model-a/settings",
+            json={"temperature": 0.2, "is_default": True, **payload},
+        )
+        assert r.status_code == 400, r.text
+        assert "turboquant_kv_" in r.json()["detail"]
+        assert mgr.get_settings("model-a") == original
+        assert mgr.settings_file.read_bytes() == saved
+
+    def test_partial_updates_validate_merged_settings(self, client):
+        c, mgr = client
+        mgr.set_settings("model-a", ModelSettings(turboquant_kv_bits=3))
+        url = "/admin/api/models/model-a/settings"
+        assert c.put(url, json={"turboquant_kv_scheme": "affine4"}).status_code == 400
+        assert c.put(url, json={"turboquant_kv_bits": 4}).status_code == 200
+        r = c.put(url, json={
+            "turboquant_kv_enabled": True,
+            "turboquant_kv_scheme": "affine4",
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["turboquant_kv_scheme"] == "affine4"
+        assert c.put(url, json={"turboquant_kv_bits": 3}).status_code == 400
+        r = c.put(url, json={"temperature": 0.25})
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["turboquant_kv_scheme"] == "affine4"
+        assert r.json()["settings"]["turboquant_kv_bits"] == 4
+        assert mgr.get_settings("model-a").turboquant_kv_enabled is True
+        r = c.put(url, json={"turboquant_kv_scheme": "turboquant", "turboquant_kv_bits": 2.5})
+        assert r.status_code == 200, r.text
+        assert mgr.get_settings("model-a").turboquant_kv_bits == 2.5
+
+    def test_null_resets_and_omitted_scheme_remains_turboquant(self, client):
+        c, mgr = client
+        url = "/admin/api/models/model-a/settings"
+        r = c.put(url, json={"turboquant_kv_enabled": True, "turboquant_kv_bits": 2.5})
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["turboquant_kv_scheme"] == "turboquant"
+        mgr.set_settings("model-a", ModelSettings(turboquant_kv_scheme="affine4"))
+        r = c.put(url, json={"turboquant_kv_bits": None})
+        assert r.status_code == 200, r.text
+        assert mgr.get_settings("model-a").turboquant_kv_scheme == "affine4"
+        r = c.put(url, json={"turboquant_kv_scheme": None, "turboquant_kv_enabled": None})
+        assert r.status_code == 200, r.text
+        settings = mgr.get_settings("model-a")
+        assert settings.turboquant_kv_scheme == "turboquant"
+        assert settings.turboquant_kv_bits == 4
+        assert settings.turboquant_kv_enabled is False
+
+    @pytest.mark.parametrize(
+        "scheme,bits", [("turboquant", 4), ("affine4", 4), ("affine8", 8)]
+    )
+    @pytest.mark.parametrize("enable_compression", [False, True])
+    def test_vlm_mtp_conflict_is_rejected_in_both_directions(
+        self, client, scheme, bits, enable_compression
+    ):
+        c, mgr = client
+        original = ModelSettings(
+            turboquant_kv_scheme=scheme,
+            turboquant_kv_bits=bits,
+            turboquant_kv_enabled=not enable_compression,
+            vlm_mtp_enabled=enable_compression,
+            vlm_mtp_draft_model="drafter",
+        )
+        mgr.set_settings("model-a", original)
+        field = "turboquant_kv_enabled" if enable_compression else "vlm_mtp_enabled"
+        r = c.put("/admin/api/models/model-a/settings", json={field: True})
+        assert r.status_code == 400, r.text
+        assert "KV cache compression" in r.json()["detail"]
+        assert mgr.get_settings("model-a") == original
+        r = c.put("/admin/api/models/model-a/settings", json={
+            "turboquant_kv_enabled": enable_compression,
+            "vlm_mtp_enabled": not enable_compression,
+        })
+        assert r.status_code == 200, r.text
+
+
 class TestProfileRoutes:
+    @pytest.mark.parametrize(
+        "scheme,bits", [("affine4", 4), ("affine8", 8)]
+    )
+    def test_affine_profile_roundtrip(self, client, scheme, bits):
+        c, mgr = client
+        settings = {
+            "turboquant_kv_enabled": True,
+            "turboquant_kv_scheme": scheme,
+            "turboquant_kv_bits": bits,
+        }
+        r = c.post("/admin/api/models/model-a/profiles", json={
+            "name": "affine", "display_name": scheme.title(), "settings": settings,
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"] == settings
+        assert "turboquant_kv_scheme" in c.get("/admin/api/profile-fields").json()["model_specific"]
+        r = c.post("/admin/api/models/model-a/profiles/affine/apply")
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["turboquant_kv_scheme"] == scheme
+        assert mgr.get_settings("model-a").turboquant_kv_bits == bits
+
+    @pytest.mark.parametrize("settings", [
+        {"turboquant_kv_scheme": "invalid"},
+        {"turboquant_kv_scheme": "affine4", "turboquant_kv_bits": 3},
+        {"turboquant_kv_scheme": "affine8", "turboquant_kv_bits": 4},
+    ])
+    def test_invalid_kv_profile_does_not_persist(self, client, settings):
+        c, mgr = client
+        r = c.post("/admin/api/models/model-a/profiles", json={
+            "name": "bad", "display_name": "Bad", "settings": settings,
+        })
+        assert r.status_code == 409, r.text
+        assert mgr.list_profiles("model-a") == []
+
     def test_list_profiles_empty(self, client):
         c, _ = client
         r = c.get("/admin/api/models/model-a/profiles")
@@ -306,6 +435,7 @@ class TestProfileRoutes:
                     "guided_grammar": 'root ::= "YES"',
                     "max_tool_result_tokens": 4096,
                     "turboquant_kv_enabled": True,
+                    "turboquant_kv_scheme": "affine4",
                     "specprefill_enabled": True,
                     "dflash_enabled": True,
                     "mtp_enabled": True,
@@ -330,6 +460,8 @@ class TestProfileRoutes:
         # output parsing), so its settings are preserved.
         assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
+        assert settings["turboquant_kv_scheme"] == "turboquant"
+        assert settings["turboquant_kv_bits"] == 4
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
         assert settings["mtp_enabled"] is False
@@ -638,6 +770,7 @@ class TestModelsResponseActiveProfile:
                 "guided_grammar": 'root ::= "YES"',
                 "max_tool_result_tokens": 4096,
                 "turboquant_kv_enabled": True,
+                "turboquant_kv_scheme": "affine4",
                 "specprefill_enabled": True,
                 "dflash_enabled": True,
                 "dflash_in_memory_cache": False,
@@ -658,6 +791,8 @@ class TestModelsResponseActiveProfile:
         # Tool calling works on the diffusion lane; setting preserved.
         assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
+        assert settings["turboquant_kv_scheme"] == "turboquant"
+        assert settings["turboquant_kv_bits"] == 4
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
         assert settings["dflash_in_memory_cache"] is True

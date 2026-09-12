@@ -1,0 +1,228 @@
+{
+  "reason": "Retry Qwen3.6 native16 reverse pass after a dynamic-memory-ceiling reload refusal",
+  "server": "Fresh process; memory guard remains balanced",
+  "runs": [
+    {
+      "model": "Qwen3.6-35B-A3B",
+      "mode": "native16",
+      "phase": "priming",
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          4096
+        ],
+        "generation_length": 16,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-7efabf7180f9",
+      "result": {
+        "bench_id": "bench-7efabf7180f9",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 4097,
+            "tg": 16,
+            "ttft_ms": 1584.3,
+            "tpot_ms": 17.89,
+            "gen_tps": 59.6,
+            "processing_tps": 2586.0,
+            "e2e_latency_s": 1.863,
+            "total_throughput": 2207.8,
+            "peak_memory_bytes": 22379359694,
+            "prompt_tokens": 4097,
+            "completion_tokens": 16,
+            "cached_tokens": 0,
+            "prompt_sha256": "909d10baf680278b2f18ba5fef092ccf0ea3a6556ce1e599b7c907b234b60bfc",
+            "output_sample": {
+              "sha256": "784433118d2fb11feea1ec3d57f5c7e3d2d1e40777ce748b253515e7ccf0ce71",
+              "head": "may have set it to disable the C++ dlpack bridge and\n                #",
+              "tail": "may have set it to disable the C++ dlpack bridge and\n                #"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 6,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 3.5,
+                "total_max": 5.1,
+                "p_avg": 3.9,
+                "e_avg": 3.3
+              },
+              "memory": {
+                "phys_footprint_peak": 21.62,
+                "mlx_active_peak": 20.63,
+                "mlx_cache_peak": 0.11,
+                "system_used_peak": 38.41,
+                "system_wired_peak": 24.01,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 97.2,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      }
+    },
+    {
+      "model": "Qwen3.6-35B-A3B",
+      "mode": "native16",
+      "phase": "reverse_retry",
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          8192,
+          32768
+        ],
+        "generation_length": 1024,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-2ecfcb65c8a7",
+      "result": {
+        "bench_id": "bench-2ecfcb65c8a7",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 8193,
+            "tg": 1024,
+            "ttft_ms": 3214.6,
+            "tpot_ms": 11.69,
+            "gen_tps": 85.6,
+            "processing_tps": 2548.7,
+            "e2e_latency_s": 15.184,
+            "total_throughput": 607.0,
+            "peak_memory_bytes": 22463245774,
+            "prompt_tokens": 8193,
+            "completion_tokens": 1024,
+            "cached_tokens": 0,
+            "prompt_sha256": "d70c15dda0e382c1581763c2b052d330210eef5c2424e3a6e3d451391bbffe33",
+            "output_sample": {
+              "sha256": "a16c873445bcc66d11bad741fd9d96afb04dc5d9fb1ccfbc2e36e8d7405c9550",
+              "head": "]\n\n    def _handle_thought_block(\n        self,\n        stream_parts: list[str],\n        visible_parts: list[str],\n        text: str,\n    ) -> None:\n        \"\"\"Handle thought block markers, converting them to ``<think>`` tags.\"\"\"\n        if not text:\n     ",
+              "tail": "self._in_thought:\n            # Close any open thought block\n            self._in_thought = False\n            return OutputParserFinalizeResult(\n                stream_delta=_THINK_CLOSE,\n                visible_delta=_THINK_CLOSE,\n                is_final"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 58,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 5.6,
+                "total_max": 14.5,
+                "p_avg": 9.8,
+                "e_avg": 3.5
+              },
+              "memory": {
+                "phys_footprint_peak": 21.86,
+                "mlx_active_peak": 20.8,
+                "mlx_cache_peak": 0.51,
+                "system_used_peak": 38.9,
+                "system_wired_peak": 24.24,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 81.1,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          },
+          {
+            "test_type": "single",
+            "pp": 32769,
+            "tg": 1024,
+            "ttft_ms": 15626.5,
+            "tpot_ms": 14.07,
+            "gen_tps": 71.1,
+            "processing_tps": 2097.0,
+            "e2e_latency_s": 30.038,
+            "total_throughput": 1125.0,
+            "peak_memory_bytes": 22854593998,
+            "prompt_tokens": 32769,
+            "completion_tokens": 1024,
+            "cached_tokens": 0,
+            "prompt_sha256": "90e7640aa9fb9d7a059e16883d95d002ebd004f90cd838d25c9cad1324605fb4",
+            "output_sample": {
+              "sha256": "84c85b1a0b9338eadcfcb7fc56c44d3058b34443bb334c01de5a8555a0320629",
+              "head": "completed, cancelled, error\n    events: list[dict] = field(default_factory=list)\n    cond: asyncio.Condition = field(default_factory=asyncio.Condition)\n    terminal: bool = False\n    task: Optional[asyncio.Task] = None\n    results: list[dict] = field(defau",
+              "tail": "            \"phase\": \"load\",\n                \"model_id\": request.model_id,\n                \"benchmark\": \"\",\n                \"connect\": True,\n                \"message\": f\"Loading {request.model_id}...\",\n                \"current\": 0,\n                \"total\":"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 116,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 4.5,
+                "total_max": 9.9,
+                "p_avg": 5.9,
+                "e_avg": 3.9
+              },
+              "memory": {
+                "phys_footprint_peak": 22.61,
+                "mlx_active_peak": 21.18,
+                "mlx_cache_peak": 1.3,
+                "system_used_peak": 39.25,
+                "system_wired_peak": 24.96,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 99.5,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      }
+    }
+  ]
+}

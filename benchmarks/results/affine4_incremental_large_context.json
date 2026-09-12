@@ -1,0 +1,326 @@
+{
+  "protocol": {
+    "mode": "affine4",
+    "generation_tokens": 128,
+    "MTP": false,
+    "context": "Qwen3.8 200000/150000; Qwen3.6 200000; plus one prompt token",
+    "implementation_commit": "2f487029",
+    "incremental_affine4": true,
+    "prefix_cache_enabled": true,
+    "cold_cache": true,
+    "memory_guard": "balanced, unchanged",
+    "public_upload": false
+  },
+  "source_sha256": {
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/affine4.py": "df676be78bd668bf2b60f3f33b3a603734a39d40e3639dde52a3a7f8e9c1f533",
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/scheduler.py": "a1cb5a129146ad8c6a6b167d4245755585109d974ceca9424ff89b2fc52dd64e",
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/memory_monitor.py": "eb905cf79e1fb299b2fdb908cbe230edde238fca2e17144710b247acd3b4d014",
+    "/private/tmp/serve_affine4_long.py": "ef7f020f85832b33fc669caa1c5ced4e1f619daf79bb4e6b82febab84bb5ada0",
+    "/private/tmp/run_affine4_incremental_long.py": "92704d4a0d508a2301a2430d5edc3b7f542bd80b24911011fe1bf8130a2adc44"
+  },
+  "runs": [
+    {
+      "model": "Qwen3.8-27B",
+      "context": 200000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.8-27B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-1c5c98719d8d",
+      "result": {
+        "bench_id": "bench-1c5c98719d8d",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 128,
+            "ttft_ms": 799885.1,
+            "tpot_ms": 85.19,
+            "gen_tps": 11.8,
+            "processing_tps": 250.0,
+            "e2e_latency_s": 810.847,
+            "total_throughput": 246.8,
+            "peak_memory_bytes": 23414786090,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "1048816ac55b7d1f27332ca861a573b1f482ef89b3f9b3075e516daf7d7089a8",
+              "head": "Build a ResponseUsage object.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        total_tokens=input_tokens + output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_token",
+              "tail": "nse State Persistence\n# =============================================================================\n\n\ndef _state_dir(base_path: Path) -> Path:\n    return base_path / \"cache\" / \"response-state\"\n\n\ndef _state_path(base_path: Path, response_id: str) -> Path:"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 3209,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 5.0,
+                "total_max": 36.4,
+                "p_avg": 2.6,
+                "e_avg": 6.2
+              },
+              "memory": {
+                "phys_footprint_peak": 26.13,
+                "mlx_active_peak": 21.62,
+                "mlx_cache_peak": 4.24,
+                "system_used_peak": 39.49,
+                "system_wired_peak": 28.95,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.5,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": []
+    },
+    {
+      "model": "Qwen3.8-27B",
+      "context": 150000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.8-27B",
+        "prompt_lengths": [
+          150000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-479a75a4885b",
+      "result": {
+        "bench_id": "bench-479a75a4885b",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 150001,
+            "tg": 128,
+            "ttft_ms": 513827.8,
+            "tpot_ms": 81.63,
+            "gen_tps": 12.3,
+            "processing_tps": 291.9,
+            "e2e_latency_s": 524.363,
+            "total_throughput": 286.3,
+            "peak_memory_bytes": 22233319466,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 150001,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "cb8ed5f096062f201f21e5749c8ae9b15ca168f249b46991715651495e8e53df",
+            "output_sample": {
+              "sha256": "808040a1521bfece03a5a67a95ba1d4cfd7b42b01c9511ae6a4c3c9b701e607c",
+              "head": "6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;\n}}\"\"\")\n    css_path.write_text(\"\\n\\n\".join(css_parts) + \"\\n\")\n\n\n# ======================================================================",
+              "tail": " U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;\n}}\"\"\")\n    css_path.write_text(\"\\n\\n\".join(css_parts) + \"\\n\")\n\n\n# =========================================================================\n# Tailwind CSS"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 2080,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 5.4,
+                "total_max": 31.5,
+                "p_avg": 3.8,
+                "e_avg": 6.2
+              },
+              "memory": {
+                "phys_footprint_peak": 24.31,
+                "mlx_active_peak": 20.5,
+                "mlx_cache_peak": 5.53,
+                "system_used_peak": 38.6,
+                "system_wired_peak": 27.03,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.8,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 1,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": []
+    },
+    {
+      "model": "Qwen3.6-35B-A3B",
+      "context": 200000,
+      "settings": {
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "dflash_enabled": false,
+        "specprefill_enabled": false,
+        "qwen35_ane_prefill_enabled": false,
+        "max_context_window": 262144,
+        "max_tokens": 8192
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 128,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-a0132259edc3",
+      "result": {
+        "bench_id": "bench-a0132259edc3",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 128,
+            "ttft_ms": 229934.6,
+            "tpot_ms": 21.09,
+            "gen_tps": 47.8,
+            "processing_tps": 869.8,
+            "e2e_latency_s": 232.744,
+            "total_throughput": 859.9,
+            "peak_memory_bytes": 23798347162,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "e9fbb691a8700ba7147124e7fb7ff387586f6a3bf0a441870194bb3f51baaa7c",
+              "head": "Build ResponseUsage with reasoning_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        total_tokens=input_tokens + output_tokens,\n        input_tokens_details=InputTokensDetails(cache",
+              "tail": "elds[\n            \"output_tokens_details\"\n        ].default_factory(\n            reasoning_tokens=reasoning_tokens,\n        ),\n    )\n\n\ndef build_response_object(\n    model: str,\n    output_items: List[OutputItem],\n    usage: Optional[ResponseUsage] = None,"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "system_metrics": {
+              "sample_count": 923,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 6.1,
+                "total_max": 44.5,
+                "p_avg": 4.6,
+                "e_avg": 6.8
+              },
+              "memory": {
+                "phys_footprint_peak": 24.4,
+                "mlx_active_peak": 21.9,
+                "mlx_cache_peak": 2.48,
+                "system_used_peak": 38.42,
+                "system_wired_peak": 26.69,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.1,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 1,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": []
+    }
+  ],
+  "runner_revisions": [
+    "92704d4a0d508a2301a2430d5edc3b7f542bd80b24911011fe1bf8130a2adc44"
+  ]
+}

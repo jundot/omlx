@@ -1,0 +1,310 @@
+{
+  "protocol": "Same BF16 random Q/K/V, randomized interleaved attention dispatch, 10 warmups, 41 rounds. No model/server/MTP. Current is commit 2f487029; cooperative query preparation and mask specialization are isolated probes.",
+  "sources": {
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/affine4.py": "df676be78bd668bf2b60f3f33b3a603734a39d40e3639dde52a3a7f8e9c1f533",
+    "/Users/ariel/opt/3party/mlx-vlm/mlx_vlm/affine4.py": "7bb7196a64d7929298f4f6d0cf394420dca6d37d4cf7053a2bb872b64ed4db80",
+    "/Users/ariel/opt/3party/omlx/omlx/patches/affine4_attention.py": "f9afa0505e9674df38cb71b6fc14cb5068458a1ec04e00217dedb4565b78b8d5"
+  },
+  "rows": [
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 1,
+      "milliseconds": {
+        "current": {
+          "median": 0.508458,
+          "p10": 0.486584,
+          "p90": 0.541708
+        },
+        "vlm_pr": {
+          "median": 0.4575,
+          "p10": 0.434292,
+          "p90": 0.525125
+        },
+        "mask_specialization": {
+          "median": 0.503,
+          "p10": 0.471625,
+          "p90": 0.549167
+        },
+        "cooperative_and_mask": {
+          "median": 0.500708,
+          "p10": 0.478709,
+          "p90": 0.541959
+        },
+        "native_bf16": {
+          "median": 0.759625,
+          "p10": 0.727083,
+          "p90": 0.811292
+        },
+        "original_omlx": {
+          "median": 0.542541,
+          "p10": 0.51425,
+          "p90": 0.568833
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True}"
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 4,
+      "milliseconds": {
+        "current": {
+          "median": 1.202708,
+          "p10": 1.183042,
+          "p90": 1.220125
+        },
+        "vlm_pr": {
+          "median": 1.067166,
+          "p10": 1.037417,
+          "p90": 1.104166
+        },
+        "mask_specialization": {
+          "median": 1.139625,
+          "p10": 1.102333,
+          "p90": 1.191292
+        },
+        "cooperative_and_mask": {
+          "median": 1.150416,
+          "p10": 1.116375,
+          "p90": 1.183833
+        },
+        "native_bf16": {
+          "median": 1.713292,
+          "p10": 1.68275,
+          "p90": 1.742084
+        },
+        "original_omlx": {
+          "median": 1.154458,
+          "p10": 1.10925,
+          "p90": 1.221333
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 6, 4, 24, 4, 4, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True, (256, 6, 4, 24, 4, 4): True}"
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 200000,
+      "query_length": 1,
+      "milliseconds": {
+        "current": {
+          "median": 1.78825,
+          "p10": 1.751625,
+          "p90": 1.820625
+        },
+        "vlm_pr": {
+          "median": 1.583667,
+          "p10": 1.563334,
+          "p90": 1.639416
+        },
+        "mask_specialization": {
+          "median": 1.72875,
+          "p10": 1.689875,
+          "p90": 1.764542
+        },
+        "cooperative_and_mask": {
+          "median": 1.742417,
+          "p10": 1.709667,
+          "p90": 1.779666
+        },
+        "native_bf16": {
+          "median": 3.465417,
+          "p10": 3.432458,
+          "p90": 3.514291
+        },
+        "original_omlx": {
+          "median": 1.816375,
+          "p10": 1.79025,
+          "p90": 1.850333
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 6, 4, 24, 4, 4, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True, (256, 6, 4, 24, 4, 4): True}"
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 200000,
+      "query_length": 4,
+      "milliseconds": {
+        "current": {
+          "median": 5.690875,
+          "p10": 5.606,
+          "p90": 5.84425
+        },
+        "vlm_pr": {
+          "median": 4.87775,
+          "p10": 4.832125,
+          "p90": 5.168958
+        },
+        "mask_specialization": {
+          "median": 5.406708,
+          "p10": 5.255583,
+          "p90": 5.6265
+        },
+        "cooperative_and_mask": {
+          "median": 5.395709,
+          "p10": 5.285375,
+          "p90": 5.76575
+        },
+        "native_bf16": {
+          "median": 9.407625,
+          "p10": 9.22375,
+          "p90": 9.65625
+        },
+        "original_omlx": {
+          "median": 5.297833,
+          "p10": 5.244667,
+          "p90": 5.430291
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 6, 4, 24, 4, 4, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True, (256, 6, 4, 24, 4, 4): True}"
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 1,
+      "milliseconds": {
+        "current": {
+          "median": 0.385167,
+          "p10": 0.357833,
+          "p90": 0.419417
+        },
+        "vlm_pr": {
+          "median": 0.351834,
+          "p10": 0.329334,
+          "p90": 0.381833
+        },
+        "mask_specialization": {
+          "median": 0.367416,
+          "p10": 0.353042,
+          "p90": 0.409958
+        },
+        "cooperative_and_mask": {
+          "median": 0.377167,
+          "p10": 0.349625,
+          "p90": 0.403375
+        },
+        "native_bf16": {
+          "median": 0.497458,
+          "p10": 0.481667,
+          "p90": 0.5385
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 6, 4, 24, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 8, 1, 8, 4, 2, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True, (256, 6, 4, 24, 4, 4): True, (256, 8, 1, 8, 4, 2): True}"
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 4,
+      "milliseconds": {
+        "current": {
+          "median": 1.067125,
+          "p10": 1.030542,
+          "p90": 1.113875
+        },
+        "vlm_pr": {
+          "median": 0.938041,
+          "p10": 0.90775,
+          "p90": 0.977541
+        },
+        "mask_specialization": {
+          "median": 0.993792,
+          "p10": 0.958416,
+          "p90": 1.040666
+        },
+        "cooperative_and_mask": {
+          "median": 1.011625,
+          "p10": 0.984792,
+          "p90": 1.045542
+        },
+        "native_bf16": {
+          "median": 1.148,
+          "p10": 1.129583,
+          "p90": 1.233541
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 6, 4, 24, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 8, 1, 8, 4, 2, mlx.core.float32, mlx.core.float16): True, (256, 8, 4, 32, 4, 2, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True, (256, 6, 4, 24, 4, 4): True, (256, 8, 1, 8, 4, 2): True, (256, 8, 4, 32, 4, 2): True}"
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 200000,
+      "query_length": 1,
+      "milliseconds": {
+        "current": {
+          "median": 1.060083,
+          "p10": 1.037667,
+          "p90": 1.147375
+        },
+        "vlm_pr": {
+          "median": 0.995208,
+          "p10": 0.959708,
+          "p90": 1.0825
+        },
+        "mask_specialization": {
+          "median": 1.044208,
+          "p10": 1.012792,
+          "p90": 1.084208
+        },
+        "cooperative_and_mask": {
+          "median": 1.064083,
+          "p10": 1.023667,
+          "p90": 1.12675
+        },
+        "native_bf16": {
+          "median": 2.10925,
+          "p10": 2.070667,
+          "p90": 2.316625
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 6, 4, 24, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 8, 1, 8, 4, 2, mlx.core.float32, mlx.core.float16): True, (256, 8, 4, 32, 4, 2, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True, (256, 6, 4, 24, 4, 4): True, (256, 8, 1, 8, 4, 2): True, (256, 8, 4, 32, 4, 2): True}"
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 200000,
+      "query_length": 4,
+      "milliseconds": {
+        "current": {
+          "median": 5.631875,
+          "p10": 4.65025,
+          "p90": 5.671417
+        },
+        "vlm_pr": {
+          "median": 4.71575,
+          "p10": 3.903042,
+          "p90": 4.779375
+        },
+        "mask_specialization": {
+          "median": 5.160792,
+          "p10": 5.001917,
+          "p90": 5.201417
+        },
+        "cooperative_and_mask": {
+          "median": 5.189417,
+          "p10": 5.13625,
+          "p90": 5.261542
+        },
+        "native_bf16": {
+          "median": 5.823042,
+          "p10": 5.715375,
+          "p90": 6.030917
+        }
+      },
+      "current_native": "{(256, 6, 1, 8, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 6, 4, 24, 4, 4, mlx.core.float32, mlx.core.float16): True, (256, 8, 1, 8, 4, 2, mlx.core.float32, mlx.core.float16): True, (256, 8, 4, 32, 4, 2, mlx.core.float32, mlx.core.float16): True}",
+      "vlm_native": "{(256, 6, 1, 8, 4, 4): True, (256, 6, 4, 24, 4, 4): True, (256, 8, 1, 8, 4, 2): True, (256, 8, 4, 32, 4, 2): True}"
+    }
+  ]
+}

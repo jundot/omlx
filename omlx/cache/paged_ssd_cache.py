@@ -219,6 +219,43 @@ def _storage_layer_cache_types(
     ]
 
 
+_AFFINE4_CACHE_TYPES = ("Affine4KVCache", "BatchAffine4KVCache")
+_AFFINE8_CACHE_TYPES = ("Affine8KVCache", "BatchAffine8KVCache")
+_AFFINE_CACHE_TYPES = (*_AFFINE4_CACHE_TYPES, *_AFFINE8_CACHE_TYPES)
+_AFFINE_SCHEMES = {"affine4": 4.0, "affine8": 8.0}
+_PACKED_CACHE_TYPES = (
+    "TurboQuantKVCache",
+    "BatchTurboQuantKVCache",
+    *_AFFINE_CACHE_TYPES,
+)
+
+
+def _validate_affine_meta(meta: Any, scheme: str | None = None) -> tuple[str, ...]:
+    """Require an explicit affine scheme and original K/V dimensions."""
+    if (
+        not isinstance(meta, (list, tuple))
+        or len(meta) != 6
+        or not all(isinstance(value, str) for value in meta)
+        or meta[3] not in _AFFINE_SCHEMES
+        or (scheme is not None and meta[3] != scheme)
+    ):
+        raise ValueError("Invalid affine cache metadata")
+    offset, bits, seed, stored_scheme, key_dim, value_dim = meta
+    if (
+        int(offset) < 0
+        or float(bits) != _AFFINE_SCHEMES[stored_scheme]
+        or int(key_dim) <= 0
+        or int(value_dim) <= 0
+    ):
+        raise ValueError("Invalid affine cache dimensions or bit depth")
+    int(seed)
+    return tuple(meta)
+
+
+def _validate_affine4_meta(meta: Any) -> tuple[str, ...]:
+    return _validate_affine_meta(meta, "affine4")
+
+
 def _canonicalize_layer_cache_types(
     layer_cache_types: list[str] | tuple[str, ...] | None,
 ) -> list[str] | None:
@@ -242,6 +279,8 @@ def _canonicalize_layer_cache_types(
         # refresh_ssd_layer_signature — which always says
         # "TurboQuantKVCache" — from sweeping valid batch-form blocks.
         "BatchTurboQuantKVCache": "TurboQuantKVCache",
+        "BatchAffine4KVCache": "Affine4KVCache",
+        "BatchAffine8KVCache": "Affine8KVCache",
     }
     return [
         wrapper_to_canonical.get(cache_type, cache_type)
@@ -353,7 +392,7 @@ def _block_turboquant_bits(
     if not layer_cache_types or not layer_meta_states:
         return None
     for i, cache_type in enumerate(layer_cache_types):
-        if cache_type not in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
+        if cache_type not in _PACKED_CACHE_TYPES:
             continue
         if i >= len(layer_meta_states):
             continue
@@ -2728,6 +2767,22 @@ class PagedSSDCacheManager(CacheManager):
             signature_payload = {}
         if not isinstance(signature_payload, dict):
             return "invalid cache signature payload"
+        expected_types = _canonicalize_layer_cache_types(self._expected_layer_cache_types)
+        actual_types = signature_payload.get("layer_cache_types")
+        if not isinstance(actual_types, list) or not all(
+            isinstance(name, str) for name in actual_types
+        ):
+            actual_types = None
+        actual_types = _canonicalize_layer_cache_types(actual_types)
+        if (
+            expected_types is not None
+            and expected_types != actual_types
+            and (
+                any(name in _AFFINE_CACHE_TYPES for name in expected_types)
+                or any(name in _AFFINE_CACHE_TYPES for name in (actual_types or []))
+            )
+        ):
+            return f"layer cache types: expected {expected_types}, got {actual_types}"
         actual_layout = signature_payload.get("payload_layout", "embedded")
         if actual_layout != self._payload_layout:
             return (
@@ -3160,6 +3215,56 @@ class PagedSSDCacheManager(CacheManager):
 
         layer_cache_types = _storage_layer_cache_types(layer_cache_types)
 
+        for i, layer_data in enumerate(cache_data):
+            affine_class = (
+                layer_cache_types[i]
+                if layer_cache_types
+                and i < len(layer_cache_types)
+                and layer_cache_types[i] in _AFFINE_CACHE_TYPES
+                else None
+            )
+            affine_marker = (
+                layer_data[0]
+                if isinstance(layer_data, tuple)
+                and len(layer_data) == 2
+                and layer_data[0] in ("__affine4__", "__affine8__")
+                else None
+            )
+            meta = (
+                layer_meta_states[i]
+                if layer_meta_states and i < len(layer_meta_states)
+                else None
+            )
+            affine_scheme = (
+                meta[3]
+                if isinstance(meta, (list, tuple))
+                and len(meta) > 3
+                and meta[3] in _AFFINE_SCHEMES
+                else None
+            )
+            expected_marker = (
+                "__affine4__"
+                if affine_class in _AFFINE4_CACHE_TYPES
+                else "__affine8__"
+                if affine_class in _AFFINE8_CACHE_TYPES
+                else None
+            )
+            if bool(affine_class) != bool(affine_marker) or (
+                affine_marker
+                and (
+                    affine_marker != expected_marker
+                    or affine_scheme != affine_marker[2:-2]
+                )
+            ) or (affine_scheme and not affine_marker):
+                logger.warning("Affine layer %d: class/payload mismatch", i)
+                return False
+            if affine_marker:
+                try:
+                    _validate_affine_meta(meta, affine_marker[2:-2])
+                except (TypeError, ValueError, IndexError):
+                    logger.warning("Affine layer %d: invalid metadata", i)
+                    return False
+
         # First save call after a model load is the canonical source for
         # the live layer-cache signature (post-TurboQuant / post-MTP). If
         # the manager wasn't told the signature at construction, adopt it
@@ -3327,7 +3432,12 @@ class PagedSSDCacheManager(CacheManager):
                     isinstance(layer_data, tuple)
                     and len(layer_data) == 2
                     and isinstance(layer_data[0], str)
-                    and layer_data[0] in ("__turboquant__", "__turboquant_v2__")
+                    and layer_data[0] in (
+                        "__turboquant__",
+                        "__turboquant_v2__",
+                        "__affine4__",
+                        "__affine8__",
+                    )
                 ):
                     # TurboQuant v2: NamedTuple states (ks, vs)
                     ks, vs = layer_data[1]
@@ -3339,7 +3449,11 @@ class PagedSSDCacheManager(CacheManager):
                             if isinstance(val, mx.array):
                                 arrays[f"layer_{i}_tq_{prefix}_{field_name}"] = val
                                 tq_tensor_idx += 1
-                    cache_list_meta[f"layer_{i}_turboquant_v2"] = "1"
+                    format_tag = {
+                        "__affine4__": "affine4",
+                        "__affine8__": "affine8",
+                    }.get(layer_data[0], "turboquant_v2")
+                    cache_list_meta[f"layer_{i}_{format_tag}"] = "1"
                     cache_list_meta[f"layer_{i}_tq_key_type"] = type(ks).__name__
                     cache_list_meta[f"layer_{i}_tq_value_type"] = type(vs).__name__
                     cache_list_meta[f"layer_{i}_tq_key_fields"] = ",".join(ks._fields)
@@ -3631,6 +3745,35 @@ class PagedSSDCacheManager(CacheManager):
                 else None
             )
 
+            affine_scheme = next(
+                (
+                    scheme
+                    for scheme in _AFFINE_SCHEMES
+                    if file_metadata and f"layer_{i}_{scheme}" in file_metadata
+                ),
+                None,
+            )
+            expected_affine_scheme = (
+                "affine4"
+                if cache_type in _AFFINE4_CACHE_TYPES
+                else "affine8"
+                if cache_type in _AFFINE8_CACHE_TYPES
+                else None
+            )
+            if expected_affine_scheme != affine_scheme or (
+                affine_scheme
+                and f"layer_{i}_turboquant_v2" in file_metadata
+            ):
+                logger.warning("Affine layer %d: class/payload mismatch", i)
+                return None
+            if affine_scheme:
+                try:
+                    metas = json.loads(file_metadata.get("layer_meta_states", "null"))
+                    _validate_affine_meta(metas[i], affine_scheme)
+                except (TypeError, ValueError, IndexError, KeyError):
+                    logger.warning("Affine layer %d: invalid metadata", i)
+                    return None
+
             if cache_type == "CacheList":
                 sub_count_key = f"layer_{i}_sub_count"
                 sub_count = 0
@@ -3672,7 +3815,9 @@ class PagedSSDCacheManager(CacheManager):
                         logger.error(f"Missing N-tuple state for layer {i}")
                         return None
                     cache_data.append(_maybe_unwrap_legacy(layer_marker))
-            elif file_metadata and f"layer_{i}_turboquant_v2" in file_metadata:
+            elif affine_scheme or (
+                file_metadata and f"layer_{i}_turboquant_v2" in file_metadata
+            ):
                 # TurboQuant v2: reconstruct NamedTuple states from flattened tensors
                 from ..turboquant_kv import (
                     TurboQuantMSEState,
@@ -3698,14 +3843,37 @@ class PagedSSDCacheManager(CacheManager):
                     "TurboQuantSplitState": TurboQuantSplitState,
                 }
                 try:
+                    if not affine_scheme:
+                        metas = json.loads(file_metadata.get("layer_meta_states", "[]"))
+                        meta = (
+                            metas[i] if isinstance(metas, list) and i < len(metas) else ()
+                        )
+                        if (
+                            isinstance(meta, (list, tuple))
+                            and len(meta) > 3
+                            and meta[3] in _AFFINE_SCHEMES
+                        ):
+                            raise TypeError("Affine metadata on a TurboQuant payload")
                     k_cls = _type_map[key_type]
                     v_cls = _type_map[value_type]
+                    if affine_scheme and (
+                        k_cls is not TurboQuantMSEState
+                        or v_cls is not TurboQuantMSEState
+                        or key_fields != list(k_cls._fields)
+                        or value_fields != list(v_cls._fields)
+                    ):
+                        raise TypeError("Invalid affine packed state fields")
                     k_tensors = [arrays[f"layer_{i}_tq_k_{f}"] for f in key_fields]
                     v_tensors = [arrays[f"layer_{i}_tq_v_{f}"] for f in value_fields]
                     ks = k_cls(*k_tensors)
                     vs = v_cls(*v_tensors)
-                    cache_data.append(("__turboquant_v2__", (ks, vs)))
-                except (KeyError, TypeError) as e:
+                    marker = (
+                        f"__{affine_scheme}__"
+                        if affine_scheme
+                        else "__turboquant_v2__"
+                    )
+                    cache_data.append((marker, (ks, vs)))
+                except (KeyError, TypeError, ValueError) as e:
                     logger.error(f"TurboQuant v2 layer {i}: reconstruction failed: {e}")
                     return None
             else:
@@ -4110,6 +4278,12 @@ class PagedSSDCacheManager(CacheManager):
         Returns:
             PagedSSDBlockMetadata if found, None otherwise.
         """
+        with self._hot_cache_lock:
+            entry = self._hot_cache.get(block_hash)
+            if entry is not None:
+                metadata = entry.get("block_metadata")
+                if metadata is not None:
+                    return metadata
         return self._index.get(block_hash)
 
     def has_block(self, block_hash: bytes) -> bool:

@@ -1,0 +1,1724 @@
+{
+  "protocol": {
+    "model": "Qwen3.6-35B-A3B",
+    "model_path": "/Users/ariel/.omlx/models/Qwen3.6-35B-A3B-oQ4e-mtp",
+    "implementation_commit": "2e993f3bd1171e52b1a2eefe4724d97c4006fa59",
+    "hardware": "Apple M5 Pro, 48 GiB",
+    "versions": {
+      "mlx": "0.32.2",
+      "mlx-lm": "0.31.3",
+      "mlx-vlm": "0.6.3"
+    },
+    "contexts": [
+      8192,
+      200000
+    ],
+    "generation_tokens": 4096,
+    "prompt": "fixed code_python corpus, deterministic UUID, N+1 tokens for N prefill rows",
+    "sampler": "greedy; benchmark-only termination suppression",
+    "speculation": "MTP, VLM MTP, DFlash, SpecPrefill disabled",
+    "ane": false,
+    "native_kv_dtype": "BF16",
+    "skip_last": true,
+    "prefix_cache": "enabled, SSD only; a new empty base path per request, zero prefix hits required",
+    "warmup": "2048 prefill rows/up to 8 generated tokens, excluded",
+    "server_isolation": "fresh process and cache directory for every case; one GPU workload at a time",
+    "order": "8K native16,tq4,affine4; 200K affine4,tq4,native16; 200K native16,tq4,affine4",
+    "memory": {
+      "memory": {
+        "prefill_memory_guard": true,
+        "memory_guard_tier": "balanced",
+        "memory_guard_custom_ceiling_gb": 0.0,
+        "soft_threshold": 0.85,
+        "hard_threshold": 0.95,
+        "prefill_safe_zone_ratio": 0.8,
+        "prefill_min_chunk_tokens": 32
+      },
+      "cache": {
+        "enabled": true,
+        "hot_cache_only": false,
+        "gdn_ssd_split_enabled": true,
+        "gdn_snapshot_storage": "auto",
+        "gdn_ssd_pending_max_size": "512MB",
+        "gdn_sidecar_precision": "fp32",
+        "ssd_cache_dir": null,
+        "ssd_cache_max_size": "10GB",
+        "hot_cache_max_size": "0",
+        "hot_cache_write_through": false,
+        "ane_compile_cache": false,
+        "initial_cache_blocks": 256
+      },
+      "scheduler": {
+        "max_concurrent_requests": 8,
+        "embedding_batch_size": 32,
+        "chunked_prefill": false,
+        "prefill_priority": "context",
+        "decode_fairness": true
+      }
+    },
+    "public_upload": false,
+    "limitations": "Generated continuations may differ between lossy formats; throughput, not a quality or teacher-forced comparison."
+  },
+  "source_sha256": {
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/affine4.py": "ac60cf2f0cfc2d7ebe32fd832842a9d086a566218226e7330e76d8384d47dd13",
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/turboquant_kv.py": "3cbd67ffe51807444f5a229e4016c7d813e0e2f6d6175efd2ab93123ded936df",
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/scheduler.py": "a1cb5a129146ad8c6a6b167d4245755585109d974ceca9424ff89b2fc52dd64e",
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/admin/benchmark.py": "543e0fce2346f2899f3149ae77145b7520d8729c8885c2596e9b020c26d37fe7",
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/benchmarks/serve_affine4_benchmark.py": "d7c2843a053a72d8f9e3171645d85bb832b0ed4347f811b3ae1902f3628973b5",
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/benchmarks/bench_affine4_server.py": "0c4c187f8c00692cdbd8ce517e3249dce714e611cfdfb7c693fe8df8f1c5e2ac",
+    "/private/tmp/run_affine4_long_decode.py": "ef535020c127bcd7a8f484e72ebd29742cdb319174073683bf425b0c3d8f6ac6",
+    "/private/tmp/serve_affine4_long_decode.py": "25bd8dbafc2f73ee9e62cf8df18fd48fb457d4e473552b75c87c24cd8acb9dc9",
+    "/Users/ariel/.omlx/models/Qwen3.6-35B-A3B-oQ4e-mtp/config.json": "ee027f987f65e3039a36463a322db3b3f9a9af224dc9da8923b592e6cdacf7c2"
+  },
+  "started_at": "2026-09-07T14:49:26.074080+00:00",
+  "runs": [
+    {
+      "label": "8192-native16-r1",
+      "context": 8192,
+      "mode": "native16",
+      "repeat": 1,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": false,
+        "turboquant_kv_scheme": "turboquant",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T14:49:26.551047+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4783.62M  free = 1360.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1079478.\nPages active:                                 819331.\nPages inactive:                               854446.\nPages speculative:                              2950.\nPages throttled:                                   0.\nPages wired down:                             249125.\nPages purgeable:                               98817.\n\"Translation faults\":                     2665846113.\nPages copy-on-write:                       494969324.\nPages zero filled:                        3375801301.\nPages reactivated:                          19983079.\nPages purged:                               28777896.\nFile-backed pages:                            707585.\nAnonymous pages:                              969142.\nPages stored in compressor:                  1524529.\nPages occupied by compressor:                  77711.\nDecompressions:                             71628288.\nCompressions:                               98135358.\nPageins:                                   179720228.\nPageouts:                                    1086680.\nSwapins:                                     1967470.\nSwapouts:                                    3035061.\nPages tagged:                                 227071.\nPages tagged resident:                        169180.\nPages tagged compressed:                       57891.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                10049.\nPages tag-storage free:                         1001.\nPages tag-storage non-tag pageable:            87243.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                    8108800.\nTagged compressions:                         1386181.\nTagged decompressions:                       1168466.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          8192
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-2edea30f3cf3",
+      "result": {
+        "bench_id": "bench-2edea30f3cf3",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 8193,
+            "tg": 4096,
+            "ttft_ms": 3320.0,
+            "tpot_ms": 12.09,
+            "gen_tps": 82.7,
+            "processing_tps": 2467.7,
+            "e2e_latency_s": 52.854,
+            "total_throughput": 232.5,
+            "peak_memory_bytes": 22463245774,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 8193,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "d70c15dda0e382c1581763c2b052d330210eef5c2424e3a6e3d451391bbffe33",
+            "output_sample": {
+              "sha256": "29a2455c819b9784b264a80b5b126460db84f2ea7f2c507c68ed5c65fac0ce0e",
+              "head": "]\n\n    def _handle_thought_block(\n        self,\n        stream_parts: list[str],\n        visible_parts: list[str],\n        text: str,\n    ) -> None:\n        \"\"\"Handle thought block markers, converting them to ``<think>`` tags.\"\"\"\n        if not text:\n     ",
+              "tail": " Any]]\n    usage: dict[str, Any]\n\n\nclass CompletionStreamChunk(BaseModel):\n    \"\"\"A completion stream chunk.\"\"\"\n\n    id: str\n    object: str = \"text_completion.chunk\"\n    created: int\n    model: str\n    choices: list[dict[str, Any]]\n\n\n@router.post(\"/v1/com"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 520,
+                "seconds": 6.259116792003624
+              },
+              {
+                "tokens": 1029,
+                "seconds": 12.284517624997534
+              },
+              {
+                "tokens": 1539,
+                "seconds": 18.402871541969944
+              },
+              {
+                "tokens": 2056,
+                "seconds": 24.651175374980085
+              },
+              {
+                "tokens": 2566,
+                "seconds": 30.7690606249962
+              },
+              {
+                "tokens": 3072,
+                "seconds": 36.98015612497693
+              },
+              {
+                "tokens": 3590,
+                "seconds": 43.27393312501954
+              },
+              {
+                "tokens": 4096,
+                "seconds": 49.50748070899863
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 207,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 9.4,
+                "total_max": 26.4,
+                "p_avg": 12.6,
+                "e_avg": 7.9
+              },
+              "memory": {
+                "phys_footprint_peak": 21.88,
+                "mlx_active_peak": 20.79,
+                "mlx_cache_peak": 0.47,
+                "system_used_peak": 37.81,
+                "system_wired_peak": 24.63,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 94.4,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T14:50:30.008632+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4783.62M  free = 1360.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1347394.\nPages active:                                 686898.\nPages inactive:                               686543.\nPages speculative:                              4851.\nPages throttled:                                   0.\nPages wired down:                             238981.\nPages purgeable:                               12684.\n\"Translation faults\":                     2667613697.\nPages copy-on-write:                       495020432.\nPages zero filled:                        3379209996.\nPages reactivated:                          20074231.\nPages purged:                               28874864.\nFile-backed pages:                            660770.\nAnonymous pages:                              717522.\nPages stored in compressor:                  1646979.\nPages occupied by compressor:                 118838.\nDecompressions:                             72403754.\nCompressions:                               99042955.\nPageins:                                   180938127.\nPageouts:                                    1086894.\nSwapins:                                     1967531.\nSwapouts:                                    3035061.\nPages tagged:                                 218837.\nPages tagged resident:                        158599.\nPages tagged compressed:                       60238.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9983.\nPages tag-storage free:                          448.\nPages tag-storage non-tag pageable:            87863.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                    8520960.\nTagged compressions:                         1389424.\nTagged decompressions:                       1169359.\n"
+      }
+    },
+    {
+      "label": "8192-tq4-r1",
+      "context": 8192,
+      "mode": "tq4",
+      "repeat": 1,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "turboquant",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T14:50:32.384032+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4783.62M  free = 1360.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1388117.\nPages active:                                 669172.\nPages inactive:                               664674.\nPages speculative:                              4890.\nPages throttled:                                   0.\nPages wired down:                             240947.\nPages purgeable:                               15035.\n\"Translation faults\":                     2667619502.\nPages copy-on-write:                       495020895.\nPages zero filled:                        3379240596.\nPages reactivated:                          20074231.\nPages purged:                               28874864.\nFile-backed pages:                            660812.\nAnonymous pages:                              677924.\nPages stored in compressor:                  1638967.\nPages occupied by compressor:                 115064.\nDecompressions:                             72404148.\nCompressions:                               99042955.\nPageins:                                   180938144.\nPageouts:                                    1086894.\nSwapins:                                     1967531.\nSwapouts:                                    3035061.\nPages tagged:                                 217291.\nPages tagged resident:                        157059.\nPages tagged compressed:                       60232.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9983.\nPages tag-storage free:                         1284.\nPages tag-storage non-tag pageable:            87027.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                    8519936.\nTagged compressions:                         1389424.\nTagged decompressions:                       1169364.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          8192
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-244fce8ccc81",
+      "result": {
+        "bench_id": "bench-244fce8ccc81",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 8193,
+            "tg": 4096,
+            "ttft_ms": 3320.2,
+            "tpot_ms": 13.03,
+            "gen_tps": 76.8,
+            "processing_tps": 2467.6,
+            "e2e_latency_s": 56.696,
+            "total_throughput": 216.8,
+            "peak_memory_bytes": 22432211470,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 8193,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "d70c15dda0e382c1581763c2b052d330210eef5c2424e3a6e3d451391bbffe33",
+            "output_sample": {
+              "sha256": "fc413d3e788b600a4c5f7ac3dbdd7065d417c4d6b2a307f84e66d1e76eacd978",
+              "head": "]\n\n    def _handle_thought_block(\n        self,\n        stream_parts: list[str],\n        visible_parts: list[str],\n        text: str,\n    ) -> None:\n        \"\"\"Handle thought block markers (``<|channel>thought\\n`` / ``<channel|>``).\"\"\"\n        if not self.",
+              "tail": "rocessed.append(out_msg)\n            i += 1\n\n            # Consume any immediately following tool results into a\n            # single model turn with tool_responses.\n            tool_responses = []\n            while i < len(raw) and raw[i].get(\"role\") == \""
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 516,
+                "seconds": 6.6190296249696985
+              },
+              {
+                "tokens": 1029,
+                "seconds": 13.212221249996219
+              },
+              {
+                "tokens": 1542,
+                "seconds": 19.83076533296844
+              },
+              {
+                "tokens": 2055,
+                "seconds": 26.448729540978093
+              },
+              {
+                "tokens": 2568,
+                "seconds": 33.16455754096387
+              },
+              {
+                "tokens": 3072,
+                "seconds": 39.79424633295275
+              },
+              {
+                "tokens": 3585,
+                "seconds": 46.55239383300068
+              },
+              {
+                "tokens": 4096,
+                "seconds": 53.36062816600315
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 222,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 9.4,
+                "total_max": 13.3,
+                "p_avg": 12.4,
+                "e_avg": 7.9
+              },
+              "memory": {
+                "phys_footprint_peak": 21.85,
+                "mlx_active_peak": 20.85,
+                "mlx_cache_peak": 0.31,
+                "system_used_peak": 37.89,
+                "system_wired_peak": 24.73,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.6,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T14:51:40.680371+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4783.62M  free = 1360.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1381924.\nPages active:                                 668236.\nPages inactive:                               662836.\nPages speculative:                              6349.\nPages throttled:                                   0.\nPages wired down:                             233569.\nPages purgeable:                               15044.\n\"Translation faults\":                     2669333975.\nPages copy-on-write:                       495072378.\nPages zero filled:                        3382541525.\nPages reactivated:                          20178791.\nPages purged:                               28884742.\nFile-backed pages:                            682883.\nAnonymous pages:                              654538.\nPages stored in compressor:                  1674416.\nPages occupied by compressor:                 130432.\nDecompressions:                             72946023.\nCompressions:                               99632086.\nPageins:                                   182145472.\nPageouts:                                    1086998.\nSwapins:                                     1967531.\nSwapouts:                                    3035061.\nPages tagged:                                 217628.\nPages tagged resident:                        153642.\nPages tagged compressed:                       63986.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9981.\nPages tag-storage free:                          620.\nPages tag-storage non-tag pageable:            87692.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                    9112896.\nTagged compressions:                         1394144.\nTagged decompressions:                       1170313.\n"
+      }
+    },
+    {
+      "label": "8192-affine4-r1",
+      "context": 8192,
+      "mode": "affine4",
+      "repeat": 1,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T14:51:43.104862+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4783.62M  free = 1360.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1420882.\nPages active:                                 641248.\nPages inactive:                               646529.\nPages speculative:                              6352.\nPages throttled:                                   0.\nPages wired down:                             240671.\nPages purgeable:                               14982.\n\"Translation faults\":                     2669351282.\nPages copy-on-write:                       495076263.\nPages zero filled:                        3382570431.\nPages reactivated:                          20178791.\nPages purged:                               28884742.\nFile-backed pages:                            682885.\nAnonymous pages:                              611244.\nPages stored in compressor:                  1666965.\nPages occupied by compressor:                 127070.\nDecompressions:                             72946468.\nCompressions:                               99632086.\nPageins:                                   182145526.\nPageouts:                                    1086998.\nSwapins:                                     1967531.\nSwapouts:                                    3035061.\nPages tagged:                                 216692.\nPages tagged resident:                        152713.\nPages tagged compressed:                       63979.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9981.\nPages tag-storage free:                         1098.\nPages tag-storage non-tag pageable:            87214.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                    9111168.\nTagged compressions:                         1394144.\nTagged decompressions:                       1170318.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          8192
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-38d03ddba7ba",
+      "result": {
+        "bench_id": "bench-38d03ddba7ba",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 8193,
+            "tg": 4096,
+            "ttft_ms": 3404.9,
+            "tpot_ms": 12.02,
+            "gen_tps": 83.2,
+            "processing_tps": 2406.2,
+            "e2e_latency_s": 52.661,
+            "total_throughput": 233.4,
+            "peak_memory_bytes": 22320002510,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 8193,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "d70c15dda0e382c1581763c2b052d330210eef5c2424e3a6e3d451391bbffe33",
+            "output_sample": {
+              "sha256": "24eed081d043639fa968ba7f201b5a9e491d3c9c10c8b5f1fd14dd4be09ce8b5",
+              "head": "]\n\n    def _handle_thought_open(self, stream_parts, visible_parts, text):\n        self._in_thought = True\n        self._text_mode = False\n        self._append_text(stream_parts, visible_parts, _THINK_OPEN)\n\n    def _handle_thought_close(self, stream_parts,",
+              "tail": "ile to prevent a `NameError` at runtime. You may need to adjust this function's logic depending on the specific transformation required for your streaming output.\n3.  **Preserved Logic**: The logic for handling thought blocks, tool responses, and text mode"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 517,
+                "seconds": 6.2070862500113435
+              },
+              {
+                "tokens": 1027,
+                "seconds": 12.32360741699813
+              },
+              {
+                "tokens": 1537,
+                "seconds": 18.395167874987237
+              },
+              {
+                "tokens": 2057,
+                "seconds": 24.624485875014216
+              },
+              {
+                "tokens": 2566,
+                "seconds": 30.77398533298401
+              },
+              {
+                "tokens": 3076,
+                "seconds": 36.88232691696612
+              },
+              {
+                "tokens": 3586,
+                "seconds": 43.04815275000874
+              },
+              {
+                "tokens": 4096,
+                "seconds": 49.23383554199245
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 204,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 9.5,
+                "total_max": 14.9,
+                "p_avg": 11.9,
+                "e_avg": 8.2
+              },
+              "memory": {
+                "phys_footprint_peak": 21.77,
+                "mlx_active_peak": 20.58,
+                "mlx_cache_peak": 0.8,
+                "system_used_peak": 37.89,
+                "system_wired_peak": 24.65,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 95.0,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T14:52:46.427859+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4783.62M  free = 1360.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1363218.\nPages active:                                 666312.\nPages inactive:                               652365.\nPages speculative:                             14381.\nPages throttled:                                   0.\nPages wired down:                             251904.\nPages purgeable:                               11384.\n\"Translation faults\":                     2671013425.\nPages copy-on-write:                       495121450.\nPages zero filled:                        3385767889.\nPages reactivated:                          20256313.\nPages purged:                               28891542.\nFile-backed pages:                            703043.\nAnonymous pages:                              630015.\nPages stored in compressor:                  1690659.\nPages occupied by compressor:                 135149.\nDecompressions:                             73411817.\nCompressions:                              100125946.\nPageins:                                   183302663.\nPageouts:                                    1087007.\nSwapins:                                     1967571.\nSwapouts:                                    3035061.\nPages tagged:                                 218344.\nPages tagged resident:                        154288.\nPages tagged compressed:                       64056.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9981.\nPages tag-storage free:                          495.\nPages tag-storage non-tag pageable:            87817.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                    9131264.\nTagged compressions:                         1394398.\nTagged decompressions:                       1170481.\n"
+      }
+    },
+    {
+      "label": "200000-affine4-r1",
+      "context": 200000,
+      "mode": "affine4",
+      "repeat": 1,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T14:52:48.756295+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4783.62M  free = 1360.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1415591.\nPages active:                                 649447.\nPages inactive:                               640535.\nPages speculative:                             15255.\nPages throttled:                                   0.\nPages wired down:                             231044.\nPages purgeable:                               13863.\n\"Translation faults\":                     2671205567.\nPages copy-on-write:                       495169603.\nPages zero filled:                        3385807819.\nPages reactivated:                          20256314.\nPages purged:                               28891542.\nFile-backed pages:                            704157.\nAnonymous pages:                              601080.\nPages stored in compressor:                  1680038.\nPages occupied by compressor:                 130265.\nDecompressions:                             73413151.\nCompressions:                              100125946.\nPageins:                                   183303937.\nPageouts:                                    1087007.\nSwapins:                                     1967623.\nSwapouts:                                    3035061.\nPages tagged:                                 216700.\nPages tagged resident:                        152675.\nPages tagged compressed:                       64025.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9981.\nPages tag-storage free:                         1698.\nPages tag-storage non-tag pageable:            86614.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                    9126336.\nTagged compressions:                         1394398.\nTagged decompressions:                       1170510.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-1819846408c7",
+      "result": {
+        "bench_id": "bench-1819846408c7",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 4096,
+            "ttft_ms": 239651.6,
+            "tpot_ms": 20.42,
+            "gen_tps": 49.0,
+            "processing_tps": 834.5,
+            "e2e_latency_s": 323.398,
+            "total_throughput": 631.1,
+            "peak_memory_bytes": 23798347162,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "fdd26cd487187355c844b33200519d94f08f73ed60c61fe332fad7caaf95d165",
+              "head": "Build ResponseUsage with reasoning_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        total_tokens=input_tokens + output_tokens,\n        input_tokens_details=InputTokensDetails(cache",
+              "tail": "   Formatted output string\n    \"\"\"\n    if not thinking:\n        return regular_content\n\n    if format == \"markdown\":\n        return f\"<think>\\n{thinking}\\n</think>\\n\\n{regular_content}\"\n    elif format == \"html\":\n        return f'<details><summary>Thinking"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 518,
+                "seconds": 10.587885624961928
+              },
+              {
+                "tokens": 1029,
+                "seconds": 21.005370625003707
+              },
+              {
+                "tokens": 1541,
+                "seconds": 31.42540037498111
+              },
+              {
+                "tokens": 2050,
+                "seconds": 41.80614008399425
+              },
+              {
+                "tokens": 2564,
+                "seconds": 52.27728537499206
+              },
+              {
+                "tokens": 3076,
+                "seconds": 62.77587579196552
+              },
+              {
+                "tokens": 3588,
+                "seconds": 73.22920595901087
+              },
+              {
+                "tokens": 4096,
+                "seconds": 83.63030545896618
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 1267,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 6.3,
+                "total_max": 46.0,
+                "p_avg": 4.8,
+                "e_avg": 7.1
+              },
+              "memory": {
+                "phys_footprint_peak": 24.22,
+                "mlx_active_peak": 21.93,
+                "mlx_cache_peak": 2.78,
+                "system_used_peak": 39.48,
+                "system_wired_peak": 27.25,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 97.7,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 0
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T14:58:22.463693+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4519.62M  free = 1624.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1501361.\nPages active:                                 592366.\nPages inactive:                               579693.\nPages speculative:                             11546.\nPages throttled:                                   0.\nPages wired down:                             230691.\nPages purgeable:                               27338.\n\"Translation faults\":                     2674285232.\nPages copy-on-write:                       495422677.\nPages zero filled:                        3407612015.\nPages reactivated:                          20342800.\nPages purged:                               28906644.\nFile-backed pages:                            531292.\nAnonymous pages:                              652313.\nPages stored in compressor:                  1726043.\nPages occupied by compressor:                 167735.\nDecompressions:                             74148459.\nCompressions:                              100918114.\nPageins:                                   184554587.\nPageouts:                                    1087824.\nSwapins:                                     1984859.\nSwapouts:                                    3035061.\nPages tagged:                                 216227.\nPages tagged resident:                        143254.\nPages tagged compressed:                       72973.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9889.\nPages tag-storage free:                          380.\nPages tag-storage non-tag pageable:            88025.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                   11161536.\nTagged compressions:                         1416703.\nTagged decompressions:                       1183763.\n"
+      }
+    },
+    {
+      "label": "200000-tq4-r1",
+      "context": 200000,
+      "mode": "tq4",
+      "repeat": 1,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "turboquant",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T14:58:24.865421+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 6144.00M  used = 4519.62M  free = 1624.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1545687.\nPages active:                                 551302.\nPages inactive:                               569709.\nPages speculative:                             11615.\nPages throttled:                                   0.\nPages wired down:                             240150.\nPages purgeable:                               26048.\n\"Translation faults\":                     2674303194.\nPages copy-on-write:                       495426588.\nPages zero filled:                        3407634731.\nPages reactivated:                          20342800.\nPages purged:                               28906644.\nFile-backed pages:                            531364.\nAnonymous pages:                              601262.\nPages stored in compressor:                  1717191.\nPages occupied by compressor:                 163666.\nDecompressions:                             74148991.\nCompressions:                              100918114.\nPageins:                                   184554677.\nPageouts:                                    1087824.\nSwapins:                                     1984859.\nSwapouts:                                    3035061.\nPages tagged:                                 215881.\nPages tagged resident:                        142932.\nPages tagged compressed:                       72949.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9889.\nPages tag-storage free:                         1404.\nPages tag-storage non-tag pageable:            87001.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                   11154752.\nTagged compressions:                         1416703.\nTagged decompressions:                       1183787.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-fc0072dade83",
+      "result": {
+        "bench_id": "bench-fc0072dade83",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 4096,
+            "ttft_ms": 237284.8,
+            "tpot_ms": 46.44,
+            "gen_tps": 21.5,
+            "processing_tps": 842.9,
+            "e2e_latency_s": 427.569,
+            "total_throughput": 477.3,
+            "peak_memory_bytes": 26722460366,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "934bc148a040f0287f326af5f9b9aa3fb662151d20030e55589d52eb305bf430",
+              "head": "Build ResponseUsage with reasoning_tokens in output_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),\n        o",
+              "tail": "ers\": {...}}\n                converted.append(\n                    {\n                        \"type\": \"function\",\n                        \"function\": {\n                            \"name\": tool.get(\"name\", \"\"),\n                            \"description\": tool"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 512,
+                "seconds": 22.2381625000271
+              },
+              {
+                "tokens": 1024,
+                "seconds": 43.9957309999736
+              },
+              {
+                "tokens": 1536,
+                "seconds": 65.46829145902302
+              },
+              {
+                "tokens": 2048,
+                "seconds": 87.06658841698663
+              },
+              {
+                "tokens": 2560,
+                "seconds": 108.89846970897634
+              },
+              {
+                "tokens": 3072,
+                "seconds": 135.07444712502183
+              },
+              {
+                "tokens": 3586,
+                "seconds": 162.69000633398537
+              },
+              {
+                "tokens": 4096,
+                "seconds": 190.17285433399957
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 1684,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 8.3,
+                "total_max": 49.4,
+                "p_avg": 9.6,
+                "e_avg": 7.6
+              },
+              "memory": {
+                "phys_footprint_peak": 29.29,
+                "mlx_active_peak": 24.48,
+                "mlx_cache_peak": 7.15,
+                "system_used_peak": 42.57,
+                "system_wired_peak": 32.45,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.3,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 0,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T15:05:43.730481+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4237.62M  free = 882.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1629216.\nPages active:                                 469044.\nPages inactive:                               452993.\nPages speculative:                             17021.\nPages throttled:                                   0.\nPages wired down:                             299610.\nPages purgeable:                               59093.\n\"Translation faults\":                     2679155529.\nPages copy-on-write:                       495768025.\nPages zero filled:                        3441406962.\nPages reactivated:                          20568455.\nPages purged:                               28946538.\nFile-backed pages:                            204406.\nAnonymous pages:                              734652.\nPages stored in compressor:                  1743246.\nPages occupied by compressor:                 215648.\nDecompressions:                             74652171.\nCompressions:                              101479341.\nPageins:                                   185869093.\nPageouts:                                    1088913.\nSwapins:                                     2021979.\nSwapouts:                                    3063879.\nPages tagged:                                 215910.\nPages tagged resident:                        152368.\nPages tagged compressed:                       63542.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9696.\nPages tag-storage free:                          213.\nPages tag-storage non-tag pageable:            88384.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                    9134208.\nTagged compressions:                         1427512.\nTagged decompressions:                       1203633.\n"
+      }
+    },
+    {
+      "label": "200000-native16-r1",
+      "context": 200000,
+      "mode": "native16",
+      "repeat": 1,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": false,
+        "turboquant_kv_scheme": "turboquant",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T15:05:46.058473+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4237.62M  free = 882.38M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1683417.\nPages active:                                 428075.\nPages inactive:                               450354.\nPages speculative:                             17063.\nPages throttled:                                   0.\nPages wired down:                             294648.\nPages purgeable:                               59183.\n\"Translation faults\":                     2679160740.\nPages copy-on-write:                       495768488.\nPages zero filled:                        3441419680.\nPages reactivated:                          20568455.\nPages purged:                               28946538.\nFile-backed pages:                            204457.\nAnonymous pages:                              691035.\nPages stored in compressor:                  1729549.\nPages occupied by compressor:                 209449.\nDecompressions:                             74652536.\nCompressions:                              101479341.\nPageins:                                   185869120.\nPageouts:                                    1088913.\nSwapins:                                     2021995.\nSwapouts:                                    3063879.\nPages tagged:                                 214944.\nPages tagged resident:                        151404.\nPages tagged compressed:                       63540.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9696.\nPages tag-storage free:                          855.\nPages tag-storage non-tag pageable:            87742.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                    9134016.\nTagged compressions:                         1427512.\nTagged decompressions:                       1203635.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-3364888eb034",
+      "result": {
+        "bench_id": "bench-3364888eb034",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 4096,
+            "ttft_ms": 279712.7,
+            "tpot_ms": 38.08,
+            "gen_tps": 26.3,
+            "processing_tps": 715.0,
+            "e2e_latency_s": 435.757,
+            "total_throughput": 468.4,
+            "peak_memory_bytes": 26547137946,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "5cef7444d93749f7f134c966bfc0ba7afa6e4f9d9400b340974e99b2eba83047",
+              "head": "Build ResponseUsage with reasoning_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),\n        output_tokens_deta",
+              "tail": "L)\n\n# Pattern to match thinking markers in various formats\n_THINK_MARKERS = [\n    \"<think>\",\n    \"</think>\",\n    \"<|thought|>\",\n    \"<|end_thought|>\",\n    \"<|thinking|>\",\n    \"<|end_thinking|>\",\n    \"<|reasoning|>\",\n    \"<|end_reasoning|>\",\n]\n\n\ndef extract"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 512,
+                "seconds": 20.345567541953642
+              },
+              {
+                "tokens": 1024,
+                "seconds": 40.24246054200921
+              },
+              {
+                "tokens": 1536,
+                "seconds": 60.06140599999344
+              },
+              {
+                "tokens": 2048,
+                "seconds": 79.838946999982
+              },
+              {
+                "tokens": 2560,
+                "seconds": 99.97907050000504
+              },
+              {
+                "tokens": 3075,
+                "seconds": 120.25617633399088
+              },
+              {
+                "tokens": 3587,
+                "seconds": 140.00416291697184
+              },
+              {
+                "tokens": 4096,
+                "seconds": 155.94311829196522
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 1715,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 9.4,
+                "total_max": 50.8,
+                "p_avg": 12.3,
+                "e_avg": 7.9
+              },
+              "memory": {
+                "phys_footprint_peak": 31.59,
+                "mlx_active_peak": 24.49,
+                "mlx_cache_peak": 7.79,
+                "system_used_peak": 45.26,
+                "system_wired_peak": 35.24,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 94.4,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 1,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T15:13:15.857863+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4165.56M  free = 954.44M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1915588.\nPages active:                                 236747.\nPages inactive:                               227475.\nPages speculative:                              6194.\nPages throttled:                                   0.\nPages wired down:                             328915.\nPages purgeable:                               15506.\n\"Translation faults\":                     2684905925.\nPages copy-on-write:                       496383294.\nPages zero filled:                        3474949399.\nPages reactivated:                          21166247.\nPages purged:                               29057756.\nFile-backed pages:                            136562.\nAnonymous pages:                              333854.\nPages stored in compressor:                  2034156.\nPages occupied by compressor:                 366729.\nDecompressions:                             75588417.\nCompressions:                              102776018.\nPageins:                                   187208076.\nPageouts:                                    1090772.\nSwapins:                                     2026387.\nSwapouts:                                    3063879.\nPages tagged:                                 207179.\nPages tagged resident:                        124565.\nPages tagged compressed:                       82614.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9311.\nPages tag-storage free:                         2269.\nPages tag-storage non-tag pageable:            86714.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                   12663424.\nTagged compressions:                         1492707.\nTagged decompressions:                       1245235.\n"
+      }
+    },
+    {
+      "label": "200000-native16-r2",
+      "context": 200000,
+      "mode": "native16",
+      "repeat": 2,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": false,
+        "turboquant_kv_scheme": "turboquant",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T15:13:18.229555+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4165.56M  free = 954.44M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1965422.\nPages active:                                 226979.\nPages inactive:                               225932.\nPages speculative:                              6968.\nPages throttled:                                   0.\nPages wired down:                             297797.\nPages purgeable:                               29437.\n\"Translation faults\":                     2684943552.\nPages copy-on-write:                       496390584.\nPages zero filled:                        3474971010.\nPages reactivated:                          21166292.\nPages purged:                               29057758.\nFile-backed pages:                            137514.\nAnonymous pages:                              322365.\nPages stored in compressor:                  2009233.\nPages occupied by compressor:                 356312.\nDecompressions:                             75590821.\nCompressions:                              102776018.\nPageins:                                   187208742.\nPageouts:                                    1090772.\nSwapins:                                     2026387.\nSwapouts:                                    3063879.\nPages tagged:                                 207186.\nPages tagged resident:                        125085.\nPages tagged compressed:                       82101.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9311.\nPages tag-storage free:                         4324.\nPages tag-storage non-tag pageable:            84659.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                   12553344.\nTagged compressions:                         1492707.\nTagged decompressions:                       1245745.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-cc3a8fb5a3ec",
+      "result": {
+        "bench_id": "bench-cc3a8fb5a3ec",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 4096,
+            "ttft_ms": 239579.0,
+            "tpot_ms": 30.77,
+            "gen_tps": 32.5,
+            "processing_tps": 834.8,
+            "e2e_latency_s": 365.713,
+            "total_throughput": 558.1,
+            "peak_memory_bytes": 26547137946,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "5cef7444d93749f7f134c966bfc0ba7afa6e4f9d9400b340974e99b2eba83047",
+              "head": "Build ResponseUsage with reasoning_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),\n        output_tokens_deta",
+              "tail": "L)\n\n# Pattern to match thinking markers in various formats\n_THINK_MARKERS = [\n    \"<think>\",\n    \"</think>\",\n    \"<|thought|>\",\n    \"<|end_thought|>\",\n    \"<|thinking|>\",\n    \"<|end_thinking|>\",\n    \"<|reasoning|>\",\n    \"<|end_reasoning|>\",\n]\n\n\ndef extract"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 516,
+                "seconds": 16.0212938329787
+              },
+              {
+                "tokens": 1028,
+                "seconds": 31.726931582961697
+              },
+              {
+                "tokens": 1540,
+                "seconds": 47.36415595799917
+              },
+              {
+                "tokens": 2052,
+                "seconds": 63.0837754579843
+              },
+              {
+                "tokens": 2564,
+                "seconds": 78.78668116696645
+              },
+              {
+                "tokens": 3076,
+                "seconds": 94.54643808299443
+              },
+              {
+                "tokens": 3588,
+                "seconds": 110.35152879200177
+              },
+              {
+                "tokens": 4096,
+                "seconds": 126.01433537498815
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 1445,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 7.5,
+                "total_max": 44.5,
+                "p_avg": 7.0,
+                "e_avg": 7.8
+              },
+              "memory": {
+                "phys_footprint_peak": 31.58,
+                "mlx_active_peak": 24.51,
+                "mlx_cache_peak": 7.79,
+                "system_used_peak": 43.93,
+                "system_wired_peak": 34.8,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.1,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 1,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T15:19:37.915390+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4141.56M  free = 978.44M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  2011797.\nPages active:                                 286762.\nPages inactive:                               287402.\nPages speculative:                               641.\nPages throttled:                                   0.\nPages wired down:                             235340.\nPages purgeable:                               15756.\n\"Translation faults\":                     2689149936.\nPages copy-on-write:                       496820022.\nPages zero filled:                        3508012472.\nPages reactivated:                          21472974.\nPages purged:                               29136785.\nFile-backed pages:                            110883.\nAnonymous pages:                              463922.\nPages stored in compressor:                  1881289.\nPages occupied by compressor:                 260934.\nDecompressions:                             76158146.\nCompressions:                              103306464.\nPageins:                                   188486973.\nPageouts:                                    1092545.\nSwapins:                                     2027678.\nSwapouts:                                    3063879.\nPages tagged:                                 206794.\nPages tagged resident:                        122697.\nPages tagged compressed:                       84097.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9399.\nPages tag-storage free:                          686.\nPages tag-storage non-tag pageable:            88207.\nPages tag-storage non-tag wired:                  12.\nBytes of compressed tags:                   13248320.\nTagged compressions:                         1512296.\nTagged decompressions:                       1263078.\n"
+      }
+    },
+    {
+      "label": "200000-tq4-r2",
+      "context": 200000,
+      "mode": "tq4",
+      "repeat": 2,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "turboquant",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T15:19:40.335696+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4141.56M  free = 978.44M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  2054048.\nPages active:                                 232400.\nPages inactive:                               270842.\nPages speculative:                               657.\nPages throttled:                                   0.\nPages wired down:                             267703.\nPages purgeable:                                8017.\n\"Translation faults\":                     2689170684.\nPages copy-on-write:                       496823966.\nPages zero filled:                        3508030296.\nPages reactivated:                          21472974.\nPages purged:                               29136785.\nFile-backed pages:                            110905.\nAnonymous pages:                              392994.\nPages stored in compressor:                  1867589.\nPages occupied by compressor:                 255567.\nDecompressions:                             76160102.\nCompressions:                              103306464.\nPageins:                                   188487031.\nPageouts:                                    1092545.\nSwapins:                                     2027678.\nSwapouts:                                    3063879.\nPages tagged:                                 206842.\nPages tagged resident:                        123205.\nPages tagged compressed:                       83637.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9399.\nPages tag-storage free:                         2392.\nPages tag-storage non-tag pageable:            86502.\nPages tag-storage non-tag wired:                  11.\nBytes of compressed tags:                   13127680.\nTagged compressions:                         1512296.\nTagged decompressions:                       1263535.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-32241918ed55",
+      "result": {
+        "bench_id": "bench-32241918ed55",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 4096,
+            "ttft_ms": 234566.3,
+            "tpot_ms": 42.6,
+            "gen_tps": 23.5,
+            "processing_tps": 852.6,
+            "e2e_latency_s": 409.152,
+            "total_throughput": 498.8,
+            "peak_memory_bytes": 27028440542,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "934bc148a040f0287f326af5f9b9aa3fb662151d20030e55589d52eb305bf430",
+              "head": "Build ResponseUsage with reasoning_tokens in output_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),\n        o",
+              "tail": "ers\": {...}}\n                converted.append(\n                    {\n                        \"type\": \"function\",\n                        \"function\": {\n                            \"name\": tool.get(\"name\", \"\"),\n                            \"description\": tool"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 512,
+                "seconds": 21.711852542008273
+              },
+              {
+                "tokens": 1024,
+                "seconds": 43.46356395800831
+              },
+              {
+                "tokens": 1536,
+                "seconds": 65.1921516250004
+              },
+              {
+                "tokens": 2048,
+                "seconds": 86.93627154198475
+              },
+              {
+                "tokens": 2560,
+                "seconds": 108.73410495795542
+              },
+              {
+                "tokens": 3072,
+                "seconds": 130.56703904201277
+              },
+              {
+                "tokens": 3584,
+                "seconds": 152.44228249997832
+              },
+              {
+                "tokens": 4096,
+                "seconds": 174.46505920798518
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 1613,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 6.6,
+                "total_max": 26.8,
+                "p_avg": 4.2,
+                "e_avg": 7.9
+              },
+              "memory": {
+                "phys_footprint_peak": 29.18,
+                "mlx_active_peak": 24.89,
+                "mlx_cache_peak": 7.05,
+                "system_used_peak": 42.19,
+                "system_wired_peak": 32.01,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.9,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 1,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T15:26:39.072023+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4133.56M  free = 986.44M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1716716.\nPages active:                                 396048.\nPages inactive:                               375958.\nPages speculative:                             18412.\nPages throttled:                                   0.\nPages wired down:                             356325.\nPages purgeable:                               16002.\n\"Translation faults\":                     2692635431.\nPages copy-on-write:                       497182317.\nPages zero filled:                        3539150811.\nPages reactivated:                          21605600.\nPages purged:                               29137735.\nFile-backed pages:                            294568.\nAnonymous pages:                              495850.\nPages stored in compressor:                  1771508.\nPages occupied by compressor:                 218526.\nDecompressions:                             76493062.\nCompressions:                              103561162.\nPageins:                                   189776011.\nPageouts:                                    1093440.\nSwapins:                                     2027786.\nSwapouts:                                    3063879.\nPages tagged:                                 207560.\nPages tagged resident:                        131777.\nPages tagged compressed:                       75783.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9382.\nPages tag-storage free:                         1704.\nPages tag-storage non-tag pageable:            87208.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                   11371712.\nTagged compressions:                         1515817.\nTagged decompressions:                       1274740.\n"
+      }
+    },
+    {
+      "label": "200000-affine4-r2",
+      "context": 200000,
+      "mode": "affine4",
+      "repeat": 2,
+      "settings": {
+        "max_context_window": 262144,
+        "max_tokens": 8192,
+        "force_sampling": false,
+        "qwen4_ple_ssd_offload": false,
+        "thinking_budget_enabled": false,
+        "guided_grammar_enabled": false,
+        "turboquant_kv_enabled": true,
+        "turboquant_kv_scheme": "affine4",
+        "turboquant_kv_bits": 4,
+        "turboquant_skip_last": true,
+        "qwen35_ane_prefill_enabled": false,
+        "qwen35_ane_prefill_sequence_length": 2048,
+        "qwen35_ane_prefill_tail_padding_min_tokens": 0,
+        "qwen35_ane_prefill_fraction": 0.53,
+        "qwen35_ane_prefill_fused_down": false,
+        "qwen35_ane_prefill_max_layers": 64,
+        "qwen35_ane_prefill_dual_ane": true,
+        "qwen35_ane_prefill_gdn": true,
+        "qwen35_ane_prefill_gdn_fraction": 0.5,
+        "qwen35_ane_prefill_gdn_max_layers": 48,
+        "qwen35_ane_prefill_cpu_enabled": false,
+        "qwen35_ane_prefill_cpu_fraction": 0.135,
+        "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+        "qwen35_ane_prefill_cpu_threads": 8,
+        "qwen35_ane_prefill_cpu_shared_resource": true,
+        "specprefill_enabled": false,
+        "dflash_enabled": false,
+        "dflash_draft_quant_enabled": false,
+        "dflash_in_memory_cache": true,
+        "dflash_in_memory_cache_max_entries": 4,
+        "dflash_in_memory_cache_max_bytes": 8589934592,
+        "dflash_ssd_cache": false,
+        "dflash_ssd_cache_max_bytes": 21474836480,
+        "dflash_draft_sink_size": 0,
+        "mtp_enabled": false,
+        "vlm_mtp_enabled": false,
+        "is_pinned": false,
+        "is_default": false,
+        "is_hidden": false,
+        "is_favorite": false,
+        "trust_remote_code": false
+      },
+      "environment_start": {
+        "time": "2026-09-07T15:26:41.438925+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4133.56M  free = 986.44M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1782213.\nPages active:                                 389663.\nPages inactive:                               367824.\nPages speculative:                             20137.\nPages throttled:                                   0.\nPages wired down:                             304486.\nPages purgeable:                               38013.\n\"Translation faults\":                     2692654982.\nPages copy-on-write:                       497182800.\nPages zero filled:                        3539251273.\nPages reactivated:                          21605602.\nPages purged:                               29137735.\nFile-backed pages:                            297058.\nAnonymous pages:                              480566.\nPages stored in compressor:                  1763807.\nPages occupied by compressor:                 216644.\nDecompressions:                             76497495.\nCompressions:                              103561162.\nPageins:                                   189777696.\nPageouts:                                    1093440.\nSwapins:                                     2027798.\nSwapouts:                                    3063879.\nPages tagged:                                 207809.\nPages tagged resident:                        133126.\nPages tagged compressed:                       74683.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9382.\nPages tag-storage free:                         2773.\nPages tag-storage non-tag pageable:            86139.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                   11165376.\nTagged compressions:                         1515817.\nTagged decompressions:                       1275840.\n"
+      },
+      "request": {
+        "model_id": "Qwen3.6-35B-A3B",
+        "prompt_lengths": [
+          200000
+        ],
+        "generation_length": 4096,
+        "batch_sizes": [],
+        "warmup_mode": "ane_2048",
+        "align_prompt_to_ane": true,
+        "force_lm_engine": false,
+        "context_profile": "code_python"
+      },
+      "bench_id": "bench-47deba2b570e",
+      "result": {
+        "bench_id": "bench-47deba2b570e",
+        "status": "completed",
+        "context_profile": "code_python",
+        "results": [
+          {
+            "test_type": "single",
+            "pp": 200001,
+            "tg": 4096,
+            "ttft_ms": 286728.1,
+            "tpot_ms": 22.35,
+            "gen_tps": 44.8,
+            "processing_tps": 697.5,
+            "e2e_latency_s": 378.359,
+            "total_throughput": 539.4,
+            "peak_memory_bytes": 23798363546,
+            "peak_memory_source": "mlx_active",
+            "prompt_tokens": 200001,
+            "completion_tokens": 4096,
+            "cached_tokens": 0,
+            "prompt_sha256": "44a701487ef5f700609cfc4509aad666996b816d0579f9bc3cd558e7edf8bf2f",
+            "output_sample": {
+              "sha256": "fdd26cd487187355c844b33200519d94f08f73ed60c61fe332fad7caaf95d165",
+              "head": "Build ResponseUsage with reasoning_tokens_details.\"\"\"\n    return ResponseUsage(\n        input_tokens=input_tokens,\n        output_tokens=output_tokens,\n        total_tokens=input_tokens + output_tokens,\n        input_tokens_details=InputTokensDetails(cache",
+              "tail": "   Formatted output string\n    \"\"\"\n    if not thinking:\n        return regular_content\n\n    if format == \"markdown\":\n        return f\"<think>\\n{thinking}\\n</think>\\n\\n{regular_content}\"\n    elif format == \"html\":\n        return f'<details><summary>Thinking"
+            },
+            "finish_reason": "length",
+            "generation_policy": "suppress_termination",
+            "decode_progress": [
+              {
+                "tokens": 1,
+                "seconds": 0.0
+              },
+              {
+                "tokens": 514,
+                "seconds": 13.11612724995939
+              },
+              {
+                "tokens": 1028,
+                "seconds": 23.65484195901081
+              },
+              {
+                "tokens": 1540,
+                "seconds": 34.045914666960016
+              },
+              {
+                "tokens": 2053,
+                "seconds": 44.47143524995772
+              },
+              {
+                "tokens": 2562,
+                "seconds": 54.68217662500683
+              },
+              {
+                "tokens": 3075,
+                "seconds": 65.6631374169956
+              },
+              {
+                "tokens": 3587,
+                "seconds": 78.64997791696806
+              },
+              {
+                "tokens": 4096,
+                "seconds": 91.5199656249606
+              }
+            ],
+            "system_metrics": {
+              "sample_count": 1488,
+              "interval_s": 0.25,
+              "cpu": {
+                "total_avg": 9.9,
+                "total_max": 49.6,
+                "p_avg": 11.8,
+                "e_avg": 9.0
+              },
+              "memory": {
+                "phys_footprint_peak": 24.16,
+                "mlx_active_peak": 21.81,
+                "mlx_cache_peak": 2.56,
+                "system_used_peak": 39.94,
+                "system_wired_peak": 28.13,
+                "total_ram": 48
+              },
+              "gpu": {
+                "util_avg": 98.2,
+                "util_max": 100.0
+              },
+              "thermal": {
+                "start": 1,
+                "max": 1
+              }
+            }
+          }
+        ],
+        "error": null,
+        "upload_state": {
+          "phase": "skipped",
+          "results": [],
+          "total": 0,
+          "success_count": 0,
+          "failed_count": 0,
+          "owner_hash": null,
+          "skipped_reason": "ane_aligned_prompt",
+          "skipped_features": [],
+          "feature_flags": []
+        }
+      },
+      "validation_errors": [],
+      "environment_end": {
+        "time": "2026-09-07T15:33:11.176461+00:00",
+        "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+        "swap": "vm.swapusage: total = 5120.00M  used = 4133.56M  free = 986.44M  (encrypted)\n",
+        "vm": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  1566490.\nPages active:                                 519655.\nPages inactive:                               516229.\nPages speculative:                              2204.\nPages throttled:                                   0.\nPages wired down:                             282727.\nPages purgeable:                               46885.\n\"Translation faults\":                     2696735952.\nPages copy-on-write:                       497558053.\nPages zero filled:                        3561680788.\nPages reactivated:                          21713788.\nPages purged:                               29182546.\nFile-backed pages:                            355449.\nAnonymous pages:                              682639.\nPages stored in compressor:                  1703825.\nPages occupied by compressor:                 196161.\nDecompressions:                             76892464.\nCompressions:                              103937589.\nPageins:                                   191062538.\nPageouts:                                    1095250.\nSwapins:                                     2028357.\nSwapouts:                                    3063879.\nPages tagged:                                 211936.\nPages tagged resident:                        149203.\nPages tagged compressed:                       62733.\nPages tag-storage:                             98304.\nPages tag-storage holding tags:                 9417.\nPages tag-storage free:                          327.\nPages tag-storage non-tag pageable:            88550.\nPages tag-storage non-tag wired:                  10.\nBytes of compressed tags:                    8853632.\nTagged compressions:                         1518018.\nTagged decompressions:                       1289793.\n"
+      }
+    }
+  ],
+  "finished_at": "2026-09-07T15:33:13.494044+00:00"
+}

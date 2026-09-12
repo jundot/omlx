@@ -1005,7 +1005,10 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         return cache_obj.merge([cache_obj])
     if (
         _TQ_SINGLETON_CACHE_TYPE is not None
-        and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+        and (
+            type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+            or type(cache_obj).__name__ in ("Affine4KVCache", "Affine8KVCache")
+        )
     ):
         return cache_obj.merge([cache_obj])
     # Model-owned singletons (e.g. qwen4_exp QSAKVCache) declare their batch
@@ -1246,6 +1249,10 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "Affine4KVCache",
+        "BatchAffine4KVCache",
+        "Affine8KVCache",
+        "BatchAffine8KVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
         # Both QSA handlers support block slicing, so their growing KV and
@@ -1260,6 +1267,10 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
     {
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "Affine4KVCache",
+        "BatchAffine4KVCache",
+        "Affine8KVCache",
+        "BatchAffine8KVCache",
     }
 )
 
@@ -1874,6 +1885,7 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
+        self._turboquant_kv_scheme = "turboquant"
         self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
@@ -3360,7 +3372,11 @@ class Scheduler:
 
         if self._model_uses_mla():
             return False
-        if self._model_uses_attention_sinks():
+        if (
+            getattr(self, "_turboquant_kv_scheme", "turboquant")
+            not in ("affine4", "affine8")
+            and self._model_uses_attention_sinks()
+        ):
             return False
 
         def _ok(c: Any) -> bool:
@@ -3377,6 +3393,10 @@ class Scheduler:
                 "BufferedRotatingKVCache",
                 "TurboQuantKVCache",
                 "BatchTurboQuantKVCache",
+                "Affine4KVCache",
+                "BatchAffine4KVCache",
+                "Affine8KVCache",
+                "BatchAffine8KVCache",
             ):
                 return True
             if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
@@ -3415,7 +3435,11 @@ class Scheduler:
         last KVCache layer if turboquant_skip_last is set.
         """
         from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from .turboquant_kv import quantized_cache_class
+
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        cache_class = quantized_cache_class(scheme)
 
         kv_indices = [
             i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
@@ -3429,13 +3453,13 @@ class Scheduler:
             if isinstance(cache_obj, KVCache):
                 if i == last_kv_idx:
                     continue
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                prompt_cache[i] = cache_class(bits=bits)
                 converted += 1
             elif isinstance(cache_obj, CacheList):
                 new_caches = []
                 for c in cache_obj.caches:
                     if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        new_caches.append(cache_class(bits=bits))
                         converted += 1
                     else:
                         new_caches.append(c)
@@ -3443,21 +3467,23 @@ class Scheduler:
         if converted > 0:
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
-                f"TurboQuant: {converted}/{len(prompt_cache)} "
+                f"{scheme}: {converted}/{len(prompt_cache)} "
                 f"cache layers set to {bits}-bit{skip_msg}"
             )
 
     def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
-        """Convert populated KVCache data to TurboQuantKVCache via from_cache().
+        """Convert native full-attention caches to the selected packed format.
 
-        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
-        cache): the completed full-precision KV is quantized once, so prefill
-        hidden states stay exact and quantization error only enters at
-        decode-time reads. This is the key difference from #717/#771, which
-        quantized on the fly during prefill and corrupted hidden states.
+        TurboQuant converts after cold prefill to preserve its hidden states.
+        Affine formats also convert at prefill entry so subsequent updates
+        retain compressed history throughout the request.
         """
         from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from .turboquant_kv import quantized_cache_class
+
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        cache_class = quantized_cache_class(scheme)
 
         kv_indices = [
             i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
@@ -3471,13 +3497,13 @@ class Scheduler:
             if isinstance(cache_obj, KVCache):
                 if i == last_kv_idx:
                     continue
-                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
+                prompt_cache[i] = cache_class.from_cache(cache_obj, bits=bits)
                 converted += 1
             elif isinstance(cache_obj, CacheList):
                 new_caches = []
                 for c in cache_obj.caches:
                     if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
+                        new_caches.append(cache_class.from_cache(c, bits=bits))
                         converted += 1
                     else:
                         new_caches.append(c)
@@ -3485,7 +3511,7 @@ class Scheduler:
         if converted > 0:
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
-                f"TurboQuant: converted {converted}/{len(prompt_cache)} "
+                f"{scheme}: converted {converted}/{len(prompt_cache)} "
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
@@ -3502,6 +3528,17 @@ class Scheduler:
         mutable flag on the shared monitor.
         """
         return text_only is True and Scheduler._qwen4_prefill_accounting_enabled(self)
+
+    def _prepare_affine_prefill_cache(self, prompt_cache: list[Any]) -> None:
+        """Keep full-attention history packed throughout affine prefill."""
+        if (
+            self._turboquant_kv_bits is not None
+            and getattr(self, "_turboquant_kv_scheme", "turboquant")
+            in ("affine4", "affine8")
+            and self._turboquant_eligible(prompt_cache)
+        ):
+            with mx.stream(self._stream):
+                self._apply_turboquant_kv_convert(prompt_cache)
 
     @staticmethod
     def _qwen4_actual_gathered_pricing(
@@ -3569,7 +3606,10 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # Fresh TurboQuant requests run fp16 during the cold prefill loop and
+        self._prepare_affine_prefill_cache(prompt_cache)
+
+        # Affine formats pack each layer's new KV during prefill. TurboQuant requests
+        # run in full precision during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
         # quantized while pre-filling the uncached suffix, then keep using TQ for
         # decode. Rotating/sliding-window layers remain native pass-through
@@ -3590,7 +3630,7 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = _cache_base_sizes(prompt_cache)
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
         # in a restored RotatingKVCache (e.g. shared layer_meta_states from
@@ -3808,6 +3848,7 @@ class Scheduler:
                 requested_step=prefill_step_size,
                 gathered_core=gathered_core,
             )
+            self._trace_prefill_memory(request, prompt_cache, "before_reclaim")
             self._maybe_record_fixed_state_bytes(prompt_cache)
             # Enforcer-requested hard-pressure drain. The flag's normal
             # consumption point is the end-of-step cleanup, but this loop
@@ -3933,6 +3974,7 @@ class Scheduler:
             Scheduler._clear_cache(self)
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
+            self._trace_prefill_memory(request, prompt_cache, "after_reclaim")
             if getattr(request, "benchmark_trace", False):
                 _trace_total_ms = (
                     time.perf_counter() - _trace_chunk_start
@@ -4731,6 +4773,24 @@ class Scheduler:
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
         return max(active, phys)
 
+    def _trace_prefill_memory(self, request, prompt_cache, phase: str) -> None:
+        """Separate cache residency, allocator buffers and physical footprint."""
+        if not getattr(request, "benchmark_trace", False):
+            return
+        logger.info(
+            "[benchmark-memory] rid=%s phase=%s context=%d cache_bytes=%d "
+            "mlx_active_bytes=%d mlx_pool_bytes=%d phys_footprint_bytes=%d "
+            "hot_cache_cpu_bytes=%d",
+            request.request_id,
+            phase,
+            _cache_base_sizes(prompt_cache),
+            sum(int(getattr(c, "nbytes", 0)) for c in prompt_cache),
+            mx.get_active_memory(),
+            mx.get_cache_memory(),
+            get_phys_footprint(),
+            self._hot_cache_cpu_bytes(),
+        )
+
     def get_active_hot_cache_block_hashes(self) -> set[bytes]:
         """Return hot-cache block hashes owned by active in-flight requests."""
         manager = getattr(self, "paged_cache_manager", None)
@@ -5390,6 +5450,7 @@ class Scheduler:
             if existing_cache is not None
             else make_prompt_cache(self.model)
         )
+        self._prepare_affine_prefill_cache(prompt_cache)
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (
@@ -5400,7 +5461,7 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = _cache_base_sizes(prompt_cache)
         if (
             boundary_enabled
             and hasattr(request, "cached_tokens")
@@ -5592,6 +5653,7 @@ class Scheduler:
             requested_step=prefill_step_size,
             gathered_core=actual_gathered_core,
         )
+        self._trace_prefill_memory(state.request, state.cache, "before_reclaim")
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
 
@@ -5688,6 +5750,7 @@ class Scheduler:
 
         if self._should_clear_after_chunk():
             Scheduler._clear_cache(self)
+            self._trace_prefill_memory(state.request, state.cache, "after_reclaim")
         chunk_dt = time.perf_counter() - _t_chunk_start
         if getattr(state.request, "benchmark_trace", False):
             _ane_sequence = int(
@@ -13184,6 +13247,8 @@ class Scheduler:
                 except Exception:
                     pass
 
+            affine_prefill = False
+            prefill_kv_dtype_size = base_dtype_size
             if (
                 self._turboquant_kv_bits is not None
                 and isinstance(head_dim, int)
@@ -13199,7 +13264,16 @@ class Scheduler:
                     )
                 )
             ):
-                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+                affine_prefill = scheme in ("affine4", "affine8")
+                tq_dtype_size = (
+                    (
+                        ((head_dim * int(self._turboquant_kv_bits) + 31) // 32 * 4 + 4)
+                        / head_dim
+                    )
+                    if affine_prefill
+                    else float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                )
                 if (
                     self._turboquant_skip_last
                     and not isinstance(actual_kv_cache_layers, bool)
@@ -13210,6 +13284,8 @@ class Scheduler:
                     ) / actual_kv_cache_layers
                 else:
                     dtype_size = tq_dtype_size
+                if affine_prefill:
+                    prefill_kv_dtype_size = dtype_size
 
             kv_bytes_per_token = None
             if estimate_qwen4_exp_kv_bytes_per_token is not None:
@@ -13253,6 +13329,8 @@ class Scheduler:
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
                     dtype_size=dtype_size,
+                    prefill_kv_dtype_size=prefill_kv_dtype_size,
+                    affine_prefill=affine_prefill,
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
                     # SDPA scores are materialized at the compute/activation
@@ -13377,9 +13455,14 @@ class Scheduler:
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        packed_type = {
+            "affine4": "Affine4KVCache",
+            "affine8": "Affine8KVCache",
+        }.get(scheme, "TurboQuantKVCache")
         for idx in kv_indices:
             if idx != last_kv_idx and idx < len(layer_cache_types):
-                layer_cache_types[idx] = "TurboQuantKVCache"
+                layer_cache_types[idx] = packed_type
 
         # The depth is keyed off the same eligibility gate the request path
         # uses, not the rewritten names: models whose convertible caches sit

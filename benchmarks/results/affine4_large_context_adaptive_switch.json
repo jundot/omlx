@@ -1,0 +1,65 @@
+{
+  "changed_at": "2026-09-07T10:08:17.015592+00:00",
+  "change": {
+    "prefill_priority": "context"
+  },
+  "memory_guard": "unchanged",
+  "activity_at_switch": {
+    "active_models": {
+      "models": [
+        {
+          "id": "Qwen3.8-27B",
+          "estimated_size": 17820265635,
+          "estimated_size_formatted": "16.60GB",
+          "actual_size": 15863376624,
+          "actual_size_formatted": "14.77GB",
+          "pinned": false,
+          "is_loading": false,
+          "loading_elapsed_seconds": null,
+          "loading_estimated_seconds": null,
+          "loading_remaining_seconds_estimate": null,
+          "active_requests": 1,
+          "waiting_requests": 0,
+          "waiting": [],
+          "activities": [],
+          "prefilling": [
+            {
+              "request_id": "08a4b0a1-7452-46bd-8599-aca66627ce74",
+              "processed": 59392,
+              "total": 200001,
+              "speed": 267.0,
+              "eta": 526.5,
+              "elapsed": 178.9,
+              "phase": "prefill",
+              "detail": null
+            }
+          ],
+          "generating": [],
+          "idle_seconds": 190.03325176239014,
+          "ttl_remaining_seconds": null,
+          "dflash": null
+        }
+      ],
+      "model_memory_used": 23835457696,
+      "model_memory_max": 38842472608,
+      "memory_pressure": {
+        "enabled": true,
+        "current_bytes": 23835457696,
+        "soft_bytes": 34958225347,
+        "hard_bytes": 36900348977,
+        "current_formatted": "22.2GB",
+        "soft_formatted": "32.6GB",
+        "hard_formatted": "34.4GB",
+        "pressure_level": "ok"
+      },
+      "total_active_requests": 1,
+      "total_waiting_requests": 0
+    }
+  },
+  "applied": {
+    "success": true,
+    "runtime_applied": [
+      "prefill_priority"
+    ]
+  }
+}

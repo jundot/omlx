@@ -1,0 +1,79 @@
+{
+  "model": "Qwen3.8-27B-oQ4e-mtp",
+  "mlx": "0.32.2",
+  "hardware": "Apple M5 Pro 48 GiB",
+  "native_geometry": {
+    "head_dim": 256,
+    "q_heads": 24,
+    "kv_heads": 4,
+    "query_rows": [
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "cases": [
+    {
+      "case": "cold",
+      "prompt_tokens": 3441,
+      "completion_tokens": 2,
+      "cached_tokens": 0,
+      "output": "42"
+    },
+    {
+      "case": "warm",
+      "prompt_tokens": 3441,
+      "completion_tokens": 2,
+      "cached_tokens": 2048,
+      "output": "42"
+    },
+    {
+      "case": "restarted",
+      "prompt_tokens": 3441,
+      "completion_tokens": 2,
+      "cached_tokens": 2048,
+      "output": "42"
+    },
+    {
+      "case": "mtp",
+      "prompt_tokens": 3460,
+      "completion_tokens": 53,
+      "cached_tokens": 2048,
+      "output": "42\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20"
+    }
+  ],
+  "mtp": {
+    "accepted_drafts": 38,
+    "proposed_drafts": 39,
+    "cycles": 17
+  },
+  "ssd_layer_types": {
+    "Affine4KVCache": 15,
+    "ArraysCache": 48,
+    "KVCache": 1
+  },
+  "final_source_recheck": {
+    "date": "2026-09-07",
+    "affine4_sha256": "a93c081aa17f5962a8255d57637d75f6b2fb650584faa402e70e909f11b6bf81",
+    "cases": [
+      {
+        "case": "warm_after_restart",
+        "prompt_tokens": 3441,
+        "completion_tokens": 2,
+        "cached_tokens": 2048,
+        "output": "42"
+      },
+      {
+        "case": "mtp",
+        "prompt_tokens": 3460,
+        "completion_tokens": 53,
+        "cached_tokens": 2048,
+        "output": "42\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20",
+        "accepted_drafts": 38,
+        "proposed_drafts": 39,
+        "cycles": 17
+      }
+    ]
+  }
+}

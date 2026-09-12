@@ -101,6 +101,19 @@ def validate_ane_prefill(settings: dict, model_type: str | None) -> None:
                 raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
 
 
+def validate_kv_compression_settings(scheme: str, bits: float) -> None:
+    """Validate the persisted KV cache format and bit depth."""
+    affine_bits = {"affine4": 4, "affine8": 8}
+    if scheme not in ("turboquant", *affine_bits):
+        raise ValueError(
+            "turboquant_kv_scheme must be 'turboquant', 'affine4', or 'affine8'"
+        )
+    if scheme in affine_bits and bits != affine_bits[scheme]:
+        raise ValueError(f"{scheme} requires turboquant_kv_bits={affine_bits[scheme]}")
+    if bits not in (2, 2.5, 3, 3.5, 4, 6, 8):
+        raise ValueError("turboquant_kv_bits must be one of 2, 2.5, 3, 3.5, 4, 6, 8")
+
+
 def vlm_mtp_processor_conflicts(data: dict) -> list:
     """Names of settings that need per-request logits processors and
     therefore cannot combine with ``vlm_mtp_enabled``.
@@ -197,8 +210,9 @@ class ModelSettings:
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
-        turboquant_kv_enabled: Enable TurboQuant KV cache compression.
-        turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
+        turboquant_kv_enabled: Enable KV cache compression.
+        turboquant_kv_scheme: Cache format: "turboquant", "affine4", or "affine8".
+        turboquant_kv_bits: Cache bit depth (2/2.5/3/3.5/4/6/8); affine formats require their named depth.
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
         qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
             supported model. Model metadata selects the implementation.
@@ -338,8 +352,9 @@ class ModelSettings:
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
-    # TurboQuant KV cache (mlx-vlm backend)
+    # KV cache compression
     turboquant_kv_enabled: bool = False
+    turboquant_kv_scheme: str = "turboquant"
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
@@ -479,6 +494,9 @@ class ModelSettings:
                 "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
                 "both be True; choose one Qwen3.5 prefill accelerator per model"
             )
+        validate_kv_compression_settings(
+            self.turboquant_kv_scheme, self.turboquant_kv_bits
+        )
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is
@@ -491,7 +509,7 @@ class ModelSettings:
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
-        # or with TurboQuant (which mutates the same cache objects).
+        # or with KV compression (which mutates the same cache objects).
         if self.vlm_mtp_enabled:
             conflicts = [
                 ("dflash_enabled", self.dflash_enabled),
@@ -1184,6 +1202,11 @@ class ModelSettingsManager:
         validate_profile_name(name)
         filtered = filter_profile_fields(settings or {})
         with self._lock:
+            base = self._settings.get(model_id) or ModelSettings()
+            validate_kv_compression_settings(
+                filtered.get("turboquant_kv_scheme", base.turboquant_kv_scheme),
+                filtered.get("turboquant_kv_bits", base.turboquant_kv_bits),
+            )
             per_model = self._profiles.setdefault(model_id, {})
             if name in per_model:
                 raise ValueError(
@@ -1261,6 +1284,13 @@ class ModelSettingsManager:
                 profile["description"] = description
             if settings is not None:
                 profile["settings"] = filter_profile_fields(settings)
+                base = self._settings.get(model_id) or ModelSettings()
+                validate_kv_compression_settings(
+                    profile["settings"].get(
+                        "turboquant_kv_scheme", base.turboquant_kv_scheme
+                    ),
+                    profile["settings"].get("turboquant_kv_bits", base.turboquant_kv_bits),
+                )
             if source_template is not None:
                 profile["source_template"] = source_template or None
             if expose_as_model is not None:

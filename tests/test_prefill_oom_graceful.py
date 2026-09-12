@@ -1134,6 +1134,7 @@ def test_step_prefill_reclaims_before_first_guard(
         "_others_decoding",
         "_should_clear_after_chunk",
         "_accrue_decode_debt",
+        "_trace_prefill_memory",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)

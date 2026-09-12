@@ -1,0 +1,102 @@
+{
+  "model": "Qwen3.6-35B-A3B-oQ4e-mtp",
+  "mode": "affine8",
+  "settings": {
+    "turboquant_kv_enabled": true,
+    "turboquant_kv_scheme": "affine8",
+    "turboquant_kv_bits": 8,
+    "turboquant_skip_last": true,
+    "mtp_enabled": false,
+    "vlm_mtp_enabled": false,
+    "dflash_enabled": false,
+    "specprefill_enabled": false,
+    "qwen35_ane_prefill_enabled": false,
+    "qwen35_oq_a8_enabled": false,
+    "max_context_window": 262144,
+    "max_tokens": 8192
+  },
+  "request": {
+    "model_id": "Qwen3.6-35B-A3B-oQ4e-mtp",
+    "prompt_lengths": [
+      8192
+    ],
+    "generation_length": 4096,
+    "batch_sizes": [],
+    "warmup_mode": "ane_2048",
+    "align_prompt_to_ane": true,
+    "force_lm_engine": false,
+    "context_profile": "code_python"
+  },
+  "bench_id": "bench-ce9cc0208232",
+  "started_at": 1789133949.627584,
+  "result": {
+    "bench_id": "bench-ce9cc0208232",
+    "status": "completed",
+    "context_profile": "code_python",
+    "results": [
+      {
+        "test_type": "single",
+        "pp": 8193,
+        "tg": 4096,
+        "ttft_ms": 3367.2,
+        "tpot_ms": 12.08,
+        "gen_tps": 82.8,
+        "processing_tps": 2433.2,
+        "e2e_latency_s": 52.847,
+        "total_throughput": 232.5,
+        "peak_memory_bytes": 22276863438,
+        "peak_memory_source": "mlx_active",
+        "prompt_tokens": 8193,
+        "completion_tokens": 4096,
+        "cached_tokens": 0,
+        "prompt_sha256": "d70c15dda0e382c1581763c2b052d330210eef5c2424e3a6e3d451391bbffe33",
+        "output_sample": {
+          "sha256": "85894f66a0770136370b51d46e5fdfd723174a76d54b4ff1740a0a3f2300e843",
+          "head": "]\n\n    def _handle_thought(self, text: str) -> str:\n        \"\"\"Handle thought block markers, returning visible text.\"\"\"\n        if not self._in_thought:\n            # Check for thought open marker\n            if text.startswith(_OPEN_MARKER):\n             ",
+          "tail": "intentionally not tracked here \u2014 the\n        # downstream ``ToolCallStreamFilter`` removes it from stream deltas\n        # while ``parse_tool_calls`` still sees the raw markers in\n        # ``output_text`` for extraction.\n        return [\n            _OPEN"
+        },
+        "finish_reason": "length",
+        "generation_policy": "suppress_termination",
+        "system_metrics": {
+          "sample_count": 208,
+          "interval_s": 0.25,
+          "cpu": {
+            "total_avg": 7.1,
+            "total_max": 12.3,
+            "p_avg": 15.8,
+            "e_avg": 2.9
+          },
+          "memory": {
+            "phys_footprint_peak": 22.09,
+            "mlx_active_peak": 20.72,
+            "mlx_cache_peak": 0.87,
+            "system_used_peak": 34.9,
+            "system_wired_peak": 24.81,
+            "total_ram": 48
+          },
+          "gpu": {
+            "util_avg": 97.4,
+            "util_max": 100.0
+          },
+          "thermal": {
+            "start": 0,
+            "max": 0
+          }
+        }
+      }
+    ],
+    "error": null,
+    "upload_state": {
+      "phase": "skipped",
+      "results": [],
+      "total": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "owner_hash": null,
+      "skipped_reason": "ane_aligned_prompt",
+      "skipped_features": [],
+      "feature_flags": []
+    }
+  },
+  "finished_at": 1789134009.697034
+}

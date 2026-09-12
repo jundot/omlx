@@ -1,0 +1,133 @@
+{
+  "model": "Qwen3.8-27B",
+  "source_sha256": "ac60cf2f0cfc2d7ebe32fd832842a9d086a566218226e7330e76d8384d47dd13",
+  "cases": [
+    {
+      "case": "cold",
+      "result": {
+        "id": "chatcmpl-404a3ed9",
+        "object": "chat.completion",
+        "created": 1788785006,
+        "model": "Qwen3.8-27B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "42"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 7098,
+          "completion_tokens": 2,
+          "total_tokens": 7100,
+          "input_tokens": 7098,
+          "output_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "model_load_duration": 2.25,
+          "total_time": 15.51
+        }
+      },
+      "validated": true
+    },
+    {
+      "case": "warm",
+      "result": {
+        "id": "chatcmpl-8287c244",
+        "object": "chat.completion",
+        "created": 1788785009,
+        "model": "Qwen3.8-27B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "42"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 7098,
+          "completion_tokens": 2,
+          "total_tokens": 7100,
+          "input_tokens": 7098,
+          "output_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 6144
+          },
+          "total_time": 2.54
+        }
+      },
+      "validated": true
+    },
+    {
+      "case": "restart",
+      "result": {
+        "id": "chatcmpl-70b931b3",
+        "object": "chat.completion",
+        "created": 1788785066,
+        "model": "Qwen3.8-27B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "42"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 7098,
+          "completion_tokens": 2,
+          "total_tokens": 7100,
+          "input_tokens": 7098,
+          "output_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 6144
+          },
+          "model_load_duration": 2.59,
+          "total_time": 2.85
+        }
+      },
+      "validated": true
+    },
+    {
+      "case": "mtp",
+      "result": {
+        "id": "chatcmpl-fab6c951",
+        "object": "chat.completion",
+        "created": 1788785087,
+        "model": "Qwen3.8-27B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "42 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 7107,
+          "completion_tokens": 53,
+          "total_tokens": 7160,
+          "input_tokens": 7107,
+          "output_tokens": 53,
+          "prompt_tokens_details": {
+            "cached_tokens": 6144
+          },
+          "model_load_duration": 2.11,
+          "total_time": 4.37
+        }
+      },
+      "validated": true
+    }
+  ]
+}

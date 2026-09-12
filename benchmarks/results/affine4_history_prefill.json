@@ -1,0 +1,66 @@
+{
+  "protocol": "BF16 Q/K/V, T=32768, causal prefill; 3 warmups and 11 randomized interleaved rounds. BF16 rotated SDPA is a diagnostic only.",
+  "source_sha256": {
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/affine4.py": "a93c081aa17f5962a8255d57637d75f6b2fb650584faa402e70e909f11b6bf81",
+    "/Users/ariel/opt/3party/mlx-vlm/mlx_vlm/affine4.py": "7bb7196a64d7929298f4f6d0cf394420dca6d37d4cf7053a2bb872b64ed4db80",
+    "/private/tmp/bench_affine4_prefill_history.py": "791c3ea3c7af80630c53fe953d246b19e394d134937e8dcbf0a2a540af85a010"
+  },
+  "rows": [
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 256,
+      "milliseconds": {
+        "current": 74.999708,
+        "vlm_pr": 34.459209,
+        "current_bf16_sdpa_probe": 22.253292,
+        "current_bf16_fused_sdpa_probe": 17.244042,
+        "native_bf16": 16.732084
+      },
+      "bf16_probe_cosine_vs_current": 0.9999812245368958
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 2048,
+      "milliseconds": {
+        "current": 564.015042,
+        "vlm_pr": 110.194125,
+        "current_bf16_sdpa_probe": 100.016541,
+        "current_bf16_fused_sdpa_probe": 101.843166,
+        "native_bf16": 92.508458
+      },
+      "bf16_probe_cosine_vs_current": 0.9999899864196777
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 256,
+      "milliseconds": {
+        "current": 32.5865,
+        "vlm_pr": 19.603208,
+        "current_bf16_sdpa_probe": 13.987084,
+        "current_bf16_fused_sdpa_probe": 11.113958,
+        "native_bf16": 11.306541
+      },
+      "bf16_probe_cosine_vs_current": 0.9999815225601196
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 2048,
+      "milliseconds": {
+        "current": 249.433584,
+        "vlm_pr": 69.829667,
+        "current_bf16_sdpa_probe": 66.170125,
+        "current_bf16_fused_sdpa_probe": 66.060708,
+        "native_bf16": 60.708166
+      },
+      "bf16_probe_cosine_vs_current": 0.9999899864196777
+    }
+  ]
+}

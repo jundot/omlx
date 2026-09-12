@@ -1,0 +1,70 @@
+{
+  "protocol": "BF16 Q/K/V, T=32768, causal prefill; 3 warmups and 11 randomized interleaved rounds. Baseline is commit 423c2d35; current uses direct BF16 unpack and fused SDPA.",
+  "source_sha256": {
+    "/Users/ariel/opt/3party/omlx/.worktrees/generic-affine4/omlx/affine4.py": "df676be78bd668bf2b60f3f33b3a603734a39d40e3639dde52a3a7f8e9c1f533",
+    "/Users/ariel/opt/3party/mlx-vlm/mlx_vlm/affine4.py": "7bb7196a64d7929298f4f6d0cf394420dca6d37d4cf7053a2bb872b64ed4db80",
+    "/private/tmp/bench_affine4_prefill_optimized.py": "2c820dc78da25e7a037ccd45cf84ff1adc4f86767044b0c1f947eafa9d8296d4"
+  },
+  "rows": [
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 256,
+      "milliseconds": {
+        "current": 14.187875,
+        "baseline_fp32": 64.152959,
+        "vlm_pr": 28.914792,
+        "current_bf16_sdpa_probe": 18.658541,
+        "current_bf16_fused_sdpa_probe": 15.283583,
+        "native_bf16": 14.588291
+      },
+      "optimized_cosine_vs_fp32": 0.9999895691871643
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 2048,
+      "milliseconds": {
+        "current": 85.750666,
+        "baseline_fp32": 486.054125,
+        "vlm_pr": 95.391041,
+        "current_bf16_sdpa_probe": 86.538875,
+        "current_bf16_fused_sdpa_probe": 87.310042,
+        "native_bf16": 80.707667
+      },
+      "optimized_cosine_vs_fp32": 0.9999899864196777
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 256,
+      "milliseconds": {
+        "current": 9.084167,
+        "baseline_fp32": 27.187,
+        "vlm_pr": 16.528833,
+        "current_bf16_sdpa_probe": 11.574625,
+        "current_bf16_fused_sdpa_probe": 9.640416,
+        "native_bf16": 9.545375
+      },
+      "optimized_cosine_vs_fp32": 0.999989926815033
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 2048,
+      "milliseconds": {
+        "current": 55.941125,
+        "baseline_fp32": 211.401375,
+        "vlm_pr": 60.180042,
+        "current_bf16_sdpa_probe": 57.122458,
+        "current_bf16_fused_sdpa_probe": 57.142958,
+        "native_bf16": 53.122375
+      },
+      "optimized_cosine_vs_fp32": 0.9999899864196777
+    }
+  ]
+}
