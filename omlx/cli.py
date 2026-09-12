@@ -1379,8 +1379,8 @@ Example directory structure:
         "launch",
         help="Launch an external tool with oMLX integration",
         description=(
-            "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
+            "Configure and launch external coding tools (Claude Code, Claude Desktop, "
+            "Copilot, Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
             "Harness) to use the running oMLX server."
         ),
     )
@@ -1388,7 +1388,7 @@ Example directory structure:
         "tool",
         type=str,
         help=(
-            "Tool to launch: claude, copilot, codex, codex_app, opencode, "
+            "Tool to launch: claude, claude_desktop, copilot, codex, codex_app, opencode, "
             "openclaw, hermes, pi, dsh, or 'list' to show available"
         ),
     )
