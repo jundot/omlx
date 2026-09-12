@@ -492,6 +492,8 @@ def test_cluster_peer_probe_route(monkeypatch):
 
 
 def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch):
+    from omlx.cluster.launch import RemoteAdmissionProbeResult
+
     gib = 1024**3
     asked = {}
     monkeypatch.setattr(
@@ -500,9 +502,12 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     )
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
+        "probe_remote_admission_details",
         lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 213 * gib + 123
+            asked.update(ssh=ssh, python=python_executable)
+            or RemoteAdmissionProbeResult(
+                admission_ceiling_bytes=213 * gib + 123
+            )
         ),
     )
 
@@ -539,6 +544,8 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
 def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
     monkeypatch,
 ):
+    from omlx.cluster.launch import RemoteAdmissionProbeResult
+
     """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
 
     gib = 1024**3
@@ -549,9 +556,10 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
     )
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
+        "probe_remote_admission_details",
         lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 64 * gib
+            asked.update(ssh=ssh, python=python_executable)
+            or RemoteAdmissionProbeResult(admission_ceiling_bytes=64 * gib)
         ),
     )
 
@@ -567,12 +575,99 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
     assert asked == {"ssh": "studio.local", "python": None}
 
 
+def test_cluster_node_budgets_rejects_invalid_remote_memory_guard_tier(monkeypatch):
+    from omlx.cluster.launch import RemoteAdmissionProbeResult
+
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_details",
+        lambda ssh, *, python_executable: RemoteAdmissionProbeResult(
+            admission_ceiling_bytes=64 * 1024**3,
+            memory_guard_tier="not-a-tier",
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={"hosts": [{"node_id": "peer", "ssh": "studio.local"}]},
+    )
+
+    assert response.status_code == 503
+    assert "unknown memory guard tier" in response.json()["detail"]
+
+
+def test_custom_memory_guard_ceiling_survives_plan_and_replan_round_trip():
+    from omlx.cluster.deployment import (
+        ClusterDeployment,
+        ClusterHost,
+        decode_worker_plan,
+    )
+    from omlx.cluster.planner import plan_unequal_pipeline, synthetic_model_layout
+    from omlx.cluster.replan import nodes_from_deployment
+
+    gib = 1024**3
+    peer_request = routes.ClusterPlanNodeRequest.model_validate({
+        "node_id": "peer",
+        "capacity_bytes": 128 * gib,
+        "reserve_bytes": 8 * gib,
+        "role": "headless",
+        "memory_guard_tier": "custom",
+        "memory_guard_custom_ceiling_gb": 44.0,
+    })
+    nodes = routes._node_budgets([
+        routes.ClusterPlanNodeRequest(
+            node_id="local",
+            capacity_bytes=128 * gib,
+            reserve_bytes=8 * gib,
+        ),
+        peer_request,
+    ])
+    assert nodes[1].memory_guard_custom_ceiling_gb == 44.0
+
+    plan = plan_unequal_pipeline(
+        synthetic_model_layout(total_weight_bytes=100 * gib, layer_count=2),
+        nodes,
+    )
+    payload = routes._plan_with_signature(plan.to_dict())
+    peer_assignment = next(
+        item
+        for item in payload["assignments"]
+        if item["node_id"] == "peer"
+    )
+    assert peer_assignment["memory_guard_custom_ceiling_gb"] == 44.0
+
+    deployment = ClusterDeployment(
+        deployment_id="custom-ceiling",
+        model="org/model",
+        backend="ring",
+        hosts=(
+            ClusterHost("local", "127.0.0.1", ("10.0.0.1",)),
+            ClusterHost("peer", "peer.local", ("10.0.0.2",)),
+        ),
+        assignments=plan.assignments,
+        plan_hash=plan.plan_hash,
+    )
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+    _, decoded = decode_worker_plan(deployment.encode_worker_plan())
+    assert [
+        item.memory_guard_custom_ceiling_gb
+        for item in restored.assignments
+        if item.node_id == "peer"
+    ] == [44.0]
+    assert [
+        item.memory_guard_custom_ceiling_gb
+        for item in decoded
+        if item.node_id == "peer"
+    ] == [44.0]
+    replan_nodes = nodes_from_deployment(restored)
+    assert replan_nodes[1]["memory_guard_custom_ceiling_gb"] == 44.0
+
 def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     called = []
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
-        lambda ssh: called.append(ssh),
+        "probe_remote_admission_details",
+        lambda ssh, **kw: called.append(ssh),
     )
 
     response = _client().post(
