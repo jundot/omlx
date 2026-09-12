@@ -14,7 +14,7 @@ import secrets
 import shlex
 import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Container, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
@@ -1028,12 +1028,13 @@ def assess_link(
 # ---------------------------------------------------------------------------
 
 # Two hosts can carry these at once without being able to reach each other:
-# loopback is per-host, and a 169.254 address means DHCP failed, so unrelated
-# Macs agree on the subnet and on nothing else.
+# loopback is per-host, and a 169.254 address on ordinary ethernet means DHCP
+# failed. Thunderbolt/RDMA interfaces legitimately use self-assigned 169.254
+# point-to-point links on macOS, which are allowed when attached to those devices.
 _UNROUTABLE_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
 )
+_LINK_LOCAL_NETWORK = ipaddress.ip_network("169.254.0.0/16")
 
 # Which shared link to prefer when hosts have several. RDMA over Thunderbolt
 # beats plain Thunderbolt beats whatever else routes.
@@ -1126,7 +1127,11 @@ def _prefix_length(token: str) -> int | None:
         return None
 
 
-def _interface_address(interface: str, fields: list[str]) -> InterfaceAddress | None:
+def _interface_address(
+    interface: str,
+    fields: list[str],
+    allowed_link_local_interfaces: Container[str] = (),
+) -> InterfaceAddress | None:
     """One ``inet`` line of ifconfig output, or None if it cannot carry a link."""
 
     try:
@@ -1134,6 +1139,8 @@ def _interface_address(interface: str, fields: list[str]) -> InterfaceAddress | 
     except ValueError:
         return None
     if any(address in network for network in _UNROUTABLE_NETWORKS):
+        return None
+    if address in _LINK_LOCAL_NETWORK and interface not in allowed_link_local_interfaces:
         return None
     prefix_length = 32
     if "netmask" in fields:
@@ -1145,7 +1152,10 @@ def _interface_address(interface: str, fields: list[str]) -> InterfaceAddress | 
     return InterfaceAddress(interface, str(address), prefix_length)
 
 
-def parse_interface_addresses(output: str) -> tuple[InterfaceAddress, ...]:
+def parse_interface_addresses(
+    output: str,
+    allowed_link_local_interfaces: Container[str] = (),
+) -> tuple[InterfaceAddress, ...]:
     """Routable IPv4 addresses per interface, from ``ifconfig -a`` output.
 
     Addresses on a down interface are dropped: ifconfig keeps listing them, and
@@ -1167,7 +1177,11 @@ def parse_interface_addresses(output: str) -> tuple[InterfaceAddress, ...]:
         fields = line.split()
         if not interface or not is_up or len(fields) < 2 or fields[0] != "inet":
             continue
-        entry = _interface_address(interface, fields)
+        entry = _interface_address(
+            interface,
+            fields,
+            allowed_link_local_interfaces=allowed_link_local_interfaces,
+        )
         if entry is not None:
             addresses.append(entry)
     return tuple(addresses)
@@ -1248,7 +1262,17 @@ def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
     already know the name of.
     """
 
-    addresses = parse_interface_addresses(_read(ssh_hostname, ["ifconfig", "-a"]))
+    rdma_interfaces = frozenset(
+        device.removeprefix("rdma_") for device in _rdma_devices(ssh_hostname)
+    )
+    thunderbolt_interfaces = parse_thunderbolt_interfaces(
+        _read(ssh_hostname, ["networksetup", "-listallhardwareports"])
+    )
+    allowed_link_local = rdma_interfaces | thunderbolt_interfaces
+    addresses = parse_interface_addresses(
+        _read(ssh_hostname, ["ifconfig", "-a"]),
+        allowed_link_local_interfaces=allowed_link_local,
+    )
     if not addresses:
         addresses = parse_linux_ip_addresses(
             _read(ssh_hostname, ["ip", "-o", "-4", "address", "show", "up"])
@@ -1256,12 +1280,8 @@ def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
     return HostInterfaces(
         host=ssh_hostname,
         addresses=addresses,
-        rdma_interfaces=frozenset(
-            device.removeprefix("rdma_") for device in _rdma_devices(ssh_hostname)
-        ),
-        thunderbolt_interfaces=parse_thunderbolt_interfaces(
-            _read(ssh_hostname, ["networksetup", "-listallhardwareports"])
-        ),
+        rdma_interfaces=rdma_interfaces,
+        thunderbolt_interfaces=thunderbolt_interfaces,
     )
 
 
