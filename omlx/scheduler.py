@@ -1871,6 +1871,9 @@ class Scheduler:
         # For ArraysCache-only models (no RotatingKVCache), use a larger block
         # size to reduce boundary snapshot overhead during prefill.
         self._enlarge_block_size_for_arrays_cache()
+        # Escape hatch for workloads the two heuristics above size badly.
+        # Must run last: it is the final say on block size.
+        self._apply_block_size_env_override()
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
@@ -2846,6 +2849,54 @@ class Scheduler:
     # e.g. a 4096-token block cannot serve a 3k-token prefix. A geometry change
     # also leaves old SSD blocks cold until normal eviction removes them.
     _ARRAYS_CACHE_BLOCK_SIZE = 2048
+
+    def _apply_block_size_env_override(self) -> None:
+        """Honor OMLX_PAGED_CACHE_BLOCK_SIZE, overriding the resolved value.
+
+        The rotating-window and ArraysCache heuristics above pick a block size
+        from model geometry alone. Geometry does not describe the request
+        shape, so a workload whose turns are shorter than the resolved block
+        can end up storing no whole blocks at all — a prefix is only reusable
+        in whole blocks — and re-prefilling every turn. This is the escape
+        hatch for that case, and for A/B measuring block size on a fixed
+        model.
+
+        Runs last so it wins over both heuristics. Defaults are unchanged when
+        the variable is unset. Applies only when the paged cache is enabled,
+        matching the gate on _enlarge_block_size_for_arrays_cache. Invalid
+        values are ignored with a warning rather than raising, so a bad export
+        cannot take the server down.
+        """
+        if not self.config.paged_ssd_cache_dir:
+            return
+        raw = os.environ.get("OMLX_PAGED_CACHE_BLOCK_SIZE", "").strip()
+        if not raw:
+            return
+        try:
+            requested = int(raw)
+        except ValueError:
+            logger.warning(
+                "Ignoring OMLX_PAGED_CACHE_BLOCK_SIZE=%r (not an integer)", raw
+            )
+            return
+        if requested <= 0 or requested & (requested - 1):
+            logger.warning(
+                "Ignoring OMLX_PAGED_CACHE_BLOCK_SIZE=%d "
+                "(must be a positive power of two)",
+                requested,
+            )
+            return
+        current = self.config.paged_cache_block_size
+        if requested == current:
+            return
+        logger.info(
+            "OMLX_PAGED_CACHE_BLOCK_SIZE override: paged cache block_size "
+            "%s -> %s (smaller blocks raise prefix reuse on short turns but "
+            "add boundary snapshot overhead on ArraysCache hybrids)",
+            current,
+            requested,
+        )
+        self.config.paged_cache_block_size = requested
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
         """Enlarge block size for ArraysCache-only hybrid models.
