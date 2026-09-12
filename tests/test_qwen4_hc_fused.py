@@ -463,6 +463,62 @@ def test_prefill_path_not_offered_for_fused_rows():
     assert not hc_fused.prefill_compatible(module, x)
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [1, 2, 4, 6])
+@pytest.mark.parametrize("use_combine", [False, True])
+def test_m4_compiled_hc_matches_eager_and_reads_replaced_weights(
+    monkeypatch, rows, use_combine
+):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(8, use_combine, dense_inject=use_combine)
+    x = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
+    first = None
+    for replace_weights in (False, True):
+        if replace_weights:
+            # The synthetic Q8 weights can saturate the sigmoid. Zeroing the
+            # up projection moves every gate to 0.5 and must affect the output.
+            up = module.input_mix_weight_up
+            up.scales = mx.zeros_like(up.scales)
+            up.biases = mx.zeros_like(up.biases)
+        monkeypatch.setattr(hc_fused, "_m4_max", lambda: False)
+        eager = hc_fused.fused_forward(module, x)
+        monkeypatch.setattr(hc_fused, "_m4_max", lambda: True)
+        compiled = hc_fused.fused_forward(module, x)
+        mx.eval(eager, compiled)
+        a = eager if use_combine else [eager]
+        b = compiled if use_combine else [compiled]
+        assert all(mx.array_equal(v, ref).item() for v, ref in zip(a, b))
+        if first is None:
+            first = b[0]
+        else:
+            assert not mx.array_equal(first, b[0]).item()
+
+
+@pytest.mark.parametrize(
+    "m4,rows,down_bits,up_bits,inject_bits,expected",
+    [
+        (True, 4, 8, 8, 16, True),
+        (True, 4, 8, 8, None, True),
+        (False, 4, 8, 8, 16, False),
+        (True, 7, 8, 8, 16, False),
+        (True, 4, 5, 8, 16, False),
+        (True, 4, 8, 6, 16, False),
+        (True, 4, 8, 8, 8, False),
+    ],
+)
+def test_hc_compilation_stays_within_measured_m4_layout(
+    monkeypatch, m4, rows, down_bits, up_bits, inject_bits, expected
+):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    monkeypatch.setattr(hc_fused, "_m4_max", lambda: m4)
+    _, signature = hc_fused._fused_plan(
+        mx.bfloat16, 4, 2560, 320, rows, down_bits, up_bits, inject_bits
+    )
+    assert signature[-1] is expected
+
+
 def test_prefill_path_kill_switch(monkeypatch):
     from mlx_vlm.models.qwen4_exp import hc_fused
 

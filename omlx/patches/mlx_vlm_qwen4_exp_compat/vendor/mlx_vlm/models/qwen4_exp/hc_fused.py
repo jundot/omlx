@@ -7,6 +7,10 @@ and affine group-size-64 projections with 4/5/6/8-bit weights. The small block
 injection projection may also use its original BF16 weights. FP32 epilogues
 can round differently from the canonical BF16 operations.
 
+On M4 Max, the measured Q8/BF16 layout uses a compiled three-kernel call and
+16-column up tiles at widths 1..6. Weights remain explicit graph inputs, so
+replacing a module's parameters cannot reuse constants from an older model.
+
 Each kernel specialization is evaluated once inside the failure handler to
 catch lazy compilation errors. Later calls stay lazy; errors during their
 external evaluation propagate to the caller. Disable with OMLX_QWEN4_HC_FUSED=0.
@@ -14,6 +18,7 @@ external evaluation propagate to the caller. Disable with OMLX_QWEN4_HC_FUSED=0.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -34,6 +39,7 @@ _DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
     "off",
 }
 _KERNELS: dict[str, object] = {}
+_FORWARDS: dict[tuple, object] = {}
 _VALIDATED: set[tuple] = set()
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
@@ -203,7 +209,7 @@ _D_SOURCE = r"""
 _U_SOURCE = r"""
     const uint g = threadgroup_position_in_grid.y;
     const uint t = thread_index_in_threadgroup;
-    const int h = int(g) * 64 + int(t >> 2);
+    const int h = int(g) * TILE_H + int(t >> 2);
     const int s = int(t & 3);
     const int n = s * H + h;
     constexpr int PF = hc_pack_factor<BITS_U>();
@@ -387,10 +393,10 @@ def _eps_array(module) -> mx.array:
     return eps
 
 
-def _kernel_norm(module, flat, rows, hc, hidden, dtype):
+def _kernel_norm(norm_weight, eps, flat, rows, hc, hidden, dtype):
     width = hc * hidden
     return _kernel("omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE)(
-        inputs=[flat, module.hc_norm.weight, _eps_array(module)],
+        inputs=[flat, norm_weight, eps],
         template=[("T", dtype), ("K", width), ("H", hidden)],
         grid=(256, hc, rows),
         threadgroup=(256, 1, 1),
@@ -457,6 +463,125 @@ def prefill_forward(module, hyper_input):
         return None
 
 
+@functools.lru_cache(maxsize=1)
+def _m4_max() -> bool:
+    return mx.device_info().get("device_name") == "Apple M4 Max"
+
+
+def _launch_fused(
+    flat,
+    norm_weight,
+    eps,
+    down_w,
+    down_s,
+    down_b,
+    up_w,
+    up_s,
+    up_b,
+    inject_w,
+    inject_s,
+    inject_b,
+    *,
+    dtype,
+    hc,
+    hidden,
+    lowrank,
+    rows,
+    down_bits,
+    up_bits,
+    inject_bits,
+    dense_inject,
+    has_inject,
+    tile,
+):
+    """Pure array graph: weights stay explicit inputs to compiled calls."""
+    width = hc * hidden
+    normed = _kernel_norm(norm_weight, eps, flat, rows, hc, hidden, dtype)
+    act, injection = _kernel(
+        "omlx_qwen4_hc_fused_down",
+        ["xn", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"],
+        ["act", "inj"],
+        _D_SOURCE,
+        header=_HEADER,
+    )(
+        inputs=[normed, down_w, down_s, down_b, inject_w, inject_s, inject_b],
+        template=[
+            ("T", dtype),
+            ("BITS_D", down_bits),
+            (
+                "BITS_I",
+                (
+                    inject_bits
+                    if has_inject and not dense_inject
+                    else down_bits
+                ),
+            ),
+            ("DENSE_I", dense_inject),
+            ("K", width),
+            ("R", lowrank),
+            ("HC", hc),
+            ("INJ", 1 if has_inject else 0),
+        ],
+        grid=(32, 8 * (lowrank // 8 + 1), rows),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(rows, lowrank), (rows, hc)],
+        output_dtypes=[dtype, dtype],
+    )
+    mixed = _kernel(
+        "omlx_qwen4_hc_fused_up",
+        ["xn", "act", "up_w", "up_s", "up_b"],
+        ["mixed"],
+        _U_SOURCE,
+        header=_HEADER,
+    )(
+        inputs=[normed, act, up_w, up_s, up_b],
+        template=[
+            ("T", dtype),
+            ("BITS_U", up_bits),
+            ("K", width),
+            ("R", lowrank),
+            ("HC", hc),
+            ("H", hidden),
+            ("S", rows),
+            ("TILE_H", tile),
+        ],
+        grid=(4 * tile, hidden // tile, 1),
+        threadgroup=(4 * tile, 1, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[dtype],
+    )[0]
+    return mixed, injection
+
+
+def _fused_plan(dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits):
+    # Only change dispatch for the M4 Max geometry measured with actual weights.
+    # Other layouts keep the existing eager three-kernel path and 64-column tile.
+    compiled = (
+        hidden == 2560
+        and lowrank == 320
+        and rows <= 6
+        and down_bits == up_bits == 8
+        and inject_bits in (None, 16)
+        and _m4_max()
+    )
+    tile = 16 if compiled else 64
+    signature = (
+        dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits, compiled,
+    )
+    forward = _FORWARDS.get(signature)
+    if forward is None:
+        forward = functools.partial(
+            _launch_fused, dtype=dtype, hc=hc, hidden=hidden, lowrank=lowrank,
+            rows=rows, down_bits=down_bits, up_bits=up_bits,
+            inject_bits=inject_bits, dense_inject=inject_bits == 16,
+            has_inject=inject_bits is not None, tile=tile,
+        )
+        if compiled:
+            forward = mx.compile(forward)
+        _FORWARDS[signature] = forward
+    return forward, signature
+
+
 def fused_forward(module, hyper_input):
     """Return fused outputs, or None on construction or first-evaluation failure."""
     global _RUNTIME_FAILED, _FAILURE_LOGGED
@@ -473,7 +598,6 @@ def fused_forward(module, hyper_input):
         )
         flat = hyper_input.reshape(rows, width)
         dtype = hyper_input.dtype
-        normed = _kernel_norm(module, flat, rows, hc, hidden, dtype)
         if dense_inject:
             # Scale/bias arguments are unused in the dense specialization.
             inject_tensors = (inject.weight, down.scales, down.biases)
@@ -481,69 +605,13 @@ def fused_forward(module, hyper_input):
             inject_tensors = (inject.weight, inject.scales, inject.biases)
         else:
             inject_tensors = (down.weight, down.scales, down.biases)
-        act, injection = _kernel(
-            "omlx_qwen4_hc_fused_down",
-            ["xn", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"],
-            ["act", "inj"],
-            _D_SOURCE,
-            header=_HEADER,
-        )(
-            inputs=[normed, down.weight, down.scales, down.biases, *inject_tensors],
-            template=[
-                ("T", dtype),
-                ("BITS_D", down.bits),
-                (
-                    "BITS_I",
-                    (
-                        inject_bits
-                        if inject is not None and not dense_inject
-                        else down.bits
-                    ),
-                ),
-                ("DENSE_I", dense_inject),
-                ("K", width),
-                ("R", lowrank),
-                ("HC", hc),
-                ("INJ", 1 if inject is not None else 0),
-            ],
-            grid=(32, 8 * (lowrank // 8 + 1), rows),
-            threadgroup=(32, 8, 1),
-            output_shapes=[(rows, lowrank), (rows, hc)],
-            output_dtypes=[dtype, dtype],
+        forward, signature = _fused_plan(
+            dtype, hc, hidden, lowrank, rows, down.bits, up.bits, inject_bits,
         )
-        mixed = _kernel(
-            "omlx_qwen4_hc_fused_up",
-            ["xn", "act", "up_w", "up_s", "up_b"],
-            ["mixed"],
-            _U_SOURCE,
-            header=_HEADER,
-        )(
-            inputs=[normed, act, up.weight, up.scales, up.biases],
-            template=[
-                ("T", dtype),
-                ("BITS_U", up.bits),
-                ("K", width),
-                ("R", lowrank),
-                ("HC", hc),
-                ("H", hidden),
-                ("S", rows),
-            ],
-            grid=(256, hidden // 64, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(rows, hidden)],
-            output_dtypes=[dtype],
-        )[
-            0
-        ]
-        signature = (
-            dtype,
-            hc,
-            hidden,
-            lowrank,
-            rows,
-            down.bits,
-            up.bits,
-            inject_bits,
+        mixed, injection = forward(
+            flat, module.hc_norm.weight, _eps_array(module),
+            down.weight, down.scales, down.biases,
+            up.weight, up.scales, up.biases, *inject_tensors,
         )
         if signature not in _VALIDATED:
             # Metal compilation is lazy. Validate once, without synchronizing
