@@ -1769,6 +1769,113 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
     assert later_owner.mtp is not None
 
 
+@pytest.mark.parametrize("tied", [False, True])
+def test_qwen4_dedicated_mtp_head_preserves_target_and_hidden(tied):
+    """A proposal head may change logits, never the target or MTP cache math."""
+    config = _tiny_config()
+    config.text_config.tie_word_embeddings = tied
+    config.text_config.mtp_use_dedicated_lm_head = True
+    model, owner = _make_bound_qwen4_language_model(config)
+    tokens = mx.array([[2, 3, 4]], dtype=mx.int32)
+    before = model(tokens, cache=model.make_cache(), return_hidden=True)
+    hidden = before.hidden_states[-1]
+    next_ids = mx.array([[5, 6, 7]], dtype=mx.uint32)
+    mixed, expected_hidden = owner.mtp(
+        hidden, next_ids, model.model.embed_tokens, model.make_mtp_cache()
+    )
+    expected = owner.mtp.lm_head(mixed[:, -2:])
+    actual, actual_hidden = model.mtp_forward(
+        hidden, next_ids, model.make_mtp_cache(),
+        return_hidden=True, logits_keep=2,
+    )
+    mx.eval(before.logits, expected, actual, expected_hidden, actual_hidden)
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(actual_hidden, expected_hidden).item()
+
+    # A conspicuous proposal-only change must remain invisible to target logits.
+    owner.mtp.lm_head.weight = mx.zeros_like(owner.mtp.lm_head.weight)
+    proposal = model.mtp_forward(
+        hidden, next_ids, model.make_mtp_cache(), logits_keep=2
+    )
+    after = model(tokens, cache=model.make_cache(), return_hidden=True).logits
+    mx.eval(proposal, after)
+    assert mx.array_equal(proposal, mx.zeros_like(proposal)).item()
+    assert not mx.array_equal(actual, proposal).item()
+    assert mx.array_equal(before.logits, after).item()
+
+    # A declared head must not silently fall back if its module disappears.
+    del owner.mtp.lm_head
+    with pytest.raises(AttributeError):
+        model.mtp_forward(hidden, next_ids, model.make_mtp_cache())
+
+
+def test_qwen4_default_mtp_still_uses_target_head():
+    config = _tiny_config()
+    model, owner = _make_bound_qwen4_language_model(config)
+    assert not config.text_config.mtp_use_dedicated_lm_head
+    assert not hasattr(owner.mtp, "lm_head")
+    hidden = mx.ones((1, 1, 64))
+    tokens = mx.array([[7]], dtype=mx.uint32)
+    mixed, _ = owner.mtp(
+        hidden, tokens, model.model.embed_tokens, model.make_mtp_cache()
+    )
+    expected = model.lm_head(mixed)
+    actual = model.mtp_forward(hidden, tokens, model.make_mtp_cache())
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_qwen4_quantized_dedicated_mtp_head_roundtrip(tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpMTPModule
+
+    config = _tiny_config()
+    config.text_config.mtp_use_dedicated_lm_head = True
+    head = Qwen4ExpMTPModule(config.text_config)
+    nn.quantize(head, group_size=32, bits=4, class_predicate=lambda p, m: p == "lm_head")
+    weights = dict(tree_flatten(head.parameters()))
+    path = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(str(path), weights)
+    restored = Qwen4ExpMTPModule(config.text_config)
+    nn.quantize(restored, group_size=32, bits=4, class_predicate=lambda p, m: p == "lm_head")
+    restored.load_weights(list(mx.load(str(path)).items()), strict=True)
+    assert restored.lm_head.weight.dtype == mx.uint32
+    inputs = mx.random.normal((1, 3, 32))
+    before, after = head.lm_head(inputs), restored.lm_head(inputs)
+    mx.eval(before, after)
+    assert mx.array_equal(before, after).item()
+
+
+def test_qwen4_declared_draft_head_requires_checkpoint_weights(tmp_path):
+    config = _tiny_config()
+    config.text_config.mtp_use_dedicated_lm_head = True
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        model = Model(config)
+        with pytest.raises(ValueError, match="requires checkpoint weights"):
+            model.sanitize({"mtp.fc_hidden.weight": mx.eye(32)})
+        # Source-prefixed head keys are normalized before the requirement check.
+        sanitized = model.sanitize({
+            "model.language_model.mtp.lm_head.weight": mx.zeros((64, 32)),
+        })
+        assert "mtp.lm_head.weight" in sanitized
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+    # Turning MTP off still permits ordinary target-only serving of this file.
+    model = Model(config)
+    assert not hasattr(model, "mtp")
+    sanitized = model.sanitize({"mtp.lm_head.weight": mx.zeros((64, 32))})
+    assert "mtp.lm_head.weight" not in sanitized
+
+
 def _disk_ple(tmp_path, *, shards, rows, dims, bits=None):
     """Write a sharded PLE table (affine-packed when ``bits`` is set, else dense bf16) and open it from disk."""
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()

@@ -63,6 +63,9 @@ class TextConfig(BaseModelConfig):
     norm_topk_prob: bool = True
     mtp_num_hidden_layers: int = 1
     mtp_use_dedicated_embeddings: bool = False
+    # Optional checkpoint head used for proposals only. Target verification
+    # retains the normal language-model head (or tied token embeddings).
+    mtp_use_dedicated_lm_head: bool = False
     mtp: Optional[Dict] = None
     eos_token_id: Optional[Union[int, List[int]]] = None
     tie_word_embeddings: bool = False
