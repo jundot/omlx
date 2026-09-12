@@ -189,12 +189,16 @@ def open_system_tcp_proxy(
     executable = _system_python()
     if executable is None:
         raise RuntimeError("system Python control proxy is unavailable")
+    proxy_env = os.environ.copy()
+    proxy_env.pop("PYTHONHOME", None)
+    proxy_env.pop("PYTHONPATH", None)
     process = subprocess.Popen(
         [executable, "-u", "-c", _PROXY_PROGRAM, host, str(port), str(timeout)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
+        env=proxy_env,
     )
     stream: socket.socket | None = None
     try:
