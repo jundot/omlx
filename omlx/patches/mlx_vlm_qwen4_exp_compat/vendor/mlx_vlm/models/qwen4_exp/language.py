@@ -36,6 +36,7 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa_decode,
     pool_completed_index_keys,
 )
+from .qsa_mask import fused_block_mask
 from . import hc_fused
 
 logger = logging.getLogger(__name__)
@@ -1234,6 +1235,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
             mx.array(True),
             axis=-1,
         )
+        fused_mask = fused_block_mask(
+            block_hits, complete_counts, query_ends,
+            self.compress_ratio, self.block_topk, key_len,
+        )
+        if fused_mask is not None:
+            return fused_mask
         selected_tokens = mx.repeat(block_hits, self.compress_ratio, axis=-1)
         if complete_key_len < key_len:
             selected_tokens = mx.concatenate(
