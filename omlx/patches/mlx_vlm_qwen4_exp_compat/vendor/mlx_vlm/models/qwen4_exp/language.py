@@ -9,15 +9,17 @@ import struct
 import time
 import weakref
 from bisect import bisect_right
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
 
 from .cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
@@ -1918,6 +1920,43 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 # Prefetch unseen pages concurrently to overlap SSD reads; keep mmap as the
 # data path. Remembering pages avoids repeating thread-pool work on warm reads.
 # os.pread releases the GIL and does not change the shared file position.
+_PLE_OWNER_PID = os.getpid()
+# Serialize descriptor publication/cleanup across fork, not row reads. These
+# module callbacks retain no readers; child cleanup never takes inherited locks.
+_PLE_RESOURCE_LOCK = RLock()
+
+
+def _ple_before_fork():
+    _PLE_RESOURCE_LOCK.acquire()
+
+
+def _ple_after_fork_parent():
+    _PLE_RESOURCE_LOCK.release()
+
+
+def _ple_after_fork_child():
+    global _PLE_RESOURCE_LOCK
+    _PLE_RESOURCE_LOCK = RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_ple_before_fork,
+        after_in_parent=_ple_after_fork_parent,
+        after_in_child=_ple_after_fork_child,
+    )
+
+
+def _ple_require_owner(owner_pid=None):
+    if os.getpid() != _PLE_OWNER_PID or (
+        owner_pid is not None and os.getpid() != owner_pid
+    ):
+        raise RuntimeError(
+            "SSD-backed Qwen4 PLE cannot be used after fork; "
+            "start a fresh process (spawn) and load the model there"
+        )
+
+
 _PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
@@ -1931,30 +1970,54 @@ class _SafeTensorMMap:
     """Read selected dense or affine-packed rows without resident weights."""
 
     def __init__(self, path: Path):
+        _ple_require_owner()
+        self._owner_pid = os.getpid()
+        self._resource_lock = Lock()
         self.path = path
-        self._file = path.open("rb")
-        header_size = struct.unpack("<Q", self._file.read(8))[0]
-        self._header = json.loads(self._file.read(header_size))
-        self._data_start = 8 + header_size
-        self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-        self._seen_pages = bytearray(
-            1 + (max(path.stat().st_size, 1) - 1) // _PLE_PAGE_SIZE
-        )
-        self._last_rearm = 0.0
-        self._rearm_count = 0
-        try:
-            self._mapping.madvise(mmap.MADV_RANDOM)
-        except (AttributeError, OSError):
-            pass
+        self._file = None
+        self._mapping = None
+        with _PLE_RESOURCE_LOCK:
+            try:
+                # FileIO has no buffered-reader mutex inherited from another thread.
+                self._file = path.open("rb", buffering=0)
+                header_size = struct.unpack("<Q", self._file.read(8))[0]
+                self._header = json.loads(self._file.read(header_size))
+                self._data_start = 8 + header_size
+                self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+                self._seen_pages = bytearray(
+                    1 + (max(path.stat().st_size, 1) - 1) // _PLE_PAGE_SIZE
+                )
+                self._last_rearm = 0.0
+                self._rearm_count = 0
+                try:
+                    self._mapping.madvise(mmap.MADV_RANDOM)
+                except (AttributeError, OSError):
+                    pass
+            except BaseException:
+                self._close_resources()
+                raise
+        register_ple_resource(self)
+
+    def _require_owner(self):
+        _ple_require_owner(self._owner_pid)
 
     def tensor_shape(self, key: str) -> tuple[int, ...]:
+        self._require_owner()
         return tuple(self._header[key]["shape"])
 
     def tensor_dtype(self, key: str) -> str:
+        self._require_owner()
         return str(self._header[key]["dtype"])
 
     def rows_np(self, key: str, rows) -> tuple[np.ndarray, str]:
         """Copy the requested rows out of the mapping; returns the raw array and the safetensors dtype."""
+        self._require_owner()
+        with self._resource_lock:
+            if self._mapping is None or self._file is None:
+                raise RuntimeError("SSD-backed Qwen4 PLE reader is closed")
+            return self._rows_np_owned(key, rows)
+
+    def _rows_np_owned(self, key, rows):
         entry = self._header[key]
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
@@ -2007,6 +2070,7 @@ class _SafeTensorMMap:
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
+        self._require_owner()
         offsets = base_offset + row_indices * row_bytes
         needed_pages = np.unique(
             np.concatenate(
@@ -2028,7 +2092,17 @@ class _SafeTensorMMap:
                     break
                 remaining -= len(chunk)
 
-        list(_PLE_IO_POOL.map(touch, (int(page) for page in fresh.tolist())))
+        # #3602 (Matt Barnson) uses submit/wait to drain failed page batches.
+        # Also drain partial submission here before releasing the reader mutex;
+        # otherwise close could recycle an FD still used by another page read.
+        futures = []
+        try:
+            for page in fresh.tolist():
+                futures.append(_PLE_IO_POOL.submit(touch, int(page)))
+            for future in futures:
+                future.result()
+        finally:
+            wait(futures)
         for page in fresh.tolist():
             self._seen_pages[page] = 1
         return False
@@ -2054,13 +2128,26 @@ class _SafeTensorMMap:
             self._rearm_count,
         )
 
+    def _close_resources(self):
+        # Caller owns the module resource lock. On exported views leave the mmap
+        # attached for a later retry, but release the file descriptor exactly once.
+        try:
+            if self._mapping is not None:
+                self._mapping.close()
+                self._mapping = None
+        finally:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
     def close(self):
-        if self._mapping is not None:
-            self._mapping.close()
-            self._mapping = None
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+        if os.getpid() != self._owner_pid:
+            with _PLE_RESOURCE_LOCK:
+                self._close_resources()
+            return
+        with self._resource_lock:
+            with _PLE_RESOURCE_LOCK:
+                self._close_resources()
 
 
 class DiskBackedShardedEmbedding(nn.Module):
@@ -2074,7 +2161,9 @@ class DiskBackedShardedEmbedding(nn.Module):
         dims: int,
         num_shards: int,
     ):
+        _ple_require_owner()
         super().__init__()
+        self._owner_pid = os.getpid()
         base, remainder = divmod(num_embeddings, num_shards)
         self.shard_sizes = tuple(
             base + (1 if index < remainder else 0) for index in range(num_shards)
@@ -2102,6 +2191,7 @@ class DiskBackedShardedEmbedding(nn.Module):
             int, tuple[str, str | None, str | None, int | None, int | None]
         ] = {}
 
+        register_ple_resource(self, priority=1)
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
         weight_map = json.loads(index_path.read_text()).get("weight_map", {})
@@ -2262,7 +2352,11 @@ class DiskBackedShardedEmbedding(nn.Module):
                 buffer[positions] = copied
         return buffers
 
+    def _require_owner(self):
+        _ple_require_owner(self._owner_pid)
+
     def _host_indices(self, indices: mx.array) -> np.ndarray:
+        self._require_owner()
         flat = indices.reshape(-1)
         mx.eval(flat)
         host = np.asarray(flat.astype(mx.int64)).reshape(-1)
@@ -2294,6 +2388,13 @@ class DiskBackedShardedEmbedding(nn.Module):
             )
 
     def __call__(self, indices: mx.array) -> mx.array:
+        self._require_owner()
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                raise RuntimeError("SSD-backed Qwen4 PLE embedding is closed")
+            return self._call_owned(indices)
+
+    def _call_owned(self, indices):
         shape = indices.shape
         host = self._host_indices(indices)
         if host.size == 0:
@@ -2328,6 +2429,7 @@ class DiskBackedShardedEmbedding(nn.Module):
 
     def _gather_per_shard(self, host_indices: list[int], shape) -> mx.array:
         """Fallback for tables whose touched shards differ in dtype or quantization."""
+        self._require_owner()
         shard_indices = [
             bisect_right(self.shard_offsets, index) - 1 for index in host_indices
         ]
@@ -2368,14 +2470,25 @@ class DiskBackedShardedEmbedding(nn.Module):
         return result.reshape(*shape, self.dims)
 
     def close(self):
+        if os.getpid() != self._owner_pid:
+            # No inherited Future.cancel/result, executor shutdown, or instance
+            # lock. The module lock was replaced in the child at fork.
+            with _PLE_RESOURCE_LOCK:
+                self._prefetch_closed = True
+                self._pending.clear()
+                for reader in self._readers.values():
+                    reader._close_resources()
+                self._readers.clear()
+                self._tensor_readers.clear()
+                self._shard_specs.clear()
+            return
         with self._prefetch_lock:
-            if self._prefetch_closed:
-                return
-            self._prefetch_closed = True
-            # Shutdown also drains running reads displaced from the two slots.
-            # Their numpy views must be released before closing the mappings.
-            self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
-            self._pending.clear()
+            if not self._prefetch_closed:
+                self._prefetch_closed = True
+                # Drain workers before closing their mmap views. Never hold the
+                # module resource lock while waiting for a worker or row read.
+                self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+                self._pending.clear()
             for reader in self._readers.values():
                 reader.close()
             self._readers.clear()

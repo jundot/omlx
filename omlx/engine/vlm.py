@@ -1192,6 +1192,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
         return
 
     import safetensors
+    from ..patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import ple_load_resources
 
     original_safe_open = safetensors.safe_open
     is_target_shard = _model_shard_matcher(model_dir)
@@ -1230,7 +1231,8 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
             model_type,
             model_dir.name,
         )
-        yield
+        with ple_load_resources():
+            yield
     finally:
         safetensors.safe_open = original_safe_open
 
