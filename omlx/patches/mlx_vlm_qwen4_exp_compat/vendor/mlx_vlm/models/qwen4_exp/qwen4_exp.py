@@ -196,9 +196,11 @@ class Model(Qwen3_5Model):
             packed = weights[f"{prefix}.weight"].dtype == mx.uint32
             if packed or f"{prefix}.scales" in weights or isinstance(head_quantization, dict):
                 head_options = head_quantization if isinstance(head_quantization, dict) else {}
-                mode = head_options.get(
-                    "mode", quantization.get("mode", "affine")
+                # mlx-vlm infers this upstream mode after sanitization.
+                default_mode = (
+                    "mxfp4" if quantization.get("quant_method") == "mxfp4" else "affine"
                 )
+                mode = head_options.get("mode", quantization.get("mode", default_mode))
                 required = [f"{prefix}.scales"]
                 if mode == "affine":
                     required.append(f"{prefix}.biases")

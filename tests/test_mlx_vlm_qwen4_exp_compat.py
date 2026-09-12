@@ -2010,10 +2010,10 @@ def test_qwen4_declared_draft_head_requires_checkpoint_weights(tmp_path):
 
 @pytest.mark.parametrize("missing", ["scales", "biases", "both", None])
 def test_dedicated_affine_mtp_head_requires_complete_tensors(tmp_path, missing):
+    config = _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
 
-    config = _tiny_config()
     config.text_config.mtp_use_dedicated_lm_head = True
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
@@ -2035,13 +2035,17 @@ def test_dedicated_affine_mtp_head_requires_complete_tensors(tmp_path, missing):
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
-def test_dedicated_mxfp4_head_does_not_require_affine_biases(tmp_path):
+@pytest.mark.parametrize("config_style", ["mlx", "upstream"])
+def test_dedicated_mxfp4_head_does_not_require_affine_biases(tmp_path, config_style):
+    config = _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
 
-    config = _tiny_config()
     config.text_config.mtp_use_dedicated_lm_head = True
-    config.quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    if config_style == "mlx":
+        config.quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    else:
+        config.quantization_config = {"quant_method": "mxfp4"}
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
     )
