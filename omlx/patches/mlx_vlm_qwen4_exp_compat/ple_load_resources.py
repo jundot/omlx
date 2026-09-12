@@ -1,7 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
 """Ownership of newly opened runtime PLE resources during one model load."""
+
 from contextlib import contextmanager
 from contextvars import ContextVar
-
 
 _LOAD_RESOURCES = ContextVar("qwen4_ple_load_resources", default=None)
 
