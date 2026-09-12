@@ -337,10 +337,11 @@ class PairingSession:
                     2.0,
                 )
             except Exception as exc:
-                # A different attempt owns the peer's record now. This proof
-                # must never remove it, nor block local cancellation forever.
+                # A different attempt owns the peer's record now, or the coordinator
+                # already cleared/denied the request (404). This proof must never
+                # remove an unowned record, nor block local cancellation forever.
                 if not isinstance(exc, PairingCodeError) and not (
-                    isinstance(exc, HTTPError) and exc.code == 403
+                    isinstance(exc, HTTPError) and exc.code in {403, 404}
                 ):
                     return
                 self.manager._record_audit(
