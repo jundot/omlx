@@ -537,6 +537,28 @@ def _qwen4_decode_dynamic_eligible(
     )
 
 
+# Minimal scale-cache helper retained from Anton Bobrik's oMLX #3553.
+# This does not import that PR's other decode/composition features.
+def _qwen4_scales(module):
+    """Cached bf16 (q_scale, k_scale) arrays for the fused Qwen4 arms."""
+    q_scale = getattr(module, "_omlx_qwen4_decode_q_scale", None)
+    k_scale = getattr(module, "_omlx_qwen4_decode_k_scale", None)
+    if q_scale is None or k_scale is None:
+        inv_scale = module.head_k_dim**-0.5
+        q_scale = mx.array(inv_scale * inv_scale, dtype=mx.bfloat16)
+        k_scale = mx.array(inv_scale, dtype=mx.bfloat16)
+        module._omlx_qwen4_decode_q_scale = q_scale
+        module._omlx_qwen4_decode_k_scale = k_scale
+    return q_scale, k_scale
+
+
+def _qwen4_unified_rms_enabled() -> bool:
+    """Experimental RMS-compatible verify fusion; explicit opt-in for review."""
+    return os.environ.get("OMLX_QWEN4_UNIFIED_GDN_RMS_VERIFY", "0").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
 def apply_qwen35_gdn_prework_patch() -> bool:
     """Route the batch-1 target-verify GDN prework through the fused kernel.
 
@@ -605,6 +627,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     def patched_call(self, inputs, mask=None, cache=None, gdn_sink=None,
                      target_verify=False):
         S = inputs.shape[1]
+        if _qwen4_unified_rms_enabled():
+            from .qwen4_unified_gdn_verify import try_fused_rms
+            result = try_fused_rms(self, inputs, mask, cache, gdn_sink)
+            if result is not None:
+                return result
         if (
             not qwen4_decode_disabled["flag"]
             and _qwen4_decode_dynamic_eligible(
