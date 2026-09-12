@@ -182,6 +182,7 @@ class ModelSettings:
         min_p: Minimum probability threshold (None = use global default).
         repetition_penalty: Repetition penalty (None = use default 1.0, i.e. disabled).
         presence_penalty: Presence penalty (None = use global default).
+        frequency_penalty: Frequency penalty (None = use global default).
         force_sampling: Force sampling even with temperature=0.
         max_tool_result_tokens: Maximum tokens in tool result (None = use global default).
         chat_template_kwargs: Extra chat template keyword arguments.
@@ -296,6 +297,7 @@ class ModelSettings:
     repetition_penalty: Optional[float] = None
     min_p: Optional[float] = None
     presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None

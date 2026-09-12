@@ -27,6 +27,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "min_p",
     "repetition_penalty",
     "presence_penalty",
+    "frequency_penalty",
     "force_sampling",
     "enable_thinking",
     "preserve_thinking",
