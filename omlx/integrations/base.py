@@ -61,6 +61,9 @@ class Integration:
     type: str  # "env_var" or "config_file"
     install_check: str  # binary name to check with `which`
     install_hint: str  # installation instructions
+    # False for integrations that resolve models server-side at request time
+    # (e.g. tier aliases) and need no launch-time model picker.
+    requires_model: bool = True
 
     # Whether `omlx launch <tool>` must interactively pick a model. Tools
     # that configure one model into their config need a pick; tools that

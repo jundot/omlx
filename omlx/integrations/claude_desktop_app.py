@@ -78,6 +78,9 @@ class ClaudeDesktopAppIntegration(Integration):
             install_hint=(
                 "Install Claude Desktop for macOS from https://claude.ai/download"
             ),
+            # The app resolves tier aliases server-side at request time,
+            # so there is no single launch-time model to pick.
+            requires_model=False,
         )
 
     def is_installed(self) -> bool:
