@@ -184,12 +184,30 @@ class Model(Qwen3_5Model):
         if (
             mtp_enabled
             and getattr(self.config.text_config, "mtp_use_dedicated_lm_head", False)
-            and "mtp.lm_head.weight" not in weights
         ):
-            raise ValueError(
-                "mtp_use_dedicated_lm_head requires checkpoint weights for "
-                "mtp.lm_head.weight"
-            )
+            prefix = "mtp.lm_head"
+            if f"{prefix}.weight" not in weights:
+                raise ValueError(
+                    "mtp_use_dedicated_lm_head requires checkpoint weights for "
+                    "mtp.lm_head.weight"
+                )
+            quantization = self.config.quantization or self.config.quantization_config or {}
+            head_quantization = quantization.get(prefix)
+            packed = weights[f"{prefix}.weight"].dtype == mx.uint32
+            if packed or f"{prefix}.scales" in weights or isinstance(head_quantization, dict):
+                head_options = head_quantization if isinstance(head_quantization, dict) else {}
+                mode = head_options.get(
+                    "mode", quantization.get("mode", "affine")
+                )
+                required = [f"{prefix}.scales"]
+                if mode == "affine":
+                    required.append(f"{prefix}.biases")
+                missing = [key for key in required if key not in weights]
+                if missing:
+                    raise ValueError(
+                        f"Incomplete {mode} dedicated MTP head: missing "
+                        + ", ".join(missing)
+                    )
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -287,8 +305,8 @@ class Model(Qwen3_5Model):
         )
         if fused_ple:
             logger.info(
-                "Fused %d resident Qwen4-Exp PLE table into one packed "
-                "device-side embedding",
+                "Enabled packed device-side lookup for %d resident "
+                "Qwen4-Exp PLE table(s)",
                 fused_ple,
             )
         return result

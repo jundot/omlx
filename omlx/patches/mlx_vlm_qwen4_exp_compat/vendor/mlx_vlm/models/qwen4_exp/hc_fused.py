@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 MAX_ROWS = 16
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
+# Compiled dispatch is validated for this projection geometry and short MTP
+# batches. Other supported layouts retain the eager fused kernels.
+_COMPILED_HIDDEN = 2560
+_COMPILED_LOWRANK = 320
+_COMPILED_MAX_ROWS = 6
+_COMPILED_TILE_COLUMNS = 16
+_EAGER_TILE_COLUMNS = 64
 _DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
     "0",
     "false",
@@ -147,6 +154,7 @@ _D_SOURCE = r"""
         if constexpr (DENSE_I) {
             // Four output rows are small enough to share the down projection's
             // dispatch without quantizing precision-sensitive injection weights.
+            // _rows_of and _dense_inject_ok require both x and inject_w to be BF16.
             const device T* wp = (const device T*)inject_w;
             for (int k = int(lane); k < SLICE; k += 32) {
                 const int col = ks * SLICE + k;
@@ -455,7 +463,7 @@ def prefill_forward(module, hyper_input):
         if not _FAILURE_LOGGED:
             _FAILURE_LOGGED = True
             logger.warning(
-                "Qwen4 fused hyper-connection kernels failed closed; using the "
+                "Qwen4 fused hyper-connection kernels failed closed for this process; using the "
                 "canonical path: %s",
                 exc,
             )
@@ -547,29 +555,41 @@ def _launch_fused(
     return mixed, injection
 
 
-def _fused_plan(dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits):
+def _fused_plan(
+    dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits,
+    *, dense_inject=False,
+):
     # Compile short Q8 calls; other layouts use eager kernel dispatch.
     compiled = (
-        hidden == 2560
-        and lowrank == 320
-        and rows <= 6
+        hidden == _COMPILED_HIDDEN
+        and lowrank == _COMPILED_LOWRANK
+        and rows <= _COMPILED_MAX_ROWS
         and down_bits == up_bits == 8
-        and inject_bits in (None, 16)
+        and inject_bits is None
     )
     # The fixed 16-column tile leaves room for tuning on newer GPU generations.
     # TODO: Detect GPU capabilities and automatically tune/cache the tile size
     # for each supported layout instead of relying on this hard-coded default.
-    tile = 16 if compiled else 64
+    tile = _COMPILED_TILE_COLUMNS if compiled else _EAGER_TILE_COLUMNS
     signature = (
-        dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits, compiled,
+        dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits,
+        dense_inject, compiled,
     )
     forward = _FORWARDS.get(signature)
     if forward is None:
+        logger.debug(
+            "Qwen4 HC %s fused dispatch: hidden=%d lowrank=%d rows=%d "
+            "down/up bits=%d/%d inject=%s; compiled eligibility requires "
+            "hidden=%d lowrank=%d rows<=%d Q8 mix and BF16/absent injection",
+            "compiled" if compiled else "eager", hidden, lowrank, rows,
+            down_bits, up_bits, "BF16" if dense_inject else inject_bits,
+            _COMPILED_HIDDEN, _COMPILED_LOWRANK, _COMPILED_MAX_ROWS,
+        )
         forward = functools.partial(
             _launch_fused, dtype=dtype, hc=hc, hidden=hidden, lowrank=lowrank,
             rows=rows, down_bits=down_bits, up_bits=up_bits,
-            inject_bits=inject_bits, dense_inject=inject_bits == 16,
-            has_inject=inject_bits is not None, tile=tile,
+            inject_bits=inject_bits, dense_inject=dense_inject,
+            has_inject=dense_inject or inject_bits is not None, tile=tile,
         )
         if compiled:
             forward = mx.compile(forward)
@@ -588,9 +608,7 @@ def fused_forward(module, hyper_input):
         down, up = module.input_mix_weight_down, module.input_mix_weight_up
         inject = module.block_inject_weight if "block_inject_weight" in module else None
         dense_inject = inject is not None and type(inject) is nn.Linear
-        inject_bits = (
-            16 if dense_inject else (inject.bits if inject is not None else None)
-        )
+        inject_bits = inject.bits if inject is not None and not dense_inject else None
         flat = hyper_input.reshape(rows, width)
         dtype = hyper_input.dtype
         if dense_inject:
@@ -602,6 +620,7 @@ def fused_forward(module, hyper_input):
             inject_tensors = (down.weight, down.scales, down.biases)
         forward, signature = _fused_plan(
             dtype, hc, hidden, lowrank, rows, down.bits, up.bits, inject_bits,
+            dense_inject=dense_inject,
         )
         mixed, injection = forward(
             flat, module.hc_norm.weight, _eps_array(module),
@@ -625,7 +644,7 @@ def fused_forward(module, hyper_input):
         if not _FAILURE_LOGGED:
             _FAILURE_LOGGED = True
             logger.warning(
-                "Qwen4 fused hyper-connection kernels failed closed; using the "
+                "Qwen4 fused hyper-connection kernels failed closed for this process; using the "
                 "canonical path: %s",
                 exc,
             )

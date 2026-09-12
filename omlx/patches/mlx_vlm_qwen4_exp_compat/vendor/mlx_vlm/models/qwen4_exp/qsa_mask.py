@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 _KERNEL = None
 _PROVEN = False
 _FAILED = False
+_INELIGIBLE_LOGGED: set[str] = set()
+
+
+def _ineligible(reason):
+    if reason not in _INELIGIBLE_LOGGED:
+        _INELIGIBLE_LOGGED.add(reason)
+        logger.debug("Qwen4 fused mask not used (%s); using general expansion", reason)
+    return None
 
 
 def _launch_mask(hits, counts, ends, ratio, topk, key_len):
@@ -35,7 +43,10 @@ def _launch_mask(hits, counts, ends, ratio, topk, key_len):
                     out[i] = token < end;
                 } else {
                     const uint block = token / RATIO;
-                    const bool hit = block < blocks && hits[row * blocks + block];
+                    // Selection currently excludes future blocks. Also enforce
+                    // causality here so a selection change cannot expose them.
+                    const bool hit = token < end && block < blocks
+                        && hits[row * blocks + block];
                     const bool tail = token >= complete * RATIO && token < end;
                     out[i] = hit || tail;
                 }
@@ -57,29 +68,29 @@ def fused_block_mask(hits, counts, ends, ratio, topk, key_len):
     """Expand selected blocks and the causal tail in one Metal kernel.
 
     Selection is already complete. This only replaces repeat/pad/tail/where
-    operations, with the same boolean result even when the hits contain blocks
-    beyond a query's causal endpoint. Key length is a runtime input so growing
+    operations for causal block selections. Future hits are additionally
+    clamped to the query endpoint. Key length is a runtime input so growing
     the cache cannot create a new shader specialization for every token.
     """
     global _PROVEN, _FAILED
-    if (
-        _FAILED
-        or hits.ndim != 3
-        or hits.shape[0] != 1
-        or not 1 <= hits.shape[1] <= 6
-        or hits.dtype != mx.bool_
-        or counts.dtype != mx.int32
-        or ends.dtype != mx.int32
-        or counts.shape != (hits.shape[1],)
-        or ends.shape != counts.shape
-        or ratio != 4
-        or topk != 512
-        or not 2048 < key_len <= 32768
-        or hits.shape[-1] != key_len // ratio
-        or mx.default_device() != mx.gpu
-        or not mx.metal.is_available()
-    ):
+    if _FAILED:
         return None
+    if hits.ndim != 3 or hits.shape[0] != 1:
+        return _ineligible("hits must have shape (1, queries, blocks)")
+    if not 1 <= hits.shape[1] <= 6:
+        return _ineligible("query count must be 1..6")
+    if hits.dtype != mx.bool_ or counts.dtype != mx.int32 or ends.dtype != mx.int32:
+        return _ineligible("hits/counts/ends require bool/int32/int32")
+    if counts.shape != (hits.shape[1],) or ends.shape != counts.shape:
+        return _ineligible("counts and ends must match the query count")
+    if ratio != 4 or topk != 512:
+        return _ineligible("compression ratio/top-k must be 4/512")
+    if not 2048 < key_len <= 32768:
+        return _ineligible("key length must be 2049..32768")
+    if hits.shape[-1] != key_len // ratio:
+        return _ineligible("hit width must match the complete key blocks")
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return _ineligible("requires a Metal GPU device")
     try:
         output = _launch_mask(hits, counts, ends, ratio, topk, key_len)
         if not _PROVEN:
@@ -90,5 +101,7 @@ def fused_block_mask(hits, counts, ends, ratio, topk, key_len):
         # The kernel writes only a fresh mask. The caller can reuse its hits
         # in the general implementation without updating any cache again.
         _FAILED = True
-        logger.warning("Qwen4 fused mask disabled after kernel failure: %s", exc)
+        logger.warning(
+            "Qwen4 fused mask disabled for this process after kernel failure: %s", exc
+        )
         return None

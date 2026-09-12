@@ -426,13 +426,20 @@ def _qwen4_decode_recurrence(q, k, v, g, beta, state):
     return gated_delta_kernel(q, k, v, g, beta, state, None)
 
 
+def _is_qwen4_gdn(module) -> bool:
+    """Identify the vendored class registered by the Qwen4 compatibility patch."""
+    return (
+        type(module).__name__ == "Qwen4ExpGatedDeltaNet"
+        and type(module).__module__ == "mlx_vlm.models.qwen4_exp.language"
+    )
+
+
 def _qwen4_decode_static_eligible(module) -> bool:
     """Fail closed unless this is the shipped Qwen4 oQe decode geometry."""
 
     conv_dim = 2 * 16 * 128 + 48 * 128
     if (
-        type(module).__name__ != "Qwen4ExpGatedDeltaNet"
-        or type(module).__module__ != "mlx_vlm.models.qwen4_exp.language"
+        not _is_qwen4_gdn(module)
         or module.training
         or module.num_k_heads != 16
         or module.num_v_heads != 48
@@ -592,10 +599,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
         if gdn_sink is None or cache is None:
             return False
-        qwen4 = (
-            type(self).__name__ == "Qwen4ExpGatedDeltaNet"
-            and type(self).__module__ == "mlx_vlm.models.qwen4_exp.language"
-        )
+        qwen4 = _is_qwen4_gdn(self)
         if inputs.shape[0] != 1 or not ((2 if qwen4 else 3) <= s_len <= 9):
             return False
         if mask is not None:
@@ -795,8 +799,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 )
 
             if (
-                type(self).__name__ == "Qwen4ExpGatedDeltaNet"
-                and type(self).__module__ == "mlx_vlm.models.qwen4_exp.language"
+                _is_qwen4_gdn(self)
                 and self.head_v_dim == 128
                 and getattr(self.norm, "activation", None) == "sigmoid"
                 and self.norm.weight.shape == (128,)

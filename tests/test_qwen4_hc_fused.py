@@ -501,14 +501,14 @@ def test_compiled_hc_matches_eager_and_reads_replaced_weights(
 @pytest.mark.parametrize(
     "hidden,lowrank,rows,down_bits,up_bits,inject_bits,expected",
     [
-        (2560, 320, 4, 8, 8, 16, True),
+        (2560, 320, 4, 8, 8, "bf16", True),
         (2560, 320, 4, 8, 8, None, True),
-        (2560, 320, 7, 8, 8, 16, False),
-        (2560, 320, 4, 5, 8, 16, False),
-        (2560, 320, 4, 8, 6, 16, False),
+        (2560, 320, 7, 8, 8, "bf16", False),
+        (2560, 320, 4, 5, 8, "bf16", False),
+        (2560, 320, 4, 8, 6, "bf16", False),
         (2560, 320, 4, 8, 8, 8, False),
-        (768, 320, 4, 8, 8, 16, False),
-        (2560, 256, 4, 8, 8, 16, False),
+        (768, 320, 4, 8, 8, "bf16", False),
+        (2560, 256, 4, 8, 8, "bf16", False),
     ],
 )
 def test_hc_compilation_respects_layout_without_requiring_a_device_name(
@@ -518,7 +518,9 @@ def test_hc_compilation_respects_layout_without_requiring_a_device_name(
 
     monkeypatch.setattr(mx, "device_info", lambda: {})
     _, signature = hc_fused._fused_plan(
-        mx.bfloat16, 4, hidden, lowrank, rows, down_bits, up_bits, inject_bits
+        mx.bfloat16, 4, hidden, lowrank, rows, down_bits, up_bits,
+        None if inject_bits == "bf16" else inject_bits,
+        dense_inject=inject_bits == "bf16",
     )
     assert signature[-1] is expected
 

@@ -286,6 +286,8 @@ def test_qwen4_single_packed_ple_aliases_without_join(monkeypatch):
 @pytest.mark.parametrize(
     "memory_gib,mode,shards,quantized,expected",
     [
+        (36, "resident", 1, True, 1),
+        (64, "resident", 1, True, 1),
         (128, "resident", 1, True, 1),
         (128, "resident", 4, True, 0),
         (256, "resident", 4, True, 1),
@@ -317,8 +319,12 @@ def test_qwen4_resident_ple_join_memory_admission(
     monkeypatch.setattr(language.os, "sysconf", lambda key: values[key] if key in values else sysconf(key))
     monkeypatch.setattr(language, "get_ple_runtime_mode", lambda: mode)
 
+    original = embedding.shards[0]
     assert language.fuse_resident_ple_embeddings(model) == expected
     assert (getattr(embedding, "fused", None) is not None) == bool(expected)
+    if expected and shards == 1:
+        assert embedding.fused is original
+        assert embedding.fused.weight is original.weight
 
 
 def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, caplog):
@@ -356,7 +362,7 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
         "96 exact hybrid projection pairs, 97 compiled decode paths"
         in caplog.text
     )
-    assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
+    assert "Enabled packed device-side lookup for 1 resident Qwen4-Exp PLE table" in caplog.text
 
 
 def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
@@ -1420,6 +1426,20 @@ def test_early_ple_gather_starts_before_first_layer_without_advancing_history(ea
     assert not disk._pending
 
 
+def test_early_ple_gather_skips_layers_without_ple(early_gather_model, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, _, _ = early_gather_model
+    model.args.ple_layer_ids = [1, 2, 99]
+    ids = mx.array([[2, 3, 4]], dtype=mx.int32)
+    monkeypatch.setattr(language, "_PLE_EARLY_GATHER", False)
+    expected = model(ids, cache=model.make_cache()).logits
+    monkeypatch.setattr(language, "_PLE_EARLY_GATHER", True)
+    actual = model(ids, cache=model.make_cache()).logits
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+
+
 @pytest.fixture
 def disk_ple_reader(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1502,6 +1522,54 @@ def test_disk_backed_ple_small_gathers_skip_prefetch(
     expected = dense[mx.array(indices, dtype=mx.int32)]
     assert mx.array_equal(reader.rows("weight", indices), expected).item()
     prefetch.assert_not_called()
+
+
+@pytest.mark.parametrize("row_count", [1, 8])
+def test_small_ple_gather_rearms_only_previously_read_pages(
+    disk_ple_reader, monkeypatch, row_count
+):
+    import numpy as np
+
+    ple, reader, dense = disk_ple_reader
+    indices = np.arange(row_count, dtype=np.intp)
+    expected = dense[mx.array(indices)]
+    start, width = reader.row_span("weight")
+    # An unrelated warm page must survive a cold gather, however slow it is.
+    reader._seen_pages[-1] = 1
+    clock = MagicMock(side_effect=AssertionError("cold gathers must not be timed"))
+    monkeypatch.setattr(ple, "time", SimpleNamespace(perf_counter=clock))
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert reader._seen_pages[-1] == 1
+    assert reader._last_rearm == 0.0
+    assert reader._rearm_count == 0
+    clock.assert_not_called()
+
+    reader._prefetch_missing_pages(indices, start, width)
+    for now, count in [(1000.0, 1), (1001.0, 1), (1060.0, 2)]:
+        reader._prefetch_missing_pages(indices, start, width)
+        ticks = iter((0.0, 0.010))
+        monkeypatch.setattr(
+            ple, "time", SimpleNamespace(
+                perf_counter=lambda ticks=ticks: next(ticks), monotonic=lambda now=now: now
+            )
+        )
+        assert mx.array_equal(reader.rows("weight", indices), expected).item()
+        assert reader._rearm_count == count
+
+
+def test_ple_inflight_read_does_not_mark_a_rearmed_bitmap(disk_ple_reader, monkeypatch):
+    ple, reader, _ = disk_ple_reader
+    original_pread = ple.os.pread
+    old_bitmap = reader._seen_pages
+
+    def pread(*args):
+        reader._seen_pages = bytearray(len(old_bitmap))
+        return original_pread(*args)
+
+    monkeypatch.setattr(ple.os, "pread", pread)
+    reader._touch_page(0)
+    assert old_bitmap[0] == 1
+    assert not any(reader._seen_pages)
 
 
 def test_disk_backed_ple_rearms_seen_bitmap_on_slow_gather(
@@ -1938,6 +2006,52 @@ def test_qwen4_declared_draft_head_requires_checkpoint_weights(tmp_path):
     assert not hasattr(model, "mtp")
     sanitized = model.sanitize({"mtp.lm_head.weight": mx.zeros((64, 32))})
     assert "mtp.lm_head.weight" not in sanitized
+
+
+@pytest.mark.parametrize("missing", ["scales", "biases", "both", None])
+def test_dedicated_affine_mtp_head_requires_complete_tensors(tmp_path, missing):
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    config = _tiny_config()
+    config.text_config.mtp_use_dedicated_lm_head = True
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        model = Model(config)
+        values = mx.quantize(mx.zeros((64, 32), dtype=mx.bfloat16), group_size=32, bits=4)
+        weights = {f"mtp.lm_head.{k}": v for k, v in zip(("weight", "scales", "biases"), values)}
+        for key in ("scales", "biases"):
+            if missing in (key, "both"):
+                del weights[f"mtp.lm_head.{key}"]
+        if missing is None:
+            assert "mtp.lm_head.biases" in model.sanitize(weights)
+        else:
+            with pytest.raises(ValueError, match="Incomplete affine dedicated MTP head"):
+                model.sanitize(weights)
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+
+def test_dedicated_mxfp4_head_does_not_require_affine_biases(tmp_path):
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    config = _tiny_config()
+    config.text_config.mtp_use_dedicated_lm_head = True
+    config.quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        weight, scales = mx.quantize(mx.zeros((64, 32)), group_size=32, bits=4, mode="mxfp4")
+        weights = {"mtp.lm_head.weight": weight, "mtp.lm_head.scales": scales}
+        assert "mtp.lm_head.scales" in Model(config).sanitize(weights)
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
 
 
 def _disk_ple(tmp_path, *, shards, rows, dims, bits=None):

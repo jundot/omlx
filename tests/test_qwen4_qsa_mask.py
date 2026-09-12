@@ -40,12 +40,12 @@ def _reference_mask(hits, counts, ends, ratio, topk, key_len):
 @pytest.mark.parametrize("width", [1, 2, 4, 6, 32])
 @pytest.mark.parametrize("key_len", [2048, 2051, 4096, 8193, 32771])
 def test_mask_matches_general_path_exactly(batch, width, key_len):
-    # Arbitrary hits intentionally include future blocks. The expansion must
-    # preserve the input bitmap exactly; causal top-k filtering happens earlier.
+    # Match the production selector: only complete causal blocks may be hits.
     rng = np.random.default_rng(91226 + width)
     hits = mx.array(rng.random((batch, width, key_len // 4)) < 0.55)
     ends = key_len - width + mx.arange(width, dtype=mx.int32) + 1
     counts = ends // 4
+    hits = hits & (mx.arange(key_len // 4)[None, None, :] < counts[None, :, None])
     expected = _reference_mask(hits, counts, ends, 4, 512, key_len)
     actual = qsa_mask._launch_mask(hits, counts, ends, 4, 512, key_len)
     mx.eval(expected, actual)
@@ -62,7 +62,6 @@ def _inputs():
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_guarded_mask_validates_once_then_stays_lazy(monkeypatch):
-    monkeypatch.setattr(mx, "device_info", lambda: {})
     monkeypatch.setattr(qsa_mask, "_PROVEN", False)
     monkeypatch.setattr(qsa_mask, "_FAILED", False)
     inputs = _inputs()
@@ -95,6 +94,12 @@ def test_mask_failure_logs_once_and_keeps_general_path(monkeypatch, caplog):
     "change", ["device", "metal", "width", "batch", "ratio", "budget", "context"]
 )
 def test_unsupported_inputs_stay_general(monkeypatch, change):
+    # Exercise the selected guard even on CPU-only hosts; never launch Metal.
+    monkeypatch.setattr(qsa_mask, "_FAILED", False)
+    monkeypatch.setattr(mx, "default_device", lambda: mx.gpu)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: True)
+    launch = Mock(side_effect=AssertionError("unsupported input reached Metal"))
+    monkeypatch.setattr(qsa_mask, "_launch_mask", launch)
     inputs = list(_inputs())
     if change == "device":
         monkeypatch.setattr(mx, "default_device", lambda: mx.cpu)
@@ -111,3 +116,36 @@ def test_unsupported_inputs_stay_general(monkeypatch, change):
     elif change == "context":
         inputs[5] = 65536
     assert qsa_mask.fused_block_mask(*inputs) is None
+    launch.assert_not_called()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("future_hits", [False, True])
+def test_mask_straddles_topk_boundary_and_clamps_future_hits(future_hits):
+    # Both the dense-budget and sparse branches must execute in a single call.
+    key_len = 2060
+    counts = mx.array([511, 512, 513], dtype=mx.int32)
+    ends = counts * 4 + mx.array([1, 2, 3], dtype=mx.int32)
+    blocks = mx.arange(key_len // 4)[None, None, :]
+    hits = mx.broadcast_to((blocks % 3) == 0, (1, 3, key_len // 4))
+    causal_hits = hits & (blocks < counts[None, :, None])
+    actual = qsa_mask._launch_mask(
+        hits if future_hits else causal_hits, counts, ends, 4, 512, key_len
+    )
+    expected = _reference_mask(causal_hits, counts, ends, 4, 512, key_len)
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected).item()
+    for row, end in enumerate(ends.tolist()):
+        assert not mx.any(actual[0, 0, row, end:]).item()
+
+
+def test_ineligible_reason_is_logged_once(monkeypatch, caplog):
+    monkeypatch.setattr(qsa_mask, "_FAILED", False)
+    monkeypatch.setattr(qsa_mask, "_INELIGIBLE_LOGGED", set())
+    inputs = list(_inputs())
+    inputs[3] = 2
+    with caplog.at_level(logging.DEBUG, logger=qsa_mask.logger.name):
+        assert qsa_mask.fused_block_mask(*inputs) is None
+        assert qsa_mask.fused_block_mask(*inputs) is None
+    assert len(caplog.records) == 1
+    assert "compression ratio/top-k" in caplog.text

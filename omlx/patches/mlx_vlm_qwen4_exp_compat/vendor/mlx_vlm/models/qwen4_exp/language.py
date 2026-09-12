@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1933,6 +1933,12 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 # os.pread releases the GIL and does not change the shared file position.
 _PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# Avoid pool overhead for a handful of reads; batch short decode/verify gathers
+# across shards, while larger prefill gathers use per-shard page prefetch.
+_PLE_PARALLEL_READ_MIN = 8
+_PLE_CROSS_SHARD_MAX_ROWS = 256
+# Start hashing/gathering early only for short token batches.
+_PLE_EARLY_GATHER_MAX_TOKENS = 64
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
 _PLE_REARM_FLOOR_SECONDS = 0.0005
@@ -1941,7 +1947,14 @@ _PLE_REARM_MIN_INTERVAL_SECONDS = 60.0
 
 
 class _SafeTensorMMap:
-    """Read selected dense or affine-packed rows without resident weights."""
+    """Read selected dense or affine-packed rows without resident weights.
+
+    The seen-page bitmap is an advisory prefetch hint, not a residency lock.
+    IO workers mark pages, gathers read marks, and re-arming replaces the bitmap.
+    Each operation retains its bitmap reference: races may cause duplicate
+    reads, but never change the mmap data returned. The owner drains submitted
+    work before closing the reader.
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -1966,6 +1979,12 @@ class _SafeTensorMMap:
     def tensor_dtype(self, key: str) -> str:
         return str(self._header[key]["dtype"])
 
+    def row_span(self, key: str) -> tuple[int, int]:
+        """File offset of the first row and its byte width."""
+        entry = self._header[key]
+        start, end = entry["data_offsets"]
+        return self._data_start + start, (end - start) // entry["shape"][0]
+
     def rows_np(self, key: str, rows) -> tuple[np.ndarray, str]:
         """Copy the requested rows out of the mapping; returns the raw array and the safetensors dtype."""
         entry = self._header[key]
@@ -1988,7 +2007,7 @@ class _SafeTensorMMap:
         if row_indices.size == 0:
             return np.empty((0, shape[1]), dtype=np_dtype), dtype
         gather_start = None
-        if row_indices.size > 8:
+        if row_indices.size > _PLE_PARALLEL_READ_MIN:
             fully_seen = self._prefetch_missing_pages(
                 row_indices,
                 self._data_start + start,
@@ -1996,9 +2015,13 @@ class _SafeTensorMMap:
             )
             gather_start = time.perf_counter() if fully_seen else None
         else:
-            # Small gathers can have been prefetched across shards. Notice
-            # later page eviction here too, without scheduling extra I/O.
-            gather_start = time.perf_counter()
+            # Cross-shard prefetch may already have read these pages. Only
+            # those gathers can indicate eviction; a first read must not
+            # clear other shards' marks or consume the re-arm interval.
+            missing = self._missing_pages(
+                row_indices, self._data_start + start, shape[1] * item_size
+            )
+            gather_start = time.perf_counter() if missing.size == 0 else None
         view = np.ndarray(
             shape,
             dtype=np_dtype,
@@ -2034,6 +2057,7 @@ class _SafeTensorMMap:
         return needed_pages[seen[needed_pages] == 0]
 
     def _touch_page(self, page: int) -> None:
+        seen = self._seen_pages
         offset = int(page) * _PLE_PAGE_SIZE
         remaining = _PLE_PAGE_SIZE
         while remaining > 0:
@@ -2043,7 +2067,7 @@ class _SafeTensorMMap:
             if not chunk:
                 break
             remaining -= len(chunk)
-        self._seen_pages[page] = 1
+        seen[page] = 1
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
@@ -2088,6 +2112,22 @@ class _SafeTensorMMap:
             self._file = None
 
 
+class _PLEShardSpec(NamedTuple):
+    weight: str
+    scales: str | None
+    biases: str | None
+    bits: int | None
+    group_size: int | None
+
+    @property
+    def tensor_keys(self) -> tuple[str, ...]:
+        if self.bits is None:
+            return (self.weight,)
+        # The constructor validates complete affine tensor families first.
+        assert self.scales is not None and self.biases is not None
+        return self.weight, self.scales, self.biases
+
+
 class DiskBackedShardedEmbedding(nn.Module):
     """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
 
@@ -2123,9 +2163,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
-        self._shard_specs: dict[
-            int, tuple[str, str | None, str | None, int | None, int | None]
-        ] = {}
+        self._shard_specs: dict[int, _PLEShardSpec] = {}
         self._page_specs: dict[int, tuple] = {}
 
         model_path = Path(model_path)
@@ -2186,7 +2224,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                     raise TypeError(
                         f"SSD-backed dense Qwen4 PLE does not support {weight_dtype}"
                     )
-                self._shard_specs[shard_index] = (
+                self._shard_specs[shard_index] = _PLEShardSpec(
                     weight_key,
                     None,
                     None,
@@ -2242,7 +2280,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                     f"Inconsistent affine PLE layout for {base}: "
                     f"weight={weight_shape}, scales={scales_shape}, dims={dims}"
                 )
-            self._shard_specs[shard_index] = (
+            self._shard_specs[shard_index] = _PLEShardSpec(
                 weight_key,
                 scales_key,
                 biases_key,
@@ -2252,13 +2290,9 @@ class DiskBackedShardedEmbedding(nn.Module):
 
         for shard_index, spec in self._shard_specs.items():
             pages = []
-            for key in spec[:1] if spec[3] is None else spec[:3]:
+            for key in spec.tensor_keys:
                 reader = self._tensor_readers[key]
-                entry = reader._header[key]
-                start, end = entry["data_offsets"]
-                pages.append(
-                    (reader, reader._data_start + start, (end - start) // entry["shape"][0])
-                )
+                pages.append((reader, *reader.row_span(key)))
             self._page_specs[shard_index] = tuple(pages)
 
     def _plan(self, host: np.ndarray):
@@ -2285,7 +2319,7 @@ class DiskBackedShardedEmbedding(nn.Module):
     def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
         shard, local, touched, specs, families, _, _, _ = plan
-        if 8 < host.size <= 256:
+        if _PLE_PARALLEL_READ_MIN < host.size <= _PLE_CROSS_SHARD_MAX_ROWS:
             # A decode/verify call touches many shards but often only one row
             # in each. Batch their page faults, rather than serializing these
             # reads below the per-shard prefetch threshold.
@@ -2299,7 +2333,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                         requests.add((reader, first))
                     if last != first and not reader._seen_pages[last]:
                         requests.add((reader, last))
-            if len(requests) > 8:
+            if len(requests) > _PLE_PARALLEL_READ_MIN:
                 futures = [_PLE_IO_POOL.submit(reader._touch_page, page) for reader, page in requests]
                 wait(futures)
                 for future in futures:
@@ -2546,6 +2580,7 @@ class ShardedEmbedding(nn.Module):
         if len(shards) == 1:
             # A checkpoint can already store the table as one packed shard.
             # Alias it directly: no join or temporary second table is needed.
+            # Loading/admission owns total residency; this does not pin memory.
             self.fused = first
             self.shards = []
             return True
@@ -2578,7 +2613,12 @@ def fuse_resident_ple_embeddings(
     *,
     minimum_physical_memory: int = 192 * 1024**3,
 ) -> int:
-    """Fuse resident affine PLE, admitting a single packed shard without a join."""
+    """Enable packed device lookups for already resident affine PLE tables.
+
+    The physical-memory threshold admits the temporary join allocation only.
+    Total model residency is decided by engine admission before weights load.
+    A single-shard alias allocates no additional table on any memory size.
+    """
 
     if get_ple_runtime_mode() != "resident":
         return 0
@@ -2973,10 +3013,18 @@ class Qwen4ExpModel(nn.Module):
         # Start disk reads here; pass the same indices through so the PLE layer
         # does not repeat the hash or mutate speculative history prematurely.
         ple_indices = {}
-        if _PLE_EARLY_GATHER and 0 < inputs.shape[0] * inputs.shape[1] <= 64:
+        if (
+            _PLE_EARLY_GATHER
+            and 0 < inputs.shape[0] * inputs.shape[1] <= _PLE_EARLY_GATHER_MAX_TOKENS
+        ):
             for layer_id in self.args.ple_layer_ids:
                 index = layer_id - 1
-                embedding = self.layers[index].ple.ple_embedding
+                if not 0 <= index < len(self.layers):
+                    continue
+                ple = getattr(self.layers[index], "ple", None)
+                if ple is None:
+                    continue
+                embedding = ple.ple_embedding
                 if isinstance(embedding.ngram_embedding, DiskBackedShardedEmbedding):
                     ple_indices[index] = embedding.prepare_indices(inputs, cache[index])
 
