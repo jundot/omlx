@@ -204,7 +204,11 @@ def quantize_engram(
         offset += length
     names = {key: f"{module_name}.{key}" if module_name else key for key in shapes}
     encoded = json.dumps(
-        {names[key]: value for key, value in header.items()}, separators=(",", ":")
+        {
+            **{names[key]: value for key, value in header.items()},
+            "__metadata__": {"format": "mlx"},
+        },
+        separators=(",", ":"),
     ).encode()
     encoded += b" " * (-len(encoded) % 8)
     data_start = 8 + len(encoded)
