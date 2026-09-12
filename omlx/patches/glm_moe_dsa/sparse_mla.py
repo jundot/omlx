@@ -478,6 +478,86 @@ def sparse_mla_attention(
     )
 
 
+def sparse_mla_attention_nope(
+    q_latent: mx.array,
+    kv_latent: mx.array,
+    topk_indices: mx.array,
+    scale: float,
+    *,
+    topk_valid_prefix: bool = False,
+    causal_prefix_indices: bool = False,
+    topk_length: Optional[mx.array] = None,
+    causal_prefix_rows: int = 0,
+    stream: Optional[mx.Stream] = None,
+) -> Optional[mx.array]:
+    """Exact GLM-5.3 NoPE sparse MLA without the all-zero PE lane.
+
+    The dedicated ABI is deliberately narrower than ``sparse_mla_attention``:
+    it accepts only the published single-device GLM-5.3 geometry and creates
+    zero-width PE views internally. Older extension builds fail closed so the
+    caller can retain the historical D_PE=64-zero fallback.
+    """
+
+    if (
+        q_latent.ndim != 4
+        or kv_latent.ndim != 4
+        or topk_indices.ndim != 4
+        or kv_latent.shape[1] != 1
+    ):
+        return None
+
+    B, H, L, D_LATENT = q_latent.shape
+    K = kv_latent.shape[2]
+    topk_rows = topk_indices.shape[2]
+    compact_prefix = causal_prefix_rows > 0 and topk_rows != L
+    if (
+        L <= 1
+        or H != 64
+        or D_LATENT != 512
+        or kv_latent.shape != (B, 1, K, D_LATENT)
+        or topk_indices.shape[:2] != (B, 1)
+        or not (
+            topk_rows == L
+            or (
+                compact_prefix
+                and topk_rows + causal_prefix_rows == L
+                and causal_prefix_indices
+                and topk_valid_prefix
+            )
+        )
+        or q_latent.dtype not in (mx.float16, mx.bfloat16)
+        or kv_latent.dtype != q_latent.dtype
+        or not glm_fast.has("glm_dsa_nope_sparse_mla_attention")
+    ):
+        return None
+
+    topk = (
+        topk_indices
+        if topk_indices.dtype == mx.uint32
+        else topk_indices.astype(mx.uint32)
+    )
+    if topk_length is not None and topk_length.dtype != mx.uint32:
+        topk_length = topk_length.astype(mx.uint32)
+    q_pe = mx.zeros((B, H, L, 0), dtype=q_latent.dtype)
+    k_pe = mx.zeros((B, 1, K, 0), dtype=q_latent.dtype)
+    try:
+        return glm_fast.glm_dsa_nope_sparse_mla_attention(
+            q_latent,
+            q_pe,
+            kv_latent,
+            k_pe,
+            topk,
+            scale,
+            topk_valid_prefix=topk_valid_prefix,
+            causal_prefix_indices=causal_prefix_indices,
+            topk_length=topk_length,
+            causal_prefix_rows=causal_prefix_rows,
+            stream=stream or mx.gpu,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def q8_vup_flat(
     x: mx.array,
     unembed_out,

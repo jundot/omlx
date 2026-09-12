@@ -26,14 +26,22 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     if vectorized:
         g_comment = "// g: [B, T, Hv, Dk]"
         g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
-        g_access = "g_[s_idx]"
+        g_hoist = """
+            for (int i = 0; i < n_per_t; ++i) {
+              gt[i] = static_cast<float>(g_[n_per_t * dk_idx + i]);
+            }"""
+        g_decay = "state[r][i] * gt[i]"
         g_advance = "g_ += Hv * Dk;"
     else:
         g_comment = "// g: [B, T, Hv]"
         g_setup = "auto g_ = g + b_idx * T * Hv;"
-        g_access = "g_[hv_idx]"
+        g_hoist = "float gg = static_cast<float>(g_[hv_idx]);"
+        g_decay = "state[r][i] * gg"
         g_advance = "g_ += Hv;"
 
+    # One thread owns R consecutive value rows. GLM's vector gate is shared by
+    # those rows, as are q, k, and beta, so row blocking removes redundant
+    # loads while preserving the per-row arithmetic and reduction order.
     source = f"""
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
@@ -50,16 +58,17 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         y += b_idx * T * Hv * Dv + hv_idx * Dv;
 
         auto dk_idx = thread_position_in_threadgroup.x;
-        auto dv_idx = thread_position_in_grid.y;
+        auto dv0 = thread_position_in_grid.y * R;
 
         // state_in, state_out: [B, Hv, Dv, Dk]
-        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+        auto i_state = state_in + (n * Dv + dv0) * Dk + n_per_t * dk_idx;
+        auto o_state = state_out + (n * Dv + dv0) * Dk + n_per_t * dk_idx;
 
-        float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {{
-          auto s_idx = n_per_t * dk_idx + i;
-          state[i] = static_cast<float>(i_state[s_idx]);
+        float state[R][n_per_t];
+        for (int r = 0; r < R; ++r) {{
+          for (int i = 0; i < n_per_t; ++i) {{
+            state[r][i] = static_cast<float>(i_state[r * Dk + i]);
+          }}
         }}
 
         {g_comment}
@@ -68,28 +77,41 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
 
         for (int t = 0; t < T; ++t) {{
           if ({mask_source}) {{
-            float kv_mem = 0.0f;
+            // q, k, vector-g, and beta are identical for all R value rows.
+            float kk[n_per_t];
+            float qq[n_per_t];
+            {"float gt[n_per_t];" if vectorized else ""}
             for (int i = 0; i < n_per_t; ++i) {{
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] * {g_access};
-              kv_mem += state[i] * k_[s_idx];
+              kk[i] = static_cast<float>(k_[n_per_t * dk_idx + i]);
+              qq[i] = static_cast<float>(q_[n_per_t * dk_idx + i]);
             }}
-            kv_mem = simd_sum(kv_mem);
+            {g_hoist}
+            float bb = static_cast<float>(beta_[hv_idx]);
 
-            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+            for (int r = 0; r < R; ++r) {{
+              float kv_mem = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {{
+                state[r][i] = {g_decay};
+                kv_mem += state[r][i] * kk[i];
+              }}
+              kv_mem = simd_sum(kv_mem);
 
-            float out = 0.0f;
-            for (int i = 0; i < n_per_t; ++i) {{
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] + k_[s_idx] * delta;
-              out += state[i] * q_[s_idx];
-            }}
-            out = simd_sum(out);
-            if (thread_index_in_simdgroup == 0) {{
-              y[dv_idx] = static_cast<InT>(out);
+              auto delta = (static_cast<float>(v_[dv0 + r]) - kv_mem) * bb;
+
+              float out = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {{
+                state[r][i] = state[r][i] + kk[i] * delta;
+                out += state[r][i] * qq[i];
+              }}
+              out = simd_sum(out);
+              if (thread_index_in_simdgroup == 0) {{
+                y[dv0 + r] = static_cast<InT>(out);
+              }}
             }}
           }} else {{
-            y[dv_idx] = static_cast<InT>(0);
+            for (int r = 0; r < R; ++r) {{
+              y[dv0 + r] = static_cast<InT>(0);
+            }}
           }}
           // Increment data pointers to next time step
           q_ += Hk * Dk;
@@ -99,9 +121,10 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
           {g_advance}
           beta_ += Hv;
         }}
-        for (int i = 0; i < n_per_t; ++i) {{
-          auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<StT>(state[i]);
+        for (int r = 0; r < R; ++r) {{
+          for (int i = 0; i < n_per_t; ++i) {{
+            o_state[r * Dk + i] = static_cast<StT>(state[r][i]);
+          }}
         }}
     """
     inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
@@ -177,7 +200,7 @@ def _gated_delta_step_ops(
     return y.astype(q.dtype), state
 
 
-def gated_delta_kernel(
+def _gated_delta_kernel_rows(
     q: mx.array,
     k: mx.array,
     v: mx.array,
@@ -185,6 +208,9 @@ def gated_delta_kernel(
     beta: mx.array,
     state: mx.array,
     mask: Optional[mx.array] = None,
+    *,
+    rows_per_thread: int,
+    threadgroup_y: int,
 ) -> Tuple[mx.array, mx.array]:
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
@@ -203,6 +229,11 @@ def gated_delta_kernel(
             kernel = _gated_delta_kernel_masked
             inputs.append(mask)
 
+    if rows_per_thread < 1 or Dv % rows_per_thread != 0:
+        raise ValueError(
+            f"rows_per_thread={rows_per_thread} must divide value width {Dv}"
+        )
+
     return kernel(
         inputs=inputs,
         template=[
@@ -212,11 +243,37 @@ def gated_delta_kernel(
             ("Dv", Dv),
             ("Hk", Hk),
             ("Hv", Hv),
+            ("R", rows_per_thread),
         ],
-        grid=(32, Dv, B * Hv),
-        threadgroup=(32, 4, 1),
+        grid=(32, Dv // rows_per_thread, B * Hv),
+        threadgroup=(32, threadgroup_y, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
         output_dtypes=[input_type, state_type],
+    )
+
+
+def gated_delta_kernel(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    Dv = v.shape[-1]
+    rows_per_thread = 4 if Dv % 4 == 0 else (2 if Dv % 2 == 0 else 1)
+    threadgroup_y = 2 if (Dv // rows_per_thread) % 2 == 0 else 1
+    return _gated_delta_kernel_rows(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        mask,
+        rows_per_thread=rows_per_thread,
+        threadgroup_y=threadgroup_y,
     )
 
 
