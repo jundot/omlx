@@ -10,6 +10,15 @@ from unittest.mock import Mock, patch
 SOURCE = Path(__file__).parents[1] / "omlx/patches/qwen4_unified_gdn_verify.py"
 
 
+def actual_class(source, name, **namespace):
+    """Execute the production class unchanged, without importing MLX/GPU code."""
+    node = next(n for n in ast.parse(source.read_text()).body
+                if isinstance(n, ast.ClassDef) and n.name == name)
+    exec(compile("from __future__ import annotations\n" + ast.unparse(node),
+                 str(source), "exec"), namespace)
+    return namespace[name]
+
+
 def array(shape, dtype="bf16"):
     return SimpleNamespace(shape=shape, dtype=dtype)
 
@@ -41,6 +50,11 @@ class HookTests(unittest.TestCase):
         packages = {name: ModuleType(name) for name in ("mlx_vlm", "mlx_vlm.models", "mlx_vlm.models.qwen3_5", "omlx", "omlx.patches", "mlx_lm", "mlx_lm.models", "mlx_lm.models.cache", "mlx_vlm.models.qwen4_exp", "mlx_vlm.models.qwen4_exp.cache")}
         packages["mlx_lm.models.cache"].ArraysCache = ArraysCache
         packages["mlx_vlm.models.qwen4_exp.cache"].ArraysCache = ArraysCache
+        handlers = ModuleType("omlx.cache.type_handlers")
+        handlers.SizedArraysCache = actual_class(
+            SOURCE.parents[2] / "omlx/cache/type_handlers.py", "SizedArraysCache")
+        packages["omlx.cache"] = ModuleType("omlx.cache")
+        packages[handlers.__name__] = handlers
         packages["mlx_vlm.models.qwen3_5"].language = q35
         packages["omlx.patches"].qwen35_gdn_prework = generic
         packages[q35.__name__], packages[generic.__name__] = q35, generic
@@ -100,6 +114,90 @@ class HookTests(unittest.TestCase):
         self.assertEqual(kernel.call_count, 1)
         self.assertFalse(ns["receipt"]()["exception_fuse"])
         self.assertEqual(ns["receipt"]()["calls"], 0)
+
+    def actual_cache_sources(self):
+        root = SOURCE.parents[2]
+        sources = [root / "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/cache.py"]
+        installed = Path(distribution("mlx-lm").locate_file("mlx_lm/models/cache.py"))
+        self.assertTrue(installed.is_file(), "CPU ABI gate requires the installed LM cache source")
+        return sources + [installed]
+
+    def test_actual_sized_wrapper_preserves_state_slots_size_and_outer_commit(self):
+        for source in self.actual_cache_sources():
+            with self.subTest(source=str(source)):
+                ns, module, packages, q35, _, kernel = self.setup_hook()
+                cls = actual_class(source, "ArraysCache", _BaseCache=object)
+                package = ("mlx_vlm.models.qwen4_exp.cache" if "qwen4_exp" in str(source)
+                           else "mlx_lm.models.cache")
+                packages[package].ArraysCache = cls
+                inner = cls(4)
+                advance = Mock(wraps=inner.advance)
+                inner.advance = advance
+                conv, state = array((1, 3, 10240)), array((1, 48, 128, 128), "fp32")
+                inner.state = [conv, state, "ple_history", "ple_conv"]
+                wrapper = packages["omlx.cache.type_handlers"].SizedArraysCache(inner, 4096)
+                self.assertIs(wrapper.state, inner.state)
+                self.assertIs(wrapper.cache, inner.cache)
+                self.assertEqual(len(wrapper), 4)
+                sink = []
+                with patch.dict(sys.modules, packages):
+                    self.assertEqual(ns["try_fused_rms"](module, array((1, 3, 2560)), None, wrapper, sink), "output")
+                self.assertEqual(inner.state, ["next_conv", "next_state", "ple_history", "ple_conv"])
+                self.assertEqual(wrapper.size(), 4096)
+                advance.assert_called_once_with(3)
+                self.assertIs(wrapper._inner, inner)
+                self.assertIs(sink[0][7], state)
+                self.assertIs(kernel.call_args.args[4], conv)
+                q35._qwen3_5_advance_left_padding_info.assert_called_once_with(wrapper, 3)
+                q35._qwen3_5_advance_lengths_info.assert_called_once_with(wrapper, 3)
+                self.assertEqual(ns["receipt"]()["calls"], 1)
+                # Wrapper writes/properties retain their production delegation.
+                wrapper.state = [conv, state]
+                wrapper.rollback_state = "rollback"
+                self.assertIs(wrapper.state, inner.state)
+                self.assertEqual(inner.rollback_state, "rollback")
+
+    def test_actual_sized_wrapper_rejects_unknown_subclass_nested_and_padding(self):
+        ns, module, packages, _, _, kernel = self.setup_hook()
+        wrapper_cls = packages["omlx.cache.type_handlers"].SizedArraysCache
+        good = ns["Cache"]([array((1, 3, 10240)), array((1, 48, 128, 128), "fp32")])
+        class InnerSubclass(ns["Cache"]):
+            pass
+        class WrapperSubclass(wrapper_cls):
+            pass
+        cases = [wrapper_cls(object(), 4096), wrapper_cls(InnerSubclass(good), 4096),
+                 WrapperSubclass(good, 4096), wrapper_cls(wrapper_cls(good, 4096), 4096)]
+        with patch.dict(sys.modules, packages):
+            for cache in cases:
+                self.assertTrue(ns["_admission"](module, array((1, 3, 2560)), None, cache, []).startswith("cache is outside"))
+            for attribute in ("lengths", "left_padding"):
+                inner = ns["Cache"](good)
+                wrapped = wrapper_cls(inner, 4096)
+                setattr(wrapped, attribute, [1])
+                self.assertEqual(getattr(inner, attribute), [1])
+                self.assertEqual(ns["_admission"](module, array((1, 3, 2560)), None, wrapped, []), "padded cache")
+        self.assertFalse(kernel.called)
+
+    def test_actual_sized_wrapper_advance_failure_fail_stops_after_commit(self):
+        ns, module, packages, q35, _, kernel = self.setup_hook()
+        def advance(cache, count):
+            cache.advanced = count
+            raise RuntimeError("injected wrapped advance failure")
+        ns["Cache"].advance = advance
+        inner = ns["Cache"]([array((1, 3, 10240)), array((1, 48, 128, 128), "fp32")])
+        wrapped = packages["omlx.cache.type_handlers"].SizedArraysCache(inner, 4096)
+        sink = []
+        with patch.dict(sys.modules, packages):
+            with self.assertRaisesRegex(RuntimeError, "wrapped advance failure"):
+                ns["try_fused_rms"](module, array((1, 3, 2560)), None, wrapped, sink)
+        self.assertEqual(inner, ["next_conv", "next_state"])
+        self.assertEqual(inner.advanced, 3)
+        self.assertEqual(wrapped.size(), 4096)
+        self.assertEqual(len(sink), 1)
+        self.assertEqual(kernel.call_count, 1)
+        self.assertEqual(ns["receipt"]()["calls"], 0)
+        self.assertFalse(ns["receipt"]()["exception_fuse"])
+        q35._qwen3_5_advance_left_padding_info.assert_not_called()
 
     def test_actual_arrays_cache_advance_methods_in_hook_are_noops_for_admitted_lane(self):
         root = SOURCE.parents[2]

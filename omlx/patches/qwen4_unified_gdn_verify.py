@@ -379,7 +379,14 @@ def _admission(module, inputs, mask, cache, gdn_sink):
         return "mask or missing rollback sink/cache"
     from mlx_lm.models.cache import ArraysCache as LMArrayCache
     from mlx_vlm.models.qwen4_exp.cache import ArraysCache as Qwen4ArrayCache
-    if type(cache) not in (LMArrayCache, Qwen4ArrayCache):
+    from omlx.cache.type_handlers import SizedArraysCache
+    qualified_inner = (LMArrayCache, Qwen4ArrayCache)
+    # Prefix restoration adds this concrete size-tracking wrapper. Admit only
+    # one exact wrapper over an already qualified concrete cache, and retain
+    # the outer object for all reads, commits and metadata advancement below.
+    # Subclasses, unknown inners and nested wrappers keep the existing route.
+    if not (type(cache) in qualified_inner or
+            (type(cache) is SizedArraysCache and type(cache._inner) in qualified_inner)):
         return "cache is outside qualified concrete ArraysCache ABI"
     if getattr(cache, "lengths", None) is not None or getattr(cache, "left_padding", None) is not None:
         return "padded cache"
