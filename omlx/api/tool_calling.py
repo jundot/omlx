@@ -211,6 +211,46 @@ def _tool_param_properties(func_name: str, tools: Optional[List]) -> dict:
     return {}
 
 
+def _merge_json_fragments(val: str, spec: Any) -> Optional[list]:
+    """Merge whitespace-separated top-level JSON values into the declared array.
+
+    Some models emit an array-typed parameter as one JSON value per line —
+    ``["a"]\n["b"]\n["c"]`` for ``{"type": "array", "items": {"type": "string"}}``.
+    That text is balanced, so the bracket repair below sees nothing to fix and the
+    raw string reaches the caller. Merge only when: the declared type is an array,
+    every fragment parses, the decoder consumes the whole string (no trailing
+    prose), and the fragments are homogeneous. ``items.type`` decides whether list
+    fragments concatenate (items are scalars/objects) or wrap (items are arrays).
+    Anything else returns None and the existing fallbacks run.
+    """
+    spec_type = spec.get("type") if isinstance(spec, dict) else None
+    if not isinstance(spec_type, str) or spec_type.strip().lower() not in ("array", "arr", "list"):
+        return None
+    fragments: List[Any] = []
+    pos = 0
+    end = len(val)
+    while True:
+        while pos < end and val[pos].isspace():
+            pos += 1
+        if pos >= end:
+            break
+        try:
+            obj, pos = _TOOL_CALL_JSON_DECODER.raw_decode(val, pos)
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
+            return None
+        fragments.append(obj)
+    if len(fragments) < 2:
+        return None
+    items = spec.get("items") if isinstance(spec, dict) else None
+    items_type = items.get("type") if isinstance(items, dict) else None
+    items_are_arrays = isinstance(items_type, str) and items_type.strip().lower() in ("array", "arr", "list")
+    if all(isinstance(f, list) for f in fragments):
+        return fragments if items_are_arrays else [x for f in fragments for x in f]
+    if all(not isinstance(f, (list, dict)) for f in fragments) or all(isinstance(f, dict) for f in fragments):
+        return fragments
+    return None
+
+
 def _repair_json_value(val: str) -> Optional[Any]:
     """Best-effort repair of near-valid JSON with unbalanced brackets.
 
@@ -315,6 +355,17 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     except (ValueError, SyntaxError, TypeError, MemoryError, *_DEEP_NEST_ERRORS):
         pass
     if ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list")):
+        merged = _merge_json_fragments(val, spec)
+        if merged is not None:
+            logger.warning(
+                "Merged %d line-separated JSON fragments for parameter %r of tool %r "
+                "(declared type %r)",
+                len(merged),
+                key,
+                func_name,
+                ptype,
+            )
+            return merged
         repaired = _repair_json_value(val)
         if repaired is not None:
             logger.warning(

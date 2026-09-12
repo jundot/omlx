@@ -3651,6 +3651,62 @@ class TestSchemaAwareFallbackCoercion:
         args = json.loads(calls[0].function.arguments)
         assert args["edits"] == self.REPAIRED_EDITS
 
+    FRAGMENTED = '["a"]\n["b"]\n["c"]'
+    REC_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "submit_recommendations",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "recommendations": {"type": "array", "items": {"type": "string"}},
+                    "matrix": {"type": "array", "items": {"type": "array"}},
+                    "note": {"type": "string"},
+                },
+            },
+        },
+    }
+
+    def _rec_text(self, param, val):
+        return (
+            "<tool_call>\n<function=submit_recommendations>\n"
+            f"<parameter={param}>\n{val}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    def test_line_separated_arrays_merge_into_declared_array(self):
+        """One-element arrays on separate lines concatenate when items are scalars."""
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == ["a", "b", "c"]
+
+    def test_line_separated_arrays_wrap_when_items_are_arrays(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("matrix", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["matrix"] == [["a"], ["b"], ["c"]]
+
+    def test_line_separated_scalars_wrap_into_declared_array(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", '"a"\n"b"'), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == ["a", "b"]
+
+    def test_fragments_with_trailing_prose_keep_raw_string(self):
+        val = '["a"]\n["b"] and that is all'
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", val), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == val
+
+    def test_mixed_fragments_keep_raw_string(self):
+        val = '["a"]\n{"k": 1}'
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", val), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == val
+
+    def test_fragments_never_merge_for_declared_string_param(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("note", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["note"] == self.FRAGMENTED
+
     def test_declared_string_param_not_json_coerced(self):
         """A numeric-looking value for a declared string param stays a string."""
         tool = {
