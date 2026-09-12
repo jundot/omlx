@@ -1582,7 +1582,7 @@ raise SystemExit(2)
 
     async def stream_generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -1610,7 +1610,11 @@ raise SystemExit(2)
             stream=True,
             kwargs=kwargs,
         )
-        prompt_tokens = len(self._tokenizer.encode(prompt))
+        prompt_tokens = (
+            len(prompt)
+            if isinstance(prompt, list)
+            else len(self._tokenizer.encode(prompt))
+        )
         completion_tokens = 0
         cached_tokens = 0
         finish_reason: str | None = None
