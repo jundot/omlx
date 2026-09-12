@@ -3,11 +3,11 @@
 
 For Mixture-of-Experts models whose expert tables do not fit in memory, keep
 only ``resident_fraction`` of each layer's experts in a contiguous slot tensor
-and fetch the rest on demand from the model's own safetensors shards (mmap
-slab reads — no converted copy of the checkpoint, no write path). Routing is
-computed exactly as shipped; a cache miss changes *when* an expert's weights
-are read, never *which* expert runs. Accuracy is therefore preserved by
-construction, at a latency cost (measured on a 26B/128-expert model: accuracy
+and fetch the rest on demand from the model's own safetensors shards
+(positional slab reads — no converted copy of the checkpoint, no write
+path). Routing is computed exactly as shipped; a cache miss changes *when*
+an expert's weights are read, never *which* expert runs. Accuracy is
+therefore preserved by construction, at a latency cost (measured on a 26B/128-expert model: accuracy
 flat down to 12% residency, throughput falling roughly as memory^0.5).
 
 Applied once post-load, before lazy weights materialize: each stock
@@ -30,11 +30,15 @@ assertion policy).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import struct
+import threading
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import mlx.core as mx
@@ -56,6 +60,11 @@ _PER_EXPERT_PROJ_RE = re.compile(
     r"^(?P<parent>.+)\.experts\.(?P<idx>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<field>weight|scales|biases)$"
 )
+
+# A pending slab read: everything needed to turn a byte range of a shard
+# into an mx.array, and nothing that touches MLX or cache state — so the
+# ``os.pread`` half can run on any thread.
+_ReadPlan = namedtuple("_ReadPlan", "fd offset nbytes np_dtype mx_view shape")
 
 # safetensors dtype tag -> (numpy transport dtype, mlx dtype to view as).
 # bf16 has no numpy equivalent, so it travels as raw uint16 and is
@@ -94,15 +103,17 @@ class CheckpointExpertStore:
 
     Expert tables are stored stacked with the expert axis leading
     (``[num_experts, ...]``), so one expert is a contiguous byte range in the
-    shard. Shards are memory-mapped read-only; a fetch copies out exactly one
-    expert's slab. No MLX/Metal calls happen here except the final host-side
-    ``mx.array`` construction, so fetches are safe to move off the Metal
-    thread later (prefetch).
+    shard. Each shard is opened once read-only and read with ``os.pread``,
+    which takes the offset as an argument instead of carrying one on the
+    descriptor — so reads of different experts are safe to run concurrently,
+    off the calling thread. The read splits in two: :meth:`read` produces
+    bytes and touches neither MLX nor cache state (any thread), :meth:`to_mx`
+    turns those bytes into an array (the calling thread's stream).
     """
 
     def __init__(self, model_path: str | Path):
         self._specs: dict[str, tuple[Path, str, tuple[int, ...], int]] = {}
-        self._mm: dict[Path, np.memmap] = {}
+        self._fds: dict[Path, int] = {}
         model_path = Path(model_path)
         for shard in sorted(model_path.glob("*.safetensors")):
             with open(shard, "rb") as f:
@@ -118,6 +129,15 @@ class CheckpointExpertStore:
                     tuple(spec["shape"]),
                     data_base + spec["data_offsets"][0],
                 )
+            # Opened once here, read-only and never mutated afterwards: the
+            # store is fully populated before any fetch, which is what makes
+            # concurrent reads against it safe without a lock.
+            self._fds[shard] = os.open(shard, os.O_RDONLY)
+
+    def __del__(self):
+        for fd in self._fds.values():
+            with contextlib.suppress(Exception):  # interpreter teardown
+                os.close(fd)
 
     def __bool__(self) -> bool:
         return bool(self._specs)
@@ -129,29 +149,60 @@ class CheckpointExpertStore:
         _, dtype, shape, _ = self._specs[name]
         return shape, dtype
 
-    def _read(self, name: str, start_elem: int, n_elems: int,
-              out_shape: tuple[int, ...]) -> mx.array:
+    def _plan(
+        self, name: str, start_elem: int, n_elems: int, out_shape: tuple[int, ...]
+    ) -> _ReadPlan:
         shard, dtype, _, offset = self._specs[name]
         np_dtype, mx_view = _DTYPES[dtype]
         itemsize = np.dtype(np_dtype).itemsize
-        mm = self._mm.get(shard)
-        if mm is None:
-            mm = self._mm[shard] = np.memmap(shard, dtype=np.uint8, mode="r")
-        start = offset + start_elem * itemsize
-        raw = np.array(mm[start : start + n_elems * itemsize])  # one copy
-        out = mx.array(raw.view(np_dtype).reshape(out_shape))
-        return out.view(mx_view) if mx_view is not None else out
+        return _ReadPlan(
+            self._fds[shard],
+            offset + start_elem * itemsize,
+            n_elems * itemsize,
+            np_dtype,
+            mx_view,
+            out_shape,
+        )
+
+    def plan_expert(self, name: str, expert: int) -> _ReadPlan:
+        """Plan one expert's slab of a stacked ``[num_experts, ...]`` tensor."""
+        _, _, shape, _ = self._specs[name]
+        slab = int(np.prod(shape[1:]))
+        return self._plan(name, expert * slab, slab, shape[1:])
+
+    def plan_tensor(self, name: str) -> _ReadPlan:
+        """Plan a whole tensor (per-expert checkpoint layouts)."""
+        _, _, shape, _ = self._specs[name]
+        return self._plan(name, 0, int(np.prod(shape)), shape)
+
+    @staticmethod
+    def read(plan: _ReadPlan) -> bytes:
+        """The plan's raw bytes. Thread-safe: positional reads only."""
+        chunks = []
+        got = 0
+        while got < plan.nbytes:
+            chunk = os.pread(plan.fd, plan.nbytes - got, plan.offset + got)
+            if not chunk:
+                raise OSError(f"short read of {plan.nbytes} bytes at {plan.offset}")
+            chunks.append(chunk)
+            got += len(chunk)
+        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+    @staticmethod
+    def to_mx(plan: _ReadPlan, raw: bytes) -> mx.array:
+        """Reinterpret a plan's bytes as its array (host-side, one copy)."""
+        out = mx.array(np.frombuffer(raw, dtype=plan.np_dtype).reshape(plan.shape))
+        return out.view(plan.mx_view) if plan.mx_view is not None else out
 
     def fetch_expert(self, name: str, expert: int) -> mx.array:
         """One expert's slab of a stacked ``[num_experts, ...]`` tensor."""
-        _, _, shape, _ = self._specs[name]
-        slab = int(np.prod(shape[1:]))
-        return self._read(name, expert * slab, slab, shape[1:])
+        plan = self.plan_expert(name, expert)
+        return self.to_mx(plan, self.read(plan))
 
     def fetch_tensor(self, name: str) -> mx.array:
         """A whole tensor (per-expert checkpoint layouts)."""
-        _, _, shape, _ = self._specs[name]
-        return self._read(name, 0, int(np.prod(shape)), shape)
+        plan = self.plan_tensor(name)
+        return self.to_mx(plan, self.read(plan))
 
 
 class _GLUStoreView:
@@ -179,10 +230,71 @@ class _GLUStoreView:
     def has(self, proj: str, field: str) -> bool:
         return self._store.has(self._name(proj, field, 0))
 
+    def plan(self, proj: str, field: str, expert: int) -> _ReadPlan:
+        if self._per_expert:
+            return self._store.plan_tensor(self._name(proj, field, expert))
+        return self._store.plan_expert(self._name(proj, field, 0), expert)
+
     def fetch(self, proj: str, field: str, expert: int) -> mx.array:
         if self._per_expert:
             return self._store.fetch_tensor(self._name(proj, field, expert))
         return self._store.fetch_expert(self._name(proj, field, 0), expert)
+
+
+# One reader pool for the whole process. A miss is IO, not compute: the
+# useful width is the storage queue depth, so the default is wider than the
+# core count. ``OMLX_MOE_OFFLOAD_IO_WORKERS`` <= 1 (or unparseable) keeps the
+# serial path and creates no threads at all;
+# ``OMLX_MOE_OFFLOAD_IO_BATCH`` caps how many experts' payloads may be in
+# flight, which is what bounds the extra host memory the pipeline holds.
+_IO_WORKERS = 12
+_IO_LOCK = threading.Lock()
+_IO_POOL: ThreadPoolExecutor | None = None
+_IO_BATCH = 0
+_IO_CONFIGURED = False
+
+
+def _env_int(name: str, default: int, invalid: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return invalid
+
+
+def _io_pool() -> ThreadPoolExecutor | None:
+    """The shared reader pool, or ``None`` when reads must stay serial."""
+    global _IO_POOL, _IO_BATCH, _IO_CONFIGURED
+    with _IO_LOCK:
+        if not _IO_CONFIGURED:
+            _IO_CONFIGURED = True
+            workers = _env_int("OMLX_MOE_OFFLOAD_IO_WORKERS", _IO_WORKERS, 0)
+            if workers > 1:
+                _IO_BATCH = max(
+                    1,
+                    _env_int("OMLX_MOE_OFFLOAD_IO_BATCH", 4 * workers, 4 * workers),
+                )
+                _IO_POOL = ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix="omlx-moe-io"
+                )
+        return _IO_POOL
+
+
+def _io_batch() -> int:
+    """Experts whose reads may be in flight at once."""
+    _io_pool()
+    return _IO_BATCH
+
+
+def _shutdown_io_pool() -> None:
+    """Drop the pool; the next fetch re-reads the environment (tests)."""
+    global _IO_POOL, _IO_BATCH, _IO_CONFIGURED
+    with _IO_LOCK:
+        pool, _IO_POOL, _IO_BATCH, _IO_CONFIGURED = _IO_POOL, None, 0, False
+    if pool is not None:
+        pool.shutdown(wait=True)
 
 
 class ExpertCache:
@@ -231,19 +343,25 @@ class ExpertCache:
         self.hits = self.misses = 0
         self.warm = False
 
-    def _install(self, e: int) -> int:
+    def _plans(self, e: int) -> list:
+        """Read plans for expert ``e``'s tensors, in slot-write order."""
+        out = []
+        for name in self.projs:
+            rb = self.resident[name][2]
+            out.append((name, 0, self.disk.plan(name, "weight", e)))
+            out.append((name, 1, self.disk.plan(name, "scales", e)))
+            if rb is not None and self.disk.has(name, "biases"):
+                out.append((name, 2, self.disk.plan(name, "biases", e)))
+        return out
+
+    def _reserve(self, e: int) -> int:
+        """Claim a slot for ``e``, evicting the LRU expert if none is free."""
         if self.free:
             slot = self.free.pop()
         else:
             old_e = next(iter(self.slot_of))  # LRU victim
             slot = self.slot_of.pop(old_e)
             self.map[old_e] = -1
-        for name in self.projs:
-            rw, rs, rb = self.resident[name]
-            rw[slot] = self.disk.fetch(name, "weight", e)
-            rs[slot] = self.disk.fetch(name, "scales", e)
-            if rb is not None and self.disk.has(name, "biases"):
-                rb[slot] = self.disk.fetch(name, "biases", e)
         self.slot_of[e] = slot
         self.map[e] = slot
         # once every expert has a slot no eviction can occur, so residency is
@@ -251,8 +369,33 @@ class ExpertCache:
         self.warm = len(self.slot_of) == self.n_experts
         return slot
 
+    def _write(self, slot: int, payload: list) -> None:
+        """Copy one expert's fetched bytes into ``slot``."""
+        for name, field, plan, raw in payload:
+            self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
+
+    def _install(self, e: int) -> int:
+        plans = self._plans(e)
+        slot = self._reserve(e)
+        self._write(
+            slot, [(n, f, pl, CheckpointExpertStore.read(pl)) for n, f, pl in plans]
+        )
+        return slot
+
     def ensure(self, idx: mx.array) -> None:
         """Make every expert in ``idx`` resident.
+
+        Two passes. The first classifies the call's misses without touching
+        any cache state and starts their reads on the IO pool, at most
+        ``OMLX_MOE_OFFLOAD_IO_BATCH`` experts in flight; the second is the
+        serial install loop, which takes bytes from the pipeline instead of
+        reading them itself (an expert the first pass did not queue, because
+        eviction unseated it in the meantime, falls back to a serial read).
+        Every mutation — ``slot_of``, ``free``, ``map``, the counters, the
+        slots — happens on the calling thread in the serial order, so LRU
+        victims, hit/miss counts and resident bytes are identical to the
+        serial path. Concurrent ``ensure`` calls on one cache stay
+        unsupported, exactly as before.
 
         The ``.tolist()`` is a device->host readback and therefore a sync per
         MoE layer per step. Removing it needs prefetch (resolve layer L+1's
@@ -261,14 +404,44 @@ class ExpertCache:
         if self.warm:  # nothing can miss; skip it
             return
         needed = set(int(e) for e in idx.reshape(-1).tolist())
+        pool = _io_pool()
+        queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
+        window = _io_batch()
+        pending: dict[int, list] = {}
+        sent = 0
+
+        def prefetch(upto: int) -> None:
+            nonlocal sent
+            while sent < min(upto, len(queue)):
+                e = queue[sent]
+                sent += 1
+                pending[e] = [
+                    (name, field, plan, pool.submit(CheckpointExpertStore.read, plan))
+                    for name, field, plan in self._plans(e)
+                ]
+
+        prefetch(window)
+        done = 0
         for e in needed:
             if e in self.slot_of:
                 slot = self.slot_of.pop(e)  # re-insert: LRU order
                 self.slot_of[e] = slot
                 self.hits += 1
-            else:
-                self.misses += 1
+                continue
+            self.misses += 1
+            group = pending.pop(e, None)
+            if group is None:
                 self._install(e)
+                continue
+            # Refill before the writes, never after, and only up to the
+            # experts already drained: at most ``window`` experts' payloads
+            # exist at once, counting the one being written here.
+            prefetch(done + window)
+            self._write(
+                self._reserve(e),
+                [(name, field, plan, f.result()) for name, field, plan, f in group],
+            )
+            done += 1
         # No mx.eval here: installs are already-materialized host arrays, and
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the

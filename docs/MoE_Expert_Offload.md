@@ -35,6 +35,13 @@ with a resident-fraction selector (12.5% – 75%). Or via the settings API:
 Toggling triggers an engine reload (it is a load-time transform). The env
 kill switch `OMLX_MOE_EXPERT_OFFLOAD=0` disables it regardless of settings.
 
+Two env vars tune the reader, and neither changes what is computed:
+
+| variable | default | effect |
+|---|---|---|
+| `OMLX_MOE_OFFLOAD_IO_WORKERS` | 12 | threads reading missing experts. `1` or less (or an unparseable value) keeps the serial path and starts no threads |
+| `OMLX_MOE_OFFLOAD_IO_BATCH` | `4 x workers` | experts whose reads may be in flight at once — the bound on the host memory the pipeline holds ahead of the slot writes |
+
 ## Performance
 
 `gemma-4-26b-a4b-it-4bit`, 585-token prompt, 256 generated tokens, warm
@@ -50,12 +57,20 @@ fill):
 
 Decode throughput degrades gracefully; TTFT is the pain point at low
 residency, because a long prefill routes to most experts per layer and pays
-the fetch churn up front. That is also the clearest follow-up: v1 fetches
-synchronously on miss, while prefill's full expert-access schedule is
-computable *before* any fetch (run the router over the whole prompt — no
-prediction needed), and decode prefetch (layer L+1's fetches during layer
-L's compute) has measured LRU→optimal headroom of +17pp hit rate at low
-residency.
+the fetch churn up front. A call's misses are therefore read *in parallel*:
+`ensure()` first classifies every expert the call needs without touching the
+cache, starts the missing experts' reads on a shared pool (`os.pread`, so a
+read needs nothing but a descriptor and an offset), and only then runs the
+serial install loop, which takes bytes from the pipeline instead of reading
+them itself. The slot writes, the LRU order, the eviction victims and the
+hit/miss counters all stay on the calling thread in the serial order, so the
+pipeline changes nothing but *when* the bytes arrive.
+
+The remaining headroom is scheduling, not IO width: prefill's full
+expert-access schedule is computable *before* any fetch (run the router over
+the whole prompt — no prediction needed), and decode prefetch (layer L+1's
+fetches during layer L's compute) has measured LRU→optimal headroom of
++17pp hit rate at low residency.
 
 ## Supported models
 
