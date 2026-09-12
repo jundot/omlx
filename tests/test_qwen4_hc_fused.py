@@ -22,7 +22,12 @@ HC, HIDDEN, LOWRANK = 4, 2560, 320
 WIDTH = HC * HIDDEN
 
 
-def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
+def _module(
+    bits: int,
+    use_combine: bool = True,
+    hidden: int = HIDDEN,
+    dense_inject: bool = False,
+):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
 
@@ -39,12 +44,18 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
         LOWRANK, width, bias=False, group_size=64, bits=bits
     )
     if use_combine:
-        module.block_inject_weight = nn.QuantizedLinear(
-            width, HC, bias=False, group_size=64, bits=bits
-        )
+        if dense_inject:
+            module.block_inject_weight = nn.Linear(width, HC, bias=False)
+            module.block_inject_weight.weight = (
+                module.block_inject_weight.weight.astype(mx.bfloat16)
+            )
+        else:
+            module.block_inject_weight = nn.QuantizedLinear(
+                width, HC, bias=False, group_size=64, bits=bits
+            )
     for name in ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight"):
         projection = getattr(module, name, None)
-        if projection is not None:
+        if isinstance(projection, nn.QuantizedLinear):
             # Checkpoint-like statistics: positive scales, small biases. Random-sign scales drive the
             # up-projection gate into saturation where any rounding difference flips whole elements.
             projection.scales = (
@@ -59,6 +70,8 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
 
 def _reference_fp32(module, x):
     def dequant(q):
+        if type(q) is nn.Linear:
+            return q.weight.astype(mx.float32)
         return mx.dequantize(
             q.weight, q.scales, q.biases, group_size=q.group_size, bits=q.bits
         ).astype(mx.float32)
@@ -92,6 +105,60 @@ def _ulps(a, b):
 def test_fused_matches_canonical_path(bits, rows, use_combine):
     mx.random.seed(20260905 + bits * 100 + rows)
     _assert_fused_matches_canonical(_module(bits, use_combine), rows, use_combine)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("rows", [1, 2, 4, 6, 16])
+def test_bf16_injection_matches_canonical(bits, rows):
+    mx.random.seed(20260912 + bits * 100 + rows)
+    _assert_fused_matches_canonical(_module(bits, dense_inject=True), rows, True)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("hidden", [64, 768, 1152, 1344])
+def test_bf16_injection_handles_other_hidden_sizes(hidden):
+    mx.random.seed(hidden + 123)
+    _assert_fused_matches_canonical(
+        _module(8, hidden=hidden, dense_inject=True), 4, True
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_bf16_injection_serial_and_verify_rows_agree():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(20260912)
+    module = _module(8, dense_inject=True)
+    x = mx.random.normal((1, 6, WIDTH)).astype(mx.bfloat16)
+    batched = module(x, target_verify=True)
+    serial = [module(x[:, i : i + 1], target_verify=False) for i in range(6)]
+    canonical = module._forward(x, target_verify=True)
+    mx.eval(batched, serial, canonical)
+    assert hc_fused.compatible(module, x)
+    for component in (0, 2):
+        joined = mx.concatenate([out[component] for out in serial], axis=1)
+        assert mx.array_equal(batched[component], joined).item()
+    assert _ulps(batched[2], canonical[2])[0] <= 4
+
+
+@pytest.mark.parametrize(
+    "dtype,bias,shape",
+    [
+        (mx.float32, False, (HC, WIDTH)),
+        (mx.float16, False, (HC, WIDTH)),
+        (mx.bfloat16, True, (HC, WIDTH)),
+        (mx.bfloat16, False, (HC + 1, WIDTH)),
+        (mx.bfloat16, False, (HC, WIDTH - 1)),
+    ],
+)
+def test_bf16_injection_rejects_unsupported_layout(dtype, bias, shape):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(8, dense_inject=True)
+    module.block_inject_weight = nn.Linear(shape[1], shape[0], bias=bias)
+    module.block_inject_weight.weight = module.block_inject_weight.weight.astype(dtype)
+    assert not hc_fused.compatible(module, mx.zeros((1, 1, WIDTH), dtype=mx.bfloat16))
 
 
 # Sizes the checkpoint never has, chosen so every kernel sees a partial final block:
@@ -331,13 +398,16 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
         (128, 4, 5, 4, 4),
         (128, 4, 5, 6, 4),
         (128, 4, 5, 6, 8),
+        (128, 4, 5, 6, 16),
         (128, 4, 5, 6, None),
     ]:
         module = _module(down_bits, inject_bits is not None, hidden=hidden)
         module.input_mix_weight_up = _module(up_bits, hidden=hidden).input_mix_weight_up
         if inject_bits is not None:
             module.block_inject_weight = _module(
-                inject_bits, hidden=hidden
+                8 if inject_bits == 16 else inject_bits,
+                hidden=hidden,
+                dense_inject=inject_bits == 16,
             ).block_inject_weight
         hc_fused._eps_array(module)
         x = mx.ones((1, rows, HC * hidden), dtype=mx.bfloat16)
@@ -349,7 +419,7 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
             second = module(x)
             assert evaluate.call_count == 1
         mx.eval(first, second)
-    assert len(hc_fused._VALIDATED) == 7
+    assert len(hc_fused._VALIDATED) == 8
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -409,7 +479,9 @@ def test_module_routes_prefill_rows_through_the_prefill_path(monkeypatch):
     module = _module(4)
     x = mx.zeros((1, 64, WIDTH), dtype=mx.bfloat16)
     calls = []
-    monkeypatch.setattr(hc_fused, "prefill_forward", lambda m, h: calls.append(h.shape) or "prefill")
+    monkeypatch.setattr(
+        hc_fused, "prefill_forward", lambda m, h: calls.append(h.shape) or "prefill"
+    )
     assert module(x) == "prefill"
     assert calls == [(1, 64, WIDTH)]
     assert module(x, target_verify=True) != "prefill"
