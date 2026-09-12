@@ -14,6 +14,7 @@
         'min_p',
         'repetition_penalty',
         'presence_penalty',
+        'repetition_context_size',
         'force_sampling',
         'enable_thinking',
         'preserve_thinking',
@@ -223,6 +224,7 @@
                 repetition_penalty: null,
                 min_p: null,
                 presence_penalty: null,
+                repetition_context_size: null,
                 force_sampling: false,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
@@ -1662,6 +1664,7 @@
                     repetition_penalty: s.repetition_penalty ?? null,
                     min_p: s.min_p ?? null,
                     presence_penalty: s.presence_penalty ?? null,
+                    repetition_context_size: s.repetition_context_size ?? null,
                     force_sampling: s.force_sampling || false,
                     enable_thinking: s.enable_thinking ?? null,
                     thinking_default: model?.thinking_default ?? null,
@@ -1768,6 +1771,7 @@
                 ms.min_p = null;
                 ms.repetition_penalty = null;
                 ms.presence_penalty = null;
+                ms.repetition_context_size = null;
                 ms.force_sampling = false;
                 ms.max_context_window = null;
                 ms.max_tokens = null;
@@ -2615,6 +2619,7 @@
                                 repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
                                 min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
+                                repetition_context_size: Number.isFinite(this.modelSettings.repetition_context_size) ? this.modelSettings.repetition_context_size : null,
                                 force_sampling: this.modelSettings.force_sampling,
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,

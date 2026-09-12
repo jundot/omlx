@@ -104,6 +104,55 @@ async def test_text_completion_stream_forwards_transport_request_id():
     assert engine.kwargs["_request_id"] == "transport-completion-1"
 
 
+@pytest.mark.asyncio
+async def test_text_completion_stream_prefers_request_window_over_model_setting():
+    from omlx.api.openai_models import CompletionRequest
+    from omlx.server import stream_completion
+
+    class Engine:
+        tokenizer = None
+
+        def __init__(self):
+            self.kwargs = None
+
+        async def stream_generate(self, **kwargs):
+            self.kwargs = kwargs
+            if False:
+                yield None
+
+    engine = Engine()
+    model_settings = ModelSettings(repetition_context_size=256)
+
+    with patch(
+        "omlx.server.get_model_settings_for_request",
+        return_value=model_settings,
+    ):
+        request = CompletionRequest(model="model", prompt="hello", stream=True)
+        chunks = [
+            chunk
+            async for chunk in stream_completion(
+                engine, "hello", request, prompt_token_ids=[]
+            )
+        ]
+        assert chunks == ["data: [DONE]\n\n"]
+        assert engine.kwargs["repetition_context_size"] == 256
+
+        request = CompletionRequest(
+            model="model",
+            prompt="hello",
+            stream=True,
+            repetition_context_size=64,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_completion(
+                engine, "hello", request, prompt_token_ids=[]
+            )
+        ]
+        assert chunks == ["data: [DONE]\n\n"]
+        assert engine.kwargs["repetition_context_size"] == 64
+
+
 class TestDiffusionStructuredOutputGuard:
     class _DiffusionEngine:
         is_diffusion_model = True

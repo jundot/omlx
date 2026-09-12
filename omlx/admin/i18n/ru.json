@@ -634,6 +634,8 @@
   "modal.model_settings.temperature": "Температура",
   "modal.model_settings.repetition_penalty": "Штраф за повторения",
   "modal.model_settings.repetition_penalty_short": "Штраф за повторы",
+  "modal.model_settings.repetition_context_size": "Размер контекста повторений",
+  "modal.model_settings.repetition_context_size_hint": "Количество предыдущих токенов, учитываемых для штрафа за повторения. По умолчанию: 20.",
   "modal.model_settings.min_p": "Min P",
   "modal.model_settings.presence_penalty": "Штраф за присутствие",
   "modal.model_settings.top_p": "Top P",

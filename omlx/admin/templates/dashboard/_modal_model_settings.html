@@ -387,6 +387,12 @@
                                                    :class="modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
+                                        <div x-show="!modelSettings.is_diffusion_model">
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_context_size') }}</label>
+                                            <input type="number" x-model.number="modelSettings.repetition_context_size" step="1" min="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.repetition_context_size_hint') }}</p>
+                                        </div>
                                         <p x-show="modelSettings.vlm_mtp_enabled"
                                            class="sm:col-span-2 text-xs text-amber-600">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
                                     </div>
