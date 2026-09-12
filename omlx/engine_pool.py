@@ -489,10 +489,11 @@ class EnginePool:
                 ceiling = self._current_ceiling()
         forced = estimate.force_ssd_offload(ceiling)
         if forced:
-            logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
-                "roughly 2.5x slower than a resident load.",
+            logger.info(
+                "Using SSD-backed Qwen4-Exp PLE for %s: estimated resident model "
+                "memory %.1fGB exceeds the %.1fGB ceiling "
+                "(%.1fGB with SSD PLE). Throughput depends on workload and "
+                "cache residency.",
                 entry.model_id,
                 estimate.resident_bytes / 1e9,
                 ceiling / 1e9,

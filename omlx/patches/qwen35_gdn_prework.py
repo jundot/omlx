@@ -7,9 +7,7 @@
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
 ones-weight RMS norms + two scalar scales + the next conv-state slice — is
-~10 small dispatches per GDN layer per verify cycle. On the 27B that is 48
-layers x ~0.29 ms (measured sync-mode at S=4 on M3 Ultra), the largest
-remaining verify-cycle cost after the attention split.
+roughly ten small dispatches per GDN layer per verify cycle.
 
 One Metal launch replaces the whole chain. Numerics notes carried from the
 donor kernel: the in-kernel sigmoid uses MLX's own unary formula

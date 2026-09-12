@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import functools
 import logging
 
 import mlx.core as mx
@@ -12,11 +11,6 @@ logger = logging.getLogger(__name__)
 _KERNEL = None
 _PROVEN = False
 _FAILED = False
-
-
-@functools.lru_cache(maxsize=1)
-def _m4_max() -> bool:
-    return mx.device_info().get("device_name") == "Apple M4 Max"
 
 
 def _launch_mask(hits, counts, ends, ratio, topk, key_len):
@@ -60,7 +54,7 @@ def _launch_mask(hits, counts, ends, ratio, topk, key_len):
 
 
 def fused_block_mask(hits, counts, ends, ratio, topk, key_len):
-    """Use one kernel for measured M4 Max rows; None keeps the general path.
+    """Expand selected blocks and the causal tail in one Metal kernel.
 
     Selection is already complete. This only replaces repeat/pad/tail/where
     operations, with the same boolean result even when the hits contain blocks
@@ -84,7 +78,6 @@ def fused_block_mask(hits, counts, ends, ratio, topk, key_len):
         or hits.shape[-1] != key_len // ratio
         or mx.default_device() != mx.gpu
         or not mx.metal.is_available()
-        or not _m4_max()
     ):
         return None
     try:

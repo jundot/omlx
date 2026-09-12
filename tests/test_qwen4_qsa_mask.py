@@ -62,7 +62,7 @@ def _inputs():
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_guarded_mask_validates_once_then_stays_lazy(monkeypatch):
-    monkeypatch.setattr(qsa_mask, "_m4_max", lambda: True)
+    monkeypatch.setattr(mx, "device_info", lambda: {})
     monkeypatch.setattr(qsa_mask, "_PROVEN", False)
     monkeypatch.setattr(qsa_mask, "_FAILED", False)
     inputs = _inputs()
@@ -79,7 +79,6 @@ def test_guarded_mask_validates_once_then_stays_lazy(monkeypatch):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_mask_failure_logs_once_and_keeps_general_path(monkeypatch, caplog):
-    monkeypatch.setattr(qsa_mask, "_m4_max", lambda: True)
     monkeypatch.setattr(qsa_mask, "_FAILED", False)
     launch = Mock(side_effect=RuntimeError("injected mask failure"))
     monkeypatch.setattr(qsa_mask, "_launch_mask", launch)
@@ -93,12 +92,15 @@ def test_mask_failure_logs_once_and_keeps_general_path(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize(
-    "change", ["chip", "width", "batch", "ratio", "budget", "context"]
+    "change", ["device", "metal", "width", "batch", "ratio", "budget", "context"]
 )
-def test_unmeasured_layout_stays_general(monkeypatch, change):
-    monkeypatch.setattr(qsa_mask, "_m4_max", lambda: change != "chip")
+def test_unsupported_inputs_stay_general(monkeypatch, change):
     inputs = list(_inputs())
-    if change == "width":
+    if change == "device":
+        monkeypatch.setattr(mx, "default_device", lambda: mx.cpu)
+    elif change == "metal":
+        monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+    elif change == "width":
         inputs[0] = mx.zeros((1, 7, 1024), dtype=mx.bool_)
     elif change == "batch":
         inputs[0] = mx.zeros((2, 4, 1024), dtype=mx.bool_)

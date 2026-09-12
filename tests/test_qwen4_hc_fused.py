@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import importlib
 from unittest.mock import Mock
 
@@ -466,7 +467,7 @@ def test_prefill_path_not_offered_for_fused_rows():
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("rows", [1, 2, 4, 6])
 @pytest.mark.parametrize("use_combine", [False, True])
-def test_m4_compiled_hc_matches_eager_and_reads_replaced_weights(
+def test_compiled_hc_matches_eager_and_reads_replaced_weights(
     monkeypatch, rows, use_combine
 ):
     from mlx_vlm.models.qwen4_exp import hc_fused
@@ -481,9 +482,11 @@ def test_m4_compiled_hc_matches_eager_and_reads_replaced_weights(
             up = module.input_mix_weight_up
             up.scales = mx.zeros_like(up.scales)
             up.biases = mx.zeros_like(up.biases)
-        monkeypatch.setattr(hc_fused, "_m4_max", lambda: False)
-        eager = hc_fused.fused_forward(module, x)
-        monkeypatch.setattr(hc_fused, "_m4_max", lambda: True)
+        # Compare the previous eager 64-column dispatch with compiled dispatch.
+        with monkeypatch.context() as patch:
+            patch.setattr(hc_fused, "_FORWARDS", {})
+            patch.setattr(mx, "compile", lambda fn: functools.partial(fn, tile=64))
+            eager = hc_fused.fused_forward(module, x)
         compiled = hc_fused.fused_forward(module, x)
         mx.eval(eager, compiled)
         a = eager if use_combine else [eager]
@@ -496,25 +499,26 @@ def test_m4_compiled_hc_matches_eager_and_reads_replaced_weights(
 
 
 @pytest.mark.parametrize(
-    "m4,rows,down_bits,up_bits,inject_bits,expected",
+    "hidden,lowrank,rows,down_bits,up_bits,inject_bits,expected",
     [
-        (True, 4, 8, 8, 16, True),
-        (True, 4, 8, 8, None, True),
-        (False, 4, 8, 8, 16, False),
-        (True, 7, 8, 8, 16, False),
-        (True, 4, 5, 8, 16, False),
-        (True, 4, 8, 6, 16, False),
-        (True, 4, 8, 8, 8, False),
+        (2560, 320, 4, 8, 8, 16, True),
+        (2560, 320, 4, 8, 8, None, True),
+        (2560, 320, 7, 8, 8, 16, False),
+        (2560, 320, 4, 5, 8, 16, False),
+        (2560, 320, 4, 8, 6, 16, False),
+        (2560, 320, 4, 8, 8, 8, False),
+        (768, 320, 4, 8, 8, 16, False),
+        (2560, 256, 4, 8, 8, 16, False),
     ],
 )
-def test_hc_compilation_stays_within_measured_m4_layout(
-    monkeypatch, m4, rows, down_bits, up_bits, inject_bits, expected
+def test_hc_compilation_respects_layout_without_requiring_a_device_name(
+    monkeypatch, hidden, lowrank, rows, down_bits, up_bits, inject_bits, expected
 ):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
-    monkeypatch.setattr(hc_fused, "_m4_max", lambda: m4)
+    monkeypatch.setattr(mx, "device_info", lambda: {})
     _, signature = hc_fused._fused_plan(
-        mx.bfloat16, 4, 2560, 320, rows, down_bits, up_bits, inject_bits
+        mx.bfloat16, 4, hidden, lowrank, rows, down_bits, up_bits, inject_bits
     )
     assert signature[-1] is expected
 

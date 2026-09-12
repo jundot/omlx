@@ -7,9 +7,8 @@ and affine group-size-64 projections with 4/5/6/8-bit weights. The small block
 injection projection may also use its original BF16 weights. FP32 epilogues
 can round differently from the canonical BF16 operations.
 
-On M4 Max, the measured Q8/BF16 layout uses a compiled three-kernel call and
-16-column up tiles at widths 1..6. Weights remain explicit graph inputs, so
-replacing a module's parameters cannot reuse constants from an older model.
+The Q8/BF16 layout uses a compiled three-kernel call at widths 1..6. Weights
+remain explicit graph inputs so parameter replacement takes effect immediately.
 
 Each kernel specialization is evaluated once inside the failure handler to
 catch lazy compilation errors. Later calls stay lazy; errors during their
@@ -463,11 +462,6 @@ def prefill_forward(module, hyper_input):
         return None
 
 
-@functools.lru_cache(maxsize=1)
-def _m4_max() -> bool:
-    return mx.device_info().get("device_name") == "Apple M4 Max"
-
-
 def _launch_fused(
     flat,
     norm_weight,
@@ -554,16 +548,17 @@ def _launch_fused(
 
 
 def _fused_plan(dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits):
-    # Only change dispatch for the M4 Max geometry measured with actual weights.
-    # Other layouts keep the existing eager three-kernel path and 64-column tile.
+    # Compile short Q8 calls; other layouts use eager kernel dispatch.
     compiled = (
         hidden == 2560
         and lowrank == 320
         and rows <= 6
         and down_bits == up_bits == 8
         and inject_bits in (None, 16)
-        and _m4_max()
     )
+    # The fixed 16-column tile leaves room for tuning on newer GPU generations.
+    # TODO: Detect GPU capabilities and automatically tune/cache the tile size
+    # for each supported layout instead of relying on this hard-coded default.
     tile = 16 if compiled else 64
     signature = (
         dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits, compiled,
