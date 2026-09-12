@@ -257,6 +257,70 @@ def test_qwen4_resident_ple_fuses_packed_shards_exactly():
     assert mx.array_equal(actual, expected).item()
 
 
+def test_qwen4_single_packed_ple_aliases_without_join(monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    embedding = ShardedEmbedding(32, 64, 1)
+    packed = nn.QuantizedEmbedding.from_embedding(
+        embedding.shards[0], group_size=32, bits=4, mode="affine"
+    )
+    embedding.shards = [packed]
+    embedding.weight_scale = mx.array([0.5], dtype=mx.bfloat16)
+    indices = mx.array([[0, 31, 3, 3]], dtype=mx.int32)
+    expected = embedding(indices)
+    mx.eval(expected)
+
+    def unexpected_join(*args, **kwargs):
+        raise AssertionError("Single-shard fusion must not allocate a joined table")
+
+    monkeypatch.setattr(mx, "concatenate", unexpected_join)
+    assert embedding.fuse_quantized_shards() is True
+    assert embedding.fused is packed
+    assert embedding.shards == []
+    assert embedding.fuse_quantized_shards() is False
+    assert mx.array_equal(embedding(indices), expected).item()
+
+
+@pytest.mark.parametrize(
+    "memory_gib,mode,shards,quantized,expected",
+    [
+        (128, "resident", 1, True, 1),
+        (128, "resident", 4, True, 0),
+        (256, "resident", 4, True, 1),
+        (128, "resident", 1, False, 0),
+        (128, "mmap", 1, True, 0),
+    ],
+)
+def test_qwen4_resident_ple_join_memory_admission(
+    monkeypatch, memory_gib, mode, shards, quantized, expected
+):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding = language.ShardedEmbedding(32, 64, shards)
+    if quantized:
+        embedding.shards = [
+            nn.QuantizedEmbedding.from_embedding(
+                shard, group_size=32, bits=4, mode="affine"
+            )
+            for shard in embedding.shards
+        ]
+    layer = SimpleNamespace(
+        ple=SimpleNamespace(ple_embedding=SimpleNamespace(ngram_embedding=embedding))
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=SimpleNamespace(layers=[layer])))
+    sysconf = language.os.sysconf
+    values = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": memory_gib * 2**30 // 4096}
+    monkeypatch.setattr(language.os, "sysconf", lambda key: values[key] if key in values else sysconf(key))
+    monkeypatch.setattr(language, "get_ple_runtime_mode", lambda: mode)
+
+    assert language.fuse_resident_ple_embeddings(model) == expected
+    assert (getattr(embedding, "fused", None) is not None) == bool(expected)
+
+
 def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, caplog):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx.nn as nn
