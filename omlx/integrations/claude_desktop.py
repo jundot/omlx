@@ -17,11 +17,14 @@ in the field), adapted to point at oMLX itself:
 3. ``~/Library/Application Support/Claude-3p/configLibrary/_meta.json``
    → entry ``{id: PROFILE_ID, name: "oMLX"}`` + ``appliedId: PROFILE_ID``
 4. ``~/Library/Application Support/Claude-3p/configLibrary/<PROFILE_ID>.json``:
-   - ``inferenceProvider: "gateway"``
-   - ``inferenceGatewayBaseUrl: "http://127.0.0.1:<omlx port>"``
-   - ``inferenceGatewayApiKey: <omlx api key, or "omlx" when open>``
-   - ``inferenceGatewayAuthScheme: "bearer"``
-   - ``disableDeploymentModeChooser: true``
+    - ``inferenceProvider: "gateway"``
+    - ``inferenceGatewayBaseUrl: "http://127.0.0.1:<omlx port>"``
+    - ``inferenceGatewayApiKey: <omlx api key, or "omlx" when open>``
+    - ``inferenceGatewayAuthScheme: "bearer"``
+    - ``disableDeploymentModeChooser: true``
+    - ``chatTabEnabled: true`` (keeps the native Chat tab visible —
+      in 3p gateway mode Claude Desktop hides it unless the applied
+      profile sets this flag)
 
 Gateway format note verification:
 Claude Desktop in gateway mode calls ``GET /v1/models`` and needs the
@@ -70,6 +73,7 @@ _GATEWAY_KEYS = (
     "inferenceGatewayUsername",
     "inferenceGatewayPassword",
     "inferenceModels",
+    "chatTabEnabled",
 )
 
 # Private key inside the oMLX profile file recording the ``appliedId`` that
@@ -197,6 +201,7 @@ def configure_omlx_gateway(
     profile["inferenceGatewayApiKey"] = key
     profile["inferenceGatewayAuthScheme"] = "bearer"
     profile["disableDeploymentModeChooser"] = True
+    profile["chatTabEnabled"] = True
     _write_json(paths["profile"], profile)
 
     logger.info(

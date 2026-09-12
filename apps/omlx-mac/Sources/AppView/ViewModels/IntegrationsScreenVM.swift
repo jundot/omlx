@@ -64,6 +64,13 @@ final class IntegrationsScreenVM {
         "\(cliCommandPrefix) launch claude"
     }
 
+    /// Composed `omlx launch claude_desktop` command. Launches Claude Desktop
+    /// pointed at the oMLX gateway. Mirrors `claudeDesktopCommand` in
+    /// `omlx/admin/static/js/dashboard.js`.
+    var claudeDesktopLaunchCommand: String {
+        "\(cliCommandPrefix) launch claude_desktop"
+    }
+
     /// Env-var recipe that runs the real `claude` binary directly. Mirrors
     /// `claudeCodeCommand` in dashboard.js — cloud form unsets the Anthropic
     /// vars, local form sets them to point at the oMLX server.

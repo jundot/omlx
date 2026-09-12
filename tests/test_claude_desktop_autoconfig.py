@@ -71,6 +71,7 @@ class TestConfigure:
         assert profile["inferenceGatewayApiKey"] == "secret"
         assert profile["inferenceGatewayAuthScheme"] == "bearer"
         assert profile["disableDeploymentModeChooser"] is True
+        assert profile["chatTabEnabled"] is True
 
     def test_open_server_defaults_api_key_to_omlx(self, tmp_path, monkeypatch):
         _force_macos(monkeypatch)
@@ -166,6 +167,7 @@ class TestRestore:
             "inferenceGatewayBaseUrl",
             "inferenceGatewayApiKey",
             "inferenceGatewayAuthScheme",
+            "chatTabEnabled",
         ):
             assert key not in profile
         assert profile["disableDeploymentModeChooser"] is False

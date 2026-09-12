@@ -105,4 +105,15 @@ final class ClaudeCodeDesktopTests: XCTestCase {
         XCTAssertTrue(str.contains("\"claude_code_opus_model\""))
         XCTAssertFalse(str.contains("claude_code_desktop_enabled"))
     }
+
+    // MARK: - Launcher command
+
+    @MainActor
+    func testClaudeDesktopLaunchCommand() {
+        // The Integrations screen shows this under the Claude Desktop toggle
+        // so the user can launch Claude Desktop pointed at the oMLX gateway.
+        // Mirrors `claudeDesktopCommand` in dashboard.js.
+        let vm = IntegrationsScreenVM()
+        XCTAssertEqual(vm.claudeDesktopLaunchCommand, "omlx launch claude_desktop")
+    }
 }

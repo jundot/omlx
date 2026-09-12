@@ -118,6 +118,16 @@ private struct ClaudeCodeSection: View {
                     }))
                     .labelsHidden().toggleStyle(.switch)
                 }
+                if vm.desktopEnabled {
+                    FreeRow {
+                        CommandBlock(
+                            command: vm.claudeDesktopLaunchCommand,
+                            caption: String(localized: "integrations.claude.desktop.command",
+                                            defaultValue: "Claude Desktop",
+                                            comment: "Caption above the Claude Desktop launcher command block")
+                        )
+                    }
+                }
             }
         }
     }
