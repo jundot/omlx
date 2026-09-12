@@ -2153,6 +2153,16 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen GDN prework patch not applied", exc_info=True)
 
+        # Small-row projections: one qmm per quantisation signature.
+        try:
+            from ..patches.qwen35_grouped_linears import (
+                apply_qwen35_grouped_linears_patch,
+            )
+
+            apply_qwen35_grouped_linears_patch()
+        except Exception:
+            logger.debug("Qwen grouped linears patch not applied", exc_info=True)
+
         # Qwen3.5/3.6 verify-width (MTP target-verify) attention -> chunked
         # causal vector-kernel calls instead of the per-row SDPA loop.
         try:

@@ -40,6 +40,12 @@ def _topk_sets(scores, topk):
     return mx.sort(indices.astype(mx.int32), axis=-1)
 
 
+@pytest.fixture(autouse=True)
+def _steel_score_kernel(monkeypatch):
+    """These tests exercise the steel score ABI; the tensor-unit kernel has its own file."""
+    monkeypatch.setenv("OMLX_QWEN4_QSA_NAX_SCORES", "0")
+
+
 def test_qwen4_qsa_symbol_is_part_of_the_extension_abi():
     assert "qwen4_qsa_indexer_scores" in fast.NATIVE_SYMBOLS
 

@@ -32,4 +32,21 @@ NB_MODULE(_ext, m) {
       "mask"_a = nb::none(),
       "sinks"_a = nb::none(),
       "stream"_a = nb::none());
+  m.def(
+      "sdpa_decode_gathered_supported",
+      &omlx::decode_fast_kernels::sdpa_decode_gathered_supported,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "indices"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "sdpa_decode_gathered",
+      &omlx::decode_fast_kernels::sdpa_decode_gathered,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "indices"_a,
+      "scale"_a,
+      "stream"_a = nb::none());
 }

@@ -26,6 +26,7 @@ stock path.
 from __future__ import annotations
 
 import logging
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -208,7 +209,8 @@ _QWEN4_DECODE_SOURCE = """
         }
         if (lane == 0) {
             const T bv = b_in[head];
-            T by = T(1) / (T(1) + metal::exp(metal::abs(bv)));
+            // mx.sigmoid is a prebuilt (precise-exp) op; nn.silu above is compiled (fast exp).
+            T by = T(1) / (T(1) + T(metal::precise::exp(float(metal::abs(bv)))));
             beta_out[head] = (bv < T(0)) ? by : T(1) - by;
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
@@ -248,6 +250,119 @@ _QWEN4_NORM_GATE_SOURCE = """
         out[base + i] = T(float(normed) * sig);
     }
 """
+
+
+_QWEN4_VERIFY_SOURCE = """
+    uint lane = thread_position_in_threadgroup.x;
+    uint t = threadgroup_position_in_grid.y;
+    uint logical_head = threadgroup_position_in_grid.z;
+    constexpr uint q_heads = uint(HK);
+    constexpr uint k_head_base = uint(HK);
+    constexpr uint v_head_base = 2 * uint(HK);
+    bool is_q = logical_head < q_heads;
+    bool is_k = logical_head >= k_head_base && logical_head < v_head_base;
+    uint head = is_q ? logical_head
+               : (is_k ? logical_head - k_head_base
+                       : logical_head - v_head_base);
+    uint channel_base = is_q ? head * uint(DK)
+                       : (is_k ? uint(HK) * uint(DK) + head * uint(DK)
+                               : 2 * uint(HK) * uint(DK) + head * uint(DV));
+
+    T activated[4];
+    float sumsq = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        uint channel = channel_base + lane * 4 + i;
+        float acc = 0.0f;
+        // Window rows t..t+3 of [state(3) | qkv(S)]: index < 3 reads the
+        // old state, otherwise qkv row (index - 3).
+        for (uint tap = 0; tap < 4; ++tap) {
+            uint idx = t + tap;
+            float xv = (idx < 3)
+                ? float(conv_state[idx * uint(C) + channel])
+                : float(qkv[(idx - 3) * uint(C) + channel]);
+            acc += xv * float(conv_w[channel * 4 + tap]);
+        }
+        const T conv = T(acc);
+        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
+        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        activated[i] = act;
+        float value = float(act);
+        sumsq += value * value;
+        if (t == 0) {
+            // Next state = concat rows S..S+2; only row-0 threads write it.
+            for (uint j = 0; j < 3; ++j) {
+                uint idx = uint(S) + j;
+                conv_out[j * uint(C) + channel] = (idx < 3)
+                    ? conv_state[idx * uint(C) + channel]
+                    : qkv[(idx - 3) * uint(C) + channel];
+            }
+        }
+    }
+
+    if (is_q || is_k) {
+        sumsq = simd_sum(sumsq);
+        float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+        float scale = is_q ? float(q_scale) : float(k_scale);
+        uint out_base = (t * uint(HK) + head) * uint(DK) + lane * 4;
+        for (uint i = 0; i < 4; ++i) {
+            const T rms = T(float(activated[i]) * inv);
+            const T value = T(float(rms) * scale);
+            if (is_q) {
+                q_out[out_base + i] = value;
+            } else {
+                k_out[out_base + i] = value;
+            }
+        }
+    } else {
+        uint out_base = (t * uint(HV) + head) * uint(DV) + lane * 4;
+        for (uint i = 0; i < 4; ++i) {
+            v_out[out_base + i] = activated[i];
+        }
+        if (lane == 0) {
+            const uint hb = t * uint(HV) + head;
+            const T bv = b_in[hb];
+            // mx.sigmoid is a prebuilt (precise-exp) op; nn.silu above is compiled (fast exp).
+            T by = T(1) / (T(1) + T(metal::precise::exp(float(metal::abs(bv)))));
+            beta_out[hb] = (bv < T(0)) ? by : T(1) - by;
+            const T apd = T(float(a_in[hb]) + float(dt_bias[head]));
+            const T neg_abs = -metal::abs(apd);
+            const T exp_term = T(metal::precise::exp(float(neg_abs)));
+            const T log_term = T(omlx_log1p(float(exp_term)));
+            const T positive = metal::max(apd, T(0));
+            const T sp = T(float(positive) + float(log_term));
+            float ea = metal::precise::exp(float(A_log[head]));
+            g_out[hb] = metal::precise::exp(-(ea * float(sp)));
+        }
+    }
+"""
+
+
+_QWEN4_VERIFY_NORM_GATE_SOURCE = """
+    uint lane = thread_position_in_threadgroup.x;
+    uint t = threadgroup_position_in_grid.y;
+    uint head = threadgroup_position_in_grid.z;
+    uint base = (t * uint(HV) + head) * uint(DV) + lane * 4;
+    float xs[4];
+    float sumsq = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        xs[i] = float(y[base + i]);
+        sumsq += xs[i] * xs[i];
+    }
+    sumsq = simd_sum(sumsq);
+    float inv = metal::precise::rsqrt(sumsq / float(DV) + float(eps));
+    for (uint i = 0; i < 4; ++i) {
+        const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
+        float zv = float(z[base + i]);
+        float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(zv)));
+        float sig = zv < 0.0f ? sy : 1.0f - sy;
+        out[base + i] = T(float(normed) * sig);
+    }
+"""
+
+_QWEN4_VERIFY_KERNEL = None
+_QWEN4_VERIFY_NORM_GATE_KERNEL = None
+_QWEN4_VERIFY_MAX_ROWS = 8
+_QWEN4_VERIFY_ENGAGED_LOGGED = False
 
 
 def _kernel():
@@ -409,6 +524,154 @@ def qwen4_decode_norm_gate_fused(y, z, norm_w, *, hv, dv, eps):
     )[0]
 
 
+def _qwen4_verify_enabled() -> bool:
+    return os.environ.get("OMLX_QWEN4_GDN_VERIFY_FUSED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def qwen4_verify_rows_supported(s_len: int) -> bool:
+    return 1 <= int(s_len) <= _QWEN4_VERIFY_MAX_ROWS
+
+
+def _qwen4_scales(module):
+    """Cached bf16 (q_scale, k_scale) arrays for the fused Qwen4 arms."""
+    q_scale = getattr(module, "_omlx_qwen4_decode_q_scale", None)
+    k_scale = getattr(module, "_omlx_qwen4_decode_k_scale", None)
+    if q_scale is None or k_scale is None:
+        inv_scale = module.head_k_dim**-0.5
+        q_scale = mx.array(inv_scale * inv_scale, dtype=mx.bfloat16)
+        k_scale = mx.array(inv_scale, dtype=mx.bfloat16)
+        module._omlx_qwen4_decode_q_scale = q_scale
+        module._omlx_qwen4_decode_k_scale = k_scale
+    return q_scale, k_scale
+
+
+def _qwen4_verify_kernel():
+    global _QWEN4_VERIFY_KERNEL
+    if _QWEN4_VERIFY_KERNEL is None:
+        _QWEN4_VERIFY_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen4_gdn_verify_prework",
+            input_names=[
+                "qkv",
+                "conv_state",
+                "conv_w",
+                "q_scale",
+                "k_scale",
+                "b_in",
+                "a_in",
+                "A_log",
+                "dt_bias",
+            ],
+            output_names=[
+                "q_out",
+                "k_out",
+                "v_out",
+                "conv_out",
+                "g_out",
+                "beta_out",
+            ],
+            header=_QWEN4_DECODE_HEADER,
+            source=_QWEN4_VERIFY_SOURCE,
+        )
+    return _QWEN4_VERIFY_KERNEL
+
+
+def qwen4_verify_prework_fused(
+    qkv, conv_state, conv_w, q_scale, k_scale, b, a, A_log, dt_bias, hk, hv, dk, dv
+):
+    """Row-batched Qwen4 GDN prework for 1..8 rows: qkv [1,S,C], conv_state [1,3,C]."""
+    s_len = int(qkv.shape[1])
+    c_dim = int(qkv.shape[-1])
+    return _qwen4_verify_kernel()(
+        inputs=[qkv, conv_state, conv_w, q_scale, k_scale, b, a, A_log, dt_bias],
+        template=[
+            ("T", qkv.dtype),
+            ("HK", hk),
+            ("HV", hv),
+            ("DK", dk),
+            ("DV", dv),
+            ("C", c_dim),
+            ("S", s_len),
+        ],
+        grid=(32, s_len, 2 * hk + hv),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (1, s_len, hk, dk),
+            (1, s_len, hk, dk),
+            (1, s_len, hv, dv),
+            (1, 3, c_dim),
+            (1, s_len, hv),
+            (1, s_len, hv),
+        ],
+        output_dtypes=[
+            qkv.dtype,
+            qkv.dtype,
+            qkv.dtype,
+            qkv.dtype,
+            mx.float32,
+            qkv.dtype,
+        ],
+    )
+
+
+def _qwen4_verify_norm_gate_kernel():
+    global _QWEN4_VERIFY_NORM_GATE_KERNEL
+    if _QWEN4_VERIFY_NORM_GATE_KERNEL is None:
+        _QWEN4_VERIFY_NORM_GATE_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen4_gdn_verify_norm_gate",
+            input_names=["y", "z", "norm_w", "eps"],
+            output_names=["out"],
+            source=_QWEN4_VERIFY_NORM_GATE_SOURCE,
+        )
+    return _QWEN4_VERIFY_NORM_GATE_KERNEL
+
+
+def qwen4_verify_norm_gate_fused(y, z, norm_w, *, hv, dv, eps):
+    s_len = int(y.shape[1])
+    return _qwen4_verify_norm_gate_kernel()(
+        inputs=[y, z, norm_w, mx.array(eps, dtype=mx.float32)],
+        template=[("T", y.dtype), ("HV", hv), ("DV", dv)],
+        grid=(32, s_len, hv),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(1, s_len, hv * dv)],
+        output_dtypes=[y.dtype],
+    )[0]
+
+
+def _qwen4_verify_recurrence_with_states(q, k, v, g, beta, state):
+    """States-returning recurrence from precomputed g/beta: the tail of
+    gated_delta_update_with_states after its _compute_g_beta."""
+    from mlx_vlm.models.qwen3_5 import gated_delta as gd
+
+    kernel = getattr(gd, "_gated_delta_with_states_kernel", None)
+    if kernel is None or mx.default_device() != mx.gpu:
+        raise RuntimeError("gated delta states kernel unavailable")
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    if state is None:
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+    return kernel(
+        inputs=[q, k, v, g, beta, state, T],
+        template=[
+            ("InT", q.dtype),
+            ("StT", state.dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+            ("StateT", T),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv, Dk)],
+        output_dtypes=[q.dtype, state.dtype, state.dtype],
+    )
+
+
 def _qwen4_decode_recurrence(q, k, v, g, beta, state):
     from mlx_lm.models.gated_delta import gated_delta_kernel
 
@@ -537,6 +800,39 @@ def _qwen4_decode_dynamic_eligible(
     )
 
 
+def _qwen4_verify_dynamic_eligible(module, inputs, mask, cache, gdn_sink) -> bool:
+    if (
+        gdn_sink is None
+        or mask is not None
+        or cache is None
+        or not isinstance(inputs, mx.array)
+        or inputs.ndim != 3
+        or inputs.shape[0] != 1
+        or inputs.shape[2] != 2560
+        or not qwen4_verify_rows_supported(inputs.shape[1])
+        or inputs.dtype != mx.bfloat16
+        or getattr(cache, "lengths", None) is not None
+        or getattr(cache, "left_padding", None) is not None
+    ):
+        return False
+    conv_state = cache[0]
+    recurrent_state = cache[1]
+    return (
+        isinstance(conv_state, mx.array)
+        and conv_state.shape == (1, 3, 10240)
+        and conv_state.dtype == mx.bfloat16
+        and (
+            recurrent_state is None
+            or (
+                isinstance(recurrent_state, mx.array)
+                and recurrent_state.shape == (1, 48, 128, 128)
+                and recurrent_state.dtype == mx.float32
+            )
+        )
+        and _qwen4_decode_static_eligible(module)
+    )
+
+
 def apply_qwen35_gdn_prework_patch() -> bool:
     """Route the batch-1 target-verify GDN prework through the fused kernel.
 
@@ -577,6 +873,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     orig_call = cls.__call__
     disabled = {"flag": False}
     qwen4_decode_disabled = {"flag": False}
+    qwen4_verify_disabled = {"flag": not _qwen4_verify_enabled()}
 
     def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
         if gdn_sink is None or cache is None:
@@ -629,17 +926,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                     inputs,
                     False,
                 )
-                inv_scale = self.head_k_dim**-0.5
-                q_scale = getattr(self, "_omlx_qwen4_decode_q_scale", None)
-                k_scale = getattr(self, "_omlx_qwen4_decode_k_scale", None)
-                if q_scale is None or k_scale is None:
-                    q_scale = mx.array(
-                        inv_scale * inv_scale,
-                        dtype=mx.bfloat16,
-                    )
-                    k_scale = mx.array(inv_scale, dtype=mx.bfloat16)
-                    self._omlx_qwen4_decode_q_scale = q_scale
-                    self._omlx_qwen4_decode_k_scale = k_scale
+                q_scale, k_scale = _qwen4_scales(self)
 
                 q, k, v, next_conv_state, g, beta = (
                     qwen4_decode_prework_fused(
@@ -705,6 +992,89 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 qwen4_decode_disabled["flag"] = True
                 logger.warning(
                     "Qwen4 fused GDN decode arm failed; reverting to stock "
+                    "for the rest of the process",
+                    exc_info=True,
+                )
+
+        if (
+            not qwen4_verify_disabled["flag"]
+            and _qwen4_verify_dynamic_eligible(self, inputs, mask, cache, gdn_sink)
+        ):
+            conv_state = cache[0]
+            recurrent_state = cache[1]
+            sink_len = len(gdn_sink)
+            try:
+                mixed_qkv, z, b, a = q35._target_verify_linears(
+                    (
+                        self.in_proj_qkv,
+                        self.in_proj_z,
+                        self.in_proj_b,
+                        self.in_proj_a,
+                    ),
+                    inputs,
+                    True,
+                )
+                z = z.reshape(1, S, self.num_v_heads, self.head_v_dim)
+                q_scale, k_scale = _qwen4_scales(self)
+                q, k, v, new_conv_state, g, beta = qwen4_verify_prework_fused(
+                    mixed_qkv,
+                    conv_state,
+                    self.conv1d.weight,
+                    q_scale,
+                    k_scale,
+                    b,
+                    a,
+                    self.A_log,
+                    self.dt_bias,
+                    self.num_k_heads,
+                    self.num_v_heads,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+                state = recurrent_state
+                if state is not None and state.shape[0] != 1:
+                    state = None
+                initial_state = state
+                out, state, intermediate_states = (
+                    _qwen4_verify_recurrence_with_states(q, k, v, g, beta, state)
+                )
+                conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+                gdn_sink.append(
+                    (
+                        q, k, v, a, b, self.A_log, self.dt_bias, initial_state,
+                        None, conv_input, self.conv_kernel_size, intermediate_states,
+                    )
+                )
+                flat = qwen4_verify_norm_gate_fused(
+                    out,
+                    z,
+                    self.norm.weight,
+                    hv=self.num_v_heads,
+                    dv=self.head_v_dim,
+                    eps=self.norm.eps,
+                )
+                result = q35._target_verify_linear(self.out_proj, flat, True)
+                # Commit cache ownership only after every fallible step succeeded.
+                cache[0] = new_conv_state
+                cache[1] = state
+                if hasattr(cache, "advance"):
+                    cache.advance(S)
+                    q35._qwen3_5_advance_left_padding_info(cache, S)
+                    q35._qwen3_5_advance_lengths_info(cache, S)
+                global _QWEN4_VERIFY_ENGAGED_LOGGED
+                if not _QWEN4_VERIFY_ENGAGED_LOGGED:
+                    _QWEN4_VERIFY_ENGAGED_LOGGED = True
+                    logger.info(
+                        "[gdn-prework] fused Qwen4 verify arm engaged (S=%d)", S
+                    )
+                return result
+            except Exception:
+                cache[0] = conv_state
+                cache[1] = recurrent_state
+                del gdn_sink[sink_len:]
+                qwen4_verify_disabled["flag"] = True
+                logger.warning(
+                    "Qwen4 fused GDN verify arm failed; reverting to stock "
                     "for the rest of the process",
                     exc_info=True,
                 )

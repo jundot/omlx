@@ -337,6 +337,171 @@ void sdpa_decode_2pass(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+
+int sdpa_decode_blocks(char devc, int N, int n_simds) {
+  int blocks;
+  if (devc == 's') {
+    blocks = 64;
+    if (N > 1024 && n_simds > 4) {
+      if (N <= 8192) {
+        blocks = 128;
+      } else if (N <= 32768) {
+        blocks = 256;
+      } else if (N <= 65536) {
+        blocks = 512;
+      } else {
+        blocks = 1024;
+      }
+    }
+  } else if (devc == 'd') {
+    int b = (((N + 255) / 256 + 31) / 32) * 32;
+    blocks = std::min(256, std::max(N >= 4096 ? 64 : 32, b));
+  } else {
+    blocks = n_simds >= 4 ? 64 : 32;
+  }
+  return blocks;
+}
+
+void sdpa_decode_gathered_2pass(
+    const Stream& s,
+    metal::Device& d,
+    MTL::Library* lib,
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& indices,
+    array& out,
+    float scale) {
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      "omlx_sdpa_decode_gathered_2pass_1_",
+      sdpa_type_name(q.dtype()),
+      "_",
+      q.shape(-1));
+
+  const int gqa_factor = q.shape(1) / k.shape(1);
+  const int q_seq_len = q.shape(2);
+  const int N = indices.shape(-1);
+  char devc = d.get_architecture().back();
+  int blocks = sdpa_decode_blocks(devc, N, gqa_factor);
+
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t v_seq_stride = v.strides()[2];
+  MTL::Size group_dims(32, gqa_factor, 1);
+  MTL::Size grid_dims(k.shape(1), q.shape(0) * q_seq_len, blocks);
+
+  Shape intermediate_shape;
+  intermediate_shape.reserve(out.ndim() + 1);
+  intermediate_shape.insert(
+      intermediate_shape.end(), out.shape().begin(), out.shape().end() - 1);
+  intermediate_shape.push_back(blocks);
+  intermediate_shape.push_back(out.shape().back());
+  array intermediate(intermediate_shape, float32, nullptr, {});
+  intermediate_shape.pop_back();
+  array sums(intermediate_shape, float32, nullptr, {});
+  array maxs(std::move(intermediate_shape), float32, nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  maxs.set_data(allocator::malloc(maxs.nbytes()));
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(intermediate);
+  compute_encoder.add_temporary(sums);
+  compute_encoder.add_temporary(maxs);
+
+  metal::MTLFCList func_consts = {
+      {&blocks, MTL::DataType::DataTypeInt, 26},
+  };
+  std::string hash_name = kname;
+  hash_name += "_";
+  hash_name += std::to_string(blocks);
+
+  auto kernel = d.get_kernel(kname, lib, hash_name, func_consts);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(intermediate, 3);
+  compute_encoder.set_output_array(sums, 4);
+  compute_encoder.set_output_array(maxs, 5);
+  compute_encoder.set_input_array(indices, 6);
+  compute_encoder.set_bytes(N, 7);
+  compute_encoder.set_bytes(k_head_stride, 8);
+  compute_encoder.set_bytes(k_seq_stride, 9);
+  compute_encoder.set_bytes(v_head_stride, 10);
+  compute_encoder.set_bytes(v_seq_stride, 11);
+  compute_encoder.set_bytes(scale, 12);
+  compute_encoder.set_bytes(q_seq_len, 13);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  kname.clear();
+  concatenate(
+      kname,
+      "omlx_sdpa_decode_2pass_2_",
+      sdpa_type_name(q.dtype()),
+      "_",
+      v.shape(-1));
+  kernel = d.get_kernel(kname, lib);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(intermediate, 0);
+  compute_encoder.set_input_array(sums, 1);
+  compute_encoder.set_input_array(maxs, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(blocks, 4);
+  group_dims = MTL::Size(1024, 1, 1);
+  grid_dims = MTL::Size(q.shape(0) * q.shape(1), q_seq_len, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+class SdpaDecodeGatheredPrimitive : public Primitive {
+ public:
+  SdpaDecodeGatheredPrimitive(Stream stream, float scale)
+      : Primitive(stream), scale_(scale) {}
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("SdpaDecodeGatheredPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& q = inputs[0];
+    auto& k = inputs[1];
+    auto& v = inputs[2];
+    auto& indices = inputs[3];
+    auto& o = outputs[0];
+    if (!q.flags().row_contiguous || !kv_layout_ok(k) || !kv_layout_ok(v) ||
+        !indices.flags().row_contiguous) {
+      throw std::runtime_error(
+          "[omlx_decode_fast.sdpa_decode_gathered] realized input layout is "
+          "not compatible with the gathered decode kernel; pass contiguous "
+          "queries/indices and a cache-layout K/V.");
+    }
+    o.set_data(allocator::malloc(o.nbytes()));
+    auto lib = d.get_library(
+        "omlx_decode_fast_kernels", current_binary_dir_sdpa());
+    sdpa_decode_gathered_2pass(s, d, lib, q, k, v, indices, o, scale_);
+  }
+
+  DEFINE_NAME(OMLXSdpaDecodeGathered)
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const SdpaDecodeGatheredPrimitive&>(other);
+    return scale_ == rhs.scale_;
+  }
+
+ private:
+  float scale_;
+};
+
 class SdpaDecodePrimitive : public Primitive {
  public:
   SdpaDecodePrimitive(Stream stream, float scale, bool do_causal)
@@ -489,6 +654,69 @@ mx::array sdpa_decode(
   if (mask.has_value()) {
     inputs.push_back(*mask);
   }
+  Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
+  return array(
+      std::move(out_shape), q.dtype(), std::move(primitive), std::move(inputs));
+}
+
+bool sdpa_decode_gathered_supported(
+    const mx::array& q,
+    const mx::array& k,
+    const mx::array& v,
+    const mx::array& indices,
+    mx::StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (s.device == Device::cpu) {
+    return false;
+  }
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || indices.ndim() != 3) {
+    return false;
+  }
+  auto t = q.dtype();
+  if (t != float32 && t != float16 && t != bfloat16) {
+    return false;
+  }
+  if (k.dtype() != t || v.dtype() != t || indices.dtype() != int32) {
+    return false;
+  }
+  const int dim = q.shape(-1);
+  if ((dim != 64 && dim != 96 && dim != 128 && dim != 256) ||
+      k.shape(-1) != dim || v.shape(-1) != dim) {
+    return false;
+  }
+  const int B = q.shape(0);
+  const int qL = q.shape(2);
+  if (qL < 1 || qL > 32 || indices.shape(0) != B || indices.shape(1) != qL ||
+      indices.shape(2) < 1) {
+    return false;
+  }
+  if (k.shape(0) != B || v.shape(0) != B || v.shape(1) != k.shape(1) ||
+      v.shape(2) != k.shape(2) || k.shape(2) < 1) {
+    return false;
+  }
+  const int gqa_factor = q.shape(1) / k.shape(1);
+  if (q.shape(1) % k.shape(1) != 0 || gqa_factor > 32) {
+    return false;
+  }
+  // Layouts are checked at eval time (flags of lazy inputs are not final).
+  return true;
+}
+
+mx::array sdpa_decode_gathered(
+    const mx::array& q,
+    const mx::array& k,
+    const mx::array& v,
+    const mx::array& indices,
+    float scale,
+    mx::StreamOrDevice s_) {
+  if (!sdpa_decode_gathered_supported(q, k, v, indices, s_)) {
+    throw std::invalid_argument(
+        "[omlx_decode_fast.sdpa_decode_gathered] unsupported shapes/dtypes/"
+        "layout for the gathered decode kernel.");
+  }
+  auto s = to_stream(s_);
+  std::vector<array> inputs = {q, k, v, indices};
+  auto primitive = std::make_shared<SdpaDecodeGatheredPrimitive>(s, scale);
   Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
   return array(
       std::move(out_shape), q.dtype(), std::move(primitive), std::move(inputs));

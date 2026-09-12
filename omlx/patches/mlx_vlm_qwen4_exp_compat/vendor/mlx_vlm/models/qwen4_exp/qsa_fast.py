@@ -22,10 +22,13 @@ IndexRoPE = Callable[[mx.array, mx.array], mx.array]
 
 _NATIVE_QSA_SCORE_DISABLED = False
 _NATIVE_QSA_SCORE_PROVEN = False
+_NATIVE_QSA_NAX_SCORES_DISABLED = False
 _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
 _NATIVE_QSA_MAIN_DISABLED = False
 _NATIVE_QSA_MAIN_PROVEN = False
+_NATIVE_QSA_GATHERED_DISABLED = False
+_NATIVE_QSA_GATHERED_PROVEN = False
 
 
 def _nax_gpu() -> bool:
@@ -189,6 +192,24 @@ def pool_completed_index_keys(
     return apply_index_rope(pooled[:, None], pooled_positions)[:, 0]
 
 
+def _native_scores_kernel(fast):
+    """The tensor-unit score kernel on NAX GPUs (OMLX_QWEN4_QSA_NAX_SCORES=0 keeps
+    the steel kernel), else the steel kernel."""
+    global _NATIVE_QSA_NAX_SCORES_DISABLED
+    if (
+        not _NATIVE_QSA_NAX_SCORES_DISABLED
+        and os.environ.get("OMLX_QWEN4_QSA_NAX_SCORES", "").strip() != "0"
+        and fast.has_symbol("qwen4_qsa_nax_indexer_scores")
+    ):
+        try:
+            if fast.qwen4_qsa_nax_indexer_available():
+                return fast.qwen4_qsa_nax_indexer_scores
+        except Exception:
+            pass
+        _NATIVE_QSA_NAX_SCORES_DISABLED = True
+    return fast.qwen4_qsa_indexer_scores
+
+
 def _native_indexer_scores(
     queries: mx.array,
     pooled_keys: mx.array,
@@ -230,7 +251,7 @@ def _native_indexer_scores(
         # The caller's [B,M,H,D] view transposes back to the GEMM-friendly
         # [B,H,M,D] ABI. The native wrapper only copies when the resulting
         # view is not row-contiguous (for example an offset query chunk).
-        scores = fast.qwen4_qsa_indexer_scores(
+        scores = _native_scores_kernel(fast)(
             queries.transpose(0, 2, 1, 3),
             pooled_keys[:, None],
             mask_ratio=compress_ratio,
@@ -347,6 +368,61 @@ def _native_sparse_gqa_attention(
         return output.transpose(0, 2, 1, 3)
     except Exception:
         _NATIVE_QSA_MAIN_DISABLED = True
+        return None
+
+
+def _native_gathered_decode_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_indices: mx.array,
+    selected_valid: mx.array,
+) -> mx.array | None:
+    """Attend the selected cache rows in place through the gathered decode kernel.
+
+    Covers the verify widths below the steel kernel's row gate, where the MLX
+    path copies every row set out of the cache before fp32 SDPA. ``queries``
+    is ``[B, H, T, D]``; ``selected_indices``/``selected_valid`` are
+    ``[B, T, S]``. Returns ``[B, T, H, D]`` or None to keep the MLX path.
+    """
+
+    global _NATIVE_QSA_GATHERED_DISABLED, _NATIVE_QSA_GATHERED_PROVEN
+    if _NATIVE_QSA_GATHERED_DISABLED:
+        return None
+    if os.environ.get("OMLX_QWEN4_QSA_GATHERED_DECODE", "").strip() == "0":
+        return None
+    if (
+        queries.ndim != 4
+        or keys.ndim != 4
+        or values.shape != keys.shape
+        or queries.dtype != keys.dtype
+        or queries.dtype != values.dtype
+        or queries.dtype not in {mx.float16, mx.bfloat16, mx.float32}
+        or queries.shape[-1] not in {64, 96, 128, 256}
+        or queries.shape[2] >= _native_main_min_rows()
+        or selected_indices.shape != selected_valid.shape
+        or selected_indices.shape[:2] != (queries.shape[0], queries.shape[2])
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.decode_fast import fast
+
+        extension = getattr(fast, "_ext", None)
+        if not getattr(fast, "NATIVE_AVAILABLE", False) or not hasattr(
+            extension, "sdpa_decode_gathered"
+        ):
+            _NATIVE_QSA_GATHERED_DISABLED = True
+            return None
+        indices = mx.where(selected_valid, selected_indices, -1).astype(mx.int32)
+        output = fast.sdpa_decode_gathered(
+            queries, keys, values, indices, queries.shape[-1] ** -0.5
+        )
+        if not _NATIVE_QSA_GATHERED_PROVEN:
+            mx.eval(output)
+            _NATIVE_QSA_GATHERED_PROVEN = True
+        return output.transpose(0, 2, 1, 3)
+    except Exception:
+        _NATIVE_QSA_GATHERED_DISABLED = True
         return None
 
 
@@ -486,6 +562,16 @@ def contiguous_causal_gathered_qsa_decode(
     if complete_key_len < key_tokens:
         tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
         selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
+
+    native_output = _native_gathered_decode_attention(
+        queries,
+        keys,
+        values,
+        selected_tokens[:, None, :],
+        mx.ones(selected_tokens.shape, dtype=mx.bool_)[:, None, :],
+    )
+    if native_output is not None:
+        return native_output
 
     selected_keys = _gather_kv_rows(keys, selected_tokens)
     selected_values = _gather_kv_rows(values, selected_tokens)
@@ -717,6 +803,13 @@ def contiguous_causal_gathered_qsa(
         tail_valid = tail < visible_counts[..., None]
         selected_indices = mx.concatenate((selected_indices, tail), axis=-1)
         selected_valid = mx.concatenate((selected_valid, tail_valid), axis=-1)
+
+        native_output = _native_gathered_decode_attention(
+            queries[:, :, start:stop], keys, values, selected_indices, selected_valid
+        )
+        if native_output is not None:
+            outputs.append(native_output)
+            continue
 
         safe_selected = mx.where(selected_valid, selected_indices, 0).astype(mx.int32)
 

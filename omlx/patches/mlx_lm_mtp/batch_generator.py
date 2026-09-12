@@ -758,6 +758,8 @@ class _MtpState:
     # True while this state is a bounded re-entry probe after a performance
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
     reentry_probe: bool = False
+    # Head-input hidden of next_main, kept at park time for the parked fold.
+    park_hidden: Optional[Any] = None
 
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
@@ -2300,6 +2302,17 @@ def _dspark_next_drafts(
     mx.async_eval(state.drafts)
 
 
+def _head_input_hidden(model: Any, hidden_rows: Any) -> Any:
+    """Trunk hidden as the MTP head consumes it: post-norm unless the head
+    normalizes internally (inkling, Qwen4 mark ``_omlx_mtp_head_prenorm``)."""
+    head_prenorm = getattr(model, "_omlx_mtp_head_prenorm", False) or getattr(
+        getattr(model, "_language_model", None), "_omlx_mtp_head_prenorm", False
+    )
+    if _HEAD_HIDDEN_POST_NORM and not head_prenorm and hidden_rows.ndim == 3:
+        return _trunk_norm_module(model)(hidden_rows)
+    return hidden_rows
+
+
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -2353,14 +2366,7 @@ def _chain_next_drafts(
         state.draft_accept_lps = []
         return
 
-    # Models whose MTP head normalizes its hidden input internally
-    # (inkling: per-block hidden_norm, chain_hidden_post_norm=False) mark
-    # themselves and receive the raw pre-norm trunk hidden.
-    head_prenorm = getattr(model, "_omlx_mtp_head_prenorm", False) or getattr(
-        getattr(model, "_language_model", None), "_omlx_mtp_head_prenorm", False
-    )
-    if _HEAD_HIDDEN_POST_NORM and not head_prenorm and hidden_rows.ndim == 3:
-        hidden_rows = _trunk_norm_module(model)(hidden_rows)
+    hidden_rows = _head_input_hidden(model, hidden_rows)
 
     # Multi-block heads (inkling) route fold/chain by a per-cycle pass
     # counter on the cache list; reset it before the fold. Single-block
@@ -2719,9 +2725,10 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].update_and_fetch(state.next_main)
-        logits, _, _ = _call_backbone(
+        logits, hidden, _ = _call_backbone(
             gen_batch.model, state.next_main[:, None], gen_batch.prompt_cache
         )
+        state.park_hidden = _park_hidden_or_none(gen_batch.model, hidden)
         last = _apply_processors(procs, prev_buf, logits[:, -1, :])
         lp_2d = _logprobs(last)
         next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(lp_2d))
@@ -2733,6 +2740,49 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         return False
     _clear_rollback(gen_batch.prompt_cache)
     return True
+
+
+def _park_hidden_or_none(model: Any, hidden: Any):
+    """Head-input hidden of the fed token; None (no parked fold) when unavailable."""
+    if hidden is None:
+        return None
+    try:
+        return _head_input_hidden(model, hidden[:, -1:])
+    except Exception:
+        return None
+
+
+def _arm_parked_fold(gen_batch: Any, state: _MtpState) -> None:
+    """Hand the committed head cache to the priming context so standard decode
+    keeps folding pairs and the re-entry probe starts primed."""
+    if not _parked_fold_enabled():
+        return
+    try:
+        if not state.mtp_cache or state.park_hidden is None:
+            return
+        if not state.head_clone:
+            _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+        anchor_offset = _prompt_priming._activation_offset(gen_batch.prompt_cache)
+        if anchor_offset is None:
+            return
+        _prompt_priming.begin_parked_ctx(
+            gen_batch.model,
+            state.mtp_cache,
+            state.park_hidden,
+            folded=int(state.hist_offset),
+            expected_offset=int(anchor_offset),
+        )
+    except Exception:
+        logger.debug("parked head fold not armed", exc_info=True)
+
+
+def _parked_fold_enabled() -> bool:
+    return os.environ.get("OMLX_MTP_PARKED_FOLD", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
@@ -2748,6 +2798,7 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     """
     if not _feed_next_main_to_standard(gen_batch, state):
         return False
+    _arm_parked_fold(gen_batch, state)
     park_state = _mtp_park_state_for_batch(gen_batch)
     if state.reentry_probe and park_state is not None:
         park_state.restart_after_failed_probe()

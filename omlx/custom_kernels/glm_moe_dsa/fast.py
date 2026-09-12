@@ -102,6 +102,7 @@ NATIVE_SYMBOLS = (
     "dsa_decode_scores",
     "dsa_indexer_scores",
     "qwen4_qsa_indexer_scores",
+    "qwen4_qsa_nax_indexer_scores",
     "qwen4_qsa_topk_indices",
     "qwen4_qsa_sparse_gqa_attention",
     "dsa_topk_indices",
@@ -288,6 +289,40 @@ def qwen4_qsa_indexer_scores(
         pooled_keys,
         mask_ratio=mask_ratio,
         mask_q_offset=mask_q_offset,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_nax_indexer_available() -> bool:
+    """True on a tensor-unit GPU with the NAX metallib built next to the extension."""
+    fn = getattr(_ext, "qwen4_qsa_nax_indexer_available", None) if _ext is not None else None
+    try:
+        return bool(fn()) if fn is not None else False
+    except Exception:
+        return False
+
+
+def qwen4_qsa_nax_indexer_scores(
+    queries: mx.array,
+    pooled_keys: mx.array,
+    mask_ratio: int = 4,
+    mask_q_offset: int = 0,
+    *,
+    block_rows: int = 64,
+    block_cols: int = 64,
+    stream=None,
+) -> mx.array:
+    """Tensor-unit form of :func:`qwen4_qsa_indexer_scores` (same inputs, fp32
+    ``[1, M, N]`` output, sums differ only by accumulation order)."""
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_nax_indexer_scores"):
+        raise RuntimeError("qwen4_qsa_nax_indexer_scores requires a local extension build")
+    return _ext.qwen4_qsa_nax_indexer_scores(
+        queries,
+        pooled_keys,
+        mask_ratio=mask_ratio,
+        mask_q_offset=mask_q_offset,
+        block_rows=block_rows,
+        block_cols=block_cols,
         **_native_stream_kwargs(stream),
     )
 

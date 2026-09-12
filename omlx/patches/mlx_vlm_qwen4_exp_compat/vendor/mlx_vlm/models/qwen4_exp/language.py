@@ -92,6 +92,19 @@ def _rank_two_text_position_ids(
     )
 
 
+def _gathered_narrow_min_context() -> int:
+    """Context (cache offset) from which narrow 2..15-row windows take the gathered
+    arm: the masked-dense path reads the whole prefix per window (4.9 ms at 82k
+    for the MTP head's 3-4 row fold) while gathered rows stay context-flat."""
+    raw = os.environ.get("OMLX_QWEN4_GATHERED_NARROW_MIN_CONTEXT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 16384
+
+
 def _gathered_min_query_tokens() -> int:
     """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
     raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
@@ -1284,16 +1297,20 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         if not (
             x.ndim == 3
             and x.shape[0] == 1
-            # Narrow multi-row windows (Lightning MTP history/verify passes)
-            # are cheaper on the official masked path; see
-            # _gathered_min_query_tokens.
-            and x.shape[1] >= _gathered_min_query_tokens()
+            and x.shape[1] > 1
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
             and self._batch_one_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+        # Narrow windows (Lightning MTP head folds, prefill tails) are cheaper
+        # on the masked path at short context and on the gathered arm once the
+        # prefix is long; see _gathered_min_query_tokens / _gathered_narrow_min_context.
+        if x.shape[1] < _gathered_min_query_tokens() and (
+            cache.offset < _gathered_narrow_min_context()
         ):
             return False
         return bool(

@@ -32,4 +32,25 @@ mx::array sdpa_decode(
     const std::optional<mx::array>& sinks = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// True when the gathered decode kernel applies: Metal stream, 4-D fp32/fp16/
+// bf16 q/k/v with equal square head dims (64/96/128/256), int32 indices of
+// shape (B, qL, S) naming cache rows per query row (-1 = empty slot), GQA
+// fan-out <= 32.
+bool sdpa_decode_gathered_supported(
+    const mx::array& q,
+    const mx::array& k,
+    const mx::array& v,
+    const mx::array& indices,
+    mx::StreamOrDevice s = {});
+
+// Decode attention over per-query-row index sets read straight from the
+// cache. Returns (B, H, qL, D).
+mx::array sdpa_decode_gathered(
+    const mx::array& q,
+    const mx::array& k,
+    const mx::array& v,
+    const mx::array& indices,
+    float scale,
+    mx::StreamOrDevice s = {});
+
 } // namespace omlx::decode_fast_kernels

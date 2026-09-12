@@ -11,6 +11,7 @@
 #include "dspark_qmv.h"
 #include "exact_block_attention.h"
 #include "fused_moe.h"
+#include "qwen4_qsa_nax_indexer.h"
 #include "qwen4_qsa_sparse_gqa.h"
 #include "sparse_mla.h"
 
@@ -64,6 +65,19 @@ NB_MODULE(_ext, m) {
       "pooled_keys"_a,
       "mask_ratio"_a = 4,
       "mask_q_offset"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen4_qsa_nax_indexer_available",
+      &omlx::glm_kernels::qwen4_qsa_nax_indexer_available);
+  m.def(
+      "qwen4_qsa_nax_indexer_scores",
+      &omlx::glm_kernels::qwen4_qsa_nax_indexer_scores,
+      "queries"_a,
+      "pooled_keys"_a,
+      "mask_ratio"_a = 4,
+      "mask_q_offset"_a = 0,
+      "block_rows"_a = 64,
+      "block_cols"_a = 64,
       "stream"_a = nb::none());
   m.def(
       "qwen4_qsa_topk_indices",

@@ -34,7 +34,19 @@ using namespace metal;
       qk_dim,                                                       \
       value_dim)
 
+#define instantiate_omlx_sdpa_decode_gathered(type, dim)          \
+  instantiate_kernel(                                             \
+      "omlx_sdpa_decode_gathered_2pass_1_" #type "_" #dim,        \
+      omlx_sdpa_decode_gathered_2pass_1,                          \
+      type,                                                       \
+      dim,                                                        \
+      dim)
+
 #define instantiate_omlx_sdpa_decode_heads(type)      \
+  instantiate_omlx_sdpa_decode_gathered(type, 64)     \
+  instantiate_omlx_sdpa_decode_gathered(type, 96)     \
+  instantiate_omlx_sdpa_decode_gathered(type, 128)    \
+  instantiate_omlx_sdpa_decode_gathered(type, 256)    \
   instantiate_omlx_sdpa_decode(type, 64, 64)          \
   instantiate_omlx_sdpa_decode(type, 96, 96)          \
   instantiate_omlx_sdpa_decode(type, 128, 128)        \

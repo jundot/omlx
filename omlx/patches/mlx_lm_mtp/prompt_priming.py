@@ -148,6 +148,9 @@ class _PrimeCtx:
     extra_key_token_start: Optional[int] = None
     extra_key_ranges: Optional[list[tuple[int, tuple[Any, ...]]]] = None
     snapshot_candidate: Any = None
+    # Parked-decode timeline: pairs are buffered and folded in blocks.
+    parked: bool = False
+    pending_pairs: list = field(default_factory=list)
 
 
 @dataclass
@@ -398,6 +401,53 @@ def _snapshot_arrays(snapshot: _MtpPrefixSnapshot) -> list[Any]:
             if isinstance(value, mx.array):
                 arrays.append(value)
     return arrays
+
+
+def park_fold_block() -> int:
+    try:
+        return max(1, int(os.environ.get("OMLX_MTP_PARK_FOLD_BLOCK", "32")))
+    except ValueError:
+        return 32
+
+
+def begin_parked_ctx(model, mtp_cache, pending_hidden, *, folded: int, expected_offset: int):
+    """Adopt a parked MTP head cache as the priming timeline (see _park_mtp_to_standard).
+
+    ``folded`` is the head cache's committed offset; ``take_primed`` returns
+    ``folded + 1`` as the new ``hist_offset``."""
+    host = _eligible_host(model)
+    if host is None or not mtp_cache or folded < 0:
+        return None
+    drop_ctx(host)
+    ctx = _PrimeCtx(
+        mtp_cache=mtp_cache,
+        pending_hidden=pending_hidden,
+        folded=int(folded),
+        expected_offset=int(expected_offset),
+        parked=True,
+    )
+    setattr(host, _CTX_ATTR, ctx)
+    return ctx
+
+
+def _flush_parked(host, ctx) -> None:
+    if not ctx.pending_pairs:
+        return
+    import mlx.core as mx
+
+    hidden = mx.concatenate([h for h, _ in ctx.pending_pairs], axis=1)
+    tokens = mx.concatenate([t for _, t in ctx.pending_pairs], axis=1)
+    host.mtp_forward(hidden, tokens, ctx.mtp_cache, logits_keep=1)
+    ctx.folded += int(tokens.shape[1])
+    ctx.pending_pairs = []
+    evals = []
+    for c in ctx.mtp_cache:
+        for name in ("keys", "values"):
+            arr = getattr(c, name, None)
+            if arr is not None:
+                evals.append(arr)
+    if evals:
+        mx.async_eval(evals)
 
 
 def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
@@ -678,6 +728,19 @@ def maybe_capture(
     if ctx is not None and ctx.window_exceeded:
         ctx.expected_offset = offset_after
         return
+    if ctx is not None and ctx.parked:
+        # Standard decode while MTP is parked: buffer (hidden, next token)
+        # pairs and fold them in blocks; the prime window does not apply.
+        if seq_len != 1:
+            drop_ctx(host)
+            return
+        if ctx.pending_hidden is not None:
+            ctx.pending_pairs.append((ctx.pending_hidden, inputs))
+            if len(ctx.pending_pairs) >= park_fold_block():
+                _flush_parked(host, ctx)
+        ctx.pending_hidden = normed[:, -1:]
+        ctx.expected_offset = offset_after
+        return
     window = prime_window()
     if window:
         # Cap by the primed span (the head-KV the window exists to bound),
@@ -800,6 +863,8 @@ def take_primed(
         # hook declined without popping it — not ours to consume.
         return None
     drop_ctx(model)
+    if ctx.parked:
+        _flush_parked(model, ctx)
     if not (ctx.valid and ctx.folded > 0 and ctx.pending_hidden is not None):
         return None
     offset = _activation_offset(cache)

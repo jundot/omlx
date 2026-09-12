@@ -600,3 +600,169 @@ template <typename T, int D>
     }
   }
 }
+
+// Gathered variant of omlx_sdpa_decode_2pass_1: every query row attends to its
+// own set of N cache rows named by `indices` (int32 [B, qL, N], -1 = empty
+// slot). Query rows live on the grid (tid.y = batch * qL + row) since their
+// index sets differ, so the threadgroup is (32, gqa_factor, 1) and the
+// qL * gqa <= 32 limit of the contiguous kernel does not apply.
+template <typename T, int D, int V = D>
+[[kernel]] void omlx_sdpa_decode_gathered_2pass_1(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const device int* indices [[buffer(6)]],
+    const constant int& N [[buffer(7)]],
+    const constant size_t& k_head_stride [[buffer(8)]],
+    const constant size_t& k_seq_stride [[buffer(9)]],
+    const constant size_t& v_head_stride [[buffer(10)]],
+    const constant size_t& v_seq_stride [[buffer(11)]],
+    const constant float& scale [[buffer(12)]],
+    const constant int& q_seq_len [[buffer(13)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int TK = 4;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+
+  typedef float U;
+
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread] = {0};
+
+  const int kv_head_idx = tid.x;
+  const int batch_idx = int(tid.y) / q_seq_len;
+  const int q_seq_idx = int(tid.y) % q_seq_len;
+  const int block_idx = tid.z;
+  const int gqa_factor = tptg.y;
+  const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * gqa_factor;
+  const int q_batch_head_idx = batch_idx * num_q_heads + q_head_idx;
+  const int o_offset = q_batch_head_idx * q_seq_len + q_seq_idx;
+
+  queries += o_offset * D + simd_lid * qk_per_thread;
+  indices += (batch_idx * q_seq_len + q_seq_idx) * N;
+
+  const int chunk = (N + blocks - 1) / blocks;
+  const int k_start = block_idx * chunk;
+  const int k_end = min(N, k_start + chunk);
+
+  const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
+  keys += kv_batch_head_idx * k_head_stride + simd_lid * qk_per_thread;
+  values += kv_batch_head_idx * v_head_stride + simd_lid * v_per_thread;
+  out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
+  sums += o_offset * blocks + block_idx;
+  maxs += o_offset * blocks + block_idx;
+
+  {
+    thread T qt[qk_per_thread];
+    load_vec<T, qk_per_thread>(qt, queries);
+    for (int i = 0; i < qk_per_thread; i++) {
+      q[i] = static_cast<U>(scale) * static_cast<U>(qt[i]);
+    }
+  }
+
+  U max_score = Limits<U>::finite_min;
+  U sum_exp_score = 0;
+
+  int i = k_start;
+  for (; i + TK <= k_end; i += TK) {
+    thread T ks[TK][qk_per_thread];
+    U scores[TK];
+    bool use_key[TK];
+    int rows[TK];
+#pragma unroll
+    for (int t = 0; t < TK; t++) {
+      rows[t] = indices[i + t];
+      use_key[t] = rows[t] >= 0;
+      // An empty slot reads row 0 (always present) and is masked below.
+      load_vec<T, qk_per_thread>(
+          ks[t], keys + size_t(max(rows[t], 0)) * k_seq_stride);
+    }
+#pragma unroll
+    for (int t = 0; t < TK; t++) {
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * static_cast<U>(ks[t][j]);
+      }
+      score = simd_sum(score);
+      scores[t] = use_key[t] ? score : Limits<U>::finite_min;
+    }
+
+    U tile_max = scores[0];
+#pragma unroll
+    for (int t = 1; t < TK; t++) {
+      tile_max = max(tile_max, scores[t]);
+    }
+    U new_max = max(max_score, tile_max);
+
+    thread T vs[TK][v_per_thread];
+#pragma unroll
+    for (int t = 0; t < TK; t++) {
+      load_vec<T, v_per_thread>(
+          vs[t], values + size_t(max(rows[t], 0)) * v_seq_stride);
+    }
+
+    if (new_max > max_score) {
+      U factor = fast::exp(max_score - new_max);
+      sum_exp_score *= factor;
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] *= factor;
+      }
+      max_score = new_max;
+    }
+
+#pragma unroll
+    for (int t = 0; t < TK; t++) {
+      U p = use_key[t] ? fast::exp(scores[t] - max_score) : U(0);
+      sum_exp_score += p;
+#pragma unroll
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] += p * static_cast<U>(vs[t][j]);
+      }
+    }
+  }
+
+  for (; i < k_end; i++) {
+    const int row = indices[i];
+    if (row >= 0) {
+      thread T k[qk_per_thread];
+      load_vec<T, qk_per_thread>(k, keys + size_t(row) * k_seq_stride);
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * static_cast<U>(k[j]);
+      }
+      score = simd_sum(score);
+
+      U new_max = max(max_score, score);
+      U factor = fast::exp(max_score - new_max);
+      U exp_score = fast::exp(score - new_max);
+
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+
+      thread T vt[v_per_thread];
+      load_vec<T, v_per_thread>(vt, values + size_t(row) * v_seq_stride);
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] = o[j] * factor + exp_score * static_cast<U>(vt[j]);
+      }
+    }
+  }
+
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+
+  for (int j = 0; j < v_per_thread; j++) {
+    out[j] = o[j];
+  }
+}

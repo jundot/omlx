@@ -41,6 +41,7 @@ target_sources(
   ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fused_moe.cpp
   ${CMAKE_CURRENT_LIST_DIR}/qwen4_qsa_sparse_gqa.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/qwen4_qsa_nax_indexer.cpp
   ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cpp)
 target_include_directories(
   omlx_glm_kernel_ops
@@ -117,6 +118,46 @@ if(MLX_BUILD_METAL)
   add_custom_target(omlx_glm_kernels_metallib DEPENDS ${OMLX_GLM_METALLIB})
 
   add_dependencies(omlx_glm_kernel_ops omlx_glm_kernels_metallib)
+
+  # Tensor-unit (NAX) kernels live in a second metallib built with
+  # -mmacosx-version-min=26.2 (MetalPerformancePrimitives tensor ops); the host
+  # checks for the file and the GPU generation and keeps the classic kernels
+  # otherwise.
+  execute_process(
+    COMMAND xcrun -sdk macosx --show-sdk-version
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE OMLX_GLM_MACOS_SDK_VERSION
+    ERROR_QUIET)
+  if(OMLX_GLM_MACOS_SDK_VERSION VERSION_GREATER_EQUAL 26.2)
+    set(OMLX_GLM_NAX_METAL_FLAGS
+        -x metal -Wall -Wextra -fno-fast-math -Wno-c++17-extensions
+        -Wno-c++20-extensions -mmacosx-version-min=26.2)
+    if(MLX_METAL_DEBUG)
+      set(OMLX_GLM_NAX_METAL_FLAGS ${OMLX_GLM_NAX_METAL_FLAGS} -gline-tables-only -frecord-sources)
+    endif()
+    set(OMLX_GLM_NAX_AIR ${CMAKE_CURRENT_BINARY_DIR}/qwen4_qsa_nax_indexer_score.air)
+    add_custom_command(
+      OUTPUT ${OMLX_GLM_NAX_AIR}
+      COMMAND xcrun -sdk macosx metal ${OMLX_GLM_NAX_METAL_FLAGS} -c
+              ${CMAKE_CURRENT_LIST_DIR}/qwen4_qsa_nax_indexer_score.metal
+              ${OMLX_GLM_METAL_INCLUDE_ARGS} -o ${OMLX_GLM_NAX_AIR}
+      DEPENDS ${CMAKE_CURRENT_LIST_DIR}/qwen4_qsa_nax_indexer_score.metal
+              ${OMLX_GLM_METAL_HEADERS}
+      COMMENT "Building qwen4_qsa_nax_indexer_score.air"
+      VERBATIM)
+    set(OMLX_GLM_NAX_METALLIB ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/omlx_glm_kernels_nax.metallib)
+    add_custom_command(
+      OUTPUT ${OMLX_GLM_NAX_METALLIB}
+      COMMAND xcrun -sdk macosx metal -mmacosx-version-min=26.2 ${OMLX_GLM_NAX_AIR}
+              -o ${OMLX_GLM_NAX_METALLIB}
+      DEPENDS ${OMLX_GLM_NAX_AIR}
+      COMMENT "Building omlx_glm_kernels_nax.metallib"
+      VERBATIM)
+    add_custom_target(omlx_glm_kernels_nax_metallib DEPENDS ${OMLX_GLM_NAX_METALLIB})
+    add_dependencies(omlx_glm_kernel_ops omlx_glm_kernels_nax_metallib)
+  else()
+    message(STATUS "omlx: macOS SDK ${OMLX_GLM_MACOS_SDK_VERSION} < 26.2, skipping glm NAX kernels")
+  endif()
 
 endif()
 
