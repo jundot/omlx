@@ -622,7 +622,14 @@ class BatchPoolingCache(_BaseCache):
             for i in range(B)
         ]
         max_new = max(new_counts)
-        if max_new == 0:
+        # Append-only caches (V4.1 index pools, and ratio==1 KV that never
+        # call accumulate_windows) leave _processed at 0 forever. After the
+        # first append, the formula above yields negative new_counts — detect
+        # append-only before that early-return.
+        if N > 0 and all(p == 0 for p in self._processed):
+            new_counts = [N] * B
+            max_new = N
+        elif max_new <= 0:
             if self._pool_buf is None:
                 return mx.zeros((B, 0, D), dtype=px.dtype)
             return self.pooled

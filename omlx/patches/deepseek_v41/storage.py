@@ -260,6 +260,9 @@ class DiskEngramEmbedding(nn.Module):
         self._closed = False
         self._resident = None
         self._prefetched = None
+        self._hot_cache = None
+        self._weight_dtype = None
+        self._scale_dtype = None
 
     def make_resident(self):
         """Keep packed tensors in Metal-managed RAM with shared CPU views."""
@@ -281,6 +284,40 @@ class DiskEngramEmbedding(nn.Module):
             self._weights.close()
             if self._scales is not self._weights:
                 self._scales.close()
+
+    def bind_hot_cache(self, cache):
+        """Attach an optional quantized hot-row cache (SSD mode only)."""
+        self._hot_cache = cache
+
+    def _row_meta(self):
+        """Cache weight/scale dtypes and head dim from safetensor headers."""
+        if self._weight_dtype is not None:
+            return
+        entry = self._weights.header[self._weight_key]
+        self._weight_dtype = entry["dtype"]
+        self._head_dim = int(entry["shape"][-1])
+        if self._scale_key is not None:
+            self._scale_dtype = self._scales.header[self._scale_key]["dtype"]
+        else:
+            self._scale_dtype = None
+
+    def _decode_rows(self, data):
+        values = decode_array(*data[0])
+        if self._bits is not None:
+            values = mx.dequantize(
+                values,
+                decode_array(*data[1]),
+                decode_array(*data[2]),
+                bits=self._bits,
+                group_size=self._group_size,
+                mode="affine",
+            )
+        elif self._scale_key is not None:
+            scales = decode_array(*data[1])
+            values = (
+                values.reshape(values.shape[0], -1, 32) * scales[..., None]
+            ).reshape(values.shape)
+        return values
 
     def selected_bytes(self, rows):
         total = 0
@@ -319,35 +356,85 @@ class DiskEngramEmbedding(nn.Module):
 
     def __call__(self, indices):
         host = np.asarray(indices).astype(np.int64)
+        flat = host.reshape(-1)
+        hot = self._hot_cache
+        use_hot = (
+            hot is not None
+            and hot.enabled
+            and self._resident is None
+            and self._bits is None
+            and self._scale_key is not None
+            and flat.size > 0
+        )
+        if use_hot:
+            self._row_meta()
+            if (
+                self._weight_dtype.startswith("F8_E4M3")
+                and self._scale_dtype is not None
+                and self._scale_dtype.startswith("F8_E8M0")
+                and int(self._head_dim) == int(hot.head_dim)
+            ):
+                uniq, inv = np.unique(flat, return_inverse=True)
+                hit_mask, hit_w, hit_s = hot.get_many_raw(uniq)
+                # Assemble packed rows for every unique id, then one decode_array path.
+                w_all = np.empty((uniq.shape[0], hot.head_dim), dtype=np.uint8)
+                s_all = np.empty((uniq.shape[0], hot.n_scales), dtype=np.uint8)
+                if np.any(hit_mask):
+                    w_all[hit_mask] = hit_w[hit_mask]
+                    s_all[hit_mask] = hit_s[hit_mask]
+                miss = uniq[~hit_mask]
+                pending, self._prefetched = self._prefetched, None
+                pref = req = None
+                if pending is not None:
+                    req, future = pending
+                    pref = future.result()
+                    req = np.asarray(req).reshape(-1)
+                if miss.size:
+                    if pref is not None and np.array_equal(np.sort(req), np.sort(miss)):
+                        key_to_i = {int(req[i]): i for i in range(req.size)}
+                        w_raw, _w_dt = pref[0]
+                        s_raw, _s_dt = pref[1]
+                        wi = np.fromiter(
+                            (key_to_i[int(k)] for k in miss),
+                            dtype=np.int64,
+                            count=miss.size,
+                        )
+                        miss_w = np.asarray(w_raw)[wi]
+                        miss_s = np.asarray(s_raw)[wi]
+                    else:
+                        data = self._read_rows(miss)
+                        miss_w = np.asarray(data[0][0])
+                        miss_s = np.asarray(data[1][0])
+                    hot.put_many(miss, miss_w, miss_s)
+                    w_all[~hit_mask] = miss_w
+                    s_all[~hit_mask] = miss_s
+                values = self._decode_rows(
+                    [
+                        (w_all, self._weight_dtype),
+                        (s_all, self._scale_dtype),
+                    ]
+                )
+                values = values[mx.array(inv)]
+                return values.reshape(*host.shape, values.shape[-1]).astype(mx.bfloat16)
+
         pending, self._prefetched = self._prefetched, None
         if pending is not None:
             requested, future = pending
             data = future.result()
-            if not np.array_equal(requested, host):
+            req = np.asarray(requested).reshape(-1)
+            if not np.array_equal(req, flat):
                 data = self._read_rows(host)
         else:
             data = self._read_rows(host)
-        values = decode_array(*data[0])
-        if self._bits is not None:
-            values = mx.dequantize(
-                values,
-                decode_array(*data[1]),
-                decode_array(*data[2]),
-                bits=self._bits,
-                group_size=self._group_size,
-                mode="affine",
-            )
-        elif self._scale_key is not None:
-            scales = decode_array(*data[1])
-            values = (
-                values.reshape(values.shape[0], -1, 32) * scales[..., None]
-            ).reshape(values.shape)
+        values = self._decode_rows(data)
         return values.reshape(*host.shape, values.shape[-1]).astype(mx.bfloat16)
+
 
     def close(self):
         with self._lock:
             self._closed = True
             self._resident = None
+            self._hot_cache = None
             self._weights.close()
             if self._scales is not self._weights:
                 self._scales.close()

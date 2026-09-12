@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""DeepSeek V4.1 reference port for oMLX's pinned mlx-vlm runtime."""
+"""DeepSeek V4.1 reference port for oMLX's pinned mlx-vlm runtime.
+
+The SwitchGLU / wsdpa / deferred-HC stack is the default load path for
+``deepseek_v41``. Engram backend and hot-row cache budget remain optional
+via ``OMLX_DSV41_ENGRAM`` / ``OMLX_DSV41_ENGRAM_CACHE_GB``.
+"""
 
 
 def apply_patch():
-    import sys
+    from .fast_path import apply_fast_path
 
-    import mlx_lm.models.cache as caches
-
-    from omlx.cache.type_handlers import CacheType
-    from omlx.cache.type_registry import CacheTypeRegistry
-
-    from . import model
-    from .cache import DeepseekV41Cache, DeepseekV41CacheHandler
-
-    sys.modules.setdefault("mlx_vlm.models.deepseek_v41", model)
-    caches.DeepseekV41Cache = DeepseekV41Cache
-    CacheTypeRegistry.register(DeepseekV41CacheHandler())
-    CacheTypeRegistry._class_name_map["DeepseekV41Cache"] = CacheType.DEEPSEEK_V41
+    return apply_fast_path()
