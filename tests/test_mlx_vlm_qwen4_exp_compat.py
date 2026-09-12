@@ -1819,6 +1819,78 @@ def test_disk_backed_ple_rejects_out_of_range_indices(tmp_path):
     embedding.close()
 
 
+def test_small_ple_gather_reads_pages_in_parallel_across_shards(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple(tmp_path, shards=16, rows=128, dims=160)
+    indices = mx.arange(16, dtype=mx.int32)[None] * 128
+    original = language.os.pread
+    lock = threading.Lock()
+    counts = {"active": 0, "peak": 0, "calls": 0}
+
+    def traced(*args):
+        with lock:
+            counts["active"] += 1
+            counts["calls"] += 1
+            counts["peak"] = max(counts["peak"], counts["active"])
+        try:
+            time.sleep(0.005)  # Model independent SSD latency, not CPU work.
+            return original(*args)
+        finally:
+            with lock:
+                counts["active"] -= 1
+
+    monkeypatch.setattr(language.os, "pread", traced)
+    try:
+        actual = embedding(indices)
+        expected = mx.take(table, indices, axis=0)
+        mx.eval(actual, expected)
+        assert mx.array_equal(actual, expected).item()
+        assert counts["peak"] > 1
+        cold_calls = counts["calls"]
+        mx.eval(embedding(indices))
+        assert counts["calls"] == cold_calls
+    finally:
+        embedding.close()
+
+
+def test_cross_shard_ple_read_failure_drains_other_reads(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, _ = _disk_ple(tmp_path, shards=16, rows=128, dims=160)
+    original = language._SafeTensorMMap._touch_page
+    lock = threading.Lock()
+    counts = {"started": 0, "finished": 0}
+
+    def failing(reader, page):
+        with lock:
+            counts["started"] += 1
+            fail = counts["started"] == 1
+        try:
+            if fail:
+                raise OSError("injected read failure")
+            time.sleep(0.01)
+            original(reader, page)
+        finally:
+            with lock:
+                counts["finished"] += 1
+
+    monkeypatch.setattr(language._SafeTensorMMap, "_touch_page", failing)
+    try:
+        with pytest.raises(OSError, match="injected read failure"):
+            embedding(mx.arange(16, dtype=mx.int32)[None] * 128)
+        assert counts["started"] > 8
+        assert counts["started"] == counts["finished"]
+    finally:
+        embedding.close()
+
+
 def test_disk_backed_ple_prefetch_serves_the_matching_call(tmp_path):
     """A prefetched chunk is assembled off the main thread and consumed by the next call with the same indices."""
     embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=5)
