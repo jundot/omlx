@@ -3601,7 +3601,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "结果反映基准测试时的可用内存和内存保护级别；对任一重大更改后请重新运行。"
+            "value" : "结果反映基准测试时的可用内存和内存防护层级；对任一重大更改后请重新运行。"
           }
         }
       }
@@ -3619,7 +3619,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "个 token 已应用到上下文窗口"
+            "value" : "个 Token 已应用到上下文窗口"
           }
         }
       }
@@ -4459,7 +4459,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每次单请求试验要输入的提示 token 数"
+            "value" : "每次单请求试验要输入的提示 Token 数"
           }
         }
       }
@@ -4531,7 +4531,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每次单请求试验的输出 token 数"
+            "value" : "每次单请求试验的输出 Token 数"
           }
         }
       }
@@ -10104,7 +10104,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "初始缓存块"
+            "value" : "初始缓存块数"
           }
         }
       }
@@ -11064,7 +11064,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "嵌入批处理大小"
+            "value" : "Embedding 批大小"
           }
         }
       }
@@ -12192,7 +12192,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大 Token"
+            "value" : "最大 Token 数"
           }
         }
       }
@@ -12504,7 +12504,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -12792,7 +12792,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置文件"
+            "value" : "配置档"
           }
         }
       }
@@ -13416,7 +13416,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "为敏感层和保护张量分配更高位，同时保持目标每位权重预算在硬上限之下。"
+            "value" : "为敏感层和保护张量分配更高的位宽，同时保持目标每位权重预算在硬上限之下。"
           }
         }
       }
@@ -14088,7 +14088,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在量化输出中保留多 token 预测头"
+            "value" : "在量化输出中保留多 Token 预测头"
           }
         }
       }
@@ -14256,7 +14256,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Imatrix 缓存路径"
+            "value" : "imatrix 缓存路径"
           }
         }
       }
@@ -14376,7 +14376,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "重用 imatrix 缓存"
+            "value" : "复用 imatrix 缓存"
           }
         }
       }
@@ -14400,7 +14400,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用兼容的缓存 imatrix（如果可用）；否则收集新的。"
+            "value" : "可用时使用兼容的已缓存 imatrix；否则重新收集。"
           }
         }
       }
@@ -14448,7 +14448,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "当量化张量没有匹配的 imatrix 条目时失败，而不是回退到标准 oQ。"
+            "value" : "当量化张量没有匹配的 imatrix 条目时报错，而不是回退到标准 oQ。"
           }
         }
       }
@@ -14472,7 +14472,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用 imatrix 校准按激活重要性加权仿射量化。"
+            "value" : "使用 imatrix 校准，按激活重要性加权仿射量化。"
           }
         }
       }
@@ -19687,7 +19687,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在 usage.sqlite3 中存储各模型每小时的 token 总量。关闭后会保留现有历史。"
+            "value" : "在 usage.sqlite3 中存储各模型每小时的 Token 总量。关闭后会保留现有历史。"
           }
         }
       }
@@ -20755,7 +20755,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大 Token"
+            "value" : "最大 Token 数"
           }
         }
       }
@@ -20827,7 +20827,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -21619,7 +21619,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "激活位"
+            "value" : "激活位宽"
           }
         }
       }
@@ -21643,7 +21643,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "组大小"
+            "value" : "分组大小"
           }
         }
       }
@@ -21667,7 +21667,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "权重位"
+            "value" : "权重位宽"
           }
         }
       }
@@ -21715,7 +21715,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "为草稿模型启用量化（权重、激活位和组大小）。"
+            "value" : "为草稿模型启用量化（权重位宽、激活位宽和分组大小）。"
           }
         }
       }
@@ -22195,7 +22195,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "验证器算法。\"自适应\"在接受率下降时缩小块大小；\"关闭\"禁用推测验证。"
+            "value" : "验证器算法。“自适应”在接受率下降时缩小块大小；“关闭”禁用推测验证。"
           }
         }
       }
@@ -22843,7 +22843,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "重排器"
+            "value" : "重排序"
           }
         }
       }
@@ -23227,7 +23227,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置文件"
+            "value" : "配置档"
           }
         }
       }
@@ -23587,7 +23587,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -24064,7 +24064,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "准确度"
+            "value" : "准确率"
           }
         },
         "zh-Hant" : {
@@ -25348,7 +25348,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "内存条目"
+            "value" : "RAM 条目"
           }
         }
       }
@@ -26041,7 +26041,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充处理"
+            "value" : "提示词处理"
           }
         }
       }
