@@ -443,6 +443,18 @@ def install_runtime_optimizations(
         if coordinator or not rank_zero_logits_active:
             logits = instance.model(inputs[:, None], cache=instance.prompt_cache)
             logits = logits[:, -1, :]
+            if not coordinator:
+                # A full-logits worker anchors its stage send in its forward
+                # result, but nothing downstream evaluates that result — this
+                # rank contributes zeros to the sample, so its logits are
+                # dead graph. The token all-sum below can then be scheduled
+                # ahead of the send: this rank blocks in the collective while
+                # rank zero waits on a recv that never comes (#3521).
+                # Materialize the forward so the send completes before the
+                # all-sum is issued. The MiniMax rank-zero-logits branch
+                # avoids this LM head via its cache-state anchor; every other
+                # architecture pays it as the price of the experimental flag.
+                mx.eval(logits)
         else:
             instance.model(
                 inputs[:, None],
