@@ -302,9 +302,10 @@ authenticated admin command before it is executed.
 - Nemotron-H receives a worker-local compatibility hook for its hybrid
   Mamba/attention cache layout and is covered by the real two-rank pipeline
   smoke test.
-- DFlash, SpecPrefill, MTP, VLM MTP, TurboQuant KV, thinking budgets, guided
+- DFlash, SpecPrefill, MTP, VLM MTP, TurboQuant KV, guided
   grammar, and `logit_bias` are rejected for a distributed deployment rather
-  than ignored.
+  than ignored. Per-request thinking budgets are honored: each rank enforces
+  them on its own decode path (#2731).
 - The first GUI activation flow intentionally supports two Macs. The schema,
   planner, launcher, and runtime support up to 64 ranks; a multi-peer GUI is
   follow-up work.
