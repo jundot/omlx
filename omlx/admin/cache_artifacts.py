@@ -47,14 +47,22 @@ class CacheArtifactExportRequest(BaseModel):
 
     ``messages``/``tools`` are rendered and tokenized exactly like a real
     turn (same path as ``/api/cache/probe``) so the block chain lines up
-    with what a re-prefill would build.
+    with what a re-prefill would build. ``token_ids`` is an alternative for
+    gateway/proxy integrations that already hold the exact rendered
+    conversation: when set, ``messages`` is ignored.
     """
 
     model_id: str
-    messages: list[dict]
+    messages: list[dict] | None = None
     tools: list[dict] | None = None
     chat_template_kwargs: dict | None = None
     thinking_budget: int | None = None
+    # Pre-rendered token ids (takes precedence over messages).
+    token_ids: list[int] | None = None
+    # Force-write the chain's write-back (RAM-only) blocks to disk before
+    # exporting. Fresh sessions are RAM-only until eviction/shutdown, so
+    # without this a just-finished session is often not exportable.
+    flush: bool = True
     # Where to write the artifact. Defaults to a ``cache_artifacts``
     # directory next to the SSD cache dir.
     output_dir: str | None = None
@@ -196,10 +204,19 @@ def export_cache_artifact(
         _resolve_context(request.model_id)
     )
     _require_ssd_tier(ssd_manager)
-    token_ids = _tokenize_prompt(engine, entry, tokenizer, request)
-    if not token_ids:
+    if request.token_ids is not None:
+        if not request.token_ids:
+            raise HTTPException(status_code=400, detail="token_ids is empty.")
+        token_ids = [int(t) for t in request.token_ids]
+    elif request.messages is not None:
+        token_ids = _tokenize_prompt(engine, entry, tokenizer, request)
+        if not token_ids:
+            raise HTTPException(
+                status_code=400, detail="Messages tokenized to zero tokens."
+            )
+    else:
         raise HTTPException(
-            status_code=400, detail="Messages tokenized to zero tokens."
+            status_code=400, detail="Provide either messages or token_ids."
         )
 
     if request.output_dir:
@@ -214,6 +231,7 @@ def export_cache_artifact(
             token_ids=token_ids,
             block_size=block_size,
             output_dir=output_dir,
+            flush=request.flush,
         )
     except OSError as exc:
         raise HTTPException(
@@ -225,14 +243,18 @@ def export_cache_artifact(
 
         with contextlib.suppress(OSError):
             os.unlink(result["artifact_path"])
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "No restorable prefix found — the SSD cache holds nothing "
-                "for this prompt (not yet prefilled, evicted, or the SSD "
-                "tier was off when it ran)."
-            ),
+        detail = (
+            "No restorable prefix found — nothing for this prompt is durable "
+            "on disk (never prefilled with the SSD tier enabled, evicted, "
+            "or the SSD tier was off when it ran)."
         )
+        ram_only = result["manifest"].get("ram_only_blocks", 0)
+        if ram_only:
+            detail += (
+                f" {ram_only} block(s) of the prefix are held RAM-only in "
+                "write-back retention and could not be flushed; retry shortly."
+            )
+        raise HTTPException(status_code=409, detail=detail)
     return result
 
 

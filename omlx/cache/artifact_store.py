@@ -114,6 +114,7 @@ def export_artifact(
     token_ids: list[int],
     block_size: int,
     output_dir: Path,
+    flush: bool = True,
 ) -> dict:
     """Materialize the longest restorable prefix of ``token_ids`` into a zip.
 
@@ -122,16 +123,31 @@ def export_artifact(
     walk stops at the first non-exportable block: the chain is contiguous by
     construction, so nothing past it is restorable either.
 
+    With ``flush`` (default) the manager is asked to force-write the chain's
+    blocks first: in write-back retention a fresh prefill lives RAM-only until
+    eviction or shutdown, so without the flush a just-finished session is
+    often not exportable at all. Blocks still RAM-only after the flush are
+    reported in the manifest under ``ram_only_blocks``.
+
     Returns ``{"artifact_path": str, "size_bytes": int, "manifest": dict}``.
     When nothing is restorable the artifact is still written (with zero
     blocks); the caller decides how to treat it.
     """
     index = manager._index
+    chain = list(chain_hashes(token_ids, block_size, model_name))
+
+    if (
+        flush
+        and not getattr(manager, "hot_cache_only", False)
+        and hasattr(manager, "flush_blocks")
+    ):
+        manager.flush_blocks([block_hash for block_hash, _chunk in chain])
 
     block_entries: list[dict[str, Any]] = []
     source_paths: list[Path] = []
     restorable_tokens = 0
-    for block_hash, chunk in chain_hashes(token_ids, block_size, model_name):
+    ram_only_blocks = 0
+    for block_hash, chunk in chain:
         if not index.contains(block_hash):
             break
         file_path = manager._get_file_path(block_hash)
@@ -156,6 +172,13 @@ def export_artifact(
         )
         source_paths.append(file_path)
         restorable_tokens += len(chunk)
+    # Diagnostic: blocks the manager claims but that have no durable file
+    # (write-back retention the flush did not clear, or pending-writer lag).
+    for block_hash, _chunk in chain:
+        if manager.has_block(block_hash) and not manager._get_file_path(
+            block_hash
+        ).is_file():
+            ram_only_blocks += 1
 
     gdn_entries: list[dict[str, Any]] = []
     if block_entries:
@@ -190,6 +213,7 @@ def export_artifact(
         "model_name": model_name,
         "block_size": block_size,
         "restorable_tokens": restorable_tokens,
+        "ram_only_blocks": ram_only_blocks,
         "token_ids": token_ids,
         "blocks": block_entries,
         "gdn_sidecars": gdn_entries,

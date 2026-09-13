@@ -42,6 +42,17 @@ def _make_manager(root: Path, *, model_name: str = MODEL) -> PagedSSDCacheManage
     )
 
 
+def _make_hot_manager(root: Path, *, model_name: str = MODEL) -> PagedSSDCacheManager:
+    """Manager with the RAM hot tier enabled (write-back retention)."""
+    return PagedSSDCacheManager(
+        cache_dir=root / "ssd",
+        max_size_bytes=1 << 30,
+        expected_model_name=model_name,
+        expected_block_size=BLOCK_SIZE,
+        hot_cache_max_bytes=256 * 1024 * 1024,
+    )
+
+
 def _save_chain(manager: PagedSSDCacheManager, tokens: list[int]) -> list[bytes]:
     """Save one block per chain segment and wait for the background writer."""
     parent = b""
@@ -66,6 +77,31 @@ def _save_chain(manager: PagedSSDCacheManager, tokens: list[int]) -> list[bytes]
             is True
         )
         assert _wait_for_file(manager._get_file_path(parent))
+        saved.append(parent)
+    return saved
+
+
+def _save_chain_ram(manager: PagedSSDCacheManager, tokens: list[int]) -> list[bytes]:
+    """Save with default write-back retention; no disk wait (there is none)."""
+    parent = b""
+    saved: list[bytes] = []
+    cache_data = [
+        (mx.zeros((1, 2, BLOCK_SIZE, 8)), mx.zeros((1, 2, BLOCK_SIZE, 8)))
+        for _ in range(LAYERS)
+    ]
+    for start in range(0, len(tokens), BLOCK_SIZE):
+        chunk = list(tokens[start : start + BLOCK_SIZE])
+        parent = compute_block_hash(parent, chunk, extra_keys=None, model_name=MODEL)
+        assert (
+            manager.save_block(
+                block_hash=parent,
+                cache_data=cache_data,
+                token_count=len(chunk),
+                model_name=MODEL,
+                layer_cache_types=["KVCache"] * LAYERS,
+            )
+            is True
+        )
         saved.append(parent)
     return saved
 
@@ -154,6 +190,72 @@ def test_export_stops_at_first_hole(tmp_path: Path):
             assert not manager_b.has_block(saved[2])
         finally:
             manager_b.close()
+    finally:
+        manager.close()
+
+
+def test_flush_blocks_write_back(tmp_path: Path):
+    """flush_blocks force-writes write-back (RAM-only) blocks to disk."""
+    manager = _make_hot_manager(tmp_path / "a")
+    try:
+        saved = _save_chain_ram(manager, TOKENS)
+        # Write-back retention: the whole chain lives in RAM — no files,
+        # no SSD index entries, but the manager knows the blocks.
+        for block_hash in saved:
+            assert not manager._get_file_path(block_hash).is_file()
+            assert not manager._index.contains(block_hash)
+            assert manager.has_block(block_hash)
+
+        assert manager.flush_blocks(saved) == 3
+        for block_hash in saved:
+            assert manager._get_file_path(block_hash).is_file()
+            assert manager._index.contains(block_hash)
+            loaded = manager.load_block(block_hash)
+            assert loaded is not None and len(loaded) == LAYERS
+
+        # Second flush: everything is clean now.
+        assert manager.flush_blocks(saved) == 0
+    finally:
+        manager.close()
+
+
+def test_export_flushes_write_back_chain(tmp_path: Path):
+    """Default export force-flushes a fresh (RAM-only) session to disk."""
+    manager = _make_hot_manager(tmp_path / "a")
+    try:
+        _save_chain_ram(manager, TOKENS)
+        result = export_artifact(
+            manager,
+            model_name=MODEL,
+            token_ids=TOKENS,
+            block_size=BLOCK_SIZE,
+            output_dir=tmp_path / "artifacts",
+        )
+        manifest = result["manifest"]
+        assert manifest["restorable_tokens"] == len(TOKENS)
+        assert len(manifest["blocks"]) == 3
+        assert manifest["ram_only_blocks"] == 0
+    finally:
+        manager.close()
+
+
+def test_export_without_flush_sees_nothing_durable(tmp_path: Path):
+    """With flush off, a write-back chain is RAM-only: zero restorable."""
+    manager = _make_hot_manager(tmp_path / "a")
+    try:
+        _save_chain_ram(manager, TOKENS)
+        result = export_artifact(
+            manager,
+            model_name=MODEL,
+            token_ids=TOKENS,
+            block_size=BLOCK_SIZE,
+            output_dir=tmp_path / "artifacts",
+            flush=False,
+        )
+        manifest = result["manifest"]
+        assert manifest["restorable_tokens"] == 0
+        assert manifest["blocks"] == []
+        assert manifest["ram_only_blocks"] == 3
     finally:
         manager.close()
 
