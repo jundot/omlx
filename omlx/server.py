@@ -2071,6 +2071,44 @@ def validate_context_window(
         )
 
 
+def bound_chat_output_to_context(
+    *,
+    num_prompt_tokens: int,
+    model_id: str | None,
+    requested_max_tokens: int | None,
+    resolved_max_tokens: int,
+) -> int:
+    """Keep a chat completion inside the effective total context window.
+
+    Explicit over-budget requests are rejected with the exact available output
+    count. An omitted request budget uses the smaller of the configured default
+    and that remainder, so a global default can never extend a sequence beyond
+    an operator's per-model context policy.
+    """
+    max_ctx = get_max_context_window(model_id)
+    if max_ctx is None:
+        return resolved_max_tokens
+    available_tokens = max_ctx - num_prompt_tokens
+    if available_tokens < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Prompt leaves no completion capacity: input_tokens="
+                f"{num_prompt_tokens}, context_limit={max_ctx}"
+            ),
+        )
+    if requested_max_tokens is not None and resolved_max_tokens > available_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"max_tokens={resolved_max_tokens} exceeds available_tokens="
+                f"{available_tokens} for input_tokens={num_prompt_tokens} "
+                f"and context_limit={max_ctx}"
+            ),
+        )
+    return min(resolved_max_tokens, available_tokens)
+
+
 def init_server(
     model_dirs: str | list[str],
     scheduler_config=None,
@@ -4156,6 +4194,12 @@ async def create_chat_completion(
             req_max_tokens=request.max_tokens,
             req_xtc_probability=getattr(request, "xtc_probability", None),
             req_xtc_threshold=getattr(request, "xtc_threshold", None),
+        )
+        max_tokens = bound_chat_output_to_context(
+            num_prompt_tokens=num_prompt_tokens,
+            model_id=request.model,
+            requested_max_tokens=request.max_tokens,
+            resolved_max_tokens=max_tokens,
         )
         chat_kwargs = {
             "max_tokens": max_tokens,
@@ -6705,6 +6749,18 @@ async def count_anthropic_tokens(
         engine = await get_engine_for_model(request.model, lease=lease)
         await _raise_if_llm_lease_abort_requested(lease)
 
+        ms = get_model_settings_for_request(request.model)
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            request.chat_template_kwargs,
+        )
+        forced_keys = forced_ct_keys(ms)
+        if request.thinking and "enable_thinking" not in forced_keys:
+            if request.thinking.type in ("enabled", "adaptive"):
+                merged_ct_kwargs["enable_thinking"] = True
+            elif request.thinking.type == "disabled":
+                merged_ct_kwargs["enable_thinking"] = False
+
         # Convert Anthropic format to internal format
         # Create a temporary MessagesRequest to reuse existing conversion logic
         temp_request = AnthropicMessagesRequest(
@@ -6715,6 +6771,7 @@ async def count_anthropic_tokens(
             tools=request.tools,
             tool_choice=request.tool_choice,
             thinking=request.thinking,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
         messages = convert_anthropic_to_internal(temp_request)
 
@@ -6729,6 +6786,8 @@ async def count_anthropic_tokens(
         }
         if internal_tools:
             template_kwargs["tools"] = internal_tools
+        if merged_ct_kwargs:
+            template_kwargs.update(merged_ct_kwargs)
 
         try:
             prompt = tokenizer.apply_chat_template(messages, **template_kwargs)

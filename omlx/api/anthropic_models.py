@@ -216,6 +216,10 @@ class TokenCountRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     tool_choice: ToolChoice | dict[str, Any] | None = None
     thinking: ThinkingConfig | None = None
+    # oMLX extension: count the same rendered template used by generation.
+    # This is required for templates where controls such as enable_thinking
+    # alter the prompt token count.
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 class TokenCountResponse(BaseModel):
