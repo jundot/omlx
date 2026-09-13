@@ -709,11 +709,35 @@ def test_automatic_never_falls_back_to_an_unsupported_pipeline():
         supports_pipeline=False,
     )
 
-    with pytest.raises(PlanningError, match="no tensor-parallel degree"):
+    # 8 heads divide 2 nodes perfectly — the refusal is the slow Ethernet
+    # link, and the message must say so instead of blaming divisibility
+    # (#3022).
+    with pytest.raises(PlanningError, match="too slow"):
         choose_parallelism(
             unsupported,
             _nodes(2),
             transports=[_link("ethernet", speed=10, tb_version=None)],
+        )
+
+
+def test_a_genuine_divisibility_failure_keeps_the_divisor_message():
+    indivisible = ModelLayout(
+        source="test",
+        fixed_weight_bytes=1 * 1024**3,
+        layer_weight_bytes=(2 * 1024**3,) * 8,
+        tensor_parallel_heads=7,
+        tensor_parallel_kv_heads=7,
+        supports_tensor_parallel=True,
+        supports_pipeline=False,
+    )
+
+    # 7 heads cannot divide any candidate degree: the honest message names
+    # the divisibility failure — not the link, which is fast here.
+    with pytest.raises(PlanningError, match="no degree divides"):
+        choose_parallelism(
+            indivisible,
+            _nodes(4),
+            transports=[_link("thunderbolt")],
         )
 
 

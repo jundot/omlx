@@ -216,7 +216,9 @@ def choose_parallelism(
             raise PlanningError(
                 "this model cannot use more than one Mac: its architecture "
                 "implements neither MLX-LM pipeline nor a compatible "
-                "tensor-parallel split"
+                "tensor-parallel split (no degree divides "
+                f"{len(nodes)} nodes across architecture dimensions "
+                f"{model.tensor_parallel_divisors})"
             )
 
     measured_choice = False
@@ -248,6 +250,7 @@ def choose_parallelism(
 
     warnings: list[str] = []
     last_error: PlanningError | None = None
+    link_rejected: list[int] = []
 
     for tensor_parallel_size in candidates:
         fast_enough = transports_are_fast_enough(
@@ -262,6 +265,9 @@ def choose_parallelism(
             and not fast_enough
             and not measured_on_this_path
         ):
+            # Record the gate: when nothing plans, the refusal must name the
+            # link, not the head divisibility that was never the problem.
+            link_rejected.append(tensor_parallel_size)
             continue
         try:
             plan = plan_hybrid(
@@ -335,6 +341,18 @@ def choose_parallelism(
     if last_error is not None:
         raise PlanningError(
             f"no workable split for {len(nodes)} nodes: {last_error}"
+        )
+    if link_rejected:
+        # #3022: the link gate dropped every remaining candidate. Name the
+        # link — the divisibility fall-through below would blame dimensions
+        # that divide the node count perfectly well.
+        raise PlanningError(
+            f"tensor parallelism is the only way to use {len(nodes)} nodes "
+            f"for this model, but the detected link "
+            f"({describe_transports(transports)}) is too slow for it — every "
+            f"layer's all-reduce would cross it. Connect a Thunderbolt cable "
+            f"for the fast path, or measure both strategies with a working "
+            f"link before choosing."
         )
     raise PlanningError(
         f"no tensor-parallel degree divides {len(nodes)} nodes across "
