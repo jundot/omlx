@@ -153,13 +153,19 @@ def test_bf16_injection_serial_and_verify_rows_agree():
         (mx.bfloat16, False, (HC, WIDTH - 1)),
     ],
 )
-def test_bf16_injection_rejects_unsupported_layout(dtype, bias, shape):
+def test_bf16_injection_rejects_unsupported_layout(monkeypatch, dtype, bias, shape):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    monkeypatch.setattr(hc_fused, "_DISABLED", False)
+    monkeypatch.setattr(hc_fused, "_RUNTIME_FAILED", False)
+    monkeypatch.setattr(mx, "default_device", lambda: mx.gpu)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: True)
     module = _module(8, dense_inject=True)
+    inputs = mx.zeros((1, 1, WIDTH), dtype=mx.bfloat16)
+    assert hc_fused.compatible(module, inputs)
     module.block_inject_weight = nn.Linear(shape[1], shape[0], bias=bias)
     module.block_inject_weight.weight = module.block_inject_weight.weight.astype(dtype)
-    assert not hc_fused.compatible(module, mx.zeros((1, 1, WIDTH), dtype=mx.bfloat16))
+    assert not hc_fused.compatible(module, inputs)
 
 
 # Sizes the checkpoint never has, chosen so every kernel sees a partial final block:
@@ -399,16 +405,16 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
         (128, 4, 5, 4, 4),
         (128, 4, 5, 6, 4),
         (128, 4, 5, 6, 8),
-        (128, 4, 5, 6, 16),
+        (128, 4, 5, 6, "bf16"),
         (128, 4, 5, 6, None),
     ]:
         module = _module(down_bits, inject_bits is not None, hidden=hidden)
         module.input_mix_weight_up = _module(up_bits, hidden=hidden).input_mix_weight_up
         if inject_bits is not None:
             module.block_inject_weight = _module(
-                8 if inject_bits == 16 else inject_bits,
+                8 if inject_bits == "bf16" else inject_bits,
                 hidden=hidden,
-                dense_inject=inject_bits == 16,
+                dense_inject=inject_bits == "bf16",
             ).block_inject_weight
         hc_fused._eps_array(module)
         x = mx.ones((1, rows, HC * hidden), dtype=mx.bfloat16)

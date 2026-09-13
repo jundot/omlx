@@ -277,8 +277,8 @@ class Model(Qwen3_5Model):
         )
         if fused_ple:
             logger.info(
-                "Enabled packed device-side lookup for %d resident "
-                "Qwen4-Exp PLE table(s)",
+                "Fused %d resident Qwen4-Exp PLE table into one packed "
+                "device-side embedding",
                 fused_ple,
             )
         return result

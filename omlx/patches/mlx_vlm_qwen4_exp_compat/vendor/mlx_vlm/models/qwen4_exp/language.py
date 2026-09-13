@@ -2571,12 +2571,6 @@ class ShardedEmbedding(nn.Module):
         if total_rows != self.shard_offsets[-1] or first.dims != self.dims:
             return False
 
-        if len(shards) == 1:
-            # Reuse the loaded shard; no join allocation or residency change.
-            self.fused = first
-            self.shards = []
-            return True
-
         fused = nn.QuantizedEmbedding(
             1,
             self.dims,
@@ -2605,16 +2599,13 @@ def fuse_resident_ple_embeddings(
     *,
     minimum_physical_memory: int = 192 * 1024**3,
 ) -> int:
-    """Enable packed device lookups for already resident affine PLE tables.
-
-    The physical-memory threshold admits the temporary join allocation only.
-    Total model residency is decided by engine admission before weights load.
-    A single-shard alias allocates no additional table on any memory size.
-    """
+    """Fuse resident affine PLE shards only where the temporary peak is safe."""
 
     if get_ple_runtime_mode() != "resident":
         return 0
     physical_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    if physical_memory < minimum_physical_memory:
+        return 0
 
     fused = 0
     language_model = getattr(model, "language_model", None)
@@ -2626,11 +2617,7 @@ def fuse_resident_ple_embeddings(
             "ngram_embedding",
             None,
         )
-        if type(embedding) is not ShardedEmbedding:
-            continue
-        if physical_memory < minimum_physical_memory and len(embedding.shards) != 1:
-            continue
-        if embedding.fuse_quantized_shards():
+        if type(embedding) is ShardedEmbedding and embedding.fuse_quantized_shards():
             fused += 1
     return fused
 

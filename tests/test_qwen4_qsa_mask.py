@@ -15,8 +15,6 @@ from mlx_vlm.models.qwen4_exp import qsa_mask  # noqa: E402
 
 
 def _reference_mask(hits, counts, ends, ratio, topk, key_len):
-    import mlx.core as mx
-
     batch, seq, blocks = hits.shape
     selected = mx.repeat(hits, ratio, axis=-1)
     if blocks * ratio < key_len:
@@ -96,17 +94,23 @@ def test_mask_failure_logs_once_and_keeps_general_path(monkeypatch, caplog):
 def test_unsupported_inputs_stay_general(monkeypatch, change):
     # Exercise the selected guard even on CPU-only hosts; never launch Metal.
     monkeypatch.setattr(qsa_mask, "_FAILED", False)
+    monkeypatch.setattr(qsa_mask, "_PROVEN", True)
     monkeypatch.setattr(mx, "default_device", lambda: mx.gpu)
     monkeypatch.setattr(mx.metal, "is_available", lambda: True)
-    launch = Mock(side_effect=AssertionError("unsupported input reached Metal"))
+    expected = object()
+    launch = Mock(return_value=expected)
     monkeypatch.setattr(qsa_mask, "_launch_mask", launch)
     inputs = list(_inputs())
+    assert qsa_mask.fused_block_mask(*inputs) is expected
+    launch.reset_mock()
     if change == "device":
         monkeypatch.setattr(mx, "default_device", lambda: mx.cpu)
     elif change == "metal":
         monkeypatch.setattr(mx.metal, "is_available", lambda: False)
     elif change == "width":
         inputs[0] = mx.zeros((1, 7, 1024), dtype=mx.bool_)
+        inputs[2] = mx.arange(4090, 4097, dtype=mx.int32)
+        inputs[1] = inputs[2] // 4
     elif change == "batch":
         inputs[0] = mx.zeros((2, 4, 1024), dtype=mx.bool_)
     elif change == "ratio":
@@ -115,6 +119,9 @@ def test_unsupported_inputs_stay_general(monkeypatch, change):
         inputs[4] = 256
     elif change == "context":
         inputs[5] = 65536
+        inputs[0] = mx.zeros((1, 4, 16384), dtype=mx.bool_)
+        inputs[2] = mx.arange(65533, 65537, dtype=mx.int32)
+        inputs[1] = inputs[2] // 4
     assert qsa_mask.fused_block_mask(*inputs) is None
     launch.assert_not_called()
 

@@ -509,14 +509,7 @@ def _launch_fused(
         template=[
             ("T", dtype),
             ("BITS_D", down_bits),
-            (
-                "BITS_I",
-                (
-                    inject_bits
-                    if has_inject and not dense_inject
-                    else down_bits
-                ),
-            ),
+            ("BITS_I", inject_bits if has_inject and not dense_inject else down_bits),
             ("DENSE_I", dense_inject),
             ("K", width),
             ("R", lowrank),
