@@ -1521,6 +1521,87 @@ def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
     assert _prompt_cache_ssd_dir(off, rank=0) is None
 
 
+# -- teardown SSD reclaim (#3422) ----------------------------------------------
+
+
+def _ssd_tree(state_dir, deployment_id, plan_hash="a" * 64):
+    root = (
+        Path(state_dir)
+        / "prompt-cache-ssd"
+        / deployment_id
+        / plan_hash
+        / "rank-0"
+    )
+    root.mkdir(parents=True)
+    (root / "snapshot.safetensors").write_bytes(b"kv")
+    return root
+
+
+def test_ssd_sweep_removes_only_the_deleted_deployments_tree(tmp_path):
+    from omlx.cluster.launch import sweep_deployment_ssd_snapshots
+
+    deployment = _deployment()
+    victim = _ssd_tree(tmp_path, deployment.deployment_id)
+    sibling = _ssd_tree(tmp_path, "other-deployment")
+    # No remote execution in this test: the runner would be called for the
+    # rank-1 host, so make it fail loudly if the target set is wrong.
+    cleared_targets = []
+
+    def runner(cmd, **_kwargs):
+        cleared_targets.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="1", stderr="")
+
+    report = sweep_deployment_ssd_snapshots(
+        deployment, state_dir=tmp_path, runner=runner
+    )
+
+    assert not victim.parent.parent.exists()
+    assert sibling.exists()  # other saved setups keep their persistence
+    assert report["cleared"] == ["local", "user@studio.local"]
+    assert report["errors"] == []
+    # Exactly one remote call, targeting the rank-1 host, carrying the id.
+    assert len(cleared_targets) == 1
+    assert any(
+        deployment.deployment_id in str(part) for part in cleared_targets[0]
+    )
+
+
+def test_ssd_sweep_rejects_an_unsafe_deployment_id(tmp_path):
+    from omlx.cluster.launch import sweep_deployment_ssd_snapshots
+
+    deployment = _deployment()
+    object.__setattr__(deployment, "deployment_id", "../escape")
+
+    def runner(cmd, **_kwargs):
+        raise AssertionError("no remote execution for an unsafe id")
+
+    report = sweep_deployment_ssd_snapshots(
+        deployment, state_dir=tmp_path, runner=runner
+    )
+
+    assert report["cleared"] == []
+    assert report["errors"] == ["deployment id is not a safe path component"]
+    assert not (tmp_path / "escape").exists()
+
+
+def test_ssd_sweep_reports_remote_failures_without_raising(tmp_path):
+    from omlx.cluster.launch import sweep_deployment_ssd_snapshots
+
+    deployment = _deployment()
+    _ssd_tree(tmp_path, deployment.deployment_id)
+
+    def runner(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="ssh down")
+
+    report = sweep_deployment_ssd_snapshots(
+        deployment, state_dir=tmp_path, runner=runner
+    )
+
+    assert report["cleared"] == ["local"]
+    assert len(report["errors"]) == 1
+    assert "user@studio.local" in report["errors"][0]
+
+
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):
     deployment = _mixed_role_deployment()
 
