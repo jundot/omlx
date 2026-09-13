@@ -322,7 +322,16 @@ def detect_transports(
                     if j < len(row) and row[j]:
                         # TB connection exists
                         physical_edges.add((i, j))
-                        link_speed = _extract_tb_link_speed(f"{ssh_prefix}{hosts[i]}")
+                        try:
+                            link_speed = _extract_tb_link_speed(
+                                f"{ssh_prefix}{hosts[i]}"
+                            )
+                        except Exception:
+                            # A missing link speed degrades this pair's
+                            # metadata only. The connectivity matrix was
+                            # already read — one SSH failure here must not
+                            # erase the fabric (#3037).
+                            link_speed = None
                         tb_version = _detect_tb_version(link_speed)
                         transports.append(
                             TransportInfo(
