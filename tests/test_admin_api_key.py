@@ -80,6 +80,99 @@ class TestListModelsSettings:
         assert settings_dict["max_context_window"] == 8192
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
+        assert model["source_type"] == "local"
+        assert model["virtual"] is False
+        assert model["deletable"] is True
+        assert model["removal_kind"] == "local_model"
+
+    def test_list_models_marks_hf_cache_removal_kind(self):
+        mock_engine_pool = MagicMock()
+        mock_engine_pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "mlx-community--Qwen",
+                    "model_path": "/tmp/hub/models--mlx-community--Qwen/snapshots/abc",
+                    "loaded": False,
+                    "estimated_size": 1000,
+                    "pinned": False,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                    "source_type": "hf_cache",
+                    "source_repo_id": "mlx-community/Qwen",
+                },
+                {
+                    "id": "distributed-model",
+                    "model_path": "/models/distributed",
+                    "loaded": False,
+                    "estimated_size": 1000,
+                    "pinned": False,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                    "source_type": "local",
+                    "distributed": True,
+                    "cluster": "test-cluster",
+                },
+                {
+                    "id": "virtual-cache-model",
+                    "model_path": "builtin://virtual-cache-model",
+                    "loaded": False,
+                    "estimated_size": 0,
+                    "pinned": False,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                    "source_type": "hf_cache",
+                    "virtual": True,
+                },
+            ]
+        }
+        mock_settings_manager = MagicMock()
+        mock_settings_manager.get_all_settings.return_value = {}
+        mock_settings_manager.list_profiles.return_value = []
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=mock_engine_pool),
+            patch.object(
+                admin_routes,
+                "_get_settings_manager",
+                return_value=mock_settings_manager,
+            ),
+            patch.object(admin_routes, "_get_server_state", return_value=None),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch.object(
+                admin_routes,
+                "_paroquant_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_dflash_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_mtp_compat_for_model",
+                return_value=(False, None),
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["source_type"] == "hf_cache"
+        assert model["source_repo_id"] == "mlx-community/Qwen"
+        assert model["virtual"] is False
+        assert model["deletable"] is True
+        assert model["removal_kind"] == "local_cache"
+
+        distributed = result["models"][1]
+        assert distributed["distributed"] is True
+        assert distributed["cluster"] == "test-cluster"
+        assert distributed["deletable"] is False
+        assert distributed["removal_kind"] is None
+
+        virtual = result["models"][2]
+        assert virtual["virtual"] is True
+        assert virtual["deletable"] is False
+        assert virtual["removal_kind"] is None
 
     def test_list_models_reports_forced_qwen4_ple_offload(self, tmp_path):
         from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
