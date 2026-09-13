@@ -805,9 +805,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 and self.norm.weight.shape == (128,)
                 and self.norm.weight.dtype == mx.bfloat16
             ):
-                # RMS normalization and gating are independent per token/head.
-                # Flatten those two axes into the existing decode kernel's
-                # row grid, preserving its BF16 materialization boundaries.
+                # Flatten token/head axes, preserving BF16 rounding boundaries.
                 out = qwen4_decode_norm_gate_fused(
                     mx.contiguous(out),
                     mx.contiguous(z),

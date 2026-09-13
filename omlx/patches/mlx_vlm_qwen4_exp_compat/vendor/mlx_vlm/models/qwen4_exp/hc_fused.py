@@ -31,8 +31,7 @@ logger = logging.getLogger(__name__)
 MAX_ROWS = 16
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
-# Compiled dispatch is validated for this projection geometry and short MTP
-# batches. Other supported layouts retain the eager fused kernels.
+# Validated compiled geometry; other layouts retain eager fused dispatch.
 _COMPILED_HIDDEN = 2560
 _COMPILED_LOWRANK = 320
 _COMPILED_MAX_ROWS = 6
@@ -559,7 +558,6 @@ def _fused_plan(
     dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits,
     *, dense_inject=False,
 ):
-    # Compile short Q8 calls; other layouts use eager kernel dispatch.
     compiled = (
         hidden == _COMPILED_HIDDEN
         and lowrank == _COMPILED_LOWRANK
@@ -567,9 +565,8 @@ def _fused_plan(
         and down_bits == up_bits == 8
         and inject_bits is None
     )
-    # The fixed 16-column tile leaves room for tuning on newer GPU generations.
-    # TODO: Detect GPU capabilities and automatically tune/cache the tile size
-    # for each supported layout instead of relying on this hard-coded default.
+    # The fixed 16-column tile is a tuning opportunity on newer GPUs.
+    # TODO: Detect GPU capabilities and auto-tune/cache tiles per layout.
     tile = _COMPILED_TILE_COLUMNS if compiled else _EAGER_TILE_COLUMNS
     signature = (
         dtype, hc, hidden, lowrank, rows, down_bits, up_bits, inject_bits,

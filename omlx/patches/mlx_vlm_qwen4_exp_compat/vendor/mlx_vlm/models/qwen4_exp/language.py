@@ -1933,8 +1933,7 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 # os.pread releases the GIL and does not change the shared file position.
 _PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-# Avoid pool overhead for a handful of reads; batch short decode/verify gathers
-# across shards, while larger prefill gathers use per-shard page prefetch.
+# Batch short gathers across shards; large prefills prefetch per shard.
 _PLE_PARALLEL_READ_MIN = 8
 _PLE_CROSS_SHARD_MAX_ROWS = 256
 # Start hashing/gathering early only for short token batches.
@@ -2015,9 +2014,8 @@ class _SafeTensorMMap:
             )
             gather_start = time.perf_counter() if fully_seen else None
         else:
-            # Cross-shard prefetch may already have read these pages. Only
-            # those gathers can indicate eviction; a first read must not
-            # clear other shards' marks or consume the re-arm interval.
+            # Only previously read pages can indicate eviction.
+            # Cold reads must not consume the re-arm interval.
             missing = self._missing_pages(
                 row_indices, self._data_start + start, shape[1] * item_size
             )
@@ -2036,8 +2034,7 @@ class _SafeTensorMMap:
     @staticmethod
     def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
-            # The host buffer already contains BF16 bits. A view preserves them
-            # directly and avoids a host expansion plus a GPU conversion.
+            # Reinterpret BF16 bits without expanding/converting them.
             return mx.array(copied).view(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
@@ -2075,8 +2072,7 @@ class _SafeTensorMMap:
         if fresh.size == 0:
             return True
         futures = [_PLE_IO_POOL.submit(self._touch_page, int(page)) for page in fresh]
-        # Drain reads before propagating a failure: closing the mapping must
-        # never leave an outstanding read using a descriptor that can be reused.
+        # Drain before raising so close cannot race an outstanding read.
         wait(futures)
         for future in futures:
             future.result()
@@ -2320,9 +2316,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
         shard, local, touched, specs, families, _, _, _ = plan
         if _PLE_PARALLEL_READ_MIN < host.size <= _PLE_CROSS_SHARD_MAX_ROWS:
-            # A decode/verify call touches many shards but often only one row
-            # in each. Batch their page faults, rather than serializing these
-            # reads below the per-shard prefetch threshold.
+            # Batch page reads across shards for short decode/verify gathers.
             requests = set()
             for shard_index, row in zip(shard.tolist(), local.tolist()):
                 for reader, start, row_bytes in self._page_specs[shard_index]:
@@ -2578,9 +2572,7 @@ class ShardedEmbedding(nn.Module):
             return False
 
         if len(shards) == 1:
-            # A checkpoint can already store the table as one packed shard.
-            # Alias it directly: no join or temporary second table is needed.
-            # Loading/admission owns total residency; this does not pin memory.
+            # Reuse the loaded shard; no join allocation or residency change.
             self.fused = first
             self.shards = []
             return True
@@ -3009,9 +3001,7 @@ class Qwen4ExpModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        # Token IDs and the PLE history are already known before the first layer.
-        # Start disk reads here; pass the same indices through so the PLE layer
-        # does not repeat the hash or mutate speculative history prematurely.
+        # Start SSD reads early without advancing committed PLE history.
         ple_indices = {}
         if (
             _PLE_EARLY_GATHER
@@ -3092,8 +3082,6 @@ class Qwen4ExpMTPModule(nn.Module):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.hc_count = args.hc_count
-        if args.mtp_use_dedicated_lm_head:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         hc_hidden_size = self.hc_count * self.hidden_size
         self.pre_fc_norm_embedding = Qwen4ExpRMSNorm(
             self.hidden_size,
@@ -3271,9 +3259,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         logits_source = mtp_output
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.mtp_use_dedicated_lm_head:
-            logits = mtp.lm_head(logits_source)
-        elif self.args.tie_word_embeddings:
+        if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(logits_source)
         else:
             logits = self.lm_head(logits_source)
