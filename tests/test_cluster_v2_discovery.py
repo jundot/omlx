@@ -117,6 +117,7 @@ def _service(
     zeroconf_module=None,
     interface_lister=None,
     config: DiscoveryConfig | None = None,
+    addr_lister=None,
 ):
     clock = clock or FakeClock()
     cfg = config or DiscoveryConfig(cluster_name="omlx", http_port=8000)
@@ -132,6 +133,7 @@ def _service(
         interface_lister=interface_lister or (lambda: ["en0"]),
         tailscale_status=tailscale_status,
         zeroconf_module=zeroconf_module,
+        addr_lister=addr_lister or (lambda: []),
     )
     return service, clock
 
@@ -306,6 +308,165 @@ def test_wassup_dedupes_repeated_announcements():
     peers = service.peers()
     assert len(peers) == 1
     assert peers[0].addrs == [{"ip": "fe80::99", "if_type": "unknown"}]
+
+
+# -- advertised address inventory (static Thunderbolt IPv4 discovery) ---------
+
+
+def test_wassup_codec_roundtrips_advertised_addrs():
+    payload = encode_wassup(7, "node-1", 8000, addrs=["10.10.10.1", "fd00::2"])
+    assert decode_wassup(payload) == {
+        "nonce": 7,
+        "node_id": "node-1",
+        "http_port": 8000,
+        "addrs": ["10.10.10.1", "fd00::2"],
+    }
+
+
+def test_wassup_codec_drops_undialable_and_malformed_advertised_addrs():
+    payload = encode_wassup(
+        7,
+        "node-1",
+        8000,
+        addrs=[
+            "fe80::1",  # bare IPv6 link-local: undialable without a scope zone
+            "fe80::1%en0",  # scoped zone is process-local
+            "127.0.0.1",
+            "not-an-ip",
+            "10.10.10.1",
+            "10.10.10.1",  # duplicate
+            4242,  # not a string
+        ],
+    )
+    assert decode_wassup(payload)["addrs"] == ["10.10.10.1"]
+
+
+def test_wassup_codec_keeps_thunderbolt_apipa_link_local_ipv4():
+    # macOS Thunderbolt bridges legitimately self-assign 169.254/16 on a
+    # direct cable (#3621/#3205); the receiver's probe decides reachability.
+    payload = encode_wassup(7, "node-1", 8000, addrs=["169.254.42.17"])
+    assert decode_wassup(payload)["addrs"] == ["169.254.42.17"]
+
+
+def test_wassup_codec_omits_addrs_key_when_nothing_is_advertised():
+    # Wire format stays byte-identical for peers that predate the field.
+    assert encode_wassup(7, "node-1", 8000) == encode_wassup(
+        7, "node-1", 8000, addrs=[]
+    )
+    assert "addrs" not in decode_wassup(encode_wassup(7, "node-1", 8000))
+
+
+def test_hello_reply_advertises_only_routable_own_addrs():
+    sock = FakeSocket()
+    service, _ = _service(
+        socket_factory=lambda: sock,
+        addr_lister=lambda: [
+            {"ip": "10.10.10.1", "if_type": "lan"},  # static Thunderbolt IPv4
+            {"ip": "169.254.42.17", "if_type": "lan"},  # APIPA Thunderbolt
+            {"ip": "fe80::1%bridge0", "if_type": "lan"},
+            {"ip": "127.0.0.1", "if_type": "lan"},
+        ],
+    )
+
+    service._handle_hello(123, service._cluster_hash, ("fe80::99", 53413), sock)
+
+    reply = decode_wassup(sock.sent[0][0])
+    assert reply["addrs"] == ["10.10.10.1", "169.254.42.17"]
+
+
+def test_advertised_addrs_become_probe_candidates_not_peer_addrs():
+    service, _ = _service("aaaa-node")
+    _announce_nonce(service)
+
+    service._handle_wassup(
+        {
+            "nonce": 42,
+            "node_id": "bbbb-node",
+            "http_port": 8000,
+            "addrs": ["10.10.10.2"],
+        },
+        ("fe80::99", 53413),
+    )
+
+    peers = service.peers()
+    # The advertised address is not trusted until the probe verifies it.
+    assert peers[0].addrs == [{"ip": "fe80::99", "if_type": "unknown"}]
+    candidate = service._candidates[("10.10.10.2", 8000)]
+    assert candidate["node_id"] == "bbbb-node"
+    assert candidate["if_type"] == "advertised"
+
+
+def test_verified_advertised_addr_joins_the_peer_record():
+    service, _ = _service(
+        "aaaa-node",
+        prober=lambda ip, port, timeout: {
+            "node_id": "bbbb-node",
+            "version": "0.7.0",
+            "cluster_name": "omlx",
+        },
+    )
+    _announce_nonce(service)
+    service._handle_wassup(
+        {
+            "nonce": 42,
+            "node_id": "bbbb-node",
+            "http_port": 8000,
+            "addrs": ["10.10.10.2"],
+        },
+        ("fe80::99", 53413),
+    )
+
+    service._probe_candidate("10.10.10.2", 8000)
+
+    peers = service.peers()
+    assert {a["ip"] for a in peers[0].addrs} == {"fe80::99", "10.10.10.2"}
+
+
+def test_forged_advertised_addr_is_dropped_by_probe_node_id_mismatch():
+    service, _ = _service(
+        "aaaa-node",
+        prober=lambda ip, port, timeout: {
+            "node_id": "cccc-evil",
+            "version": "0.7.0",
+            "cluster_name": "omlx",
+        },
+    )
+    _announce_nonce(service)
+    service._handle_wassup(
+        {
+            "nonce": 42,
+            "node_id": "bbbb-node",
+            "http_port": 8000,
+            "addrs": ["10.10.10.2"],
+        },
+        ("fe80::99", 53413),
+    )
+
+    service._probe_candidate("10.10.10.2", 8000)
+
+    assert ("10.10.10.2", 8000) not in service._candidates
+    peers = service.peers()
+    assert {a["ip"] for a in peers[0].addrs} == {"fe80::99"}
+
+
+def test_own_advertised_addrs_are_never_probed():
+    service, _ = _service(
+        "aaaa-node",
+        addr_lister=lambda: [{"ip": "10.10.10.1", "if_type": "lan"}],
+    )
+    _announce_nonce(service)
+
+    service._handle_wassup(
+        {
+            "nonce": 42,
+            "node_id": "bbbb-node",
+            "http_port": 8000,
+            "addrs": ["10.10.10.1"],
+        },
+        ("fe80::99", 53413),
+    )
+
+    assert ("10.10.10.1", 8000) not in service._candidates
 
 
 # -- verification probe --------------------------------------------------------
