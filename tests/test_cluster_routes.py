@@ -909,6 +909,83 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     assert removed.status_code == 200
 
 
+def test_cluster_deployment_delete_reclaims_ssd_snapshots_best_effort(
+    tmp_path,
+    monkeypatch,
+):
+    from omlx.cluster.planner import ModelLayout
+    from omlx.cluster.registry import configure_cluster_registry
+
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "nemotron"
+    model_path.mkdir(parents=True)
+    pool = _install_ready_pool(monkeypatch, model_path)
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1,
+            layer_weight_bytes=(10, 10, 10, 10),
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "preflight_remote_hosts",
+        lambda deployment: [{"rank": 0}, {"rank": 1}],
+    )
+    sweeps = []
+    monkeypatch.setattr(
+        routes,
+        "sweep_deployment_ssd_snapshots",
+        lambda deployment: sweeps.append(deployment.deployment_id)
+        or {
+            "deployment_id": deployment.deployment_id,
+            "cleared": ["local"],
+            "errors": ["studio.local: ssh down"],
+        },
+    )
+
+    body = {
+        "deployment_id": "ssd-pool",
+        "model_path": str(model_path),
+        "backend": "jaccl",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["192.168.5.1"],
+                "rdma": [None, "rdma_en5"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["192.168.5.2"],
+                "rdma": ["rdma_en5", None],
+            },
+        ],
+    }
+    body["approved_placement"] = _approval_for(body)
+    assert _client().post("/admin/api/cluster/deployments", json=body).status_code == 200
+
+    removed = _client().delete("/admin/api/cluster/deployments/ssd-pool")
+
+    assert removed.status_code == 200
+    payload = removed.json()
+    assert payload["stopped"] is True
+    # The reclaim is reported — including its partial failure — and the
+    # DELETE still succeeded: disk problems must not fail a finished teardown.
+    assert sweeps == ["ssd-pool"]
+    assert payload["ssd_reclaim"]["cleared"] == ["local"]
+    assert payload["ssd_reclaim"]["errors"] == ["studio.local: ssh down"]
+    assert pool.verified_teardowns == ["ssd-pool"]
+
+
 def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
     tmp_path,
     monkeypatch,

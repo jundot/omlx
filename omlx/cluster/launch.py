@@ -881,6 +881,97 @@ def stop_deployment_processes(
     }
 
 
+_SAFE_DEPLOYMENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+# Runs on the peer: resolve ITS base_path (logins/data roots differ across
+# Macs), then remove only this deployment's snapshot scope. Guards the same
+# way the cold cluster SSD clear does — nothing outside prompt-cache-ssd is
+# ever touched, and the deployment id was validated before being embedded.
+_REMOTE_SSD_SWEEP_SCRIPT = r"""
+import shutil, sys
+from pathlib import Path
+from omlx.settings import GlobalSettings
+deployment_id = sys.argv[1]
+root = (
+    Path(GlobalSettings.load().base_path)
+    / 'cluster/runtime/prompt-cache-ssd'
+    / deployment_id
+)
+if root.name != deployment_id or root.parent.name != 'prompt-cache-ssd':
+    raise SystemExit(3)
+existed = root.exists()
+if existed:
+    shutil.rmtree(root)
+print('1' if existed else '0')
+""".strip()
+
+
+def sweep_deployment_ssd_snapshots(
+    deployment: ClusterDeployment,
+    *,
+    state_dir: str | Path = "~/.omlx/cluster/runtime",
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Best-effort reclaim of one deleted deployment's SSD prompt snapshots.
+
+    Snapshot directories are scoped
+    ``<state_dir>/prompt-cache-ssd/<deployment_id>/<plan_hash>/rank-N`` — once
+    the deployment is deleted, no process will ever open that scope again
+    (#3422: 226 GB + 239 GB orphaned on the two ranks, disk filled to 100%).
+    Ranks are already stopped when this runs, so the bytes are dead weight.
+
+    Failures are reported, never raised: the teardown already succeeded, and
+    a disk-reclaim problem must not turn a completed DELETE into an error.
+    Only the deleted deployment's scope is removed — every other saved
+    setup's snapshots (the persistence feature) stay intact.
+    """
+
+    report: dict[str, Any] = {
+        "deployment_id": deployment.deployment_id,
+        "cleared": [],
+        "errors": [],
+    }
+    if not _SAFE_DEPLOYMENT_ID.match(deployment.deployment_id):
+        # Never interpolate an unvalidated id into a path or a remote script.
+        report["errors"].append("deployment id is not a safe path component")
+        return report
+
+    root = (
+        Path(state_dir).expanduser()
+        / "prompt-cache-ssd"
+        / deployment.deployment_id
+    )
+    try:
+        if root.exists():
+            shutil.rmtree(root)
+            report["cleared"].append("local")
+    except OSError as exc:
+        report["errors"].append(f"local: {exc}")
+
+    remote_targets = sorted(
+        {
+            host.ssh
+            for rank, host in enumerate(deployment.hosts)
+            if rank > 0 and host.ssh
+        }
+    )
+    command = shlex.join(
+        ["python3", "-c", _REMOTE_SSD_SWEEP_SCRIPT, deployment.deployment_id]
+    )
+    for target in remote_targets:
+        try:
+            completed = _run_cluster_ssh(target, command, timeout=45.0, runner=runner)
+        except Exception as exc:  # noqa: BLE001 - best-effort by contract
+            report["errors"].append(f"{target}: {exc}")
+            continue
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            report["errors"].append(f"{target}: {detail[:300]}")
+        else:
+            report["cleared"].append(target)
+    return report
+
+
 def reap_orphaned_launches(
     state_dir: str | Path = "~/.omlx/cluster/runtime",
     *,
