@@ -183,3 +183,82 @@ def test_build_guard_survives_a_host_with_no_enforcer(monkeypatch):
 
     monkeypatch.setattr("omlx.cluster.memory_guard.ceiling_breakdown", _boom)
     assert not build_guard(_Model(), rank=0).active
+
+
+# -- #3527: the ceiling is re-read per check, not frozen at the load transient --
+
+
+def _tiered_guard(*, ceiling, tier="balanced", layer_count=0) -> RankPrefillGuard:
+    return RankPrefillGuard(
+        rank_monitor(_Model(), layer_count=layer_count),
+        rank=0,
+        node_id="studio",
+        ceiling_bytes=ceiling,
+        memory_guard_tier=tier,
+    )
+
+
+def test_a_transient_build_ceiling_does_not_reject_after_memory_settles(monkeypatch):
+    """The guard is built seconds after the weights land — free memory's
+    transient minimum. #3527: 49.7 GiB frozen there rejected a 68.3 GiB slice
+    forever; 11 s later the honest ceiling was 112.1 GiB."""
+
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda tier: {"hard_limit": 112 * GiB},
+    )
+    guard = _tiered_guard(ceiling=50 * GiB)
+    # Needs more than the frozen 50 GiB, fits the settled 112 GiB.
+    guard.check(300_000, current_usage_bytes=1 * GiB)
+
+
+def test_a_live_ceiling_still_backs_off_under_real_pressure(monkeypatch):
+    """Re-reading must not weaken the guard: a host that later fills up
+    rejects exactly as the frozen one would have at build time."""
+
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda tier: {"hard_limit": 40 * GiB},
+    )
+    guard = _tiered_guard(ceiling=112 * GiB)
+    with pytest.raises(PrefillMemoryExceededError):
+        guard.check(300_000, current_usage_bytes=1 * GiB)
+
+
+def test_a_failed_live_read_falls_back_to_the_build_time_ceiling(monkeypatch):
+    def _boom(_tier):
+        raise RuntimeError("vm_stat unavailable")
+
+    monkeypatch.setattr("omlx.cluster.memory_guard.ceiling_breakdown", _boom)
+    guard = _tiered_guard(ceiling=4 * GiB)
+    with pytest.raises(PrefillMemoryExceededError):
+        guard.check(200_000, current_usage_bytes=3 * GiB)
+
+
+def test_a_guard_without_a_tier_keeps_its_fixed_ceiling(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda tier: {"hard_limit": 112 * GiB},
+    )
+    guard = _tiered_guard(ceiling=4 * GiB, tier="")
+    with pytest.raises(PrefillMemoryExceededError):
+        guard.check(200_000, current_usage_bytes=3 * GiB)
+
+
+def test_build_guard_threads_the_tier_through(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda tier: {"hard_limit": 112 * GiB},
+    )
+    guard = build_guard(
+        _Model(), rank=0, memory_guard_tier="balanced"
+    )
+    # Build-time read says 112, but prove the check path re-reads: shrink the
+    # live ceiling and the same prompt must now refuse.
+    guard.check(300_000, current_usage_bytes=1 * GiB)
+    monkeypatch.setattr(
+        "omlx.cluster.memory_guard.ceiling_breakdown",
+        lambda tier: {"hard_limit": 40 * GiB},
+    )
+    with pytest.raises(PrefillMemoryExceededError):
+        guard.check(300_000, current_usage_bytes=1 * GiB)
