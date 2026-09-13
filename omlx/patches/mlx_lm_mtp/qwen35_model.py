@@ -426,22 +426,61 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         input_embeddings=None,
         n_confirmed: int = 0,
     ):
+        import mlx.core as mx
+
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
             hidden_states = self.embed_tokens(inputs)
 
+        # #3518: the MTP replacement dropped upstream's pipeline path
+        # entirely — it iterated self.layers (None-filled outside the
+        # assignment), indexed cache[self.fa_idx] unguarded, and skipped
+        # every collective, so every pipeline-parallel qwen3_5 deployment
+        # crashed. Mirror upstream's pipeline flow exactly; the MTP-only
+        # differences (pre-norm return, n_confirmed) are preserved below.
+        pipeline_rank = getattr(self, "pipeline_rank", 0)
+        pipeline_size = getattr(self, "pipeline_size", 1)
+        layers = self.pipeline_layers if pipeline_size > 1 else self.layers
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(
+                hidden_states, (pipeline_rank + 1)
+            )
+
+        for layer, c in zip(layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
             )
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         # PR 990: return pre-norm hidden so the MTP head can fuse it. The
         # wrapping ``TextModel.__call__`` applies ``self.model.norm`` on top
