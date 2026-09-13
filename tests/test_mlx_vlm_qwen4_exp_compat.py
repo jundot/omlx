@@ -2160,7 +2160,7 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
         assert entered.wait(10)
         embedding.prefetch(mx.array([[2]], dtype=mx.int32))
         embedding.prefetch(mx.array([[3]], dtype=mx.int32))
-        assert all(future is not active for _, future in embedding._pending.values())
+        assert all(pending.future is not active for pending in embedding._pending.values())
         thread.start()
         assert closing.wait(10)
         assert not closed.is_set()
@@ -2178,3 +2178,91 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
     embedding.prefetch(mx.array([[4]], dtype=mx.int32))
     assert not embedding._pending
     embedding.close()
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_ple_reuses_prefetched_prefix_and_suffix(tmp_path, monkeypatch, bits):
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits)
+    indices = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+    try:
+        embedding.prefetch(indices)
+        pending = next(iter(embedding._pending.values()))
+        pending.future.result(timeout=10)
+        monkeypatch.setattr(embedding, "_assemble", MagicMock(side_effect=AssertionError("Rows already gathered")))
+        for start, end in [(0, 2), (2, 5), (5, 6)]:
+            chunk = indices[:, start:end]
+            embedding.prefetch(chunk)
+            values = embedding(chunk)
+            assert mx.array_equal(values, table[chunk]).item()
+            assert embedding.last_prefetch_hit
+        assert not embedding._pending
+    finally:
+        embedding.close()
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_ple_reuses_short_prefetch_when_chunk_grows(tmp_path, monkeypatch, bits):
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits)
+    indices = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+    try:
+        embedding.prefetch(indices[:, :2])
+        next(iter(embedding._pending.values())).future.result(timeout=10)
+        assemble = MagicMock(wraps=embedding._assemble)
+        monkeypatch.setattr(embedding, "_assemble", assemble)
+        embedding.prefetch(indices)
+        values = embedding(indices)
+        assert mx.array_equal(values, table[indices]).item()
+        assert embedding.last_prefetch_hit
+        assert assemble.call_count == 1
+        assert assemble.call_args.args[0].tolist() == [5, 22, 3, 9]
+        assert not embedding._pending
+    finally:
+        embedding.close()
+
+
+def test_disk_ple_running_oversized_prefetch_does_not_block_current_rows(tmp_path, monkeypatch):
+    from threading import Event, current_thread, main_thread
+
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64)
+    entered, release = Event(), Event()
+    assemble = embedding._assemble
+    indices = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+
+    def paused_assemble(host, plan):
+        if current_thread() is not main_thread():
+            entered.set()
+            assert release.wait(10)
+        return assemble(host, plan)
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    try:
+        embedding.prefetch(indices)
+        pending = next(iter(embedding._pending.values()))
+        assert entered.wait(10)
+        first = indices[:, :2]
+        embedding.prefetch(first)
+        assert mx.array_equal(embedding(first), table[first]).item()
+        assert not embedding.last_prefetch_hit
+        assert not pending.future.done()
+        release.set()
+        pending.future.result(timeout=10)
+        monkeypatch.setattr(embedding, "_assemble", MagicMock(side_effect=AssertionError("Suffix already gathered")))
+        assert mx.array_equal(embedding(indices[:, 2:]), table[indices[:, 2:]]).item()
+        assert embedding.last_prefetch_hit
+        assert not embedding._pending
+    finally:
+        release.set()
+        embedding.close()
+
+
+def test_disk_ple_reuse_requires_identical_index_prefix(tmp_path):
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64)
+    try:
+        embedding.prefetch(mx.array([[3, 17, 5, 22]], dtype=mx.int32))
+        next(iter(embedding._pending.values())).future.result(timeout=10)
+        different_history = mx.array([[4, 17]], dtype=mx.int32)
+        assert mx.array_equal(embedding(different_history), table[different_history]).item()
+        assert not embedding.last_prefetch_hit
+        assert len(embedding._pending) == 1
+    finally:
+        embedding.close()

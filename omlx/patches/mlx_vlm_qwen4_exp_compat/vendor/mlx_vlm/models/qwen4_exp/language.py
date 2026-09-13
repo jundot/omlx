@@ -9,7 +9,7 @@ import struct
 import time
 import weakref
 from bisect import bisect_right
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
@@ -2124,6 +2124,12 @@ class _PLEShardSpec(NamedTuple):
         return self.weight, self.scales, self.biases
 
 
+class _PLEPrefetch(NamedTuple):
+    plan: tuple
+    future: Future
+    offset: int = 0
+
+
 class DiskBackedShardedEmbedding(nn.Module):
     """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
 
@@ -2150,7 +2156,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.rows_read = 0
         self.last_uploads = 0
         self.last_prefetch_hit = False
-        self._pending: dict[bytes, tuple] = {}
+        self._pending: dict[bytes, _PLEPrefetch] = {}
         self._prefetch_lock = Lock()
         self._prefetch_closed = False
         self._prefetch_executor = ThreadPoolExecutor(
@@ -2355,7 +2361,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         return host
 
     def prefetch(self, indices: mx.array) -> None:
-        """Assemble a chunk's rows on the prefetch worker; a later call with the same indices consumes them."""
+        """Assemble upcoming rows; exact matching prefixes can share a buffer."""
         host = self._host_indices(indices)
         if host.size == 0:
             return
@@ -2368,23 +2374,72 @@ class DiskBackedShardedEmbedding(nn.Module):
             key = host.tobytes()
             if key in self._pending:
                 return
+            if any(
+                saved.startswith(key) or key.startswith(saved)
+                for saved in self._pending
+            ):
+                return
             # Keep two upcoming chunks; obsolete queued reads need not run.
             while len(self._pending) >= 2:
-                _, future = self._pending.pop(next(iter(self._pending)))
-                future.cancel()
-            self._pending[key] = (
+                pending = self._pending.pop(next(iter(self._pending)))
+                pending.future.cancel()
+            self._pending[key] = _PLEPrefetch(
                 plan,
                 self._prefetch_executor.submit(self._assemble, host, plan),
             )
+
+    def _prefetched_rows(self, host: np.ndarray):
+        key = host.tobytes()
+        pending = self._pending.pop(key, None)
+        if pending is not None:
+            if pending.offset and not pending.future.done():
+                return None
+            buffers = pending.future.result()
+            if pending.offset:
+                buffers = {f: b[pending.offset:] for f, b in buffers.items()}
+                return self._plan(host), buffers
+            return pending.plan, buffers
+        for saved, pending in self._pending.items():
+            if saved.startswith(key):
+                del self._pending[saved]
+                self._pending[saved[len(key) :]] = pending._replace(
+                    offset=pending.offset + host.size
+                )
+                # Keep the suffix, but don't wait for an oversized running read.
+                if not pending.future.done():
+                    return None
+                end = pending.offset + host.size
+                buffers = {
+                    f: b[pending.offset : end]
+                    for f, b in pending.future.result().items()
+                }
+                return self._plan(host), buffers
+            if key.startswith(saved):
+                plan = self._plan(host)
+                if plan is None:
+                    return None
+                del self._pending[saved]
+                count = len(saved) // host.itemsize
+                prefix = pending.future.result()
+                tail = host[count:]
+                suffix = self._assemble(tail, self._plan(tail))
+                buffers = {
+                    f: np.concatenate(
+                        (b[pending.offset : pending.offset + count], suffix[f])
+                    )
+                    for f, b in prefix.items()
+                }
+                return plan, buffers
+        return None
 
     def __call__(self, indices: mx.array) -> mx.array:
         shape = indices.shape
         host = self._host_indices(indices)
         if host.size == 0:
             return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
-        pending = self._pending.pop(host.tobytes(), None)
-        if pending is not None:
-            plan, buffers = pending[0], pending[1].result()
+        prefetched = self._prefetched_rows(host)
+        if prefetched is not None:
+            plan, buffers = prefetched
             self.last_prefetch_hit = True
         else:
             self.last_prefetch_hit = False

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import pytest
 
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.request import Request, RequestStatus, SamplingParams
@@ -1572,3 +1573,102 @@ def test_external_prefill_announces_the_next_chunk_to_the_model():
         scheduler._do_external_prefill(request, tokens, cache)
     assert model.chunk_lengths == [4, 4, 2]
     assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize(
+    "limiting_guard", ["_adaptive_chunk_size", "_guard_prefill_chunk"]
+)
+def test_ple_lookahead_uses_the_guarded_chunk_size(chunked, limiting_guard):
+    model = _RecordingModel("vlm")
+    events = []
+    model.prefetch_ple = lambda next_ids, current_ids: events.append(
+        ("prefetch", next_ids.tolist()[0], current_ids.tolist()[0])
+    )
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=MagicMock(eos_token_id=2),
+        config=SchedulerConfig(
+            prefill_step_size=128, chunked_prefill=chunked, paged_cache_block_size=0
+        ),
+    )
+    request = _make_request("guarded-lookahead", n_tokens=97)
+
+    def limit(n, **kwargs):
+        events.append(("guard", n))
+        return min(n, 32)
+
+    with (
+        patch("omlx.scheduler._sync_and_clear_cache"),
+        patch.object(scheduler, limiting_guard, side_effect=limit),
+    ):
+        if chunked:
+            state = _make_prefill_state(scheduler, request, n_remaining=96)
+            state.tokens_remaining = mx.arange(96, dtype=mx.int32)[None]
+            while not scheduler._step_prefill_chunk(state):
+                pass
+        else:
+            scheduler._do_external_prefill(request, list(range(97)), [])
+    assert events[0][0] == "guard"
+    assert model.chunk_lengths == [32, 32, 32]
+    assert [event[1:] for event in events if event[0] == "prefetch"] == [
+        (list(range(32)), []),
+        (list(range(32, 64)), list(range(32))),
+        (list(range(64, 96)), list(range(32, 64))),
+    ]
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_ple_does_not_prefetch_before_eviction_retry(chunked):
+    model = _RecordingModel("vlm")
+    model.prefetch_ple = MagicMock()
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=MagicMock(eos_token_id=2),
+        config=SchedulerConfig(
+            prefill_step_size=128, chunked_prefill=chunked, paged_cache_block_size=0
+        ),
+    )
+    request = _make_request("eviction-lookahead", n_tokens=97)
+    eviction = PrefillEvictionRequest(
+        request_id=request.request_id,
+        model_id="test",
+        current_bytes=1,
+        target_cap_bytes=1,
+        predicted_transient_bytes=1,
+        requested_tokens=96,
+        reason="adaptive_prefill_throttle",
+    )
+    with (
+        patch("omlx.scheduler._sync_and_clear_cache"),
+        patch.object(
+            scheduler,
+            "_adaptive_chunk_size",
+            side_effect=_PrefillEvictionNeeded(eviction),
+        ),
+        pytest.raises(_PrefillEvictionNeeded),
+    ):
+        if chunked:
+            scheduler._step_prefill_chunk(
+                _make_prefill_state(scheduler, request, n_remaining=96)
+            )
+        else:
+            scheduler._do_external_prefill(request, list(range(97)), [])
+    model.prefetch_ple.assert_not_called()
+    assert not model.chunk_lengths
+
+
+def test_ple_lookahead_preserves_next_cache_boundary():
+    model = _RecordingModel("vlm")
+    model.prefetch_ple = MagicMock()
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=MagicMock(eos_token_id=2),
+        config=SchedulerConfig(prefill_step_size=128),
+    )
+    # Current guarded chunk ends at offset 60; only four next tokens fit.
+    tokens = mx.arange(100, dtype=mx.int32)[None]
+    scheduler._prefetch_ple_chunks(tokens, 32, 28, 0, True, 64)
+    call = model.prefetch_ple.call_args
+    assert call.args[0].tolist() == [list(range(32, 36))]
+    assert call.args[1].tolist() == [list(range(32))]
