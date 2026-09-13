@@ -102,7 +102,6 @@ class BatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
-            text_only=True,
         )
 
     @property
