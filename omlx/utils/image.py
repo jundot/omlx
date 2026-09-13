@@ -11,6 +11,8 @@ import base64
 import binascii
 import hashlib
 import io
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
@@ -82,12 +84,44 @@ def validate_image_data_uri(value: str, *, field: str = "image") -> str:
     return value
 
 
+# Decoded-image cache.
+#
+# Multi-turn agent loops resend the same historical screenshots on every turn
+# (byte-identical base64 data URIs). Decoding a PNG/JPEG is CPU-bound and,
+# once the conversation accumulates many screenshots, re-decoding the whole
+# history every turn dominates time-to-first-token. Keying the decoded RGB
+# image by the hash of its source bytes lets repeated turns reuse prior
+# decodes and only decode genuinely new images. Bounded by total decoded
+# pixel bytes so the cache cannot grow without limit.
+_IMAGE_DECODE_CACHE_MAX_BYTES = 512 * 1024 * 1024  # 512 MiB
+
+_image_decode_cache: "OrderedDict[str, Image.Image]" = OrderedDict()
+_image_decode_cache_bytes = 0
+_image_decode_cache_lock = threading.Lock()
+
+
+def _decoded_pixel_bytes(img: Image.Image) -> int:
+    width, height = img.size
+    return width * height * len(img.getbands())
+
+
+def clear_image_decode_cache() -> None:
+    """Drop all cached decoded images (frees memory; forces re-decode)."""
+    global _image_decode_cache_bytes
+    with _image_decode_cache_lock:
+        _image_decode_cache.clear()
+        _image_decode_cache_bytes = 0
+
+
 def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
     """
     Load an image from a base64 data URI.
 
     Supports:
     - Data URIs: "data:image/jpeg;base64,..." format
+
+    Decoded images are cached by source-byte hash so that re-sending the
+    same image across turns does not re-run the CPU-bound decode.
 
     Args:
         url_or_base64: Image base64 data URI string
@@ -99,8 +133,16 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
         InvalidRequestError: If the input is not a valid image data URI
     """
     img_bytes = _decode_base64_data_uri(url_or_base64, field=field)
+    key = hashlib.sha256(img_bytes).hexdigest()
+
+    with _image_decode_cache_lock:
+        hit = _image_decode_cache.get(key)
+        if hit is not None:
+            _image_decode_cache.move_to_end(key)
+            return hit
+
     try:
-        img = Image.open(io.BytesIO(img_bytes))
+        loaded = Image.open(io.BytesIO(img_bytes))
     except Exception as exc:
         raise InvalidRequestError(
             f"{field} does not contain a decodable image.",
@@ -109,9 +151,29 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
 
     # Apply EXIF orientation (phone photos etc.) before processing.
     # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
-    img = ImageOps.exif_transpose(img)
+    oriented = ImageOps.exif_transpose(loaded)
     # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
-    return img.convert("RGB")
+    rgb = oriented.convert("RGB")
+
+    nbytes = _decoded_pixel_bytes(rgb)
+    if nbytes <= _IMAGE_DECODE_CACHE_MAX_BYTES:
+        global _image_decode_cache_bytes
+        with _image_decode_cache_lock:
+            # Another thread may have decoded the same key while we were
+            # decoding; reconcile accounting before inserting.
+            stale = _image_decode_cache.pop(key, None)
+            if stale is not None:
+                _image_decode_cache_bytes -= _decoded_pixel_bytes(stale)
+            _image_decode_cache[key] = rgb
+            _image_decode_cache_bytes += nbytes
+            while (
+                _image_decode_cache_bytes > _IMAGE_DECODE_CACHE_MAX_BYTES
+                and _image_decode_cache
+            ):
+                _, evicted = _image_decode_cache.popitem(last=False)
+                _image_decode_cache_bytes -= _decoded_pixel_bytes(evicted)
+
+    return rgb
 
 
 def extract_images_from_messages(

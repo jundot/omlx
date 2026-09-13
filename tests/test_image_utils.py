@@ -513,3 +513,96 @@ class TestComputePerImageHashes:
     def test_empty_returns_empty(self):
         """Empty list returns empty list."""
         assert compute_per_image_hashes([]) == []
+
+
+# =============================================================================
+# Tests: load_image decode cache
+#
+# Regression for the multi-turn agent TTFT cliff: an agent loop resends the
+# same historical screenshots on every turn, and load_image re-ran the
+# CPU-bound PNG/JPEG decode for every one of them each turn. Decoded images
+# are now cached by content hash so repeated turns skip the re-decode.
+# =============================================================================
+
+
+def _unique_image(seed: int, width: int = 24, height: int = 24) -> Image.Image:
+    """Build an RGB image whose pixel bytes are unique to ``seed``."""
+    import random
+
+    rng = random.Random(seed)
+    data = bytes(rng.getrandbits(8) for _ in range(width * height * 3))
+    return Image.frombytes("RGB", (width, height), data)
+
+
+class TestLoadImageDecodeCache:
+    """Decoded images are cached by content hash across load_image calls."""
+
+    def setup_method(self):
+        from omlx.utils.image import clear_image_decode_cache
+
+        clear_image_decode_cache()
+
+    def test_identical_image_decoded_once_across_calls(self):
+        """Same bytes on a later turn must not re-open/re-decode the image."""
+        uri = "data:image/png;base64," + _image_to_base64(_unique_image(1))
+        real_open = Image.open
+        calls = {"n": 0}
+
+        def counting_open(*args, **kwargs):
+            calls["n"] += 1
+            return real_open(*args, **kwargs)
+
+        with patch("omlx.utils.image.Image.open", side_effect=counting_open):
+            first = load_image(uri)
+            second = load_image(uri)
+
+        assert calls["n"] == 1
+        assert first.size == second.size == (24, 24)
+        assert first.tobytes() == second.tobytes()
+
+    def test_distinct_images_each_decoded(self):
+        """Different bytes decode independently (no false cache hits)."""
+        uri_a = "data:image/png;base64," + _image_to_base64(_unique_image(2))
+        uri_b = "data:image/png;base64," + _image_to_base64(_unique_image(3))
+        real_open = Image.open
+        calls = {"n": 0}
+
+        def counting_open(*args, **kwargs):
+            calls["n"] += 1
+            return real_open(*args, **kwargs)
+
+        with patch("omlx.utils.image.Image.open", side_effect=counting_open):
+            load_image(uri_a)
+            load_image(uri_b)
+            load_image(uri_a)  # cache hit, no new decode
+
+        assert calls["n"] == 2
+
+    def test_clear_forces_redecode(self):
+        """clear_image_decode_cache() drops entries so the next load decodes."""
+        uri = "data:image/png;base64," + _image_to_base64(_unique_image(4))
+        real_open = Image.open
+        calls = {"n": 0}
+
+        def counting_open(*args, **kwargs):
+            calls["n"] += 1
+            return real_open(*args, **kwargs)
+
+        with patch("omlx.utils.image.Image.open", side_effect=counting_open):
+            load_image(uri)
+            load_image(uri)
+            from omlx.utils.image import clear_image_decode_cache
+
+            clear_image_decode_cache()
+            load_image(uri)
+
+        assert calls["n"] == 2
+
+    def test_cached_pixels_match_source(self):
+        """A cache hit returns pixels identical to a cold decode."""
+        src = _unique_image(5)
+        uri = "data:image/png;base64," + _image_to_base64(src)
+        cold = load_image(uri)
+        warm = load_image(uri)
+        assert cold.mode == warm.mode == "RGB"
+        assert cold.tobytes() == warm.tobytes()
