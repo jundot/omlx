@@ -546,8 +546,7 @@ def test_rdma_detection_does_not_invent_a_three_mac_full_mesh(monkeypatch):
         ("a.local", "b.local"),
         ("b.local", "a.local"),
         ("b.local", "c.local"),
-        ("c.local", "b.local"),
-    }
+        ("c.local", "b.local"),    }
     assert ("a.local", "c.local") not in rdma_edges
 
 
@@ -869,3 +868,49 @@ def test_the_detected_link_speed_is_carried_into_the_explanation():
     assert link.link_speed_gbps == 120
     assert "120 Gb/s" in link.reason
     assert link.to_dict()["source"]["address"] == "10.0.1.1"
+
+
+def test_a_failed_link_speed_probe_degrades_the_pair_not_the_fabric(monkeypatch):
+    """#3037 D4: a link-speed SSH failure must not erase the connectivity
+    matrix that was already read — speed/Version degrade to None per pair."""
+
+    class FakeConfig:
+        class Host:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def extract_connectivity(hosts, verbose=False):
+            return hosts, {}
+
+        @staticmethod
+        def make_connectivity_matrix(hosts, reverse):
+            return [
+                [False, True],
+                [True, False],
+            ]
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport._import_mlx_config",
+        lambda: FakeConfig,
+    )
+
+    def boom(host):
+        raise OSError("ssh to the link-speed probe failed")
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport._extract_tb_link_speed",
+        boom,
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_available",
+        lambda hosts, ssh_prefix="": False,
+    )
+
+    transports = detect_transports(["a.local", "b.local"])
+
+    thunderbolt = [item for item in transports if item.kind == "thunderbolt"]
+    assert len(thunderbolt) == 2, "the matrix was read; the fabric survives"
+    assert all(item.link_speed_gbps is None for item in thunderbolt)
+    assert all(item.tb_version is None for item in thunderbolt)
+    assert not any(item.kind == "ethernet" for item in transports)
