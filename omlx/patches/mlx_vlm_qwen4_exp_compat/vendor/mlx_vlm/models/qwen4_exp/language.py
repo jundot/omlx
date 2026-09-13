@@ -9,11 +9,11 @@ import struct
 import time
 import weakref
 from bisect import bisect_right
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -36,12 +36,19 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa_decode,
     pool_completed_index_keys,
 )
+from .qsa_mask import fused_block_mask
 from . import hc_fused
 
 logger = logging.getLogger(__name__)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+_PLE_EARLY_GATHER = os.environ.get("OMLX_QWEN4_PLE_EARLY_GATHER", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 # Identity cache: keep the array alive so CPython cannot recycle id().
 _TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
@@ -1228,6 +1235,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
             mx.array(True),
             axis=-1,
         )
+        fused_mask = fused_block_mask(
+            block_hits, complete_counts, query_ends,
+            self.compress_ratio, self.block_topk, key_len,
+        )
+        if fused_mask is not None:
+            return fused_mask
         selected_tokens = mx.repeat(block_hits, self.compress_ratio, axis=-1)
         if complete_key_len < key_len:
             selected_tokens = mx.concatenate(
@@ -1920,6 +1933,11 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 # os.pread releases the GIL and does not change the shared file position.
 _PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# Batch short gathers across shards; large prefills prefetch per shard.
+_PLE_PARALLEL_READ_MIN = 8
+_PLE_CROSS_SHARD_MAX_ROWS = 256
+# Start hashing/gathering early only for short token batches.
+_PLE_EARLY_GATHER_MAX_TOKENS = 64
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
 _PLE_REARM_FLOOR_SECONDS = 0.0005
@@ -1928,7 +1946,14 @@ _PLE_REARM_MIN_INTERVAL_SECONDS = 60.0
 
 
 class _SafeTensorMMap:
-    """Read selected dense or affine-packed rows without resident weights."""
+    """Read selected dense or affine-packed rows without resident weights.
+
+    The seen-page bitmap is an advisory prefetch hint, not a residency lock.
+    IO workers mark pages, gathers read marks, and re-arming replaces the bitmap.
+    Each operation retains its bitmap reference: races may cause duplicate
+    reads, but never change the mmap data returned. The owner drains submitted
+    work before closing the reader.
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -1953,6 +1978,12 @@ class _SafeTensorMMap:
     def tensor_dtype(self, key: str) -> str:
         return str(self._header[key]["dtype"])
 
+    def row_span(self, key: str) -> tuple[int, int]:
+        """File offset of the first row and its byte width."""
+        entry = self._header[key]
+        start, end = entry["data_offsets"]
+        return self._data_start + start, (end - start) // entry["shape"][0]
+
     def rows_np(self, key: str, rows) -> tuple[np.ndarray, str]:
         """Copy the requested rows out of the mapping; returns the raw array and the safetensors dtype."""
         entry = self._header[key]
@@ -1975,13 +2006,20 @@ class _SafeTensorMMap:
         if row_indices.size == 0:
             return np.empty((0, shape[1]), dtype=np_dtype), dtype
         gather_start = None
-        if row_indices.size > 8:
+        if row_indices.size > _PLE_PARALLEL_READ_MIN:
             fully_seen = self._prefetch_missing_pages(
                 row_indices,
                 self._data_start + start,
                 shape[1] * item_size,
             )
             gather_start = time.perf_counter() if fully_seen else None
+        else:
+            # Only previously read pages can indicate eviction.
+            # Cold reads must not consume the re-arm interval.
+            missing = self._missing_pages(
+                row_indices, self._data_start + start, shape[1] * item_size
+            )
+            gather_start = time.perf_counter() if missing.size == 0 else None
         view = np.ndarray(
             shape,
             dtype=np_dtype,
@@ -1996,8 +2034,8 @@ class _SafeTensorMMap:
     @staticmethod
     def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
-            values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
-            return mx.array(values).astype(mx.bfloat16)
+            # Reinterpret BF16 bits without expanding/converting them.
+            return mx.array(copied).view(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
@@ -2005,8 +2043,7 @@ class _SafeTensorMMap:
     def rows(self, key: str, rows: list[int]) -> mx.array:
         return self.to_mx(*self.rows_np(key, rows))
 
-    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
-        """Prefetch unmarked pages; return whether all were already marked."""
+    def _missing_pages(self, row_indices, base_offset, row_bytes):
         offsets = base_offset + row_indices * row_bytes
         needed_pages = np.unique(
             np.concatenate(
@@ -2014,23 +2051,31 @@ class _SafeTensorMMap:
             )
         )
         seen = np.frombuffer(self._seen_pages, dtype=np.uint8)
-        fresh = needed_pages[seen[needed_pages] == 0]
+        return needed_pages[seen[needed_pages] == 0]
+
+    def _touch_page(self, page: int) -> None:
+        seen = self._seen_pages
+        offset = int(page) * _PLE_PAGE_SIZE
+        remaining = _PLE_PAGE_SIZE
+        while remaining > 0:
+            chunk = os.pread(
+                self._file.fileno(), remaining, offset + (_PLE_PAGE_SIZE - remaining)
+            )
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        seen[page] = 1
+
+    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
+        """Prefetch unmarked pages; return whether all were already marked."""
+        fresh = self._missing_pages(row_indices, base_offset, row_bytes)
         if fresh.size == 0:
             return True
-        fd = self._file.fileno()
-
-        def touch(page: int) -> None:
-            offset = int(page) * _PLE_PAGE_SIZE
-            remaining = _PLE_PAGE_SIZE
-            while remaining > 0:
-                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-
-        list(_PLE_IO_POOL.map(touch, (int(page) for page in fresh.tolist())))
-        for page in fresh.tolist():
-            self._seen_pages[page] = 1
+        futures = [_PLE_IO_POOL.submit(self._touch_page, int(page)) for page in fresh]
+        # Drain before raising so close cannot race an outstanding read.
+        wait(futures)
+        for future in futures:
+            future.result()
         return False
 
     def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
@@ -2063,6 +2108,28 @@ class _SafeTensorMMap:
             self._file = None
 
 
+class _PLEShardSpec(NamedTuple):
+    weight: str
+    scales: str | None
+    biases: str | None
+    bits: int | None
+    group_size: int | None
+
+    @property
+    def tensor_keys(self) -> tuple[str, ...]:
+        if self.bits is None:
+            return (self.weight,)
+        # The constructor validates complete affine tensor families first.
+        assert self.scales is not None and self.biases is not None
+        return self.weight, self.scales, self.biases
+
+
+class _PLEPrefetch(NamedTuple):
+    plan: tuple
+    future: Future
+    offset: int = 0
+
+
 class DiskBackedShardedEmbedding(nn.Module):
     """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
 
@@ -2089,7 +2156,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.rows_read = 0
         self.last_uploads = 0
         self.last_prefetch_hit = False
-        self._pending: dict[bytes, tuple] = {}
+        self._pending: dict[bytes, _PLEPrefetch] = {}
         self._prefetch_lock = Lock()
         self._prefetch_closed = False
         self._prefetch_executor = ThreadPoolExecutor(
@@ -2098,9 +2165,8 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
-        self._shard_specs: dict[
-            int, tuple[str, str | None, str | None, int | None, int | None]
-        ] = {}
+        self._shard_specs: dict[int, _PLEShardSpec] = {}
+        self._page_specs: dict[int, tuple] = {}
 
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
@@ -2160,7 +2226,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                     raise TypeError(
                         f"SSD-backed dense Qwen4 PLE does not support {weight_dtype}"
                     )
-                self._shard_specs[shard_index] = (
+                self._shard_specs[shard_index] = _PLEShardSpec(
                     weight_key,
                     None,
                     None,
@@ -2216,13 +2282,20 @@ class DiskBackedShardedEmbedding(nn.Module):
                     f"Inconsistent affine PLE layout for {base}: "
                     f"weight={weight_shape}, scales={scales_shape}, dims={dims}"
                 )
-            self._shard_specs[shard_index] = (
+            self._shard_specs[shard_index] = _PLEShardSpec(
                 weight_key,
                 scales_key,
                 biases_key,
                 bits,
                 group_size,
             )
+
+        for shard_index, spec in self._shard_specs.items():
+            pages = []
+            for key in spec.tensor_keys:
+                reader = self._tensor_readers[key]
+                pages.append((reader, *reader.row_span(key)))
+            self._page_specs[shard_index] = tuple(pages)
 
     def _plan(self, host: np.ndarray):
         """Shards, local rows and tensor families for a chunk; None when the touched shards differ."""
@@ -2248,6 +2321,23 @@ class DiskBackedShardedEmbedding(nn.Module):
     def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
         shard, local, touched, specs, families, _, _, _ = plan
+        if _PLE_PARALLEL_READ_MIN < host.size <= _PLE_CROSS_SHARD_MAX_ROWS:
+            # Batch page reads across shards for short decode/verify gathers.
+            requests = set()
+            for shard_index, row in zip(shard.tolist(), local.tolist()):
+                for reader, start, row_bytes in self._page_specs[shard_index]:
+                    offset = start + row * row_bytes
+                    first = offset // _PLE_PAGE_SIZE
+                    last = (offset + row_bytes - 1) // _PLE_PAGE_SIZE
+                    if not reader._seen_pages[first]:
+                        requests.add((reader, first))
+                    if last != first and not reader._seen_pages[last]:
+                        requests.add((reader, last))
+            if len(requests) > _PLE_PARALLEL_READ_MIN:
+                futures = [_PLE_IO_POOL.submit(reader._touch_page, page) for reader, page in requests]
+                wait(futures)
+                for future in futures:
+                    future.result()
         buffers: dict[int, np.ndarray] = {}
         for shard_index, spec in zip(touched, specs):
             positions = np.flatnonzero(shard == shard_index)
@@ -2271,7 +2361,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         return host
 
     def prefetch(self, indices: mx.array) -> None:
-        """Assemble a chunk's rows on the prefetch worker; a later call with the same indices consumes them."""
+        """Assemble upcoming rows; exact matching prefixes can share a buffer."""
         host = self._host_indices(indices)
         if host.size == 0:
             return
@@ -2284,23 +2374,72 @@ class DiskBackedShardedEmbedding(nn.Module):
             key = host.tobytes()
             if key in self._pending:
                 return
+            if any(
+                saved.startswith(key) or key.startswith(saved)
+                for saved in self._pending
+            ):
+                return
             # Keep two upcoming chunks; obsolete queued reads need not run.
             while len(self._pending) >= 2:
-                _, future = self._pending.pop(next(iter(self._pending)))
-                future.cancel()
-            self._pending[key] = (
+                pending = self._pending.pop(next(iter(self._pending)))
+                pending.future.cancel()
+            self._pending[key] = _PLEPrefetch(
                 plan,
                 self._prefetch_executor.submit(self._assemble, host, plan),
             )
+
+    def _prefetched_rows(self, host: np.ndarray):
+        key = host.tobytes()
+        pending = self._pending.pop(key, None)
+        if pending is not None:
+            if pending.offset and not pending.future.done():
+                return None
+            buffers = pending.future.result()
+            if pending.offset:
+                buffers = {f: b[pending.offset:] for f, b in buffers.items()}
+                return self._plan(host), buffers
+            return pending.plan, buffers
+        for saved, pending in self._pending.items():
+            if saved.startswith(key):
+                del self._pending[saved]
+                self._pending[saved[len(key) :]] = pending._replace(
+                    offset=pending.offset + host.size
+                )
+                # Keep the suffix, but don't wait for an oversized running read.
+                if not pending.future.done():
+                    return None
+                end = pending.offset + host.size
+                buffers = {
+                    f: b[pending.offset : end]
+                    for f, b in pending.future.result().items()
+                }
+                return self._plan(host), buffers
+            if key.startswith(saved):
+                plan = self._plan(host)
+                if plan is None:
+                    return None
+                del self._pending[saved]
+                count = len(saved) // host.itemsize
+                prefix = pending.future.result()
+                tail = host[count:]
+                suffix = self._assemble(tail, self._plan(tail))
+                buffers = {
+                    f: np.concatenate(
+                        (b[pending.offset : pending.offset + count], suffix[f])
+                    )
+                    for f, b in prefix.items()
+                }
+                return plan, buffers
+        return None
 
     def __call__(self, indices: mx.array) -> mx.array:
         shape = indices.shape
         host = self._host_indices(indices)
         if host.size == 0:
             return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
-        pending = self._pending.pop(host.tobytes(), None)
-        if pending is not None:
-            plan, buffers = pending[0], pending[1].result()
+        prefetched = self._prefetched_rows(host)
+        if prefetched is not None:
+            plan, buffers = prefetched
             self.last_prefetch_hit = True
         else:
             self.last_prefetch_hit = False
@@ -2663,7 +2802,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         history = mx.concatenate([previous_context.astype(mx.int64), next_ids], axis=-1)
         prefetch(self._ngram_indices(history, next_ids.shape[1]))
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+    def prepare_indices(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+        """Start the current lookup without advancing the committed token history."""
+        input_ids = input_ids.astype(mx.int64)
+        history = mx.concatenate(
+            [self._previous_context(input_ids, cache), input_ids], axis=-1
+        )
+        indices = self._ngram_indices(history, input_ids.shape[1])
+        self.ngram_embedding.prefetch(indices)
+        return indices
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache],
+        prepared_indices: Optional[mx.array] = None,
+    ):
         input_ids = input_ids.astype(mx.int64)
         previous_context = self._previous_context(input_ids, cache)
 
@@ -2671,7 +2825,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if cache is not None:
             cache[3] = mx.contiguous(token_history[:, -self.context_len :])
 
-        ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
+        ngram_ids = (
+            self._ngram_indices(token_history, input_ids.shape[1])
+            if prepared_indices is None
+            else prepared_indices
+        )
         embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
@@ -2735,6 +2893,7 @@ class Qwen4ExpPLELayer(nn.Module):
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
         target_verify: bool = False,
+        prepared_indices: Optional[mx.array] = None,
     ):
         capture_speculative_state = target_verify and input_ids.shape[1] > 1
         if cache is not None:
@@ -2744,7 +2903,9 @@ class Qwen4ExpPLELayer(nn.Module):
             history = self.ple_embedding._previous_context(
                 input_ids.astype(mx.int64), cache
             )
-        embeddings = self.ple_embedding(input_ids, cache)
+        embeddings = self.ple_embedding(
+            input_ids, cache, prepared_indices=prepared_indices
+        )
         keys = self.norm_key(
             _target_verify_linear(self.key_proj, embeddings, target_verify)
         ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
@@ -2801,6 +2962,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         position_ids: Optional[mx.array],
         gdn_sink=None,
         target_verify: bool = False,
+        ple_indices: Optional[mx.array] = None,
     ):
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
@@ -2809,6 +2971,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 cache,
                 mask,
                 target_verify=target_verify,
+                prepared_indices=ple_indices,
             )
 
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
@@ -2880,6 +3043,23 @@ class Qwen4ExpModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        # Start SSD reads early without advancing committed PLE history.
+        ple_indices = {}
+        if (
+            _PLE_EARLY_GATHER
+            and 0 < inputs.shape[0] * inputs.shape[1] <= _PLE_EARLY_GATHER_MAX_TOKENS
+        ):
+            for layer_id in self.args.ple_layer_ids:
+                index = layer_id - 1
+                if not 0 <= index < len(self.layers):
+                    continue
+                ple = getattr(self.layers[index], "ple", None)
+                if ple is None:
+                    continue
+                embedding = ple.ple_embedding
+                if isinstance(embedding.ngram_embedding, DiskBackedShardedEmbedding):
+                    ple_indices[index] = embedding.prepare_indices(inputs, cache[index])
+
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
@@ -2896,6 +3076,7 @@ class Qwen4ExpModel(nn.Module):
                 position_ids=position_ids,
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
+                ple_indices=ple_indices.get(index),
             )
             if (
                 _EAGER_DISPATCH

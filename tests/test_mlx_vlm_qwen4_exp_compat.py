@@ -1257,6 +1257,119 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     embedding.close()
 
 
+def test_disk_bf16_upload_preserves_every_bit_pattern():
+    import numpy as np
+    from mlx_vlm.models.qwen4_exp.language import _SafeTensorMMap
+
+    bits = np.arange(65536, dtype=np.uint16).reshape(256, 256)
+    uploaded = _SafeTensorMMap.to_mx(bits, "BF16")
+    assert uploaded.dtype == mx.bfloat16
+    assert np.array_equal(np.asarray(uploaded.view(mx.uint16)), bits)
+
+
+@pytest.fixture
+def early_gather_model(tmp_path):
+    config = _tiny_config()
+    config.text_config.num_hidden_layers = 3
+    config.text_config.layer_types = ["linear_attention", "linear_attention", "full_attention"]
+    config.text_config.ple_layer_ids = [2]
+    from mlx_vlm.models.qwen4_exp.language import (
+        DiskBackedShardedEmbedding,
+        LanguageModel,
+    )
+
+    mx.random.seed(1789194451)
+    model = LanguageModel(config.text_config, config)
+    embedding = model.model.layers[1].ple.ple_embedding
+    resident = embedding.ngram_embedding
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors = {
+        f"{prefix}.shard_{index}.weight": shard.weight.astype(mx.bfloat16)
+        for index, shard in enumerate(resident.shards)
+    }
+    filename = "ple.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: filename for name in tensors}})
+    )
+    disk = DiskBackedShardedEmbedding(
+        tmp_path, prefix, resident.shard_offsets[-1], resident.dims, len(resident.shards)
+    )
+    embedding.ngram_embedding = disk
+    mx.eval(model.parameters())
+    try:
+        yield model, embedding, disk
+    finally:
+        disk.close()
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 3])
+def test_early_ple_gather_matches_late_gather_across_rollback(early_gather_model, monkeypatch, accepted):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, _, disk = early_gather_model
+    early_cache, late_cache = model.make_cache(), model.make_cache()
+    prefix = mx.array([[2, 1, 3]], dtype=mx.int32)
+    verify_ids = mx.array([[4, 5, 1, 6]], dtype=mx.int32)
+    outputs = []
+    for enabled, cache in ((True, early_cache), (False, late_cache)):
+        monkeypatch.setattr(language, "_PLE_EARLY_GATHER", enabled)
+        model(prefix, cache=cache)
+        verified = model(verify_ids, cache=cache, return_hidden=True)
+        assert disk.last_prefetch_hit is enabled
+        mx.eval(verified.logits)
+        model.rollback_speculative_cache(cache, verified.gdn_states, accepted=accepted, block_size=4)
+        resumed = model(mx.array([[7]], dtype=mx.int32), cache=cache)
+        mx.eval(resumed.logits)
+        outputs.append((verified.logits, resumed.logits))
+    for component in (0, 1):
+        assert mx.array_equal(outputs[0][component], outputs[1][component]).item()
+    _assert_ple_state_matches(early_cache[1], late_cache[1])
+
+
+def test_early_ple_gather_starts_before_first_layer_without_advancing_history(early_gather_model, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, embedding, disk = early_gather_model
+    cache = model.make_cache()
+    monkeypatch.setattr(language, "_PLE_EARLY_GATHER", True)
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    mx.eval(model(prefix, cache=cache).logits)
+    history = cache[1][3]
+    next_ids = mx.array([[5, 1, 6]], dtype=mx.int32)
+    prepared = embedding.prepare_indices(next_ids, cache[1])
+    assert cache[1][3] is history
+    assert disk._pending
+    observed = []
+    original = language.Qwen4ExpDecoderLayer.__call__
+
+    def traced(layer, *args, **kwargs):
+        if layer is model.model.layers[0]:
+            observed.append(bool(disk._pending))
+        return original(layer, *args, **kwargs)
+
+    monkeypatch.setattr(language.Qwen4ExpDecoderLayer, "__call__", traced)
+    mx.eval(model(next_ids, cache=cache).logits)
+    assert prepared.shape == (1, 3, embedding.ngram_heads)
+    assert observed == [True]
+    assert disk.last_prefetch_hit
+    assert not disk._pending
+
+
+def test_early_ple_gather_skips_layers_without_ple(early_gather_model, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, _, _ = early_gather_model
+    model.args.ple_layer_ids = [1, 2, 99]
+    ids = mx.array([[2, 3, 4]], dtype=mx.int32)
+    monkeypatch.setattr(language, "_PLE_EARLY_GATHER", False)
+    expected = model(ids, cache=model.make_cache()).logits
+    monkeypatch.setattr(language, "_PLE_EARLY_GATHER", True)
+    actual = model(ids, cache=model.make_cache()).logits
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+
+
 @pytest.fixture
 def disk_ple_reader(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1339,6 +1452,54 @@ def test_disk_backed_ple_small_gathers_skip_prefetch(
     expected = dense[mx.array(indices, dtype=mx.int32)]
     assert mx.array_equal(reader.rows("weight", indices), expected).item()
     prefetch.assert_not_called()
+
+
+@pytest.mark.parametrize("row_count", [1, 8])
+def test_small_ple_gather_rearms_only_previously_read_pages(
+    disk_ple_reader, monkeypatch, row_count
+):
+    import numpy as np
+
+    ple, reader, dense = disk_ple_reader
+    indices = np.arange(row_count, dtype=np.intp)
+    expected = dense[mx.array(indices)]
+    start, width = reader.row_span("weight")
+    # An unrelated warm page must survive a cold gather, however slow it is.
+    reader._seen_pages[-1] = 1
+    clock = MagicMock(side_effect=AssertionError("cold gathers must not be timed"))
+    monkeypatch.setattr(ple, "time", SimpleNamespace(perf_counter=clock))
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert reader._seen_pages[-1] == 1
+    assert reader._last_rearm == 0.0
+    assert reader._rearm_count == 0
+    clock.assert_not_called()
+
+    reader._prefetch_missing_pages(indices, start, width)
+    for now, count in [(1000.0, 1), (1001.0, 1), (1060.0, 2)]:
+        reader._prefetch_missing_pages(indices, start, width)
+        ticks = iter((0.0, 0.010))
+        monkeypatch.setattr(
+            ple, "time", SimpleNamespace(
+                perf_counter=lambda ticks=ticks: next(ticks), monotonic=lambda now=now: now
+            )
+        )
+        assert mx.array_equal(reader.rows("weight", indices), expected).item()
+        assert reader._rearm_count == count
+
+
+def test_ple_inflight_read_does_not_mark_a_rearmed_bitmap(disk_ple_reader, monkeypatch):
+    ple, reader, _ = disk_ple_reader
+    original_pread = ple.os.pread
+    old_bitmap = reader._seen_pages
+
+    def pread(*args):
+        reader._seen_pages = bytearray(len(old_bitmap))
+        return original_pread(*args)
+
+    monkeypatch.setattr(ple.os, "pread", pread)
+    reader._touch_page(0)
+    assert old_bitmap[0] == 1
+    assert not any(reader._seen_pages)
 
 
 def test_disk_backed_ple_rearms_seen_bitmap_on_slow_gather(
@@ -1670,6 +1831,37 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
     assert later_owner.mtp is not None
 
 
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("logits_keep", [0, 2])
+def test_qwen4_default_mtp_still_uses_target_head(tied, logits_keep):
+    """Drafting shares the target projection and preserves hidden-state output."""
+    config = _tiny_config()
+    config.text_config.tie_word_embeddings = tied
+    model, owner = _make_bound_qwen4_language_model(config)
+    assert not hasattr(owner.mtp, "lm_head")
+    hidden = mx.ones((1, 3, 64))
+    tokens = mx.array([[5, 6, 7]], dtype=mx.uint32)
+    mixed, expected_hidden = owner.mtp(
+        hidden, tokens, model.model.embed_tokens, model.make_mtp_cache()
+    )
+    if logits_keep:
+        mixed = mixed[:, -logits_keep:]
+    expected = (
+        model.model.embed_tokens.as_linear(mixed) if tied else model.lm_head(mixed)
+    )
+    actual, actual_hidden = model.mtp_forward(
+        hidden, tokens, model.make_mtp_cache(),
+        return_hidden=True, logits_keep=logits_keep,
+    )
+    logits_only = model.mtp_forward(
+        hidden, tokens, model.make_mtp_cache(), logits_keep=logits_keep
+    )
+    mx.eval(expected, actual, expected_hidden, actual_hidden, logits_only)
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(actual_hidden, expected_hidden).item()
+    assert mx.array_equal(logits_only, actual).item()
+
+
 def _disk_ple(tmp_path, *, shards, rows, dims, bits=None):
     """Write a sharded PLE table (affine-packed when ``bits`` is set, else dense bf16) and open it from disk."""
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1718,6 +1910,78 @@ def test_disk_backed_ple_rejects_out_of_range_indices(tmp_path):
     with pytest.raises(IndexError):
         embedding(mx.array([[1, 8]], dtype=mx.int32))
     embedding.close()
+
+
+def test_small_ple_gather_reads_pages_in_parallel_across_shards(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple(tmp_path, shards=16, rows=128, dims=160)
+    indices = mx.arange(16, dtype=mx.int32)[None] * 128
+    original = language.os.pread
+    lock = threading.Lock()
+    counts = {"active": 0, "peak": 0, "calls": 0}
+
+    def traced(*args):
+        with lock:
+            counts["active"] += 1
+            counts["calls"] += 1
+            counts["peak"] = max(counts["peak"], counts["active"])
+        try:
+            time.sleep(0.005)  # Model independent SSD latency, not CPU work.
+            return original(*args)
+        finally:
+            with lock:
+                counts["active"] -= 1
+
+    monkeypatch.setattr(language.os, "pread", traced)
+    try:
+        actual = embedding(indices)
+        expected = mx.take(table, indices, axis=0)
+        mx.eval(actual, expected)
+        assert mx.array_equal(actual, expected).item()
+        assert counts["peak"] > 1
+        cold_calls = counts["calls"]
+        mx.eval(embedding(indices))
+        assert counts["calls"] == cold_calls
+    finally:
+        embedding.close()
+
+
+def test_cross_shard_ple_read_failure_drains_other_reads(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, _ = _disk_ple(tmp_path, shards=16, rows=128, dims=160)
+    original = language._SafeTensorMMap._touch_page
+    lock = threading.Lock()
+    counts = {"started": 0, "finished": 0}
+
+    def failing(reader, page):
+        with lock:
+            counts["started"] += 1
+            fail = counts["started"] == 1
+        try:
+            if fail:
+                raise OSError("injected read failure")
+            time.sleep(0.01)
+            original(reader, page)
+        finally:
+            with lock:
+                counts["finished"] += 1
+
+    monkeypatch.setattr(language._SafeTensorMMap, "_touch_page", failing)
+    try:
+        with pytest.raises(OSError, match="injected read failure"):
+            embedding(mx.arange(16, dtype=mx.int32)[None] * 128)
+        assert counts["started"] > 8
+        assert counts["started"] == counts["finished"]
+    finally:
+        embedding.close()
 
 
 def test_disk_backed_ple_prefetch_serves_the_matching_call(tmp_path):
@@ -1896,7 +2160,7 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
         assert entered.wait(10)
         embedding.prefetch(mx.array([[2]], dtype=mx.int32))
         embedding.prefetch(mx.array([[3]], dtype=mx.int32))
-        assert all(future is not active for _, future in embedding._pending.values())
+        assert all(pending.future is not active for pending in embedding._pending.values())
         thread.start()
         assert closing.wait(10)
         assert not closed.is_set()
@@ -1914,3 +2178,91 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
     embedding.prefetch(mx.array([[4]], dtype=mx.int32))
     assert not embedding._pending
     embedding.close()
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_ple_reuses_prefetched_prefix_and_suffix(tmp_path, monkeypatch, bits):
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits)
+    indices = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+    try:
+        embedding.prefetch(indices)
+        pending = next(iter(embedding._pending.values()))
+        pending.future.result(timeout=10)
+        monkeypatch.setattr(embedding, "_assemble", MagicMock(side_effect=AssertionError("Rows already gathered")))
+        for start, end in [(0, 2), (2, 5), (5, 6)]:
+            chunk = indices[:, start:end]
+            embedding.prefetch(chunk)
+            values = embedding(chunk)
+            assert mx.array_equal(values, table[chunk]).item()
+            assert embedding.last_prefetch_hit
+        assert not embedding._pending
+    finally:
+        embedding.close()
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_ple_reuses_short_prefetch_when_chunk_grows(tmp_path, monkeypatch, bits):
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits)
+    indices = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+    try:
+        embedding.prefetch(indices[:, :2])
+        next(iter(embedding._pending.values())).future.result(timeout=10)
+        assemble = MagicMock(wraps=embedding._assemble)
+        monkeypatch.setattr(embedding, "_assemble", assemble)
+        embedding.prefetch(indices)
+        values = embedding(indices)
+        assert mx.array_equal(values, table[indices]).item()
+        assert embedding.last_prefetch_hit
+        assert assemble.call_count == 1
+        assert assemble.call_args.args[0].tolist() == [5, 22, 3, 9]
+        assert not embedding._pending
+    finally:
+        embedding.close()
+
+
+def test_disk_ple_running_oversized_prefetch_does_not_block_current_rows(tmp_path, monkeypatch):
+    from threading import Event, current_thread, main_thread
+
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64)
+    entered, release = Event(), Event()
+    assemble = embedding._assemble
+    indices = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+
+    def paused_assemble(host, plan):
+        if current_thread() is not main_thread():
+            entered.set()
+            assert release.wait(10)
+        return assemble(host, plan)
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    try:
+        embedding.prefetch(indices)
+        pending = next(iter(embedding._pending.values()))
+        assert entered.wait(10)
+        first = indices[:, :2]
+        embedding.prefetch(first)
+        assert mx.array_equal(embedding(first), table[first]).item()
+        assert not embedding.last_prefetch_hit
+        assert not pending.future.done()
+        release.set()
+        pending.future.result(timeout=10)
+        monkeypatch.setattr(embedding, "_assemble", MagicMock(side_effect=AssertionError("Suffix already gathered")))
+        assert mx.array_equal(embedding(indices[:, 2:]), table[indices[:, 2:]]).item()
+        assert embedding.last_prefetch_hit
+        assert not embedding._pending
+    finally:
+        release.set()
+        embedding.close()
+
+
+def test_disk_ple_reuse_requires_identical_index_prefix(tmp_path):
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64)
+    try:
+        embedding.prefetch(mx.array([[3, 17, 5, 22]], dtype=mx.int32))
+        next(iter(embedding._pending.values())).future.result(timeout=10)
+        different_history = mx.array([[4, 17]], dtype=mx.int32)
+        assert mx.array_equal(embedding(different_history), table[different_history]).item()
+        assert not embedding.last_prefetch_hit
+        assert len(embedding._pending) == 1
+    finally:
+        embedding.close()

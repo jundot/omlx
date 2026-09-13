@@ -2,14 +2,12 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 3..9).
+"""Fused GDN prework for Qwen3.5/3.6 and Qwen4 MTP verification.
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
 ones-weight RMS norms + two scalar scales + the next conv-state slice — is
-~10 small dispatches per GDN layer per verify cycle. On the 27B that is 48
-layers x ~0.29 ms (measured sync-mode at S=4 on M3 Ultra), the largest
-remaining verify-cycle cost after the attention split.
+roughly ten small dispatches per GDN layer per verify cycle.
 
 One Metal launch replaces the whole chain. Numerics notes carried from the
 donor kernel: the in-kernel sigmoid uses MLX's own unary formula
@@ -17,10 +15,10 @@ donor kernel: the in-kernel sigmoid uses MLX's own unary formula
 inputs; the RMS applies the ones-weight rounding then the separate scalar
 multiply's rounding — the composed chain's two casts.
 
-S >= 3 is a HARD gate: the next conv state is copied from qkv rows only,
-which is wrong when a state row would still come from the OLD conv state.
-Only the target-verify arm routes here; decode (S=1) and prefill keep the
-stock path.
+Qwen3.5/3.6 verification keeps its S in 3..9 envelope. Qwen4 also supports
+S=2 by retaining the required prefix from the old convolution state. Qwen4
+verification reuses the per-row norm/gate kernel below; the separately
+guarded Qwen4 single-token path retains its existing eligibility checks.
 """
 
 from __future__ import annotations
@@ -98,6 +96,19 @@ _SOURCE = """
         uint state_base = state_row * uint(C) + channel_base + lane * 4;
         for (uint i = 0; i < 4; ++i) {
             conv_out[state_base + i] = qkv[raw_base + i];
+        }
+    }
+    if constexpr (S < NKEEP) {
+        // Narrow verification retains part of the previous convolution
+        // window before the new rows written above.
+        if (row == 0) {
+            for (uint old = 0; old < uint(NKEEP - S); ++old) {
+                uint channel = channel_base + lane * 4;
+                for (uint i = 0; i < 4; ++i) {
+                    conv_out[old * uint(C) + channel + i] =
+                        conv_state[(old + uint(S)) * uint(C) + channel + i];
+                }
+            }
         }
     }
 """
@@ -415,13 +426,20 @@ def _qwen4_decode_recurrence(q, k, v, g, beta, state):
     return gated_delta_kernel(q, k, v, g, beta, state, None)
 
 
+def _is_qwen4_gdn(module) -> bool:
+    """Identify the vendored class registered by the Qwen4 compatibility patch."""
+    return (
+        type(module).__name__ == "Qwen4ExpGatedDeltaNet"
+        and type(module).__module__ == "mlx_vlm.models.qwen4_exp.language"
+    )
+
+
 def _qwen4_decode_static_eligible(module) -> bool:
     """Fail closed unless this is the shipped Qwen4 oQe decode geometry."""
 
     conv_dim = 2 * 16 * 128 + 48 * 128
     if (
-        type(module).__name__ != "Qwen4ExpGatedDeltaNet"
-        or type(module).__module__ != "mlx_vlm.models.qwen4_exp.language"
+        not _is_qwen4_gdn(module)
         or module.training
         or module.num_k_heads != 16
         or module.num_v_heads != 48
@@ -581,7 +599,8 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
         if gdn_sink is None or cache is None:
             return False
-        if inputs.shape[0] != 1 or not (3 <= s_len <= 9):
+        qwen4 = _is_qwen4_gdn(self)
+        if inputs.shape[0] != 1 or not ((2 if qwen4 else 3) <= s_len <= 9):
             return False
         if mask is not None:
             return False
@@ -779,7 +798,24 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                     "[gdn-prework] fused verify prework engaged (S=%d)", S
                 )
 
-            out = self.norm(out, z)
+            if (
+                _is_qwen4_gdn(self)
+                and self.head_v_dim == 128
+                and getattr(self.norm, "activation", None) == "sigmoid"
+                and self.norm.weight.shape == (128,)
+                and self.norm.weight.dtype == mx.bfloat16
+            ):
+                # Flatten token/head axes, preserving BF16 rounding boundaries.
+                out = qwen4_decode_norm_gate_fused(
+                    mx.contiguous(out),
+                    mx.contiguous(z),
+                    self.norm.weight,
+                    hv=S * self.num_v_heads,
+                    dv=self.head_v_dim,
+                    eps=self.norm.eps,
+                ).reshape(B, S, -1)
+            else:
+                out = self.norm(out, z)
             result = q35._target_verify_linear(
                 self.out_proj, out.reshape(B, S, -1), True
             )
