@@ -59,6 +59,9 @@ def test_node_id_probe_is_public_and_returns_identity(_configured_stores):
     assert payload["node_id"] == identity.node_id
     assert payload["version"]
     assert payload["cluster_name"] == "omlx"  # default with no service
+    # Display-only and public like cluster_name: lets probe-verified peers
+    # refresh a renamed Mac without mDNS (Thunderbolt/manual-add paths).
+    assert payload["friendly_name"] == identity.friendly_name
     # The probe must not leak capabilities or the device inventory.
     assert "caps" not in payload
     assert "devices" not in payload
