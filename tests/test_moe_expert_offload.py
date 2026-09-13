@@ -11,6 +11,8 @@ output magnitude ~5), so those cases assert a rounding-scale tolerance —
 head-room for kernel choice, not for wrong experts, which show as O(1).
 """
 
+import threading
+
 import pytest
 
 try:
@@ -28,6 +30,8 @@ if HAS_MLX:
     from omlx.patches.moe_expert_offload import (
         CheckpointExpertStore,
         OffloadSwitchGLU,
+        _io_pool,
+        _shutdown_io_pool,
         apply_moe_expert_offload,
         moe_offload_stats,
     )
@@ -514,6 +518,145 @@ class TestApplyAndForward:
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
         # OffloadSwitchGLU is not `type(...) is SwitchGLU`; nothing to rewrap
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
+
+
+class TestParallelFetch:
+    """Misses are read off the calling thread; the cache state is not.
+
+    The pool only produces bytes: slots, LRU order, eviction victims and the
+    counters are still mutated serially on the calling thread, so a parallel
+    run must be indistinguishable from a serial one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_pool(self):
+        _shutdown_io_pool()
+        yield
+        _shutdown_io_pool()
+
+    def _wrap(self, tmp_path, glu, workers, monkeypatch, fraction=0.25):
+        if workers is None:
+            monkeypatch.delenv("OMLX_MOE_OFFLOAD_IO_WORKERS", raising=False)
+        else:
+            monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", workers)
+        _shutdown_io_pool()
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, fraction) == 1
+        return model, model.layers[0].experts.switch_glu.cache
+
+    def test_parallel_fetch_matches_serial_slots(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=3)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(21)
+        calls = [(mx.random.normal((2, 3, D)), _ri(2, 3, K)) for _ in range(5)]
+
+        def run(workers):
+            model, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            outs = [model(x, i) for x, i in calls]
+            mx.eval(*outs)
+            return cache, outs
+
+        serial, out_serial = run("1")
+        parallel, out_parallel = run("16")
+
+        assert parallel.misses > parallel.capacity  # the pool actually ran
+        assert bool(mx.array_equal(serial.map, parallel.map))
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for a, b in zip(serial.resident[proj], parallel.resident[proj]):
+                assert (a is None) == (b is None)
+                if a is not None:
+                    assert bool(mx.array_equal(a, b))
+        for a, b in zip(out_serial, out_parallel):
+            assert bool(mx.array_equal(a, b))
+
+    def test_ensure_preserves_lru_order_and_counters(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=4)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(11)
+        # 12 indices per call over 8 slots: every call evicts, repeatedly
+        seq = [_ri(6, K) for _ in range(12)]
+
+        def run(workers):
+            _, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            assert cache.capacity == 8
+            for i in seq:
+                cache.ensure(i)
+            return cache
+
+        serial, parallel = run("1"), run("12")
+        assert list(serial.slot_of.items()) == list(parallel.slot_of.items())
+        assert serial.free == parallel.free
+        assert (serial.hits, serial.misses) == (parallel.hits, parallel.misses)
+        assert serial.misses > serial.capacity
+
+    @pytest.mark.parametrize("workers", ["0", "-4", "abc", "1", None])
+    def test_io_workers_env_degenerate_values(self, tmp_path, monkeypatch, workers):
+        glu = _make_glu(seed=5)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        ref = glu(x, i)
+        mx.eval(ref)
+        model, _ = self._wrap(tmp_path, glu, workers, monkeypatch)
+        got = model.layers[0].experts.switch_glu(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+        assert (_io_pool() is None) is (workers is not None)
+
+    def test_store_reads_are_thread_safe(self, tmp_path):
+        glu = _make_glu(seed=6)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        store = CheckpointExpertStore(tmp_path)
+        name = "layers.0.experts.switch_glu.gate_proj.weight"
+        raws = {}
+
+        def read(e):
+            raws[e] = CheckpointExpertStore.read(store.plan_expert(name, e))
+
+        threads = [threading.Thread(target=read, args=(e,)) for e in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(raws) == 8
+        for e, raw in raws.items():  # mx stays on this thread
+            got = CheckpointExpertStore.to_mx(store.plan_expert(name, e), raw)
+            assert bool(mx.array_equal(got, glu.gate_proj["weight"][e]))
+
+    def test_prefetch_batching_bounds_inflight(self, tmp_path, monkeypatch):
+        """The pipeline may not hold more than a batch of experts' payloads:
+        that bound is the only thing standing between reading ahead and
+        buffering a whole layer's expert table in host memory."""
+        glu = _make_glu(seed=7)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "4")
+        real_read, real_to_mx = CheckpointExpertStore.read, CheckpointExpertStore.to_mx
+        lock = threading.Lock()
+        live = {"now": 0, "peak": 0}
+
+        def counting_read(plan):  # a payload exists from here ...
+            raw = real_read(plan)
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            return raw
+
+        def counting_to_mx(plan, raw):  # ... until it becomes an array
+            with lock:
+                live["now"] -= 1
+            return real_to_mx(plan, raw)
+
+        monkeypatch.setattr(CheckpointExpertStore, "read", staticmethod(counting_read))
+        monkeypatch.setattr(
+            CheckpointExpertStore, "to_mx", staticmethod(counting_to_mx)
+        )
+        _, cache = self._wrap(tmp_path, glu, "8", monkeypatch)
+        assert _io_pool() is not None
+        mx.random.seed(5)
+        for _ in range(6):
+            cache.ensure(_ri(8, K))
+        assert cache.misses > cache.capacity
+        assert live["peak"] <= 4 * 9  # batch x tensors per expert
+        assert live["now"] == 0  # nothing left holding bytes
 
 
 @pytest.mark.slow
