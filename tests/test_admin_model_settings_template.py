@@ -366,6 +366,43 @@ def test_oq_a8_i18n_keys_exist_in_every_locale():
         assert not missing, f"{path.name} is missing {sorted(missing)}"
 
 
+def test_profile_api_toggle_state_uses_i18n_keys():
+    """Both expose-as-API toggles localise their ON/OFF state.
+
+    The state was hardcoded before the migration; `API` itself stays a Latin
+    literal because it is the product's own acronym for an API-addressable
+    model, and this PR leaves acronyms untranslated.
+    """
+    html = _model_settings_template()
+
+    # New-profile form and the inline edit form share the one key pair.
+    assert html.count("t('modal.model_settings.profiles.expose_as_model_on')") == 2
+    assert html.count("t('modal.model_settings.profiles.expose_as_model_off')") == 2
+    assert "'ON'" not in html
+    assert "'OFF'" not in html
+
+    assert [line.strip() for line in html.splitlines()].count("API") == 2
+
+
+def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    english = {
+        "modal.model_settings.profiles.expose_as_model_on": "ON",
+        "modal.model_settings.profiles.expose_as_model_off": "OFF",
+    }
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        missing = set(english) - set(catalog)
+        assert not missing, f"{path.name} is missing {sorted(missing)}"
+        # Extraction only: every locale renders the English source, exactly as
+        # the button did before. Translations land in the companion PR.
+        for key, value in english.items():
+            assert catalog[key] == value, (
+                f"{path.name} {key} is not the English fallback"
+            )
+
+
 def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     """Offload is incompatible with speculative verification paths."""
     html = _model_settings_template()

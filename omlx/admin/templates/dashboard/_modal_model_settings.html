@@ -228,7 +228,7 @@
                                         : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
                                     class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[10px] font-bold transition-colors">
                                 API
-                                <span x-text="newProfile.expose_as_model ? 'ON' : 'OFF'"></span>
+                                <span x-text="newProfile.expose_as_model ? t('modal.model_settings.profiles.expose_as_model_on') : t('modal.model_settings.profiles.expose_as_model_off')"></span>
                             </button>
                         </div>
                         <input type="text" x-model="newProfile.description" :placeholder="t('modal.model_settings.profiles.description_label')"
@@ -264,7 +264,7 @@
                                                 : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
                                             class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[10px] font-bold transition-colors">
                                         API
-                                        <span x-text="(p._editExposeAsModel ?? p.expose_as_model) ? 'ON' : 'OFF'"></span>
+                                        <span x-text="(p._editExposeAsModel ?? p.expose_as_model) ? t('modal.model_settings.profiles.expose_as_model_on') : t('modal.model_settings.profiles.expose_as_model_off')"></span>
                                     </button>
                                 </div>
                             </div>
