@@ -1208,6 +1208,8 @@
   "modal.model_settings.profiles.scope_global": "全局",
   "modal.model_settings.profiles.scope_model": "模型",
   "modal.model_settings.profiles.refresh_tooltip": "从 omlx.ai 获取最新预设",
+  "modal.model_settings.profiles.expose_as_model_on": "ON",
+  "modal.model_settings.profiles.expose_as_model_off": "OFF",
   "modal.model_settings.ane_gdn_off": "GDN off",
   "modal.model_settings.dflash_activation_bits": "Activation Bits",
   "modal.model_settings.dflash_block_size_hint": "Maximum draft and verify tokens per cycle. Leave empty to use the checkpoint block size.",
