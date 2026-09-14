@@ -6862,8 +6862,8 @@ async def create_response(
             preserve_images=preserve_tool_images,
         )
 
-        # Convert tools: flat → nested. Namespace groups are expanded under a
-        # joined wire name; namespace_aliases maps it back for the return path.
+        # Convert tools: flat → nested. namespace_aliases maps each expanded
+        # namespace member's wire name back for the return path.
         namespace_aliases: dict = {}
         openai_tools = convert_responses_tools(request.tools, namespace_aliases)
         if (

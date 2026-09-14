@@ -398,19 +398,18 @@ def convert_responses_input_to_messages(
 # =============================================================================
 
 
-def _namespace_wire_name(namespace: str, name: str) -> str:
-    """Join a namespace and a child name the way Codex's join_tool_name() does."""
-    return f"{namespace.rstrip('_')}__{name.lstrip('_')}"
+def _namespace_wire_name(namespace: str, name: str, taken: set) -> str:
+    """Join a namespace and a child name the way Codex's join_tool_name() does.
 
-
-def _unique_wire_name(wire: str, taken: set) -> str:
-    """Suffix a wire name until it stops colliding with an already-used one."""
-    if wire not in taken:
-        return wire
+    A name a flat tool already holds is suffixed rather than shadowing it.
+    """
+    joined = f"{namespace.rstrip('_')}__{name.lstrip('_')}"
+    wire = joined
     suffix = 2
-    while f"{wire}_{suffix}" in taken:
+    while wire in taken:
+        wire = f"{joined}_{suffix}"
         suffix += 1
-    return f"{wire}_{suffix}"
+    return wire
 
 
 def _convert_function_tool(
@@ -459,9 +458,7 @@ def convert_responses_tools(
                     member = ResponsesTool(**member)
                 if not isinstance(member, ResponsesTool) or not member.name:
                     continue
-                wire = _unique_wire_name(
-                    _namespace_wire_name(tool.name, member.name), taken
-                )
+                wire = _namespace_wire_name(tool.name, member.name, taken)
                 converted = _convert_function_tool(member, name=wire)
                 if converted:
                     taken.add(wire)
@@ -481,9 +478,9 @@ def split_namespace_tool_name(
     name: str,
     aliases: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> Tuple[Optional[str], str]:
-    """Restore ``(namespace, name)`` for a call the model made by wire name.
+    """Restore ``(namespace, name)`` for a call made by wire name.
 
-    Flat tools are unaffected: they return ``(None, name)`` (#3371).
+    Flat tools are unaffected: they return ``(None, name)``.
     """
     if aliases:
         entry = aliases.get(name)

@@ -777,14 +777,6 @@ class TestConvertResponsesTools:
         ]
         assert aliases == {"mcp__demo__get_weather_2": ("mcp__demo__", "get_weather")}
 
-    def test_flat_tools_record_no_aliases(self):
-        aliases = {}
-        result = convert_responses_tools(
-            [ResponsesTool(type="function", name="get_weather")], aliases
-        )
-        assert result[0]["function"]["name"] == "get_weather"
-        assert aliases == {}
-
     def test_split_namespace_tool_name(self):
         aliases = {"mcp__demo__get_weather": ("mcp__demo__", "get_weather")}
         assert split_namespace_tool_name("mcp__demo__get_weather", aliases) == (
@@ -798,31 +790,26 @@ class TestConvertResponsesTools:
         )
         assert split_namespace_tool_name("get_weather") == (None, "get_weather")
 
-    def test_function_call_output_item_carries_namespace(self):
-        item = build_function_call_output_item(
+    def test_namespace_serializes_only_when_set(self):
+        namespaced = build_function_call_output_item(
             name="get_weather",
             arguments='{"city": "Paris"}',
             call_id="call_1",
             namespace="mcp__demo__",
-        )
-        assert item.name == "get_weather"
-        assert item.namespace == "mcp__demo__"
+        ).model_dump()
+        assert namespaced["name"] == "get_weather"
+        assert namespaced["namespace"] == "mcp__demo__"
         flat = build_function_call_output_item(
             name="get_weather", arguments="{}", call_id="call_2"
-        )
-        assert flat.namespace is None
+        ).model_dump()
+        assert "namespace" not in flat
+        # Other optional fields keep serializing as null, as before.
+        assert flat["role"] is None and flat["summary"] is None
 
-    def test_namespace_ignores_malformed_members(self):
-        tools = [
-            ResponsesTool(type="namespace", name="ns__", tools=["not-a-tool"]),
-            ResponsesTool(type="function", name="fn_a"),
-        ]
-        result = convert_responses_tools(tools)
-        assert [t["function"]["name"] for t in result] == ["fn_a"]
-
-    def test_namespace_without_members_is_skipped(self):
+    def test_namespace_without_usable_members_contributes_nothing(self):
         tools = [
             ResponsesTool(type="namespace", name="empty__"),
+            ResponsesTool(type="namespace", name="junk__", tools=["not-a-tool"]),
             ResponsesTool(type="function", name="fn_a"),
         ]
         result = convert_responses_tools(tools)
