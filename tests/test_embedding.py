@@ -885,7 +885,9 @@ class TestEmbeddingEngine:
 
             asyncio.run(engine.start())
 
-            MockModel.assert_called_once_with("test-model", trust_remote_code=False)
+            MockModel.assert_called_once_with(
+                "test-model", trust_remote_code=False, embedding_dtype=None
+            )
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())
@@ -2047,3 +2049,66 @@ class TestDeclaredPoolingMode:
 
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
+
+
+class TestEmbeddingDtype:
+    """The bf16 -> fp16 compute promotion for embedding models."""
+
+    class _Module:
+        def __init__(self, weight):
+            self._params = {"weight": weight}
+
+        def parameters(self):
+            return self._params
+
+        def update(self, tree):
+            self._params = tree
+
+    def test_auto_promotes_bfloat16(self):
+        import mlx.core as mx
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        m = MLXEmbeddingModel("dummy")
+        assert (
+            m._resolve_embedding_dtype(self._Module(mx.zeros((2,), dtype=mx.bfloat16)))
+            == mx.float16
+        )
+
+    def test_auto_leaves_float16(self):
+        import mlx.core as mx
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        m = MLXEmbeddingModel("dummy")
+        assert (
+            m._resolve_embedding_dtype(self._Module(mx.zeros((2,), dtype=mx.float16)))
+            is None
+        )
+
+    def test_explicit_float32(self):
+        import mlx.core as mx
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        m = MLXEmbeddingModel("dummy", embedding_dtype="float32")
+        assert (
+            m._resolve_embedding_dtype(self._Module(mx.zeros((2,), dtype=mx.float16)))
+            == mx.float32
+        )
+
+    def test_invalid_dtype_rejected(self):
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        m = MLXEmbeddingModel("dummy", embedding_dtype="int8")
+        with pytest.raises(ValueError):
+            m._resolve_embedding_dtype(None)
+
+    def test_apply_casts_bfloat16_params(self):
+        import mlx.core as mx
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        mod = self._Module(mx.zeros((2,), dtype=mx.bfloat16))
+        MLXEmbeddingModel("dummy")._apply_embedding_dtype(mod)
+        assert mod._params["weight"].dtype == mx.float16

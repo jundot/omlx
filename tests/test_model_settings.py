@@ -932,3 +932,12 @@ def test_oq_a8_is_a_model_specific_profile_field():
     for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET
+
+
+def test_embedding_dtype_is_a_model_specific_profile_field():
+    """Tied to a specific embedding model checkpoint rather than universal."""
+    from omlx.model_profiles import MODEL_SPECIFIC_PROFILE_FIELDS, UNIVERSAL_FIELDS_SET
+
+    assert "embedding_dtype" in MODEL_SPECIFIC_PROFILE_FIELDS
+    assert "embedding_dtype" not in UNIVERSAL_FIELDS_SET
+

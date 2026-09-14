@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
@@ -78,7 +78,12 @@ class MLXEmbeddingModel:
         >>> print(len(output.embeddings))  # 2
     """
 
-    def __init__(self, model_name: str, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model_name: str,
+        trust_remote_code: bool = False,
+        embedding_dtype: Optional[str] = None,
+    ):
         """
         Initialize the MLX embedding model.
 
@@ -86,9 +91,13 @@ class MLXEmbeddingModel:
             model_name: HuggingFace model name or local path
             trust_remote_code: Allow execution of custom Python shipped inside
                 the model repository. Off by default for security (issue #926).
+            embedding_dtype: Compute dtype override ("auto" | "float16" |
+                "float32" | None). None/"auto" promotes a bfloat16 checkpoint
+                to float16 on load.
         """
         self.model_name = model_name
         self.trust_remote_code = trust_remote_code
+        self.embedding_dtype = embedding_dtype
 
         self.model = None
         self.processor = None
@@ -100,6 +109,50 @@ class MLXEmbeddingModel:
         self._remap_input_ids_to_inputs = False
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
+
+    def _resolve_embedding_dtype(self, module):
+        """Target compute dtype for a loaded module, or None to leave it as-is.
+
+        ``auto``/``None`` promotes a bfloat16 checkpoint to float16: bf16 MLX
+        embedding matmuls round activations to bf16 and miss the 1e-3
+        conformance gate (measured max|delta| 0.0037, vs 0.0006 for the
+        identical weights computed in fp16). Explicit ``float32``/``float16``
+        force the cast.
+        """
+        requested = self.embedding_dtype
+        if requested == "float32":
+            return mx.float32
+        if requested == "float16":
+            return mx.float16
+        if requested not in (None, "auto"):
+            raise ValueError(
+                "embedding_dtype must be one of: auto, float16, float32"
+            )
+        if module is None:
+            return None
+        for _, value in tree_flatten(module.parameters()):
+            if isinstance(value, mx.array) and value.dtype == mx.bfloat16:
+                return mx.float16
+        return None
+
+    def _apply_embedding_dtype(self, module) -> None:
+        """Cast a loaded module's floating parameters to the resolved dtype."""
+        target = self._resolve_embedding_dtype(module)
+        if target is None or module is None:
+            return
+        module.update(
+            tree_map(
+                lambda a: a.astype(target)
+                if isinstance(a, mx.array)
+                and a.dtype in (mx.bfloat16, mx.float32)
+                else a,
+                module.parameters(),
+            )
+        )
+        mx.eval(module.parameters())
+        logger.info(
+            "Embedding compute dtype for %s: %s", self.model_name, target
+        )
 
     # Fallbacks for MLX conversions that dropped the sentence-transformers
     # metadata. Reviewed against the concrete checkpoints on the Hub: none of
@@ -266,6 +319,7 @@ class MLXEmbeddingModel:
             weights = model_instance.sanitize(weights)
             self._validate_native_weights(model_instance, weights)
             model_instance.load_weights(list(weights.items()), strict=False)
+            self._apply_embedding_dtype(model_instance)
             mx.eval(model_instance.parameters())
             # Embedding inference must be deterministic: put the model in eval
             # mode so dropout (p>0 in XLM-RoBERTa/BERT) is disabled. Without this
@@ -330,6 +384,7 @@ class MLXEmbeddingModel:
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
             patch_modernbert_attention(self.model)
+            self._apply_embedding_dtype(self.model)
 
             if hasattr(self.model, "config"):
                 config = self.model.config

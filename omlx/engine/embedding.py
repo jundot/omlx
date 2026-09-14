@@ -48,6 +48,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         batch_size: int | None = None,
         *,
         scheduler_config: Any | None = None,
+        embedding_dtype: str | None = None,
     ):
         """
         Initialize the embedding engine.
@@ -59,6 +60,8 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             batch_size: Explicit per-forward input chunk size override.
             scheduler_config: Shared scheduler configuration. Embedding uses
                 embedding_batch_size as its per-forward input chunk size.
+            embedding_dtype: Embedding compute dtype override
+                ("auto" | "float16" | "float32" | None).
         """
         super().__init__()
         self._model_name = model_name
@@ -71,6 +74,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             )
         self._batch_size = max(1, int(batch_size))
         self._model: Optional[MLXEmbeddingModel] = None
+        self._embedding_dtype = embedding_dtype
 
     @property
     def model_name(self) -> str:
@@ -98,7 +102,9 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         logger.info(f"Starting embedding engine: {self._model_name}")
         self._model = MLXEmbeddingModel(
-            self._model_name, trust_remote_code=self._trust_remote_code
+            self._model_name,
+            trust_remote_code=self._trust_remote_code,
+            embedding_dtype=self._embedding_dtype,
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), self._model.load)

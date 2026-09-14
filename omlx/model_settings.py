@@ -285,6 +285,10 @@ class ModelSettings:
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
         active_profile_name: Name of the currently-applied profile (None = no profile).
+        embedding_dtype: Embedding-model compute dtype. None = auto: cast a
+            bfloat16 checkpoint to float16 on load (bf16 embedding matmuls round
+            activations to bf16 and miss the 1e-3 conformance gate).
+            "float16"/"float32" force the cast; "auto" is an alias for None.
     """
 
     # Sampling parameters (None means use global default)
@@ -465,8 +469,18 @@ class ModelSettings:
     display_name: Optional[str] = None
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
+    # Embedding compute dtype (None/auto = promote a bfloat16 checkpoint to fp16).
+    embedding_dtype: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.embedding_dtype is not None and self.embedding_dtype not in (
+            "auto",
+            "float16",
+            "float32",
+        ):
+            raise ValueError(
+                "embedding_dtype must be one of: auto, float16, float32"
+            )
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
             raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping

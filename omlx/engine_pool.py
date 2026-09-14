@@ -3019,6 +3019,9 @@ class EnginePool:
                         model_name=entry.model_path,
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
+                        embedding_dtype=getattr(
+                            model_settings, "embedding_dtype", None
+                        ),
                     )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(
