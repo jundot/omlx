@@ -42,7 +42,9 @@ def envelope(arguments, name="write"):
             + ">\n"
             + (value if isinstance(value, str) else json.dumps(value))
             + "\n</parameter>\n"
-            for key, value in arguments.items()
+            for key, value in (
+                arguments.items() if isinstance(arguments, dict) else arguments
+            )
         )
         + "</function>\n</tool_call>"
     )
@@ -171,6 +173,72 @@ async def test_arguments_match_native_parser(value, size):
     assert not actual["errors"]
     assert signature(actual) == signature(native)
     assert all(call["id"].startswith("call_") for call in actual["calls"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 7, 13, 64, 1024])
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        [("content", ""), ("path", "demo.txt"), ("content", "")],
+        [("content", "same"), ("content", "same")],
+        [("content", '"quoted"\\text\n'), ("content", '"quoted"\\text\n')],
+        [("content", "🚀 café"), ("content", "🚀 café")],
+        [("content", "x" * 5000), ("content", "x" * 5000)],
+        [("content", "NULL"), ("content", "null")],
+        [("number", "3.0"), ("number", "3")],
+        [("flag", "TRUE"), ("flag", "true")],
+        [("items", '[1, {"x": "y"}]'), ("items", '[1,{"x":"y"}]')],
+        [("content", "same"), ("content", "different"), ("content", "same")],
+    ],
+)
+async def test_repeated_parameters_match_native_without_duplicate_json_keys(
+    parameters, size
+):
+    raw = envelope(parameters)
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+    pairs = json.loads(actual["calls"][0]["arguments"], object_pairs_hook=list)
+    names = [name for name, _ in pairs]
+    assert len(names) == len(set(names))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 7, 13, 64, 1024])
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        [("content", "first"), ("content", "second")],
+        [("number", 1), ("number", 2)],
+        [("items", [1]), ("items", [2])],
+    ],
+)
+async def test_changed_final_parameter_cannot_validate_previously_emitted_value(
+    parameters, size
+):
+    raw = envelope(parameters)
+    native = await run(raw, size, False)
+    assert not native["errors"] and native["finish"] == "tool_calls"
+    actual = await run(raw, size, True)
+    assert actual["errors"] and actual["finish"] is None
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(actual["calls"][0]["arguments"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 7, 13, 64, 1024])
+async def test_parameter_tracking_resets_for_the_next_call(size):
+    raw = envelope([("content", ""), ("content", "")]) + envelope(
+        {"content": "next"}
+    )
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+    assert len(actual["calls"]) == 2
+    assert len({call["id"] for call in actual["calls"]}) == 2
 
 
 @pytest.mark.asyncio

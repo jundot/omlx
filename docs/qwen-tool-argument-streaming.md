@@ -18,6 +18,9 @@ validated calls, never partial JSON.
 The final closing JSON bytes are withheld until the complete envelope passes
 native parsing and its arguments match every byte already emitted.
 Duplicate calls retain separate indexes and IDs.
+Repeated XML parameters emit only one JSON key and succeed when native parsing
+confirms the value already sent. If a later occurrence changes that value, the
+stream ends with an error because earlier argument bytes cannot be withdrawn.
 
 Malformed, oversized or interrupted partial calls produce an SSE error and no
 successful completion; the client should discard the incomplete call.

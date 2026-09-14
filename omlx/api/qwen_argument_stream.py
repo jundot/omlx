@@ -30,9 +30,16 @@ class QwenArgumentStream:
         self.started = False
         self.first = True
         self.received = 0
+        self.seen_parameters = set()
+        self.duplicate_parameter = False
 
     def emit(self, argument="", name=None):
         f = {}
+        # Native parsing keeps one value per parameter. Suppress repeated
+        # JSON keys, then let finish reject any final value that differs
+        # from the bytes already sent for that parameter.
+        if name is None and self.duplicate_parameter:
+            return {"index": len(self.calls) - 1, "function": f}
         if name is not None:
             f["name"] = name
         if argument:
@@ -93,6 +100,8 @@ class QwenArgumentStream:
                     self.enabled = False
                     break
                 self.config = _get_arguments_config(name, self.tools)
+                self.seen_parameters = set()
+                self.duplicate_parameter = False
                 self.current = {
                     "name": name,
                     "id": "call_" + uuid.uuid4().hex[:8],
@@ -125,6 +134,8 @@ class QwenArgumentStream:
                             )
                     break
                 self.param = self.buf[11:i]
+                self.duplicate_parameter = self.param in self.seen_parameters
+                self.seen_parameters.add(self.param)
                 self.buf = self.buf[i + 1 :]
                 self.state = "value"
                 self.raw = []
