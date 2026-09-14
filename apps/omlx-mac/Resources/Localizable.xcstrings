@@ -20736,6 +20736,102 @@
         }
       }
     },
+    "settings.basic.context_window.yarn.factor" : {
+      "comment" : "Read-only YaRN factor derived from the context window override; placeholders are the factor, the target window, and the native window",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YaRN scale factor = %@ (%@ / %@)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Коэффициент YaRN = %@ (%@ / %@)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YaRN 缩放系数 = %@（%@ / %@）"
+          }
+        }
+      }
+    },
+    "settings.basic.context_window.yarn.off" : {
+      "comment" : "Read-only YaRN state under the Context Window row when the window does not exceed the native window",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YaRN scale factor = off"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Коэффициент YaRN = выкл."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YaRN 缩放系数 = 关闭"
+          }
+        }
+      }
+    },
+    "settings.basic.context_window.yarn.over_ceiling" : {
+      "comment" : "Read-only YaRN factor under the Context Window row when the window asks for more than Qwen's published 4x recipe ceiling",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YaRN scale factor = %@ (%@ / %@) — over 4× cap"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Коэффициент YaRN = %@ (%@ / %@) — свыше лимита 4×"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "YaRN 缩放系数 = %@（%@ / %@）— 超过 4× 上限"
+          }
+        }
+      }
+    },
+    "settings.basic.context_window.yarn.sub" : {
+      "comment" : "Sublabel on the Context Window row for checkpoints that derive YaRN rope scaling from this field; placeholder is the grouped native context length",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Above the native %@ tokens, YaRN rope scaling engages automatically (up to 4×)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Свыше нативных %@ токенов rope-масштабирование YaRN включается автоматически (до 4×)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超过原生 %@ 个 Token 后，YaRN rope 缩放自动启用（最高 4×）。"
+          }
+        }
+      }
+    },
     "settings.basic.max_tokens.label" : {
       "comment" : "Row label for the max generated tokens field",
       "extractionState" : "manual",

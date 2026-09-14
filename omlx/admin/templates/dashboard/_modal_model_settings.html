@@ -350,6 +350,12 @@
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <div x-show="modelSettings.yarn_rope_supported" x-cloak class="mt-1">
+                                                <p class="text-xs text-neutral-500">
+                                                    {{ t('modal.model_settings.yarn_factor_label') }} =
+                                                    <span class="font-mono" x-text="yarnFactorDisplay()"></span>
+                                                </p>
+                                            </div>
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>

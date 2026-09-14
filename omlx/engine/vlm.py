@@ -2123,6 +2123,19 @@ class VLMBatchedEngine(BaseEngine):
                 scheduler._set_model_info_for_monitor()
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
+        # Qwen4-Exp YaRN: the loader bound the effective rope target before
+        # construction; stamp it before refresh_ssd_layer_signature below so
+        # the SSD cache compatibility signature carries what the rotary was
+        # actually built with (None for every other model type).
+        if self.model_type == "qwen4_exp":
+            from ..patches.mlx_vlm_qwen4_exp_compat.yarn_rope import (
+                get_yarn_runtime_context_length,
+            )
+
+            scheduler._yarn_context_length = get_yarn_runtime_context_length()
+        else:
+            scheduler._yarn_context_length = None
+
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
         if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:

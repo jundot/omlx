@@ -492,6 +492,8 @@ private struct BasicTab: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
 
+    @Environment(\.omlxTheme) private var theme
+
     var body: some View {
         BasicEditBanner(vm: vm, client: client)
         SectionHeader(String(localized: "settings.basic.section",
@@ -523,10 +525,29 @@ private struct BasicTab: View {
             Row(label: String(localized: "settings.basic.context_window.label",
                               defaultValue: "Context Window",
                               comment: "Row label for the context window field"),
-                sublabel: String(localized: "settings.basic.context_window.sub",
-                                 defaultValue: "Maximum tokens per request",
-                                 comment: "Sublabel for the context window field")) {
+                sublabel: vm.contextWindowSublabel) {
                 TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
+            }
+            // Read-only YaRN readout. There is no YaRN control: on a
+            // YaRN-capable checkpoint (Qwen4-Exp) the server derives rope
+            // scaling from the value above, so the derived factor is echoed
+            // back here as one terse line.
+            if let yarn = vm.yarnScaling {
+                FreeRow(isLast: false) {
+                    HStack(spacing: 6) {
+                        Image(systemName: yarn.isOverCeiling
+                                      ? "exclamationmark.triangle.fill"
+                                      : "arrow.up.forward.app")
+                            .font(.system(size: 10))
+                            .foregroundStyle(yarn.isOverCeiling ? theme.amberDot : theme.textTertiary)
+                        Text(vm.yarnScalingSummary)
+                            .font(.omlxMono(11))
+                            .foregroundStyle(yarn.isOverCeiling ? theme.amberDot : theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, -2)
+                }
             }
             Row(label: String(localized: "settings.basic.max_tokens.label",
                               defaultValue: "Max Tokens",
