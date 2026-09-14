@@ -6,6 +6,7 @@ This module tests SSD-based storage for paged KV cache blocks,
 enabling larger effective cache sizes than GPU memory allows.
 """
 
+import concurrent.futures
 import errno
 import gc
 import json
@@ -17,7 +18,7 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -3553,6 +3554,7 @@ class TestInlineLRUUnlinks:
 
         def fake_put(item, timeout=None, *args, **kwargs):
             calls.append(timeout)
+            time.sleep(timeout or 0)
             raise queue.Full
 
         try:
@@ -3560,9 +3562,14 @@ class TestInlineLRUUnlinks:
             mgr._write_queue.put = fake_put  # type: ignore[method-assign]
 
             block_hash = b"full_queue_wait"
+            started = time.monotonic()
             assert self._save_block(mgr, mx, block_hash) is True
+            elapsed = time.monotonic() - started
 
-            assert calls == [1.0]
+            assert len(calls) >= 2
+            assert all(timeout is not None for timeout in calls)
+            assert all(0 < timeout <= 0.05 for timeout in calls if timeout is not None)
+            assert 0.9 <= elapsed <= 2.0
             stats = mgr.get_stats()
             assert stats.ssd_write_drops == 0
             assert stats.ssd_inline_write_fallbacks == 1
@@ -3573,6 +3580,685 @@ class TestInlineLRUUnlinks:
             mgr._write_queue.put = original_put  # type: ignore[method-assign]
             mgr._write_queue.full = original_full  # type: ignore[method-assign]
             mgr.close()
+
+    def test_begin_shutdown_rejects_new_saves(self, tmp_path, mx):
+        """Once teardown starts, store workers must stop creating SSD writes."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "shutdown_rejects_saves",
+            max_size_bytes=1 << 30,
+        )
+        try:
+            mgr.begin_shutdown(deadline=time.monotonic() + 1.0)
+
+            block_hash = b"after_shutdown"
+            assert self._save_block(mgr, mx, block_hash) is False
+            assert mgr.accepting_writes is False
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_deadline_close_never_writes_inline_and_rolls_back_queue_failure(
+        self, tmp_path, mx
+    ):
+        """The one shutdown deadline must bound enqueue and writer join together."""
+        budget = SharedHotCacheBudget(1 << 20)
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "deadline_queue_full",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+            hot_cache_budget=budget,
+        )
+        block_hash = b"deadline_queue_full"
+        assert self._save_block(mgr, mx, block_hash) is True
+        assert mgr._hot_cache_get(block_hash) is not None
+        assert budget.total_bytes > 0
+
+        started = time.monotonic()
+        observed_put_timeouts: list[float | None] = []
+
+        def wait_until_queue_timeout(item, timeout=None, *args, **kwargs):
+            observed_put_timeouts.append(timeout)
+            time.sleep(timeout or 0)
+            raise queue.Full
+
+        try:
+            with (
+                patch.object(
+                    mgr._write_queue, "put", side_effect=wait_until_queue_timeout
+                ),
+                patch.object(mgr, "_write_block_file") as write_inline,
+            ):
+                mgr.close(deadline=started + 0.05)
+            elapsed = time.monotonic() - started
+
+            assert elapsed < 0.4
+            assert observed_put_timeouts
+            put_timeout = observed_put_timeouts[0]
+            assert put_timeout is not None
+            assert 0 < put_timeout <= 0.05
+            # close() may make one non-blocking sentinel attempt after the
+            # bounded data enqueue; it must not start another timed wait.
+            assert observed_put_timeouts[1:] in ([], [None])
+            write_inline.assert_not_called()
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_buffers
+            # The timed-out writer may still own manager state; close must not
+            # clear the hot tier underneath that live thread.
+            if mgr._writer_thread is not None and mgr._writer_thread.is_alive():
+                assert mgr._hot_cache_get(block_hash) is not None
+                assert budget.total_bytes > 0
+
+            # Once the writer exits it owns no live buffers, so deferred close
+            # cleanup must release both manager state and shared-budget ownership.
+            assert mgr._writer_thread is not None
+            mgr._writer_thread.join(timeout=2.0)
+            assert not mgr._writer_thread.is_alive()
+            assert mgr._hot_cache_get(block_hash) is None
+            assert budget.total_bytes == 0
+            with mgr._pending_write_hashes_lock:
+                assert mgr._pending_write_hashes == set()
+                assert mgr._pending_write_buffers == {}
+        finally:
+            if mgr._writer_thread is not None:
+                mgr._writer_thread.join(timeout=2.0)
+            mgr.close()
+
+    def test_expired_deadline_skips_enqueue_preparation(self, tmp_path, mx):
+        """An expired close budget must not start index or eviction work."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "expired_before_enqueue",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+        )
+        block_hash = b"expired_before_enqueue"
+        assert self._save_block(mgr, mx, block_hash) is True
+        entry = mgr._hot_cache_get(block_hash)
+        assert entry is not None
+
+        try:
+            with (
+                patch.object(mgr, "_enforce_size_limit_for_new_block") as enforce,
+                patch.object(mgr._index, "add", wraps=mgr._index.add) as index_add,
+                patch.object(
+                    mgr._write_queue, "put", wraps=mgr._write_queue.put
+                ) as put,
+            ):
+                assert (
+                    mgr._enqueue_ssd_write(
+                        block_hash,
+                        entry,
+                        blocking=True,
+                        deadline=time.monotonic() - 1.0,
+                    )
+                    is False
+                )
+
+            enforce.assert_not_called()
+            index_add.assert_not_called()
+            put.assert_not_called()
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_deadline_expiring_during_preparation_skips_index_and_queue(
+        self, tmp_path, mx
+    ):
+        """No index or queue mutation may start after preparation uses the budget."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "deadline_during_preparation",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+        )
+        block_hash = b"deadline_during_preparation"
+        assert self._save_block(mgr, mx, block_hash) is True
+        entry = mgr._hot_cache_get(block_hash)
+        assert entry is not None
+        deadline = time.monotonic() + 0.03
+
+        def consume_budget(*args, **kwargs):
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+
+        try:
+            with (
+                patch.object(
+                    mgr,
+                    "_enforce_size_limit_for_new_block",
+                    side_effect=consume_budget,
+                ) as enforce,
+                patch.object(mgr._index, "add", wraps=mgr._index.add) as index_add,
+                patch.object(
+                    mgr._write_queue, "put", wraps=mgr._write_queue.put
+                ) as put,
+            ):
+                assert (
+                    mgr._enqueue_ssd_write(
+                        block_hash,
+                        entry,
+                        blocking=True,
+                        deadline=deadline,
+                    )
+                    is False
+                )
+
+            enforce.assert_called_once()
+            index_add.assert_not_called()
+            put.assert_not_called()
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_deadline_expiring_during_disk_check_skips_eviction(self, tmp_path, mx):
+        """Size enforcement must not begin eviction after disk checks use the budget."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "deadline_during_disk_check",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+        )
+        block_hash = b"deadline_during_disk_check"
+        assert self._save_block(mgr, mx, block_hash) is True
+        entry = mgr._hot_cache_get(block_hash)
+        assert entry is not None
+        deadline = time.monotonic() + 0.03
+
+        def slow_disk_check():
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+            return 1
+
+        try:
+            with (
+                patch.object(
+                    mgr, "_get_effective_max_size", side_effect=slow_disk_check
+                ),
+                patch.object(mgr, "_tracked_ssd_size", return_value=2),
+                patch.object(
+                    mgr, "_evict_tracked_until_size", return_value=[]
+                ) as evict,
+            ):
+                assert (
+                    mgr._enqueue_ssd_write(
+                        block_hash,
+                        entry,
+                        blocking=True,
+                        deadline=deadline,
+                    )
+                    is False
+                )
+
+            evict.assert_not_called()
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_deadline_expiring_during_eviction_selection_stops_without_restore(
+        self, tmp_path, mx
+    ):
+        """Selected entries stay logically evicted without post-deadline work."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "deadline_during_eviction_selection",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+        )
+        block_hash = b"deadline_during_eviction_selection"
+        assert self._save_block(mgr, mx, block_hash) is True
+        entry = mgr._hot_cache_get(block_hash)
+        assert entry is not None
+        deadline = time.monotonic() + 0.03
+        source_index = MagicMock()
+        selected_metadata = MagicMock()
+
+        def slow_selection(*args, **kwargs):
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+            return [(source_index, selected_metadata)]
+
+        try:
+            with (
+                patch.object(mgr, "_get_effective_max_size", return_value=1),
+                patch.object(mgr, "_tracked_ssd_size", return_value=2),
+                patch.object(
+                    mgr,
+                    "_evict_tracked_until_size",
+                    side_effect=slow_selection,
+                ),
+                patch.object(mgr, "_unlink_evicted") as unlink,
+            ):
+                assert (
+                    mgr._enqueue_ssd_write(
+                        block_hash,
+                        entry,
+                        blocking=True,
+                        deadline=deadline,
+                    )
+                    is False
+                )
+
+            unlink.assert_not_called()
+            source_index.add.assert_not_called()
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_deadline_rollback_cannot_restore_after_writer_unlinks_file(
+        self, tmp_path, mx
+    ):
+        """A writer observing eviction must not be followed by stale restoration."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "deadline_writer_index_race",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+        )
+        block_hash = b"deadline_writer_index_race"
+        assert self._save_block(mgr, mx, block_hash) is True
+        entry = mgr._hot_cache_get(block_hash)
+        assert entry is not None
+        block_metadata = entry["block_metadata"]
+        mgr._index.add(block_metadata)
+        deadline = time.monotonic() + 0.05
+        writer_start = threading.Event()
+
+        def writer():
+            assert writer_start.wait(timeout=1.0)
+            return mgr._write_block_file(
+                block_hash,
+                entry["tensors_raw"],
+                entry["file_metadata"],
+                block_metadata.file_path,
+                source="deadline-race-test",
+            )
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                writer_future = executor.submit(writer)
+
+                def select_then_run_writer(*args, **kwargs):
+                    selected = mgr._index.remove(block_hash)
+                    assert selected is not None
+                    writer_start.set()
+                    assert writer_future.result(timeout=1.0) is True
+                    time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+                    return [(mgr._index, selected)]
+
+                with (
+                    patch.object(mgr, "_get_effective_max_size", return_value=1),
+                    patch.object(mgr, "_tracked_ssd_size", return_value=2),
+                    patch.object(
+                        mgr,
+                        "_evict_tracked_until_size",
+                        side_effect=select_then_run_writer,
+                    ),
+                ):
+                    mgr._enforce_size_limit_for_new_block(
+                        block_metadata.file_size,
+                        deadline=deadline,
+                    )
+
+            assert not block_metadata.file_path.exists()
+            assert not mgr._index.contains(block_hash)
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_unique_temp_files_and_rename_failure_keeps_committed_file(
+        self, tmp_path
+    ):
+        """Two managers writing the same hash must not collide on temp files, and
+        a rename failure must not unlink another manager's committed final file.
+
+        Regression for the deterministic ``<stem>_tmp.safetensors`` temp name
+        (namespace collision across managers) and for the old exception handler
+        that unlinked the FINAL path on any failure (a rename failure means
+        another manager may own/commit that file).
+        """
+        cache_dir = tmp_path / "unique_temp_collision"
+        block_hash = b"unique_temp_collision_hash"
+        mgr_a = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1 << 30)
+        mgr_b = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1 << 30)
+        tensors_raw = {"k0_raw": (bytes(range(16)), "float32", [4])}
+        metadata = {"test": "1"}
+        # Both managers resolve to the SAME final file path.
+        file_path_a = mgr_a._get_file_path(block_hash)
+        file_path_b = mgr_b._get_file_path(block_hash)
+        assert file_path_a == file_path_b
+
+        # Register the block in manager A's index so the success path does not
+        # treat it as "evicted during write" and unlink the fresh final file.
+        mgr_a._index.add(
+            PagedSSDBlockMetadata(
+                block_hash=block_hash,
+                file_path=file_path_a,
+                file_size=0,
+                token_count=0,
+                created_at=time.time(),
+                last_access=time.time(),
+                num_layers=1,
+            )
+        )
+
+        written_temps: list[str] = []
+
+        def recording_write(path, *args, **kwargs):
+            written_temps.append(str(path))
+            return _write_safetensors_no_mx(path, *args, **kwargs)
+
+        try:
+            # Manager A commits the final file (rename succeeds).
+            with patch(
+                "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
+                side_effect=recording_write,
+            ):
+                ok_a = mgr_a._write_block_file(
+                    block_hash,
+                    tensors_raw,
+                    metadata,
+                    file_path_a,
+                    source="unique-temp-test",
+                )
+            assert ok_a is True
+            assert file_path_a.exists()
+
+            # Manager B's rename fails; only its OWN temp file may be unlinked.
+            def failing_rename(src, dst):
+                raise OSError(errno.EACCES, "simulated rename failure")
+
+            with (
+                patch(
+                    "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
+                    side_effect=recording_write,
+                ),
+                patch(
+                    "omlx.cache.paged_ssd_cache.os.rename",
+                    side_effect=failing_rename,
+                ),
+            ):
+                ok_b = mgr_b._write_block_file(
+                    block_hash,
+                    tensors_raw,
+                    metadata,
+                    file_path_b,
+                    source="unique-temp-test",
+                )
+            assert ok_b is False
+
+            # The committed final file survives: the failure handler must not
+            # unlink another manager's file.
+            assert file_path_b.exists()
+
+            # Each manager used a DISTINCT temp file, and the failed manager's
+            # temp file was cleaned up.
+            assert len(written_temps) == 2
+            assert written_temps[0] != written_temps[1]
+            assert not Path(written_temps[1]).exists()
+            # Manager B left no index entry behind.
+            assert not mgr_b._index.contains(block_hash)
+        finally:
+            mgr_a.close(deadline=time.monotonic() + 1.0)
+            mgr_b.close(deadline=time.monotonic() + 1.0)
+
+    def test_close_None_reuses_installed_finite_deadline(self, tmp_path):
+        """close(deadline=None) on a manager with an installed finite deadline
+        must stay bounded (no unbounded inline write / fresh join).
+
+        Regression: a later no-argument close must not reset the manager back to
+        unbounded teardown after a finite deadline was already installed.
+        """
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "sticky_deadline",
+            max_size_bytes=1 << 30,
+        )
+        block_hash = b"sticky_deadline"
+        # Insert a fresh dirty pending-write entry deterministically so the flush
+        # loop must try to persist it, independent of the background writer's
+        # async timing and independent of whether the hot cache tier is enabled.
+        file_path = mgr._get_file_path(block_hash)
+        entry = {
+            "dirty": True,
+            "tensors_raw": {"k0_raw": (bytes(range(16)), "float32", [4])},
+            "file_metadata": {"test": "1"},
+            "block_metadata": PagedSSDBlockMetadata(
+                block_hash=block_hash,
+                file_path=file_path,
+                file_size=16,
+                token_count=0,
+                created_at=time.time(),
+                last_access=time.time(),
+                num_layers=1,
+            ),
+        }
+        with mgr._pending_write_hashes_lock:
+            mgr._pending_write_buffers[block_hash] = entry
+
+        # Install a finite persistence deadline, as begin_shutdown would.
+        installed = time.monotonic() + 5.0
+        mgr.begin_shutdown(deadline=installed)
+
+        enqueue_deadlines: list[float | None] = []
+
+        def record_enqueue(*args, **kwargs):
+            enqueue_deadlines.append(kwargs.get("deadline"))
+            return True
+
+        try:
+            with patch.object(mgr, "_enqueue_ssd_write", side_effect=record_enqueue):
+                mgr.close(deadline=None)
+
+            # The sticky finite deadline flows into the flush enqueue (it is the
+            # installed budget, not None), so no unbounded inline write can run.
+            assert enqueue_deadlines
+            assert enqueue_deadlines[0] is not None
+            assert enqueue_deadlines[0] == installed
+            # The installed deadline survives a None-deadline close.
+            assert mgr._persistence_deadline is not None
+        finally:
+            if mgr._writer_thread is not None:
+                mgr._writer_thread.join(timeout=2.0)
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_no_deadline_shutdown_flushes_admitted_block_without_hot_cache(
+        self, tmp_path, mx
+    ):
+        """Default no-hot-cache mode must retain an admitted direct write."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "no_deadline_direct_write",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=0,
+        )
+        block_hash = b"no_deadline_direct_write"
+        reached_put = threading.Event()
+        release_put = threading.Event()
+        original_put = mgr._put_ssd_write_item
+
+        def gated_put(item, *args, **kwargs):
+            reached_put.set()
+            assert release_put.wait(timeout=1.0)
+            return original_put(item, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(mgr, "_put_ssd_write_item", side_effect=gated_put),
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                future = executor.submit(self._save_block, mgr, mx, block_hash)
+                assert reached_put.wait(timeout=1.0)
+                mgr.begin_shutdown()
+                release_put.set()
+                assert future.result(timeout=1.0) is True
+
+            metadata = mgr._index.get(block_hash)
+            assert metadata is not None
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+                assert block_hash in mgr._pending_write_buffers
+            assert mgr._hot_cache_get(block_hash) is None
+            assert mgr.load_block(block_hash) is not None
+
+            mgr.close()
+            assert metadata.file_path.exists()
+            assert mgr._index.contains(block_hash)
+        finally:
+            release_put.set()
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_no_deadline_shutdown_flushes_dirty_victim_from_active_worker(
+        self, tmp_path, mx
+    ):
+        """A worker that passed admission must not lose its dirty eviction."""
+        entry_size = self._entry_size()
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "no_deadline_active_worker_eviction",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=entry_size + 100,
+        )
+        victim_hash = b"no_deadline_dirty_victim"
+        new_hash = b"no_deadline_active_worker"
+        assert self._save_block(mgr, mx, victim_hash) is True
+        victim = mgr._hot_cache_get(victim_hash)
+        assert victim is not None
+        victim_path = victim["block_metadata"].file_path
+        reached_hot_put = threading.Event()
+        release_hot_put = threading.Event()
+        original_hot_put = mgr._hot_cache_put
+
+        def gated_hot_put(block_hash, entry):
+            reached_hot_put.set()
+            assert release_hot_put.wait(timeout=1.0)
+            return original_hot_put(block_hash, entry)
+
+        try:
+            with (
+                patch.object(mgr, "_hot_cache_put", side_effect=gated_hot_put),
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                future = executor.submit(self._save_block, mgr, mx, new_hash)
+                assert reached_hot_put.wait(timeout=1.0)
+                mgr.begin_shutdown()
+                release_hot_put.set()
+                assert future.result(timeout=1.0) is True
+
+            mgr.close()
+            assert victim_path.exists()
+            assert mgr._index.contains(victim_hash)
+        finally:
+            release_hot_put.set()
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_finite_shutdown_rolls_back_enqueue_that_entered_before_signal(
+        self, tmp_path, mx
+    ):
+        """A finite shutdown must not defer provisional index/buffer state."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "finite_shutdown_enqueue_race",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+        )
+        block_hash = b"finite_shutdown_enqueue_race"
+        assert self._save_block(mgr, mx, block_hash) is True
+        entry = mgr._hot_cache_get(block_hash)
+        assert entry is not None
+        put_started = threading.Event()
+
+        def blocked_put(item, timeout=None, *args, **kwargs):
+            put_started.set()
+            assert mgr._persistence_shutdown.wait(timeout=1.0)
+            raise queue.Full
+
+        try:
+            with (
+                patch.object(mgr._write_queue, "put", side_effect=blocked_put),
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                future = executor.submit(mgr._enqueue_ssd_write, block_hash, entry)
+                assert put_started.wait(timeout=1.0)
+                mgr.begin_shutdown(deadline=time.monotonic() + 0.5)
+                assert future.result(timeout=1.0) is False
+
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_shutdown_interrupts_active_save_on_saturated_writer(self, tmp_path, mx):
+        """A producer already waiting for queue space must stop without inline I/O."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "shutdown_active_saturated_save",
+            max_size_bytes=1 << 30,
+        )
+        block_hash = b"active_saturated_save"
+        put_started = threading.Event()
+
+        def saturated_put(item, timeout=None, *args, **kwargs):
+            put_started.set()
+            time.sleep(min(timeout or 0, 0.05))
+            raise queue.Full
+
+        try:
+            with (
+                patch.object(mgr._write_queue, "put", side_effect=saturated_put),
+                patch.object(mgr, "_write_block_file") as write_inline,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                future = executor.submit(self._save_block, mgr, mx, block_hash)
+                assert put_started.wait(timeout=1.0)
+                mgr.begin_shutdown(deadline=time.monotonic() + 0.2)
+
+                assert future.result(timeout=0.4) is False
+                write_inline.assert_not_called()
+
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
+
+    def test_shutdown_interrupts_write_through_save_on_saturated_writer(
+        self, tmp_path, mx
+    ):
+        """Write-through producers observe the same bounded shutdown signal."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "shutdown_write_through_saturated_save",
+            max_size_bytes=1 << 30,
+            hot_cache_max_bytes=1 << 20,
+            hot_cache_write_through=True,
+        )
+        block_hash = b"write_through_saturated_save"
+        put_started = threading.Event()
+
+        def saturated_put(item, timeout=None, *args, **kwargs):
+            put_started.set()
+            time.sleep(min(timeout or 0, 0.05))
+            raise queue.Full
+
+        try:
+            with (
+                patch.object(mgr._write_queue, "put", side_effect=saturated_put),
+                patch.object(mgr, "_write_block_file") as write_inline,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                future = executor.submit(self._save_block, mgr, mx, block_hash)
+                assert put_started.wait(timeout=1.0)
+                mgr.begin_shutdown(deadline=time.monotonic() + 0.2)
+
+                assert future.result(timeout=0.4) is True
+                write_inline.assert_not_called()
+
+            assert mgr._hot_cache_get(block_hash) is not None
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close(deadline=time.monotonic() + 1.0)
 
     def test_eviction_does_not_enqueue_unlink_tasks(self, tmp_path, mx):
         """Force eviction; assert no ``("unlink", ...)`` items ever enter
