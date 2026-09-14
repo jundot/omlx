@@ -1,9 +1,17 @@
 /* Local serving history; independent of the high-frequency live stats poll. */
+if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('alpine:init', () => {
+        Alpine.store('usageHistory', {});
+    });
+}
 function usageHistory() {
     return {
         range: 'today', model: '', models: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
         timer: null, request: null,
         init() {
+            // Share this instance through the Alpine store so the heatmap
+            // card (a separate x-data scope, order-independent) can read it.
+            Alpine.store('usageHistory', this);
             this.$watch('mainTab', tab => {
                 if (tab === 'status') this.load();
             });

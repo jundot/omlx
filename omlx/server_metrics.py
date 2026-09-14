@@ -280,6 +280,55 @@ class ServerMetrics:
             "uptime_seconds": round(uptime, 1),
         }
 
+    def _rolling_snapshot(
+        self, model_id: str, hours: int
+    ) -> Dict[str, Any]:
+        """Snapshot over a rolling window from the hourly usage history.
+
+        History uses the same formulas as _build_snapshot (prefill excludes
+        cached tokens, generation TPS over generation seconds), so windowed
+        numbers are directly comparable with session/all-time ones. They can
+        still differ slightly: history records at request completion and has
+        its own enable timestamp.
+        """
+        with self._lock:
+            uptime = time.time() - self._start_time
+            history = self.usage_history
+        empty = self._build_snapshot(0, 0, 0, 0, 0.0, 0.0, uptime)
+        if history is None or not history.enabled or not history.available:
+            empty["history_available"] = False
+            return empty
+        try:
+            result = history.query(f"{hours}h", model=model_id, now=time.time())
+            if not result["enabled"] or not result["available"]:
+                empty["history_available"] = False
+                return empty
+            summary = result["totals"]
+        except Exception:  # noqa: BLE001 - window must never break /stats
+            logger.warning("Rolling stats query failed", exc_info=True)
+            empty["history_available"] = False
+            return empty
+        return {
+            "total_tokens_served": summary["total_tokens"],
+            "total_cached_tokens": summary["cached_tokens"],
+            "cache_efficiency": round(summary["cache_efficiency"] * 100, 1),
+            "total_prompt_tokens": summary["prompt_tokens"],
+            "total_completion_tokens": summary["completion_tokens"],
+            "total_requests": summary["requests"],
+            "avg_prefill_tps": (
+                round(summary["prefill_tps"], 1)
+                if summary["prefill_tps"] is not None
+                else 0.0
+            ),
+            "avg_generation_tps": (
+                round(summary["generation_tps"], 1)
+                if summary["generation_tps"] is not None
+                else 0.0
+            ),
+            "uptime_seconds": round(uptime, 1),
+            "history_available": True,
+        }
+
     def get_snapshot(
         self, model_id: str = "", scope: str = "session"
     ) -> Dict[str, Any]:
@@ -288,8 +337,12 @@ class ServerMetrics:
         Args:
             model_id: If provided and tracked, return per-model metrics.
                       Otherwise return global aggregate.
-            scope: "session" for current session, "alltime" for persisted totals.
+            scope: "session" for current session, "alltime" for persisted
+                   totals, or "12h"/"24h" for rolling windows built from
+                   the hourly usage history.
         """
+        if scope in ("12h", "24h"):
+            return self._rolling_snapshot(model_id, int(scope[:-1]))
         with self._lock:
             now = time.time()
             uptime = now - self._start_time

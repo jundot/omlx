@@ -1129,3 +1129,200 @@
             animation-iteration-count: 1 !important;
         }
     }
+
+
+/* ===== Status tab flat-grid layout (local patch v2) ===== */
+/* One CSS grid with fixed 8px implicit rows; status-layout.js places every
+   card explicitly (grid-column from width mode, grid-row from a masonry
+   cursor over --omlx-cols columns). Card heights are content-derived, so
+   rows only exist to give vertical placement a common unit. */
+.omlx-status-layout {
+    display: grid;
+    grid-template-columns: repeat(var(--omlx-cols, 2), minmax(0, 1fr));
+    grid-auto-rows: 8px;
+    column-gap: 2rem;
+    /* Row spans include this gap (GAP in status-layout.js); changing one
+       without the other breaks vertical rhythm. */
+    row-gap: 0;
+    align-items: start;
+}
+@media (max-width: 1023.98px) {
+    /* Single-column stack: JS stops placing, auto flow takes over. */
+    .omlx-status-layout {
+        grid-template-columns: minmax(0, 1fr);
+        grid-auto-rows: auto;
+    }
+    .omlx-status-layout > .omlx-card {
+        grid-column: 1 / -1 !important;
+        grid-row: auto !important;
+    }
+}
+.omlx-card {
+    position: relative;
+    min-width: 0;
+    margin-bottom: 2rem; /* baked into the row-span math; see GAP above */
+}
+/* Spacing is the grid gap + card margin; neutralize the legacy mb-8/mt-8
+   the wrapped sections carry (an inner bottom margin would inflate the
+   measured height and the row span, leaving a double gap). */
+.omlx-card > *:last-child {
+    margin-top: 0;
+    margin-bottom: 0;
+}
+.omlx-drag-handle {
+    position: absolute;
+    top: 0.45rem;
+    left: 0.35rem;
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.15rem;
+    height: 1.75rem;
+    border-radius: 0.35rem;
+    color: var(--text-muted, #94a3b8);
+    opacity: 0.45; /* always faintly visible so the grip is discoverable */
+    cursor: grab;
+    touch-action: none; /* pointer-event dragging must own touch gestures */
+    transition: opacity 150ms ease, background-color 150ms ease;
+}
+.omlx-card:hover > .omlx-drag-handle {
+    opacity: 0.7;
+}
+.omlx-drag-handle:hover {
+    opacity: 1 !important;
+    background-color: var(--bg-tertiary, #f1f5f9);
+}
+.omlx-drag-handle:active {
+    cursor: grabbing;
+}
+.omlx-card.omlx-dragging {
+    opacity: 0.45;
+}
+.omlx-drag-active .omlx-drag-handle {
+    opacity: 0.7;
+}
+.omlx-drag-active {
+    user-select: none;
+    cursor: grabbing !important;
+}
+
+/* Per-card width-cycle button, opposite corner from the drag grip. */
+.omlx-width-btn {
+    position: absolute;
+    top: 0.45rem;
+    right: 0.35rem;
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.6rem;
+    height: 1.75rem;
+    border-radius: 0.35rem;
+    color: var(--text-muted, #94a3b8);
+    background: transparent;
+    border: none;
+    opacity: 0.35;
+    cursor: pointer;
+    transition: opacity 150ms ease, background-color 150ms ease;
+}
+.omlx-card:hover > .omlx-width-btn {
+    opacity: 0.7;
+}
+.omlx-width-btn:hover {
+    opacity: 1 !important;
+    background-color: var(--bg-tertiary, #f1f5f9);
+}
+/* Cards in a narrow slot: keep dense content readable. These replace the
+   v1 .omlx-status-col-scoped fixes; [data-span] is set by the layout JS
+   and equals 1 whenever a card really is one column wide. */
+.omlx-card[data-span="1"][data-card="stats-cards"] .sm\:p-8 { padding: 1.25rem; }
+.omlx-card[data-span="1"][data-card="stats-cards"] .text-5xl,
+.omlx-card[data-span="1"][data-card="stats-cards"] .text-3xl,
+.omlx-card[data-span="1"][data-card="stats-cards"] .text-2xl {
+    font-size: clamp(1rem, 1.3vw, 1.4rem);
+    overflow-wrap: anywhere;
+}
+.omlx-card > div > .bg-neutral-100,
+.omlx-card > section > .bg-neutral-100 {
+    flex-wrap: wrap;
+}
+.omlx-card[data-span="1"][data-card="usage"] .lg\:grid-cols-5 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.omlx-card[data-span="1"][data-card="usage"] .text-2xl {
+    font-size: clamp(1rem, 1.4vw, 1.5rem);
+    white-space: nowrap;
+}
+.omlx-card[data-span="1"][data-card="runtime-cache"] .bg-neutral-100 .whitespace-nowrap {
+    white-space: normal;
+}
+
+/* Layout settings popover (columns + page width), anchored in the header. */
+.omlx-layout-popover {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 0.5rem);
+    z-index: 40;
+    width: 17rem;
+    background: var(--bg-primary, #fff);
+    border: 1px solid var(--border-normal, #e2e8f0);
+    border-radius: 0.75rem;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, 0.14);
+    padding: 1rem;
+    font-size: 0.75rem;
+}
+[data-theme="dark"] .omlx-layout-popover {
+    background: var(--bg-primary, #18181b);
+    border-color: var(--border-normal, #3f3f46);
+}
+.omlx-layout-popover .omlx-seg {
+    display: flex;
+    border: 1px solid var(--border-normal, #e2e8f0);
+    border-radius: 0.5rem;
+    overflow: hidden;
+}
+[data-theme="dark"] .omlx-layout-popover .omlx-seg {
+    border-color: var(--border-normal, #3f3f46);
+}
+.omlx-layout-popover .omlx-seg button {
+    flex: 1;
+    padding: 0.35rem 0;
+    text-align: center;
+    color: var(--text-muted, #64748b);
+    transition: background-color 120ms ease, color 120ms ease;
+}
+.omlx-layout-popover .omlx-seg button + button {
+    border-left: 1px solid var(--border-normal, #e2e8f0);
+}
+[data-theme="dark"] .omlx-layout-popover .omlx-seg button + button {
+    border-left-color: var(--border-normal, #3f3f46);
+}
+.omlx-layout-popover .omlx-seg button.active {
+    background: #171717;
+    color: #fff;
+}
+[data-theme="dark"] .omlx-layout-popover .omlx-seg button.active {
+    background: #fafafa;
+    color: #171717;
+}
+.omlx-layout-popover input[type="range"] {
+    width: 100%;
+    accent-color: #171717;
+}
+
+/* Dark theme handles */
+[data-theme="dark"] .omlx-drag-handle:hover {
+    background-color: var(--bg-tertiary, #2d2d32);
+}
+[data-theme="dark"] .omlx-width-btn:hover {
+    background-color: var(--bg-tertiary, #2d2d32);
+}
+
+/* Page shell width: user-settable cap (Settings popover -> page width).
+   The four graduated v1 media queries are replaced by one variable so the
+   dashboard cannot silently ignore the choice at unusual viewport sizes. */
+.omlx-page-shell.max-w-7xl {
+    max-width: min(100% - 3rem, var(--omlx-max-width, 1740px));
+}
+/* end status tab flat-grid layout v2 */
