@@ -16,6 +16,7 @@ given, resolved on the calling thread.
 """
 
 import threading
+from contextlib import suppress
 
 import mlx.core as mx
 from mlx_lm.generate import generation_stream
@@ -31,6 +32,20 @@ _default_generation_stream = generation_stream
 # inference thread concurrently issues a reclaim-triggering mx op.
 # See: https://github.com/jundot/omlx/issues/1106
 _mx_buffer_access_lock = threading.RLock()
+
+
+def clear_thread_streams() -> None:
+    """Release every MLX stream owned by the current worker thread.
+
+    MLX keeps a per-thread stream registry. Synchronizing and clearing the
+    buffer cache does not remove those entries, so a worker that touched MLX
+    must call ``mx.clear_streams()`` immediately before it exits.
+    """
+    # A ThreadPoolExecutor starts lazily. If this is the worker's first task,
+    # no default stream exists yet and there is nothing to synchronize.
+    with suppress(RuntimeError):
+        mx.synchronize()
+    mx.clear_streams()
 
 
 def _sync_and_clear_cache(stream=None):

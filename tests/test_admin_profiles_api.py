@@ -416,9 +416,7 @@ class TestApplySnapshotSemantics:
             },
         )
         r = c.post("/admin/api/models/model-a/profiles/p/apply")
-        assert r.json()["settings"]["chat_template_kwargs"] == {
-            "enable_thinking": True
-        }
+        assert r.json()["settings"]["chat_template_kwargs"] == {"enable_thinking": True}
 
         c.put(
             "/admin/api/models/model-a/profiles/p",
@@ -1012,3 +1010,73 @@ class TestExposeAsModelAPI:
         assert "modal.model_settings.profiles.expose_as_model" in html
         assert "modal.model_settings.profiles.exposed_as" in en
         assert "modal.model_settings.profiles.expose_engine_fields_hint" in en
+
+
+@pytest.mark.parametrize("operation", ["create", "update", "apply"])
+@pytest.mark.parametrize("reason", ["hardware", "architecture", "conflict", "floor"])
+def test_a8_profile_validation_preserves_settings(
+    client, monkeypatch, operation, reason
+):
+    c, mgr = client
+    entry = admin_routes._get_engine_pool().get_entry("model-a")
+    entry.config_model_type = "llama" if reason == "architecture" else "qwen3_5"
+    monkeypatch.setattr(
+        admin_routes, "_oq_a8_kernels_available", lambda: reason != "hardware"
+    )
+    settings = {"qwen35_oq_a8_enabled": True}
+    if reason == "conflict":
+        settings["qwen35_ane_prefill_enabled"] = True
+    if reason == "floor":
+        settings["qwen35_oq_a8_min_tokens"] = 0
+    mgr.set_settings("model-a", ModelSettings())
+    if operation != "create":
+        mgr.save_profile(
+            "model-a", "a8", "A8", "", settings=settings if operation == "apply" else {}
+        )
+    before = mgr.get_settings("model-a").to_dict()
+    profiles = mgr.list_profiles("model-a")
+    url = "/admin/api/models/model-a/profiles"
+    if operation == "create":
+        response = c.post(
+            url, json={"name": "a8", "display_name": "A8", "settings": settings}
+        )
+    elif operation == "update":
+        response = c.put(url + "/a8", json={"settings": settings})
+    else:
+        response = c.post(url + "/a8/apply")
+    assert response.status_code == 400, response.text
+    assert mgr.get_settings("model-a").to_dict() == before
+    assert mgr.list_profiles("model-a") == profiles
+
+
+def test_a8_profile_apply_checks_merged_ane_conflict(client, monkeypatch):
+    c, mgr = client
+    admin_routes._get_engine_pool().get_entry("model-a").config_model_type = "qwen3_5"
+    monkeypatch.setattr(admin_routes, "_oq_a8_kernels_available", lambda: True)
+    mgr.set_settings("model-a", ModelSettings(qwen35_ane_prefill_enabled=True))
+    mgr.save_profile("model-a", "a8", "A8", "", settings={"qwen35_oq_a8_enabled": True})
+    response = c.post("/admin/api/models/model-a/profiles/a8/apply")
+    assert response.status_code == 400
+    assert mgr.get_settings("model-a").qwen35_ane_prefill_enabled
+    assert not mgr.get_settings("model-a").qwen35_oq_a8_enabled
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_6_moe", "qwen3_8"])
+def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model_type):
+    c, mgr = client
+    admin_routes._get_engine_pool().get_entry("model-a").config_model_type = model_type
+    monkeypatch.setattr(admin_routes, "_oq_a8_kernels_available", lambda: True)
+    url = "/admin/api/models/model-a/profiles"
+    assert (
+        c.post(
+            url,
+            json={
+                "name": "a8",
+                "display_name": "A8",
+                "settings": {"qwen35_oq_a8_enabled": True},
+            },
+        ).status_code
+        == 200
+    )
+    assert c.post(url + "/a8/apply").status_code == 200
+    assert mgr.get_settings("model-a").qwen35_oq_a8_enabled

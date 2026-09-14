@@ -162,6 +162,32 @@ class TestUtilsPatch:
             is True
         )
 
+    @pytest.mark.parametrize("location", ["quantization", "quantization_config", "text_quantization", "text_quantization_config"])
+    @pytest.mark.parametrize("bits", [2, 3, 3.5])
+    def test_nested_sub4_override_disables_native_attention(self, location, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        quantization = {"bits": 4, "overrides": [{"layers.0.mlp": {"bits": bits}}]}
+        config = {"model_type": "deepseek_v4"}
+        if location.startswith("text_"):
+            config["text_config"] = {location[5:]: quantization}
+        else:
+            config[location] = quantization
+        assert _native_ratio128_attention_enabled(config) is False
+
+    @pytest.mark.parametrize("bits", [4, 8, True, False, None, "3"])
+    def test_nested_non_sub4_values_keep_existing_dispatch(self, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        config = {"model_type": "deepseek_v4", "quantization": {"layers": {"bits": bits}}}
+        assert _native_ratio128_attention_enabled(config) is True
+        config = {"model_type": "qwen3", "quantization": {"bits": 2}}
+        assert _native_ratio128_attention_enabled(config) is True
+
     @pytest.mark.parametrize(
         ("bits", "expected_enabled"),
         ((4, True), (2, False)),
@@ -2370,3 +2396,98 @@ class TestIndexerFallbackTiling:
         _, dm = self._reduce_and_ref()
         assert 64 * 512 * dm._INDEXER_POOL_TILE < 2**31
         assert dm._INDEXER_MAX_ELEMS < 2**31
+
+
+class TestAffineBlockRouteThreshold:
+    """Affine blocks require enough routes to amortize their setup cost."""
+
+    def _linear(self):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        import mlx.core as mx
+
+        linear = sl.QuantizedSwitchLinear(
+            64, 64, num_experts=2, bias=False, group_size=64, bits=2
+        )
+        # affine metadata in the activation dtype, as a loaded oQ checkpoint has
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        if linear.get("biases") is None:
+            linear.biases = mx.zeros_like(linear.scales)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+        return linear
+
+    def test_affine_blocks_engage_only_from_the_route_threshold(self, monkeypatch):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl.glm_fast, "has_symbol", lambda name: True)
+        linear = self._linear()
+        below = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES - 1, 1, 64), dtype=mx.bfloat16)
+        at = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES, 1, 64), dtype=mx.bfloat16)
+        assert linear._can_use_affine_blocks(below, sorted_indices=True) is False
+        assert linear._can_use_affine_blocks(at, sorted_indices=True) is True
+        # unsorted routes never take the block path, whatever the count
+        assert linear._can_use_affine_blocks(at, sorted_indices=False) is False
+
+    def test_thresholds_default_to_the_measured_crossovers(self):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        assert sl._SORT_MIN_ROUTES == 32
+        assert sl._AFFINE_NATIVE_MIN_ROUTES == 1024
+
+
+@pytest.mark.parametrize("family", ["glu", "mlp"])
+@pytest.mark.parametrize(
+    "mode,bits,group,sort_at_32",
+    [
+        ("affine", 2, 64, True),
+        ("affine", 4, 64, False),
+        ("mxfp4", 4, 32, False),
+        (None, None, None, False),
+    ],
+)
+@pytest.mark.parametrize("tokens", [4, 8])
+def test_switch_sorting_preserves_other_formats(
+    monkeypatch, family, mode, bits, group, sort_at_32, tokens
+):
+    import mlx.core as mx
+
+    from omlx.patches.deepseek_v4 import switch_layers as sl
+
+    mx.random.seed(3409)
+    if family == "glu":
+        model = sl.SwitchGLU(128, 64, 8)
+        names = ("gate_proj", "up_proj", "down_proj")
+    else:
+        model = sl.SwitchMLP(128, 64, 8)
+        names = ("fc1", "fc2")
+    if mode is not None:
+        for name in names:
+            layer = getattr(model, name).to_quantized(
+                group_size=group, bits=bits, mode=mode
+            )
+            if mode == "affine":
+                layer.scales = layer.scales.astype(mx.float16)
+                layer.biases = layer.biases.astype(mx.float16)
+            setattr(model, name, layer)
+
+    hidden = (mx.random.normal((1, tokens, 128)) * 0.1).astype(mx.float16)
+    indices = mx.random.randint(0, 8, (1, tokens, 8)).astype(mx.uint32)
+    calls = []
+    original_sort = sl._gather_sort
+
+    def tracked_sort(x, indices):
+        calls.append(indices.size)
+        return original_sort(x, indices)
+
+    monkeypatch.setattr(sl, "_gather_sort", tracked_sort)
+    actual = model(hidden, indices)
+    mx.eval(actual)
+    should_sort = tokens == 8 or sort_at_32
+    assert calls == ([tokens * 8] if should_sort else [])
+
+    monkeypatch.setattr(sl, "_sort_threshold", lambda *args: 10**9)
+    expected = model(hidden, indices)
+    mx.eval(expected)
+    assert mx.allclose(actual, expected, rtol=1e-2, atol=1e-3).item()

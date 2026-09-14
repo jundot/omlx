@@ -302,6 +302,45 @@ class TestBoundarySnapshotSSDStore:
         # Session directory still exists (recreated).
         assert self.store._snapshot_dir.exists()
 
+    def test_take_staged_file_leaves_request_dir_for_queued_writes(self):
+        """Promoting one boundary must not remove the directory a queued write stages into."""
+        from unittest.mock import patch
+
+        from omlx.cache import boundary_snapshot_store as mod
+
+        request_id = "req-staging"
+        last_tmp = self.store._file_path(request_id, 3072)
+        last_tmp = last_tmp.with_name(last_tmp.stem + "_tmp.safetensors")
+        original_write = mod._write_safetensors_no_mx
+        promoted: list[Path | None] = []
+
+        def promote_earlier_boundaries_first(path, tensors_raw, metadata):
+            # The writer has just created the request directory and is about
+            # to stage the last boundary; the store thread promotes the two
+            # earlier boundaries at exactly that moment.
+            if Path(path) == last_tmp and not promoted:
+                promoted.append(
+                    self.store.take_staged_file(request_id, 1024, timeout_s=5.0)
+                )
+                promoted.append(
+                    self.store.take_staged_file(request_id, 2048, timeout_s=5.0)
+                )
+            return original_write(path, tensors_raw, metadata)
+
+        with patch.object(
+            mod,
+            "_write_safetensors_no_mx",
+            side_effect=promote_earlier_boundaries_first,
+        ):
+            for token_count in (1024, 2048, 3072):
+                assert self.store.save(
+                    request_id, token_count, [MagicMock()], _mock_extract_cache_states
+                )
+            staged = self.store.take_staged_file(request_id, 3072, timeout_s=5.0)
+
+        assert promoted and all(path is not None for path in promoted)
+        assert staged is not None and staged.is_file()
+
     def test_take_staged_file_survives_concurrent_cleanup_all(self):
         """Caller-owned promotion files must outlive session cleanup."""
         import threading
@@ -368,6 +407,32 @@ class TestBoundarySnapshotSSDStore:
         assert loaded is not None
         assert len(loaded) == 4
         assert loaded[1]["class_name"] == "ArraysCache"
+
+    def test_invalid_disk_metadata_is_rejected_before_materialization(
+        self, monkeypatch
+    ):
+        from omlx.cache import boundary_snapshot_store as mod
+
+        request_id = "invalid-metadata"
+        token_count = 1024
+        file_path = self.store._file_path(request_id, token_count)
+        file_path.parent.mkdir(parents=True)
+        mx.save_safetensors(
+            str(file_path),
+            {"payload": mx.ones((8,), dtype=mx.float32)},
+            metadata={
+                "num_layers": "0",
+                "layer_info": "[]",
+                "gdn_sidecar_format_version": "999",
+            },
+        )
+
+        eval_mock = MagicMock(side_effect=AssertionError("unexpected mx.eval"))
+        monkeypatch.setattr(mod.mx, "eval", eval_mock)
+
+        assert self.store.load(request_id, token_count) is None
+        assert self.store.load_file(file_path) is None
+        eval_mock.assert_not_called()
 
     def test_multiple_snapshots_per_request(self):
         """Multiple token boundaries for the same request."""

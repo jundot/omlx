@@ -36,6 +36,8 @@ final class ModelSettingsScreenVM {
         case reasoningParser
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
+        case qwen35AnePrefillSharedFraction
+        case qwen35OqA8Enabled, qwen35OqA8MinTokens
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
         case qwen35AnePrefillTailPaddingMinTokens
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
@@ -267,9 +269,17 @@ final class ModelSettingsScreenVM {
     var turboquantKvEnabled: Bool = false
     var turboquantKvBits: String = "4"
 
+    // Experimental: oQ mixed-bit INT8-activation prefill kernels. There is no
+    // layout to choose: the kernel reads the checkpoint's own packed weight
+    // stream, so it is both the fastest option and the one that costs no extra
+    // memory. The tile is picked per bit width by the dispatcher.
+    var qwen35OqA8Enabled: Bool = false
+    var qwen35OqA8MinTokens: String = "128"
+
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
     // These defaults are the measured M3 Ultra optimum for the 2,048-token
     // benchmark path. The feature itself remains opt-in.
+    var qwen35AnePrefillSharedFraction = "1"
     var qwen35AnePrefillEnabled: Bool = false
     var qwen35AnePrefillSequenceLength: String = "2048"
     var qwen35AnePrefillTailPaddingMinTokens: String = "0"
@@ -372,6 +382,21 @@ final class ModelSettingsScreenVM {
         return Self.diffusionConfigModelTypes.contains(type)
     }
 
+    var thinkingForced: Bool { model?.thinkingForced == true }
+
+    static func aneFractionOptions(current: String, presets: [Double]) -> [(String, String)] {
+        let value = Double(current)
+        var options = presets.map { ($0 == value ? current : String($0), $0.formatted(.percent.precision(.fractionLength(0)))) }
+        if let value, !presets.contains(value) {
+            options.insert((current, value.formatted(.percent.precision(.fractionLength(0...2)))), at: 0)
+        }
+        return options
+    }
+
+    var reasoningEffortPresets: [String] {
+        model?.reasoningEffortOptions ?? []
+    }
+
     var isQwen4Exp: Bool {
         (model?.configModelType ?? "")
             .lowercased()
@@ -390,6 +415,9 @@ final class ModelSettingsScreenVM {
         case .forceSampling, .reasoningParser:
             return true
         case .turboquantKvEnabled, .turboquantKvBits:
+            return true
+        case .qwen35AnePrefillSharedFraction,
+             .qwen35OqA8Enabled, .qwen35OqA8MinTokens:
             return true
         case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength,
              .qwen35AnePrefillTailPaddingMinTokens:
@@ -537,10 +565,13 @@ final class ModelSettingsScreenVM {
                 )
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
+                self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
+                self.qwen35OqA8Enabled = s?.qwen35OqA8Enabled ?? false
+                self.qwen35OqA8MinTokens = s?.qwen35OqA8MinTokens.map(String.init) ?? "128"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
                 self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
-                self.qwen35AnePrefillFraction = s?.qwen35AnePrefillFraction.map { Self.formatPct($0) } ?? "0.53"
+                self.qwen35AnePrefillFraction = String(s?.qwen35AnePrefillFraction ?? m.anePrefillDefaultFraction ?? 0.53)
                 self.qwen35AnePrefillMaxLayers = s?.qwen35AnePrefillMaxLayers.map(String.init) ?? "64"
                 self.qwen35AnePrefillDualAne = s?.qwen35AnePrefillDualAne ?? true
                 self.qwen35AnePrefillGdn = s?.qwen35AnePrefillGdn ?? true
@@ -690,12 +721,20 @@ final class ModelSettingsScreenVM {
             patch.forcedCtKwargs = pair.forced ?? []
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
+        case .qwen35AnePrefillSharedFraction:
+            guard validateAneWorkingSettings() else { return }
+            patch.qwen35AnePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
+        case .qwen35OqA8Enabled:  patch.qwen35OqA8Enabled = qwen35OqA8Enabled
+        case .qwen35OqA8MinTokens:
+            guard let value = Int(qwen35OqA8MinTokens), value >= 1 else {
+                lastError = "oQ A8 minimum prompt tokens must be a positive integer."
+                return
+            }
+            patch.qwen35OqA8MinTokens = value
         case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
-            switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
-            case .success(let value): patch.qwen35AnePrefillSequenceLength = value
-            case .failure(let error): lastError = error.message; return
-            }
+            guard validateAneWorkingSettings() else { return }
+            patch.qwen35AnePrefillSequenceLength = Int(qwen35AnePrefillSequenceLength)
         case .qwen35AnePrefillTailPaddingMinTokens:
             switch QwenAneSettingsValidator.tailPadding(
                 qwen35AnePrefillTailPaddingMinTokens,
@@ -705,13 +744,8 @@ final class ModelSettingsScreenVM {
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillFraction:
-            switch QwenAneSettingsValidator.mlpFraction(
-                qwen35AnePrefillFraction,
-                cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuFraction : "0"
-            ) {
-            case .success(let value): patch.qwen35AnePrefillFraction = value
-            case .failure(let error): lastError = error.message; return
-            }
+            guard validateAneWorkingSettings() else { return }
+            patch.qwen35AnePrefillFraction = Double(qwen35AnePrefillFraction)
         case .qwen35AnePrefillMaxLayers:
             switch QwenAneSettingsValidator.mlpLayers(qwen35AnePrefillMaxLayers) {
             case .success(let value): patch.qwen35AnePrefillMaxLayers = value
@@ -811,6 +845,7 @@ final class ModelSettingsScreenVM {
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         }
+        if thinkingForced { patch.enableThinking = .some(nil) }
         do {
             _ = try await client.updateModelSettings(id: modelID, patch: patch)
             self.lastError = nil
@@ -884,7 +919,20 @@ final class ModelSettingsScreenVM {
     func applyANETuningRecommendation() {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
         qwen35AnePrefillEnabled = recommendation.enabled
+        if recommendation.enabled {
+            // The two prefill accelerators are mutually exclusive, and the
+            // tuner's recommendation is the more specific answer here: it was
+            // measured on this model's own layers.
+            qwen35OqA8Enabled = false
+        }
         qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
+        if let fraction = recommendation.mlpFraction { qwen35AnePrefillFraction = String(fraction) }
+        if recommendation.backend == "k2" {
+            if let fraction = recommendation.sharedFraction { qwen35AnePrefillSharedFraction = String(fraction) }
+            profileDirty = true
+            lastError = nil
+            return
+        }
         qwen35AnePrefillTailPaddingMinTokens = String(
             recommendation.tailPaddingMinTokens ?? 0
         )
@@ -919,6 +967,7 @@ final class ModelSettingsScreenVM {
     // MARK: - Chat-template kwarg list mutation
 
     func addKwarg(_ kind: ChatTemplateKwargEntryKind) {
+        if thinkingForced && kind == .enableThinking { return }
         if isDiffusionModel {
             switch kind {
             case .enableThinking, .reasoningEffort:
@@ -930,7 +979,7 @@ final class ModelSettingsScreenVM {
         let defaultValue: String
         switch kind {
         case .enableThinking:  defaultValue = "true"
-        case .reasoningEffort: defaultValue = "low"
+        case .reasoningEffort: defaultValue = model?.reasoningEffortDefault ?? ""
         case .custom:          defaultValue = ""
         }
         chatTemplateEntries.append(
@@ -1005,13 +1054,12 @@ final class ModelSettingsScreenVM {
         return Self.dsaConfigModelTypes.contains(type)
     }
 
-    var isQwen35AnePrefillModel: Bool {
-        guard let rawType = model?.configModelType else { return false }
-        let type = rawType.lowercased().replacingOccurrences(of: "-", with: "_")
-        return type.hasPrefix("qwen3_5")
-            || type.hasPrefix("qwen3_6")
-            || type.hasPrefix("qwen3_8")
+    var isQwenOqA8Model: Bool {
+        let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
+
+    var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
     /// Native Lightning MTP can't co-exist with the other speculative
     /// decoders. TurboQuant KV supports its decode-shaped multi-row verify
@@ -1028,6 +1076,25 @@ final class ModelSettingsScreenVM {
                           comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
         return nil
+    }
+
+    /// The oQ INT8-activation kernels and ANE prefill both wrap the same
+    /// Qwen3.5 MLP call, so enabling both leaves whichever patched last in
+    /// charge and the other silently inert. The server rejects the pair; these
+    /// mirror that so the losing toggle disables itself and says why instead
+    /// of the save returning a 400 with the switch already flipped.
+    var qwen35OqA8ConflictReason: String? {
+        guard qwen35AnePrefillEnabled else { return nil }
+        return String(localized: "settings.qwen_oq_a8.conflict.ane",
+                      defaultValue: "Disable Qwen ANE Prefill before enabling INT8 activation prefill.",
+                      comment: "Tooltip / sublabel shown when INT8 activation prefill can't be enabled because ANE prefill is on")
+    }
+
+    var qwen35AnePrefillConflictReason: String? {
+        guard qwen35OqA8Enabled else { return nil }
+        return String(localized: "settings.qwen_ane.conflict.oq_a8",
+                      defaultValue: "Disable Qwen INT8 Activation Prefill before enabling ANE prefill.",
+                      comment: "Tooltip / sublabel shown when ANE prefill can't be enabled because INT8 activation prefill is on")
     }
 
     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
@@ -1124,7 +1191,7 @@ final class ModelSettingsScreenVM {
 
         // Universal — thinking / tool / reasoning
         if !isDiffusion {
-            putBool(ProfileSettingsKey.enableThinking, enableThinking)
+            if !thinkingForced { putBool(ProfileSettingsKey.enableThinking, enableThinking) }
             putBool(ProfileSettingsKey.thinkingBudgetEnabled, thinkingBudgetEnabled)
             putInt(ProfileSettingsKey.thinkingBudgetTokens, thinkingBudgetTokens)
             putBool(ProfileSettingsKey.forceSampling, forceSampling)
@@ -1156,11 +1223,20 @@ final class ModelSettingsScreenVM {
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
             }
+            putBool(ProfileSettingsKey.qwen35OqA8Enabled, qwen35OqA8Enabled)
+            if qwen35OqA8Enabled {
+                putInt(ProfileSettingsKey.qwen35OqA8MinTokens, qwen35OqA8MinTokens)
+            }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {
                 putInt(ProfileSettingsKey.qwen35AnePrefillSequenceLength, qwen35AnePrefillSequenceLength)
-                putInt(ProfileSettingsKey.qwen35AnePrefillTailPaddingMinTokens, qwen35AnePrefillTailPaddingMinTokens)
                 putDouble(ProfileSettingsKey.qwen35AnePrefillFraction, qwen35AnePrefillFraction)
+                if model?.anePrefillBackend == "k2" {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillSharedFraction, qwen35AnePrefillSharedFraction)
+                }
+            }
+            if qwen35AnePrefillEnabled && isQwen35AnePrefillModel {
+                putInt(ProfileSettingsKey.qwen35AnePrefillTailPaddingMinTokens, qwen35AnePrefillTailPaddingMinTokens)
                 putInt(ProfileSettingsKey.qwen35AnePrefillMaxLayers, qwen35AnePrefillMaxLayers)
                 putBool(ProfileSettingsKey.qwen35AnePrefillDualAne, qwen35AnePrefillDualAne)
                 putBool(ProfileSettingsKey.qwen35AnePrefillGdn, qwen35AnePrefillGdn)
@@ -1352,7 +1428,7 @@ final class ModelSettingsScreenVM {
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
         let cleanName = name.trimmingCharacters(in: .whitespaces)
         guard !cleanName.isEmpty, scope != .preset else { return }
-        guard validateQwenAneWorkingSettings() else { return }
+        guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1399,7 +1475,7 @@ final class ModelSettingsScreenVM {
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         guard scope != .preset else { return }
-        guard validateQwenAneWorkingSettings() else { return }
+        guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1437,8 +1513,17 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    private func validateQwenAneWorkingSettings() -> Bool {
+    private func validateAneWorkingSettings() -> Bool {
         guard qwen35AnePrefillEnabled else { return true }
+        if model?.anePrefillBackend == "k2" {
+            guard let width = Int(qwen35AnePrefillSequenceLength), width >= 32, width % 32 == 0,
+                  let dense = Double(qwen35AnePrefillFraction), dense > 0, dense <= 1,
+                  let shared = Double(qwen35AnePrefillSharedFraction), shared >= 0, shared <= 1 else {
+                lastError = "ANE requires a tile divisible by 32, dense share in (0, 1], and shared share in [0, 1]."
+                return false
+            }
+            return true
+        }
 
         switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
         case .success: break

@@ -28,6 +28,7 @@ from omlx.settings import (
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
+    UsageSettings,
     burst_decode_env,
     get_settings,
     get_ssd_capacity,
@@ -797,6 +798,58 @@ class TestMCPSettings:
         assert "garbage-tail" in backups[0].read_text()
 
 
+class TestUsageSettings:
+    """Tests for UsageSettings and the usage_history toggle."""
+
+    def test_default_values(self):
+        assert UsageSettings().usage_history is True
+        assert GlobalSettings().usage.usage_history is True
+
+    def test_to_dict_from_dict_round_trip(self):
+        settings = UsageSettings.from_dict({"usage_history": False})
+        assert settings.usage_history is False
+        assert settings.to_dict() == {"usage_history": False}
+        assert UsageSettings.from_dict({}).usage_history is True
+
+    def test_global_settings_save_load_round_trip(self, tmp_path):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.usage.usage_history = False
+        gs.save()
+        data = json.loads((tmp_path / "settings.json").read_text())
+        assert data["usage"] == {"usage_history": False}
+        assert gs.to_dict()["usage"] == {"usage_history": False}
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.usage.usage_history is False
+
+    def test_legacy_settings_file_defaults_on(self, tmp_path):
+        """Settings files written before the toggle existed keep recording."""
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.save()
+        settings_file = tmp_path / "settings.json"
+        data = json.loads(settings_file.read_text())
+        del data["usage"]
+        settings_file.write_text(json.dumps(data))
+        assert GlobalSettings.load(base_path=tmp_path).usage.usage_history is True
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("0", False),
+            ("false", False),
+            ("off", False),
+            ("1", True),
+            ("on", True),
+            ("TRUE", True),
+        ],
+    )
+    def test_env_override(self, tmp_path, monkeypatch, value, expected):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.usage.usage_history = not expected
+        gs.save()
+        monkeypatch.setenv("OMLX_USAGE_HISTORY", value)
+        assert GlobalSettings.load(base_path=tmp_path).usage.usage_history is expected
+
+
 class TestHuggingFaceSettings:
     """Tests for HuggingFaceSettings dataclass."""
 
@@ -1034,6 +1087,53 @@ class TestGlobalSettings:
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
+
+    @pytest.mark.parametrize(
+        "host",
+        ["127.0.0.1", "127.12.34.56", "localhost", "LOCALHOST.", "::1"],
+    )
+    def test_loopback_bind_does_not_require_api_key(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        assert not any("API key is required" in error for error in settings.validate())
+
+    @pytest.mark.parametrize(
+        "host",
+        ["0.0.0.0", "::", "192.168.1.10", "my-mac.local", "127.0.0.1,0.0.0.0"],
+    )
+    def test_network_bind_requires_api_key(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        assert any("API key is required" in error for error in settings.validate())
+
+    def test_network_bind_with_api_key_is_valid(self):
+        settings = GlobalSettings()
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "secret-key"
+
+        assert settings.validate() == []
+
+    def test_network_bind_rejects_api_key_bypass(self):
+        settings = GlobalSettings()
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "secret-key"
+        settings.auth.skip_api_key_verification = True
+
+        errors = settings.validate()
+
+        assert any("cannot be skipped" in error for error in errors)
+
+    @pytest.mark.parametrize("host", ["", "   ", "999.999.999.999"])
+    def test_invalid_bind_host_is_reported(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        errors = settings.validate()
+
+        assert any("host" in error.lower() for error in errors)
+        assert not any("API key is required" in error for error in errors)
 
     def test_get_effective_model_dirs_includes_hf_cache_between_dirs(
         self, tmp_path, monkeypatch

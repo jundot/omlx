@@ -238,6 +238,149 @@ class TestHasRequests:
 
 
 # ---------------------------------------------------------------------------
+# Chunk-local mRoPE ownership
+# ---------------------------------------------------------------------------
+
+
+class TestChunkedPrefillMRoPE:
+    def test_text_prefill_rebinds_delta_after_interleaved_cleanup(self):
+        class MRoPERecordingModel(_RecordingModel):
+            _uses_mrope = True
+
+            def __init__(self):
+                super().__init__("vlm")
+                self.batch_deltas = None
+                self.delta_history = []
+
+            def set_text_prefill_rope_delta(self, delta):
+                self.batch_deltas = mx.array([delta])
+                self.delta_history.append([delta])
+
+            def set_batch_rope_deltas(self, deltas):
+                raise AssertionError("text prefill must use the bounded binder")
+
+            def __call__(self, tokens, cache=None):
+                assert self.batch_deltas is not None
+                super().__call__(tokens, cache=cache)
+
+        model = MRoPERecordingModel()
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=4,
+                chunked_prefill=True,
+                paged_cache_block_size=0,
+            ),
+        )
+        request = _make_request("mrope-interleaved", n_tokens=9)
+        request.rope_deltas = 7.0
+        state = _make_prefill_state(scheduler, request, n_remaining=8)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            assert not scheduler._step_prefill_chunk(state)
+            # Reproduce a concurrent request's completion cleanup.
+            model.batch_deltas = None
+            assert scheduler._step_prefill_chunk(state)
+
+        assert model.chunk_lengths == [4, 4]
+        assert model.delta_history == [[7.0], [7.0]]
+
+    def test_text_prefill_chunk_records_text_positions_proof_on_request(self):
+        """Each text chunk proves the request text-only; insert() later marks its batch uid."""
+
+        class MRoPEMarkingModel(_RecordingModel):
+            _uses_mrope = True
+
+            def __init__(self):
+                super().__init__("vlm")
+                self.batch_deltas = None
+                self.marked = []
+
+            def set_text_prefill_rope_delta(self, delta):
+                self.batch_deltas = mx.array([delta])
+
+            def mark_text_positions(self, uid):
+                self.marked.append(uid)
+
+            def __call__(self, tokens, cache=None):
+                super().__call__(tokens, cache=cache)
+
+        model = MRoPEMarkingModel()
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=4,
+                chunked_prefill=True,
+                paged_cache_block_size=0,
+            ),
+        )
+        request = _make_request("mrope-marked", n_tokens=9)
+        request.rope_deltas = 0.0
+        scheduler.request_id_to_uid[request.request_id] = 42
+        state = _make_prefill_state(scheduler, request, n_remaining=8)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            assert not scheduler._step_prefill_chunk(state)
+            assert scheduler._step_prefill_chunk(state)
+
+        # The prefill-time uid is a temporary one (id(request)); the chunk only
+        # records the proof on the request, and insert() marks the batch uid.
+        assert request.text_positions_proven is True
+        assert model.marked == []
+
+    def test_mock_request_without_rope_delta_uses_text_default(self):
+        """Legacy/minimal request doubles retain the canonical text delta."""
+
+        class MRoPERecordingModel(_RecordingModel):
+            _uses_mrope = True
+
+            def __init__(self):
+                super().__init__("vlm")
+                self.delta_history = []
+
+            def set_text_prefill_rope_delta(self, delta):
+                self.delta_history.append([delta])
+
+        model = MRoPERecordingModel()
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=4,
+                chunked_prefill=True,
+                paged_cache_block_size=0,
+            ),
+        )
+        request = SimpleNamespace(request_id="mock-without-rope-delta")
+        state = _PrefillState(
+            request=request,
+            cache=[],
+            tokens_remaining=mx.zeros((1, 4), dtype=mx.int32),
+            last_token=[99],
+            tokens_processed=0,
+            base_size=0,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=5,
+        )
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            assert scheduler._step_prefill_chunk(state)
+
+        assert model.chunk_lengths == [4]
+        assert model.delta_history == [[0.0]]
+
+
+# ---------------------------------------------------------------------------
 # get_stats includes num_prefilling
 # ---------------------------------------------------------------------------
 
@@ -1371,3 +1514,61 @@ class TestPrefillCleanupUsesEngineStream:
 
         assert len(rejected) == 1
         self._assert_engine_stream(streams, sched)
+
+
+def test_step_prefill_chunk_announces_the_next_chunk_to_the_model():
+    """Each chunk step tells a model with prefetch_ple which tokens follow, so it can gather ahead."""
+
+    class LookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_ple(self, next_ids, current_ids):
+            self.seen.append((next_ids.tolist()[0], current_ids.tolist()[0]))
+
+    model = LookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(prefill_step_size=4, chunked_prefill=True, paged_cache_block_size=0),
+    )
+    request = _make_request("lookahead", n_tokens=11)
+    state = _make_prefill_state(scheduler, request, n_remaining=10)
+    state.tokens_remaining = mx.arange(10, 20, dtype=mx.int32)[None]
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        while not scheduler._step_prefill_chunk(state):
+            pass
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
+
+
+def test_external_prefill_announces_the_next_chunk_to_the_model():
+    """The non-chunked prefill loop announces the next chunk too; the last chunk announces nothing."""
+    import types
+
+    class LookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_ple(self, next_ids, current_ids):
+            self.seen.append((next_ids.tolist()[0], current_ids.tolist()[0]))
+
+    model = LookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(prefill_step_size=4, paged_cache_block_size=0),
+    )
+    tokens = list(range(10, 21))  # 10 prefill tokens, the last token goes to the batch generator
+    request = _make_request("lookahead-external", n_tokens=11)
+    cache = [types.SimpleNamespace(state=mx.array([0]))]
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        scheduler._do_external_prefill(request, tokens, cache)
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]

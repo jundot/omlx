@@ -261,6 +261,23 @@ extension View {
     func omlxThemed() -> some View { modifier(OMLXThemeBinder()) }
 }
 
+// MARK: - Control metrics
+
+/// Standard widths for trailing controls (text inputs, selects) in settings
+/// rows. Every `TextInput`/`Popup` picks the smallest token that fits its
+/// content instead of hand-tuning a per-row width, so control edges line up
+/// between rows and across screens.
+extension CGFloat {
+    /// Bare numbers: ports, counts, factors.
+    static let controlNarrow: CGFloat = 90
+    /// Numbers with a suffix or stepper, short enum selects.
+    static let controlCompact: CGFloat = 130
+    /// Names, keys, typical selects.
+    static let controlMedium: CGFloat = 220
+    /// Paths, URLs, model-id selects.
+    static let controlWide: CGFloat = 320
+}
+
 // MARK: - Color helpers
 
 extension Color {

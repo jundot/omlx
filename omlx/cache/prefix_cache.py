@@ -8,7 +8,9 @@ with SSD persistence. oMLX only supports paged SSD-based caching.
 
 import logging
 import math
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +23,9 @@ except ImportError:
     HAS_MLX = False
 
 from ._rotating_subclass import PrefillReadyRotatingKVCache
+from .deepseek_v41_delta import DELTA_CLASS as V41_DELTA_CLASS
+from .deepseek_v41_delta import compact_state as compact_v41_state
+from .deepseek_v41_delta import restore_chain as restore_v41_chain
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
 from .paged_cache import (
@@ -97,6 +102,16 @@ _TIP_LINEAGE_MAX_ENTRIES = 4096
 # _maybe_backfill_dedup_block_payload). Cleared on overflow, like the tip
 # lineage map.
 _BACKFILL_CHECKED_MAX_ENTRIES = 4096
+
+# Lightning-MTP prompt priming has one small attention cache of its own.  The
+# normal prefix cache stores only the backbone cache, so a warm trunk restore
+# used to lose the MTP history and restart speculative decode unprimed.  Keep a
+# deliberately tiny in-memory sidecar of full-block boundary snapshots.  Four
+# entries bounds the worst-case Qwen4 100K-context footprint to roughly the
+# same order as one ordinary request cache while covering the recent branches
+# of an interactive conversation.  The entries are keyed by the *same* chain
+# hash as the backbone block and are dropped with that block/hash lifecycle.
+_MTP_PREFIX_SNAPSHOT_MAX_ENTRIES = 4
 
 
 def _wrap_cachelist_sub_marker(
@@ -246,6 +261,16 @@ class BlockAwarePrefixCache(CacheManager):
         # for boundary-snapshot backfill this session (real state found or
         # rewrite saved). Each hash is inspected at most once per run.
         self._backfill_checked_hashes: set[bytes] = set()
+
+        # Full-block Lightning-MTP prompt-history snapshots.  Values are
+        # opaque to the generic prefix cache; prompt_priming owns their shape.
+        # Access can race with the asynchronous backbone store worker's hash
+        # callbacks, so use a private lock rather than relying on the GIL for
+        # the multi-step LRU operations.
+        self._mtp_prefix_snapshots: OrderedDict[bytes, tuple[int, Any]] = (
+            OrderedDict()
+        )
+        self._mtp_prefix_snapshot_lock = threading.RLock()
 
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
@@ -1568,8 +1593,10 @@ class BlockAwarePrefixCache(CacheManager):
             return None
 
         try:
-            if promote_to_hot_cache:
-                self.preload_blocks(block_table)
+            # reconstruct_cache performs the same SSD load and promotes each
+            # block as it is consumed.  preload_blocks is serialized for Metal
+            # safety, so running it here would deserialize the exact chain
+            # twice before returning it.
             restored_cache = self.reconstruct_cache(
                 block_table,
                 promote_to_hot_cache=promote_to_hot_cache,
@@ -1653,6 +1680,15 @@ class BlockAwarePrefixCache(CacheManager):
         """
         if not cache_data:
             return 0
+
+        # V4.1 stores packed rows and a bounded window rather than a 4D KV
+        # tensor. Its first state slot records the absolute token position,
+        # including any prefix restored before this request's prefill.
+        for layer in cache_data:
+            if layer.get("class_name") == "DeepseekV41Cache":
+                state = layer.get("state", ())
+                if len(state) in (7, 8) and state[0].shape == (1,):
+                    return int(state[0].item())
 
         # Non-sliceable cache types use sliding window or have no sequence dimension
         # RotatingKVCache: sliding window, seq_len limited to max_size
@@ -2499,6 +2535,21 @@ class BlockAwarePrefixCache(CacheManager):
                             if has_snapshot
                             else layer_state["state"]
                         )
+                        marker_class = cache_type_name
+                        if cache_type_name == "DeepseekV41Cache":
+                            source_layer = (
+                                snapshot_cache_data[layer_idx]
+                                if has_snapshot
+                                else layer_state
+                            )
+                            state = compact_v41_state(
+                                state,
+                                source_layer.get("meta_state", ()),
+                                start_idx,
+                                end_idx,
+                            )
+                            if len(state) == 8:
+                                marker_class = V41_DELTA_CLASS
                         if isinstance(state, (list, tuple)) and len(state) > 2:
                             cloned = [
                                 (
@@ -2508,7 +2559,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 )
                                 for elem in state
                             ]
-                            block_slices.append(("__nstate__", cache_type_name, cloned))
+                            block_slices.append(("__nstate__", marker_class, cloned))
                         elif isinstance(state, (list, tuple)) and len(state) >= 2:
                             conv_state = (
                                 state[0] if state[0] is not None else mx.array([])
@@ -4068,6 +4119,15 @@ class BlockAwarePrefixCache(CacheManager):
                     reconstructed_caches.append(cache)
                     continue
 
+                if cache_type_name == "DeepseekV41Cache":
+                    restored = restore_v41_chain(
+                        [block[layer_idx] for block in all_block_data],
+                        [metas[layer_idx] for metas in all_block_meta_states],
+                        valid_token_count,
+                    )
+                    reconstructed_caches.append(restored)
+                    continue
+
                 # === Generic N-tuple non-sliceable cache: use latest boundary ===
                 if (
                     isinstance(last_block_layer_data, tuple)
@@ -4757,10 +4817,113 @@ class BlockAwarePrefixCache(CacheManager):
         from any thread; it must not call back into the paged cache.
         """
         self._prefix_index.pop(block_hash, None)
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots.pop(block_hash, None)
 
     def _on_hash_map_cleared(self) -> None:
         """Drop all prefix-index entries after a wholesale hash-map clear."""
         self._prefix_index.clear()
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots.clear()
+
+    def _mtp_prefix_chain_tip(
+        self,
+        tokens: list[int],
+        boundary_tokens: int,
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    ) -> bytes | None:
+        """Return the ordinary full-block chain hash for an MTP sidecar.
+
+        VLM requests can change hidden states without changing token ids.  The
+        generic prefix cache supports per-range media keys, but
+        ``compute_chain_hashes`` cannot reproduce that resolution from a lone
+        boundary snapshot.  Fail closed for those two complex forms; text-only
+        requests and a single request-wide ``extra_keys`` tuple remain exact.
+        """
+        boundary_tokens = int(boundary_tokens)
+        if (
+            boundary_tokens <= 0
+            or boundary_tokens > len(tokens)
+            or boundary_tokens % self.block_size != 0
+            or extra_key_token_start is not None
+            or extra_key_ranges is not None
+        ):
+            return None
+        parent_hash: BlockHash | None = None
+        for start in range(0, boundary_tokens, self.block_size):
+            parent_hash = compute_block_hash(
+                parent_hash,
+                tokens[start : start + self.block_size],
+                extra_keys=extra_keys,
+                model_name=self.paged_cache.model_name,
+            )
+        return parent_hash
+
+    def store_mtp_prefix_snapshot(
+        self,
+        tokens: list[int],
+        boundary_tokens: int,
+        snapshot: Any,
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    ) -> bool:
+        """Keep an exact Lightning-MTP history at one backbone block boundary.
+
+        This is intentionally memory-only.  SSD persistence would require a
+        versioned serialization contract for every model family's MTP cache;
+        an unsupported or stale sidecar must merely fall back to unprimed MTP,
+        never make the target model consume an invented history.
+        """
+        tip = self._mtp_prefix_chain_tip(
+            tokens,
+            boundary_tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+        if tip is None or snapshot is None:
+            return False
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots[tip] = (int(boundary_tokens), snapshot)
+            self._mtp_prefix_snapshots.move_to_end(tip)
+            while len(self._mtp_prefix_snapshots) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES:
+                self._mtp_prefix_snapshots.popitem(last=False)
+        return True
+
+    def restore_mtp_prefix_snapshot(
+        self,
+        tokens: list[int],
+        boundary_tokens: int,
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    ) -> Any | None:
+        """Return the exact MTP sidecar matching a reconstructed trunk prefix."""
+        tip = self._mtp_prefix_chain_tip(
+            tokens,
+            boundary_tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+        if tip is None:
+            return None
+        # A snapshot published before completion is not reusable until the
+        # matching backbone block has actually been stored and remains live.
+        if self.paged_cache.cached_block_hash_to_block.get_block(tip) is None:
+            return None
+        with self._mtp_prefix_snapshot_lock:
+            entry = self._mtp_prefix_snapshots.get(tip)
+            if entry is None or entry[0] != int(boundary_tokens):
+                return None
+            self._mtp_prefix_snapshots.move_to_end(tip)
+            return entry[1]
 
     def get_stats(self) -> PrefixCacheStats:
         """
@@ -4858,9 +5021,15 @@ class BlockAwarePrefixCache(CacheManager):
         Returns:
             Number of entries cleared.
         """
-        cleared_count = len(self._request_tables) + len(self._prefix_index)
+        with self._mtp_prefix_snapshot_lock:
+            mtp_snapshot_count = len(self._mtp_prefix_snapshots)
+        cleared_count = (
+            len(self._request_tables) + len(self._prefix_index) + mtp_snapshot_count
+        )
         self._request_tables.clear()
         self._prefix_index.clear()
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots.clear()
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count

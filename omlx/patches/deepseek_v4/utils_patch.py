@@ -50,9 +50,13 @@ def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
     quantizations = [config.get("quantization"), config.get("quantization_config")]
     text_config = config.get("text_config")
     if isinstance(text_config, dict):
-        quantizations.append(text_config.get("quantization_config"))
+        quantizations.extend(
+            [text_config.get("quantization"), text_config.get("quantization_config")]
+        )
 
-    for quantization in quantizations:
+    # Per-layer overrides can be nested below a four-bit default.
+    while quantizations:
+        quantization = quantizations.pop()
         bits = quantization.get("bits") if isinstance(quantization, dict) else None
         if (
             isinstance(bits, (int, float))
@@ -60,6 +64,10 @@ def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
             and float(bits) < 4
         ):
             return False
+        if isinstance(quantization, dict):
+            quantizations.extend(quantization.values())
+        elif isinstance(quantization, list):
+            quantizations.extend(quantization)
     return True
 
 

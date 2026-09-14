@@ -272,8 +272,10 @@ class TestSkipApiKeyVerification:
         import asyncio
 
         original_key = _server_state.api_key
+        original_host = _server_state.bind_host
         original_gs = _server_state.global_settings
         _server_state.api_key = "test-key"
+        _server_state.bind_host = "127.0.0.1"
         _server_state.global_settings = self._make_global_settings(
             host="127.0.0.1", skip=True
         )
@@ -283,25 +285,90 @@ class TestSkipApiKeyVerification:
             assert result is True
         finally:
             _server_state.api_key = original_key
+            _server_state.bind_host = original_host
             _server_state.global_settings = original_gs
 
-    def test_skip_verification_on_any_host(self):
-        """Skip verification when enabled regardless of host."""
-        from omlx.server import verify_api_key, _server_state
+    def test_skip_verification_is_ignored_on_network_host(self):
+        """The no-auth switch must not bypass API auth on a network bind."""
         import asyncio
 
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
         original_key = _server_state.api_key
+        original_host = _server_state.bind_host
         original_gs = _server_state.global_settings
         _server_state.api_key = "test-key"
+        _server_state.bind_host = "0.0.0.0"
         _server_state.global_settings = self._make_global_settings(
             host="0.0.0.0", skip=True
         )
 
         try:
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert result is True
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
+            _server_state.bind_host = original_host
+            _server_state.global_settings = original_gs
+
+    def test_network_host_without_configured_key_requires_auth(self):
+        """A missing key cannot turn a network-facing API into no-auth mode."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        original_host = _server_state.bind_host
+        original_gs = _server_state.global_settings
+        _server_state.api_key = None
+        _server_state.bind_host = "0.0.0.0"
+        _server_state.global_settings = self._make_global_settings(
+            host="0.0.0.0", skip=False
+        )
+
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.bind_host = original_host
+            _server_state.global_settings = original_gs
+
+    def test_saved_loopback_host_does_not_change_live_network_auth(self):
+        """A pending host change cannot disable auth before restart."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        original_host = _server_state.bind_host
+        original_gs = _server_state.global_settings
+        settings = self._make_global_settings(host="127.0.0.1", skip=True)
+        _server_state.api_key = "test-key"
+        _server_state.bind_host = "0.0.0.0"
+        _server_state.global_settings = settings
+
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.bind_host = original_host
             _server_state.global_settings = original_gs
 
     def test_skip_verification_disabled_by_default(self):

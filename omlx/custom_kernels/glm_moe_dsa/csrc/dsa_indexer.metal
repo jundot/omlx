@@ -25,6 +25,12 @@ struct OMLXDSATopKParams {
       "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,              \
       dsa_indexer_score, itype, bm, bn, bk, wm, wn)
 
+#define instantiate_qwen4_qsa_indexer_score(iname, itype, bm, bn, bk, wm, wn) \
+  instantiate_kernel(                                                        \
+      "qwen4_qsa_indexer_score_" #iname                                     \
+      "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,                \
+      qwen4_qsa_indexer_score, itype, bm, bn, bk, wm, wn)
+
 #define instantiate_dsa_topk_indices(iname, itype, topk, threads)       \
   instantiate_kernel(                                                   \
       "steel_dsa_topk_indices_" #iname "_topk" #topk "_t" #threads,    \
@@ -45,6 +51,12 @@ struct OMLXDSATopKParams {
 instantiate_dsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
 instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 
+// Qwen4 QSA scores use the same validated M3 Steel tile, but write fp32 after
+// reducing the fixed four heads. Keeping this in the existing metallib also
+// lets stale extension builds fail closed at the missing ABI symbol.
+instantiate_qwen4_qsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
+instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
+
 instantiate_dsa_topk_indices(float16, half, 2048, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 2048, 1024);
 instantiate_dsa_topk_indices(float16, half, 512, 1024);
@@ -54,7 +66,19 @@ instantiate_kernel(
     "dspark_fp32_topk_indices_topk512_t256",
     dspark_fp32_topk_indices,
     512,
-    256);
+    256,
+    false);
+
+// Qwen4's fixed 2048-token budget selects 512 complete four-token blocks.
+// This shares DSpark's O(1)-workspace FP32 radix selector, but reverses the
+// deterministic traversal so cutoff ties match mx.argpartition's highest-index
+// membership exactly.
+instantiate_kernel(
+    "qwen4_qsa_fp32_topk_indices_topk512_t256",
+    dspark_fp32_topk_indices,
+    512,
+    256,
+    true);
 
 // ── DC-1: fused decode indexer scan ──────────────────────────────────────────
 // One thread per key position: score(key) = sum_h w_h * relu(q_h · k_key), fp32

@@ -2200,11 +2200,12 @@
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
-                        <option value="auto">{{ t('chat.thinking_mode.auto') }}</option>
-                        <option value="on_unlimit">{{ t('chat.thinking_mode.on_unlimited') }}</option>
-                        <option value="on_limit">{{ t('chat.thinking_mode.on_limited') }}</option>
-                        <option value="off">{{ t('chat.thinking_mode.off') }}</option>
+                        <option value="auto" :disabled="!thinkingModes().includes('auto')">{{ t('chat.thinking_mode.auto') }}</option>
+                        <option value="on_unlimit" :disabled="!thinkingModes().includes('on_unlimit')">{{ t('chat.thinking_mode.on_unlimited') }}</option>
+                        <option value="on_limit" :disabled="!thinkingModes().includes('on_limit')">{{ t('chat.thinking_mode.on_limited') }}</option>
+                        <option value="off" :disabled="!thinkingModes().includes('off')">{{ t('chat.thinking_mode.off') }}</option>
                     </select>
+                    <p x-show="currentModelInfo()?.thinking_forced" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
@@ -2729,12 +2730,22 @@
                 };
             },
 
+            currentModelInfo() {
+                const id = this.aliasToGateway[this.currentModel] || this.currentModel;
+                return (this._adminModelsList || []).find(model => model.id === id);
+            },
+
+            thinkingModes() {
+                return this.currentModelInfo()?.thinking_modes || [];
+            },
+
             thinkingModeValue() {
-                if (this.modelSettings.enable_thinking === false) return 'off';
-                if (this.modelSettings.enable_thinking === true) {
-                    return this.modelSettings.thinking_budget_enabled ? 'on_limit' : 'on_unlimit';
-                }
-                return 'auto';
+                const s = this.modelSettings;
+                const mode = this.currentModelInfo()?.thinking_forced
+                    ? (s.thinking_budget_enabled ? 'on_limit' : 'auto')
+                    : s.enable_thinking === false ? 'off'
+                    : s.enable_thinking === true ? (s.thinking_budget_enabled ? 'on_limit' : 'on_unlimit') : 'auto';
+                return this.thinkingModes().includes(mode) ? mode : 'auto';
             },
 
             normalizeThinkingBudgetTokens(value) {
@@ -2796,25 +2807,11 @@
             },
 
             setThinkingMode(mode) {
-                if (mode === 'on_unlimit') {
-                    this.modelSettings.enable_thinking = true;
-                    this.modelSettings.thinking_budget_enabled = false;
-                    this.modelSettings.thinking_budget_tokens = null;
-                } else if (mode === 'on_limit') {
-                    this.modelSettings.enable_thinking = true;
-                    this.modelSettings.thinking_budget_enabled = true;
-                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
-                        this.modelSettings.thinking_budget_tokens
-                    );
-                } else if (mode === 'off') {
-                    this.modelSettings.enable_thinking = false;
-                    this.modelSettings.thinking_budget_enabled = false;
-                    this.modelSettings.thinking_budget_tokens = null;
-                } else {
-                    this.modelSettings.enable_thinking = null;
-                    this.modelSettings.thinking_budget_enabled = false;
-                    this.modelSettings.thinking_budget_tokens = null;
-                }
+                if (!this.thinkingModes().includes(mode)) return;
+                this.modelSettings.enable_thinking = mode === 'auto' ? null : mode !== 'off';
+                this.modelSettings.thinking_budget_enabled = mode === 'on_limit';
+                this.modelSettings.thinking_budget_tokens = mode === 'on_limit'
+                    ? this.normalizeThinkingBudgetTokens(this.modelSettings.thinking_budget_tokens) : null;
                 this.onModelSettingsChange();
             },
 
@@ -3409,13 +3406,12 @@
                 for (const key of scalarKeys) {
                     if (s[key] != null) gen[key] = s[key];
                 }
-                if (s.enable_thinking === true) {
-                    gen.chat_template_kwargs = { enable_thinking: true };
-                    if (s.thinking_budget_enabled) {
-                        gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
-                    }
-                } else if (s.enable_thinking === false) {
-                    gen.chat_template_kwargs = { enable_thinking: false };
+                const mode = this.thinkingModeValue();
+                if (mode !== 'auto' && !this.currentModelInfo()?.thinking_forced) {
+                    gen.chat_template_kwargs = { enable_thinking: mode !== 'off' };
+                }
+                if (mode === 'on_limit') {
+                    gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
                 }
                 return Object.keys(gen).length ? gen : null;
             },

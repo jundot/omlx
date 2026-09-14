@@ -33,6 +33,9 @@ _LM_GDN_PREFILL_BACKEND: (
     ]
     | None
 ) = None
+# First-refusal backend for a single already-routable prefill projection.
+# See register_qwen35_prefill_linear_backend().
+_PREFILL_LINEAR_BACKEND: Callable[[Any, mx.array], mx.array | None] | None = None
 _SUPPORTED_QMM_BITS = frozenset((2, 4, 5, 6, 8))
 _Q8_MIN_TOKENS = 16384
 
@@ -55,6 +58,42 @@ def register_qwen35_lm_gdn_prefill_backend(
 
     global _LM_GDN_PREFILL_BACKEND
     _LM_GDN_PREFILL_BACKEND = backend
+
+
+def register_qwen35_prefill_linear_backend(
+    backend: Callable[[Any, mx.array], mx.array | None] | None,
+) -> None:
+    """Register a first-refusal backend for individual prefill projections.
+
+    The GDN input projections have their own hook because they share one
+    quantized activation across four matmuls. This one is for the projections
+    that stand alone -- the linear-attention ``out_proj`` above all, which is
+    per layer and was reaching ``_linear_qmm`` on both engines while a faster
+    kernel sat unused.
+
+    It does not widen *which* projections are accelerated: everything that
+    reaches these two helpers is already routed through the W4A16 NAX path.
+    It only lets a backend serve the ones it can. Returning None declines, and
+    the caller falls back unchanged.
+    """
+
+    global _PREFILL_LINEAR_BACKEND
+    _PREFILL_LINEAR_BACKEND = backend
+
+
+def _backend_or_qmm(linear: Any, x: mx.array, variant: int) -> mx.array:
+    """First refusal to the registered backend, then the W4A16 NAX kernel."""
+    backend = _PREFILL_LINEAR_BACKEND
+    if backend is not None:
+        try:
+            routed = backend(linear, x)
+        except Exception:
+            # A backend fault must cost throughput, never a request.
+            logger.debug("prefill linear backend failed; falling back", exc_info=True)
+            routed = None
+        if routed is not None:
+            return routed
+    return _linear_qmm(linear, x, variant)
 
 
 def _native_qmm_for_bits(bits: int) -> Callable[..., mx.array] | None:
@@ -368,7 +407,7 @@ def apply_qwen35_q4_prefill_linear_patch() -> bool:
 
     def patched_linear(linear, x: mx.array, target_verify: bool):
         if should_route(linear, x, target_verify):
-            return _linear_qmm(linear, x, variant)
+            return _backend_or_qmm(linear, x, variant)
         return orig_linear(linear, x, target_verify)
 
     def patched_linears(linears, x: mx.array, target_verify: bool):
@@ -439,7 +478,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
 
     def qmm_or_linear(linear: Any, x: mx.array) -> mx.array:
         if should_route(linear, x):
-            return _linear_qmm(linear, x, variant)
+            return _backend_or_qmm(linear, x, variant)
         return linear(x)
 
     installed = False

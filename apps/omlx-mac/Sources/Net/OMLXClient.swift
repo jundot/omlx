@@ -87,6 +87,13 @@ final class OMLXClient: ObservableObject {
         try await get("/admin/api/server-info")
     }
 
+    func getUsage(range: String = "today", model: String = "") async throws -> UsageHistoryDTO {
+        try await get(AdminAPI.usage, query: [
+            URLQueryItem(name: "range", value: range),
+            URLQueryItem(name: "model", value: model),
+        ])
+    }
+
     func getStats(scope: String = "session", model: String = "") async throws -> StatsDTO {
         try await get("/admin/api/stats", query: [
             URLQueryItem(name: "scope", value: scope),

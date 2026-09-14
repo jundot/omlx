@@ -31,7 +31,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     turboquant = _section(
         html,
         "<!-- TurboQuant KV Cache -->",
-        "<!-- IndexCache (DSA models only) -->",
+        "<!-- MoE Expert Offload -->",
     )
     lightning_mtp = _section(
         html,
@@ -84,9 +84,9 @@ def test_reasoning_effort_has_presets_and_custom_input():
     assert 'placeholder="0.9"' in section
     assert "<datalist" not in section
 
-    order = ["low", "medium", "high", "xhigh", "max"]
-    positions = [section.index(f'value="{value}"') for value in order]
-    assert positions == sorted(positions)
+    assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
+    assert ':value="value" x-text="value"' in section
+    assert '!selectedModel?.reasoning_effort_custom && !entry.custom' in section
 
 
 def test_reasoning_effort_add_guard_covers_custom_entries():
@@ -190,8 +190,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
         "qwen35_ane_prefill_gdn_max_layers",
     }
 
-    assert 'x-if="isQwen35AnePrefillModel(selectedModel)"' in html
-    assert "'qwen3_5', 'qwen3_6', 'qwen3_8'" in script
+    assert "x-if=\"selectedModel?.ane_prefill_backend === 'qwen'\"" in html
     for field in fields:
         assert f"modelSettings.{field}" in html
         assert f"{field}:" in script
@@ -239,9 +238,10 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "cancelANETuning()" in html
     assert "applyANETuningRecommendation()" in html
     assert "aneTuningRecommendationText()" in html
-    assert "aneTuningResultText(result)" in html
+    assert "aneTuning.status?.message" in html
+    assert "aneTuningProgressPercent()" in html
     assert "aneTuning.status?.termination_reason" in html
-    assert "aneTuning.status?.results || []" in html
+    assert "!aneTuning.running && aneTuning.status?.recommendation" in html
     assert 'x-model="aneTuningOverrides.allowCpu"' in html
     assert 'x-model="aneTuningOverrides.allowAneGdn"' in html
     assert 'x-model="aneTuningOverrides.allowCpuGdn"' in html
@@ -258,8 +258,6 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
     assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
     assert "recommendation.cpu_shared_resource" in script
-    assert "if (result?.processing_tps === null" in script
-    assert "result?.latency_ms !== null" in script
 
 
 def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
@@ -281,7 +279,10 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     )[0]
 
     assert "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048" in state
-    assert "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53" in state
+    assert (
+        "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53"
+        in state
+    )
     assert "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
     assert "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
@@ -306,3 +307,77 @@ def test_js_embedded_translations_escape_apostrophes():
         r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
     )
     assert unsafe == []
+
+
+def test_oq_a8_toggle_is_gated_to_qwen35_models():
+    """The kernels only exist for this checkpoint family, so the UI hides them."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert 'x-if="isQwenOqA8Model(selectedModel)"' in section
+    assert "modelSettings.qwen35_oq_a8_enabled" in section
+    # The detail controls only appear once the feature is on.
+    assert 'x-show="modelSettings.qwen35_oq_a8_enabled"' in section
+    assert "modelSettings.qwen35_oq_a8_min_tokens" in section
+
+
+def test_oq_a8_offers_no_kernel_choice():
+    """The tile is not a user-facing choice: the dispatcher picks it per bit
+    width from a measured default, so the modal exposes only the toggle and
+    the token floor."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert "modelSettings.qwen35_oq_a8_variant" not in section
+
+
+def test_oq_a8_settings_are_registered_in_the_dashboard_script():
+    js = _dashboard_script()
+    for field in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+        # Profile-field registry, modal defaults, server load, and save payload.
+        assert js.count(field) >= 4, field
+    assert "validateQwenOqA8Settings()" in js
+    # The modal has to explain the ANE clash itself rather than let the save
+    # come back as a bare 400 with the toggle already flipped.
+    validator = js.split("validateQwenOqA8Settings()", 1)[1].split("},", 1)[0]
+    assert "qwen35_ane_prefill_enabled" in validator
+    # The tile must not leak into any of those four places, not even as a
+    # hidden default the modal never renders.
+    assert "qwen35_oq_a8_variant" not in js
+
+
+def test_oq_a8_labels_use_i18n_keys():
+    html = _model_settings_template()
+    assert "{{ t('modal.model_settings.qwen_oq_a8') }}" in html
+    assert ">Qwen INT8 Activation Prefill<" not in html
+
+
+def test_oq_a8_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    keys = {
+        "modal.model_settings.qwen_oq_a8",
+        "modal.model_settings.qwen_oq_a8_hint",
+        "modal.model_settings.qwen_oq_a8_min_tokens",
+    }
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        missing = keys - set(catalog)
+        assert not missing, f"{path.name} is missing {sorted(missing)}"
+
+
+def test_moe_expert_offload_toggle_blocks_speculative_decoding():
+    """Offload is incompatible with speculative verification paths."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "modelSettings.moe_expert_offload_enabled" in section
+    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert ":disabled" in section
+    for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
+        assert f"modelSettings.{key}" in section

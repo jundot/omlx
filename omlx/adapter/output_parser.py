@@ -26,6 +26,16 @@ from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
 logger = logging.getLogger(__name__)
 
 
+def _decode_output_token(tokenizer, detokenizer, token_id: int) -> str:
+    if detokenizer is not None:
+        detokenizer.add_token(token_id)
+        return detokenizer.last_segment
+    try:
+        return tokenizer.decode([token_id], skip_special_tokens=False)
+    except TypeError:
+        return tokenizer.decode([token_id])
+
+
 @dataclass
 class OutputParserTokenResult:
     """Per-token parser result returned during streaming."""
@@ -71,6 +81,8 @@ class OutputParserFactory:
     thinking_start_output_text: str | None = None
     thinking_end_text: str | None = None
     thinking_end_trailing_text: str | None = None
+    # Alternative (open, close) pairs when the prompt selects one of several.
+    thinking_marker_pairs: tuple[tuple[str, str], ...] = ()
     # Marker strings that must survive special-token stripping so the
     # parser session can see them in the text stream.  Engines that strip
     # special tokens during detokenization (e.g. the serial diffusion
@@ -241,16 +253,7 @@ class BailingHybridOutputParserSession:
             self._visible_filter = None
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode(
-                [token_id],
-                skip_special_tokens=False,
-            )
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     @staticmethod
     def _filtered_text(text: str, tool_filter: Any) -> str:
@@ -510,6 +513,12 @@ class DeepSeekV4OutputParserSession:
 
     def __init__(self, tokenizer: Any, model_path: str | None = None):
         self._tokenizer = tokenizer
+        self._tool_start = (
+            getattr(tokenizer, "tool_call_start", None) or _DEEPSEEK_V4_TOOL_CALL_START
+        )
+        self._tool_end = (
+            getattr(tokenizer, "tool_call_end", None) or _DEEPSEEK_V4_TOOL_CALL_END
+        )
         self._raw_text = ""
         self._stopped = False
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
@@ -527,13 +536,7 @@ class DeepSeekV4OutputParserSession:
             self._visible_filter = None
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _filtered_text(self, text: str, tool_filter: Any) -> str:
         if not text:
@@ -548,13 +551,13 @@ class DeepSeekV4OutputParserSession:
         return tool_filter.finish()
 
     def _trim_at_first_tool_block_end(self, text: str) -> tuple[str, bool]:
-        start_idx = text.find(_DEEPSEEK_V4_TOOL_CALL_START)
+        start_idx = text.find(self._tool_start)
         if start_idx < 0:
             return text, False
-        end_idx = text.find(_DEEPSEEK_V4_TOOL_CALL_END, start_idx)
+        end_idx = text.find(self._tool_end, start_idx)
         if end_idx < 0:
             return text, False
-        cutoff = end_idx + len(_DEEPSEEK_V4_TOOL_CALL_END)
+        cutoff = end_idx + len(self._tool_end)
         return text[:cutoff], True
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
@@ -642,13 +645,7 @@ class MiniMaxM3OutputParserSession:
         self._visible_normalizer = _MiniMaxM3ProtocolNormalizer()
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _filtered_text(
         self,
@@ -994,13 +991,7 @@ class InklingOutputParserSession:
             )
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         if self._splitter.stopped:
@@ -1130,13 +1121,7 @@ class Cohere2MoeOutputParserSession:
         self._tool_calls: dict[int, dict[str, str]] = {}
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _accumulate_tool_calls(self, tool_calls: list[Any]) -> None:
         for tool_call in tool_calls:
@@ -1228,6 +1213,92 @@ class Cohere2MoeOutputParserSession:
         )
 
 
+_K2_THINK_MARKERS = (
+    ("<ifm|think>", "</ifm|think>"),
+    ("<ifm|think_fast>", "</ifm|think_fast>"),
+    ("<ifm|think_faster>", "</ifm|think_faster>"),
+)
+_K2_TOOL_CALLS_START = "<ifm|tool_calls>"
+_K2_TOOL_CALLS_END = "</ifm|tool_calls>"
+_K2_MARKERS = tuple(marker for pair in _K2_THINK_MARKERS for marker in pair) + (
+    _K2_TOOL_CALLS_START,
+    _K2_TOOL_CALLS_END,
+)
+
+
+class K2HorizonOutputParserSession:
+    """Normalize IFM reasoning markers; leave tool parsing to the shared API path."""
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        marker_ids: dict[str, int],
+        model_path: str | None = None,
+    ):
+        self._tokenizer = tokenizer
+        self._open_ids = {marker_ids[start] for start, _ in _K2_THINK_MARKERS}
+        self._close_ids = {marker_ids[end] for _, end in _K2_THINK_MARKERS}
+        self._literal_texts = {
+            marker_ids[_K2_TOOL_CALLS_START]: _K2_TOOL_CALLS_START,
+            marker_ids[_K2_TOOL_CALLS_END]: _K2_TOOL_CALLS_END,
+        }
+        self._in_reasoning = False
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+    def notify_prefilled_thought(self) -> None:
+        self._in_reasoning = True
+
+    def _decode_token(self, token_id: int) -> str:
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
+
+    def _emit(self, text: str) -> OutputParserTokenResult:
+        return OutputParserTokenResult(
+            stream_text=text, visible_text=text, record_token=True
+        )
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        if token_id in self._open_ids:
+            if self._in_reasoning:
+                return OutputParserTokenResult(record_token=True)
+            self._in_reasoning = True
+            return self._emit("<think>\n")
+        if token_id in self._close_ids:
+            if not self._in_reasoning:
+                return OutputParserTokenResult(record_token=True)
+            self._in_reasoning = False
+            return self._emit("</think>")
+
+        literal = self._literal_texts.get(token_id)
+        text = literal if literal is not None else self._decode_token(token_id)
+        if literal == _K2_TOOL_CALLS_START and self._in_reasoning:
+            self._in_reasoning = False
+            text = "</think>" + text
+        return self._emit(text)
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        text = ""
+        if self._detokenizer is not None:
+            self._detokenizer.finalize()
+            text = self._detokenizer.last_segment
+
+        return OutputParserFinalizeResult(
+            stream_text=text,
+            visible_text=text,
+        )
+
+
+def _k2_horizon_marker_ids(tokenizer: Any) -> dict[str, int]:
+    marker_ids = {}
+    for marker in _K2_MARKERS:
+        token_id = _token_id_for_text(tokenizer, marker)
+        if token_id is None:
+            raise ValueError(f"K2 Horizon tokenizer lacks the {marker!r} token")
+        marker_ids[marker] = token_id
+    return marker_ids
+
+
 def detect_output_parser(
     model_name: str,
     tokenizer: Any,
@@ -1273,6 +1344,22 @@ def detect_output_parser(
                 protocol_marker_texts=_BAILING_ROLE_MARKERS,
             )
 
+    if model_type == "k2_horizon":
+        marker_ids = _k2_horizon_marker_ids(tokenizer)
+        return OutputParserFactory(
+            kind="k2_horizon",
+            create_session=lambda session_tokenizer: K2HorizonOutputParserSession(
+                session_tokenizer,
+                marker_ids,
+                model_path=session_model_path,
+            ),
+            thinking_start_text=_K2_THINK_MARKERS[0][0],
+            thinking_start_output_text="<think>\n",
+            thinking_end_text=_K2_THINK_MARKERS[0][1],
+            thinking_marker_pairs=_K2_THINK_MARKERS,
+            protocol_marker_texts=_K2_MARKERS,
+        )
+
     if is_harmony_model(model_name, model_config):
         temp_parser = HarmonyStreamingParser(tokenizer)
         return OutputParserFactory(
@@ -1313,6 +1400,18 @@ def detect_output_parser(
                 _TOOL_RESPONSE_OPEN,
                 _TOOL_RESPONSE_CLOSE,
             ),
+        )
+
+    if getattr(tokenizer, "tool_call_start", None) == "<｜DSML｜ calls>":
+        from ..patches.deepseek_v41.output_parser import DeepSeekV41OutputParserSession
+
+        return OutputParserFactory(
+            kind="deepseek_v41",
+            create_session=lambda session_tokenizer: DeepSeekV41OutputParserSession(
+                session_tokenizer, model_path=session_model_path
+            ),
+            stop_token_ids=set(),
+            protocol_marker_texts=("<｜DSML｜ calls>", "</｜DSML｜ calls>"),
         )
 
     if _is_deepseek_v4_model(model_name, tokenizer, model_config):
@@ -1461,6 +1560,11 @@ def detect_message_extractor(
         from .gemma4 import extract_gemma4_messages
 
         return extract_gemma4_messages
+
+    if model_config and model_config.get("model_type") == "k2_horizon":
+        from ..api.utils import extract_k2_horizon_messages
+
+        return extract_k2_horizon_messages
 
     # Default: caller decides between extract_text_content and
     # extract_multimodal_content based on engine type (VLM vs text).

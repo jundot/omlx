@@ -20,6 +20,11 @@ class _HybridModel:
     def __init__(self):
         self.layers = [MagicMock(), MagicMock()]
 
+    def make_cache(self):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        return [KVCache(), ArraysCache(size=2)]
+
 
 def _hybrid_extracted(token_count: int, recurrent_value: float):
     return [
@@ -618,6 +623,7 @@ def test_split_exact_prefix_fails_closed_before_placeholder_allocation(tmp_path)
 def test_scheduler_exact_split_hit_reprefills_only_last_block():
     """Exact GDN hits walk back one block before reconstruction (N-1 safety)."""
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.model = _HybridModel()
     scheduler.config = SchedulerConfig(
         paged_cache_block_size=BLOCK_SIZE,
         gdn_ssd_split_enabled=True,

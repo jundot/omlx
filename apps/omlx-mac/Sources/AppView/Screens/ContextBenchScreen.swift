@@ -118,7 +118,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Context Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -135,7 +135,6 @@ private struct ConfigurationSection: View {
                         (value: $0, label: "\($0 / 1024)k")
                     }
                 )
-                .frame(width: 320)
                 .disabled(running)
             }
 
@@ -162,7 +161,6 @@ private struct ConfigurationSection: View {
                     ],
                     icons: ["arrow.up.left.and.arrow.down.right", "speedometer"]
                 )
-                .frame(width: 240)
                 .disabled(running)
             }
 

@@ -2,13 +2,17 @@
 """Tests for ProcessMemoryEnforcer."""
 
 import asyncio
+import base64
+import io
 from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 import omlx.process_memory_enforcer as pme
+import omlx.utils.image as images
 import omlx.utils.psutil_compat as psutil_compat
 from omlx.engine.tts import TTSEngine
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
@@ -228,6 +232,10 @@ def mock_engine_pool():
     )
     pool._mark_pending_unload_locked = MagicMock(
         side_effect=_mark_pending_unload_locked
+    )
+    pool._scheduled_pending_unloads = []
+    pool._schedule_pending_unload_locked = MagicMock(
+        side_effect=pool._scheduled_pending_unloads.append
     )
     return pool
 
@@ -1525,6 +1533,36 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model")
 
     @pytest.mark.asyncio
+    async def test_single_busy_model_schedules_retry_when_still_busy_after_abort(
+        self, enforcer
+    ):
+        """The pending-unload latch must not depend on a later manual drain check.
+
+        _check_and_enforce()'s while loop is not revisited once pressure recovers
+        to "ok" (an earlier branch returns before reaching it), so if the busy
+        victim has not drained by the time this tick's single inline
+        _unload_pending_if_idle_locked call runs, nothing else will ever retry it.
+        """
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [13 * 1024**3, 13 * 1024**3]
+            )
+            await enforcer._check_and_enforce()
+
+        assert entry.pending_unload_reason == "hard memory pressure"
+        enforcer._engine_pool._schedule_pending_unload_locked.assert_called_once_with(
+            "big-model"
+        )
+
+    @pytest.mark.asyncio
     async def test_two_models_one_inferring_evicts_idle(self, enforcer):
         """Scenario 1: Two models, only one inferring. Evict idle LRU."""
         engine_active = MagicMock()
@@ -2348,7 +2386,10 @@ class TestTwoWatermarkPressureLevels:
             await enforcer._check_and_enforce()
 
         assert to_thread_calls
-        assert to_thread_calls[0][0] == enforcer._shrink_hot_cache_for_pressure
+        assert any(
+            call[0] == enforcer._shrink_hot_cache_for_pressure
+            for call in to_thread_calls
+        )
         budget.shrink_to.assert_called_once()
         target_hot = budget.shrink_to.call_args.args[0]
         assert target_hot == 12 * 1024**3
@@ -2696,7 +2737,9 @@ class TestWiredLimitSuggestionClamp:
         user_cap = 124518 * 1024**2  # highest whole-MiB value below 95%
         with (
             self._with_total(total),
-            patch.object(pme, "get_iogpu_wired_limit_bytes", return_value=user_cap),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
             patch.object(pme.mx, "set_wired_limit", return_value=0),
             caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
         ):
@@ -2977,3 +3020,53 @@ class TestPressureReclaimGrace:
             await enforcer._check_and_enforce()
         shrink.assert_called_once()
         engine.abort_all_requests.assert_awaited_once()
+
+
+@pytest.mark.parametrize("initial_usage", [95_000, 105_000])
+async def test_image_cache_reclaimed_before_model_eviction(
+    mock_engine_pool, initial_usage
+):
+    images.clear_image_decode_cache()
+    buffer = io.BytesIO()
+    Image.new("RGB", (120, 120), "red").save(buffer, format="PNG")
+    source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    images.load_image(source)
+    retained_bytes = images._image_decode_cache_bytes
+    enforcer = _make_enforcer(
+        mock_engine_pool, ceiling=100_000, soft_threshold=0.9, hard_threshold=1.0
+    )
+    try:
+        # Simulate the footprint dropping when unowned cache entries are released.
+        with patch.object(
+            enforcer,
+            "_current_usage_bytes",
+            side_effect=lambda: initial_usage
+            - retained_bytes
+            + images._image_decode_cache_bytes,
+        ):
+            await enforcer._check_and_enforce()
+        assert not images._image_decode_cache
+        assert enforcer._pressure_level == "ok"
+        mock_engine_pool._unload_engine.assert_not_called()
+    finally:
+        images.clear_image_decode_cache()
+
+
+async def test_image_cache_reclaim_remeasures_retained_request_memory(mock_engine_pool):
+    images.clear_image_decode_cache()
+    buffer = io.BytesIO()
+    Image.new("RGB", (120, 120), "blue").save(buffer, format="PNG")
+    source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    active_image = images.load_image(source)
+    enforcer = _make_enforcer(
+        mock_engine_pool, ceiling=100_000, soft_threshold=0.9, hard_threshold=1.0
+    )
+    try:
+        # The request still owns the pixels, so dropping the cache frees no RAM.
+        with patch.object(enforcer, "_current_usage_bytes", return_value=95_000):
+            await enforcer._check_and_enforce()
+        assert not images._image_decode_cache
+        assert enforcer._pressure_level == "soft"
+        assert active_image.getpixel((0, 0)) == (0, 0, 255)
+    finally:
+        images.clear_image_decode_cache()

@@ -39,6 +39,31 @@ mx::array dsa_indexer_scores_mma(
     int mask_q_offset = 0,
     mx::StreamOrDevice s = {});
 
+// Qwen4-Exp QSA prefill score fusion. This deliberately narrow ABI consumes
+// q [1,4,M,128] and pooled k [1,1,N,128] in fp16/bf16 and writes the exact
+// selection domain directly as fp32 [1,M,N]:
+//
+//   sum_h relu(q_h @ k.T) / sqrt(128)
+//
+// The pooled causal mask is applied in the epilogue, so no [1,4,M,N]
+// intermediate is materialized. Unsupported shapes fail closed at the ABI;
+// the QSA caller retains its portable float32 implementation as fallback.
+mx::array qwen4_qsa_indexer_scores(
+    const mx::array& queries,
+    const mx::array& pooled_keys,
+    int mask_ratio = 4,
+    int mask_q_offset = 0,
+    mx::StreamOrDevice s = {});
+
+// Lossless fixed-width Qwen4 QSA block selection. Scores are the contiguous
+// fp32 [1, M, N] result of qwen4_qsa_indexer_scores; the output is uint32
+// [1, M, 512]. Cutoff ties deliberately retain the highest block indices to
+// match mx.argpartition(scores, kth=-512)[..., -512:] set membership.
+mx::array qwen4_qsa_topk_indices(
+    const mx::array& scores,
+    int topk = 512,
+    mx::StreamOrDevice s = {});
+
 mx::array dsa_topk_indices(
     const mx::array& scores,
     int topk,

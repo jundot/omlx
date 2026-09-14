@@ -25,6 +25,8 @@ from omlx.patches.mlx_vlm_glm5_next_compat import (
 try:
     import mlx.core as mx
 
+    from omlx.engine import vlm as vlm_module
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
@@ -2543,6 +2545,21 @@ class TestVLMEngineFrequencyPenalty:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
+    async def test_generate_forwards_preserve_reasoning(self):
+        """The non-streaming path must carry the flag the streaming path already does."""
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", preserve_reasoning=True)
+
+        assert engine._engine.generate.call_args.kwargs["preserve_reasoning"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
     async def test_generate_defaults_frequency_penalty_to_zero(self):
         engine = _make_loaded_engine(model_type="test-vlm")
         engine._engine = SimpleNamespace(
@@ -2614,3 +2631,50 @@ class TestVLMEngineFrequencyPenalty:
 
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert call_kwargs["sampling_params"].frequency_penalty == 0.42
+
+
+# ---------------------------------------------------------------------------
+# TestCaptureVLMPositionState
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureVLMPositionState:
+    """_capture_vlm_position_state() must hand the scheduler concrete arrays.
+
+    get_rope_index() leaves the mRoPE state lazy on the executor's default
+    stream; a lazy cross-stream input in the engine-stream prefill graph
+    deadlocks the Qwen ANE prefill primitive on restored prefixes (#3305).
+    """
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_captures_and_materializes_lazy_mrope_state(self):
+        pid = mx.arange(6).reshape(1, 6) + 1
+        rd = mx.zeros((1, 1)) - 3
+        lm = SimpleNamespace(_position_ids=pid, _rope_deltas=rd)
+        extra = {}
+
+        with patch.object(vlm_module.mx, "eval", wraps=mx.eval) as eval_mock:
+            vlm_module._capture_vlm_position_state(lm, extra)
+
+        assert extra["position_ids"] is pid
+        assert extra["_captured_rope_deltas"] is rd
+        eval_mock.assert_called_once()
+        assert [id(a) for a in eval_mock.call_args.args] == [id(pid), id(rd)]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_existing_position_ids_are_kept(self):
+        given = mx.zeros((1, 2))
+        lm = SimpleNamespace(_position_ids=mx.ones((1, 2)), _rope_deltas=None)
+        extra = {"position_ids": given}
+
+        vlm_module._capture_vlm_position_state(lm, extra)
+
+        assert extra["position_ids"] is given
+        assert "_captured_rope_deltas" not in extra
+
+    def test_missing_language_model_is_noop(self):
+        extra = {}
+
+        vlm_module._capture_vlm_position_state(None, extra)
+
+        assert extra == {}

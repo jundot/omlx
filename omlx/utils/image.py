@@ -11,6 +11,9 @@ import base64
 import binascii
 import hashlib
 import io
+import struct
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
@@ -82,12 +85,61 @@ def validate_image_data_uri(value: str, *, field: str = "image") -> str:
     return value
 
 
+# Decoded-image cache.
+#
+# Multi-turn agent loops resend the same historical screenshots on every turn
+# (byte-identical base64 data URIs). Decoding a PNG/JPEG is CPU-bound and,
+# once the conversation accumulates many screenshots, re-decoding the whole
+# history every turn dominates time-to-first-token. Keying the decoded RGB
+# image by the hash of its source bytes lets repeated turns reuse prior
+# decodes and only decode genuinely new images. Bounded by total decoded
+# pixel bytes so the cache cannot grow without limit.
+_IMAGE_DECODE_CACHE_MAX_BYTES = 512 * 1024 * 1024  # 512 MiB
+
+_image_decode_cache: "OrderedDict[str, Image.Image]" = OrderedDict()
+_image_decode_cache_bytes = 0
+_image_decode_cache_generation = 0
+_image_decode_cache_lock = threading.Lock()
+
+
+def _decoded_pixel_bytes(img: Image.Image) -> int:
+    width, height = img.size
+    # Pillow stores RGB pixels in four-byte slots, plus one pointer per row.
+    return width * height * 4 + height * struct.calcsize("P")
+
+
+def clear_image_decode_cache() -> int:
+    """Drop cache references and return their accounted bytes.
+
+    Active requests retain their images. Decodes started before this clear
+    may finish for their callers, but must not repopulate the cache.
+    """
+    global _image_decode_cache_bytes, _image_decode_cache_generation
+    with _image_decode_cache_lock:
+        released = _image_decode_cache_bytes
+        _image_decode_cache.clear()
+        _image_decode_cache_bytes = 0
+        _image_decode_cache_generation += 1
+        return released
+
+
+def _cached_image(key: str) -> Image.Image | None:
+    with _image_decode_cache_lock:
+        hit = _image_decode_cache.get(key)
+        if hit is not None:
+            _image_decode_cache.move_to_end(key)
+        return hit
+
+
 def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
     """
     Load an image from a base64 data URI.
 
     Supports:
     - Data URIs: "data:image/jpeg;base64,..." format
+
+    Decoded images are cached by source-byte hash so that re-sending the
+    same image across turns does not re-run the CPU-bound decode.
 
     Args:
         url_or_base64: Image base64 data URI string
@@ -99,8 +151,22 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
         InvalidRequestError: If the input is not a valid image data URI
     """
     img_bytes = _decode_base64_data_uri(url_or_base64, field=field)
+    return _load_image_bytes(img_bytes, field=field)
+
+
+def _load_image_bytes(
+    img_bytes: bytes, *, field: str, generation: int | None = None
+) -> Image.Image:
+    key = hashlib.sha256(img_bytes).hexdigest()
+    with _image_decode_cache_lock:
+        if generation is None:
+            generation = _image_decode_cache_generation
+    hit = _cached_image(key)
+    if hit is not None:
+        return hit
+
     try:
-        img = Image.open(io.BytesIO(img_bytes))
+        loaded = Image.open(io.BytesIO(img_bytes))
     except Exception as exc:
         raise InvalidRequestError(
             f"{field} does not contain a decodable image.",
@@ -109,9 +175,31 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
 
     # Apply EXIF orientation (phone photos etc.) before processing.
     # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
-    img = ImageOps.exif_transpose(img)
+    oriented = ImageOps.exif_transpose(loaded)
     # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
-    return img.convert("RGB")
+    rgb = oriented.convert("RGB")
+
+    nbytes = _decoded_pixel_bytes(rgb)
+    if nbytes <= _IMAGE_DECODE_CACHE_MAX_BYTES:
+        global _image_decode_cache_bytes
+        with _image_decode_cache_lock:
+            if generation != _image_decode_cache_generation:
+                return rgb
+            # Another thread may have decoded the same key while we were
+            # decoding; reconcile accounting before inserting.
+            stale = _image_decode_cache.pop(key, None)
+            if stale is not None:
+                _image_decode_cache_bytes -= _decoded_pixel_bytes(stale)
+            _image_decode_cache[key] = rgb
+            _image_decode_cache_bytes += nbytes
+            while (
+                _image_decode_cache_bytes > _IMAGE_DECODE_CACHE_MAX_BYTES
+                and _image_decode_cache
+            ):
+                _, evicted = _image_decode_cache.popitem(last=False)
+                _image_decode_cache_bytes -= _decoded_pixel_bytes(evicted)
+
+    return rgb
 
 
 def extract_images_from_messages(
@@ -138,6 +226,9 @@ def extract_images_from_messages(
     text_messages = []
     images = []
     audio = []
+    pending_images = []
+    with _image_decode_cache_lock:
+        generation = _image_decode_cache_generation
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -190,7 +281,12 @@ def extract_images_from_messages(
                     url = getattr(image_url_obj, "url", None)
 
                 if url:
-                    images.append(load_image(url, field="image_url"))
+                    img_bytes = _decode_base64_data_uri(url, field="image_url")
+                    key = hashlib.sha256(img_bytes).hexdigest()
+                    hit = _cached_image(key)
+                    if hit is None:
+                        pending_images.append((len(images), img_bytes))
+                    images.append(hit)
 
             elif part_type == "input_audio":
                 # OpenAI audio format: {"type":"input_audio","input_audio":{"data":"...","format":"wav"}}
@@ -220,6 +316,14 @@ def extract_images_from_messages(
             if key not in ("role", "content"):
                 new_msg[key] = msg[key]
         text_messages.append(new_msg)
+
+    # Retain every existing hit before inserting misses. A long chronological
+    # history can exceed the cache; decoding its oldest misses first would
+    # otherwise evict later hits before this request reaches them.
+    for index, img_bytes in pending_images:
+        images[index] = _load_image_bytes(
+            img_bytes, field="image_url", generation=generation
+        )
 
     return text_messages, images, audio
 

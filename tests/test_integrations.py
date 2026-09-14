@@ -1402,6 +1402,7 @@ class TestClaudeCodeIntegration:
         assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000"
         assert env["ANTHROPIC_AUTH_TOKEN"] == "secret"
         assert env["ANTHROPIC_API_KEY"] == ""
+        assert env["ANTHROPIC_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5"

@@ -492,6 +492,31 @@ def test_sanitize_and_oq_keep_sensitive_parameters_in_fp32():
     ) == {"bits": 8, "group_size": 64, "mode": "affine"}
 
 
+def test_sanitize_remaps_quantized_forget_gate_sidecars():
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    prefix = "language_model.model.layers.0.self_attn."
+    weights = {
+        prefix + "f_a_proj.weight": mx.ones((32, 32)),
+        prefix + "f_a_proj.scales": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_a_proj.biases": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_b_proj.weight": mx.ones((32, 32)),
+        prefix + "f_b_proj.scales": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_b_proj.biases": mx.ones((2,), dtype=mx.bfloat16),
+    }
+    sanitized = model.sanitize(dict(weights))
+    gate = prefix + "forget_gate."
+    for proj in ("f_a_proj", "f_b_proj"):
+        for part in ("weight", "scales", "biases"):
+            assert gate + proj + "." + part in sanitized
+    assert not any(
+        key.startswith(prefix + "f_") and ".forget_gate." not in key
+        for key in sanitized
+    )
+
+
 def test_vector_gate_kernel_matches_reference_with_padding_mask():
     from mlx_vlm.models.glm5_next.gated_delta import gated_delta_update
 
