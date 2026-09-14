@@ -128,6 +128,28 @@ def _patch_text_config(g4_config: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _align_drafter_dtype(drafter: Any, dtype: Any) -> None:
+    """Store the assistant head at the dtype its activations arrive in.
+
+    The head ships bfloat16, so on a float16 checkpoint every head matmul
+    promotes to float32. Safe in either direction: the head only proposes,
+    and every token emitted is one the backbone verified.
+    """
+    from mlx.utils import tree_map
+
+    def _cast(value: Any) -> Any:
+        if (
+            isinstance(value, mx.array)
+            and value.dtype in (mx.float16, mx.bfloat16)
+            and value.dtype != dtype
+        ):
+            return value.astype(dtype)
+        return value
+
+    drafter.update(tree_map(_cast, drafter.parameters()))
+    logger.info("gemma4 vlm assistant head aligned to %s", dtype)
+
+
 def _patch_vlm_language_model(g4_lang: Any) -> None:
     cls = g4_lang.LanguageModel
     if "_omlx_mtp_runtime_patched" in cls.__dict__:
@@ -266,6 +288,12 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             )
 
         h = hidden_states[:, -1:, :]
+        # Compared as a string: `mx.array.dtype` builds a fresh Dtype per
+        # access, and `None != a_dtype` raises out of nanobind.
+        want_dtype = str(h.dtype)
+        if getattr(drafter, "_omlx_head_dtype", None) != want_dtype:
+            _align_drafter_dtype(drafter, h.dtype)
+            drafter._omlx_head_dtype = want_dtype
         ids = next_token_ids[:, -1:]
         tok_embed = drafter._input_embed(ids) * drafter._input_embed_scale
         inputs_embeds = mx.concatenate([tok_embed.astype(h.dtype), h], axis=-1)
