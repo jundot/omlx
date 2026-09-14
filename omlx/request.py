@@ -170,6 +170,8 @@ class Request:
         None  # Model-specific kwargs (e.g., position_ids)
     )
     vlm_image_hash: Optional[str] = None  # SHA256 hash of images for prefix cache
+    # CPU-only factual context for optional SSD inspection, not model kwargs.
+    cache_inspection_media: tuple[dict[str, Any], ...] = ()
     vlm_cache_key_start: int = 0  # Token index where image-specific cache keying starts
     vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = (
         None  # [(token_start, cumulative_image_hash)]

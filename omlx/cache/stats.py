@@ -211,6 +211,9 @@ class PagedSSDCacheStats(BaseCacheStats):
     errors: int = 0
     ssd_write_drops: int = 0
     ssd_inline_write_fallbacks: int = 0
+    inspection_writes: int = 0
+    inspection_errors: int = 0
+    inspection_backfill_drops: int = 0
     evict_unlink_failures: int = 0
 
     # Storage capacity
@@ -258,6 +261,9 @@ class PagedSSDCacheStats(BaseCacheStats):
         self.errors = 0
         self.ssd_write_drops = 0
         self.ssd_inline_write_fallbacks = 0
+        self.inspection_writes = 0
+        self.inspection_errors = 0
+        self.inspection_backfill_drops = 0
         self.evict_unlink_failures = 0
 
     def to_dict(self) -> Dict[str, Any]:
