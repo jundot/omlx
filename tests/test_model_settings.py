@@ -932,3 +932,17 @@ def test_oq_a8_is_a_model_specific_profile_field():
     for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET
+class TestNgramSpecSettings:
+    def test_ngram_requires_mtp(self):
+        import pytest
+
+        from omlx.model_settings import ModelSettings
+
+        with pytest.raises(ValueError, match="ngram_spec_enabled requires"):
+            ModelSettings(ngram_spec_enabled=True, mtp_enabled=False)
+
+    def test_ngram_with_mtp_is_valid(self):
+        from omlx.model_settings import ModelSettings
+
+        s = ModelSettings(mtp_enabled=True, ngram_spec_enabled=True)
+        assert s.ngram_spec_enabled is True

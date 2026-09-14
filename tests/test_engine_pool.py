@@ -4438,6 +4438,20 @@ def test_qwen4_moe_savings_precede_ple_force_decision(
         _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
         assert is_forced is forced
         assert pool._entry_runtime_resident_size(entry, settings) == expected
+def test_ngram_spec_changes_runtime_signature():
+    from omlx.engine_pool import EnginePool
+    from omlx.model_settings import ModelSettings
+
+    pool = EnginePool()
+    base = ModelSettings(mtp_enabled=True)
+    flipped = ModelSettings(mtp_enabled=True, ngram_spec_enabled=True)
+    sig_a = pool._engine_runtime_signature("m", base)
+    sig_b = pool._engine_runtime_signature("m", flipped)
+    assert sig_a != sig_b
+
+    # sub-parameters only count while the parent toggle is active
+    tuned_off = ModelSettings(mtp_enabled=True, ngram_spec_match_len=24)
+    assert pool._engine_runtime_signature("m", tuned_off) == sig_a
 
 
 @pytest.mark.asyncio
