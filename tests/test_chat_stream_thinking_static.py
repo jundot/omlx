@@ -82,3 +82,40 @@ def test_stream_responses_api_starts_parser_when_prompt_opens_thinking():
         "ThinkingParser so prompt-opened reasoning streams as "
         "reasoning summary deltas, not output_text."
     )
+
+
+def test_stream_chat_completion_rejected_envelope_is_flushed_not_dropped():
+    """An envelope rejected by the early-stream gate must be flushed as content.
+
+    The ToolCallStreamFilter suppresses envelopes from content deltas, so a
+    bare "continue" in the registered-name/parse-fail branch discards the
+    turn's only payload and the client gets finish=stop with empty content and
+    no tool_calls (jundot/omlx#3660). The reject branch must therefore yield
+    the captured envelope as a visible content delta.
+    """
+    node = _server_stream_node("stream_chat_completion")
+    rejects = [
+        stmt
+        for stmt in ast.walk(node)
+        if isinstance(stmt, ast.If) and "registered_tool_names" in ast.dump(stmt.test)
+    ]
+    assert rejects, "early-stream registered-name gate not found"
+
+    def _flushes_segment(stmt):
+        dumped = ast.dump(stmt)
+        return (
+            any(isinstance(y, ast.Yield) for y in ast.walk(stmt))
+            and "id='segment'" in dumped
+            and "attr='text'" in dumped
+        )
+
+    for stmt in rejects:
+        assert _flushes_segment(stmt), (
+            "rejected qwen3_coder envelope must be yielded back as a content "
+            "delta instead of being silently dropped"
+        )
+    flushed = any(_flushes_segment(stmt) for stmt in rejects)
+    assert flushed, (
+        "no reject-path yield flushes segment.text; a rejected tool-call "
+        "envelope can still vanish from the stream (#3660)"
+    )
