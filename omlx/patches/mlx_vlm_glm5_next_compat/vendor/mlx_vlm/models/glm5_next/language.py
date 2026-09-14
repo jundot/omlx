@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -28,6 +29,18 @@ from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
+
+# Crossover for the native sparse-MLA kernel, measured on this M1 Ultra
+# (2026-08-30, real GLM-5.3-Flash shapes: 64 heads, latent 512, top-k 2048).
+# The native kernel has a fixed cost and stays flat in context length, while
+# the dense fallback is O(context). Below the crossover the native path LOSES:
+#     ctx  4096: dense  28.13 ms  native  82.45 ms  -> 0.34x (3x slower)
+#     ctx  8192: dense 107.62 ms  native 165.12 ms  -> 0.65x
+#     ctx 16384: dense 445.53 ms  native 334.38 ms  -> 1.33x
+#     ctx 32768: dense 909.99 ms  native 343.39 ms  -> 2.65x
+# The previous value (4096) enabled the kernel exactly where it is 3x slower.
+# Re-measure if #3251 lands: its M=1 indexer specialization moves the crossover.
+_SPARSE_MLA_MIN_KV = int(os.environ.get("OMLX_GLM5_SPARSE_MLA_MIN_KV", "16384"))
 _NATIVE_INDEXER_WARNED = False
 
 
@@ -616,7 +629,7 @@ class Glm5NextSparseAttention(nn.Module):
                 q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=q_latent.dtype)
                 k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype)
                 output = None
-                if Kv >= 4096:
+                if Kv >= _SPARSE_MLA_MIN_KV:
                     output = sparse_mla_attention(
                         q_latent,
                         q_pe,
