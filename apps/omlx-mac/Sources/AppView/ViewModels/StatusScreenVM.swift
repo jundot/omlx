@@ -77,7 +77,7 @@ final class StatusScreenVM {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.tick()
+                await self.tick(clearsError: false)
                 try? await Task.sleep(for: .seconds(5))
             }
         }
@@ -89,13 +89,18 @@ final class StatusScreenVM {
         metrics.stop()
     }
 
-    private func tick() async {
+    /// `clearsError`: the 5s poll loop (below) must not touch `lastError` —
+    /// it was wiping a clearStats/clearSsdCache/clearHotCache failure within
+    /// that window (§G2). Those three action methods call this right after
+    /// their own successful request, where touching lastError is legitimate
+    /// action-triggered feedback, not a poll clobbering it.
+    private func tick(clearsError: Bool = true) async {
         guard let client else { return }
         do {
             self.stats = try await client.getStats(scope: scope)
-            self.lastError = nil
+            if clearsError { self.lastError = nil }
         } catch {
-            self.lastError = error.omlxDescription
+            if clearsError { self.lastError = error.omlxDescription }
         }
     }
 

@@ -29,7 +29,7 @@ final class ModelsScreenVM {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.refresh()
+                await self.refresh(clearsError: false)
                 try? await Task.sleep(for: .seconds(2))
             }
         }
@@ -94,13 +94,18 @@ final class ModelsScreenVM {
         }
     }
 
-    private func refresh() async {
+    /// `clearsError`: the 2s poll loop (below) must not touch `lastError` —
+    /// it was wiping a load/unload/favorite/remove failure within that
+    /// window (§G2). The action methods call this right after their own
+    /// successful request, where touching lastError is legitimate
+    /// action-triggered feedback, not a poll clobbering it.
+    private func refresh(clearsError: Bool = true) async {
         guard let client else { return }
         do {
             self.allModels = sortModelsByName(try await client.listModels().models)
-            self.lastError = nil
+            if clearsError { self.lastError = nil }
         } catch {
-            self.lastError = error.omlxDescription
+            if clearsError { self.lastError = error.omlxDescription }
         }
     }
 
