@@ -214,6 +214,53 @@ class TestApplyAndForward:
         mx.eval(got)
         assert bool(mx.array_equal(ref, got))
 
+    def test_over_capacity_prefill_installs_each_expert_once(self, tmp_path):
+        """Above the sort threshold and over capacity, the prefill is chunked
+        on expert boundaries: every distinct expert is fetched exactly once
+        per call, however many tokens route to it. The token-chunked path
+        fetched an expert again in every chunk that touched it."""
+        model, _ = self._wrapped_model(tmp_path, n_layers=1)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        glu = model.layers[0].experts.switch_glu
+        fetched = []
+        inner = glu.cache.disk.fetch
+
+        def spy(proj, field, e):
+            if proj == "gate_proj" and field == "weight":
+                fetched.append(e)
+            return inner(proj, field, e)
+
+        glu.cache.disk.fetch = spy
+        # 2 x 60 tokens x k=2 = 240 routes: sorted kernel, ~all 32 experts
+        x, i = mx.random.normal((2, 60, D)), _ri(2, 60, K)
+        distinct = set(i.reshape(-1).tolist())
+        assert len(distinct) > glu.cache.capacity  # the path under test
+        out = glu(x, i)
+        mx.eval(out)
+        assert sorted(fetched) == sorted(distinct)  # once each, none twice
+        assert glu.cache.misses == len(distinct)
+        assert len(glu.cache.slot_of) <= glu.cache.capacity
+
+    def test_over_capacity_prefill_matches_resident(self, tmp_path):
+        """Route order is restored and every route meets its own expert:
+        rounding-scale agreement with the resident model above the sort
+        threshold (kernel batching differs), and bit-exact below it, where
+        both sides run the unsorted kernel."""
+        model, glus = self._wrapped_model(tmp_path, n_layers=1)
+        above = (mx.random.normal((2, 60, D)), _ri(2, 60, K))
+        below = (mx.random.normal((3, 9, D)), _ri(3, 9, K))
+        ref_above, ref_below = model(*above), model(*below)
+        mx.eval(ref_above, ref_below)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        cache = model.layers[0].experts.switch_glu.cache
+        got_above = model(*above)
+        mx.eval(got_above)
+        assert cache.misses > cache.capacity  # went over capacity
+        assert mx.allclose(got_above, ref_above, rtol=1e-4, atol=1e-5).item()
+        got_below = model(*below)
+        mx.eval(got_below)
+        assert bool(mx.array_equal(ref_below, got_below))
+
     def test_batch_invariance(self, tmp_path):
         model, _ = self._wrapped_model(tmp_path, n_layers=1)
         apply_moe_expert_offload(model, tmp_path, 0.25)

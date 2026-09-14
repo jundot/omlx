@@ -2678,3 +2678,31 @@ class TestCaptureVLMPositionState:
         vlm_module._capture_vlm_position_state(None, extra)
 
         assert extra == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+@pytest.mark.parametrize("side_limit, expected_tokens", [(2048, 3072), (0, 11750)])
+async def test_preflight_uses_processed_image_dimensions(
+    monkeypatch, side_limit, expected_tokens
+):
+    from omlx.utils import image as image_module
+
+    monkeypatch.setattr(image_module, "get_max_image_side_length", lambda: side_limit)
+    image_module.clear_image_decode_cache()
+    try:
+        engine = _make_loaded_engine()
+        engine._processor = _QWEN_PROC
+        engine._apply_chat_template = MagicMock(return_value="test")
+        engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+        messages = [{"role": "user", "content": [_image_part(4000, 3000)]}]
+        # Repeat to exercise the decoded-image cache as well.
+        for _ in range(2):
+            await engine.preflight_chat(messages)
+            assert engine._preflight_or_raise_with_eviction.call_args.kwargs[
+                "num_prompt_tokens"
+            ] == expected_tokens + 1
+    finally:
+        image_module.clear_image_decode_cache()

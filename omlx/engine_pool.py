@@ -1294,7 +1294,8 @@ class EnginePool:
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            self._raise_if_reload_busy(entry, "activate distributed cluster")
+            if not getattr(entry.engine, "runtime_failed_reason", None):
+                self._raise_if_reload_busy(entry, "activate distributed cluster")
             await self._unload_engine(model_id)
             self._clear_load_failure(entry)
 

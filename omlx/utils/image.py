@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import io
+import math
 import struct
 import threading
 from collections import OrderedDict
@@ -19,6 +20,29 @@ from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageOps
 
 from ..exceptions import InvalidRequestError
+from ..settings import get_settings
+
+DEFAULT_MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MiB
+DEFAULT_MAX_IMAGE_SIDE_LENGTH = 2048  # 2048 px
+
+
+def get_max_image_bytes() -> int:
+    """Return the resolved image payload limit in bytes."""
+    try:
+        settings = get_settings()
+    except RuntimeError:
+        return DEFAULT_MAX_IMAGE_BYTES
+    return settings.server.max_image_upload_bytes()
+
+
+def get_max_image_side_length() -> int:
+    """Return the resolved image side limit (0 disables resizing)."""
+    try:
+        settings = get_settings()
+    except RuntimeError:
+        return DEFAULT_MAX_IMAGE_SIDE_LENGTH
+    return settings.server.max_image_side_length
+
 
 _IMAGE_INPUT_ERROR = (
     "Image inputs must be base64 data URIs "
@@ -51,13 +75,31 @@ def _decode_base64_data_uri(value: str, *, field: str) -> bytes:
             field=field,
         )
 
+    # Pre-check base64 encoded length to reject massive inputs before decoding
+    max_bytes = get_max_image_bytes()
+    if max_bytes > 0:
+        max_encoded_len = int(math.ceil(max_bytes * 4 / 3)) + 1024
+        if len(encoded) > max_encoded_len:
+            raise InvalidRequestError(
+                f"{field} image payload exceeds the maximum allowed limit of {max_bytes} bytes.",
+                field=field,
+            )
+
     try:
-        return base64.b64decode(encoded, validate=True)
+        decoded = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise InvalidRequestError(
             f"{field} contains invalid base64 data.",
             field=field,
         ) from exc
+
+    if max_bytes > 0 and len(decoded) > max_bytes:
+        raise InvalidRequestError(
+            f"{field} image payload ({len(decoded)} bytes) exceeds the maximum allowed limit of {max_bytes} bytes.",
+            field=field,
+        )
+
+    return decoded
 
 
 def _decode_input_audio_data(data: str, *, field: str = "input_audio.data") -> bytes:
@@ -157,6 +199,13 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
 def _load_image_bytes(
     img_bytes: bytes, *, field: str, generation: int | None = None
 ) -> Image.Image:
+    max_bytes = get_max_image_bytes()
+    if max_bytes > 0 and len(img_bytes) > max_bytes:
+        raise InvalidRequestError(
+            f"{field} image payload ({len(img_bytes)} bytes) exceeds the maximum allowed limit of {max_bytes} bytes.",
+            field=field,
+        )
+
     key = hashlib.sha256(img_bytes).hexdigest()
     with _image_decode_cache_lock:
         if generation is None:
@@ -167,17 +216,27 @@ def _load_image_bytes(
 
     try:
         loaded = Image.open(io.BytesIO(img_bytes))
+        # Apply EXIF orientation (phone photos etc.) before processing.
+        # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
+        oriented = ImageOps.exif_transpose(loaded)
+        # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
+        rgb = oriented.convert("RGB")
+    except Image.DecompressionBombError as exc:
+        raise InvalidRequestError(
+            f"{field} exceeds maximum allowed image resolution (decompression bomb detected).",
+            field=field,
+        ) from exc
     except Exception as exc:
         raise InvalidRequestError(
             f"{field} does not contain a decodable image.",
             field=field,
         ) from exc
 
-    # Apply EXIF orientation (phone photos etc.) before processing.
-    # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
-    oriented = ImageOps.exif_transpose(loaded)
-    # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
-    rgb = oriented.convert("RGB")
+    # Downscale oversized images preserving aspect ratio to prevent memory spikes in VLMs
+    max_side = get_max_image_side_length()
+    if max_side > 0 and (rgb.width > max_side or rgb.height > max_side):
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        rgb.thumbnail((max_side, max_side), resample=resample)
 
     nbytes = _decoded_pixel_bytes(rgb)
     if nbytes <= _IMAGE_DECODE_CACHE_MAX_BYTES:

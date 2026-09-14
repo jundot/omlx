@@ -746,3 +746,201 @@ class TestDecodeCacheFollowup:
             load_image(small)
         assert opened.call_count == 0
         assert len(module._image_decode_cache) == 1
+
+
+# =============================================================================
+# Tests: Image size validation and downscaling (Issue #3650)
+# =============================================================================
+
+
+class TestImageSizeAndDownscaling:
+    """Tests for payload size limits, decompression bomb guards, and aspect downscaling."""
+
+    @pytest.fixture(autouse=True)
+    def isolate_cache(self):
+        from omlx.utils.image import clear_image_decode_cache
+
+        clear_image_decode_cache()
+        yield
+        clear_image_decode_cache()
+
+    def test_rejects_oversized_payload(self, monkeypatch):
+        """Images exceeding max payload bytes are rejected before decode."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_bytes", lambda: 100)
+        img = _make_test_image(64, 64, "blue")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum allowed limit"):
+            load_image(uri)
+
+    def test_rejects_oversized_encoded_length_early(self, monkeypatch):
+        """Massive base64 strings are rejected early before b64decode."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_bytes", lambda: 100)
+        fake_b64 = "A" * 2000
+        uri = f"data:image/png;base64,{fake_b64}"
+
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum allowed limit"):
+            load_image(uri)
+
+    def test_downscales_oversized_width_preserving_aspect(self, monkeypatch):
+        """Wide image exceeding max side length is downscaled preserving aspect ratio."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 1024)
+        img = _make_test_image(2048, 1024, "red")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (1024, 512)
+
+    def test_downscales_oversized_height_preserving_aspect(self, monkeypatch):
+        """Tall image exceeding max side length is downscaled preserving aspect ratio."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 1024)
+        img = _make_test_image(1024, 2048, "green")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (512, 1024)
+
+    def test_preserves_dimensions_within_limit(self, monkeypatch):
+        """Images within limits are not resized."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 2048)
+        img = _make_test_image(800, 600, "yellow")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (800, 600)
+
+    def test_downscaling_disabled_when_side_limit_zero(self, monkeypatch):
+        """Setting max side length to 0 disables downscaling."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 0)
+        img = _make_test_image(3000, 1500, "purple")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (3000, 1500)
+
+    def test_decompression_bomb_raises_invalid_request_error(self, monkeypatch):
+        """Decompression bombs detected by Pillow raise InvalidRequestError."""
+        from PIL import Image as PILImage
+
+        monkeypatch.setattr(PILImage, "MAX_IMAGE_PIXELS", 50)
+        img = _make_test_image(20, 20, "red")  # 400 pixels > 50
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        with pytest.raises(InvalidRequestError, match="decompression bomb detected"):
+            load_image(uri)
+
+    def test_extract_images_from_messages_downscales_oversized(self, monkeypatch):
+        """extract_images_from_messages downscales oversized images in messages."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 512)
+        img = _make_test_image(1024, 512, "blue")
+        b64 = _image_to_base64(img)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                    {"type": "text", "text": "Describe"},
+                ],
+            }
+        ]
+
+        text_msgs, images, audio = extract_images_from_messages(messages)
+        assert len(images) == 1
+        assert images[0].size == (512, 256)
+
+    def test_extract_images_from_messages_rejects_oversized_payload(self, monkeypatch):
+        """extract_images_from_messages rejects images exceeding payload limits."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_bytes", lambda: 100)
+        img = _make_test_image(64, 64, "blue")
+        b64 = _image_to_base64(img)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum allowed limit"):
+            extract_images_from_messages(messages)
+
+    def test_cache_stores_downscaled_image_and_accounts_accurately(self, monkeypatch):
+        """Cache holds downscaled image and byte accounting reflects downscaled size."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 100)
+        img = _make_test_image(400, 200, "cyan")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (100, 50)
+        expected_bytes = module._decoded_pixel_bytes(loaded)
+        assert module._image_decode_cache_bytes == expected_bytes
+
+        # Subsequent fetch hits cache without redecoding
+        with patch.object(Image, "open", wraps=Image.open) as opened:
+            cached = load_image(uri)
+        assert opened.call_count == 0
+        assert cached.size == (100, 50)
+
+    @pytest.mark.parametrize("cli_override", [False, True])
+    def test_resolved_settings_control_image_processing(
+        self, monkeypatch, tmp_path, cli_override
+    ):
+        from argparse import Namespace
+
+        from omlx import settings as settings_module
+        from omlx.utils.image import get_max_image_bytes, get_max_image_side_length
+
+        monkeypatch.setattr(settings_module, "_global_settings", None)
+        monkeypatch.setenv("OMLX_MAX_IMAGE_UPLOAD_SIZE", "20MB")
+        monkeypatch.setenv("OMLX_MAX_IMAGE_SIDE_LENGTH", "1500")
+        args = Namespace(max_image_upload_size="30MB", max_image_side_length=512)
+        settings_module.init_settings(
+            base_path=tmp_path, cli_args=args if cli_override else None
+        )
+        side = 512 if cli_override else 1500
+        assert get_max_image_bytes() == (30 if cli_override else 20) * 1024 * 1024
+        assert get_max_image_side_length() == side
+        uri = "data:image/png;base64," + _image_to_base64(
+            _make_test_image(3000, 1500, "blue")
+        )
+        assert load_image(uri).size == (side, side // 2)
+
+    def test_uninitialized_settings_use_defaults(self, monkeypatch):
+        from omlx import settings as settings_module
+        from omlx.utils.image import get_max_image_bytes, get_max_image_side_length
+
+        monkeypatch.setattr(settings_module, "_global_settings", None)
+        assert get_max_image_bytes() == 50 * 1024 * 1024
+        assert get_max_image_side_length() == 2048

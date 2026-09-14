@@ -48,14 +48,30 @@ fill):
 | 25% | 4.57 GB | 40.1 | 9.6 s | 0.67 |
 | 12.5% | 2.96 GB | 29.3 | 18.1 s | 0.45 |
 
-Decode throughput degrades gracefully; TTFT is the pain point at low
-residency, because a long prefill routes to most experts per layer and pays
-the fetch churn up front. That is also the clearest follow-up: v1 fetches
-synchronously on miss, while prefill's full expert-access schedule is
-computable *before* any fetch (run the router over the whole prompt — no
-prediction needed), and decode prefetch (layer L+1's fetches during layer
-L's compute) has measured LRU→optimal headroom of +17pp hit rate at low
-residency.
+Decode throughput degrades gracefully. TTFT was the pain point at low
+residency in the first version: a long prefill routes to most experts per
+layer, and chunking the prefill by tokens re-fetched an expert in every
+chunk that touched it, evicting on the way. Over-capacity prefill is now
+chunked on expert boundaries instead — the routes are sorted by expert and
+each chunk holds every route of up to `capacity` distinct experts, the same
+shape as the DeepSeek V4.1 adapter's sorted prefill — so each expert is read
+at most once per layer per model call. Measured with
+`benchmarks/moe_offload_prefill_bench.py` on the same model (585-token
+prompt, 32 decode tokens, single runs; warm = second identical request, cold
+= first request after load; filesystem page-cache state is not controlled).
+Fetch counts are sampled at the first yielded token and include the decode
+step mlx-lm runs ahead of that yield, rather than measuring pure prefill:
+
+| residency | expert fetches through first token, before → after | TTFT warm, before → after | TTFT cold, after | decode tok/s |
+|---|---|---|---|---|
+| 50% | 6,073 → 1,719 | 2.38 s → 0.69 s | 1.64 s | 60.6 |
+| 25% | 30,302 → 2,675 | 8.87 s → 0.85 s | 1.51 s | 43.5 |
+| 12.5% | 64,369 → 2,913 | 16.60 s → 0.97 s | 11.92 s | 31.7 |
+
+Decode is untouched by the change (it takes the no-sync fast path). The
+remaining follow-up is decode prefetch (layer L+1's fetches during layer
+L's compute), which has measured LRU→optimal headroom of +17pp hit rate at
+low residency.
 
 ## Supported models
 

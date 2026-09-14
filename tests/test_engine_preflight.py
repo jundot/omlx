@@ -342,7 +342,7 @@ async def test_preflight_completion_raises_for_oversize_prompt(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
-    """Each image-bearing content part must add
+    """Each decoded image must add
     ``_IMAGE_TOKEN_UPPER_BOUND_FALLBACK`` to the prompt size the scheduler sees,
     so image-heavy borderline requests can't slip past."""
     from omlx.engine.vlm import _IMAGE_TOKEN_UPPER_BOUND_FALLBACK, VLMBatchedEngine
@@ -368,7 +368,10 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
                     "type": "image_url",
                     "image_url": {"url": _TINY_PNG_DATA_URI},
                 },
-                {"type": "image", "source": {}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _TINY_PNG_DATA_URI},
+                },
                 {"type": "text", "text": "world"},
             ],
         }
