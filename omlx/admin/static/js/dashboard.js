@@ -3372,6 +3372,9 @@
                     const response = await fetch(url);
                     if (response.ok) {
                         const data = await response.json();
+                        if (data.active_models && data.active_models.models) {
+                            this._ghostFinishedActivity(data.active_models.models);
+                        }
                         this.stats = { ...this.stats, ...data };
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -3482,6 +3485,42 @@
                 this._statsRefreshTimer = setInterval(() => {
                     this.loadStats(false);
                 }, 500);
+            },
+
+            /* Finished request rows linger in the Active Models card for a
+               few seconds as dimmed ghosts before dropping out. Without this
+               the card height jumps every time a request completes and the
+               masonry grid has to re-place, which read as the card
+               overflowing (or gapping over) the section below it. */
+            _activityGhostStore: {},
+            _ghostFinishedActivity(models) {
+                const GHOST_MS = 8000;
+                const now = Date.now();
+                const store = this._activityGhostStore;
+                const seen = new Set();
+                const byId = {};
+                for (const m of models) {
+                    byId[m.id] = m;
+                    for (const kind of ['generating', 'activities']) {
+                        for (const e of (m[kind] || [])) {
+                            const key = m.id + '|' + kind + '|' + e.request_id;
+                            seen.add(key);
+                            store[key] = { entry: { ...e, _finished: false }, kind, modelId: m.id, lastSeen: now };
+                        }
+                    }
+                }
+                // Entries seen recently but missing from this poll are
+                // finished: re-inject them into the payload, dimmed.
+                for (const [key, g] of Object.entries(store)) {
+                    if (seen.has(key)) continue;
+                    if (now - g.lastSeen > GHOST_MS) { delete store[key]; continue; }
+                    const m = byId[g.modelId];
+                    if (!m) { delete store[key]; continue; }  // model unloaded: drop ghost
+                    const list = (m[g.kind] = m[g.kind] || []);
+                    if (!list.some(e => e.request_id === g.entry.request_id)) {
+                        list.push({ ...g.entry, _finished: true });
+                    }
+                }
             },
 
             stopStatsRefresh() {

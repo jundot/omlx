@@ -445,6 +445,10 @@
         placeStable();
 
         // Active-models lists, cache bars etc. change card height at runtime.
+        // Observe the cards as well as the grid: with fixed row-spans a card
+        // growing or shrinking inside its span does NOT resize the grid
+        // container, so observing only the root misses exactly the height
+        // changes that need re-placement (overlap / gap under the card).
         let roTimer = null;
         try {
             const ro = new ResizeObserver(() => {
@@ -453,6 +457,7 @@
                 roTimer = setTimeout(placeStable, 300);
             });
             ro.observe(r);
+            for (const card of cards()) ro.observe(card);
         } catch (e) { /* no ResizeObserver: heights update on next drag */ }
 
         let resizeTimer = null;

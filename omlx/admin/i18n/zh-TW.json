@@ -114,6 +114,7 @@
   "status.active_models.waiting": "等待",
   "status.active_models.req": "請求",
   "status.active_models.generating": "生成中...",
+  "status.active_models.finished": "已完成",
   "status.active_models.unload": "卸載模型",
   "status.active_models.enforcer_disabled": "記憶體強制管理已停用",
   "status.active_models.dflash_label": "DFlash",

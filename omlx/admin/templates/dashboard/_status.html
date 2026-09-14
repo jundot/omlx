@@ -163,8 +163,10 @@
                             </div>
                     <div data-card="active-models" class="omlx-card">
                                 <div class="omlx-drag-handle" title="{{ t('status.drag_handle_tooltip') }}"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></div>
-                    <!-- Active Models -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
+                    <!-- Active Models (overflow-hidden clips the white body
+                         to the rounded-2xl corners; without it the bottom
+                         corners render squared under the card border) -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 mb-8 overflow-hidden">
                         <div class="lg:hidden flex flex-col gap-2 px-4 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
@@ -359,15 +361,17 @@
                                             </template>
                                         </div>
                                     </template>
-                                    <!-- Generating sub-rows -->
+                                    <!-- Generating sub-rows (finished ones
+                                         linger as dimmed ghosts; see
+                                         _ghostFinishedActivity in dashboard.js) -->
                                     <template x-if="m.generating && m.generating.length > 0">
                                         <div class="mt-1.5 ml-5 space-y-1.5">
                                             <template x-for="gen in m.generating" :key="gen.request_id">
-                                                <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+                                                <div class="flex flex-wrap items-center gap-x-4 gap-y-1" :class="gen._finished ? 'opacity-50' : ''">
                                                     <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
                                                     <span class="inline-flex items-center gap-2 min-w-[104px] whitespace-nowrap">
-                                                        <span class="w-2 h-2 rounded-full flex-shrink-0 bg-green-400 animate-pulse"></span>
-                                                        <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0" :class="gen._finished ? 'bg-neutral-300' : 'bg-green-400 animate-pulse'"></span>
+                                                        <span class="text-[10px] font-medium" :class="gen._finished ? 'text-neutral-400' : 'text-green-600'" x-text="gen._finished ? window.t('status.active_models.finished') : window.t('status.active_models.generating')"></span>
                                                     </span>
                                                     <span class="text-[10px] text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
                                                     <span x-show="gen.tokens_per_second > 0" class="text-[10px] text-neutral-400 w-20 whitespace-nowrap"
@@ -379,15 +383,16 @@
                                             </template>
                                         </div>
                                     </template>
-                                    <!-- Non-streaming activity sub-rows -->
+                                    <!-- Non-streaming activity sub-rows (same
+                                         ghost behaviour as generating) -->
                                     <template x-if="m.activities && m.activities.length > 0">
                                         <div class="mt-1.5 ml-5 space-y-1.5">
                                             <template x-for="activity in m.activities" :key="activity.request_id">
-                                                <div class="flex flex-wrap items-center gap-x-5 gap-y-1">
+                                                <div class="flex flex-wrap items-center gap-x-5 gap-y-1" :class="activity._finished ? 'opacity-50' : ''">
                                                     <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
                                                     <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
-                                                        <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
-                                                        <span class="text-[10px] text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activity._finished ? 'bg-neutral-300' : activityDotClass(activity.last_activity_age_seconds)"></span>
+                                                        <span class="text-[10px] font-medium" :class="activity._finished ? 'text-neutral-400' : 'text-green-600'" x-text="activity._finished ? window.t('status.active_models.finished') : (activity.detail || activity.kind || window.t('status.active_models.active'))"></span>
                                                     </span>
                                                     <span x-show="formatActivityMetadata(activity)" class="text-[10px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
                                                     <span x-show="activity.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>

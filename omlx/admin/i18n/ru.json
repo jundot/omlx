@@ -114,6 +114,7 @@
   "status.active_models.waiting": "В ожидании",
   "status.active_models.req": "запрос",
   "status.active_models.generating": "Генерация...",
+  "status.active_models.finished": "Завершено",
   "status.active_models.unload": "Выгрузить модель",
   "status.active_models.enforcer_disabled": "Ограничитель отключен",
   "status.active_models.dflash_label": "DFlash",

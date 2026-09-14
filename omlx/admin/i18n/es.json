@@ -114,6 +114,7 @@
   "status.active_models.waiting": "Esperando",
   "status.active_models.req": "req",
   "status.active_models.generating": "Generando...",
+  "status.active_models.finished": "Terminado",
   "status.active_models.unload": "Descargar modelo",
   "status.active_models.enforcer_disabled": "Enforcer disabled",
   "status.active_models.dflash_label": "DFlash",

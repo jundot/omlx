@@ -114,6 +114,7 @@
   "status.active_models.waiting": "待機",
   "status.active_models.req": "リクエスト",
   "status.active_models.generating": "生成中...",
+  "status.active_models.finished": "完了",
   "status.active_models.unload": "モデルをアンロード",
   "status.active_models.enforcer_disabled": "Enforcer disabled",
   "status.active_models.dflash_label": "DFlash",
