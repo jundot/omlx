@@ -2966,6 +2966,16 @@ class Qwen4ExpMTPModule(nn.Module):
         layer_config = replace(
             args,
             num_hidden_layers=1,
+            num_experts=(
+                args.mtp_num_experts
+                if args.mtp_num_experts is not None
+                else args.num_experts
+            ),
+            num_experts_per_tok=(
+                args.mtp_num_experts_per_tok
+                if args.mtp_num_experts_per_tok is not None
+                else args.num_experts_per_tok
+            ),
             layer_types=["qwen_sparse_attention"],
             full_attention_interval=1,
             ple_layer_ids=[],
