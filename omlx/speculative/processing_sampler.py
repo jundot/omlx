@@ -44,10 +44,15 @@ argmax and never calls the sampler for drafts; any plain ``sampler(...)``
 call falls through to the base sampler.
 
 Scope: processors must expose ``snapshot_state()`` / ``restore_state()``
-(today: ``ThinkingBudgetProcessor``). Grammar constraints stay on the
-BatchGenerator fallback — beyond statefulness, a grammar mask makes the
-unconstrained drafter's proposals systematically rejectable, so the
-speculative path would buy nothing there anyway.
+(today: ``ThinkingBudgetProcessor`` and ``GrammarConstraintProcessor``).
+Processors that also expose ``begin_speculative(history_len)`` /
+``end_speculative(history, pending)`` are switched into self-advancing mode
+for the lifetime of the wrapper: the grammar processor normally learns the
+sampled token from the scheduler's deferred accept, which this path never
+runs, so here it advances its matcher from the history each call hands it.
+Output stays grammar-valid because every emitted token is a target-side
+sample from masked logits; the drafter's greedy proposals are unmasked on
+this path, so acceptance under a grammar is a measurement, not a given.
 """
 
 from __future__ import annotations
@@ -96,6 +101,10 @@ class MTPProcessingSampler:
         self._history: list[int] = [int(t) for t in prompt_token_ids]
         self._prompt_len = len(self._history)
         self._snapshots: dict[int, list[dict]] = {}
+        for proc in self._processors:
+            begin = getattr(proc, "begin_speculative", None)
+            if callable(begin):
+                begin(self._prompt_len)
         self._initial_snapshot = self._snap()
         self._degraded = False
 
@@ -127,6 +136,12 @@ class MTPProcessingSampler:
         self._restore(self._initial_snapshot)
         del self._history[self._prompt_len :]
         self._snapshots.clear()
+        for proc in self._processors:
+            end = getattr(proc, "end_speculative", None)
+            if callable(end):
+                # The BatchGenerator fallback samples from scratch: nothing
+                # is in flight for the deferred accept to pick up.
+                end(self._history, pending=False)
 
     # -- mlx-vlm positioned verify hook -------------------------------------
 
