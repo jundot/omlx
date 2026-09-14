@@ -1895,7 +1895,7 @@ def parse_tool_calls_with_thinking_fallback(
 
 @dataclass(frozen=True)
 class ToolCallStreamSegment:
-    """One FIFO-safe visible-content or complete-envelope stream event."""
+    """One FIFO-safe content, complete-envelope or opt-in fragment event."""
 
     kind: str
     text: str
@@ -1926,6 +1926,9 @@ class ToolCallStreamFilter:
         capture_ordered_segments: Retain an opt-in FIFO of visible-content and
             complete-envelope events for the narrow qwen3_coder Chat path.
             Other filters pay no segment-copying cost.
+        capture_envelope_fragments: Also retain paired-envelope fragments in the
+            same FIFO for opt-in partial argument delivery. The caller must
+            validate partial arguments against the completed native envelope.
     """
 
     _COMPLETED_ENVELOPE_MAX_COUNT = 16
@@ -1937,6 +1940,7 @@ class ToolCallStreamFilter:
         *,
         consume_dsml_separator: bool = True,
         capture_ordered_segments: bool = False,
+        capture_envelope_fragments: bool = False,
     ):
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
@@ -2000,6 +2004,7 @@ class ToolCallStreamFilter:
         self._completed_envelope_bytes = 0
         self._completed_envelope_overflowed = False
         self._capture_ordered_segments = bool(capture_ordered_segments)
+        self._capture_envelope_fragments = bool(capture_envelope_fragments and capture_ordered_segments)
         self._ordered_segments: List[ToolCallStreamSegment] = []
         # IFM groups are parsed together at EOF. Hold from the first opener
         # so failed parsing can return the exact suffix in its original order,
@@ -2071,6 +2076,10 @@ class ToolCallStreamFilter:
         if self._capture_ordered_segments:
             self._ordered_segments.append(ToolCallStreamSegment("content", text))
 
+    def _record_envelope_fragment(self, text: str) -> None:
+        if self._capture_envelope_fragments and not self._completed_envelope_overflowed and text:
+            self._ordered_segments.append(ToolCallStreamSegment("envelope_delta", text))
+
     def _record_completed_envelope(self, completed: str) -> None:
         if not self._capture_ordered_segments:
             return
@@ -2090,7 +2099,7 @@ class ToolCallStreamFilter:
             self._ordered_segments = [
                 segment
                 for segment in self._ordered_segments
-                if segment.kind != "envelope"
+                if segment.kind not in ("envelope", "envelope_delta")
             ]
             return
         self._completed_envelopes.append(completed)
@@ -2670,6 +2679,7 @@ class ToolCallStreamFilter:
                     if keep:
                         moved = self._buffer[:-keep]
                         self._pending_envelope_parts.append(moved)
+                        self._record_envelope_fragment(moved)
                         # Rebase the JSON scan: those chars left the buffer
                         # front but were already consumed by the scanner.
                         self._shift_json_scan(len(moved), moved)
@@ -2677,6 +2687,7 @@ class ToolCallStreamFilter:
                     else:
                         moved = self._buffer
                         self._pending_envelope_parts.append(moved)
+                        self._record_envelope_fragment(moved)
                         self._shift_json_scan(len(moved), moved)
                         self._buffer = ""
                     break
@@ -2684,6 +2695,7 @@ class ToolCallStreamFilter:
                     "".join(self._pending_envelope_parts)
                     + self._buffer[: end_idx + len(self._suppressing_until)]
                 )
+                self._record_envelope_fragment(self._buffer[: end_idx + len(self._suppressing_until)])
                 self._record_completed_envelope(completed)
                 self._buffer = self._buffer[end_idx + len(self._suppressing_until) :]
                 self._suppressing_until = None
@@ -2710,6 +2722,7 @@ class ToolCallStreamFilter:
                         # Recover the exact opening bytes, including dynamic
                         # namespace markers, if the matching close never arrives.
                         self._pending_envelope_parts = [opening_marker]
+                        self._record_envelope_fragment(opening_marker)
                         self._pending_start_marker = opening_marker
                         # Fresh envelope: start the payload scan from scratch.
                         self._reset_json_scan()

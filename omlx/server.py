@@ -5265,15 +5265,21 @@ async def stream_chat_completion(
     qwen_tool_envelope_streaming_capable = False
     registered_tool_names: set[str] = set()
     stream_content = True
+    argument_stream = None
     if has_tools:
         registered_tool_names = _registered_tool_names(kwargs.get("tools"))
         qwen_tool_envelope_streaming_capable = bool(
             registered_tool_names and _chat_can_stream_qwen_tool_envelopes(engine)
         )
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
+        if (qwen_tool_envelope_streaming_capable and request.stream_options
+                and request.stream_options.incremental_tool_arguments):
+            from .api.qwen_argument_stream import QwenArgumentStream
+            argument_stream = QwenArgumentStream(kwargs.get("tools"))
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
             capture_ordered_segments=stream_completed_qwen_tools,
+            capture_envelope_fragments=argument_stream is not None,
         )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
@@ -5304,6 +5310,9 @@ async def stream_chat_completion(
                 # A structured producer is authoritative. Correct engines keep
                 # the explicit capability false; this guard also prevents a
                 # same-output raw envelope from racing its structured result.
+                if argument_stream is not None and argument_stream.calls:
+                    raise ValueError("Structured producer interrupted partial tool arguments")
+                argument_stream = None
                 stream_completed_qwen_tools = False
                 stream_tool_sequence_safe = False
             if output.new_text:
@@ -5352,6 +5361,9 @@ async def stream_chat_completion(
                             # retained duplicate state.
                             tool_filter.take_completed_envelopes()
                             if tool_filter.completed_envelope_overflowed:
+                                if argument_stream is not None and argument_stream.calls:
+                                    raise ValueError("Partial tool envelope exceeded the early-stream limit")
+                                argument_stream = None
                                 logger.warning(
                                     "Early qwen tool streaming disabled for this "
                                     "Chat turn: completed-envelope queue exceeded "
@@ -5394,6 +5406,21 @@ async def stream_chat_completion(
                             yield event
                             continue
 
+                        if segment.kind == "envelope_delta":
+                            if argument_stream is not None and stream_tool_sequence_safe:
+                                for delta in argument_stream.feed(segment.text):
+                                    delta["index"] += len(streamed_tool_calls)
+                                    chunk = ChatCompletionChunk(
+                                        id=response_id, model=request.model,
+                                        choices=[ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(tool_calls=[delta]),
+                                            finish_reason=None,
+                                        )],
+                                    )
+                                    mark_visible_delta()
+                                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                            continue
+
                         if segment.kind != "envelope":
                             stream_tool_sequence_safe = False
                             continue
@@ -5415,10 +5442,34 @@ async def stream_chat_completion(
                                 if key is not None
                             )
                         ):
+                            if argument_stream is not None and argument_stream.calls:
+                                raise ValueError("Partial tool arguments did not form a valid registered call")
+                            argument_stream = None
                             stream_tool_sequence_safe = False
                             continue
                         if not stream_tool_sequence_safe:
                             continue
+                        if argument_stream is not None:
+                            remaining = argument_stream.finish(completed_calls)
+                            if remaining is not None:
+                                offset = len(streamed_tool_calls)
+                                for tc, partial in zip(completed_calls, argument_stream.calls):
+                                    tc.id = partial["id"]
+                                    streamed_tool_calls.append(tc)
+                                for delta in remaining:
+                                    delta["index"] += offset
+                                    chunk = ChatCompletionChunk(
+                                        id=response_id, model=request.model,
+                                        choices=[ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(tool_calls=[delta]),
+                                            finish_reason=None,
+                                        )],
+                                    )
+                                    mark_visible_delta()
+                                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                                argument_stream = QwenArgumentStream(kwargs.get("tools"))
+                                continue
+                            argument_stream = QwenArgumentStream(kwargs.get("tools"))
                         for tc in completed_calls:
                             index = len(streamed_tool_calls)
                             streamed_tool_calls.append(tc)
@@ -5455,6 +5506,16 @@ async def stream_chat_completion(
     except Exception as e:
         error_data = _streaming_error_payload(e, "chat streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
+    if argument_stream is not None and argument_stream.calls:
+        yield "data: " + json.dumps({"error": {
+            "message": "Incomplete tool arguments; retry the request",
+            "type": "tool_stream_validation_error",
+        }}) + "\n\n"
         yield "data: [DONE]\n\n"
         return
 

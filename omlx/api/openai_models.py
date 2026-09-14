@@ -320,6 +320,10 @@ class StreamOptions(BaseModel):
     """Options for streaming responses."""
 
     include_usage: bool = False
+    incremental_tool_arguments: bool = Field(
+        default=False,
+        description="Stream partial Qwen XML tool arguments on supported Chat engines; clients must wait for complete calls before execution.",
+    )
 
 
 class ChatCompletionRequest(BaseModel):
