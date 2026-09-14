@@ -27,14 +27,15 @@ from omlx.api.tool_calling import (
     _gemma4_args_to_json_robust,
     _json_value_end,
     _marker_payloads,
+    _parse_attribute_function_tool_calls,
     _parse_gemma4_tool_call_fallback,
     _parse_hermes_tool_calls,
     _parse_namespaced_tool_calls,
     _parse_xml_tool_calls,
-    _strip_marker_spans,
     _remap_tool_call_names,
     _repair_json_value,
     _serialize_tool_call_arguments,
+    _strip_marker_spans,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -4519,3 +4520,307 @@ def test_bracket_deep_decode_never_runs_raw_arguments():
         for call in calls or []:
             if call.function.name == "bad":
                 assert not call.function.arguments.startswith('{"raw":')
+
+
+class TestAttributeStyleFunctionDialect:
+    """Tests for the attribute-style <function name="..."> dialect (#3429).
+
+    MiniCPM5-family chat templates emit
+    ``<function name="name"><param name="key">value</param></function>``,
+    combining the ``<invoke name="...">`` attribute convention with the
+    ``<function=...>`` element name — previously the one unhandled
+    combination, both bare and wrapped in ``<tool_call>``.
+    """
+
+    READ_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    }
+
+    BARE_CALL = (
+        '<function name="read"><param name="path">/workspace/TASK.md</param>'
+        "</function>"
+    )
+
+    def _tokenizer(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+        return tok
+
+    def test_bare_element_parses_with_declared_tool(self):
+        cleaned, calls = parse_tool_calls(
+            self.BARE_CALL, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {
+            "path": "/workspace/TASK.md"
+        }
+
+    def test_bare_element_keeps_surrounding_prose(self):
+        text = f"I'll read the file. {self.BARE_CALL} Standing by."
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert calls is not None
+        assert "function" not in cleaned
+        assert "I'll read the file." in cleaned
+        assert "Standing by." in cleaned
+
+    def test_parameter_spelling_variant(self):
+        text = (
+            '<function name="read"><parameter name="path">/x</parameter>'
+            "</function>"
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert json.loads(calls[0].function.arguments) == {"path": "/x"}
+
+    def test_wrapped_in_tool_call_envelope(self):
+        text = f"<tool_call>{self.BARE_CALL}</tool_call>"
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert cleaned == ""
+        assert calls[0].function.name == "read"
+
+    def test_wrapped_form_needs_no_tools(self):
+        # Inside a <tool_call> envelope the wrapper is the anchor, matching
+        # the other wrapped branches: no tool declarations required.
+        text = f"<tool_call>{self.BARE_CALL}</tool_call>"
+        _, calls = _parse_xml_tool_calls(text)
+        assert calls[0].function.name == "read"
+
+    def test_multiple_bare_calls(self):
+        text = (
+            '<function name="read"><param name="path">/a</param></function>\n'
+            '<function name="read"><param name="path">/b</param></function>'
+        )
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert cleaned == ""
+        assert [json.loads(c.function.arguments)["path"] for c in calls] == [
+            "/a",
+            "/b",
+        ]
+
+    def test_schema_coercion_of_integer_param(self):
+        text = (
+            '<function name="read"><param name="path">/x</param>'
+            '<param name="limit">5</param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert json.loads(calls[0].function.arguments) == {
+            "path": "/x",
+            "limit": 5,
+        }
+
+    def test_cdata_wrapped_value_is_unwrapped(self):
+        # The MiniCPM5 template asks for CDATA around values containing
+        # "<", "&" or newlines; the argument must carry the literal value.
+        text = (
+            '<function name="read"><param name="path">'
+            "<![CDATA[/dir with <odd> & chars/TASK.md]]></param></function>"
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert json.loads(calls[0].function.arguments) == {
+            "path": "/dir with <odd> & chars/TASK.md"
+        }
+
+    def test_undeclared_name_is_left_untouched(self):
+        text = '<function name="evil"><param name="path">/x</param></function>'
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert calls is None
+        assert cleaned == text
+
+    def test_bare_parser_inert_without_tools(self):
+        for tools in (None, []):
+            cleaned, calls = _parse_attribute_function_tool_calls(
+                self.BARE_CALL, tools
+            )
+            assert calls is None
+            assert cleaned == self.BARE_CALL
+
+    def test_stream_filter_suppresses_bare_dialect_across_chunks(self):
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Sure. ",
+            "<funct",
+            'ion name="read"><param name="pa',
+            'th">/x</param></funct',
+            "ion>",
+            " Done.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Sure.  Done."
+
+    def test_stream_filter_flushes_incomplete_marker_prose(self):
+        # "<function " (no name attribute) can never complete the open
+        # marker, so withheld prose must flush rather than vanish.
+        f = ToolCallStreamFilter(_make_tokenizer())
+        out = f.feed("see <function") + f.feed(" docs for details") + f.finish()
+        assert out == "see <function docs for details"
+
+    def test_cdata_containing_literal_param_tags(self):
+        # CDATA must protect nested <param> tags from premature truncation.
+        text = (
+            '<function name="read"><param name="path">config.xml</param>'
+            '<param name="content"><![CDATA['
+            '<param name="nested">inside</param>'
+            ']]></param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["path"] == "config.xml"
+        assert args["content"] == '<param name="nested">inside</param>'
+
+    def test_unclosed_preceding_tag_does_not_swallow_valid_call(self):
+        # A preceding unclosed <function> tag in prose must not swallow
+        # subsequent registered tool calls.
+        text = (
+            'Example: <function name="unclosed"> not closed. '
+            f'Real call: {self.BARE_CALL}'
+        )
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert 'Example: <function name="unclosed"> not closed.' in cleaned
+
+    def test_tag_whitespace_tolerance(self):
+        # Whitespace before closing '>' in tags should be tolerated.
+        text = (
+            '<function name="read" ><param name="path" >/x</param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert json.loads(calls[0].function.arguments) == {"path": "/x"}
+
+    def test_no_argument_call(self):
+        ping_tool = {
+            "type": "function",
+            "function": {"name": "ping", "parameters": {"type": "object"}},
+        }
+        text = '<function name="ping"></function>'
+        _, calls = parse_tool_calls(text, self._tokenizer(), [ping_tool])
+        assert calls is not None
+        assert calls[0].function.name == "ping"
+        assert json.loads(calls[0].function.arguments) == {}
+
+    def test_stream_filter_preserves_undeclared_function_in_prose(self):
+        # Gap 1: undeclared function markup in prose must not be suppressed
+        # during streaming, aligning with non-streaming behavior.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        text = 'Here is an example: <function name="example"><param name="k">v</param></function> in prose.'
+        out = f.feed(text) + f.finish()
+        assert out == text
+
+    def test_stream_filter_inert_for_bare_dialect_without_tools(self):
+        # Bare dialect is inert when no tools are declared.
+        for tools in (None, []):
+            f = ToolCallStreamFilter(_make_tokenizer(), tools=tools)
+            text = f"Prose {self.BARE_CALL} end."
+            out = f.feed(text) + f.finish()
+            assert out == text
+
+    def test_cdata_with_literal_function_close_tag(self):
+        # Gap 2: literal </function> inside CDATA must not truncate the call
+        # or produce empty arguments.
+        literal_code = 'def test():\n    return "</function>"\n'
+        text = (
+            '<function name="read"><param name="path"><![CDATA['
+            f'{literal_code}'
+            ']]></param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {"path": literal_code}
+
+    def test_cdata_with_embedded_function_call_example(self):
+        # Gap 2: a complete function call example inside CDATA should be
+        # preserved verbatim as argument value without triggering nested call extraction.
+        inner_example = '<function name="read"><param name="path">nested.py</param></function>'
+        text = (
+            f'Output: <function name="read"><param name="path"><![CDATA['
+            f'{inner_example}'
+            ']]></param></function> End.'
+        )
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {"path": inner_example}
+        assert "Output:" in cleaned
+        assert "End." in cleaned
+        assert "nested.py" not in cleaned
+
+    def test_stream_filter_cdata_with_literal_function_close_across_chunks(self):
+        # Gap 2 streaming: literal </function> inside CDATA across chunk boundaries
+        # must not end suppression prematurely or leak subsequent XML into visible output.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Before call. ",
+            '<function name="read"><param name="path"><![CDATA[',
+            'def foo():\n    return "</func',
+            'tion>"\n',
+            ']]></param></function>',
+            " After call.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Before call.  After call."
+
+    def test_stream_filter_cdata_delimiters_split_across_chunks(self):
+        # Gap 2 streaming: <![CDATA[ and ]]> delimiters split across chunks
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Prefix: ",
+            '<function name="read"><param name="path"><![CD',
+            'ATA[</function>]]',
+            '></param></function>',
+            " Suffix.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Prefix:  Suffix."
+
+    def test_stream_filter_multiple_spaces_in_tag(self):
+        # Gap 3: multiple spaces in opening tag must be suppressed during streaming.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Start ",
+            '<function  ',
+            ' name="read"  ><param  name="path">/test.py</param></function>',
+            " End",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Start  End"
+
+    def test_stream_filter_capture_ordered_segments(self):
+        # Verify capture_ordered_segments retains the complete envelope
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            tools=[self.READ_TOOL],
+            capture_ordered_segments=True,
+        )
+        raw_call = '<function name="read"><param name="path">/x</param></function>'
+        chunks = ["Hello ", raw_call, " world"]
+        out = "".join(f.feed(c) for c in chunks) + f.finish()
+        assert out == "Hello  world"
+        envelopes = f.take_completed_envelopes()
+        assert envelopes == [raw_call]
+
+

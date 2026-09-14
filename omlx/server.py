@@ -5273,13 +5273,16 @@ async def stream_chat_completion(
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
+            tools=kwargs.get("tools"),
             capture_ordered_segments=stream_completed_qwen_tools,
         )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -5923,12 +5926,17 @@ async def stream_anthropic_messages(
     tool_filter = None
     thinking_filter = None
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -7553,12 +7561,17 @@ async def stream_responses_api(
     thinking_filter = None
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter

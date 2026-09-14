@@ -494,6 +494,81 @@ def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
         pos = value_end + len(_XML_PARAMETER_CLOSE)
 
 
+_ATTR_FUNCTION_OPEN_RE = re.compile(r'<function\s+name="([^"]+)"\s*>')
+# Both <param> (MiniCPM5's chat template) and <parameter> spellings occur in
+# the wild; the backreference pairs open/close spellings so a literal
+# "</param>" cannot close a <parameter> element. The non-greedy CDATA
+# alternative ensures nested literal tags inside CDATA do not end elements early.
+_ATTR_PARAM_RE = re.compile(
+    r'<(param|parameter)\s+name="([^"]+)"\s*>(?:\s*<!\[CDATA\[(.*?)\]\]>\s*|(.*?))</\1>',
+    re.DOTALL,
+)
+
+
+def _iter_attr_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
+    """Yield ``(key, value)`` for each ``<param name="k">v</param>`` element.
+
+    MiniCPM5's chat template tells the model to wrap values containing
+    ``<``, ``&`` or newlines in a CDATA block; the wrapper is removed here so
+    the argument carries the literal value, verbatim.
+    """
+    for match in _ATTR_PARAM_RE.finditer(params_text):
+        value = match.group(3) if match.group(3) is not None else match.group(4).strip()
+        yield match.group(2), value
+
+
+def _find_attr_function_span(
+    text: str,
+    open_match: Any,
+) -> Optional[Tuple[int, int, str]]:
+    """Locate the true end of a <function name="..."> element.
+
+    Returns (span_start, span_end, payload) or None if unclosed or malformed.
+    A literal '</function>' or '<function' inside a '<![CDATA[...]]>' block
+    does NOT terminate or split the element.
+    An unclosed '<function' tag followed by another '<function' open tag
+    outside CDATA causes this candidate to be rejected so the following
+    real call is not swallowed.
+    """
+    span_start = open_match.start()
+    payload_start = open_match.end()
+    cursor = payload_start
+    n = len(text)
+
+    while cursor < n:
+        cdata_start = text.find("<![CDATA[", cursor)
+        close_tag = text.find("</function>", cursor)
+        next_open = _ATTR_FUNCTION_OPEN_RE.search(text, cursor)
+
+        if close_tag < 0:
+            return None
+
+        if (
+            next_open is not None
+            and (cdata_start < 0 or next_open.start() < cdata_start)
+            and next_open.start() < close_tag
+        ):
+            # Another <function name="..."> begins outside CDATA before </function>:
+            # this candidate was unclosed.
+            return None
+
+        if cdata_start >= 0 and cdata_start < close_tag:
+            # CDATA block precedes the close tag. Skip past CDATA.
+            cdata_end = text.find("]]>", cdata_start + len("<![CDATA["))
+            if cdata_end < 0:
+                # Unclosed CDATA block.
+                return None
+            cursor = cdata_end + len("]]>")
+            continue
+
+        # close_tag is outside CDATA!
+        span_end = close_tag + len("</function>")
+        payload = text[payload_start:close_tag]
+        return span_start, span_end, payload
+
+    return None
+
+
 def _find_marker_span_end(
     text: str, payload_start: int, end_marker: str
 ) -> Optional[Tuple[int, int]]:
@@ -517,6 +592,23 @@ def _find_marker_span_end(
     exists.  Every other case falls back to the historical first-match
     behaviour, so this can only change outputs that are broken today.
     """
+    if end_marker == "</function>":
+        cursor = payload_start
+        n = len(text)
+        while cursor < n:
+            cdata_start = text.find("<![CDATA[", cursor)
+            close_tag = text.find("</function>", cursor)
+            if close_tag < 0:
+                return None
+            if cdata_start >= 0 and cdata_start < close_tag:
+                cdata_end = text.find("]]>", cdata_start + len("<![CDATA["))
+                if cdata_end < 0:
+                    return None
+                cursor = cdata_end + len("]]>")
+                continue
+            return close_tag, close_tag + len("</function>")
+        return None
+
     plain = text.find(end_marker, payload_start)
     if plain < 0:
         return None
@@ -586,6 +678,7 @@ def _parse_xml_tool_calls(
     Handles models that use <tool_call>...</tool_call> XML format, including:
     - GLM format: <tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
     - Qwen/Llama format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+    - Attribute style: <tool_call><function name="name"><param name="key">value</param></function></tool_call>
     - Generic JSON: <tool_call>{"name": ..., "arguments": ...}</tool_call>
 
     When ``tools`` is provided, parameter values are coerced to their
@@ -628,6 +721,33 @@ def _parse_xml_tool_calls(
             if _built is not None:
                 tool_calls.append(_built)
             continue
+
+        # Attribute style: <function name="name"><param name="key">value</param></function>
+        # (MiniCPM5 family, #3429). Uses _find_attr_function_span so a literal
+        # close tag or embedded function example inside CDATA cannot end or
+        # truncate the element early.
+        attr_open = _ATTR_FUNCTION_OPEN_RE.match(content)
+        if attr_open:
+            func_name = attr_open.group(1)
+            found = _find_attr_function_span(content, attr_open)
+            if found is not None:
+                params_text = found[2]
+            else:
+                attr_close = content.rfind(_XML_FUNCTION_CLOSE)
+                params_text = (
+                    content[attr_open.end() : attr_close]
+                    if attr_close >= attr_open.end()
+                    else None
+                )
+            if params_text is not None:
+                props = _tool_param_properties(func_name, tools)
+                arguments = {}
+                for key, val in _iter_attr_xml_parameters(params_text):
+                    arguments[key] = _coerce_param_value(val, key, props, func_name)
+                _built = _build_tool_call(func_name, arguments)
+                if _built is not None:
+                    tool_calls.append(_built)
+                continue
 
         # GLM XML format: func_name<arg_key>k</arg_key><arg_value>v</arg_value>...
         arg_keys = re.findall(r"<arg_key>(.*?)</arg_key>", content)
@@ -702,6 +822,80 @@ def _parse_namespaced_tool_calls(
 
     cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
     return cleaned, tool_calls
+
+
+def _parse_attribute_function_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Fallback parser for bare attribute-style tool calls (#3429).
+
+    MiniCPM5-family chat templates emit
+    ``<function name="name"><param name="key">value</param></function>``
+    with no wrapper marker at all, so none of the envelope-anchored parsers
+    ever see it.
+
+    Without an envelope the only safe anchor is the request's own tool
+    declarations: an element is parsed only when its name exactly matches a
+    declared tool, so prose that merely mentions ``<function name="...">``
+    markup for an unknown function passes through untouched, and the parser
+    is inert when the request declares no tools.
+
+    Elements are bounded at the first ``</function>`` outside CDATA blocks
+    (so literal ``</function>`` or embedded function examples inside CDATA
+    do not terminate the call early or misextract nested calls).
+    An element also cannot span a later ``<function`` open tag outside CDATA,
+    so an unclosed tag in prose cannot swallow a following real call.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    if not tools:
+        return text, None
+    registered = _extract_tool_names(tools)
+    if not registered:
+        return text, None
+
+    tool_calls = []
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    while pos < len(text):
+        match = _ATTR_FUNCTION_OPEN_RE.search(text, pos)
+        if not match:
+            break
+        func_name = match.group(1)
+        if func_name not in registered:
+            pos = match.end()
+            continue
+
+        found = _find_attr_function_span(text, match)
+        if found is None:
+            pos = match.end()
+            continue
+
+        span_start, span_end, payload = found
+        props = _tool_param_properties(func_name, tools)
+        arguments = {}
+        for key, val in _iter_attr_xml_parameters(payload):
+            arguments[key] = _coerce_param_value(val, key, props, func_name)
+        _built = _build_tool_call(func_name, arguments)
+        if _built is not None:
+            tool_calls.append(_built)
+            spans.append((span_start, span_end))
+            pos = span_end
+        else:
+            pos = match.end()
+
+    if not tool_calls:
+        return text, None
+
+    out: List[str] = []
+    last = 0
+    for span_start, span_end in spans:
+        out.append(text[last:span_start])
+        last = span_end
+    out.append(text[last:])
+    return "".join(out).strip(), tool_calls
 
 
 def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -1718,6 +1912,14 @@ def _parse_tool_calls_impl(
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns, tools)
 
+    # Fallback: bare attribute-style <function name="..."> elements with no
+    # wrapper marker (MiniCPM5 family, #3429). Anchored on declared tool
+    # names; see the parser's docstring.
+    if _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
+        attr_result = _parse_attribute_function_tool_calls(cleaned_text, tools)
+        if attr_result[1] is not None:
+            return attr_result
+
     # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
     if "<|tool_call_start|>" in cleaned_text:
         hermes_result = _parse_hermes_tool_calls(cleaned_text)
@@ -1764,7 +1966,9 @@ def _parse_tool_calls_impl(
     return cleaned_text, None
 
 
-def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
+def sanitize_tool_call_markup(
+    text: str, tokenizer: Any, tools: Optional[List] = None
+) -> str:
     """Remove tool-call control markup while preserving surrounding prose."""
     if not text:
         return ""
@@ -1775,7 +1979,9 @@ def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
     # Every caller sanitizes thinking-channel text; keep it byte-identical
     # with the streamed reasoning deltas, which do not consume DeepSeek
     # V4's separator either.
-    stream_filter = ToolCallStreamFilter(tokenizer, consume_dsml_separator=False)
+    stream_filter = ToolCallStreamFilter(
+        tokenizer, tools=tools, consume_dsml_separator=False
+    )
     cleaned = stream_filter.feed(text)
     cleaned += stream_filter.finish()
     return cleaned.strip()
@@ -1816,7 +2022,7 @@ def extract_tool_calls_with_thinking(
       of whether regular text was also produced.
     """
     cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
+    cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
 
     if (
@@ -1935,6 +2141,7 @@ class ToolCallStreamFilter:
         self,
         tokenizer: Any,
         *,
+        tools: Optional[Any] = None,
         consume_dsml_separator: bool = True,
         capture_ordered_segments: bool = False,
     ):
@@ -1954,6 +2161,16 @@ class ToolCallStreamFilter:
             ("<tool_call>", "</tool_call>"),
         ]
         self._suppress_after_markers: List[str] = []
+        if tools:
+            if isinstance(tools, (set, frozenset)):
+                self._registered_tool_names = set(tools)
+            elif isinstance(tools, (list, tuple)) and tools and isinstance(tools[0], str):
+                self._registered_tool_names = set(tools)
+            else:
+                self._registered_tool_names = _extract_tool_names(tools)
+        else:
+            self._registered_tool_names = set()
+        self._attr_func_in_cdata = False
         if marker:
             if marker_end:
                 self._marker_pairs.insert(0, (marker, marker_end))
@@ -2125,6 +2342,7 @@ class ToolCallStreamFilter:
         self._json_escaped = False
         self._json_scan_off = 0
         self._json_complete_off = 0
+        self._attr_func_in_cdata = False
         # Tail of already-consumed payload, kept so a `</function>` straddling
         # the pending/buffer boundary is still visible to the xml check.
         self._xml_prev_tail = ""
@@ -2224,6 +2442,37 @@ class ToolCallStreamFilter:
             i += 1
         self._json_scan_off = i
 
+    def _find_attr_function_suppression_end(self, buffer: str) -> int:
+        cursor = 0
+        n = len(buffer)
+        while cursor < n:
+            if self._attr_func_in_cdata:
+                cdata_end = buffer.find("]]>", cursor)
+                if cdata_end < 0:
+                    return -1
+                self._attr_func_in_cdata = False
+                cursor = cdata_end + len("]]>")
+                continue
+
+            cdata_start = buffer.find("<![CDATA[", cursor)
+            close_tag = buffer.find("</function>", cursor)
+
+            if close_tag < 0:
+                if cdata_start >= 0:
+                    self._attr_func_in_cdata = True
+                    cursor = cdata_start + len("<![CDATA[")
+                    continue
+                return -1
+
+            if cdata_start >= 0 and cdata_start < close_tag:
+                self._attr_func_in_cdata = True
+                cursor = cdata_start + len("<![CDATA[")
+                continue
+
+            return close_tag
+
+        return -1
+
     def _find_suppression_end(self, buffer: str) -> int:
         """Index in ``buffer`` of the close marker that really ends the envelope.
 
@@ -2248,6 +2497,9 @@ class ToolCallStreamFilter:
         marker = self._suppressing_until
         if not marker:
             return -1
+
+        if marker == "</function>":
+            return self._find_attr_function_suppression_end(buffer)
 
         self._advance_json_scan(buffer)
 
@@ -2395,6 +2647,18 @@ class ToolCallStreamFilter:
             if hit is not None:
                 starts.append(hit)
 
+        def compute_attr_func() -> Optional[Tuple[int, int, Optional[str]]]:
+            if not self._registered_tool_names:
+                return None
+            for m in _ATTR_FUNCTION_OPEN_RE.finditer(text, start):
+                if m.group(1) in self._registered_tool_names:
+                    return (m.start(), len(m.group(0)), "</function>")
+            return None
+
+        hit = lookup("attr_func", compute_attr_func)
+        if hit is not None:
+            starts.append(hit)
+
         if not starts:
             return None
         return min(starts, key=lambda x: x[0])
@@ -2430,6 +2694,39 @@ class ToolCallStreamFilter:
             return False
         return "tool_call".startswith(suffix)
 
+    def _could_be_partial_attr_function_open(self, candidate: str) -> bool:
+        """Return True if candidate could prefix a bare <function name="..."> tag for a declared tool."""
+        if not self._registered_tool_names:
+            return False
+        if not candidate.startswith("<") or ">" in candidate:
+            return False
+        if "<function".startswith(candidate):
+            return True
+        if not candidate.startswith("<function"):
+            return False
+        rest = candidate[len("<function") :]
+        if not rest:
+            return True
+        if not rest[0].isspace():
+            return False
+        rest = rest.lstrip()
+        if not rest:
+            return True
+        for prefix in ("n", "na", "nam", "name", 'name='):
+            if rest == prefix:
+                return True
+        if rest.startswith('name="'):
+            after_quote = rest[len('name="') :]
+            if '"' not in after_quote:
+                return any(
+                    t.startswith(after_quote) for t in self._registered_tool_names
+                )
+            tool_name, after_closing_quote = after_quote.split('"', 1)
+            if tool_name not in self._registered_tool_names:
+                return False
+            return after_closing_quote.isspace() or after_closing_quote == ""
+        return False
+
     def _partial_suffix_len(self, text: str) -> int:
         """Length of trailing suffix that might be an opening-marker prefix."""
         keep = 0
@@ -2439,7 +2736,9 @@ class ToolCallStreamFilter:
         last_lt = text.rfind("<")
         if last_lt >= 0:
             candidate = text[last_lt:]
-            if self._could_be_partial_namespaced_open(candidate):
+            if self._could_be_partial_namespaced_open(
+                candidate
+            ) or self._could_be_partial_attr_function_open(candidate):
                 keep = max(keep, len(candidate))
 
         # Partial prefix detection for bracket markers (e.g. "[", "[C",
@@ -2504,6 +2803,9 @@ class ToolCallStreamFilter:
         for sa_marker in self._suppress_after_markers:
             if sa_marker.startswith(tail) or tail.startswith(sa_marker):
                 return True
+
+        if self._could_be_partial_attr_function_open(tail):
+            return True
 
         if not tail.startswith("<"):
             return False
@@ -2664,9 +2966,22 @@ class ToolCallStreamFilter:
             if self._suppressing_until is not None:
                 end_idx = self._find_suppression_end(self._buffer)
                 if end_idx < 0:
-                    keep = self._partial_prefix_len(
-                        self._buffer, self._suppressing_until
-                    )
+                    if self._suppressing_until == "</function>":
+                        if self._attr_func_in_cdata:
+                            keep = self._partial_prefix_len(self._buffer, "]]>")
+                        else:
+                            keep = max(
+                                self._partial_prefix_len(
+                                    self._buffer, "</function>"
+                                ),
+                                self._partial_prefix_len(
+                                    self._buffer, "<![CDATA["
+                                ),
+                            )
+                    else:
+                        keep = self._partial_prefix_len(
+                            self._buffer, self._suppressing_until
+                        )
                     if keep:
                         moved = self._buffer[:-keep]
                         self._pending_envelope_parts.append(moved)
