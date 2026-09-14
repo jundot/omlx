@@ -93,6 +93,71 @@ bool kv_layout_ok(const array& arr) {
   return (strides[0] == strides[1] * shape[1]);
 }
 
+// Mirrors mlx::core::metal::check_kernel_threadgroup_size (mlx backend/metal
+// utils.h), which upstream calls at every SDPA dispatch site: Metal may drop
+// a dispatch whose threadgroup exceeds the compiled pipeline residency limit
+// without any error, leaving the output buffer uninitialized (#3660).
+void check_kernel_threadgroup_size(
+    const MTL::ComputePipelineState* kernel,
+    const MTL::Size& group_dims,
+    const std::string& name) {
+  auto max_size = kernel->maxTotalThreadsPerThreadgroup();
+  auto requested_size =
+      group_dims.width * group_dims.height * group_dims.depth;
+  if (max_size < requested_size) {
+    std::ostringstream msg;
+    msg << "Maximum threads per threadgroup is " << max_size
+        << " but requested " << requested_size << " for kernel " << name
+        << ".";
+    throw std::runtime_error(msg.str());
+  }
+}
+
+// Routing decision for vector decode SDPA: which pass to use and how many
+// blocks the two-pass split selects. The eval_gpu router, the two-pass
+// encoder, and sdpa_decode_supported() share it so the pipeline probed for
+// residency is always the pipeline that gets dispatched.
+struct SdpaDecodePlan {
+  bool use_2pass;
+  int blocks;
+};
+
+SdpaDecodePlan sdpa_decode_plan(int gqa_factor, int qL, int N, char devc) {
+  const bool gqa = gqa_factor > 1;
+  SdpaDecodePlan plan;
+  if (devc == 'd') {
+    plan.use_2pass = gqa ? (N >= 1024) : (N >= 32768);
+  } else {
+    plan.use_2pass =
+        (devc == 's' && N >= 1024) || (gqa && N >= 4096);
+  }
+
+  const int n_simds = gqa_factor * qL;
+  if (devc == 's') {
+    plan.blocks = 64;
+    if (N > 1024 && n_simds > 4) {
+      if (N <= 8192) {
+        plan.blocks = 128;
+      } else if (N <= 32768) {
+        plan.blocks = 256;
+      } else if (N <= 65536) {
+        plan.blocks = 512;
+      } else {
+        plan.blocks = 1024;
+      }
+    }
+  } else if (devc == 'd') {
+    // Split the KV sequence so that each threadgroup processes a contiguous
+    // chunk of ~256 keys, while keeping at least 32-64 blocks for parallelism
+    // and capping at 256 to bound the partials traffic. Tuned on M3 Ultra.
+    int b = (((N + 255) / 256 + 31) / 32) * 32;
+    plan.blocks = std::min(256, std::max(N >= 4096 ? 64 : 32, b));
+  } else {
+    plan.blocks = n_simds >= 4 ? 64 : 32;
+  }
+  return plan;
+}
+
 void sdpa_decode_1pass(
     const Stream& s,
     metal::Device& d,
@@ -147,6 +212,7 @@ void sdpa_decode_1pass(
 
   auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname, lib, hash_name, func_consts);
+  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   compute_encoder.set_input_array(q, 0);
@@ -203,37 +269,9 @@ void sdpa_decode_2pass(
       v.shape(-1));
 
   int gqa_factor = q.shape(1) / k.shape(1);
-  int n_simds = gqa_factor * q.shape(2);
-
-  char devc = d.get_architecture().back();
   int N = k.shape(2);
-  int blocks;
-  if (devc == 's') {
-    blocks = 64;
-    if (N > 1024 && n_simds > 4) {
-      if (N <= 8192) {
-        blocks = 128;
-      } else if (N <= 32768) {
-        blocks = 256;
-      } else if (N <= 65536) {
-        blocks = 512;
-      } else {
-        blocks = 1024;
-      }
-    }
-  } else if (devc == 'd') {
-    // Split the KV sequence so that each threadgroup processes a contiguous
-    // chunk of ~256 keys, while keeping at least 32-64 blocks for parallelism
-    // and capping at 256 to bound the partials traffic. Tuned on M3 Ultra.
-    int b = (((N + 255) / 256 + 31) / 32) * 32;
-    blocks = std::min(256, std::max(N >= 4096 ? 64 : 32, b));
-  } else {
-    if (n_simds >= 4) {
-      blocks = 64;
-    } else {
-      blocks = 32;
-    }
-  }
+  int blocks = sdpa_decode_plan(
+      gqa_factor, q.shape(2), N, d.get_architecture().back()).blocks;
 
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
@@ -283,6 +321,7 @@ void sdpa_decode_2pass(
   hash_name += std::to_string(blocks);
 
   auto kernel = d.get_kernel(kname, lib, hash_name, func_consts);
+  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   compute_encoder.set_input_array(q, 0);
@@ -334,6 +373,7 @@ void sdpa_decode_2pass(
 
   group_dims = MTL::Size(1024, 1, 1);
   grid_dims = MTL::Size(q.shape(0) * q.shape(1), q.shape(2), 1);
+  check_kernel_threadgroup_size(kernel, group_dims, kname);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -384,19 +424,13 @@ class SdpaDecodePrimitive : public Primitive {
     o.set_data(allocator::malloc(o.nbytes()));
 
     bool do_causal = do_causal_ && q.shape(2) > 1;
-    char devc = d.get_architecture().back();
-    bool gqa = k.shape(1) < q.shape(1);
-    bool use_2pass;
-    if (devc == 'd') {
-      use_2pass = gqa ? (k.shape(2) >= 1024) : (k.shape(2) >= 32768);
-    } else {
-      use_2pass =
-          (devc == 's' && k.shape(2) >= 1024) || (gqa && k.shape(2) >= 4096);
-    }
+    auto plan = sdpa_decode_plan(
+        q.shape(1) / k.shape(1), q.shape(2), k.shape(2),
+        d.get_architecture().back());
 
     auto lib = d.get_library(
         "omlx_decode_fast_kernels", current_binary_dir_sdpa());
-    if (use_2pass) {
+    if (plan.use_2pass) {
       sdpa_decode_2pass(
           s, d, lib, q, k, v, o, scale_, do_causal, mask, sinks);
     } else {
@@ -462,7 +496,86 @@ bool sdpa_decode_supported(
   if (q.shape(1) % k.shape(1) != 0 || qL * gqa_factor > 32) {
     return false;
   }
-  return true;
+  // Residency gate (jundot/omlx#3660): Metal may silently drop a dispatch
+  // whose threadgroup exceeds the compiled pipeline residency limit, leaving
+  // the output unwritten (observed on heavy D=256 instantiations; the router
+  // picks one pass at gathered QSA widths whenever the architecture gate does
+  // not force two). Probe the exact pipeline the plan selects and fail closed
+  // so callers fall back to portable SDPA. The probe mirrors the decode
+  // contract (causal=False, no mask, no sinks); other FC variants of a
+  // kernel share its register footprint.
+  auto& d = mlx::core::metal::device(s.device);
+  MTL::Library* lib = nullptr;
+  try {
+    lib = d.get_library("omlx_decode_fast_kernels", current_binary_dir_sdpa());
+  } catch (...) {
+    return false;
+  }
+  if (lib == nullptr) {
+    return false;
+  }
+
+  const auto plan = sdpa_decode_plan(
+      gqa_factor, qL, kL, d.get_architecture().back());
+  const bool query_transposed = !q.flags().row_contiguous;
+  const bool no_causal = false;
+  const bool ffalse = false;
+  mlx::core::metal::MTLFCList consts = {
+      {&ffalse, MTL::DataType::DataTypeBool, 20},
+      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+      {&no_causal, MTL::DataType::DataTypeBool, 22},
+      {&ffalse, MTL::DataType::DataTypeBool, 23},
+      {&ffalse, MTL::DataType::DataTypeBool, 24},
+      {&ffalse, MTL::DataType::DataTypeBool, 25},
+  };
+
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      "omlx_sdpa_decode",
+      plan.use_2pass ? "_2pass_1" : "",
+      "_",
+      sdpa_type_name(t),
+      "_",
+      qk_dim,
+      "_",
+      v_dim);
+  std::string hash_name = kname;
+  hash_name += "_nomask";
+  hash_name += query_transposed ? "_qt" : "_qnt";
+  hash_name += "_nc_nosinks";
+
+  auto residency_ok = [&](const std::string& name,
+                          const std::string& hash,
+                          const mlx::core::metal::MTLFCList& fc,
+                          size_t threads) -> bool {
+    try {
+      auto* kernel = d.get_kernel(name, lib, hash, fc);
+      return kernel != nullptr &&
+          kernel->maxTotalThreadsPerThreadgroup() >= threads;
+    } catch (...) {
+      return false;
+    }
+  };
+
+  if (!plan.use_2pass) {
+    // group_dims is (1024, 1, 1) for every one-pass instantiation.
+    return residency_ok(kname, hash_name, consts, 1024);
+  }
+
+  hash_name += "_" + std::to_string(plan.blocks);
+  consts.push_back({&plan.blocks, MTL::DataType::DataTypeInt, 26});
+  if (!residency_ok(kname, hash_name, consts,
+          32 * static_cast<size_t>(gqa_factor) * qL)) {
+    return false;
+  }
+
+  // Aggregation pass: host dispatch takes the no-function-constants path.
+  kname.clear();
+  concatenate(
+      kname, "omlx_sdpa_decode_2pass_2_", sdpa_type_name(t), "_", v_dim);
+  return residency_ok(kname, "", {}, 1024);
 }
 
 mx::array sdpa_decode(
