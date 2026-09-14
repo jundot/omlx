@@ -1908,6 +1908,10 @@
                     description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
+                    // #3648: the create endpoint has always taken this; the form
+                    // just never sent it, so a profile could only be exposed by
+                    // saving it and reopening it.
+                    expose_as_model: !!this.newProfile.expose_as_model,
                 };
                 try {
                     const r = await fetch(

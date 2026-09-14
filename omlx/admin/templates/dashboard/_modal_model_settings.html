@@ -204,7 +204,7 @@
                                 </div>
                             </template>
                             <button type="button"
-                                    @click="showNewProfileForm = true; profileError = ''; newProfile = {display_name:'',api_name:'',api_name_touched:false,description:'',also_as_template:false}"
+                                    @click="showNewProfileForm = true; profileError = ''; newProfile = {display_name:'',api_name:'',api_name_touched:false,description:'',also_as_template:false,expose_as_model:false}"
                                     class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
                                 {{ t('modal.model_settings.profiles.new_profile') }}
                             </button>
@@ -216,8 +216,24 @@
                         <input type="text" x-model="newProfile.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
                                @input="if (!newProfile.api_name_touched) newProfile.api_name = slugifyProfileApiName(newProfile.display_name)"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
-                        <input type="text" x-model="newProfile.api_name" @input="newProfile.api_name_touched = true" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
-                               class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
+                        <!-- #3648: the API toggle sits with the api name it governs, as in the
+                             edit form below. Assigning an api name here implied the profile was
+                             already API-addressable; it was not, until the profile was saved and
+                             reopened with the pencil. -->
+                        <div class="flex items-center gap-2">
+                            <input type="text" x-model="newProfile.api_name" @input="newProfile.api_name_touched = true" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
+                                   class="min-w-0 flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
+                            <button type="button"
+                                    @click="newProfile.expose_as_model = !newProfile.expose_as_model"
+                                    :title="t('modal.model_settings.profiles.expose_as_model')"
+                                    :class="newProfile.expose_as_model
+                                        ? 'bg-emerald-600 text-white border-emerald-600'
+                                        : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
+                                    class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[10px] font-bold transition-colors">
+                                API
+                                <span x-text="newProfile.expose_as_model ? 'ON' : 'OFF'"></span>
+                            </button>
+                        </div>
                         <input type="text" x-model="newProfile.description" :placeholder="t('modal.model_settings.profiles.description_label')"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <div class="flex justify-end gap-2">
