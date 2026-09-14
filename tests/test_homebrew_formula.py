@@ -92,10 +92,12 @@ class TestMacOS27Workarounds:
         assert "on_macos do" in formula
         assert f'skip_clean "libexec" if {MACOS_27_GUARD}' in formula
 
-    def test_pip_cache_bypassed_on_macos_27(self, formula):
-        """Pip reuses locally built wheels even under --no-binary, so a
-        wheel cached before the strip guards existed stays corrupted."""
-        assert 'pip_flags << "--no-cache-dir"' in formula
+    def test_pip_cache_reenabled_on_macos_27(self, formula):
+        """Homebrew's pip cache (~/Library/Caches/Homebrew/pip_cache) only ever
+        contains wheels built by the formula itself, i.e. with the strip guards
+        applied, so --no-cache-dir is no longer needed; wheel reuse makes
+        repeat installs fast again."""
+        assert 'pip_flags << "--no-cache-dir"' not in formula
 
 
 class TestSharedPipFlags:
