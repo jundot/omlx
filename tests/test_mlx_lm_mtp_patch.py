@@ -1939,6 +1939,14 @@ class TestModelSettingsMtp:
         assert s.mtp_enabled is True
         assert s.specprefill_enabled is True
 
+    def test_specprefill_dflash_mutual_exclusion(self):
+        # SpecPrefill's prefill boost is wired only inside BatchedEngine; when
+        # DFlash is the active engine its specprefill kwargs are silently
+        # discarded (no scheduler / no specprefill concept), so reject the
+        # combo at construction time rather than as a silent no-op (#1233).
+        with pytest.raises(ValueError, match="specprefill has no effect"):
+            ModelSettings(dflash_enabled=True, specprefill_enabled=True)
+
 
 # ---------------------------------------------------------------------------
 # utils.model_loading — compatibility helpers + dispatch
