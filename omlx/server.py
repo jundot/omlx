@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, NamedTuple, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -3894,6 +3894,435 @@ async def create_completion(
         raise
 
 
+def _engine_entry_or_none(model_id: str | None):
+    """Pool entry for *model_id*, or None when the engine pool is not up.
+
+    Turn preparation only reads entry metadata (config model type), so a pool
+    that is not initialized yet degrades to "unknown" instead of failing —
+    the endpoint paths that require a live engine fail earlier anyway, and the
+    admin cache endpoints resolve their own entry before replaying a turn.
+    """
+    try:
+        return get_engine_pool().get_entry(model_id)
+    except Exception:
+        return None
+
+
+class ChatTurnInputs(NamedTuple):
+    """Prompt-render inputs for one chat turn, prepared exactly once.
+
+    Produced by :func:`prepare_chat_turn_inputs`.  Keeping the whole
+    preparation (model settings, reasoning placement, message extraction,
+    tool merging, thinking flags, partial mode) behind one call is what lets
+    the cache probe and cache-artifact export hash the *same* prompt the
+    server prefills — the block chain is keyed on token ids, so any step of
+    this preparation that a caller re-implements is a cache miss (#3615).
+    """
+
+    messages: list[dict[str, Any]]
+    settings: Any
+    chat_kwargs: dict[str, Any]
+    chat_template_kwargs: dict[str, Any]
+    tools_for_template: list[dict[str, Any]] | None
+    native_reasoning: bool
+    response_format: Any
+    response_format_warning: str | None
+    max_tokens: int
+
+
+async def prepare_chat_turn_inputs(
+    engine: BaseEngine,
+    resolved_model: str,
+    request: ChatCompletionRequest,
+    entry: Any = None,
+) -> ChatTurnInputs:
+    """Prepare a /v1/chat/completions turn: messages + engine kwargs.
+
+    Pure extraction of the preparation block of ``create_chat_completion`` —
+    behavior is identical to running that code inline.  Returns everything the
+    endpoint still needs afterwards (generation kwargs, response-format
+    warning, resolved settings) alongside the rendered-prompt inputs.
+
+    ``entry`` is the caller's already-resolved pool entry, read only for
+    metadata (config model type, preserve-thinking default). The cache probe
+    and cache-artifact export pass theirs, so the replay resolves exactly what
+    the serving path resolved.
+    """
+
+    # Get per-model settings
+    max_tool_result_tokens = None
+    reasoning_parser = None
+    settings_guided_grammar = None
+    ms = get_model_settings_for_request(request.model)
+    if ms:
+        max_tool_result_tokens = ms.max_tool_result_tokens
+        reasoning_parser = ms.reasoning_parser
+        settings_guided_grammar = _settings_guided_grammar(ms)
+    merged_ct_kwargs = merge_chat_template_request_kwargs(
+        ms,
+        merge_reasoning_effort_chat_template_kwargs(
+            request.chat_template_kwargs,
+            request.reasoning_effort,
+        ),
+    )
+
+    # Extract messages - different engines need different content handling.
+    # Templates that expose message.reasoning_content natively (Qwen 3.6+)
+    # get reasoning as a separate field; others fall back to <think> inlined
+    # in content.
+    _entry = entry if entry is not None else _engine_entry_or_none(resolved_model)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None)
+            if _entry is not None
+            else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
+    is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = not is_vlm and getattr(
+        engine, "supports_multimodal_fallback", False
+    )
+    extractor = getattr(engine, "message_extractor", None)
+    merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
+    if extractor is not None:
+        extractor_kwargs = {}
+        try:
+            if (
+                "consolidate_system_messages"
+                in inspect.signature(extractor).parameters
+            ):
+                extractor_kwargs["consolidate_system_messages"] = False
+        except (TypeError, ValueError):
+            pass
+        messages = extractor(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            **extractor_kwargs,
+        )
+        merge_system_fallback_roles = True
+    elif is_vlm or is_dflash_vlm:
+        # VLM or DFlash with VLM fallback: preserve image_url content parts
+        messages = extract_multimodal_content(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
+        )
+    else:
+        messages = extract_text_content(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
+        )
+
+    # Detect and strip partial mode at the API boundary — exactly once,
+    # before any chat template application.  The boolean result is forwarded
+    # as an explicit parameter so the engine never has to re-derive it.
+    is_partial = detect_and_strip_partial(messages)
+
+    # Compile grammar for structured output (logit-level enforcement).
+    # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
+    response_format = request.response_format
+    guided_grammar = _effective_guided_grammar(
+        structured_outputs=request.structured_outputs,
+        response_format=response_format,
+        request_guided_grammar=request.guided_grammar,
+        settings_guided_grammar=settings_guided_grammar,
+    )
+    structured_outputs = _normalize_structured_outputs(
+        request.structured_outputs,
+        guided_grammar,
+    )
+    _reject_diffusion_structured_outputs(
+        engine,
+        response_format=response_format,
+        structured_outputs=structured_outputs,
+        guided_grammar=guided_grammar,
+    )
+    if structured_outputs is not None or response_format:
+        await engine.start()
+    compiled_grammar = _compile_grammar_for_request(
+        engine,
+        structured_outputs=structured_outputs,
+        response_format=response_format,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        reasoning_parser=reasoning_parser,
+    )
+    # Fall back to prompt injection when grammar is not compiled. The degrade
+    # is also surfaced to the caller as a Warning response header (#1241).
+    # Only response formats that actually request grammar-constrained JSON
+    # (json_object / json_schema) can be "unenforced"; a plain text format
+    # never asked for enforcement, so it must not warn (#1241 review).
+    response_format_warning = None
+    if compiled_grammar is None and _response_format_requests_grammar(
+        response_format
+    ):
+        response_format_warning = _response_format_warning_header(response_format)
+        json_instruction = build_json_system_prompt(response_format)
+        if json_instruction:
+            messages = _inject_json_instruction(messages, json_instruction)
+
+    # Merge MCP tools with user-provided tools unless the request explicitly
+    # disables tool use.
+    tools_disabled = request.tool_choice == "none"
+    if getattr(engine, "is_diffusion_model", False) and not getattr(
+        engine, "supports_tool_calling", False
+    ):
+        if request.tools and not tools_disabled:
+            raise InvalidRequestError(
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
+                field="tools",
+            )
+        tools_disabled = True
+    effective_tools = None if tools_disabled else request.tools
+    if (
+        _server_state.mcp_manager
+        and not tools_disabled
+        and mcp_tools_exposed()
+    ):
+        # Convert Pydantic ToolDefinition models to dicts for merge_tools
+        user_tools_dicts = (
+            [t.model_dump() for t in request.tools] if request.tools else None
+        )
+        effective_tools = _server_state.mcp_manager.get_merged_tools(
+            user_tools_dicts
+        )
+
+    # Validate context window before sending to model
+    tools_for_template = (
+        convert_tools_for_template(effective_tools) if effective_tools else None
+    )
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if tools_for_template and "gemma" in (resolved_model or "").lower():
+        tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+    await _ensure_tokenizer_for_system_probe(engine, messages)
+    messages = prepare_system_messages_for_template(
+        messages,
+        engine.tokenizer,
+        tools=tools_for_template,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=is_partial,
+        merge_consecutive_roles=merge_system_fallback_roles,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+    )
+    try:
+        num_prompt_tokens = engine.count_chat_tokens(
+            messages,
+            tools_for_template,
+            chat_template_kwargs=merged_ct_kwargs or None,
+            is_partial=is_partial,
+        )
+    except Exception as e:
+        # Catch chat template rendering failures: Jinja2 TemplateError,
+        # AssertionError from strict role validation, ValueError, etc.
+        err_name = type(e).__name__.lower()
+        err_msg = str(e).lower()
+        if (
+            "template" in err_name
+            or "template" in err_msg
+            or isinstance(e, (AssertionError, ValueError))
+        ):
+            raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+        raise
+    validate_context_window(num_prompt_tokens, request.model)
+
+    # Prepare kwargs
+    (
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        min_p,
+        presence_penalty,
+        frequency_penalty,
+        max_tokens,
+        xtc_probability,
+        xtc_threshold,
+    ) = get_sampling_params(
+        request.temperature,
+        request.top_p,
+        request.model,
+        req_top_k=getattr(request, "top_k", None),
+        req_repetition_penalty=getattr(request, "repetition_penalty", None),
+        req_min_p=getattr(request, "min_p", None),
+        req_presence_penalty=getattr(request, "presence_penalty", None),
+        req_frequency_penalty=getattr(request, "frequency_penalty", None),
+        req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, "xtc_probability", None),
+        req_xtc_threshold=getattr(request, "xtc_threshold", None),
+    )
+    chat_kwargs = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
+    }
+
+    # Widen the repetition-penalty look-back window when the client
+    # asks for it (mlx-lm default window is 20 tokens).
+    repetition_context_size = getattr(
+        request, "repetition_context_size", None
+    )
+    if repetition_context_size is not None:
+        chat_kwargs["repetition_context_size"] = repetition_context_size
+
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
+
+    # Add thinking budget if applicable
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if thinking_budget is not None:
+        chat_kwargs["thinking_budget"] = thinking_budget
+
+    # Auto-set enable_thinking in chat template kwargs when a positive thinking
+    # budget is active (from request or model settings).  Some chat
+    # templates (e.g. Gemma 4) explicitly suppress thinking unless this
+    # kwarg is True.
+    if (
+        thinking_budget is not None
+        and thinking_budget > 0
+        and "enable_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["enable_thinking"] = True
+
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
+    # today but strict templates could raise, so gate on the detected flag.
+    # (_entry is the pool entry resolved for native reasoning above.)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["preserve_thinking"] = True
+
+    # Add compiled grammar for logit-level structured output.
+    # When a reasoning_parser is configured, the structural tag includes
+    # a thinking phase — auto-set a thinking_budget so the model exits
+    # the reasoning phase and the grammar can activate.
+    if compiled_grammar is not None:
+        chat_kwargs["compiled_grammar"] = compiled_grammar
+        if reasoning_parser and "thinking_budget" not in chat_kwargs:
+            default_budget = min(max_tokens // 2, 4096)
+            chat_kwargs["thinking_budget"] = default_budget
+            logger.debug(
+                "Auto-set thinking_budget=%d for grammar-constrained request",
+                default_budget,
+            )
+
+    # Add tools if provided (includes MCP tools)
+    if tools_for_template:
+        chat_kwargs["tools"] = tools_for_template
+
+    # Add chat template kwargs
+    if merged_ct_kwargs:
+        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    # Forward partial-mode decision to the engine explicitly
+    chat_kwargs["is_partial"] = is_partial
+
+    return ChatTurnInputs(
+        messages=messages,
+        settings=ms,
+        chat_kwargs=chat_kwargs,
+        chat_template_kwargs=merged_ct_kwargs,
+        tools_for_template=tools_for_template,
+        native_reasoning=native_reasoning,
+        response_format=response_format,
+        response_format_warning=response_format_warning,
+        max_tokens=max_tokens,
+    )
+
+
+async def served_prompt_token_ids(
+    engine: BaseEngine,
+    model_id: str,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | int | float | None = None,
+    thinking_budget: int | None = None,
+    tool_choice: str | dict | None = None,
+    response_format: Any = None,
+    entry: Any = None,
+) -> tuple[list[int], str]:
+    """Return the prompt token ids a real turn would prefill for *messages*.
+
+    The prompt block cache is keyed on token ids, so a caller that re-derives
+    the prompt can be "right" and still miss every cached block (#3615).
+    Instead of re-implementing the render, this replays the live turn for an
+    OpenAI-format conversation: :func:`prepare_chat_turn_inputs` (model
+    settings, native-reasoning placement, tool-result truncation, MCP tools,
+    thinking flags, partial mode) followed by the same
+    ``engine.prepare_chat_messages`` / ``engine.render_chat_prompt`` /
+    ``tokenizer.encode`` sequence ``stream_chat`` runs.
+
+    Raises ``ValueError`` for multimodal conversations: image and audio parts
+    enter the block key through a separate channel, so those sessions can only
+    be exported from pre-rendered ``token_ids``.
+    """
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list) and any(
+            not isinstance(part, dict) or part.get("type", "text") != "text"
+            for part in content
+        ):
+            raise ValueError(
+                "Multimodal content is not hashable from messages — export or "
+                "probe this turn with the exact token_ids the engine saw."
+            )
+
+    request = ChatCompletionRequest(
+        model=model_id,
+        messages=messages,  # type: ignore[arg-type]
+        max_tokens=max_tokens if max_tokens is not None else 1,
+        tools=tools,  # type: ignore[arg-type]
+        tool_choice=tool_choice,
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_effort=reasoning_effort,
+        thinking_budget=thinking_budget,
+        response_format=response_format,
+    )
+    if not hasattr(engine, "render_chat_prompt"):
+        raise ValueError(
+            "Engine does not expose prompt rendering — export or probe this "
+            "model with the exact token_ids the engine saw."
+        )
+    turn = await prepare_chat_turn_inputs(engine, model_id, request, entry=entry)
+    prompt = engine.render_chat_prompt(
+        engine.prepare_chat_messages(turn.messages),
+        turn.tools_for_template,
+        chat_template_kwargs=turn.chat_template_kwargs or None,
+        is_partial=bool(turn.chat_kwargs.get("is_partial", False)),
+    )
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("Engine has no tokenizer — cannot tokenize the prompt.")
+    return list(tokenizer.encode(prompt)), prompt
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -3953,297 +4382,19 @@ async def create_chat_completion(
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
 
-        # Get per-model settings
-        max_tool_result_tokens = None
-        reasoning_parser = None
-        settings_guided_grammar = None
-        ms = get_model_settings_for_request(request.model)
-        if ms:
-            max_tool_result_tokens = ms.max_tool_result_tokens
-            reasoning_parser = ms.reasoning_parser
-            settings_guided_grammar = _settings_guided_grammar(ms)
-        merged_ct_kwargs = merge_chat_template_request_kwargs(
-            ms,
-            merge_reasoning_effort_chat_template_kwargs(
-                request.chat_template_kwargs,
-                request.reasoning_effort,
-            ),
-        )
-
-        # Extract messages - different engines need different content handling.
-        # Templates that expose message.reasoning_content natively (Qwen 3.6+)
-        # get reasoning as a separate field; others fall back to <think> inlined
-        # in content.
-        _entry = get_engine_pool().get_entry(resolved_model)
-        native_reasoning = uses_native_reasoning_content(
-            resolved_model,
-            config_model_type=(
-                getattr(_entry, "config_model_type", None)
-                if _entry is not None
-                else None
-            ),
-            engine_model_type=getattr(engine, "model_type", None),
-            preserve_thinking_default=(
-                getattr(_entry, "preserve_thinking_default", None)
-                if _entry is not None
-                else None
-            ),
-        )
-        is_vlm = isinstance(engine, VLMBatchedEngine)
-        is_dflash_vlm = not is_vlm and getattr(
-            engine, "supports_multimodal_fallback", False
-        )
-        extractor = getattr(engine, "message_extractor", None)
-        merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
-        if extractor is not None:
-            extractor_kwargs = {}
-            try:
-                if (
-                    "consolidate_system_messages"
-                    in inspect.signature(extractor).parameters
-                ):
-                    extractor_kwargs["consolidate_system_messages"] = False
-            except (TypeError, ValueError):
-                pass
-            messages = extractor(
-                request.messages,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                **extractor_kwargs,
-            )
-            merge_system_fallback_roles = True
-        elif is_vlm or is_dflash_vlm:
-            # VLM or DFlash with VLM fallback: preserve image_url content parts
-            messages = extract_multimodal_content(
-                request.messages,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                native_reasoning_content=native_reasoning,
-                consolidate_system_messages=False,
-            )
-        else:
-            messages = extract_text_content(
-                request.messages,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                native_reasoning_content=native_reasoning,
-                consolidate_system_messages=False,
-            )
-
-        # Detect and strip partial mode at the API boundary — exactly once,
-        # before any chat template application.  The boolean result is forwarded
-        # as an explicit parameter so the engine never has to re-derive it.
-        is_partial = detect_and_strip_partial(messages)
-
-        # Compile grammar for structured output (logit-level enforcement).
-        # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
-        response_format = request.response_format
-        guided_grammar = _effective_guided_grammar(
-            structured_outputs=request.structured_outputs,
-            response_format=response_format,
-            request_guided_grammar=request.guided_grammar,
-            settings_guided_grammar=settings_guided_grammar,
-        )
-        structured_outputs = _normalize_structured_outputs(
-            request.structured_outputs,
-            guided_grammar,
-        )
-        _reject_diffusion_structured_outputs(
-            engine,
-            response_format=response_format,
-            structured_outputs=structured_outputs,
-            guided_grammar=guided_grammar,
-        )
-        if structured_outputs is not None or response_format:
-            await engine.start()
-        compiled_grammar = _compile_grammar_for_request(
-            engine,
-            structured_outputs=structured_outputs,
-            response_format=response_format,
-            chat_template_kwargs=merged_ct_kwargs or None,
-            reasoning_parser=reasoning_parser,
-        )
-        # Fall back to prompt injection when grammar is not compiled. The degrade
-        # is also surfaced to the caller as a Warning response header (#1241).
-        # Only response formats that actually request grammar-constrained JSON
-        # (json_object / json_schema) can be "unenforced"; a plain text format
-        # never asked for enforcement, so it must not warn (#1241 review).
-        response_format_warning = None
-        if compiled_grammar is None and _response_format_requests_grammar(
-            response_format
-        ):
-            response_format_warning = _response_format_warning_header(response_format)
-            json_instruction = build_json_system_prompt(response_format)
-            if json_instruction:
-                messages = _inject_json_instruction(messages, json_instruction)
-
-        # Merge MCP tools with user-provided tools unless the request explicitly
-        # disables tool use.
-        tools_disabled = request.tool_choice == "none"
-        if getattr(engine, "is_diffusion_model", False) and not getattr(
-            engine, "supports_tool_calling", False
-        ):
-            if request.tools and not tools_disabled:
-                raise InvalidRequestError(
-                    "Tool calling is not supported for this diffusion model "
-                    "(no tool parser matched its chat template).",
-                    field="tools",
-                )
-            tools_disabled = True
-        effective_tools = None if tools_disabled else request.tools
-        if (
-            _server_state.mcp_manager
-            and not tools_disabled
-            and mcp_tools_exposed()
-        ):
-            # Convert Pydantic ToolDefinition models to dicts for merge_tools
-            user_tools_dicts = (
-                [t.model_dump() for t in request.tools] if request.tools else None
-            )
-            effective_tools = _server_state.mcp_manager.get_merged_tools(
-                user_tools_dicts
-            )
-
-        # Validate context window before sending to model
-        tools_for_template = (
-            convert_tools_for_template(effective_tools) if effective_tools else None
-        )
-        # Gemma 4 drops required params that lack descriptions — enrich them
-        if tools_for_template and "gemma" in (resolved_model or "").lower():
-            tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
-        await _ensure_tokenizer_for_system_probe(engine, messages)
-        messages = prepare_system_messages_for_template(
-            messages,
-            engine.tokenizer,
-            tools=tools_for_template,
-            chat_template_kwargs=merged_ct_kwargs or None,
-            is_partial=is_partial,
-            merge_consecutive_roles=merge_system_fallback_roles,
-            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
-        )
-        try:
-            num_prompt_tokens = engine.count_chat_tokens(
-                messages,
-                tools_for_template,
-                chat_template_kwargs=merged_ct_kwargs or None,
-                is_partial=is_partial,
-            )
-        except Exception as e:
-            # Catch chat template rendering failures: Jinja2 TemplateError,
-            # AssertionError from strict role validation, ValueError, etc.
-            err_name = type(e).__name__.lower()
-            err_msg = str(e).lower()
-            if (
-                "template" in err_name
-                or "template" in err_msg
-                or isinstance(e, (AssertionError, ValueError))
-            ):
-                raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
-            raise
-        validate_context_window(num_prompt_tokens, request.model)
-
-        # Prepare kwargs
-        (
-            temperature,
-            top_p,
-            top_k,
-            repetition_penalty,
-            min_p,
-            presence_penalty,
-            frequency_penalty,
-            max_tokens,
-            xtc_probability,
-            xtc_threshold,
-        ) = get_sampling_params(
-            request.temperature,
-            request.top_p,
-            request.model,
-            req_top_k=getattr(request, "top_k", None),
-            req_repetition_penalty=getattr(request, "repetition_penalty", None),
-            req_min_p=getattr(request, "min_p", None),
-            req_presence_penalty=getattr(request, "presence_penalty", None),
-            req_frequency_penalty=getattr(request, "frequency_penalty", None),
-            req_max_tokens=request.max_tokens,
-            req_xtc_probability=getattr(request, "xtc_probability", None),
-            req_xtc_threshold=getattr(request, "xtc_threshold", None),
-        )
-        chat_kwargs = {
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "min_p": min_p,
-            "repetition_penalty": repetition_penalty,
-            "presence_penalty": presence_penalty,
-            "frequency_penalty": frequency_penalty,
-            "xtc_probability": xtc_probability,
-            "xtc_threshold": xtc_threshold,
-        }
-
-        # Widen the repetition-penalty look-back window when the client
-        # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
-        )
-        if repetition_context_size is not None:
-            chat_kwargs["repetition_context_size"] = repetition_context_size
-
-        # Add seed for reproducible generation (best-effort)
-        if request.seed is not None:
-            chat_kwargs["seed"] = request.seed
-
-        # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
-        if thinking_budget is not None:
-            chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking in chat template kwargs when a positive thinking
-        # budget is active (from request or model settings).  Some chat
-        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
-        # kwarg is True.
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
-
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
-        # today but strict templates could raise, so gate on the detected flag.
-        _entry = get_engine_pool().get_entry(resolved_model)
-        if (
-            _entry is not None
-            and _entry.preserve_thinking_default is True
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
-
-        # Add compiled grammar for logit-level structured output.
-        # When a reasoning_parser is configured, the structural tag includes
-        # a thinking phase — auto-set a thinking_budget so the model exits
-        # the reasoning phase and the grammar can activate.
-        if compiled_grammar is not None:
-            chat_kwargs["compiled_grammar"] = compiled_grammar
-            if reasoning_parser and "thinking_budget" not in chat_kwargs:
-                default_budget = min(max_tokens // 2, 4096)
-                chat_kwargs["thinking_budget"] = default_budget
-                logger.debug(
-                    "Auto-set thinking_budget=%d for grammar-constrained request",
-                    default_budget,
-                )
-
-        # Add tools if provided (includes MCP tools)
-        if tools_for_template:
-            chat_kwargs["tools"] = tools_for_template
-
-        # Add chat template kwargs
-        if merged_ct_kwargs:
-            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-
-        # Forward partial-mode decision to the engine explicitly
-        chat_kwargs["is_partial"] = is_partial
+        # Prepare the turn (settings, message extraction, tools, thinking
+        # flags, partial mode) through the single shared entry point — cache
+        # probe/export run the same function to stay hash-compatible (#3615).
+        turn = await prepare_chat_turn_inputs(engine, resolved_model, request)
+        messages = turn.messages
+        ms = turn.settings
+        chat_kwargs = turn.chat_kwargs
+        merged_ct_kwargs = turn.chat_template_kwargs
+        tools_for_template = turn.tools_for_template
+        native_reasoning = turn.native_reasoning
+        response_format = turn.response_format
+        response_format_warning = turn.response_format_warning
+        max_tokens = turn.max_tokens
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
         )

@@ -13,9 +13,11 @@ index and register verified files back into it.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -23,7 +25,6 @@ from pydantic import BaseModel
 from ..cache import artifact_store
 from ..cache.artifact_store import ArtifactError
 from .auth import require_admin
-from .routes import _normalize_probe_tool_calls, _probe_chat_template_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,8 @@ class CacheArtifactExportRequest(BaseModel):
     turn (same path as ``/api/cache/probe``) so the block chain lines up
     with what a re-prefill would build. ``token_ids`` is an alternative for
     gateway/proxy integrations that already hold the exact rendered
-    conversation: when set, ``messages`` is ignored.
+    conversation: when set, ``messages`` is ignored. Multimodal turns must use
+    ``token_ids`` — image and audio enter the block key outside the text.
     """
 
     model_id: str
@@ -57,6 +59,14 @@ class CacheArtifactExportRequest(BaseModel):
     tools: list[dict] | None = None
     chat_template_kwargs: dict | None = None
     thinking_budget: int | None = None
+    # Forwarded to the serving turn preparation: max_tokens feeds the
+    # thinking-budget default, tool_choice / response_format / reasoning_effort
+    # each change the rendered prompt. Same values as the served turn →
+    # same block hashes.
+    max_tokens: int | None = None
+    reasoning_effort: str | int | float | None = None
+    tool_choice: str | dict | None = None
+    response_format: dict | None = None
     # Pre-rendered token ids (takes precedence over messages).
     token_ids: list[int] | None = None
     # Force-write the chain's write-back (RAM-only) blocks to disk before
@@ -147,50 +157,46 @@ def _require_ssd_tier(ssd_manager) -> None:
         )
 
 
-def _tokenize_prompt(
-    engine, entry, tokenizer, request: CacheArtifactExportRequest
+async def _tokenize_prompt(
+    engine, model_id: str, request: CacheArtifactExportRequest, *, entry: Any = None
 ) -> list[int]:
-    """Render + tokenize exactly like ``probe_cache`` (keep in sync)."""
-    try:
-        messages = _normalize_probe_tool_calls(request.messages)
-        if hasattr(engine, "_preprocess_messages"):
-            messages = engine._preprocess_messages(messages)
-        try:
-            from ..api.tool_calling import convert_tools_for_template  # type: ignore
+    """Token ids exactly as the serving path would prefill them.
 
-            template_tools = (
-                convert_tools_for_template(request.tools)
-                if request.tools
-                else None
-            )
-        except Exception:
-            template_tools = request.tools or None
-        if hasattr(engine, "_apply_chat_template"):
-            prompt = engine._apply_chat_template(
-                messages,
-                template_tools,
-                chat_template_kwargs=_probe_chat_template_kwargs(
-                    request,
-                    preserve_thinking_default=getattr(
-                        entry, "preserve_thinking_default", None
-                    ),
-                ),
-            )
-        else:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        return list(tokenizer.encode(prompt))
+    Replays the live turn preparation (``server.served_prompt_token_ids``)
+    instead of re-rendering here: the block cache is keyed on token ids, so
+    anything derived separately — a truncated tool result, MCP or enriched
+    tools, thinking flags, reasoning effort, a folded mid-system note — was a
+    hash miss and a 409 on a conversation that served fine (#3615).
+    """
+    from ..server import served_prompt_token_ids
+
+    try:
+        token_ids, _prompt = await served_prompt_token_ids(
+            engine,
+            model_id,
+            messages=request.messages,
+            tools=request.tools,
+            chat_template_kwargs=request.chat_template_kwargs,
+            max_tokens=request.max_tokens,
+            reasoning_effort=request.reasoning_effort,
+            thinking_budget=request.thinking_budget,
+            tool_choice=request.tool_choice,
+            response_format=request.response_format,
+            entry=entry,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=400, detail=f"Failed to tokenize messages: {exc}"
         ) from exc
+    return token_ids
 
 
 @router.post("/api/cache/artifact/export")
-def export_cache_artifact(
+async def export_cache_artifact(
     request: CacheArtifactExportRequest,
     is_admin: bool = Depends(require_admin),
 ):
@@ -200,7 +206,7 @@ def export_cache_artifact(
     artifact always holds a contiguous, importable chain. Returns the
     artifact path, size and manifest (block list, token counts).
     """
-    engine, entry, ssd_manager, model_name, block_size, tokenizer = (
+    engine, entry, ssd_manager, model_name, block_size, _tokenizer = (
         _resolve_context(request.model_id)
     )
     _require_ssd_tier(ssd_manager)
@@ -209,7 +215,9 @@ def export_cache_artifact(
             raise HTTPException(status_code=400, detail="token_ids is empty.")
         token_ids = [int(t) for t in request.token_ids]
     elif request.messages is not None:
-        token_ids = _tokenize_prompt(engine, entry, tokenizer, request)
+        token_ids = await _tokenize_prompt(
+            engine, request.model_id, request, entry=entry
+        )
         if not token_ids:
             raise HTTPException(
                 status_code=400, detail="Messages tokenized to zero tokens."
@@ -225,7 +233,9 @@ def export_cache_artifact(
         output_dir = Path(ssd_manager._cache_dir).parent / "cache_artifacts"
 
     try:
-        result = artifact_store.export_artifact(
+        # Copying a session can be gigabytes — keep it off the event loop.
+        result = await asyncio.to_thread(
+            artifact_store.export_artifact,
             ssd_manager,
             model_name=model_name,
             token_ids=token_ids,

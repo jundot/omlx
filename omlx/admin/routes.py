@@ -33,8 +33,6 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
-from ..api.openai_models import _coerce_tool_call_arguments
-from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import (
@@ -42,7 +40,6 @@ from ..model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
-    merge_chat_template_kwargs,
 )
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
@@ -211,6 +208,12 @@ class CacheProbeRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     thinking_budget: int | None = None
+    # Forwarded to the serving turn preparation. Every one of these can change
+    # the rendered prompt, so pass the same values the turn was served with or
+    # the probe hashes a different conversation.
+    max_tokens: int | None = None
+    reasoning_effort: str | int | float | None = None
+    tool_choice: str | dict | None = None
 
 
 class ModelSettingsRequest(BaseModel):
@@ -6394,83 +6397,6 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
     }
 
 
-def _normalize_probe_tool_calls(messages: list[dict]) -> list[dict]:
-    """Parse echoed tool_call arguments (JSON string -> object) for templating.
-
-    Native tool-calling chat templates (GLM, Qwen3.x, MiniMax) iterate
-    ``tool_call.function.arguments.items()``, but the OpenAI wire form sends
-    ``arguments`` as a JSON string. Rendering the string form raises
-    ``'str object' has no attribute 'items'`` and the probe 400s, so any
-    conversation that used tools reports an error (hollow cache dot) instead
-    of a real hit/miss. The chat path parses these before rendering; mirror
-    that here so (a) tool conversations tokenize and (b) the probe's block
-    hashes line up with what a real prefill produced. Returns shallow copies
-    so the caller's message dicts are left untouched.
-    """
-    normalized: list[dict] = []
-    for msg in messages:
-        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
-        if not tool_calls:
-            normalized.append(msg)
-            continue
-        new_calls = []
-        for tc in tool_calls:
-            fn = tc.get("function") if isinstance(tc, dict) else None
-            if isinstance(fn, dict) and "arguments" in fn:
-                arguments = _coerce_tool_call_arguments(fn["arguments"])
-                tc = {
-                    **tc,
-                    "function": {**fn, "arguments": _try_parse_json(arguments)},
-                }
-            new_calls.append(tc)
-        normalized.append({**msg, "tool_calls": new_calls})
-    return normalized
-
-
-def _probe_chat_template_kwargs(
-    request: "CacheProbeRequest",
-    *,
-    preserve_thinking_default: bool | None = None,
-) -> dict | None:
-    """Chat-template kwargs the scheduler would actually prefill this with.
-
-    The probe answers "is this prompt cached", so it has to render byte-for
-    byte what a real turn renders. Rendering with the caller's kwargs alone
-    ignores the model's own settings — a model with enable_thinking set (or
-    any forced/persisted chat_template_kwargs) then hashes a prompt that is
-    never prefilled, and since the block walk stops at the first miss, every
-    block reports cold.
-    """
-    settings = None
-    if _get_settings_manager is not None:
-        try:
-            manager = _get_settings_manager()
-            if manager is not None:
-                settings = manager.get_settings_for_request(
-                    request.model_id,
-                    resolved_model_id=request.model_id,
-                )
-        except Exception:
-            # A settings lookup failure must not break probing outright —
-            # fall back to the caller's kwargs (pre-fix behaviour).
-            logger.warning(
-                "cache probe: model settings lookup failed for %s; "
-                "rendering with request kwargs only",
-                request.model_id,
-                exc_info=True,
-            )
-            settings = None
-    return (
-        merge_chat_template_kwargs(
-            settings,
-            request.chat_template_kwargs,
-            thinking_budget=request.thinking_budget,
-            preserve_thinking_default=preserve_thinking_default,
-        )
-        or None
-    )
-
-
 @router.post("/api/cache/probe")
 async def probe_cache(
     request: CacheProbeRequest,
@@ -6535,42 +6461,27 @@ async def probe_cache(
             detail="Cache block size unavailable — cache may not be enabled.",
         )
 
-    # Render + tokenize the prompt using the same path as generation so the
-    # hashes line up with what the scheduler would produce at prefill.
+    # Render + tokenize the prompt through the serving path so the hashes
+    # line up with what the scheduler prefills for the same conversation.
     try:
-        messages = _normalize_probe_tool_calls(request.messages)
-        if hasattr(engine, "_preprocess_messages"):
-            messages = engine._preprocess_messages(messages)
-        try:
-            from ..api.tool_calling import convert_tools_for_template  # type: ignore
+        from ..server import served_prompt_token_ids
 
-            template_tools = (
-                convert_tools_for_template(request.tools) if request.tools else None
-            )
-        except Exception:
-            template_tools = request.tools or None
-        if hasattr(engine, "_apply_chat_template"):
-            prompt = engine._apply_chat_template(
-                messages,
-                template_tools,
-                chat_template_kwargs=_probe_chat_template_kwargs(
-                    request,
-                    preserve_thinking_default=getattr(
-                        entry, "preserve_thinking_default", None
-                    ),
-                ),
-            )
-        else:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        token_ids = list(tokenizer.encode(prompt))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to tokenize messages: {exc}"
+        token_ids, prompt = await served_prompt_token_ids(
+            engine,
+            request.model_id,
+            messages=request.messages,
+            tools=request.tools,
+            chat_template_kwargs=request.chat_template_kwargs,
+            max_tokens=request.max_tokens,
+            reasoning_effort=request.reasoning_effort,
+            thinking_budget=request.thinking_budget,
+            tool_choice=request.tool_choice,
+            entry=entry,
         )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to tokenize messages: {exc}")
 
     total_tokens = len(token_ids)
     if total_tokens == 0:

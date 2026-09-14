@@ -899,11 +899,9 @@ class BatchedEngine(BaseEngine):
         Returns:
             Number of prompt tokens
         """
-        messages = self._preprocess_messages(messages)
-        template_tools = convert_tools_for_template(tools) if tools else None
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
+        prompt = self.render_chat_prompt(
+            self.prepare_chat_messages(messages),
+            tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
@@ -933,7 +931,7 @@ class BatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         prompt: str,
-        template_tools: Any,
+        tools: list[dict] | None,
         ct_kwargs: dict[str, Any] | None,
         kwargs: dict[str, Any],
     ) -> None:
@@ -959,7 +957,9 @@ class BatchedEngine(BaseEngine):
         if len(non_system) < len(messages) and non_system:
             try:
                 non_system_prompt = self._apply_chat_template(
-                    non_system, template_tools, chat_template_kwargs=ct_kwargs
+                    non_system,
+                    convert_tools_for_template(tools) if tools else None,
+                    chat_template_kwargs=ct_kwargs,
                 )
                 full_tokens = len(self._tokenizer.encode(prompt))
                 non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
@@ -1224,25 +1224,21 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # Preprocess messages for Harmony (gpt-oss) models
-        messages = self._preprocess_messages(messages)
-
-        # Convert tools for template
-        template_tools = convert_tools_for_template(tools) if tools else None
-
-        # Apply chat template
+        # Render through the shared canonical path (Harmony preprocess +
+        # tool-schema conversion + chat template).
+        messages = self.prepare_chat_messages(messages)
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = self.render_chat_prompt(
             messages,
-            template_tools,
+            tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(
-            messages, prompt, template_tools, ct_kwargs, kwargs
+            messages, prompt, tools, ct_kwargs, kwargs
         )
 
         return await self.generate(
@@ -1281,14 +1277,13 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
-        messages = self._preprocess_messages(messages)
-        template_tools = convert_tools_for_template(tools) if tools else None
+        messages = self.prepare_chat_messages(messages)
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
         self._prepare_k2_tool_grammar(tools, kwargs)
-        prompt = self._apply_chat_template(
+        prompt = self.render_chat_prompt(
             messages,
-            template_tools,
+            tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
@@ -1382,25 +1377,20 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # Preprocess messages for Harmony (gpt-oss) models
-        messages = self._preprocess_messages(messages)
-
-        # Convert tools for template
-        template_tools = convert_tools_for_template(tools) if tools else None
-
-        # Apply chat template
+        # Render through the shared canonical path.
+        messages = self.prepare_chat_messages(messages)
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = self.render_chat_prompt(
             messages,
-            template_tools,
+            tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(
-            messages, prompt, template_tools, ct_kwargs, kwargs
+            messages, prompt, tools, ct_kwargs, kwargs
         )
 
         async for output in self.stream_generate(
