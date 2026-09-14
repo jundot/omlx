@@ -28,6 +28,7 @@ from omlx.api.responses_utils import (
     convert_stored_response_to_messages,
     format_sse_event,
     normalize_response_output_to_messages,
+    split_namespace_tool_name,
 )
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -717,6 +718,115 @@ class TestConvertResponsesTools:
         tools = [ResponsesTool(type="local_shell")]
         result = convert_responses_tools(tools)
         assert result is None
+
+    def test_namespace_tools_are_expanded(self):
+        """Namespace groups hold client-executed function tools (#3371)."""
+        aliases = {}
+        tools = [
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                description="Demo MCP server",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "description": "Get the current weather for a city.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                    {"type": "function", "name": "get_time"},
+                ],
+            )
+        ]
+        result = convert_responses_tools(tools, aliases)
+        assert result is not None
+        # Wire names join the namespace like Codex's join_tool_name().
+        assert [t["function"]["name"] for t in result] == [
+            "mcp__demo__get_weather",
+            "mcp__demo__get_time",
+        ]
+        assert result[0]["type"] == "function"
+        assert result[0]["function"]["description"] == (
+            "Get the current weather for a city."
+        )
+        assert result[0]["function"]["parameters"]["required"] == ["city"]
+        assert aliases == {
+            "mcp__demo__get_weather": ("mcp__demo__", "get_weather"),
+            "mcp__demo__get_time": ("mcp__demo__", "get_time"),
+        }
+
+    def test_namespace_wire_name_survives_collision(self):
+        """A flat tool already holding the joined name must not be shadowed."""
+        aliases = {}
+        tools = [
+            ResponsesTool(type="function", name="mcp__demo__get_weather"),
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                tools=[{"type": "function", "name": "get_weather"}],
+            ),
+        ]
+        result = convert_responses_tools(tools, aliases)
+        assert [t["function"]["name"] for t in result] == [
+            "mcp__demo__get_weather",
+            "mcp__demo__get_weather_2",
+        ]
+        assert aliases == {"mcp__demo__get_weather_2": ("mcp__demo__", "get_weather")}
+
+    def test_flat_tools_record_no_aliases(self):
+        aliases = {}
+        result = convert_responses_tools(
+            [ResponsesTool(type="function", name="get_weather")], aliases
+        )
+        assert result[0]["function"]["name"] == "get_weather"
+        assert aliases == {}
+
+    def test_split_namespace_tool_name(self):
+        aliases = {"mcp__demo__get_weather": ("mcp__demo__", "get_weather")}
+        assert split_namespace_tool_name("mcp__demo__get_weather", aliases) == (
+            "mcp__demo__",
+            "get_weather",
+        )
+        # Flat calls, and calls the model invented, pass through unchanged.
+        assert split_namespace_tool_name("get_weather", aliases) == (
+            None,
+            "get_weather",
+        )
+        assert split_namespace_tool_name("get_weather") == (None, "get_weather")
+
+    def test_function_call_output_item_carries_namespace(self):
+        item = build_function_call_output_item(
+            name="get_weather",
+            arguments='{"city": "Paris"}',
+            call_id="call_1",
+            namespace="mcp__demo__",
+        )
+        assert item.name == "get_weather"
+        assert item.namespace == "mcp__demo__"
+        flat = build_function_call_output_item(
+            name="get_weather", arguments="{}", call_id="call_2"
+        )
+        assert flat.namespace is None
+
+    def test_namespace_ignores_malformed_members(self):
+        tools = [
+            ResponsesTool(type="namespace", name="ns__", tools=["not-a-tool"]),
+            ResponsesTool(type="function", name="fn_a"),
+        ]
+        result = convert_responses_tools(tools)
+        assert [t["function"]["name"] for t in result] == ["fn_a"]
+
+    def test_namespace_without_members_is_skipped(self):
+        tools = [
+            ResponsesTool(type="namespace", name="empty__"),
+            ResponsesTool(type="function", name="fn_a"),
+        ]
+        result = convert_responses_tools(tools)
+        assert [t["function"]["name"] for t in result] == ["fn_a"]
 
 
 # =============================================================================

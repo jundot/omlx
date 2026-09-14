@@ -4,7 +4,7 @@
 import json
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from .shared_models import IDPrefix, generate_id, get_unix_timestamp
 
@@ -166,8 +166,23 @@ class OutputItem(BaseModel):
     call_id: Optional[str] = None
     name: Optional[str] = None
     arguments: Optional[str] = None
+    # Namespace the called tool was declared in, when it came from a
+    # "namespace" tool group; clients resolve the call by (namespace, name).
+    namespace: Optional[str] = None
     # reasoning fields
     summary: Optional[List[ReasoningSummaryPart]] = None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_namespace(self, handler):
+        """Keep ``namespace`` off every item that has none.
+
+        The other optional fields keep serializing as null, as they always
+        have; only this one is added per item type.
+        """
+        data = handler(self)
+        if data.get("namespace") is None:
+            data.pop("namespace", None)
+        return data
 
 
 class InputTokensDetails(BaseModel):
