@@ -303,6 +303,34 @@ def test_boundary_snapshot_diagnostics_preserve_store_skip_cause():
     assert diagnostics.snapshot()["last_event"]["cause"] == "ssd_load_failed"
 
 
+def test_boundary_snapshot_diagnostics_record_returns_event_with_cause():
+    """record() hands back the assembled event so callers logging the skip
+    (the store-skip INFO line) can include the derived cause without a
+    second snapshot() round-trip."""
+    diagnostics = BoundarySnapshotDiagnostics()
+    miss = diagnostics.record(
+        "override_miss",
+        reason="no_aligned_snapshots",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=1,
+    )
+    assert miss["event"] == "override_miss"
+    assert "cause" not in miss
+
+    skip = diagnostics.record(
+        "store_skip",
+        reason="boundary_snapshot_unavailable",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=1,
+    )
+    assert skip["cause"] == "no_aligned_snapshots"
+    assert skip == diagnostics.snapshot()["last_event"]
+
+
 def test_boundary_snapshot_diagnostics_clear_resets_state():
     diagnostics = BoundarySnapshotDiagnostics()
     diagnostics.record(

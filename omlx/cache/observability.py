@@ -115,7 +115,7 @@ class BoundarySnapshotDiagnostics:
         source: str | None = None,
         storage: str | None = None,
         available_boundaries: int | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         counter = {
             "capture_attempt": "capture_attempts",
             "capture_success": "captures",
@@ -157,6 +157,9 @@ class BoundarySnapshotDiagnostics:
                 if value is not None:
                     last_event[key] = value
             self._last_event = last_event
+            # Callers logging the event (e.g. the store-skip INFO line) need
+            # the derived cause, which only exists on this assembled record.
+            return dict(last_event)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
