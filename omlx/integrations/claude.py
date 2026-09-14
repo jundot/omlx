@@ -178,4 +178,5 @@ class ClaudeCodeIntegration(Integration):
         print(f"Launching Claude Code with model {ctx.model}...")
         if ctx.context_window:
             print(f"Auto-compact window: {ctx.context_window:,} tokens")
+        self._echo_command(ctx, argv)
         os.execvpe(binary, argv, env)

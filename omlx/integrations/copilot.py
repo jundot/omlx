@@ -50,4 +50,6 @@ class CopilotIntegration(Integration):
             print(f"Max prompt tokens: {ctx.context_window:,}")
         if ctx.max_tokens:
             print(f"Max output tokens: {ctx.max_tokens:,}")
-        os.execvpe("copilot", ["copilot", *ctx.extra_args], env)
+        args = ["copilot", *ctx.extra_args]
+        self._echo_command(ctx, args)
+        os.execvpe("copilot", args, env)

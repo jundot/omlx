@@ -150,4 +150,5 @@ class CodexIntegration(Integration):
             args.extend(["-m", ctx.model])
         args.extend(ctx.extra_args)
 
+        self._echo_command(ctx, args)
         os.execvpe("codex", args, env)
