@@ -25,7 +25,10 @@ import pytest
 
 import omlx.cache.prefix_cache as prefix_cache_module
 from omlx.cache.paged_cache import PagedCacheManager
-from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+from omlx.cache.paged_ssd_cache import (
+    PagedSSDCacheManager,
+    cachelist_pm_class_eligible,
+)
 from omlx.cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from omlx.cache.type_registry import CacheTypeRegistry
 
@@ -160,7 +163,17 @@ def test_plan_helper_classification():
         "mixed kv+arrays": (["KVCache", "ArraysCache"], True),
         "kv only": (["KVCache", "KVCache"], False),
         "arrays only": (["ArraysCache"], False),
-        "pooling member": (["KVCache", "PoolingCache"], False),
+        # PoolingCache is per-member boundary-eligible (GLM-5.x
+        # CacheList(KVCache, PoolingCache)): its compacted pooled delta is
+        # persisted as PoolingCacheDelta and the chain is rebuilt on restore
+        # (PR #3290).
+        "pooling member": (["KVCache", "PoolingCache"], True),
+        # BatchPoolingCache is boundary-eligible too: its state is
+        # self-contained at the boundary and it is not compacted to deltas,
+        # so it persists/restores last-block-wins like ArraysCache — the
+        # plan helper and the class-level eligibility must agree
+        # (maintainer review #3290).
+        "batch pooling member": (["KVCache", "BatchPoolingCache"], True),
         "no names": ([], False),
     }
     live = _build_mixed_cachelist(BLOCK_SIZE)
@@ -170,6 +183,7 @@ def test_plan_helper_classification():
         "KVCache": kv_state,
         "ArraysCache": arrays_state,
         "PoolingCache": arrays_state,
+        "BatchPoolingCache": arrays_state,
     }
     for name, (classes, eligible) in cases.items():
         states = [states_by_class[c] for c in classes]
@@ -177,6 +191,9 @@ def test_plan_helper_classification():
         assert (plan is not None) == eligible, name
         if plan is not None:
             assert plan == ["slice", "boundary"]
+        # The class-level eligibility used for signature expectations must
+        # agree with the plan helper on every classification case.
+        assert cachelist_pm_class_eligible(classes) == eligible, name
 
 
 def test_blocks_stored_per_member_sized(tmp_path):
