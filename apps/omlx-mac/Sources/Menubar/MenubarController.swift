@@ -1287,7 +1287,7 @@ final class MenubarController: NSObject {
     /// Menu-visible models: virtual builtin entries (e.g. the MarkItDown
     /// document converter) have no real load/unload lifecycle and are dropped.
     nonisolated static func visibleMenuModels(_ models: [ModelDTO]) -> [ModelDTO] {
-        models.filter { $0.virtual != true }
+        models.filter { $0.virtual != true && $0.isHelper != true }
     }
 
     /// Splits models into the three menu sections — loaded/loading models,

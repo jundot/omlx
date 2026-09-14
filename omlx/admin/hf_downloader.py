@@ -11,6 +11,7 @@ import errno
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from httpx import HTTPError
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
     GatedRepoError,
@@ -830,6 +832,42 @@ class HFDownloader:
 
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
+        is_uno_adapter = False
+        uno_adapter_error = None
+        if (
+            is_adapter
+            and "uno" in re.split(r"[-_/]", repo_id.lower())
+            and any(f["name"] == "adapter_model.safetensors" for f in files)
+        ):
+            from ..uno_bundle import uno_adapter_base
+
+            try:
+                config_path = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        hf_hub_download,
+                        repo_id=repo_id,
+                        filename="adapter_config.json",
+                        endpoint=endpoint,
+                    ),
+                    timeout=_HF_API_TIMEOUT,
+                )
+                config = json.loads(Path(config_path).read_text())
+                if not isinstance(config, dict):
+                    raise ValueError("adapter_config.json must contain an object")
+                is_uno_adapter = uno_adapter_base(config) is not None
+            except (OSError, ValueError, HTTPError, HfHubHTTPError) as error:
+                # Metadata remains usable, but a failed check is not proof that
+                # this is an unsupported adapter. Both clients expose a retry.
+                is_uno_adapter = None
+                if isinstance(error, GatedRepoError):
+                    uno_adapter_error = "Adapter access was denied. Check repository access and your Hugging Face token, then retry."
+                elif isinstance(error, TimeoutError):
+                    uno_adapter_error = (
+                        "Adapter verification timed out. Retry to verify compatibility."
+                    )
+                else:
+                    uno_adapter_error = "Could not read the adapter configuration. Check repository access and retry to verify compatibility."
+                logger.warning("Could not verify Uno adapter '%s': %s", repo_id, error)
 
         # Params from the dtype histogram (logical count). Size from current
         # revision blob bytes — U32 packed quants are not 4 bytes/param (#3401).
@@ -886,6 +924,8 @@ class HFDownloader:
                 info.last_modified.isoformat() if info.last_modified else ""
             ),
             "is_adapter": is_adapter,
+            "is_uno_adapter": is_uno_adapter,
+            "uno_adapter_error": uno_adapter_error,
         }
 
     def __init__(

@@ -710,7 +710,7 @@ struct ProfileDetailCard: View {
         // global templates; they only appear on per-model profiles.
         let accelKeys = [
             "turboquant_kv_enabled", "dflash_enabled", "mtp_enabled",
-            "specprefill_enabled", "index_cache_freq", "vlm_mtp_enabled",
+            "specprefill_enabled", "index_cache_freq", "vlm_mtp_enabled", "uno_enabled",
         ]
         let hasAcceleration = accelKeys.contains { s[$0] != nil }
         let templateKeys = ["reasoning_parser", "chat_template_kwargs", "forced_ct_kwargs"]
@@ -904,6 +904,9 @@ struct ProfileDetailCard: View {
                                        defaultValue: "Lightning MTP",
                                        comment: "Acceleration chip: built-in MTP head multi-token prediction"),
                          on: on)
+            }
+            if let on = s["uno_enabled"].flatMap({ boolOf($0) }) {
+                flagChip(label: "Uno", on: on)
             }
             if let on = s["vlm_mtp_enabled"].flatMap({ boolOf($0) }) {
                 flagChip(label: String(localized: "profile.detail.acceleration.vlm_mtp",

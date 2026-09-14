@@ -21,7 +21,7 @@ final class ModelsScreenVM {
     var activeModels: [ModelDTO] {
         allModels.filter { $0.loaded || $0.isLoading }
     }
-    var libraryModels: [ModelDTO] { allModels }
+    var libraryModels: [ModelDTO] { allModels.filter { $0.isHelper != true } }
 
     func start(client: OMLXClient) async {
         self.client = client

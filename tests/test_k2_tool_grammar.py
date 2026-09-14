@@ -4,11 +4,13 @@
 import json
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
 
 from omlx._torch_stub import install
 from omlx.exceptions import InvalidRequestError
-from omlx.patches.k2_horizon.tool_grammar import compile_tool_grammar
+from omlx.patches.k2_horizon.tool_grammar import UnoToolConstraint, compile_tool_grammar
+from omlx.patches.k2_horizon.uno_decode import acceptance_and_residual
 
 install()
 xgr = pytest.importorskip("xgrammar")
@@ -131,6 +133,33 @@ def test_optional_backend_and_conflicting_constraints(compiler):
         compile_tool_grammar(compiler, tools_for("read"), existing)
 
 
+def test_uno_first_token_rejection_residual_and_rollback(compiler):
+    compiled = compile_tool_grammar(compiler, tools_for("brave-search"))
+    constraint = UnoToolConstraint(compiled, len(VOCAB))
+    prefix = [256, 258]
+    constraint.commit(prefix)
+    logits = mx.zeros((3, len(VOCAB)))
+    seed = constraint.seed(logits)
+    assert mx.isneginf(seed[0, 268]).item()
+    assert seed[0, 267].item() == 0
+    assert mx.array_equal(seed[1:], logits[1:]).item()
+    proposals = [ord("b"), ord("X"), ord("z")]
+    target = constraint.verify(logits, proposals)
+    assert mx.isneginf(target[0, ord("X")]).item()
+    assert target[0, ord("r")].item() == 0
+    assert mx.array_equal(target[1:], logits[1:]).item()
+    p = mx.softmax(target[:1], axis=-1)
+    q = mx.full(p.shape, 1 / len(VOCAB))
+    flags, residual = acceptance_and_residual(
+        p, q, mx.array([ord("X")]), mx.array([0.5])
+    )
+    assert not flags.item()
+    assert residual[0, ord("X")].item() == 0
+    constraint.commit(list(b"brave-search"))
+    assert accept(constraint.matcher, "</ifm|tool_call></ifm|tool_calls>")
+    assert constraint.matcher.accept_token(STOP)
+
+
 def test_non_k2_engine_does_not_touch_grammar():
     from omlx.engine.batched import BatchedEngine
 
@@ -140,6 +169,45 @@ def test_non_k2_engine_does_not_touch_grammar():
         existing = kwargs["compiled_grammar"]
         BatchedEngine._prepare_k2_tool_grammar(engine, tools_for("read"), kwargs)
         assert kwargs["compiled_grammar"] is existing
+
+
+@pytest.mark.parametrize("temperature", [0, 1.0])
+@pytest.mark.parametrize("block_size", [1, 2, 8])
+def test_uno_commits_constrained_tokens_and_keeps_kv(compiler, temperature, block_size):
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.patches.k2_horizon.uno_decode import UnoDecoder
+    from test_k2_horizon import run_uno_cycles
+
+    class Model:
+        _uno_adapter_loaded = True
+        args = SimpleNamespace(vocab_size=len(VOCAB))
+
+        def make_cache(self):
+            self.cache = [KVCache()]
+            return self.cache
+
+        def __call__(self, inputs, cache=None, lora_mask=None):
+            values = inputs[:, None, :, None].astype(mx.float32)
+            cache[0].update_and_fetch(values, values)
+            return mx.broadcast_to(
+                mx.where(mx.arange(len(VOCAB)) == ord("X"), 10.0, 0.0),
+                (1, inputs.shape[1], len(VOCAB)),
+            )
+
+    model = Model()
+    compiled = compiler.compile_grammar('root ::= "abc"')
+    constraint = UnoToolConstraint(compiled, len(VOCAB))
+    decoder = UnoDecoder(
+        model,
+        eos_token_ids=[STOP],
+        block_size=block_size,
+        temperature=temperature,
+        constraint=constraint,
+    )
+    cycles = list(run_uno_cycles(decoder, [10, 11], 10))
+    assert [token for cycle in cycles for token in cycle.tokens] == [97, 98, 99, STOP]
+    assert model.cache[0].state[0][0, 0, :, 0].tolist() == [10, 11, 97, 98, 99]
 
 
 def test_partial_tool_prefix_is_explicitly_rejected():

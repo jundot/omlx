@@ -95,6 +95,76 @@ def client(tmp_path, monkeypatch):
 
 
 class TestProfileRoutes:
+
+    def test_uno_profile_writes_validate_inherited_settings(self, client, monkeypatch):
+        c, manager = client
+        pool = admin_routes._get_engine_pool()
+        monkeypatch.setattr(pool, "get_uno_adapter", lambda *_: None, raising=False)
+        manager.set_settings(
+            "model-a", ModelSettings(uno_enabled=True, uno_adapter_model="adapter")
+        )
+        payload = {
+            "name": "sample",
+            "display_name": "Sample",
+            "settings": {"min_p": 0.05},
+        }
+        response = c.post("/admin/api/models/model-a/profiles", json=payload)
+        assert response.status_code == 400
+        assert "model-a:sample" in response.text and "min_p" in response.text
+        assert manager.list_profiles("model-a") == []
+        payload["settings"] = {"temperature": 0.2}
+        assert (
+            c.post("/admin/api/models/model-a/profiles", json=payload).status_code
+            == 200
+        )
+        before = manager.profiles_file.read_bytes()
+        response = c.put(
+            "/admin/api/models/model-a/profiles/sample",
+            json={"settings": {"min_p": 0.05}},
+        )
+        assert response.status_code == 400
+        assert manager.profiles_file.read_bytes() == before
+        response = c.put(
+            "/admin/api/models/model-a/profiles/sample",
+            json={"settings": {"uno_enabled": False, "min_p": 0.05}},
+        )
+        assert response.status_code == 200, response.text
+
+    def test_enabling_uno_rejects_conflicting_profiles_before_side_effects(
+        self, client, monkeypatch
+    ):
+        c, manager = client
+        pool = admin_routes._get_engine_pool()
+        monkeypatch.setattr(pool, "get_uno_adapter", lambda *_: None, raising=False)
+        manager.set_settings("model-a", ModelSettings())
+        for name, settings in (
+            ("alpha", {"min_p": 0.05}),
+            ("beta", {"repetition_penalty": 1.2}),
+        ):
+            manager.save_profile("model-a", name, name, None, settings)
+        before = manager.settings_file.read_bytes(), manager.profiles_file.read_bytes()
+        response = c.put(
+            "/admin/api/models/model-a/settings",
+            json={
+                "uno_enabled": True,
+                "uno_adapter_model": "adapter",
+                "is_pinned": True,
+                "is_default": True,
+                "model_type_override": "embedding",
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert "alpha" in response.text and "beta" in response.text
+        assert "min_p" in response.text and "repetition_penalty" in response.text
+        assert (
+            manager.settings_file.read_bytes(),
+            manager.profiles_file.read_bytes(),
+        ) == before
+        assert not pool.get_entry("model-a").is_pinned
+        assert pool.get_entry("model-a").model_type == "llm"
+        assert pool.get_entry("model-a").engine_type == "batched"
+        assert admin_routes._get_server_state().default_model is None
+
     def test_list_profiles_empty(self, client):
         c, _ = client
         r = c.get("/admin/api/models/model-a/profiles")

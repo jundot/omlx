@@ -81,7 +81,7 @@ final class ContextBenchScreenVM {
             // Loaded-first, then case-insensitive by id (accuracy pattern),
             // excluding virtual entries that cannot be benchmarked.
             self.models = resp.models
-                .filter { !($0.virtual ?? false) }
+                .filter { $0.virtual != true && $0.isHelper != true }
                 .sorted { a, b in
                     if a.loaded != b.loaded { return a.loaded && !b.loaded }
                     return a.id.localizedCaseInsensitiveCompare(b.id) == .orderedAscending

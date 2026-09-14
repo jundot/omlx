@@ -733,15 +733,20 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
-                    sublabel: String(localized: "settings.advanced.thinking_budget.sub",
+                    sublabel: !vm.thinkingBudgetAvailable ? String(
+                        localized: "settings.uno.budget_hint",
+                        defaultValue: "Uno does not support thinking budgets.")
+                        : String(localized: "settings.advanced.thinking_budget.sub",
                                      defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
                                      comment: "Sublabel for the thinking budget field")) {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
                                       mono: true, suffix: "tk", width: .controlCompact)
+                                .disabled(!vm.thinkingBudgetAvailable)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
+                            .disabled(!vm.thinkingBudgetAvailable && !vm.thinkingBudgetEnabled)
                     }
                 }
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
@@ -1098,6 +1103,25 @@ private struct AccelerationSection: View {
         // Profile-eligible like the experimental fields below — edits
         // write to the working profile via bindProfile.
         ListGroup {
+            if vm.model?.unoCompatible == true {
+                Row(label: "Uno", sublabel: vm.unoEnabled ? vm.unoConflictReason ?? String(
+                    localized: "settings.uno.hint", defaultValue: "Use Uno for one request. Overlapping requests use ordinary continuous batching.") : nil,
+                    isLast: true) {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Popup(selection: vm.bindProfile($vm.unoAdapterModel), width: .controlWide,
+                              options: vm.unoAdapterModelOptions())
+                            .accessibilityIdentifier("uno.adapter")
+                        if vm.unoEnabled && vm.unoConflictReason != nil {
+                            Button(String(localized: "settings.uno.apply", defaultValue: "Apply required settings")) { vm.applyUnoSettings() }
+                                .buttonStyle(.plain)
+                        }
+                        if vm.unoAdapterCandidates.isEmpty, let repo = vm.model?.unoAdapterRepo,
+                           let url = URL(string: "https://huggingface.co/\(repo)") {
+                            Link(String(localized: "settings.uno.get_adapter", defaultValue: "Get adapter"), destination: url)
+                        }
+                    }
+                }
+            } else {
             // Lightning MTP
             Row(label: String(localized: "settings.acceleration.mtp.label",
                               defaultValue: "Lightning MTP",
@@ -1107,6 +1131,7 @@ private struct AccelerationSection: View {
                 RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
                     .disabled(mtpToggleDisabled)
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
+            }
             }
         }
     }
@@ -1440,7 +1465,7 @@ private struct ExperimentalSection: View {
                         )
                     }
                     RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
-                        .disabled(vm.vlmMtpEnabled)
+                        .disabled(vm.vlmMtpEnabled || (vm.unoEnabled && !vm.turboquantKvEnabled))
                         .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
             }
@@ -1470,7 +1495,7 @@ private struct ExperimentalSection: View {
                               comment: "Row label for the SpecPrefill toggle"),
                 sublabel: specprefillSublabel) {
                 RowSwitch(isOn: vm.bindProfile($vm.specprefillEnabled))
-                    .disabled(vm.vlmMtpEnabled)
+                    .disabled(vm.vlmMtpEnabled || (vm.unoEnabled && !vm.specprefillEnabled))
                     .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
             }
             if vm.specprefillEnabled {
@@ -1506,6 +1531,7 @@ private struct ExperimentalSection: View {
                 }
             }
 
+            if vm.model?.unoCompatible != true || vm.dflashEnabled {
             // DFlash
             Row(label: String(localized: "settings.experimental.dflash.label",
                               defaultValue: "DFlash",
@@ -1658,6 +1684,9 @@ private struct ExperimentalSection: View {
                 }
             }
 
+            }
+
+            if vm.model?.unoCompatible != true || vm.vlmMtpEnabled {
             // VLM MTP — last row of the experimental group. Reveals the
             // draft-model picker and block-size field when enabled.
             Row(label: String(localized: "settings.experimental.vlm_mtp.label",
@@ -1693,6 +1722,7 @@ private struct ExperimentalSection: View {
                               placeholder: "4", mono: true, width: .controlNarrow)
                 }
             }
+            }
         }
     }
 
@@ -1717,7 +1747,7 @@ private struct ExperimentalSection: View {
     }
 
     private var dflashToggleDisabled: Bool {
-        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled || (vm.unoEnabled && !vm.dflashEnabled)
     }
 
     private var dflashHelp: String {
@@ -1770,7 +1800,7 @@ private struct ExperimentalSection: View {
     }
 
     private var vlmMtpToggleDisabled: Bool {
-        vm.vlmMtpConflictReason != nil
+        (vm.unoEnabled && !vm.vlmMtpEnabled) || vm.vlmMtpConflictReason != nil
     }
 
     private var vlmMtpSublabel: String {

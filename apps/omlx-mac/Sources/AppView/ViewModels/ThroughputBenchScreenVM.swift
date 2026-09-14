@@ -200,7 +200,7 @@ final class ThroughputBenchScreenVM {
         guard let client else { return }
         do {
             let resp = try await client.listModels()
-            self.models = resp.models
+            self.models = resp.models.filter { $0.isHelper != true }
         } catch {
             // Surface so the user can recover; polling does not depend on this.
             self.lastError = error.omlxDescription

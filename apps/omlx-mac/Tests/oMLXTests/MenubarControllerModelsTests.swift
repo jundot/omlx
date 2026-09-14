@@ -114,8 +114,11 @@ final class MenubarControllerModelsTests: XCTestCase {
 
     // MARK: - visibleMenuModels
 
-    func testVisibleMenuModelsDropsVirtualEntries() {
+    func testVisibleMenuModelsDropsVirtualEntriesAndHelpers() {
+        var helper = makeModel("K2-Uno")
+        helper.isHelper = true
         let models = [
+            helper,
             makeModel("a"),
             makeModel("markitdown", loaded: true, virtual: true),
         ]

@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Native MLX linear two-pass Uno decoding with request-owned KV and RNG."""
+
+# Psi-Spec reference: https://github.com/ifm-ai/uno/blob/main/nano_vllm_uno/engine/two_pass_decoding.py
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import mlx.core as mx
+
+
+def probabilities(logits, temperature, top_p=1.0, top_k=None):
+    """Compute the exact filtered distribution used to sample and verify."""
+    from ...utils.sampling import apply_top_k, apply_top_p
+
+    values = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    if top_p < 1:
+        values = apply_top_p(values, top_p)
+    if top_k is not None and top_k < values.shape[-1]:
+        values = apply_top_k(values, top_k)
+    return mx.softmax((values * (1 / temperature)).astype(mx.float32), axis=-1)
+
+
+def acceptance_and_residual(p, q, proposals, uniforms):
+    pt = mx.take_along_axis(p, proposals[..., None], axis=-1).squeeze(-1)
+    qt = mx.take_along_axis(q, proposals[..., None], axis=-1).squeeze(-1)
+    ratio = mx.where(qt > 0, pt / mx.where(qt > 0, qt, 1), 0)
+    accepted = uniforms < mx.minimum(ratio, 1)
+    residual = mx.maximum(p - q, 0)
+    mass = mx.sum(residual, axis=-1, keepdims=True)
+    # Psi-Spec returns p when correction mass is zero.
+    residual = mx.where(mass > 0, residual / mx.where(mass > 0, mass, 1), p)
+    return accepted, residual
+
+
+@dataclass(frozen=True)
+class UnoCycle:
+    tokens: tuple[int, ...]
+    accepted_proposals: int
+
+
+class UnoDecoder:
+    """Generate committed blocks. Callers never observe rejected draft tokens."""
+
+    def __init__(
+        self,
+        model,
+        *,
+        eos_token_ids,
+        block_size=8,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=None,
+        seed=0,
+        constraint=None,
+    ):
+        if not getattr(model, "_uno_adapter_loaded", False):
+            raise ValueError("Uno decoding requires a validated conditional adapter")
+        # The released Uno recipes use eight-token blocks. Tails may be shorter.
+        if type(block_size) is not int or not 1 <= block_size <= 8:
+            raise ValueError("Uno block_size must be in [1, 8]")
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("Uno temperature must be finite and nonnegative")
+        if not math.isfinite(top_p) or not 0 < top_p <= 1:
+            raise ValueError("Uno top_p must be in (0, 1]")
+        if top_k is not None and (
+            type(top_k) is not int or not 0 < top_k <= model.args.vocab_size
+        ):
+            raise ValueError("Uno top_k must be positive and within vocabulary")
+        self.model = model
+        self.eos = set(eos_token_ids)
+        self.block_size = block_size
+        self.temperature, self.top_p, self.top_k = temperature, top_p, top_k
+        self.key = mx.random.key(seed)
+        self.constraint = constraint
+
+    def _key(self):
+        self.key, key = mx.random.split(self.key)
+        return key
+
+    def _sample(self, logits):
+        if self.temperature == 0:
+            return mx.argmax(logits, axis=-1), None
+        probs = probabilities(logits, self.temperature, self.top_p, self.top_k)
+        return mx.random.categorical(mx.log(probs), key=self._key()), probs
+
+    @staticmethod
+    def _trim(cache, length):
+        for layer in cache:
+            if layer.offset < length:
+                raise RuntimeError(f"Uno KV frontier {layer.offset} precedes {length}")
+            layer.trim(layer.offset - length)
+            if layer.offset != length:
+                raise RuntimeError("Uno KV rollback failed")
+
+    def cycle(self, seed_token, *, cache, frontier, max_tokens, cancelled=None):
+        """Verify one block from an existing KV frontier."""
+        if type(max_tokens) is not int or max_tokens <= 0:
+            raise ValueError("Uno cycle requires positive max_tokens")
+        if (
+            type(seed_token) is not int
+            or not 0 <= seed_token < self.model.args.vocab_size
+        ):
+            raise ValueError("Uno seed token outside vocabulary")
+        if cancelled is not None and cancelled():
+            return
+        length = min(self.block_size, max_tokens)
+        if any(layer.offset != frontier - 1 for layer in cache):
+            raise RuntimeError("Uno draft must start with one uncached seed")
+        # Upstream noise.py uses [1, mask_token_id). Released K2 masks equal vocab_size.
+        noise = mx.random.randint(
+            1, self.model.args.vocab_size, shape=(length - 1,), key=self._key()
+        )
+        draft = mx.concatenate([mx.array([seed_token]), noise])[None]
+        row_mask = mx.concatenate([mx.zeros((1,)), mx.ones((length - 1,))])[None]
+        draft_logits = self.model(draft, cache=cache, lora_mask=row_mask)[0]
+        if self.constraint is not None:
+            draft_logits = self.constraint.seed(draft_logits)
+        proposals, q = self._sample(draft_logits)
+        mx.eval(proposals, q)
+        self._trim(cache, frontier)
+        verify_logits = self.model(proposals[None], cache=cache)[0]
+        if self.constraint is not None:
+            verify_logits = self.constraint.verify(verify_logits, proposals.tolist())
+        targets, p = self._sample(verify_logits)
+        uniforms = residual = None
+        if self.temperature == 0:
+            flags = proposals[1:] == targets[:-1]
+            corrections = targets[:-1]
+        elif length > 1:
+            uniforms = mx.random.uniform(shape=(length - 1,), key=self._key())
+            flags, residual = acceptance_and_residual(
+                p[:-1], q[1:], proposals[1:], uniforms
+            )
+            corrections = mx.random.categorical(mx.log(residual), key=self._key())
+        else:
+            flags = mx.array([], dtype=mx.bool_)
+            corrections = mx.array([], dtype=mx.int32)
+        mx.eval(flags, corrections, targets)
+        accepted = 0
+        for flag in flags.tolist():
+            if not flag:
+                break
+            accepted += 1
+        proposed = proposals.tolist()
+        output = proposed[: accepted + 1]
+        if accepted < length - 1:
+            output.append(int(corrections[accepted].item()))
+        else:
+            output.append(int(targets[-1].item()))
+        output = output[:max_tokens]
+        for i, token in enumerate(output):
+            if token in self.eos:
+                output = output[: i + 1]
+                break
+        if cancelled is not None and cancelled():
+            return
+        if self.constraint is not None:
+            self.constraint.commit(output)
+        self._trim(cache, frontier + len(output) - 1)
+        return UnoCycle(tuple(output), min(accepted, len(output) - 1))

@@ -10,6 +10,8 @@ from mlx_lm.models.cache import make_prompt_cache
 
 from omlx.patches.k2_horizon import apply_k2_horizon_patch
 from omlx.patches.k2_horizon.k2_horizon_model import GroupedRMSNorm, Model, ModelArgs
+from omlx.patches.k2_horizon.uno_adapter import ConditionalLoRALinear
+from omlx.patches.k2_horizon.uno_decode import UnoDecoder, acceptance_and_residual
 
 
 def small_config(**overrides):
@@ -98,6 +100,69 @@ def test_grouped_norm(groups, length):
 
 
 @pytest.mark.parametrize("quantized", [False, True])
+def test_conditional_adapter_keeps_clean_rows(quantized):
+    base = nn.Linear(64, 64, bias=False)
+    base.set_dtype(mx.bfloat16)
+    if quantized:
+        base = base.to_quantized(group_size=32, bits=4)
+    a, b = mx.ones((2, 64), mx.bfloat16), mx.ones((64, 2), mx.bfloat16)
+    layer = ConditionalLoRALinear(base, a, b, 2)
+    x = mx.ones((1, 2, 64), mx.bfloat16)
+    actual = layer.conditional_forward(x, mx.array([[0, 1]]))
+    assert mx.array_equal(actual[:, 0], base(x)[:, 0]).item()
+    assert not mx.array_equal(actual[:, 1], base(x)[:, 1]).item()
+
+
+def test_acceptance_residual():
+    p, q = mx.array([[0.7, 0.3]]), mx.array([[0.4, 0.6]])
+    flags, residual = acceptance_and_residual(p, q, mx.array([1]), mx.array([0.8]))
+    assert not flags.item()
+    assert mx.allclose(residual, mx.array([[1.0, 0.0]])).item()
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+def test_adapter_loading_casts_to_base_activations(tmp_path, quantized, dtype):
+    import json
+
+    from omlx.patches.k2_horizon.uno_adapter import TARGETS, load_uno_adapter
+
+    model = Model(ModelArgs.from_dict(small_config()))
+    model.set_dtype(mx.bfloat16)
+    tensors = {}
+    for i, layer in enumerate(model.layers):
+        for scope, names in TARGETS.items():
+            for name in names:
+                out_dims, in_dims = getattr(getattr(layer, scope), name).weight.shape
+                prefix = f"model.layers.{i}.{scope}.{name}"
+                tensors[f"{prefix}.lora_A.weight"] = mx.ones((2, in_dims), dtype)
+                tensors[f"{prefix}.lora_B.weight"] = mx.ones((out_dims, 2), dtype)
+    if quantized:
+        from mlx_lm.utils import quantize_model
+
+        model, _ = quantize_model(model, small_config(), group_size=32, bits=4)
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "base_model_name_or_path": "IFM/K2-Horizon-0.9B",
+                "r": 2,
+                "lora_alpha": 16,
+                "bias": "none",
+                "fan_in_fan_out": False,
+                "target_modules": [
+                    name for names in TARGETS.values() for name in names
+                ],
+            }
+        )
+    )
+    mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), tensors)
+    info = load_uno_adapter(model, tmp_path, base_model_id="IFM/K2-Horizon-0.9B")
+    assert info["pairs"] == 14
+    assert model.layers[0].self_attn.q_proj.lora_a.dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("quantized", [False, True])
 def test_indexed_checkpoint_roundtrip(tmp_path, quantized):
     import json
 
@@ -122,6 +187,100 @@ def test_indexed_checkpoint_roundtrip(tmp_path, quantized):
     (tmp_path / shard).unlink()
     with pytest.raises(FileNotFoundError, match="Missing K2 checkpoint shard"):
         utils.load_model(tmp_path)
+
+
+class _ScriptedModel:
+    """A fixed categorical target with real MLX KV storage for rollback tests."""
+
+    def __init__(self, reject_at=None):
+        self.args = SimpleNamespace(vocab_size=128)
+        self._uno_adapter_loaded = True
+        self.reject_at = reject_at
+
+    def make_cache(self):
+        from mlx_lm.models.cache import KVCache
+
+        self.cache = [KVCache()]
+        return self.cache
+
+    def __call__(self, inputs, cache=None, lora_mask=None):
+        if cache is not None:
+            values = inputs[:, None, :, None].astype(mx.float32)
+            cache[0].update_and_fetch(values, values)
+        length = inputs.shape[1]
+        if lora_mask is not None:
+            tokens = list(range(10, 10 + length))
+        else:
+            tokens = list(range(11, 11 + length))
+            if self.reject_at is not None and self.reject_at < length - 1:
+                tokens[self.reject_at] = 90
+        return mx.where(
+            mx.arange(128)[None, None, :] == mx.array(tokens)[None, :, None],
+            0.0,
+            -mx.inf,
+        )
+
+
+@pytest.mark.parametrize("reject_at", list(range(7)) + [None])
+def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(reject_at):
+    model = _ScriptedModel(reject_at)
+    decoder = UnoDecoder(model, eos_token_ids=[], block_size=8, temperature=0)
+    cache = model.make_cache()
+    model(mx.array([[2, 3]]), cache=cache)
+    cycle = decoder.cycle(4, cache=cache, frontier=3, max_tokens=16)
+    expected = (
+        list(range(10, 19))
+        if reject_at is None
+        else list(range(10, 11 + reject_at)) + [90]
+    )
+    assert list(cycle.tokens) == expected
+    assert cycle.accepted_proposals == (7 if reject_at is None else reject_at)
+    assert all(c.offset == 3 + len(expected) - 1 for c in cache)
+    keys = model.cache[0].state[0]
+    assert keys[0, 0, :, 0].tolist() == [2, 3, 4] + expected[:-1]
+
+
+def run_uno_cycles(decoder, prompt, max_tokens, cache=None):
+    cache = make_prompt_cache(decoder.model) if cache is None else cache
+    if cache[0].offset < len(prompt) - 1:
+        decoder.model(mx.array([prompt[cache[0].offset : -1]]), cache=cache)
+    seed, frontier = prompt[-1], len(prompt)
+    while max_tokens:
+        cycle = decoder.cycle(
+            seed, cache=cache, frontier=frontier, max_tokens=max_tokens
+        )
+        yield cycle
+        if cycle.tokens[-1] in decoder.eos:
+            break
+        seed = cycle.tokens[-1]
+        frontier += len(cycle.tokens)
+        max_tokens -= len(cycle.tokens)
+
+
+@pytest.mark.parametrize("eos_slot", range(9))
+def test_eos_at_every_committed_slot_excludes_later_draft_tokens(eos_slot):
+    model = _ScriptedModel()
+    decoder = UnoDecoder(
+        model, eos_token_ids=[10 + eos_slot], block_size=8, temperature=0
+    )
+    cycles = list(run_uno_cycles(decoder, [2, 3, 4], 16))
+    assert len(cycles) == 1
+    assert list(cycles[0].tokens) == list(range(10, 11 + eos_slot))
+    assert cycles[0].accepted_proposals == min(7, eos_slot)
+    assert model.cache[0].state[0][0, 0, :, 0].tolist() == [2, 3, 4] + list(
+        range(10, 10 + eos_slot)
+    )
+
+
+@pytest.mark.parametrize("budget", range(1, 9))
+def test_budget_shorter_than_block_is_exact(budget):
+    decoder = UnoDecoder(
+        _ScriptedModel(), eos_token_ids=[], block_size=8, temperature=0
+    )
+    cycles = list(run_uno_cycles(decoder, [2, 3], budget))
+    assert [token for cycle in cycles for token in cycle.tokens] == list(
+        range(10, 10 + budget)
+    )
 
 
 def test_mova_router_preserves_source_partition_rounding():
@@ -177,3 +336,101 @@ def test_router_bias_only_changes_selection():
         expected = mx.broadcast_to(mx.arange(3 - top_k, 3), indices.shape)
         assert mx.array_equal(mx.sort(indices), expected).item()
         assert mx.all(weights == scale / top_k).item()
+
+
+@pytest.mark.parametrize(
+    "top_k, expected",
+    [
+        (None, [[0.625, 0.375, 0, 0], [0, 0, 3 / 7, 4 / 7]]),
+        (1, [[1, 0, 0, 0], [0, 0, 0, 1]]),
+    ],
+)
+def test_uno_probabilities_restore_vocabulary_order(top_k, expected):
+    from omlx.patches.k2_horizon.uno_decode import probabilities
+
+    logits = mx.log(mx.array([[0.5, 0.3, 0.2, 0], [0.1, 0.2, 0.3, 0.4]]))
+    actual = probabilities(logits, temperature=1, top_p=0.6, top_k=top_k)
+    assert mx.allclose(actual, mx.array(expected), atol=1e-6).item()
+
+
+def test_uno_rejects_untrained_block_size():
+    with pytest.raises(ValueError, match="1, 8"):
+        UnoDecoder(
+            SimpleNamespace(_uno_adapter_loaded=True), eos_token_ids={0}, block_size=9
+        )
+
+
+@pytest.mark.parametrize("cancel_warm", [False, True])
+def test_uno_reuses_ssd_prefix_after_reload(
+    tmp_path, mock_tokenizer, monkeypatch, cancel_warm
+):
+    from omlx.patches.k2_horizon.compiled import install_compiled_blocks
+    from omlx.patches.k2_horizon.uno_batch import install_cache_hooks
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, SchedulerConfig
+
+    mx.random.seed(81)
+    model = Model(ModelArgs.from_dict(small_config()))
+    model._uno_adapter_loaded = model._omlx_uno_enabled = True
+    model._omlx_uno_eos = []
+    install_compiled_blocks(model)
+    install_cache_hooks()
+    mock_tokenizer.eos_token_id = None
+    mock_tokenizer.convert_tokens_to_ids = lambda _: None
+    config = SchedulerConfig(
+        model_name="k2-base:k2-compiled-v1",
+        paged_ssd_cache_dir=str(tmp_path),
+        paged_ssd_cache_max_size=1024**2,
+        paged_cache_block_size=4,
+        hot_cache_max_size=0,
+    )
+    prompt = list(range(2, 19))
+    calls = []
+    original = UnoDecoder.cycle
+
+    def record(self, *args, **kwargs):
+        calls.append(True)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(UnoDecoder, "cycle", record)
+    results = []
+    for attempt in range(3 if cancel_warm else 2):
+        scheduler = Scheduler(model, mock_tokenizer, config)
+        request = Request(
+            request_id=f"request-{attempt}",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=24, temperature=0),
+        )
+        try:
+            scheduler.add_request(request)
+            for _ in range(100):
+                scheduler.step()
+                if cancel_warm and attempt == 1 and request.num_output_tokens >= 2:
+                    scheduler.abort_request(request.request_id)
+                if request.is_finished():
+                    break
+            assert request.is_finished()
+            results.append((request.cached_tokens, list(request.output_token_ids)))
+        finally:
+            scheduler.shutdown()
+    assert calls, "The scheduler must execute Uno cycles"
+    assert len(results[0][1]) == 24
+    assert results[0][0] == 0
+    assert results[-1][0] == 16
+    assert results[0][1] == results[-1][1]
+    if cancel_warm:
+        assert 0 < len(results[1][1]) < len(results[0][1])
+        assert results[1][1] == results[0][1][: len(results[1][1])]
+
+
+@pytest.mark.parametrize("reject_at", [None, 2])
+def test_uno_restored_prefix_preserves_only_verified_kv(reject_at):
+    model = _ScriptedModel(reject_at)
+    prompt = [2, 3, 4, 5, 6]
+    cache = model.make_cache()
+    model(mx.array([prompt[:3]]), cache=cache)
+    decoder = UnoDecoder(model, eos_token_ids=[], block_size=8, temperature=0)
+    cycles = list(run_uno_cycles(decoder, prompt, 9, cache))
+    emitted = [token for cycle in cycles for token in cycle.tokens]
+    assert cache[0].state[0][0, 0, :, 0].tolist() == prompt + emitted[:-1]
+    assert cache[0].offset == len(prompt) + len(emitted) - 1

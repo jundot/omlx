@@ -48,7 +48,7 @@ final class AccuracyBenchScreenVM {
         guard let client else { return }
         do {
             let resp = try await client.listModels()
-            self.models = resp.models
+            self.models = resp.models.filter { $0.isHelper != true }
         } catch {
             self.lastError = String(localized: "bench.accuracy.error.load_models",
                                     defaultValue: "Failed to load models: \(error.omlxDescription)",

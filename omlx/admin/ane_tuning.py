@@ -436,6 +436,7 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
         settings.qwen35_ane_prefill_fraction = candidate.mlp_fraction or 1 / 3
         settings.qwen35_ane_prefill_shared_fraction = candidate.shared_fraction
         for field in (
+            "uno_enabled",
             "dflash_enabled",
             "specprefill_enabled",
             "mtp_enabled",
@@ -2355,10 +2356,12 @@ def _validate_k2_tuning_model(model: Any) -> None:
     """Check loaded MLP weights, not the checkpoint's activation dtype."""
     import mlx.nn as nn
 
+    from ..patches.k2_horizon.ane_prefill import _linear
+
     for layer in model.layers[:-1]:
         mlp = getattr(layer.mlp, "shared_experts", layer.mlp)
         for name in ("gate_proj", "up_proj", "down_proj"):
-            projection = getattr(mlp, name)
+            projection = _linear(getattr(mlp, name))
             if (
                 not isinstance(projection, nn.QuantizedLinear)
                 or projection.mode != "affine"

@@ -780,6 +780,10 @@ def _patched_generation_batch_step(self):
     # is there to guarantee.
     _omlx_advance_grammar_rows(self)
 
+    if getattr(model, "_omlx_uno_enabled", False):
+        from .patches.k2_horizon.uno_batch import step
+
+        return step(self, _original_generation_batch_step)
     return _original_generation_batch_step(self)
 
 
@@ -12499,6 +12503,11 @@ class Scheduler:
         with suppress(Exception):
             get_decode_activity().publish(
                 self._decode_activity_key, len(self.running)
+            )
+
+        if getattr(self.model, "_omlx_uno_enabled", False):
+            self.model._omlx_uno_singleton = (
+                len(self.running) + len(self.waiting) + len(self.prefilling) == 1
             )
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)

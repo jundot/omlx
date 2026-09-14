@@ -10,6 +10,9 @@ import mlx.nn as nn
 import numpy as np
 from mlx_lm.models.activations import swiglu
 
+from .compiled import CompiledBody
+from .uno_adapter import ConditionalLoRALinear
+
 TILE = 2048
 FRACTION = 1 / 3
 
@@ -27,9 +30,7 @@ class _Blob:
         self.data.extend(bytes((-len(self.data)) % 64))
         offset = len(self.data)
         header = bytearray(64)
-        struct.pack_into(
-            "<IIQQ", header, 0, 0xDEADBEEF, 1, len(raw), offset + 64
-        )
+        struct.pack_into("<IIQQ", header, 0, 0xDEADBEEF, 1, len(raw), offset + 64)
         self.data.extend(header)
         self.data.extend(raw)
         self.count += 1
@@ -94,6 +95,10 @@ def _full_mlp_procedure(projections, width, blob):
     return "\n".join(lines)
 
 
+def _linear(ref):
+    return ref.linear if isinstance(ref, ConditionalLoRALinear) else ref
+
+
 def _projection_part(linear, cut, *, down=False, suffix=False):
     if isinstance(linear, nn.QuantizedLinear):
         if getattr(linear, "mode", "affine") != "affine":
@@ -144,7 +149,8 @@ class PrefillMLP:
         if fast._ext is None or not hasattr(fast._ext, "ane_compile_program"):
             raise RuntimeError("K2 ANE prefill requires the native ANE extension")
         projections = tuple(
-            getattr(reference, n) for n in ("gate_proj", "up_proj", "down_proj")
+            _linear(getattr(reference, n))
+            for n in ("gate_proj", "up_proj", "down_proj")
         )
         hidden = projections[0].weight.shape[0]
         dim = projections[2].weight.shape[0]
@@ -291,7 +297,7 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
         mlp = getattr(layer.mlp, "shared_experts", layer.mlp)
         for name in ("gate_proj", "up_proj", "down_proj"):
             ref = getattr(mlp, name)
-            linear = ref
+            linear = _linear(ref)
             if not isinstance(linear, (nn.Linear, nn.QuantizedLinear)):
                 raise ValueError("ANE prefill requires linear K2 MLP projections")
             dtype = (
@@ -303,11 +309,11 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
                 raise ValueError(
                     "ANE prefill requires FP16/BF16 activations and bias-free projections"
                 )
-        gate = mlp.gate_proj.weight
+        gate = _linear(mlp.gate_proj).weight
         alignment = max(
             64,
             *(
-                getattr(getattr(mlp, n), "group_size", 64)
+                getattr(_linear(getattr(mlp, n)), "group_size", 64)
                 for n in ("gate_proj", "up_proj", "down_proj")
             ),
         )
@@ -325,8 +331,12 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
     for (ref, _), program in zip(references, programs):
         program.active = False
         ref._omlx_ane_prefill = program
+    if isinstance(model.model, CompiledBody):
+        model.model._prefill_mlps = programs
 
     model_ref = weakref.ref(model)
+    # Only pad near-full tails: at most 1/32 of a tile (64 rows at 2048).
+    min_ane_rows = width - width // 32
 
     def prefill(inputs, *, cache):
         target = model_ref()
@@ -337,9 +347,13 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
         try:
             for start in range(0, inputs.shape[1], width):
                 chunk = inputs[:, start : start + width]
+                use_ane = chunk.shape[1] >= min_ane_rows
                 for program in programs:
-                    program.active = chunk.shape[1] == width
-                target(chunk, cache=cache)
+                    program.active = use_ane
+                if isinstance(target.model, CompiledBody):
+                    target.model(chunk, cache=cache, prefill=use_ane)
+                else:
+                    target(chunk, cache=cache)
                 mx.eval([c.state for c in cache])
         finally:
             for program in programs:
@@ -347,7 +361,8 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
 
     model._omlx_prefill = prefill
     model._omlx_k2_ane_signature = (
-        f"k2-ane-v2-{fraction:.17g}-{shared_fraction:.17g}-{width}"
+        f"k2-ane-v3-tail31of32-{fraction:.17g}-{shared_fraction:.17g}-{width}"
+        + ("-compiled" if isinstance(model.model, CompiledBody) else "")
     )
     model._omlx_k2_ane_prefill_count = len(programs)
     return prefill

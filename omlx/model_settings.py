@@ -26,7 +26,47 @@ from .model_profiles import (
 
 logger = logging.getLogger(__name__)
 
+
+class InvalidProfileSettingsError(ValueError):
+    """A profile's effective settings conflict with its selected engine."""
+
+
 # Current settings file format version
+# Neutral values required by Uno. The admin API also exposes these to settings clients.
+UNO_REQUIRED_SETTINGS = {
+    "mtp_enabled": False,
+    "vlm_mtp_enabled": False,
+    "dflash_enabled": False,
+    "specprefill_enabled": False,
+    "turboquant_kv_enabled": False,
+    "guided_grammar_enabled": False,
+    "thinking_budget_enabled": False,
+    "min_p": 0,
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "xtc_probability": 0,
+}
+
+
+def uno_conflicts(settings: dict, defaults: dict | None = None) -> dict:
+    """Required overrides, after resolving unset values through global defaults."""
+    effective = {
+        **(defaults or {}),
+        **{k: v for k, v in settings.items() if v is not None},
+    }
+    return {k: v for k, v in UNO_REQUIRED_SETTINGS.items() if effective.get(k, v) != v}
+
+
+def validate_uno_settings(settings: dict, defaults: dict | None = None) -> None:
+    if not settings.get("uno_enabled"):
+        return
+    if not settings.get("uno_adapter_model"):
+        raise ValueError("Select a Uno adapter before enabling Uno.")
+    for name, neutral in uno_conflicts(settings, defaults).items():
+        raise ValueError(f"Uno requires {name}={neutral}.")
+
+
 SETTINGS_VERSION = 1
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
@@ -435,6 +475,9 @@ class ModelSettings:
     # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
     mtp_num_draft_tokens: Optional[int] = None
 
+    uno_enabled: bool = False
+    uno_adapter_model: str | None = None
+
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
@@ -479,6 +522,7 @@ class ModelSettings:
                 "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
                 "both be True; choose one Qwen3.5 prefill accelerator per model"
             )
+        validate_uno_settings(vars(self))
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is
@@ -743,6 +787,7 @@ class ModelSettingsManager:
             settings: The settings to apply.
         """
         with self._lock:
+            self._validate_profiles_for_settings_locked(model_id, settings)
             # Handle exclusive default constraint
             if settings.is_default:
                 for mid, s in self._settings.items():
@@ -973,32 +1018,120 @@ class ModelSettingsManager:
                     return base_model_id, profile
         return None
 
-    def _settings_with_profile_locked(
-        self, model_id: str, profile: Dict[str, Any]
-    ) -> ModelSettings:
-        base = self._settings.get(model_id)
+    def _merged_profile_settings_locked(
+        self,
+        model_id: str,
+        profile: dict[str, Any],
+        *,
+        runtime: bool = False,
+        base: ModelSettings | None = None,
+    ) -> dict:
+        base = base if base is not None else self._settings.get(model_id)
         merged = base.to_dict() if base is not None else {}
         # Request-time settings still use only universal fields. Engine-
         # construction fields are handled separately by
         # get_exposed_profile_runtime_settings_for_request(), which can
         # trigger an engine variant reload without persisting base settings.
-        merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
+        profile_settings = profile.get("settings") or {}
+        filter_fields = filter_profile_fields if runtime else filter_universal_fields
+        merged.update(filter_fields(profile_settings))
+        # Uno validation must see the engine selected by this profile, including
+        # an ordinary-decoding profile on a Uno-enabled base.
+        for key in ("uno_enabled", "uno_adapter_model"):
+            if key in profile_settings:
+                merged[key] = profile_settings[key]
+        if merged.get("uno_enabled"):
+            # Validate Uno against the selected engine's conflict flags, while
+            # retaining the universal-only overlay for other engine types.
+            for key in UNO_REQUIRED_SETTINGS:
+                if key in profile_settings:
+                    merged[key] = profile_settings[key]
         # A profile overriding penalties / grammar / thinking budget on a
         # vlm_mtp base model would make __post_init__ raise on this
         # request-time merge; drop vlm_mtp for the merged view instead.
         merged, _ = resolve_vlm_mtp_conflicts(merged)
+        return merged
+
+    def _settings_with_profile_locked(
+        self,
+        model_id: str,
+        profile: dict[str, Any],
+        *,
+        runtime: bool = False,
+    ) -> ModelSettings:
+        merged = self._merged_profile_settings_locked(
+            model_id, profile, runtime=runtime
+        )
+        # Preserve legacy-profile recovery on reads. Save validation must see
+        # both requested accelerators so it can reject the incompatible pair.
         merged, _ = resolve_qwen35_prefill_conflicts(merged)
-        return ModelSettings.from_dict(merged)
+        try:
+            return ModelSettings.from_dict(merged)
+        except ValueError as error:
+            alias = self._display_profile_model_id_locked(model_id, profile)
+            raise InvalidProfileSettingsError(f"Profile '{alias}': {error}") from error
 
     def _runtime_settings_with_profile_locked(
         self, model_id: str, profile: Dict[str, Any]
     ) -> ModelSettings:
-        base = self._settings.get(model_id)
-        merged = base.to_dict() if base is not None else {}
-        merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
-        merged, _ = resolve_vlm_mtp_conflicts(merged)
-        merged, _ = resolve_qwen35_prefill_conflicts(merged)
-        return ModelSettings.from_dict(merged)
+        return self._settings_with_profile_locked(model_id, profile, runtime=True)
+
+    def _validate_profile_settings_locked(
+        self,
+        model_id: str,
+        profile: dict,
+        *,
+        base: ModelSettings | None = None,
+        settings_validator: Callable[[dict], None] | None = None,
+    ) -> None:
+        merged = self._merged_profile_settings_locked(
+            model_id,
+            profile,
+            runtime=True,
+            base=base,
+        )
+        try:
+            validate_uno_settings(merged)
+            if settings_validator is not None:
+                settings_validator(merged)
+        except ValueError as error:
+            alias = self._display_profile_model_id_locked(model_id, profile)
+            raise InvalidProfileSettingsError(f"Profile '{alias}': {error}") from error
+
+    def _validate_profiles_for_settings_locked(
+        self,
+        model_id: str,
+        settings: ModelSettings,
+        settings_validator: Callable[[dict], None] | None = None,
+    ) -> None:
+        conflicts = []
+        for profile in self._profiles.get(model_id, {}).values():
+            try:
+                self._validate_profile_settings_locked(
+                    model_id,
+                    profile,
+                    base=settings,
+                    settings_validator=settings_validator,
+                )
+            except InvalidProfileSettingsError as error:
+                conflicts.append(str(error))
+        if conflicts:
+            raise InvalidProfileSettingsError(
+                "Cannot save settings: saved profiles conflict with the resulting "
+                "configuration: " + "; ".join(conflicts)
+            )
+
+    def validate_profiles_for_settings(
+        self,
+        model_id: str,
+        settings: ModelSettings,
+        settings_validator: Callable[[dict], None] | None = None,
+    ) -> None:
+        """Reject a base change before callers change runtime state or persist it."""
+        with self._lock:
+            self._validate_profiles_for_settings_locked(
+                model_id, settings, settings_validator
+            )
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
         """Return the base model for an exposed profile model ID, if any."""
@@ -1131,9 +1264,22 @@ class ModelSettingsManager:
                         base_model_id, profile
                     )
                     item["source_model_id"] = base_model_id
-                    item["settings"] = self._settings_with_profile_locked(
-                        base_model_id, item
-                    ).to_dict()
+                    item["invalid"] = False
+                    item["invalid_reason"] = None
+                    try:
+                        self._runtime_settings_with_profile_locked(base_model_id, item)
+                        item["settings"] = self._settings_with_profile_locked(
+                            base_model_id, item
+                        ).to_dict()
+                    except InvalidProfileSettingsError as error:
+                        item["invalid"] = True
+                        item["invalid_reason"] = str(error)
+                        item["settings"] = self._merged_profile_settings_locked(
+                            base_model_id, item
+                        )
+                        logger.warning(
+                            "Invalid exposed profile remains listed: %s", error
+                        )
                     exposed.append(item)
             return exposed
 
@@ -1179,12 +1325,13 @@ class ModelSettingsManager:
         expose_as_model: bool = False,
         api_name: Optional[str] = None,
         reserved_model_ids: Optional[set[str]] = None,
+        settings_validator: Callable[[dict], None] | None = None,
     ) -> dict:
         """Create a new profile. Raises if name is invalid or already exists."""
         validate_profile_name(name)
         filtered = filter_profile_fields(settings or {})
         with self._lock:
-            per_model = self._profiles.setdefault(model_id, {})
+            per_model = self._profiles.get(model_id, {})
             if name in per_model:
                 raise ValueError(
                     f"Profile '{name}' already exists for model '{model_id}'"
@@ -1207,12 +1354,18 @@ class ModelSettingsManager:
                 "source_template": source_template,
                 "expose_as_model": bool(expose_as_model),
             }
+            self._validate_profile_settings_locked(
+                model_id,
+                profile_record,
+                settings_validator=settings_validator,
+            )
             self._validate_exposed_profile_ids_available_locked(
                 model_id,
                 profile_record,
                 reserved_model_ids=reserved_model_ids,
             )
             per_model[name] = profile_record
+            self._profiles[model_id] = per_model
             self._save_profiles()
             return dict(per_model[name])
 
@@ -1229,6 +1382,7 @@ class ModelSettingsManager:
         expose_as_model: Optional[bool] = None,
         api_name: Optional[str] = None,
         reserved_model_ids: Optional[set[str]] = None,
+        settings_validator: Callable[[dict], None] | None = None,
     ) -> Optional[dict]:
         """Update a profile's metadata/settings. Returns updated dict or None if not found."""
         with self._lock:
@@ -1266,6 +1420,11 @@ class ModelSettingsManager:
             if expose_as_model is not None:
                 profile["expose_as_model"] = bool(expose_as_model)
             profile["updated_at"] = utcnow().isoformat()
+            self._validate_profile_settings_locked(
+                model_id,
+                profile,
+                settings_validator=settings_validator,
+            )
             self._validate_exposed_profile_ids_available_locked(
                 model_id,
                 profile,
@@ -1331,6 +1490,7 @@ class ModelSettingsManager:
         model_id: str,
         name: str,
         settings_sanitizer: Optional[Callable[[dict[str, Any]], None]] = None,
+        profile_settings_validator: Callable[[dict], None] | None = None,
     ) -> Optional[ModelSettings]:
         """Merge profile settings into the model's live settings and persist."""
         with self._lock:
@@ -1363,6 +1523,11 @@ class ModelSettingsManager:
             merged, _ = resolve_vlm_mtp_conflicts(merged)
             merged, _ = resolve_qwen35_prefill_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
+            self._validate_profiles_for_settings_locked(
+                model_id,
+                new_settings,
+                profile_settings_validator,
+            )
             self._settings[model_id] = new_settings
             try:
                 self._save()
