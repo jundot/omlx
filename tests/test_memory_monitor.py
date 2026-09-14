@@ -11,6 +11,7 @@ from omlx.memory_monitor import (
     _SDPA_FULL_SUPPORTED_HEAD_DIMS,
     _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
     _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
+    _TURBOQUANT_SCORE_DTYPE_SIZE,
     MemoryInfo,
     MemoryMonitor,
 )
@@ -365,6 +366,128 @@ class TestEstimatePrefillPeakBytes:
         expected_kv = m.estimate_prompt_kv_bytes(32768)
         assert peak == expected_sdpa + expected_kv
         assert expected_sdpa > 8 * 2048 * 256 * 2
+
+    def test_tiled_prefill_tile_override_bounds_transient(self):
+        """B3/3.2: once TurboQuant's bounded-tile route is registered on
+        this instance, the guard must charge the tile transient (query_block
+        x kv_tile), not the full O(L^2) unfused score matrix."""
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        query_tokens, kv_len = 2048, 32768
+        actual = m._estimate_sdpa_activation_bytes(query_tokens, kv_len)
+        out = self._expected_output_sdpa(8, query_tokens, 256)
+        expected_tile_scores = 8 * 256 * 16384 * _TURBOQUANT_SCORE_DTYPE_SIZE
+        assert actual == out + expected_tile_scores
+        # Sanity: must be far cheaper than the untiled fallback would charge.
+        assert actual < self._expected_fallback_sdpa(8, query_tokens, kv_len, 256)
+
+    def test_tiled_prefill_tile_override_prices_fp32_not_compute_dtype(self):
+        """#3108: the pinned mlx-vlm TurboQuant kernel builds its score
+        tile, output, normalizer and max_score as mx.float32
+        unconditionally -- pricing the tile at the model's (bf16) compute
+        dtype undercounted a 32-head, 2048-query, 32768-kv tile by 2x (320
+        MiB priced vs. 576 MiB+ real, per the live review numbers)."""
+        m = self._make_monitor(head_dim=256, n_attn=32, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        actual = m._estimate_sdpa_activation_bytes(2048, 32768)
+        out = self._expected_output_sdpa(32, 2048, 256)
+        fp32_tile_scores = 32 * 256 * 16384 * 4
+        assert actual == out + fp32_tile_scores
+        # The bf16-priced (buggy) estimate must not appear anywhere close --
+        # this is the exact 2x undercount the review flagged, not rounding.
+        bf16_tile_scores = 32 * 256 * 16384 * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        assert actual > out + bf16_tile_scores * 1.5
+
+    def test_tiled_prefill_tile_override_caps_query_at_query_block(self):
+        """The kernel itself tiles the query axis (TurboQuant blocks queries
+        at 256 regardless of the chunk's true query_tokens) -- charging the
+        raw query_tokens here would silently re-introduce an O(query_tokens)
+        over-charge on large chunks and defeat the point of registering the
+        tile at all."""
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        small = m._estimate_sdpa_activation_bytes(256, 65536)
+        large = m._estimate_sdpa_activation_bytes(8192, 65536)
+        out_small = self._expected_output_sdpa(8, 256, 256)
+        out_large = self._expected_output_sdpa(8, 8192, 256)
+        tile_scores = 8 * 256 * 16384 * _TURBOQUANT_SCORE_DTYPE_SIZE
+        assert small == out_small + tile_scores
+        assert large == out_large + tile_scores
+
+    def test_tiled_prefill_tile_override_skip_last_prices_worse_of_both_routes(self):
+        """#3108: turboquant_skip_last (default True) leaves one KV-cache
+        layer on its ordinary kernel, not the tiled route -- if that layer's
+        head_dim isn't in sdpa256's tiled set either, it falls all the way
+        to the O(L^2) unfused fallback there. The guard must price the
+        WORSE of the two routes actually exercised in one forward pass, not
+        just the (cheap) tiled route, or a config aimed at exactly that gap
+        (sdpa256 disabled / head_dim outside the fused+tiled sets) silently
+        undercounts a real, large transient."""
+        # head_dim=384 is outside every fused/tiled head_dim set, so the
+        # dense (skip_last) layer's estimate is the full unfused matrix.
+        m = self._make_monitor(head_dim=384, n_attn=8, n_kv=4, n_layers=48)
+        query_tokens, kv_len = 2048, 32768
+
+        m.register_tiled_prefill_tile(
+            query_block=256, kv_tile=16384, min_kv_len=8192, skip_last=True
+        )
+        with_skip_last = m._estimate_sdpa_activation_bytes(query_tokens, kv_len)
+        dense_estimate = self._expected_fallback_sdpa(
+            8, query_tokens, kv_len, 384
+        )
+        assert with_skip_last == dense_estimate
+        assert with_skip_last > dense_estimate * 0.9  # sanity: not the cheap tile
+
+        # Without skip_last (every layer genuinely tiled), the cheap tile
+        # estimate is the correct (and only) answer.
+        m.register_tiled_prefill_tile(
+            query_block=256, kv_tile=16384, min_kv_len=8192, skip_last=False
+        )
+        without_skip_last = m._estimate_sdpa_activation_bytes(query_tokens, kv_len)
+        out = self._expected_output_sdpa(8, query_tokens, 384)
+        tile_scores = 8 * 256 * 16384 * _TURBOQUANT_SCORE_DTYPE_SIZE
+        assert without_skip_last == out + tile_scores
+        assert without_skip_last < with_skip_last
+
+    def test_clear_tiled_prefill_tile_also_clears_skip_last(self):
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(
+            query_block=256, kv_tile=16384, min_kv_len=8192, skip_last=True
+        )
+        m.clear_tiled_prefill_tile()
+        assert m._tiled_prefill_skip_last is False
+
+    def test_tiled_prefill_tile_override_respects_min_kv_len_gate(self):
+        """Below the kernel's own route-gate threshold, the real call takes
+        the unfused fallback -- charging the cheap tile estimate there would
+        under-count admission for a call that never actually tiles."""
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        actual = m._estimate_sdpa_activation_bytes(2048, 4096)
+        assert actual == self._expected_fallback_sdpa(8, 2048, 4096, 256)
+
+    def test_clear_tiled_prefill_tile_restores_fallback(self):
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        m.register_tiled_prefill_tile(query_block=256, kv_tile=16384, min_kv_len=8192)
+        m.clear_tiled_prefill_tile()
+        actual = m._estimate_sdpa_activation_bytes(2048, 32768)
+        assert actual == self._expected_fallback_sdpa(8, 2048, 32768, 256)
+
+    def test_tiled_prefill_tile_override_is_per_instance_not_global(self):
+        """Core safety property (§B3/3.2 design consult): registering the
+        tile on one model's monitor must NOT leak into a second, concurrently
+        -resident model's monitor sharing the same head_dim -- engine_pool.py
+        keeps two models resident during a swap, and a global registration
+        would silently under-charge the OTHER model's genuinely-unfused
+        prefill, an admission under-count (OOM risk), not just a missed
+        optimization."""
+        turboquant_model = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        turboquant_model.register_tiled_prefill_tile(
+            query_block=256, kv_tile=16384, min_kv_len=8192
+        )
+        other_model = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        actual = other_model._estimate_sdpa_activation_bytes(2048, 32768)
+        assert actual == self._expected_fallback_sdpa(8, 2048, 32768, 256)
 
     def test_sdpa_fallback_scores_track_compute_dtype(self):
         # The unfused score matrix is materialized at the model's compute
