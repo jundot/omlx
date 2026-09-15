@@ -2056,6 +2056,10 @@ def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
         return []
 
 
+# The residency options the dashboard offers; sized per model in list_models.
+_MOE_OFFLOAD_PRESET_FRACTIONS = (0.125, 0.25, 0.5, 0.75)
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -2130,6 +2134,44 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         moe_offload_supported, _ = moe_offload_compatibility(
             model_info.get("model_path") or ""
         )
+        moe_offload_presets: list[dict] = []
+        moe_offload_fit_fraction = None
+        moe_offload_fit_bytes = 0
+        if moe_offload_supported:
+            entry = engine_pool.get_entry(model_id)
+            if entry is not None:
+                try:
+                    ceiling = residency_ceiling if residency_ceiling > 0 else None
+                    for fraction in _MOE_OFFLOAD_PRESET_FRACTIONS:
+                        size = int(
+                            engine_pool.moe_offload_admission_bytes(
+                                entry, settings, fraction, ceiling=ceiling
+                            )
+                        )
+                        moe_offload_presets.append(
+                            {
+                                "fraction": fraction,
+                                "bytes": size,
+                                "fits": ceiling is None or size <= ceiling,
+                            }
+                        )
+                    if ceiling is not None:
+                        fit = engine_pool.fit_moe_offload_fraction(
+                            entry, settings, ceiling
+                        )
+                        if fit is not None:
+                            moe_offload_fit_fraction = float(fit)
+                            moe_offload_fit_bytes = int(
+                                engine_pool.moe_offload_admission_bytes(
+                                    entry, settings, fit, ceiling=ceiling
+                                )
+                            )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "Could not size MoE expert offload for %s",
+                        model_id,
+                        exc_info=True,
+                    )
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2254,6 +2296,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "moe_expert_offload_supported": moe_offload_supported,
+            # Admission sizes per residency option and the largest whole-expert
+            # residency that fits the memory ceiling (None when unknown or when
+            # even the routing floor exceeds it).
+            "moe_expert_offload_presets": moe_offload_presets,
+            "moe_expert_offload_fit_fraction": moe_offload_fit_fraction,
+            "moe_expert_offload_fit_bytes": moe_offload_fit_bytes,
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,

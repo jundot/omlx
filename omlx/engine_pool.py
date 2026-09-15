@@ -53,6 +53,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .model_settings import (
+    ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -355,14 +356,20 @@ class EnginePool:
         *,
         base_size: int | None = None,
         include_ane_reservation: bool = True,
+        ceiling: int | None = None,
     ) -> int:
-        """Include Engram runtime storage and optional K2 ANE reservations."""
+        """Include Engram runtime storage and optional K2 ANE reservations.
+
+        ``ceiling`` is the memory ceiling the SSD-offload fallbacks (Qwen4
+        PLE, DeepSeek V4.1 Engram) decide against; ``None`` uses the pool's
+        stable ceiling, as admission does.
+        """
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
-            entry, runtime_settings
+            entry, runtime_settings, ceiling=ceiling
         )
         if qwen4_estimate is not None:
             base = min(
@@ -372,7 +379,7 @@ class EnginePool:
                 else qwen4_estimate.resident_bytes,
             )
         v41_offload, _, v41_estimate = self._deepseek_v41_engram_offload_status(
-            entry, runtime_settings
+            entry, runtime_settings, ceiling=ceiling
         )
         if v41_estimate is not None:
             base = (
@@ -435,6 +442,69 @@ class EnginePool:
                     entry.model_path, base, fraction
                 )
         return base + extra
+
+    def moe_offload_admission_bytes(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        fraction: float,
+        *,
+        ceiling: int | None = None,
+    ) -> int:
+        """Admission-time resident size with expert offload at ``fraction``.
+
+        The same arithmetic admission runs (``_entry_runtime_resident_size``
+        with offload enabled on a copy of ``settings``), so a size shown for
+        an option is the size admission will hold that option to.
+        """
+        probe = copy.copy(settings) if settings is not None else ModelSettings()
+        probe.moe_expert_offload_enabled = True
+        probe.moe_expert_offload_resident_fraction = float(fraction)
+        return self._entry_runtime_resident_size(entry, probe, ceiling=ceiling)
+
+    def _moe_offload_candidate_fractions(self, entry: EngineEntry) -> tuple[float, ...]:
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type == "deepseek_v41":
+            from .patches.deepseek_v41.moe_offload import capacity_fractions
+
+            return capacity_fractions(entry.model_path)
+        from .patches.moe_expert_offload import offload_capacity_fractions
+
+        return offload_capacity_fractions(entry.model_path)
+
+    def fit_moe_offload_fraction(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        budget_bytes: int,
+    ) -> float | None:
+        """Largest resident fraction admission would accept under ``budget_bytes``.
+
+        ``1.0`` when the fully resident model fits, ``None`` when even the
+        routing floor does not. Candidates are the whole-expert capacities the
+        checkpoint allows, so the result round-trips through the setting. The
+        budget doubles as the ceiling the SSD fallbacks decide against, which
+        keeps the fitting fractions a prefix of the candidates: a resident
+        Qwen4 PLE table or V4.1 Engram store that stops fitting is forced to
+        SSD, and its mmap size is what the larger fractions are then held to.
+        """
+        candidates = self._moe_offload_candidate_fractions(entry)
+        if not candidates:
+            size = self.moe_offload_admission_bytes(
+                entry, settings, 1.0, ceiling=budget_bytes
+            )
+            return 1.0 if size <= budget_bytes else None
+        lo, hi = 0, len(candidates)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            size = self.moe_offload_admission_bytes(
+                entry, settings, candidates[mid], ceiling=budget_bytes
+            )
+            if size <= budget_bytes:
+                lo = mid + 1
+            else:
+                hi = mid
+        return candidates[lo - 1] if lo else None
 
     def _qwen4_ple_offload_status(
         self,
