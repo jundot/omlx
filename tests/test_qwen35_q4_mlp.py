@@ -64,6 +64,56 @@ def test_qwen35_q_affine_qmm_matches_mlx_quantized_matmul(bits):
     assert rel <= 0.05
 
 
+@pytest.mark.parametrize("bits", [2, 4, 5, 6])
+def test_qwen35_qmm_default_variant_is_dtype_aware(bits):
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    assert q4patch._qmm_variant_for(bits, mx.bfloat16, None) == 9
+    assert q4patch._qmm_variant_for(bits, mx.float16, None) == 8
+
+
+def test_qwen35_qmm_q8_keeps_existing_variant():
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    assert q4patch._qmm_variant_for(8, mx.bfloat16, None) == 8
+    assert q4patch._qmm_variant_for(8, mx.float16, None) == 8
+
+
+def test_qwen35_qmm_variant_override_wins(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    monkeypatch.delenv("OMLX_QWEN35_Q4_MLP_VARIANT", raising=False)
+    assert q4patch._variant_override("OMLX_QWEN35_Q4_MLP_VARIANT") is None
+
+    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP_VARIANT", "3")
+    override = q4patch._variant_override("OMLX_QWEN35_Q4_MLP_VARIANT")
+    assert override == 3
+    assert q4patch._qmm_variant_for(4, mx.bfloat16, override) == 3
+    assert q4patch._qmm_variant_for(4, mx.float16, override) == 3
+
+
+def test_qwen35_qmm_default_minimum_preserves_q8_threshold():
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    assert q4patch._QMM_MIN_TOKENS == 128
+    assert (
+        q4patch._route_min_tokens_for_bits(
+            4,
+            q4patch._QMM_MIN_TOKENS,
+            q4patch._Q8_MIN_TOKENS,
+        )
+        == 128
+    )
+    assert (
+        q4patch._route_min_tokens_for_bits(
+            8,
+            q4patch._QMM_MIN_TOKENS,
+            q4patch._Q8_MIN_TOKENS,
+        )
+        == 16384
+    )
+
+
 def test_qwen35_q4_mlp_patch_routes_prefill_and_skips_decode(monkeypatch):
     fast = _require_q4_kernel()
     import mlx_lm.models.qwen3_5 as qwen35
