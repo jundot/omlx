@@ -3660,9 +3660,12 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                     max_model_len=get_max_context_window(model_id),
                 )
             )
+        # Both sets are needed by the exposed-profile and Claude tier-alias
+        # blocks below, and the latter runs with or without a settings manager,
+        # so they are built here rather than inside the settings guard.
+        physical_ids = {m["id"] for m in status["models"]}
+        existing_ids = {m.id for m in models}
         if settings_manager:
-            physical_ids = {m["id"] for m in status["models"]}
-            existing_ids = {m.id for m in models}
             for profile in settings_manager.list_exposed_profile_models():
                 source_model_id = profile["source_model_id"]
                 profile_model_id = profile["model_id"]
@@ -3684,10 +3687,12 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
         # Claude Desktop tier aliases: derived, non-persisted slot IDs
         # that resolve at runtime to the configured Claude Code tier models.
         # Skipped (with a warning, never a crash) when the slot collides with
-        # an existing model ID or an exposed custom alias.
+        # an existing model ID or an exposed custom alias, and when the tier
+        # names a model that is not discovered: resolution hands the raw tier
+        # value to pool.get_engine, which only accepts physical model IDs, so
+        # a stale or aliased tier would list a slot no request can serve.
         tier_aliases = get_claude_tier_aliases()
         if tier_aliases:
-            physical_ids = {m["id"] for m in status["models"]}
             custom_aliases = set()
             if settings_manager:
                 for _ms in settings_manager.get_all_settings().values():
@@ -3704,6 +3709,14 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                         "Skipping Claude Desktop tier alias %r: collides with "
                         "an existing model ID or custom alias",
                         slot_id,
+                    )
+                    continue
+                if tier_model not in physical_ids:
+                    logger.warning(
+                        "Skipping Claude Desktop tier alias %r: tier model %r "
+                        "is not an available model",
+                        slot_id,
+                        tier_model,
                     )
                     continue
                 max_tokens = _server_state.sampling.max_tokens
