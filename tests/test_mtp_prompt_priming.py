@@ -327,8 +327,8 @@ class TestCaptureFold:
         )
         warm_ctx = prompt_priming._find_ctx(model)
         assert warm_ctx is not None
-        assert warm_ctx.folded == 7
-        assert warm_ctx.expected_offset == 8
+        assert warm_ctx.head_hist_offset == 7
+        assert warm_ctx.target_expected_offset == 8
         assert mx.array_equal(warm_ctx.pending_hidden, boundary_pending).item()
 
         # The scheduler's prepared-set normally prevents this second call;
@@ -504,7 +504,7 @@ class TestCaptureSkips:
         assert prompt_priming.prime_ctx_stats(model) is None
         ctx = prompt_priming._find_ctx(model)
         assert ctx is not None and ctx.window_exceeded
-        assert ctx.expected_offset == 17
+        assert ctx.target_expected_offset == 17
 
     def test_take_primed_requires_seam_offset(self, model):
         """No activation forward ran: seam mismatch must discard the ctx."""
