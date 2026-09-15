@@ -538,6 +538,22 @@ def test_admission_and_fit_match_the_engine_pool(tmp_path, engram):
         assert fit_resident_fraction(
             target, expected - 1, engram_ssd_offload=engram
         ) == ((capacity - 1) / 8 if capacity > 2 else None)
+    # The engine pool's fit runs the same arithmetic. The budget is also the
+    # ceiling the Engram fallback decides against, so a resident store that
+    # stops fitting is priced at its mmap size: the answer is the SSD fit.
+    from omlx.patches.deepseek_v41.moe_offload import capacity_fractions
+
+    assert capacity_fractions(target) == tuple(c / 8 for c in range(2, 9))
+    base = ModelSettings(deepseek_v41_engram_ssd_offload=engram)
+    for capacity in range(2, 9):
+        fraction = capacity / 8
+        expected = admission_bytes(target, fraction, engram_ssd_offload=engram)
+        assert pool.moe_offload_admission_bytes(entry, base, fraction) == expected
+        assert base.moe_expert_offload_enabled is False
+        for budget in (expected, expected - 1):
+            assert pool.fit_moe_offload_fraction(entry, base, budget) == (
+                fit_resident_fraction(target, budget, engram_ssd_offload=True)
+            )
 
 
 @pytest.mark.parametrize("window_experts", [1, 2])

@@ -559,6 +559,17 @@ def _admission_bytes(path, fraction, engram_ssd_offload, signature):
     )
 
 
+def capacity_fractions(path):
+    """Every resident fraction that maps to a distinct whole-expert capacity.
+
+    The adapter keeps ``min(count, max(floor, round(count * fraction)))``
+    experts per layer, so only ``capacity / count`` values change what is
+    resident. Ascending, from the routing floor to fully resident.
+    """
+    plan = _plan(path, 1.0)
+    return tuple(c / plan.count for c in range(plan.floor, plan.count + 1))
+
+
 def fit_resident_fraction(path, budget_bytes, *, engram_ssd_offload=True):
     """Largest resident fraction whose admission estimate fits ``budget_bytes``.
 
