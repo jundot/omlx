@@ -536,6 +536,68 @@ class TestMuseGlimmerQuantPredicate:
         assert isinstance(result, dict) and result["bits"] >= 6
 
 
+class TestSpark25QuantPredicate:
+    """Spark-X2.5 (fused QKV + headwise gate) predicate behavior."""
+
+    @pytest.fixture
+    def spark_config(self):
+        return {
+            "model_type": "spark2_5",
+            "num_hidden_layers": 36,
+            "hidden_size": 2560,
+        }
+
+    @pytest.fixture
+    def module(self):
+        return MagicMock(spec=[])
+
+    def test_head_gate_protected(self, spark_config, module):
+        # The per-head sigmoid gate must stay at source precision to mirror
+        # the model's own quant_predicate.
+        assert (
+            universal_quant_predicate(
+                "model.layers.10.self_attn.g_proj", module, spark_config
+            )
+            is False
+        )
+
+    def test_mlp_gate_proj_quantized(self, spark_config, module):
+        # The MLP SwiGLU gate is a normal dense projection — quantized.
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.gate_proj", module, spark_config
+        )
+        assert result is not False
+
+    def test_fused_qkv_quantized(self, spark_config, module):
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.q_k_v_proj", module, spark_config
+        )
+        assert result is not False
+
+    def test_out_proj_quantized(self, spark_config, module):
+        # Dense-model out_proj quantizes at base bits (the o_proj 5-bit rule
+        # targets fused v_o_proj-style layouts).
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.out_proj", module, spark_config
+        )
+        assert result is True
+
+    def test_down_proj_protected(self, spark_config, module):
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.down_proj", module, spark_config
+        )
+        assert isinstance(result, dict) and result["bits"] == 5
+
+    def test_gate_rule_does_not_leak_to_other_models(self, module):
+        # Non-spark configs must not skip self_attn.g_proj.
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.g_proj",
+            module,
+            {"model_type": "llama", "num_hidden_layers": 32},
+        )
+        assert result is not False
+
+
 # =============================================================================
 # Test helper functions
 # =============================================================================

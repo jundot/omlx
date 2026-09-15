@@ -680,6 +680,12 @@ def universal_quant_predicate(
     if any(p in path for p in ("mixer.in_proj", "mixer.out_proj", "x_proj", "dt_proj")):
         return bits(5)
 
+    # Spark2.5 head gates are tiny per-head gating projections (hidden_size x
+    # num_heads). The model's own quant_predicate keeps them at source
+    # precision; mirror that so oQ and load-time quantization agree.
+    if config.get("model_type") == "spark2_5" and ".self_attn.g_proj" in path:
+        return False
+
     return True
 
 
@@ -4262,6 +4268,17 @@ def _build_model_sanitizer(
                 apply_hy_v3_patch()
             except Exception as patch_err:
                 logger.debug(f"hy_v3 patch not applied: {patch_err}")
+
+        # Spark-X2.5 is vendored by oMLX for mlx-lm builds without it. The
+        # patch self-disables when upstream mlx-lm ships spark2_5, so this
+        # stays correct after the oMLX mlx-lm pin bump.
+        if config.get("model_type") == "spark2_5":
+            try:
+                from omlx.patches.spark2_5 import apply_spark2_5_patch
+
+                apply_spark2_5_patch()
+            except Exception as patch_err:
+                logger.debug(f"spark2_5 patch not applied: {patch_err}")
 
         if config.get("model_type") == "mimo_v2":
             try:
