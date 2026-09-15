@@ -33,27 +33,45 @@ def _quantized_bf16(linear, bits=4):
     return qlinear
 
 
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
-def test_qwen35_q_affine_qmm_matches_mlx_quantized_matmul(bits):
+@pytest.mark.parametrize(
+    "bits,group_size,tokens,dtype,variant",
+    [(bits, 64, 32, mx.bfloat16, 8) for bits in (4, 5, 6, 8)]
+    + [
+        (4, 32, tokens, dtype, 8)
+        for dtype in (mx.float16, mx.bfloat16)
+        for tokens in (31, 128, 129)
+    ]
+    + [(4, 32, 32, mx.bfloat16, variant) for variant in (0, 9)]
+    + [(8, 32, 32, mx.bfloat16, 8)],
+)
+def test_qwen35_q_affine_qmm_matches_mlx_quantized_matmul(
+    bits, group_size, tokens, dtype, variant
+):
     fast = _require_qmm_kernels((bits,))
-    x = mx.random.normal((1, 32, 256)).astype(mx.bfloat16)
+    x = mx.random.normal((1, tokens, 256)).astype(dtype)
     w_full = mx.random.normal((128, 256)).astype(mx.float32)
     weight, scales, biases = mx.quantize(
-        w_full, group_size=64, bits=bits, mode="affine"
+        w_full, group_size=group_size, bits=bits, mode="affine"
     )
     scales = scales.astype(x.dtype)
     biases = biases.astype(x.dtype)
+    qmm = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")
+    if group_size == 32 and (bits != 4 or variant != 8):
+        with pytest.raises(ValueError, match="unsupported group_size"):
+            qmm(x, weight, scales, biases, variant, group_size)
+        return
+
     ref = mx.quantized_matmul(
         x,
         weight,
         scales=scales,
         biases=biases,
         transpose=True,
-        group_size=64,
+        group_size=group_size,
         bits=bits,
         mode="affine",
     )
-    got = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")(x, weight, scales, biases, 8)
+    got = qmm(x, weight, scales, biases, variant, group_size)
     mx.eval(ref, got)
 
     diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32))
@@ -309,6 +327,7 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
         "expected",
     ),
     [
+        (32, False, False, False, True),
         (64, True, True, False, True),
         (128, False, False, False, True),
         (128, False, True, False, True),
@@ -362,6 +381,38 @@ def test_qwen35_qmm_routing_uses_stock_nax_availability(
         )
         is expected
     )
+
+    if group_size == 32:
+        assert fast.qmm_supports_group_size(32)
+        assert not q4patch._is_supported_affine_linear_shape(
+            linear, mx.float16, ndim=3, seq_len=2048, input_dim=256
+        )
+        linear.bits = 8
+        assert not q4patch._is_supported_affine_linear_shape(
+            linear, mx.bfloat16, ndim=3, seq_len=2048, input_dim=256
+        )
+        linear.bits = 4
+
+        calls = []
+        native_result = object()
+
+        def qmm(*args):
+            calls.append(args)
+            return native_result
+
+        monkeypatch.setattr(q4patch, "_native_qmm_for_bits", lambda _bits: qmm)
+        x = mx.zeros((1, 2048, 256), dtype=mx.bfloat16)
+        assert q4patch._linear_qmm(linear, x, 8) is native_result
+        assert len(calls) == 1
+
+        calls.clear()
+        monkeypatch.setattr(q4patch, "is_nax_available", lambda: True)
+        q4patch._linear_qmm(linear, x, 8)
+        assert calls == []
+
+        monkeypatch.setattr(q4patch, "is_nax_available", lambda: False)
+        q4patch._linear_qmm(linear, x, 9)
+        assert calls == []
 
 
 def test_qwen35_q4_mlp_patch_prechecks_down_proj_before_gate_up(monkeypatch):

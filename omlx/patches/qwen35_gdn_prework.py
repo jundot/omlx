@@ -2,7 +2,7 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 3..9).
+"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 2..9).
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
@@ -17,8 +17,8 @@ donor kernel: the in-kernel sigmoid uses MLX's own unary formula
 inputs; the RMS applies the ones-weight rounding then the separate scalar
 multiply's rounding — the composed chain's two casts.
 
-S >= 3 is a HARD gate: the next conv state is copied from qkv rows only,
-which is wrong when a state row would still come from the OLD conv state.
+At S=2 the next conv state retains the final row of the old conv state
+before the two new qkv rows. Wider verifies retain only new qkv rows.
 Only the target-verify arm routes here; decode (S=1) and prefill keep the
 stock path.
 """
@@ -92,12 +92,14 @@ _SOURCE = """
             v_out[out_base + i] = activated[i];
         }
     }
-    if (row + uint(NKEEP) >= uint(S)) {
-        uint state_row = row + uint(NKEEP) - uint(S);
-        uint raw_base = row * uint(C) + channel_base + lane * 4;
+    for (uint state_row = row; state_row < uint(NKEEP); state_row += uint(S)) {
+        uint source_row = uint(S) + state_row;
         uint state_base = state_row * uint(C) + channel_base + lane * 4;
         for (uint i = 0; i < 4; ++i) {
-            conv_out[state_base + i] = qkv[raw_base + i];
+            uint channel = channel_base + lane * 4 + i;
+            conv_out[state_base + i] = source_row < uint(NKEEP)
+                ? conv_state[source_row * uint(C) + channel]
+                : qkv[(source_row - uint(NKEEP)) * uint(C) + channel];
         }
     }
 """
@@ -581,7 +583,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
         if gdn_sink is None or cache is None:
             return False
-        if inputs.shape[0] != 1 or not (3 <= s_len <= 9):
+        if inputs.shape[0] != 1 or not (2 <= s_len <= 9):
             return False
         if mask is not None:
             return False
