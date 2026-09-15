@@ -594,6 +594,9 @@ def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
 def _unregister_uid_row(model, uid) -> None:
     """Drop a finished request's row so heavy processors are not pinned
     until FIFO eviction; the bounded size stays as the backstop."""
+    from .patches.mlx_lm_mtp.generated_prefix import unregister
+
+    unregister(model, uid)
     with _uid_row_registry_lock:
         _uid_row_registry.pop((id(model), uid), None)
 
@@ -606,6 +609,9 @@ def _unregister_uid_rows_for_model(model) -> None:
     nothing behind that a later engine load could match if ``id(model)`` were
     recycled.
     """
+    from .patches.mlx_lm_mtp.generated_prefix import unregister
+
+    unregister(model)
     model_id = id(model)
     with _uid_row_registry_lock:
         for key in [key for key in _uid_row_registry if key[0] == model_id]:
@@ -5831,6 +5837,9 @@ class Scheduler:
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
+            from .patches.mlx_lm_mtp.generated_prefix import register
+
+            register(self.model, uid, request, self.block_aware_cache)
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
             now = time.monotonic()
@@ -11308,6 +11317,9 @@ class Scheduler:
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
+                from .patches.mlx_lm_mtp.generated_prefix import register
+
+                register(self.model, uid, request, self.block_aware_cache)
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 now = time.monotonic()
