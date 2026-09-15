@@ -50,7 +50,9 @@ private struct HeroCard: View {
                 .interpolation(.high)
                 .frame(width: 69, height: 69)
             VStack(alignment: .leading, spacing: 4) {
-                Text("oMLX")
+                Text(String(localized: "common.app_name",
+                            defaultValue: "oMLX",
+                            comment: "Product name shown as the About screen title"))
                     .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "about.hero.tagline",

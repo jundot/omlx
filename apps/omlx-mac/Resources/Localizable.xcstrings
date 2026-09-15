@@ -1,6 +1,240 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "app.command.close_window" : {
+      "comment" : "App menu command that hides all windows and drops the Dock icon",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close Window"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭窗口"
+          }
+        }
+      }
+    },
+    "common.app_name" : {
+      "comment" : "Product name used as the app logo accessibility label and the About screen title",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX"
+          }
+        }
+      }
+    },
+    "common.copy.help" : {
+      "comment" : "Tooltip on the code chip explaining that clicking copies the value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Click to copy"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点击复制"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.menu" : {
+      "comment" : "Menu label for hardware overrides in the ANE split tuner",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tuner overrides"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "调优覆盖"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_offload" : {
+      "comment" : "ANE tuner override: allow offloading work to the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow CPU offload"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 卸载"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_gate" : {
+      "comment" : "ANE tuner override: allow the gate and up projections on the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow CPU gate/up"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 门控/上投影"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_down" : {
+      "comment" : "ANE tuner override: allow the down projection on the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow CPU down projection"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 下投影"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_ane_gdn" : {
+      "comment" : "ANE tuner override: allow GDN layers on the ANE",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow GDN on ANE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 ANE 运行 GDN"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_gdn" : {
+      "comment" : "ANE tuner override: allow GDN layers on the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow GDN on CPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 运行 GDN"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_shared" : {
+      "comment" : "ANE tuner override: allow performance-aware CPU scheduling",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow performance-aware CPU scheduling"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 性能感知调度"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.use_result" : {
+      "comment" : "Button that applies the ANE tuner recommendation",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use result"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用结果"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.tune_again" : {
+      "comment" : "Button that re-runs the ANE split tuner",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tune again"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新调优"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.tune_for_mac" : {
+      "comment" : "Button that starts ANE split tuning for the current Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tune for this Mac"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "为这台 Mac 调优"
+          }
+        }
+      }
+    },
     "settings.experimental.k2_ane.label" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -14,6 +248,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Обработка промпта K2 на ANE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2 ANE 提示词处理"
           }
         }
       }
@@ -32,6 +272,12 @@
             "state" : "translated",
             "value" : "Использует ANE для предзаполнения плотных MLP и общих экспертов. Внимание и декодирование остаются на GPU. Применяется после перезагрузки модели."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用 ANE 处理稠密与共享专家 MLP 的预填充。注意力和解码仍在 GPU 上。重新加载后生效。"
+          }
         }
       }
     },
@@ -49,6 +295,12 @@
             "state" : "translated",
             "value" : "Плотные MLP на ANE"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 上的稠密 MLP"
+          }
         }
       }
     },
@@ -65,6 +317,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Общие MLP на ANE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 上的共享 MLP"
           }
         }
       }
@@ -2401,7 +2659,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CMMLU (中文)"
+            "value" : "CMMLU（中文）"
           }
         }
       }
@@ -2425,7 +2683,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "JMMLU (日语)"
+            "value" : "JMMLU（日语）"
           }
         }
       }
@@ -2449,7 +2707,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "KMMLU (韩语)"
+            "value" : "KMMLU（韩语）"
           }
         }
       }
@@ -3601,7 +3859,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "结果反映基准测试时的可用内存和内存保护级别；对任一重大更改后请重新运行。"
+            "value" : "结果反映基准测试时的可用内存和内存防护层级；对任一重大更改后请重新运行。"
           }
         }
       }
@@ -3619,7 +3877,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "个 token 已应用到上下文窗口"
+            "value" : "个 Token 已应用到上下文窗口"
           }
         }
       }
@@ -4459,7 +4717,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每次单请求试验要输入的提示 token 数"
+            "value" : "每次单请求试验要输入的提示 Token 数"
           }
         }
       }
@@ -4531,7 +4789,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每次单请求试验的输出 token 数"
+            "value" : "每次单请求试验的输出 Token 数"
           }
         }
       }
@@ -6112,7 +6370,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "https://hf-mirror.com  （空 = huggingface.co）"
+            "value" : "https://hf-mirror.com （空 = huggingface.co）"
           }
         }
       }
@@ -6256,7 +6514,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "https://modelscope.cn  （空 = ModelScope 默认值）"
+            "value" : "https://modelscope.cn （空 = ModelScope 默认值）"
           }
         }
       }
@@ -10104,7 +10362,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "初始缓存块"
+            "value" : "初始缓存块数"
           }
         }
       }
@@ -11064,7 +11322,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "嵌入批处理大小"
+            "value" : "Embedding 批大小"
           }
         }
       }
@@ -12192,7 +12450,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大 Token"
+            "value" : "最大 Token 数"
           }
         }
       }
@@ -12504,7 +12762,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -12768,7 +13026,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%1$@ 配置文件 · 设置: %2$lld"
+            "value" : "%1$@ 配置文件 · 设置：%2$lld"
           }
         }
       }
@@ -12792,7 +13050,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置文件"
+            "value" : "配置档"
           }
         }
       }
@@ -12864,7 +13122,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "聊天模板 · 覆盖: %lld"
+            "value" : "聊天模板 · 覆盖：%lld"
           }
         }
       }
@@ -12888,7 +13146,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "强制 CT · 键: %lld"
+            "value" : "强制 CT · 键：%lld"
           }
         }
       }
@@ -13416,7 +13674,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "为敏感层和保护张量分配更高位，同时保持目标每位权重预算在硬上限之下。"
+            "value" : "为敏感层和保护张量分配更高的位宽，同时保持目标每位权重预算在硬上限之下。"
           }
         }
       }
@@ -14088,7 +14346,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在量化输出中保留多 token 预测头"
+            "value" : "在量化输出中保留多 Token 预测头"
           }
         }
       }
@@ -14256,7 +14514,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Imatrix 缓存路径"
+            "value" : "imatrix 缓存路径"
           }
         }
       }
@@ -14376,7 +14634,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "重用 imatrix 缓存"
+            "value" : "复用 imatrix 缓存"
           }
         }
       }
@@ -14400,7 +14658,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用兼容的缓存 imatrix（如果可用）；否则收集新的。"
+            "value" : "可用时使用兼容的已缓存 imatrix；否则重新收集。"
           }
         }
       }
@@ -14448,7 +14706,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "当量化张量没有匹配的 imatrix 条目时失败，而不是回退到标准 oQ。"
+            "value" : "当量化张量没有匹配的 imatrix 条目时报错，而不是回退到标准 oQ。"
           }
         }
       }
@@ -14472,7 +14730,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用 imatrix 校准按激活重要性加权仿射量化。"
+            "value" : "使用 imatrix 校准，按激活重要性加权仿射量化。"
           }
         }
       }
@@ -18039,6 +18297,12 @@
             "state" : "translated",
             "value" : "0.0.0.0 & :: (все сети)"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "0.0.0.0 & ::（所有网络）"
+          }
         }
       }
     },
@@ -19687,7 +19951,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在 usage.sqlite3 中存储各模型每小时的 token 总量。关闭后会保留现有历史。"
+            "value" : "在 usage.sqlite3 中存储各模型每小时的 Token 总量。关闭后会保留现有历史。"
           }
         }
       }
@@ -19903,7 +20167,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "参数: %lld"
+            "value" : "参数：%lld"
           }
         }
       }
@@ -20253,6 +20517,12 @@
             "state" : "translated",
             "value" : "Required because resident loading exceeds the configured model-memory limit."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "必需，因为常驻加载超出了配置的模型内存上限。"
+          }
         }
       }
     },
@@ -20265,6 +20535,12 @@
             "state" : "translated",
             "value" : "SSD N-gram Offload (Qwen4 only)"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD N-gram 卸载（仅 Qwen4）"
+          }
         }
       }
     },
@@ -20276,6 +20552,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将 PLE N-gram 表保留在 SSD 上以节省内存。上下文变化后预填充可能变慢。"
           }
         }
       }
@@ -20755,7 +21037,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大 Token"
+            "value" : "最大 Token 数"
           }
         }
       }
@@ -20827,7 +21109,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -21619,7 +21901,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "激活位"
+            "value" : "激活位宽"
           }
         }
       }
@@ -21643,7 +21925,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "组大小"
+            "value" : "分组大小"
           }
         }
       }
@@ -21667,7 +21949,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "权重位"
+            "value" : "权重位宽"
           }
         }
       }
@@ -21715,7 +21997,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "为草稿模型启用量化（权重、激活位和组大小）。"
+            "value" : "为草稿模型启用量化（权重位宽、激活位宽和分组大小）。"
           }
         }
       }
@@ -22195,7 +22477,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "验证器算法。\"自适应\"在接受率下降时缩小块大小；\"关闭\"禁用推测验证。"
+            "value" : "验证器算法。“自适应”在接受率下降时缩小块大小；“关闭”禁用推测验证。"
           }
         }
       }
@@ -22843,7 +23125,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "重排器"
+            "value" : "重排序"
           }
         }
       }
@@ -23227,7 +23509,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置文件"
+            "value" : "配置档"
           }
         }
       }
@@ -23587,7 +23869,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -24064,7 +24346,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "准确度"
+            "value" : "准确率"
           }
         },
         "zh-Hant" : {
@@ -25348,7 +25630,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "内存条目"
+            "value" : "RAM 条目"
           }
         }
       }
@@ -26041,7 +26323,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充处理"
+            "value" : "提示词处理"
           }
         }
       }
