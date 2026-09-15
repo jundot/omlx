@@ -2725,6 +2725,20 @@ function clusterV2Wizard() {
             return proposal?.ready_to_activate === true || proposal?.ready_to_stage === true;
         },
 
+        planBlockerText() {
+            // A greyed Activate button must say why (#3585): the proposal
+            // already carries the reason — the fabric blocker, the preflight
+            // summary (with its pasteable fixes), or the staging error.
+            const proposal = this.planProposal;
+            if (!proposal || this.proposalCanProceed(proposal)) return '';
+            return (
+                proposal.fabric_blocker ||
+                proposal.preflight ||
+                proposal.staging?.error ||
+                ''
+            );
+        },
+
         async measurePlanNodes(hosts, nodes) {
             const roles = Object.fromEntries(nodes.map((node) => [node.node_id, node.role]));
             const result = await this.apiFetch(CLUSTER_V2_API.nodeBudgets, {

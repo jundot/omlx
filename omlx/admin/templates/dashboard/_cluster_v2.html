@@ -953,6 +953,10 @@
                                 <svg x-show="activateBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
                                 <span x-text="activateBusy ? (stagingJob && !stagingJob.ready ? stagingButtonLabel() : 'Activating…') : 'Activate cluster'"></span>
                             </button>
+                            <div x-show="planBlockerText()" x-cloak
+                                 class="w-full rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
+                                 data-cluster-v2-activate-blocker
+                                 x-text="planBlockerText()"></div>
                         </div>
                     </div>
                 </template>
