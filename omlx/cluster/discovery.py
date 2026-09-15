@@ -556,6 +556,9 @@ _JOIN_IGNORED_ERRNOS = {
 # peer (a down Thunderbolt bridge otherwise spams one line per second per
 # interface forever — 7k lines in nine minutes observed in the field).
 _TX_FAIL_LOG_INTERVAL = 60.0
+# How long a computed own-address advertisement snapshot is reused before
+# re-enumerating interfaces (Thunderbolt hotplug changes it at runtime).
+_ADV_ADDRS_TTL = 30.0
 # After this many consecutive HELLO rounds in which every send failed, the
 # multicast socket is discarded and rebuilt. macOS gotcha #6: Thunderbolt
 # hotplug renumbers interfaces, which wedges a bound socket's per-interface
@@ -585,11 +588,58 @@ def decode_hello(data: bytes) -> tuple[int, int] | None:
     return nonce, cluster_hash
 
 
-def encode_wassup(nonce: int, node_id: str, http_port: int) -> bytes:
-    payload = json.dumps(
-        {"nonce": nonce, "node_id": node_id, "http_port": int(http_port)},
-        separators=(",", ":"),
-    ).encode("utf-8")
+def _sanitize_advertised_addrs(value: Any) -> list[str]:
+    """Keep only dialable, well-formed advertised addresses (never raises).
+
+    Bare IPv6 link-local is undialable without its (process-local) scope
+    zone, and loopback/multicast/unspecified can never help a peer reach us,
+    so those are dropped here rather than on every receiver. IPv4 link-local
+    (169.254.0.0/16) is KEPT: macOS Thunderbolt bridges legitimately
+    self-assign APIPA addresses on a direct cable (RFC 3927, and #3621/#3205
+    at the transport layer), and the receiver's probe verification — never an
+    address-range guess — decides whether the two Macs actually share a link.
+    """
+
+    if not isinstance(value, list):
+        return []
+    addrs: list[str] = []
+    for entry in value[:8]:
+        if not isinstance(entry, str):
+            continue
+        ip = entry.split("%", 1)[0]
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if (
+            parsed.is_loopback
+            or parsed.is_multicast
+            or parsed.is_unspecified
+            or (parsed.version == 6 and parsed.is_link_local)
+        ):
+            continue
+        if ip not in addrs:
+            addrs.append(ip)
+    return addrs
+
+
+def encode_wassup(
+    nonce: int,
+    node_id: str,
+    http_port: int,
+    addrs: list[str] | None = None,
+) -> bytes:
+    payload_dict: dict[str, Any] = {
+        "nonce": nonce,
+        "node_id": node_id,
+        "http_port": int(http_port),
+    }
+    clean = _sanitize_advertised_addrs(addrs) if addrs else []
+    if clean:
+        # The key is omitted entirely when there is nothing to advertise so
+        # the wire format stays byte-identical for peers that predate it.
+        payload_dict["addrs"] = clean
+    payload = json.dumps(payload_dict, separators=(",", ":")).encode("utf-8")
     return _WASSUP_MAGIC + payload
 
 
@@ -613,7 +663,16 @@ def decode_wassup(data: bytes) -> dict[str, Any] | None:
         return None
     if not isinstance(http_port, int) or not 1 <= http_port <= 65535:
         return None
-    return {"nonce": nonce, "node_id": node_id, "http_port": http_port}
+    payload_out: dict[str, Any] = {
+        "nonce": nonce,
+        "node_id": node_id,
+        "http_port": http_port,
+    }
+    # Optional advertised address inventory (v2.1); absent for older peers.
+    advertised = _sanitize_advertised_addrs(payload.get("addrs"))
+    if advertised:
+        payload_out["addrs"] = advertised
+    return payload_out
 
 
 @dataclass
@@ -1065,6 +1124,7 @@ class DiscoveryService:
         interface_lister: Callable[[], list[str]] = _default_interface_lister,
         tailscale_status: Callable[[], dict[str, Any] | None] | None = None,
         zeroconf_module: Any = "auto",
+        addr_lister: Callable[[], list[dict[str, str]]] = local_addr_dicts,
     ) -> None:
         self.identity = identity
         self.registry = registry
@@ -1105,6 +1165,10 @@ class DiscoveryService:
         self._zc_instance: Any | None = None
         self._zc_browser: Any | None = None
         self._zc_info: Any | None = None
+        self._addr_lister = addr_lister
+        # (computed_at, addrs) — address enumeration shells out to ifconfig,
+        # so HELLO bursts reuse a short-lived snapshot.
+        self._adv_cache: tuple[float, list[str]] | None = None
         self._rehydrate_paired_candidates()
 
     # -- public API ----------------------------------------------------------
@@ -1566,6 +1630,32 @@ class DiscoveryService:
         if wassup is not None:
             self._handle_wassup(wassup, addr)
 
+    def _advertised_addrs(self) -> list[str]:
+        """Routable own addresses advertised inside WASSUP replies.
+
+        HELLO/WASSUP otherwise reveal only packet source addresses, which on
+        a direct Thunderbolt link are IPv6 link-local — dialable by nobody
+        once the scope zone is stripped. Advertising the static/routable
+        inventory (e.g. the 10.0.0.x Thunderbolt pair) lets the receiver
+        probe-verify each address against the announced node_id instead of
+        learning it by hand. Receivers still verify every advertised address
+        with an HTTP probe before trusting it.
+        """
+
+        now = self._clock()
+        cached = self._adv_cache
+        if cached is not None and now - cached[0] < _ADV_ADDRS_TTL:
+            return list(cached[1])
+        try:
+            entries = self._addr_lister()
+        except Exception:
+            entries = []
+        addrs = _sanitize_advertised_addrs(
+            [entry.get("ip") for entry in entries if isinstance(entry, dict)]
+        )
+        self._adv_cache = (now, addrs)
+        return list(addrs)
+
     def _handle_hello(
         self, nonce: int, cluster_hash: int, addr: Any, sock: Any = None
     ) -> None:
@@ -1597,7 +1687,12 @@ class DiscoveryService:
         # link-local HELLO source requires the ingress interface as scope id
         # in the reply destination; without it the kernel has no route and
         # the handshake silently never completes.
-        reply = encode_wassup(nonce, self.identity.node_id, self.config.http_port)
+        reply = encode_wassup(
+            nonce,
+            self.identity.node_id,
+            self.config.http_port,
+            addrs=self._advertised_addrs(),
+        )
         target_sock = sock if sock is not None else self._socket
         if target_sock is not None:
             target = (
@@ -1642,6 +1737,21 @@ class DiscoveryService:
         self._add_candidate(
             peer_ip, payload["http_port"], node_id=node_id, if_type="unknown"
         )
+        # Advertised routable addresses (e.g. a static Thunderbolt IPv4 that
+        # multicast can never reveal) become probe candidates — never peer
+        # addresses directly. The probe verifies each against the announced
+        # node_id and drops mismatches, so a forged advertisement is harmless.
+        if payload.get("addrs"):
+            own = set(self._advertised_addrs())
+            for advertised_ip in payload["addrs"]:
+                if advertised_ip == peer_ip or advertised_ip in own:
+                    continue
+                self._add_candidate(
+                    advertised_ip,
+                    payload["http_port"],
+                    node_id=node_id,
+                    if_type="advertised",
+                )
         if is_new:
             self._fire_change(peer)
         # Higher node_id (string compare) initiates contact: the higher node
