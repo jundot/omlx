@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .responses_models import (
     InputItem,
@@ -398,13 +398,50 @@ def convert_responses_input_to_messages(
 # =============================================================================
 
 
+def _namespace_wire_name(namespace: str, name: str, taken: set) -> str:
+    """Join a namespace and a child name the way Codex's join_tool_name() does.
+
+    A name a flat tool already holds is suffixed rather than shadowing it.
+    """
+    joined = f"{namespace.rstrip('_')}__{name.lstrip('_')}"
+    wire = joined
+    suffix = 2
+    while wire in taken:
+        wire = f"{joined}_{suffix}"
+        suffix += 1
+    return wire
+
+
+def _convert_function_tool(
+    tool: ResponsesTool, name: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Convert one flat function tool, or None if it is not one."""
+    if tool.type != "function" or not tool.name:
+        return None
+    func_def: Dict[str, Any] = {"name": name or tool.name}
+    if tool.description:
+        func_def["description"] = tool.description
+    if tool.parameters:
+        func_def["parameters"] = tool.parameters
+    if tool.strict is not None:
+        func_def["strict"] = tool.strict
+    return {"type": "function", "function": func_def}
+
+
 def convert_responses_tools(
     tools: Optional[List[ResponsesTool]],
+    aliases: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """Convert Responses API flat tool format to Chat Completions nested format.
 
     Responses: {"type": "function", "name": "fn", "parameters": {...}}
     Chat Completions: {"type": "function", "function": {"name": "fn", "parameters": {...}}}
+
+    A "namespace" tool is a container of ordinary client-executed function
+    tools (the shape Codex uses for each MCP server), so its members are
+    expanded under a joined wire name instead of being skipped. When
+    ``aliases`` is given it is filled with ``wire_name -> (namespace, name)``
+    so a resulting call can be returned with its namespace intact (#3371).
 
     Non-function tool types (local_shell, mcp, web_search, etc.) are skipped
     since they are not supported by local model chat templates.
@@ -413,19 +450,43 @@ def convert_responses_tools(
         return None
 
     result = []
+    taken = {tool.name for tool in tools if tool.type == "function" and tool.name}
     for tool in tools:
-        if tool.type == "function" and tool.name:
-            func_def: Dict[str, Any] = {"name": tool.name}
-            if tool.description:
-                func_def["description"] = tool.description
-            if tool.parameters:
-                func_def["parameters"] = tool.parameters
-            if tool.strict is not None:
-                func_def["strict"] = tool.strict
-            result.append({"type": "function", "function": func_def})
+        if tool.type == "namespace" and tool.name:
+            for member in getattr(tool, "tools", None) or []:
+                if isinstance(member, dict):
+                    member = ResponsesTool(**member)
+                if not isinstance(member, ResponsesTool) or not member.name:
+                    continue
+                wire = _namespace_wire_name(tool.name, member.name, taken)
+                converted = _convert_function_tool(member, name=wire)
+                if converted:
+                    taken.add(wire)
+                    if aliases is not None:
+                        aliases[wire] = (tool.name, member.name)
+                    result.append(converted)
+            continue
+        converted = _convert_function_tool(tool)
+        if converted:
+            result.append(converted)
         # Non-function tools (local_shell, mcp, web_search, etc.) are
         # silently skipped — local models can't execute them.
     return result if result else None
+
+
+def split_namespace_tool_name(
+    name: str,
+    aliases: Optional[Dict[str, Tuple[str, str]]] = None,
+) -> Tuple[Optional[str], str]:
+    """Restore ``(namespace, name)`` for a call made by wire name.
+
+    Flat tools are unaffected: they return ``(None, name)``.
+    """
+    if aliases:
+        entry = aliases.get(name)
+        if entry:
+            return entry
+    return None, name
 
 
 # =============================================================================
@@ -454,6 +515,7 @@ def build_function_call_output_item(
     call_id: str,
     item_id: Optional[str] = None,
     status: str = "completed",
+    namespace: Optional[str] = None,
 ) -> OutputItem:
     """Build a function_call-type OutputItem."""
     return OutputItem(
@@ -463,6 +525,7 @@ def build_function_call_output_item(
         call_id=call_id,
         name=name,
         arguments=arguments,
+        namespace=namespace,
     )
 
 
