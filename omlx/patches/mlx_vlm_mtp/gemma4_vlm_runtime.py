@@ -44,8 +44,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import mlx.core as mx
-
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
@@ -138,7 +136,8 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         Gemma4AssistantDraftModel,
         ModelConfig as Gemma4AssistantConfig,
     )
-    from mlx_vlm.speculative.mtp import _slice_shared_kv_after_reject  # noqa: SLF001
+
+    from ..mlx_lm_gemma4_assistant import draft_step, query_position
 
     original_init = cls.__init__
     original_call = cls.__call__
@@ -198,39 +197,13 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         # Committed length at capture time. A later rollback lowers the
         # live cache counters below this, and mtp_forward slices the
         # rejected tail off the stashed banks by the difference.
-        self._omlx_mtp_kv_offset = _mtp_query_position(self)
+        self._omlx_mtp_kv_offset = query_position(self)
         return LanguageModelOutput(
             logits=out.logits,
             hidden_states=out.hidden_states,
             gdn_states=[],
             shared_kv_states=sink,
         )
-
-    def _mtp_query_position(self) -> int:
-        """Current committed length = the drafter's constant query position.
-
-        Read from the live cache list (stashed at the last verify forward)
-        so post-rollback folds see the committed offset, not the verify
-        length. Uses the caches' host-side int counters — never the
-        per-row ``offset`` mx.array — to keep the chain cycle sync-free:
-        ``BatchRotatingKVCache._offset`` is the absolute processed length
-        (its ``_idx`` is a ring index), ``BatchKVCache._idx`` is the
-        storage length (== committed length; singleton MTP activation
-        guarantees zero left padding), and plain caches keep an int
-        ``offset``. All three are adjusted by ``trim`` / the rollback
-        undo, so post-rollback reads are committed-only.
-        """
-        for c in self._omlx_mtp_cache_ref or []:
-            rotating_offset = getattr(c, "_offset", None)
-            if isinstance(rotating_offset, int):
-                return rotating_offset
-            offset = getattr(c, "offset", None)
-            if isinstance(offset, int):
-                return offset
-            idx = getattr(c, "_idx", None)
-            if isinstance(idx, int):
-                return idx
-        raise RuntimeError("gemma4 mtp_forward: no cache offset available")
 
     def mtp_forward(
         self,
@@ -240,54 +213,9 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         return_hidden: bool = False,
         logits_keep: int = 0,
     ):
-        """Assistant-head forward under the Lightning chain contract.
-
-        The head is single-position (no history fold): only the last
-        (hidden, token) pair matters, so multi-row history folds slice to
-        the final position. ``hidden_states`` is either the trunk-normed
-        backbone hidden (first fold call) or the head's own
-        ``post_projection`` output (chain steps) — both 5376-dim, matching
-        ``draft_block``'s ``h_prev`` feedback. ``mtp_cache`` is unused
-        (stateless head).
-        """
+        """Drive the assistant head; the mlx-lm path drives it the same way."""
         del mtp_cache, logits_keep  # stateless head; output is 1 position
-        drafter = self.mtp
-        # Re-bind when the backbone embed module was swapped after the
-        # __init__-time bind — nn.quantize() replaces embed_tokens with a
-        # QuantizedEmbedding AFTER model construction, and a stale binding
-        # keeps a random-init nn.Embedding (garbage drafts, ~10% accept).
-        if drafter._input_embed is not self.model.embed_tokens:
-            drafter.bind(self)
-        shared_kv = getattr(self, "_omlx_mtp_shared_kv", None)
-        if not shared_kv:
-            raise RuntimeError(
-                "gemma4 mtp_forward called without a prior "
-                "return_hidden backbone forward (no shared K/V stash)"
-            )
-
-        h = hidden_states[:, -1:, :]
-        ids = next_token_ids[:, -1:]
-        tok_embed = drafter._input_embed(ids) * drafter._input_embed_scale
-        inputs_embeds = mx.concatenate([tok_embed.astype(h.dtype), h], axis=-1)
-
-        # Committed length (post-rollback). The stash was captured at the
-        # verify forward, so on a rejection it still carries the rejected
-        # draft rows in the tail — slice them off (verify captures are
-        # temporal-ordered, mirrors _mtp_rounds' post-reject slicing).
-        valid_len = _mtp_query_position(self)
-        rejected = getattr(self, "_omlx_mtp_kv_offset", valid_len) - valid_len
-        if rejected > 0:
-            shared_kv = _slice_shared_kv_after_reject(shared_kv, rejected)
-
-        # The drafter's constant query position is the position of the
-        # hidden's token — the last committed slot, not the next one
-        # (mirrors _mtp_draft_position).
-        drafter._kv_valid_len = valid_len
-        position_ids = mx.array([[max(valid_len - 1, 0)]])
-        head_hidden, logits = drafter(inputs_embeds, shared_kv, position_ids)
-        if return_hidden:
-            return logits, head_hidden
-        return logits
+        return draft_step(self, hidden_states, next_token_ids, return_hidden)
 
     def make_mtp_cache(self):
         """The assistant head keeps no state — nothing to clone or trim."""

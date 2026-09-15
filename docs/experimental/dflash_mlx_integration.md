@@ -118,7 +118,7 @@ are deliberately disabled for Laguna until they have dedicated
 numerical-parity coverage; ordinary adaptive DFlash verification remains
 available.
 
-Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also ships an `-assistant` variant (e.g. `gemma-4-26B-A4B-it-assistant`) that targets MTP speculative decoding via mlx-vlm — do not mix these in the DFlash toggle. Meta breaks this naming convention: `Muse-Glimmer-30B-assistant` IS a DFlash drafter (block-diffusion, `block_size` 16), not an MTP checkpoint. Drafter routing therefore keys on `config_model_type` (`muse_glimmer_assistant` is in the dashboard's DFlash drafter set), not on the checkpoint name. The Muse Glimmer target is a VLM: DFlash drives its text backbone through dflash-mlx's bundled text-only mlx-lm module, and image requests divert to the VLM fallback engine as usual.
+Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also ships an `-assistant` variant (e.g. `gemma-4-26B-A4B-it-assistant`) that targets MTP speculative decoding — do not mix these in the DFlash toggle. Meta breaks this naming convention: `Muse-Glimmer-30B-assistant` IS a DFlash drafter (block-diffusion, `block_size` 16), not an MTP checkpoint. Drafter routing therefore keys on `config_model_type` (`muse_glimmer_assistant` is in the dashboard's DFlash drafter set), not on the checkpoint name. The Muse Glimmer target is a VLM: DFlash drives its text backbone through dflash-mlx's bundled text-only mlx-lm module, and image requests divert to the VLM fallback engine as usual.
 
 ### Per-model settings
 
