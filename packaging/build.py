@@ -703,8 +703,10 @@ def build_venvstacks():
         resolved_toml.unlink()
 
     # Install mlx-audio separately: build wheel from git, install --no-deps.
-    # mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm,
-    # so it can't go through venvstacks' uv resolver.
+    # mlx-audio's declared dependency set drifts against our git-pinned
+    # mlx-lm (strict ==0.31.1 became >=0.31.1 by 40bc168, but the resolver
+    # still can't see our git pin), so it can't go through venvstacks' uv
+    # resolver; pyproject.toml lists the transitives we actually need.
     _install_mlx_audio(EXPORT_DIR)
 
     # Install paroquant --no-deps. The official [mlx] extra requires
@@ -730,8 +732,13 @@ def build_venvstacks():
     return EXPORT_DIR
 
 
-# mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981"
+# mlx-audio git commit — aligned with pyproject.toml [audio] extra.
+# Must include voxtral_realtime create_streaming_session (upstream f679861);
+# see #3231. 40bc168 (2026-07-04) is the newest commit whose declared deps
+# stay compatible with our transformers<5.13 pin (upstream raised the floor
+# to >=5.14 in 3e9e8aa). resample_audio is back on mlx_audio.utils here, so
+# the mlx_audio_compat shim becomes a no-op (kept for older dev checkouts).
+_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@40bc1680eaa47b8f3d5992bbb2913f08c3d1a123"
 
 
 def _install_mlx_audio(export_dir: Path):
