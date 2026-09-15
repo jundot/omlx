@@ -131,6 +131,30 @@ class TestDFlashModelSettings:
         assert settings.dflash_block_size == 5
         assert settings.dflash_verify_mode == "adaptive"
 
+    def test_max_snapshot_tokens_roundtrip(self):
+        """The prefix-snapshot cap survives JSON in every meaningful state.
+
+        0 is not an empty value here: dflash-mlx gates the insert on
+        ``max_snapshot_tokens > 0``, so 0 lifts the cap while absent keeps its
+        32_000 default. A round-trip that collapses 0 to None would silently
+        restore the default and make the setting unreachable.
+        """
+        for stored, expected in ((None, None), (0, 0), (120_000, 120_000)):
+            data = {"dflash_enabled": True}
+            if stored is not None:
+                data["dflash_max_snapshot_tokens"] = stored
+            settings = ModelSettings.from_dict(data)
+            assert settings.dflash_max_snapshot_tokens == expected
+
+            restored = ModelSettings.from_dict(settings.to_dict())
+            assert restored.dflash_max_snapshot_tokens == expected
+
+    def test_max_snapshot_tokens_defaults_to_none(self):
+        """Absent from JSON means the dflash-mlx default still applies."""
+        settings = ModelSettings.from_dict({"dflash_enabled": True})
+        assert settings.dflash_max_snapshot_tokens is None
+        assert "dflash_max_snapshot_tokens" not in settings.to_dict()
+
     def test_roundtrip_serialization(self):
         original = ModelSettings(
             dflash_enabled=True,
