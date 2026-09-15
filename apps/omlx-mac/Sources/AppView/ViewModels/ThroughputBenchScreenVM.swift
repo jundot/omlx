@@ -91,13 +91,16 @@ final class ThroughputBenchScreenVM {
         if s.dflashEnabled == true { flags.append("DFlash") }
         if s.specprefillEnabled == true { flags.append("SpecPrefill") }
         if s.turboquantKvEnabled == true {
+            let scheme = s.turboquantKvScheme ?? "turboquant"
+            let name = scheme == "affine4"
+                ? "Affine4 KV" : scheme == "affine8" ? "Affine8 KV" : "TurboQuant KV"
             if let bits = s.turboquantKvBits {
                 let text = bits == bits.rounded()
                     ? String(Int(bits))
                     : String(format: "%g", bits)
-                flags.append("TurboQuant KV \(text)-bit")
+                flags.append("\(name) \(text)-bit")
             } else {
-                flags.append("TurboQuant KV")
+                flags.append(name)
             }
         }
         if s.mtpEnabled == true { flags.append("Lightning MTP") }

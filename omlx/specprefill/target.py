@@ -51,6 +51,7 @@ SyncAndClearCache = Callable[[], None]
 # Issue #2177: helper signature mirroring Scheduler._extract_cache_states.
 # Returns the per-layer extracted state dicts and an optional ModelCacheConfig.
 ExtractCacheStates = Callable[[list[Any]], tuple[list[dict[str, Any]], Any | None]]
+PreparePromptCache = Callable[[list[Any]], None]
 
 
 def run_specprefill_target_prefill(
@@ -75,6 +76,7 @@ def run_specprefill_target_prefill(
     exact_prefix_cache: ExactPrefixCache | None = None,
     static_prefix_tokens: Sequence[int] | None = None,
     promote_static_prefix_to_hot_cache: bool = True,
+    prepare_prompt_cache: PreparePromptCache | None = None,
 ) -> SpecPrefillTargetPrefillResult:
     """Prefill system and selected conversation tokens for one request."""
     prompt_cache = None
@@ -131,6 +133,8 @@ def run_specprefill_target_prefill(
                 )
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(target_model)
+        if prepare_prompt_cache is not None:
+            prepare_prompt_cache(prompt_cache)
 
         if system_token_count > 0 and static_prefix_cached_tokens == 0:
             sys_arr = mx.array(all_tokens[:system_token_count])
