@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
 # healthy cluster that had simply not been asked anything for 45 seconds looked
 # exactly like a wedged one.
 _DEFAULT_STALE_AFTER = 45.0
-_DEFAULT_PROBE_TIMEOUT = 5.0
+_DEFAULT_PROBE_TIMEOUT = float(
+    os.environ.get("OMLX_CLUSTER_PEER_PROBE_TIMEOUT", "10.0")
+)
 _MAX_REMOTE_MARKER_BYTES = 256 * 1024
 
 _LOOPBACK_TARGETS = {"127.0.0.1", "localhost", "::1"}
@@ -435,8 +437,12 @@ def raise_if_peer_lost(health: tuple[PeerHealth, ...]) -> None:
 # process, so a single flaky probe during a twenty-minute weight load would
 # throw the whole deployment away; two consecutive failures is 30 s of silence
 # at the default interval and still well inside a human's patience.
-_DEFAULT_FAILURE_TOLERANCE = 2
-_DEFAULT_SERVING_INTERVAL = 3.0
+_DEFAULT_FAILURE_TOLERANCE = int(
+    os.environ.get("OMLX_CLUSTER_PEER_FAILURE_TOLERANCE", "2")
+)
+_DEFAULT_SERVING_INTERVAL = float(
+    os.environ.get("OMLX_CLUSTER_PEER_SERVING_INTERVAL", "3.0")
+)
 
 
 class PeerWatchdog:
