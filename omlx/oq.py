@@ -6960,6 +6960,11 @@ def _find_model_layers(model):
     elif hasattr(model, "model") and hasattr(model.model, "word_embeddings"):
         embed_fn = model.model.word_embeddings
         layers = model.model.layers
+    # Hugging Face-style naming (Spark-X2.5): the embedding module is
+    # ``model.embedding`` rather than ``embed_tokens``.
+    elif hasattr(model, "model") and hasattr(model.model, "embedding"):
+        embed_fn = model.model.embedding
+        layers = model.model.layers
     elif hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         lm = model.language_model.model
         if hasattr(lm, "embed_tokens"):

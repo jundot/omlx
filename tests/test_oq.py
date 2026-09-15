@@ -598,6 +598,70 @@ class TestSpark25QuantPredicate:
         assert result is not False
 
 
+class TestSpark25ImatrixDiscovery:
+    """oQe imatrix calibration must discover Spark's HF-style embedding."""
+
+    @pytest.fixture
+    def model(self):
+        from mlx_lm.models.spark2_5 import Model, ModelArgs
+
+        args = ModelArgs(
+            model_type="spark2_5",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1000,
+            sliding_window=32,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        return Model(args)
+
+    def test_find_model_layers_finds_embedding_style(self, model):
+        from omlx.oq import _find_model_layers
+
+        embed_fn, layers = _find_model_layers(model)
+        assert layers is model.model.layers
+        assert embed_fn is model.model.embedding
+
+    def test_prepare_layer_inputs_generic_masks(self, model):
+        from omlx.oq import _prepare_layer_inputs
+
+        inputs = mx.random.normal((1, 8, 128))
+        calib = mx.zeros((1, 8), dtype=mx.int32)
+        out, masks, position_ids = _prepare_layer_inputs(
+            model, model.model.layers, calib, inputs
+        )
+        assert out is inputs
+        assert len(masks) == 4
+        assert all(m is not None for m in masks)
+        assert position_ids.shape == (1, 8)
+
+    def test_forward_layer_result_runs_spark_block(self, model):
+        from omlx.oq import _forward_layer_result
+
+        inputs = mx.random.normal((1, 8, 128))
+        mask = mx.zeros((8, 8), dtype=mx.float32) * -1e9
+        position_ids = mx.arange(8)[None, :]
+        out, aux = _forward_layer_result(
+            model.model.layers[0], inputs, mask, position_ids
+        )
+        assert aux is None
+        assert out is not None
+        assert out.shape == (1, 8, 128)
+
+
 # =============================================================================
 # Test helper functions
 # =============================================================================
