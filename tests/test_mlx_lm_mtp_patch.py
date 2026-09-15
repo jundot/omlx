@@ -2964,3 +2964,75 @@ def test_chain_rollback_finds_the_method_behind_the_vlm_adapter():
 
     assert bg._chain_rollback(_Adapter(), [], 1, 3, None) is True
     assert calls == [(1, 3)]
+
+
+class TestQwen35PipelineAwareness:
+    """#3518: the MTP __call__ replacement must keep upstream's pipeline path."""
+
+    def _patched_shell(self, *, pipeline_rank, pipeline_size):
+        from mlx_lm.models import qwen3_5
+
+        from omlx.patches.mlx_lm_mtp.qwen35_model import _patch_qwen3_5_text_model
+
+        _patch_qwen3_5_text_model(qwen3_5)
+
+        model = qwen3_5.Qwen3_5TextModel.__new__(qwen3_5.Qwen3_5TextModel)
+        calls = []
+
+        class FakeLayer:
+            is_linear = False
+
+            def __call__(self, h, mask=None, cache=None, n_confirmed=0):
+                calls.append(("layer", n_confirmed))
+                return h
+
+        local = FakeLayer()
+        # Non-local stage entries are None after apply_pipeline_assignment.
+        model.layers = [None, local] if pipeline_rank == 1 else [local, None]
+        model.pipeline_layers = [local]
+        model.embed_tokens = lambda ids: ids
+        model.fa_idx = None
+        model.ssm_idx = None
+        model.pipeline_rank = pipeline_rank
+        model.pipeline_size = pipeline_size
+        return model, calls
+
+    def test_patched_call_survives_a_pipeline_assignment(self, monkeypatch):
+        import mlx.core as mx
+
+        model, calls = self._patched_shell(pipeline_rank=1, pipeline_size=2)
+        sent, gathered = [], []
+        monkeypatch.setattr(
+            mx.distributed, "send", lambda value, *_a, **_k: sent.append(1) or value
+        )
+        monkeypatch.setattr(
+            mx.distributed,
+            "all_gather",
+            lambda value, *_a, **_k: gathered.append(1) or value,
+        )
+        monkeypatch.setattr(
+            mx.distributed,
+            "recv_like",
+            lambda value, *_a, **_k: value,
+        )
+        tokens = mx.array([[1, 2, 3]])
+
+        out = model(tokens, cache=[None])
+
+        assert bool((out == tokens).all())  # pre-norm hidden, through the fakes
+        # The local layer ran; the None-filled non-local entries never did.
+        assert calls == [("layer", 0)]
+        # Rank 1 of 2 sends to rank 0 and joins the gather — the collectives
+        # the unpatched replacement skipped entirely (#3518's crash/hang).
+        assert sent == [1]
+        assert gathered == [1]
+
+    def test_single_node_behavior_is_unchanged(self):
+        model, calls = self._patched_shell(pipeline_rank=0, pipeline_size=1)
+        import mlx.core as mx
+
+        tokens = mx.array([[1, 2, 3]])
+        out = model(tokens, cache=[None], n_confirmed=0)
+
+        assert out is tokens
+        assert calls == [("layer", 0)]
