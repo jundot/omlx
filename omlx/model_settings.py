@@ -19,6 +19,7 @@ from .model_profiles import (
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
+    normalize_turboquant_kv_bits,
     slugify_profile_api_name,
     validate_profile_name,
     utcnow,
@@ -467,6 +468,8 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        # Profiles retain raw JSON types; engine signatures use repr().
+        self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
             raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
@@ -531,6 +534,8 @@ class ModelSettings:
         result = {}
         for f in fields(self):
             value = getattr(self, f.name)
+            if f.name == "turboquant_kv_bits":
+                value = normalize_turboquant_kv_bits(value)
             if value is not None:
                 result[f.name] = value
         return result
@@ -845,6 +850,11 @@ class ModelSettingsManager:
                 used_api_names: set[str] = set()
                 for name, profile in profiles.items():
                     settings = profile.get("settings")
+                    # Normalize in memory only; the next save writes floats.
+                    if settings and "turboquant_kv_bits" in settings:
+                        settings["turboquant_kv_bits"] = normalize_turboquant_kv_bits(
+                            settings["turboquant_kv_bits"]
+                        )
                     if settings and "ttl_seconds" in settings:
                         del settings["ttl_seconds"]
                         changed = True

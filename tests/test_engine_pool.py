@@ -1362,6 +1362,104 @@ class TestEnginePoolAsync:
         assert refreshed.load_failed is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("bits", [8, 8.0, "8", "8.0", 2.5, "2.5", 3.5, "3.5"])
+    async def test_turboquant_profile_numeric_spelling_reuses_engine(
+        self, pool_with_mock_engines, tmp_path, bits
+    ):
+        """Legacy JSON spellings must reuse an engine, even while leased."""
+        from omlx.model_settings import ModelSettingsManager
+
+        (tmp_path / "model_settings.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "models": {
+                        "model-a": {
+                            "model_alias": "alias-a",
+                            "turboquant_kv_enabled": True,
+                            "turboquant_kv_bits": float(bits),
+                        }
+                    },
+                }
+            )
+        )
+        (tmp_path / "model_profiles.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profiles": {
+                        "model-a": {
+                            "test": {
+                                "name": "test",
+                                "display_name": "Test",
+                                "api_name": "test",
+                                "expose_as_model": True,
+                                "settings": {"turboquant_kv_bits": bits},
+                            }
+                        }
+                    },
+                }
+            )
+        )
+        manager = ModelSettingsManager(tmp_path)
+        pool = pool_with_mock_engines
+        pool._settings_manager = manager
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine) as factory:
+            assert (
+                await pool.get_engine(pool.resolve_model_id("alias-a", manager))
+                is engine
+            )
+            pool.get_entry("model-a").in_use = 1
+            for alias in ("model-a:test", "alias-a:test"):
+                resolved = manager.get_exposed_profile_runtime_settings_for_request(
+                    alias
+                )
+                assert resolved is not None
+                model_id, settings = resolved
+                assert (
+                    await pool.get_engine(model_id, runtime_settings=settings) is engine
+                )
+            assert await pool.get_engine("model-a") is engine
+
+        factory.assert_called_once()
+        engine.stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_turboquant_real_bit_depth_change_reloads_engine(
+        self, pool_with_mock_engines
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        engines = [MagicMock(), MagicMock()]
+        for engine in engines:
+            engine.start = AsyncMock()
+            engine.stop = AsyncMock()
+            engine.has_active_requests.return_value = False
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=engines):
+            first = await pool.get_engine(
+                "model-a",
+                runtime_settings=ModelSettings(
+                    turboquant_kv_enabled=True,
+                    turboquant_kv_bits=3,
+                ),
+            )
+            second = await pool.get_engine(
+                "model-a",
+                runtime_settings=ModelSettings(
+                    turboquant_kv_enabled=True,
+                    turboquant_kv_bits=3.5,
+                ),
+            )
+        assert first is engines[0]
+        assert second is engines[1]
+        first.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_runtime_settings_signature_reload(self, pool_with_mock_engines):
         """A profile runtime variant with engine fields reloads the base engine."""
         from omlx.model_settings import ModelSettings
