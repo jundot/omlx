@@ -432,7 +432,8 @@ class _HeadroomOwner:
         self.value = value
         self.route_changes = []
 
-    def headroom(self):
+    def headroom(self, kv_len=0):
+        self.last_kv_len = kv_len
         return self.value
 
     def _sdpa256_bounded_route_changed(self, active):
@@ -689,7 +690,7 @@ def test_tiled_route_logs_headroom_numbers(_sdpa256_provider_reset, caplog):
     records = _tiled_log_records(caplog)
     assert len(records) == 1
     msg = records[0].getMessage()
-    assert "exceeds live guard headroom" in msg
+    assert "exceeds the static guard headroom" in msg
     assert "kv_len=16384" in msg
     assert "MiB" in msg
 
@@ -717,7 +718,8 @@ def test_unfused_route_logs_nothing(_sdpa256_provider_reset, caplog):
 
 def test_scheduler_headroom_provider_math():
     """_sdpa256_unfused_headroom mirrors the adaptive throttle target:
-    hard ceiling x headroom safety, clamped by the abort cap, minus usage."""
+    hard ceiling x headroom safety, clamped by the abort cap, minus the
+    request's static resident model (never live usage)."""
     from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
 
     gib = 1024**3
@@ -732,8 +734,12 @@ def test_scheduler_headroom_provider_math():
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
         _prefill_abort_cap = Scheduler._prefill_abort_cap
+        _sdpa256_static_resident_bytes = Scheduler._sdpa256_static_resident_bytes
 
         def _current_usage_bytes(self):
+            raise AssertionError("route headroom must not sample live usage")
+
+        def _sdpa256_static_resident_bytes(self, kv_len):
             return 10 * gib
 
     fake = _Fake()
@@ -758,9 +764,13 @@ def test_scheduler_headroom_provider_math():
     fake._memory_hard_limit_bytes = 100 * gib
     assert Scheduler._sdpa256_unfused_headroom(fake) == int(100 * gib * 0.90) - 10 * gib
 
-    # Abort cap binds when lower than the throttle target.
+    # Once the stable physical cap is known it is the ceiling: the dynamic
+    # hard limit moves with reclaimable system memory and must not move the
+    # route with it.
     fake._memory_abort_limit_bytes = 80 * gib
-    assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.95) - 10 * gib
+    assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.90) - 10 * gib
+    fake._memory_hard_limit_bytes = 120 * gib
+    assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.90) - 10 * gib
 
 
 def test_unguarded_fast_path_logs_once(caplog):

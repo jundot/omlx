@@ -54,12 +54,18 @@ _Q_TILE = 512
 _KV_TILE = 1024
 _NEG_INF = -1e30
 
-# Live guard-headroom provider for memory-aware routing (issue #2204).
+# Guard-headroom provider for memory-aware routing (issue #2204).
 # Scheduler.step registers the active Scheduler on its execution thread. Each
 # engine uses its own worker, so thread-local storage keeps concurrent engines
 # from replacing one another's provider. The bound method is weakly held so a
 # torn-down Scheduler leaves that worker on the memory-bounded native fused
 # default.
+#
+# The provider is called as ``provider(kv_len)`` and must answer from the
+# request's geometry and static configuration only, never from live process
+# memory. The two routes are different floating-point reductions, so a route
+# that depended on live usage made temperature-0 output a function of process
+# history (resident weight pages, a previous request's pooled buffers).
 _HEADROOM_PROVIDER_LOCAL = threading.local()
 # Backward-compatible override: True = always force fused, False = never force,
 # None = memory-aware auto.
@@ -126,7 +132,11 @@ def _tiled_route_required(queries, keys) -> bool:
     The stock unfused fallback is faster wherever its score matrix fits
     (issues #2155 / #2204), so force the fused path only when the unfused
     transient would not fit under the guard ceiling — or when no headroom
-    info is available, keeping the memory-safe #2025 behavior."""
+    info is available, keeping the memory-safe #2025 behavior.
+
+    The decision is a pure function of the call shape and the provider's
+    static budget for ``kv_len``: the same request takes the same route in
+    every process, whatever ran before it."""
     provider = _get_unfused_headroom_provider()
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
@@ -141,7 +151,8 @@ def _tiled_route_required(queries, keys) -> bool:
                 "(engine without a scheduler, or scheduler gone)",
             )
             return True
-        headroom = provider()
+        kv_len = int(keys.shape[-2])
+        headroom = provider(kv_len)
         if headroom is None or headroom < 0:
             _note_tiled_route(
                 "no-ceiling",
@@ -167,9 +178,9 @@ def _tiled_route_required(queries, keys) -> bool:
         if bounded:
             _note_tiled_route(
                 "insufficient-headroom",
-                f"unfused transient ~{transient / 2**20:.0f}MiB exceeds live "
-                f"guard headroom ~{headroom / 2**20:.0f}MiB at "
-                f"kv_len={keys.shape[-2]}",
+                f"unfused transient ~{transient / 2**20:.0f}MiB exceeds the "
+                f"static guard headroom ~{headroom / 2**20:.0f}MiB at "
+                f"kv_len={kv_len}",
             )
         return bounded
     except Exception:

@@ -576,6 +576,47 @@ _uid_row_drift_last_warning = float("-inf")
 _SDPA256_UNBOUNDED_HEADROOM = 1 << 62
 
 
+def _module_parameter_bytes(module: Any) -> int:
+    """Bytes of every parameter array reachable from ``module``.
+
+    ``nn.Module.parameters()`` skips attributes whose name starts with an
+    underscore, and model adapters keep the language model behind one
+    (``VLMModelAdapter._language_model``), so the public tree alone would
+    miss most of the weights. Walk the children and add the private
+    subtrees explicitly. Reads shapes only; nothing is evaluated.
+    """
+    from mlx.utils import tree_flatten
+
+    total = 0
+    seen: set[int] = set()
+    stack = [module]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        parameters = getattr(node, "parameters", None)
+        if not callable(parameters):
+            continue
+        for _, value in tree_flatten(parameters()):
+            if isinstance(value, mx.array):
+                total += int(value.nbytes)
+        children = getattr(node, "children", None)
+        if not callable(children):
+            continue
+        for name, child in children().items():
+            if not str(name).startswith("_"):
+                continue  # public children are already in parameters()
+            # nn.Module subclasses dict: test for a module before a container.
+            if callable(getattr(child, "parameters", None)):
+                stack.append(child)
+            elif isinstance(child, (list, tuple)):
+                stack.extend(child)
+            elif isinstance(child, dict):
+                stack.extend(child.values())
+    return total
+
+
 def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
     """Record the sampler and logits processors each freshly-inserted uid must run.
 
@@ -4166,17 +4207,65 @@ class Scheduler:
         if previous != active and (previous is not None or active):
             self._prefill_transient_tracker.reset_history()
 
-    def _sdpa256_unfused_headroom(self) -> int:
-        """Live headroom (bytes) for one unfused SDPA transient, under the
-        same target the adaptive prefill throttle enforces (hard ceiling x
-        headroom safety, clamped by the abort cap). Negative when the
-        ceiling is unknown (enforcer not propagated yet), which tells the
-        sdpa256 route to keep its memory-bounded default. When the guard
-        is explicitly disabled there is no ceiling to respect: the user
-        opted out of memory management, so the route gets unbounded
-        headroom and keeps the unfused fast path (#2283). Called from
-        the route gate on the MLX step thread mid-prefill, where refreshing
-        the active-memory sample is safe (issue #2204)."""
+    def _sdpa256_parameter_bytes(self) -> int:
+        """Bytes of the loaded model's parameters, computed once from the
+        parameter tree (no evaluation, no allocation). -1 when the model
+        exposes no parameter tree, which keeps the route on its bounded
+        default."""
+        cached = getattr(self, "_sdpa256_parameter_bytes_cached", None)
+        if cached is not None:
+            return cached
+        try:
+            if not callable(getattr(self.model, "parameters", None)):
+                raise TypeError("model exposes no parameter tree")
+            total = _module_parameter_bytes(self.model)
+        except Exception:
+            logger.debug("sdpa256: model parameter bytes unavailable", exc_info=True)
+            total = -1
+        self._sdpa256_parameter_bytes_cached = total
+        return total
+
+    def _sdpa256_static_resident_bytes(self, kv_len: int) -> int:
+        """Deterministic model of resident memory when a prefill chunk attends
+        over ``kv_len`` tokens: parameters, the projected cache for that
+        context, the measured fixed recurrent state, and the configured hot
+        cache budget. Every term is a function of the loaded model, the
+        settings and the request; none is sampled from the process. -1 when
+        the model dimensions are unknown."""
+        params = self._sdpa256_parameter_bytes()
+        monitor = self.memory_monitor
+        if params < 0 or monitor is None or not monitor.has_model_info():
+            return -1
+        resident = params
+        resident += int(monitor.estimate_prompt_kv_bytes(max(int(kv_len), 0)))
+        resident += int(monitor.fixed_state_bytes)
+        resident += int(getattr(self.config, "hot_cache_max_size", 0) or 0)
+        return resident
+
+    def _sdpa256_unfused_headroom(self, kv_len: int = 0) -> int:
+        """Static headroom (bytes) for one unfused SDPA transient at
+        ``kv_len``, under the same target the adaptive prefill throttle
+        enforces (hard ceiling x headroom safety, clamped by the abort cap).
+        Negative when the ceiling is unknown (enforcer not propagated yet)
+        or the model dimensions are unknown, which tells the sdpa256 route
+        to keep its memory-bounded default. When the guard is explicitly
+        disabled there is no ceiling to respect: the user opted out of
+        memory management, so the route gets unbounded headroom and keeps
+        the unfused fast path (#2283).
+
+        The ceiling is the stable physical cap (``_memory_abort_limit_bytes``,
+        min(static ceiling, Metal cap)) once the enforcer has propagated it;
+        the dynamic hard limit tracks reclaimable system memory and moves
+        by gigabytes within one prefill, which would move the route with it.
+
+        The headroom is deliberately not ``target - _current_usage_bytes()``.
+        The two SDPA routes are different floating-point reductions, and
+        live usage differs by gigabytes between otherwise identical
+        processes (resident pages of the mmap'd weights, a previous
+        request's pooled buffers), so a live-usage route made temperature-0
+        output depend on process history. Pricing the request's own
+        projected residency instead keeps the route a pure function of
+        (model, settings, request geometry)."""
         hard_cap = self._memory_hard_limit_bytes
         if hard_cap <= 0:
             if self._memory_limits_propagated and not self._prefill_memory_guard:
@@ -4194,11 +4283,15 @@ class Scheduler:
         headroom_safety = getattr(
             self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
         )
-        target = int(hard_cap * headroom_safety)
+        ceiling = self._memory_abort_limit_bytes or hard_cap
+        target = int(ceiling * headroom_safety)
         abort_cap = self._prefill_abort_cap()
         if abort_cap > 0:
             target = min(target, abort_cap)
-        return target - self._current_usage_bytes()
+        resident = self._sdpa256_static_resident_bytes(kv_len)
+        if resident < 0:
+            return -1
+        return target - resident
 
     # Two pauses, not one: a marginal pooled-buffer reclaim can satisfy the
     # first pass's target check while buying only a couple of minutes of KV
