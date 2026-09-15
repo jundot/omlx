@@ -2,6 +2,7 @@
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -66,6 +67,7 @@ from omlx.oq import (
     _progress_total_bytes,
     _quantize_chunked,
     _sensitivity_lm_config_override,
+    _shard_files,
     _should_quantize_tensor,
     _source_imatrix_signature,
     _source_has_nextn_tensors,
@@ -2205,6 +2207,78 @@ class TestLazyTensorIndex:
         idx = _LazyTensorIndex([path])
         del idx["layer.0.weight"]
         assert "layer.0.weight" not in idx
+
+
+# =============================================================================
+# Test shard discovery (issue #3679)
+# =============================================================================
+
+
+# First eight bytes of a macOS AppleDouble sidecar: the 0x00051607 magic plus
+# a version word. Read as a little-endian safetensors header length they mean
+# nothing, and the bytes that follow are not UTF-8.
+_APPLEDOUBLE_BLOB = (
+    bytes.fromhex("0005160700020000") + b"Mac OS X" + bytes(range(0xB0, 0x100))
+)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestShardDiscovery:
+    """``._*`` AppleDouble sidecars must not be indexed as model shards.
+
+    macOS materialises extended attributes as real ``._<name>`` files on
+    exFAT/NTFS/SMB, and ``Path.glob`` matches them because it does not skip
+    dot-prefixed names. Indexing one used to abort the quant task with a
+    ``UnicodeDecodeError`` that named no file.
+    """
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        _write_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {
+                "model.embed_tokens.weight": np.random.randn(32, 16).astype(np.float16),
+                "model.layers.0.self_attn.q_proj.weight": np.random.randn(
+                    16, 16
+                ).astype(np.float16),
+            },
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 32,
+                    "vocab_size": 32,
+                    "rms_norm_eps": 1e-5,
+                    "tie_word_embeddings": True,
+                }
+            )
+        )
+        (tmp_path / "._model.safetensors").write_bytes(_APPLEDOUBLE_BLOB)
+        (tmp_path / "._.hidden.safetensors").write_bytes(_APPLEDOUBLE_BLOB)
+        return tmp_path
+
+    def test_glob_matches_the_sidecars(self, model_dir):
+        # Guards the premise: if Path.glob ever starts skipping hidden names
+        # the rest of this class stops testing anything.
+        assert len(list(model_dir.glob("*.safetensors"))) == 3
+
+    def test_shard_files_skips_hidden_names(self, model_dir):
+        assert [p.name for p in _shard_files(model_dir)] == ["model.safetensors"]
+
+    def test_estimate_ignores_appledouble_sidecars(self, model_dir):
+        result = estimate_bpw_and_size(str(model_dir), oq_level=4)
+        assert result["output_size_bytes"] > 0
+
+    def test_unreadable_real_shard_still_raises_and_names_the_path(self, model_dir):
+        broken = model_dir / "model-00002-of-00002.safetensors"
+        broken.write_bytes(_APPLEDOUBLE_BLOB)
+        with pytest.raises(ValueError, match=re.escape(broken.name)):
+            _LazyTensorIndex(_shard_files(model_dir))
 
 
 # =============================================================================
