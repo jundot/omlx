@@ -6,6 +6,10 @@ outputs, scatters back to ``[B, T, topk, D]``, and then applies router scores.
 For Qwen MoE prefill we can consume the sorted expert output directly with the
 existing native weighted-sum kernel, avoiding the scatter and expanded
 intermediate. Decode and target-verify paths keep the original implementation.
+
+The native kernel is instantiated for top-k 6, 8 and 10; the last covers the
+512-expert Qwen4-Exp MoE (``num_experts_per_tok=10``), whose block inherits
+the Qwen3.5-MoE class and previously fell through to the stock path.
 """
 
 from __future__ import annotations
@@ -55,7 +59,7 @@ def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) 
         return False
     if getattr(self, "sharding_group", None) is not None:
         return False
-    if getattr(self, "top_k", None) not in (6, 8):
+    if getattr(self, "top_k", None) not in (6, 8, 10):
         return False
     if x.shape[-2] * int(getattr(self, "top_k", 0)) < 64:
         return False
