@@ -1517,6 +1517,56 @@ process.stdout.write(JSON.stringify({
     assert result["usableSelf"] == "128 GB usable as Workstation"
 
 
+def test_measured_memory_guard_settings_reach_the_v2_plan_payload():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+component.selectedModelPath = '/models/m';
+let posted = null;
+component.apiFetch = async (url, options = {}) => {
+  if (url.endsWith('/node-budgets')) return {nodes: [
+    { node_id: 'node-a', capacity_bytes: 250000, reserve_bytes: 10000,
+      role: 'workstation', memory_guard_tier: 'aggressive',
+      memory_guard_custom_ceiling_gb: 12.5 },
+    { node_id: 'node-b', capacity_bytes: 120000, reserve_bytes: 10000,
+      role: 'headless', memory_guard_tier: 'custom',
+      memory_guard_custom_ceiling_gb: 44.0 },
+  ]};
+  if (url.endsWith('/autoconfigure')) {
+    posted = JSON.parse(options.body);
+    return {
+      plan: { assignments: [], placement_signature: 'a'.repeat(16) },
+      activation: { approved_placement: 'a'.repeat(16) },
+    };
+  }
+  throw new Error('unexpected URL ' + url);
+};
+(async () => {
+  await component.runPlan();
+  process.stdout.write(JSON.stringify(posted.nodes.map((node) => ({
+    node_id: node.node_id,
+    memory_guard_tier: node.memory_guard_tier,
+    memory_guard_custom_ceiling_gb: node.memory_guard_custom_ceiling_gb,
+  }))));
+})();
+"""
+    )
+
+    assert result == [
+        {
+            "node_id": "node-a",
+            "memory_guard_tier": "aggressive",
+            "memory_guard_custom_ceiling_gb": 12.5,
+        },
+        {
+            "node_id": "node-b",
+            "memory_guard_tier": "custom",
+            "memory_guard_custom_ceiling_gb": 44.0,
+        },
+    ]
+
+
 def test_fit_failure_parses_the_shortfall_and_flips_only_on_click():
     result = _run_wizard(
         _WIZARD_TWO_MACS

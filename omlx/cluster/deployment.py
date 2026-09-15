@@ -275,6 +275,9 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
     memory_guard_tier = normalize_memory_guard_tier(
         payload.get("memory_guard_tier", "balanced")
     )
+    memory_guard_custom_ceiling_gb = float(
+        payload.get("memory_guard_custom_ceiling_gb", 0.0) or 0.0
+    )
     try:
         predicted = {}
         for key in (
@@ -300,6 +303,7 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             manual_memory_limit=bool(payload.get("manual_memory_limit", False)),
             role=role,
             memory_guard_tier=memory_guard_tier,
+            memory_guard_custom_ceiling_gb=memory_guard_custom_ceiling_gb,
             tensor_parallel_rank=int(payload.get("tensor_parallel_rank", 0)),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             sharded_weight_bytes=int(payload.get("sharded_weight_bytes", 0)),
