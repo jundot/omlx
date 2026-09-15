@@ -65,6 +65,19 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let qwen4PleSsdOffloadForced: Bool?
     let qwen4PleResidentBytes: Int64?
     let qwen4PleMmapBytes: Int64?
+    /// MoE expert streaming: model supports the streaming converter.
+    let expertStreamingSupported: Bool?
+    /// Legacy MoE expert offload (resident-fraction adapter) capability.
+    /// Broader than `expertStreamingSupported`: deepseek_v41 / gemma4 /
+    /// olmoe take the legacy path without the unified streaming converter.
+    /// The expert section gates on `expertStreamingSupported || this`.
+    let moeExpertOffloadSupported: Bool?
+    /// DeepSeek V4.1 Engram SSD-offload capability and the server-side
+    /// forced residency decision (mirrors `qwen4PleSsdOffload*`).
+    let deepseekV41EngramSsdOffloadSupported: Bool?
+    let deepseekV41EngramSsdOffloadForced: Bool?
+    let deepseekV41EngramResidentBytes: Int64?
+    let deepseekV41EngramMmapBytes: Int64?
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -97,6 +110,27 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?
+    // Unified MoE expert streaming switch (canonical key). The legacy
+    // moe_expert_offload_enabled alias below feeds the same backend — the
+    // UI ORs them on load and migrates to the canonical key on save.
+    let expertStreamingEnabled: Bool?
+    let moeExpertOffloadEnabled: Bool?
+    // Fraction of each layer's experts kept resident (0 < f <= 1).
+    // Consumed by the legacy offload adapter only (deepseek_v41, gemma4,
+    // olmoe); the unified streaming backend sizes residency from the GiB
+    // budget instead.
+    let moeExpertOffloadResidentFraction: Double?
+    // DeepSeek V4.1 Engram SSD offload (per-model; never in profiles).
+    let deepseekV41EngramSsdOffload: Bool?
+    // Dynamic expert budget (auto default): nil everywhere = automatic
+    // (RAM-scaled initial budget + hunger/pressure governor).
+    let expertStreamingBudgetGib: Double?
+    let expertStreamingBudgetAuto: Bool?
+    let expertStreamingDynamic: Bool?
+    let expertStreamingDynamicMaxGib: Double?
+    let expertStreamingDynamicMinGib: Double?
+    let expertStreamingDynamicStallTarget: Double?
+    let expertStreamingPrefillBudgetGib: Double?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -188,6 +222,25 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var ttlSeconds: Int? = nil
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
+    // Unified MoE expert streaming switch. Saving always pairs it with
+    // moeExpertOffloadEnabled=false so a stored legacy alias cannot
+    // re-arm offload against an explicit canonical off (migration-on-save,
+    // same pair the WebUI sends).
+    var expertStreamingEnabled: Bool? = nil
+    var moeExpertOffloadEnabled: Bool? = nil
+    // Legacy-adapter resident fraction (0,1] — v41/gemma4/olmoe only.
+    var moeExpertOffloadResidentFraction: Double? = nil
+    // DeepSeek V4.1 Engram SSD offload (per-model; never in profiles).
+    var deepseekV41EngramSsdOffload: Bool? = nil
+    // Dynamic expert budget: Double??/Bool?? so the editor can send JSON
+    // null to clear a pin back to auto (nil omits the key).
+    var expertStreamingBudgetGib: Double?? = nil
+    var expertStreamingBudgetAuto: Bool? = nil
+    var expertStreamingDynamic: Bool?? = nil
+    var expertStreamingDynamicMaxGib: Double?? = nil
+    var expertStreamingDynamicMinGib: Double?? = nil
+    var expertStreamingDynamicStallTarget: Double?? = nil
+    var expertStreamingPrefillBudgetGib: Double?? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil

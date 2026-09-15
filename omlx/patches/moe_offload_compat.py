@@ -16,7 +16,31 @@ def moe_offload_compatibility(model_path):
         path = Path(model_path).expanduser().resolve()
         config = path / "config.json"
         raw = json.loads(config.read_text())
-        if raw.get("model_type") not in _SUPPORTED_TYPES:
+        mtype = raw.get("model_type")
+        # Unified backend first: streaming-owned model types are eligible
+        # when the converter's own structural estimate says so.
+        try:
+            from .expert_streaming.residency import (
+                SUPPORTED_TYPES as _STREAMING_TYPES,
+                expert_streaming_estimate,
+                normalize_model_type,
+            )
+
+            if mtype and normalize_model_type(mtype) in _STREAMING_TYPES:
+                est = expert_streaming_estimate(str(path))
+                if est.supported:
+                    return True, ""
+                # Dual-listed types (qwen4_exp) may still be servable by the
+                # legacy fetch-on-miss adapter — fall through to its
+                # per-tensor inspection rather than rejecting here.
+                if mtype not in _SUPPORTED_TYPES:
+                    return False, (
+                        getattr(est, "reason", None)
+                        or "MoE expert offload is not supported for this checkpoint."
+                    )
+        except Exception:
+            pass
+        if mtype not in _SUPPORTED_TYPES:
             return False, "MoE expert offload is not supported for this model type."
         files = [config, *path.glob("*.safetensors")]
         index = path / "model.safetensors.index.json"
@@ -66,6 +90,14 @@ def _inspect(path, signature):
         elif kind == "qwen4_exp":
             parent = f"language_model.model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
+            if not store.has(prefix + ".gate_proj.weight"):
+                # mlx-vlm nesting: the checkpoint (and its quantization
+                # policy) omits the runtime's `.model` segment, so both the
+                # store names AND the per-key spec lookup below must use
+                # the de-nested spelling — otherwise the lookup falls back
+                # to the global 8-bit spec and the shape math is wrong.
+                parent = f"language_model.layers.{layer}.mlp"
+                prefix = parent + ".switch_mlp"
         else:
             parent = f"language_model.model.layers.{layer}.experts"
             prefix = parent + ".switch_glu"

@@ -93,8 +93,9 @@ def test_offloaded_generation_matches_resident():
     )
     from omlx.utils.model_loading import lm_load_compat, materialize_lazy_state
 
-    # Offloaded arm first: its peak sample must precede the resident load,
-    # because mx.get_peak_memory() is a process-global high-water mark.
+    # Offloaded model first: its peak sample must precede the resident
+    # load, because mx.get_peak_memory() is a process-global high-water
+    # mark.
     model, tok = lm_load_compat(MODEL_REPO, lazy=True)
     wrapped = apply_moe_expert_offload(model, MODEL_REPO, RESIDENT_FRACTION)
     assert wrapped > 0, "no layers wrapped — arm would silently run resident"

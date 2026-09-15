@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MoE expert offloading (omlx/patches/moe_expert_offload.py).
 
-Assertion policy (measured against the pinned mlx-lm, see module docstring):
-decode and unsorted/chunked prefill are BIT-EXACT at any residency; the
-sorted prefill kernel is presentation-invariant at real model dimensions, so
-full-residency prefill is bit-exact there too. Where partial residency
-legitimately chunks below the sort threshold, the sorted and unsorted
-gather_qmm kernels differ by ~4e-3 absolute (measured at gemma-26B geometry,
-output magnitude ~5), so those cases assert a rounding-scale tolerance —
-head-room for kernel choice, not for wrong experts, which show as O(1).
+Assertion policy: decode and unsorted/chunked prefill are BIT-EXACT at
+any residency; the sorted prefill kernel is presentation-invariant at
+real model dimensions, so full-residency prefill is bit-exact there too.
+Where partial residency legitimately chunks below the sort threshold, the
+sorted and unsorted gather_qmm kernels differ by ~4e-3 absolute at
+gemma-26B-scale geometry (output magnitude ~5), so those cases assert a
+rounding-scale tolerance — head-room for kernel choice, not for wrong
+experts, which show as O(1).
 """
 
 import pytest
@@ -28,6 +28,7 @@ if HAS_MLX:
     from omlx.patches.moe_expert_offload import (
         CheckpointExpertStore,
         OffloadSwitchGLU,
+        _apply_legacy_adapter,
         apply_moe_expert_offload,
         moe_offload_stats,
     )
@@ -156,8 +157,8 @@ class TestApplyAndForward:
         invisible to materialize_lazy_state's module walk; left lazy they stay
         bound to the loader thread's stream and the first request from an
         inference thread dies with "There is no Stream(gpu, N) in current
-        thread" (reproduced live on the VLM path). The helper must find every
-        wrapped layer and leave its arrays evaluated."""
+        thread". The helper must find every wrapped layer and leave its
+        arrays evaluated."""
         import threading
 
         from omlx.patches.moe_expert_offload import materialize_offload_state
@@ -178,8 +179,8 @@ class TestApplyAndForward:
             loader = threading.Thread(target=_build, args=(Path(tmp),))
             loader.start()
             loader.join()
-            # a DIFFERENT thread reads the materialized state — exactly the
-            # loader-thread/inference-thread split that crashed the VLM path
+            # a DIFFERENT thread reads the materialized state — the
+            # loader-thread/inference-thread split being exercised
             glu = holder["model"].layers[0].experts.switch_glu
             x = mx.random.normal((1, 1, D))
             idx = _ri(1, 1, K, e=E)
@@ -217,8 +218,7 @@ class TestApplyAndForward:
     def test_over_capacity_prefill_installs_each_expert_once(self, tmp_path):
         """Above the sort threshold and over capacity, the prefill is chunked
         on expert boundaries: every distinct expert is fetched exactly once
-        per call, however many tokens route to it. The token-chunked path
-        fetched an expert again in every chunk that touched it."""
+        per call, however many tokens route to it."""
         model, _ = self._wrapped_model(tmp_path, n_layers=1)
         apply_moe_expert_offload(model, tmp_path, 0.25)
         glu = model.layers[0].experts.switch_glu
@@ -671,7 +671,9 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
             }
         )
     )
-    assert apply_moe_expert_offload(model, tmp_path, 0.125) == 1
+    # Legacy-unit scope: qwen4_exp routes to streaming via the public entry,
+    # so pin the legacy adapter directly for its cache/eviction assertions.
+    assert _apply_legacy_adapter(model, tmp_path, 0.125) == 1
     cache = layer.mlp.switch_mlp.cache
     assert cache.capacity == 64
     for _ in range(5):

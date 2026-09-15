@@ -70,11 +70,29 @@ class TestModelSettings:
         assert restored.moe_expert_offload_resident_fraction == 0.5
 
     def test_moe_expert_offload_fraction_out_of_range_rejected(self):
-        """Residency outside (0, 1] fails at construction, not at load."""
+        """Residency outside (0, 1] fails when offload is actually requested.
+
+        A stored inert fraction on an offload-disabled model must not reject
+        unrelated saves; the check fires at the point it matters — when the
+        canonical or legacy enable flag is on.
+        """
+        ModelSettings(moe_expert_offload_resident_fraction=0.0)
+        ModelSettings(moe_expert_offload_resident_fraction=1.5)
         with pytest.raises(ValueError, match="resident_fraction"):
-            ModelSettings(moe_expert_offload_resident_fraction=0.0)
+            ModelSettings(
+                moe_expert_offload_enabled=True,
+                moe_expert_offload_resident_fraction=0.0,
+            )
         with pytest.raises(ValueError, match="resident_fraction"):
-            ModelSettings(moe_expert_offload_resident_fraction=1.5)
+            ModelSettings(
+                moe_expert_offload_enabled=True,
+                moe_expert_offload_resident_fraction=1.5,
+            )
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(
+                expert_streaming_enabled=True,
+                moe_expert_offload_resident_fraction=1.5,
+            )
 
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""

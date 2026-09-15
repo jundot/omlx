@@ -226,6 +226,12 @@ final class MenubarControllerModelsTests: XCTestCase {
             qwen4PleSsdOffloadForced: nil,
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
+            expertStreamingSupported: nil,
+            moeExpertOffloadSupported: nil,
+            deepseekV41EngramSsdOffloadSupported: nil,
+            deepseekV41EngramSsdOffloadForced: nil,
+            deepseekV41EngramResidentBytes: nil,
+            deepseekV41EngramMmapBytes: nil,
             virtual: virtual,
             settings: nil
         )

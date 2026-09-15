@@ -306,17 +306,25 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
+            load_kwargs: dict[str, Any] = {}
+            # Unified offload predicate: either key (legacy alias or
+            # canonical) AND the OMLX_MOE_EXPERT_OFFLOAD kill switch —
+            # env=0 must keep the load eager so nothing below wraps a
+            # model that was only lazy for offload's sake.
+            from ..model_settings import moe_offload_requested
+
+            if moe_offload_requested(self._model_settings):
+                # Lazy-load so giant MoE checkpoints (DeepSeek V4 Flash
+                # oQ4e ~166G) stream from SSD instead of materializing
+                # fully in RAM; expert streaming replaces the MoE banks
+                # before materialize_lazy_state runs.
+                load_kwargs["lazy"] = True
+
             return lm_load_compat(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
-                # With expert offload the load stays lazy so the wrap below
-                # can drop non-resident expert tensors BEFORE anything
-                # materializes them; materialize_lazy_state then evaluates
-                # what remains. Without offload, load eagerly as before.
-                lazy=bool(
-                    getattr(self._model_settings, "moe_expert_offload_enabled", False)
-                ),
+                **load_kwargs,
             )
 
         loop = asyncio.get_running_loop()
@@ -332,46 +340,29 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
-        # MoE expert offload: replace covered SwitchGLU layers with a
-        # fetch-on-miss LRU cache streaming experts from the checkpoint's
-        # own safetensors. Must run BEFORE materialize_lazy_state — the load
-        # above stayed lazy when this is enabled, and dropping the stock
-        # modules here is what keeps non-resident experts from ever
-        # materializing. Runs on the MLX executor because it allocates the
-        # resident slot tensors (#1304).
-        moe_offload_wrapped = 0
-        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
-            from ..patches.moe_expert_offload import (
-                apply_moe_expert_offload,
-                materialize_offload_state,
-            )
+        # Expert streaming (SSD): keep hot experts resident, stream the rest.
+        # Runs BEFORE materialize_lazy_state on purpose. On lazy-loaded
+        # checkpoints every tensor is a plain mx.array and materialize_lazy_state
+        # would evaluate the entire tree — including the multi-hundred-GB MoE
+        # expert banks (OOM / SIGKILL). Converting to streaming first drops
+        # those arrays (GC'd), so the materialize that follows only evaluates
+        # dense weights and RoPE freqs. Effective settings already include
+        # forced activation from EnginePool. Also runs before gate+up fusion
+        # (fusion would change the stacked layout).
+        from ..patches.expert_streaming import streaming_offload_load
 
-            fraction = float(
-                getattr(
-                    self._model_settings,
-                    "moe_expert_offload_resident_fraction",
-                    0.25,
-                )
-            )
-            moe_offload_wrapped = await loop.run_in_executor(
-                get_mlx_executor(),
-                apply_moe_expert_offload,
-                self._model,
-                self._model_name,
-                fraction,
-            )
-            if moe_offload_wrapped:
-                # The caches' slot maps and resident slots live on plain
-                # attributes outside the module tree, so materialize_lazy_state
-                # below never reaches them; left lazy they stay bound to this
-                # loader stream and the first request from an inference thread
-                # dies with "There is no Stream(gpu, N) in current thread".
-                await loop.run_in_executor(
-                    get_mlx_executor(), materialize_offload_state, self._model
-                )
+        _es_backing, moe_offload_wrapped = await streaming_offload_load(
+            self._model,
+            self._model_name,
+            self._model_settings,
+            label="model",
+        )
+        if _es_backing is not None:
+            self._expert_streaming_backing = _es_backing
 
         # Materialize lazy buffers on the loader thread so per-engine
-        # inference threads can read them (#1304).
+        # inference threads can read them (#1304). Post-streaming the MoE
+        # banks are gone, so this stays bounded.
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._model
         )
@@ -380,6 +371,9 @@ class BatchedEngine(BaseEngine):
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
         # executor because it rewrites weights in place.
+        # Merged: skip fusion when EITHER offload system is active —
+        # offloaded experts were never materialized, and streaming already
+        # handles the projection layout.
         if moe_offload_wrapped:
             # Fusion concatenates the stock SwitchGLU gate/up weights in RAM,
             # which cannot apply to experts that were never materialized; the
@@ -392,6 +386,7 @@ class BatchedEngine(BaseEngine):
         elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
+            and not getattr(self._model_settings, "expert_streaming_enabled", False)
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (
@@ -789,6 +784,23 @@ class BatchedEngine(BaseEngine):
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
+        # Persist the learned expert-pin profile while the backing is still
+        # reachable (teardown below drops it with the model).
+        from omlx.patches.expert_streaming import (
+            resolve_streaming_backing,
+            save_expert_pin_profile,
+            shutdown_expert_streaming,
+        )
+
+        save_expert_pin_profile(self)
+        try:
+            shutdown_expert_streaming(resolve_streaming_backing(self))
+        except Exception:
+            pass
+        try:
+            self._expert_streaming_backing = None
+        except Exception:
+            pass
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
@@ -1053,6 +1065,10 @@ class BatchedEngine(BaseEngine):
         )
 
         text = clean_special_tokens(output.output_text)
+        self._log_streaming_summary(
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+        )
 
         return GenerationOutput(
             text=text,
@@ -1062,6 +1078,21 @@ class BatchedEngine(BaseEngine):
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
+        )
+
+    def _log_streaming_summary(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """One-line MoE streaming health log per completed request.
+
+        No-op unless expert streaming is active.
+        """
+        from ..patches.expert_streaming import log_expert_streaming_summary
+
+        log_expert_streaming_summary(
+            self,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
 
     async def stream_generate(
@@ -1138,8 +1169,10 @@ class BatchedEngine(BaseEngine):
         )
 
         finished_normally = False
+        last_output = None
         try:
             async for output in engine.stream_outputs(request_id):
+                last_output = output
                 text = clean_special_tokens(output.output_text)
 
                 # Set finished_normally BEFORE yield, because the consumer
@@ -1193,6 +1226,14 @@ class BatchedEngine(BaseEngine):
             else:
                 logger.debug(
                     f"[stream_generate] Request {request_id} finished normally"
+                )
+                self._log_streaming_summary(
+                    prompt_tokens=int(
+                        getattr(last_output, "prompt_tokens", 0) or 0
+                    ),
+                    completion_tokens=int(
+                        getattr(last_output, "completion_tokens", 0) or 0
+                    ),
                 )
 
     async def chat(

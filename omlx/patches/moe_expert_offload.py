@@ -7,8 +7,7 @@ and fetch the rest on demand from the model's own safetensors shards (mmap
 slab reads — no converted copy of the checkpoint, no write path). Routing is
 computed exactly as shipped; a cache miss changes *when* an expert's weights
 are read, never *which* expert runs. Accuracy is therefore preserved by
-construction, at a latency cost (measured on a 26B/128-expert model: accuracy
-flat down to 12% residency, throughput falling roughly as memory^0.5).
+construction, at a latency cost.
 
 Applied once post-load, before lazy weights materialize: each stock
 ``SwitchGLU`` whose projections are quantized and fully covered by the
@@ -35,6 +34,7 @@ import logging
 import os
 import re
 import struct
+import threading
 from pathlib import Path
 
 import mlx.core as mx
@@ -47,6 +47,7 @@ from mlx_lm.models.switch_layers import (
 )
 
 from ..scheduler import _sync_and_clear_cache
+from .expert_streaming.slot_cache import DecodeVisitStats, SlotBookkeeping
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,16 @@ class CheckpointExpertStore:
         _, _, shape, _ = self._specs[name]
         return self._read(name, 0, int(np.prod(shape)), shape)
 
+    def close(self) -> None:
+        """Release the shard memmaps (also called via the engine's
+        ``_expert_streaming_backing`` shutdown hook). Idempotent."""
+        for mm in self._mm.values():
+            try:
+                mm._mmap.close()
+            except Exception:
+                pass
+        self._mm.clear()
+
 
 class _GLUStoreView:
     """Adapt the flat store to one SwitchGLU's checkpoint naming scheme.
@@ -185,6 +196,22 @@ class _GLUStoreView:
         return self._store.fetch_expert(self._name(proj, field, 0), expert)
 
 
+def _checkpoint_prefixes(runtime_prefix: str) -> list[str]:
+    """Candidate checkpoint spellings for a runtime module-tree prefix.
+
+    mlx-vlm nests the language model under an extra ``.model`` segment, so
+    the runtime tree says ``language_model.model.layers.N`` while the
+    checkpoint (and its quantization policy) spells
+    ``language_model.layers.N`` — a mapping sanitize() resolves at load but
+    raw-name store matching never sees. Prefer the exact spelling, then the
+    de-nested one. Every candidate still faces full shape+dtype validation,
+    so a wrong guess cannot be accepted.
+    """
+    if ".model." in runtime_prefix:
+        return [runtime_prefix, runtime_prefix.replace(".model.", ".")]
+    return [runtime_prefix]
+
+
 class ExpertCache:
     """Contiguous resident slots over one layer's experts, LRU eviction.
 
@@ -196,7 +223,11 @@ class ExpertCache:
 
     def __init__(self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView):
         self.n_experts = glu.gate_proj["weight"].shape[0]
-        self.capacity = min(capacity, self.n_experts)
+        # Slot bookkeeping (slot_of/free/rooms/cap + counters) is the shared
+        # SlotBookkeeping — same machinery the DSv4.1 _ExpertSlots runs.
+        # ``capacity`` is the governor-driven ceiling; ``rooms`` the
+        # physical row count of the slot tensors (<= rooms after shrink).
+        self.book = SlotBookkeeping(min(int(capacity), self.n_experts))
         self.projs = _PROJS
         self.disk = disk
         self.resident: dict[str, list] = {}
@@ -225,25 +256,105 @@ class ExpertCache:
             )
             for name in self.projs
         }
-        self.slot_of: dict[int, int] = {}  # expert id -> slot, LRU ordered
-        self.free = list(range(self.capacity))
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
-        self.hits = self.misses = 0
         self.warm = False
+        # Per-expert bytes for the governor's budget<->slots math.
+        self.per_expert_bytes = sum(
+            int(np.prod(a.shape[1:])) * a.dtype.size
+            for triple in self.resident.values()
+            for a in triple
+            if a is not None
+        )
+        # Residency mutation is serialized per layer; request-level
+        # serialization comes from the engine's streaming backing marker.
+        self._lock = threading.RLock()
+
+    # SlotBookkeeping aliases — the bookkeeping fields live on ``book``;
+    # these keep the pre-existing attribute surface for callers/tests.
+    @property
+    def slot_of(self):
+        return self.book.slot_of
+
+    @property
+    def free(self):
+        return self.book.free
+
+    @property
+    def rooms(self):
+        return self.book.rooms
+
+    @property
+    def capacity(self):
+        return self.book.cap
+
+    @capacity.setter
+    def capacity(self, v):
+        self.book.cap = int(v)
+
+    @property
+    def hits(self):
+        return self.book.hits
+
+    @hits.setter
+    def hits(self, v):
+        self.book.hits = int(v)
+
+    @property
+    def misses(self):
+        return self.book.misses
+
+    @misses.setter
+    def misses(self, v):
+        self.book.misses = int(v)
+
+    @property
+    def evictions(self):
+        return self.book.evictions
+
+    @evictions.setter
+    def evictions(self, v):
+        self.book.evictions = int(v)
 
     def _install(self, e: int) -> int:
-        if self.free:
+        # Fetch every field BEFORE touching slot_of/free/map: a mid-fetch
+        # failure must not orphan a row (not in free, not in slot_of) or
+        # leave a victim half-overwritten.
+        payload = {}
+        for name in self.projs:
+            rb = self.resident[name][2]
+            payload[name] = (
+                self.disk.fetch(name, "weight", e),
+                self.disk.fetch(name, "scales", e),
+                (
+                    self.disk.fetch(name, "biases", e)
+                    if rb is not None and self.disk.has(name, "biases")
+                    else None
+                ),
+            )
+        # ``capacity`` is a COUNT ceiling, not a row range: after a
+        # governor shrink the free list can still hold rows, but the
+        # resident set must not grow past it.
+        if self.free and len(self.slot_of) < self.capacity:
             slot = self.free.pop()
         else:
-            old_e = next(iter(self.slot_of))  # LRU victim
-            slot = self.slot_of.pop(old_e)
-            self.map[old_e] = -1
-        for name in self.projs:
-            rw, rs, rb = self.resident[name]
-            rw[slot] = self.disk.fetch(name, "weight", e)
-            rs[slot] = self.disk.fetch(name, "scales", e)
-            if rb is not None and self.disk.has(name, "biases"):
-                rb[slot] = self.disk.fetch(name, "biases", e)
+            evicted = self.book.evict_oldest_outside(
+                (), on_evict=lambda v: self.map.__setitem__(v, -1)
+            )
+            _old_e, slot = evicted
+        try:
+            for name in self.projs:
+                rw, rs, rb = self.resident[name]
+                w, s, b = payload[name]
+                rw[slot] = w
+                rs[slot] = s
+                if b is not None:
+                    rb[slot] = b
+        except Exception:
+            # Row bytes are suspect mid-write: back to free, victim stays
+            # evicted (its data is already clobbered). Same rule as the
+            # DSv4.1 rollback's interrupted-entry branch.
+            self.free.append(slot)
+            raise
         self.slot_of[e] = slot
         self.map[e] = slot
         # once every expert has a slot no eviction can occur, so residency is
@@ -256,23 +367,72 @@ class ExpertCache:
 
         The ``.tolist()`` is a device->host readback and therefore a sync per
         MoE layer per step. Removing it needs prefetch (resolve layer L+1's
-        residency during layer L's compute) — deliberately not in v1.
+        residency during layer L's compute).
         """
         if self.warm:  # nothing can miss; skip it
             return
         needed = set(int(e) for e in idx.reshape(-1).tolist())
-        for e in needed:
-            if e in self.slot_of:
-                slot = self.slot_of.pop(e)  # re-insert: LRU order
-                self.slot_of[e] = slot
-                self.hits += 1
-            else:
-                self.misses += 1
-                self._install(e)
+        with self._lock:
+            for e in needed:
+                if self.book.touch(e):  # re-insert at MRU end
+                    self.hits += 1
+                else:
+                    self.misses += 1
+                    self._install(e)
         # No mx.eval here: installs are already-materialized host arrays, and
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
         # per-chunk eval in __call__, which is a different mechanism.
+
+    def resize(self, cap: int) -> None:
+        """Retarget the residency ceiling (governor path).
+
+        Shrink evicts LRU-tail rows until the resident set fits the new
+        cap; grow past the physical row count reallocs the slot tensors
+        in two phases — the new arrays are built and evaluated BEFORE
+        the rebind, so a failure keeps the old storage serving (same
+        contract as the V4.1 ``_ExpertSlots`` grow).
+        """
+        with self._lock:
+            cap = max(1, min(int(cap), self.n_experts))
+            if cap > self.rooms:
+                grown: dict[str, list] = {}
+                for name in self.projs:
+                    rw, rs, rb = self.resident[name]
+                    nw = mx.zeros((cap,) + rw.shape[1:], dtype=rw.dtype)
+                    ns = mx.zeros((cap,) + rs.shape[1:], dtype=rs.dtype)
+                    nb = (
+                        None
+                        if rb is None
+                        else mx.zeros((cap,) + rb.shape[1:], dtype=rb.dtype)
+                    )
+                    nw[: self.rooms] = rw
+                    ns[: self.rooms] = rs
+                    if nb is not None:
+                        nb[: self.rooms] = rb
+                    grown[name] = [nw, ns, nb]
+                mx.eval(
+                    *[
+                        a
+                        for triple in grown.values()
+                        for a in triple
+                        if a is not None
+                    ]
+                )
+                self.resident = grown
+                self.book.grew_to(cap)
+            self.capacity = cap
+            self.book.trim_to_cap(
+                (), on_evict=lambda v: self.map.__setitem__(v, -1)
+            )
+            self.warm = len(self.slot_of) == self.n_experts
+
+    def clear(self) -> None:
+        """Drop all residency (governor pressure path)."""
+        with self._lock:
+            self.book.reset()
+            self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
+            self.warm = False
 
     def qmm(
         self, name: str, x: mx.array, slots: mx.array, sorted_indices: bool = False
@@ -303,6 +463,10 @@ class OffloadSwitchGLU(nn.Module):
         super().__init__()
         self.cache = ExpertCache(glu, capacity, disk)
         self.activation = glu.activation
+        # Governor wiring (set post-wrap by _apply_legacy_adapter): the
+        # shared LegacyOffloadState and this layer's index inside it.
+        self._state = None
+        self._layer = -1
 
     def _forward(self, x: mx.array, indices: mx.array) -> mx.array:
         c = self.cache
@@ -333,8 +497,8 @@ class OffloadSwitchGLU(nn.Module):
         of up to ``capacity`` distinct experts, the same shape as the
         DeepSeek V4.1 adapter's sorted prefill: an expert's routes all land
         in one chunk, so each expert is installed at most once per call
-        (the token-chunked path re-fetched an expert in every chunk that
-        touched it, evicting on the way). Routes within a chunk are
+        (token-chunked would re-fetch an expert in every chunk that touched
+        it, evicting on the way). Routes within a chunk are
         independent — the cross-expert weighted sum happens in the caller —
         so the chunk runs with one expert index per route, under the kernel
         the resident model would choose for the whole call (sorted at or
@@ -377,18 +541,28 @@ class OffloadSwitchGLU(nn.Module):
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         # A single _forward must have every expert it routes to resident AT
         # ONCE: a long prefill can route to more distinct experts than the
-        # cache holds, in which case earlier installs would be evicted before
-        # the gather runs and their slots would read garbage. Decode (working
-        # set = batch x top_k) takes the no-sync fast path; larger calls pay
-        # one readback to decide, and go expert-major only when the distinct
-        # working set genuinely exceeds capacity.
+        # cache holds, in which case earlier installs would be evicted
+        # before the gather runs and their slots would read garbage. Chunk
+        # the routes on expert boundaries so each expert is installed at
+        # most once per call. Decode (working set = batch x top_k) takes
+        # the no-sync fast path.
         c = self.cache
         flat_i = indices.reshape(-1, indices.shape[-1])
         n_tok, k = flat_i.shape
         if k > c.capacity:
             raise ValueError("Expert cache capacity is smaller than routing top-k")
-        if n_tok * k <= c.capacity or n_tok == 1:
-            return self._forward(x, indices)
+        if n_tok * k <= c.capacity:
+            before = c.misses
+            out = self._forward(x, indices)
+            state = self._state
+            if n_tok == 1 and state is not None:
+                # Decode-shaped visit: one routed row per call, the unit
+                # the governor's hunger window counts (same contract as
+                # the V4.1 OffloadedExpert note_visit).
+                state.note_visit(self._layer, c.misses > before)
+            return out
+        # One host sync for the whole routing matrix; the distinct-set runs
+        # on it — re-tolist()ing every mx slice would be a device sync each.
         ids = flat_i.reshape(-1).tolist()
         if len(set(ids)) <= c.capacity:
             return self._forward(x, indices)
@@ -397,6 +571,178 @@ class OffloadSwitchGLU(nn.Module):
         # every chunk runs the kernel the resident model would have used.
         out = self._forward_expert_major(flat_x, ids, k, indices.size >= 64)
         return out.reshape(indices.shape + (x.shape[-1],))
+
+
+class _LegacyCacheStats(DecodeVisitStats):
+    """Cumulative decode-visit counters for governor windows.
+
+    The shared contract class (``expert_streaming.slot_cache``) is the
+    shape ``ExpertResidencyGovernor._window`` duck-reads — same fields the
+    V4.1 backing and the unified CacheStats expose.
+    """
+
+    pass
+
+
+class LegacyOffloadState:
+    """Governor-facing cache over the legacy per-layer ``ExpertCache``s.
+
+    Same duck-type ``V41StreamingBacking`` presents to
+    ``ExpertResidencyGovernor`` — ``capacity`` / ``resize`` / ``clear`` /
+    ``set_layer_caps`` / ``layer_cap_overrides`` / ``stats`` — so one
+    policy drives both partitioned backends. Units are per-layer like
+    V4.1: ``per_slot`` is one resident row in every wrapped layer, the
+    governor sees ``num_layers=1``, and ``capacity`` reports the uniform
+    per-layer base. Attached to the model as ``_moe_offload_legacy_state``;
+    the scheduler still finds the ``CheckpointExpertStore`` marker for
+    request serialization (the guard's mini-bank transient does not apply
+    to these persistent slot buffers).
+    """
+
+    def __init__(
+        self,
+        caches: list,
+        *,
+        dynamic: bool = True,
+        max_budget_bytes: int | None = None,
+        min_budget_bytes: int | None = None,
+        stall_target: float | None = None,
+        min_cap: int | None = None,
+    ) -> None:
+        self._lock = threading.RLock()
+        self.caches = list(caches)
+        self.num_layers = len(self.caches)
+        self.per_slot = max(
+            1,
+            sum(
+                max(1, int(getattr(c, "per_expert_bytes", 0) or 0))
+                for c in self.caches
+            ),
+        )
+        self.base_cap = (
+            min(int(c.capacity) for c in self.caches) if self.caches else 0
+        )
+        self.overrides: dict = {}
+        self.stats = _LegacyCacheStats()
+        self.governor = None
+        if not dynamic or not self.caches:
+            return
+        try:
+            from .expert_streaming.governor import (
+                ExpertResidencyGovernor,
+                _max_dynamic_budget_bytes,
+            )
+
+            initial_total = self.base_cap * self.per_slot
+            gov_max = (
+                int(max_budget_bytes)
+                if max_budget_bytes is not None
+                else _max_dynamic_budget_bytes()
+            )
+            gov_min = (
+                int(min_budget_bytes)
+                if min_budget_bytes is not None
+                else max(int(0.25 * 1024**3), initial_total // 4)
+            )
+            # Never shrink a layer below one token's decode working set:
+            # the wrap-time capacity already floors at the model's routing
+            # top-k, and going below it turns every step into a fetch
+            # storm.
+            floor = (
+                int(min_cap)
+                if min_cap is not None
+                else min(8, self.base_cap)
+            )
+            kwargs = {}
+            if stall_target is not None:
+                kwargs["stall_target"] = stall_target
+            self.governor = ExpertResidencyGovernor(
+                self,
+                self.per_slot,
+                1,
+                max(gov_max, initial_total),
+                min_budget_bytes=gov_min,
+                min_cap=max(1, floor),
+                **kwargs,
+            )
+            logger.info(
+                "moe expert offload: dynamic residency governor armed "
+                "(per-layer %d slots, min %d, max %.2f GiB)",
+                self.base_cap,
+                self.governor._min_cap_slots(),
+                self.governor.max_budget_bytes / 1024**3,
+            )
+        except Exception:
+            logger.debug("legacy governor arming failed", exc_info=True)
+            self.governor = None
+
+    # -- governor duck-type ------------------------------------------------
+    def resize(self, cap: int, per_layer: int | None) -> None:
+        """Retarget the uniform per-layer base (atomic under the lock)."""
+        want = max(1, int(per_layer if per_layer is not None else cap))
+        with self._lock:
+            self.base_cap = want
+            self.overrides = {}
+            for cache in self.caches:
+                cache.resize(want)
+
+    def clear(self) -> None:
+        with self._lock:
+            for cache in self.caches:
+                cache.clear()
+
+    def set_layer_caps(self, caps: dict) -> None:
+        with self._lock:
+            self.overrides = {int(k): max(1, int(v)) for k, v in caps.items()}
+            for idx, cache in enumerate(self.caches):
+                cache.resize(self.overrides.get(idx, self.base_cap))
+
+    def layer_cap_overrides(self) -> dict:
+        return dict(self.overrides)
+
+    @property
+    def capacity(self) -> int:
+        # Per-layer-units contract (see class docstring).
+        return self.base_cap
+
+    @property
+    def evictions(self) -> int:
+        return sum(c.evictions for c in self.caches)
+
+    # No ``streaming_guard_info``: the scheduler's prefill-bank transient
+    # exists for the generic path's lazy mini-banks; the legacy slot
+    # buffers are persistent and pre-allocated, so that term does not
+    # apply. The scheduler reads it via getattr-with-default.
+    def note_visit(self, layer_idx: int, missed: bool) -> None:
+        # Called by OffloadSwitchGLU.__call__ AFTER the cache lock is
+        # released — taking the state lock here keeps the order
+        # cache._lock then state._lock impossible to invert.
+        with self._lock:
+            self.stats.note_visit(layer_idx, missed)
+
+    def summary(self) -> dict:
+        # The governor snapshot runs OUTSIDE the state lock on purpose:
+        # governor.summary() takes gov._lock while observe()/tick() hold
+        # gov._lock across cache.resize() -> state._lock. Taking the
+        # state lock first here would invert the mandated
+        # governor->cache order and AB-BA deadlock against a tick; the
+        # governor numbers don't need the state lock anyway.
+        gov = self.governor.summary() if self.governor else {}
+        with self._lock:
+            hits = sum(c.hits for c in self.caches)
+            misses = sum(c.misses for c in self.caches)
+            resident = sum(len(c.slot_of) for c in self.caches)
+        total = hits + misses
+        return {
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": (hits / total) if total else 0.0,
+            "evictions": self.evictions,
+            "resident": resident,
+            "capacity_per_layer": self.base_cap,
+            "layers": self.num_layers,
+            "governor": gov,
+        }
 
 
 def _resolve_model_dir(model_path: str | Path) -> Path | None:
@@ -506,19 +852,32 @@ def _resolve_store_view(
             ["biases"] if lin.get("biases") is not None else []
         )
 
-    stacked = _GLUStoreView(store, path)
     parent = path.rsplit(".", 1)[0] if "." in path else ""
-    view = (
-        stacked
-        if stacked.has("gate_proj", "weight")
-        else _GLUStoreView(store, parent, per_expert=True)
-    )
+    # Stacked scheme first (exact spelling, then de-nested checkpoint
+    # spelling), then per-expert. The first probe hit wins; the loop below
+    # validates it strictly. Falling through to an exact-spelling
+    # per-expert view keeps the decline reason pointing at a concrete path
+    # when the checkpoint has neither scheme.
+    view: _GLUStoreView | None = None
+    for cand in _checkpoint_prefixes(path):
+        stacked = _GLUStoreView(store, cand)
+        if stacked.has("gate_proj", "weight"):
+            view = stacked
+            break
+    if view is None:
+        for cand in _checkpoint_prefixes(parent):
+            per_expert = _GLUStoreView(store, cand, per_expert=True)
+            if per_expert.has("gate_proj", "weight"):
+                view = per_expert
+                break
+    if view is None:
+        view = _GLUStoreView(store, parent, per_expert=True)
 
     for proj in _PROJS:
         lin = getattr(glu, proj)
         for field in fields_of[proj]:
             module_shape = tuple(lin[field].shape)
-            if view is stacked:
+            if not view._per_expert:
                 checks = [(view._name(proj, field, 0), module_shape)]
             else:
                 checks = [
@@ -536,7 +895,10 @@ def _resolve_store_view(
 
 
 def apply_moe_expert_offload(
-    model, model_path: str | Path, resident_fraction: float = 0.25
+    model,
+    model_path: str | Path,
+    resident_fraction: float = 0.25,
+    model_settings=None,
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
@@ -544,9 +906,49 @@ def apply_moe_expert_offload(
     ``OMLX_MOE_EXPERT_OFFLOAD=0``, the model has no stock SwitchGLU, or the
     checkpoint does not cover them). Must run before lazy weights are
     materialized for the memory saving to exist.
+
+    Alias contract (unified backend): ``moe_expert_offload_*`` remain
+    supported load-time keys. On model types covered by expert_streaming
+    they are served by that stack (fraction = initial budget, dynamic
+    governor on); elsewhere the legacy adapter runs unchanged.
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return 0
+    # Unified backend: model types covered by expert_streaming route
+    # to our stack — the resident fraction becomes the INITIAL budget and
+    # the dynamic governor adapts from there. The legacy fetch-on-miss
+    # adapter below stays for gemma4/olmoe (and any layout it alone
+    # supports); DeepSeek V4.1 never reaches here (own loader + adapter in
+    # patches/deepseek_v41). Falls through to legacy when streaming
+    # converts nothing, so behavior never regresses by accident.
+    if _streaming_owns_model(model_path):
+        routed = _apply_via_streaming(
+            model, model_path, resident_fraction, model_settings
+        )
+        if routed:
+            return routed
+        logger.info(
+            "moe expert offload: streaming backend converted nothing for "
+            "%s; falling back to the legacy fetch-on-miss adapter",
+            model_path,
+        )
+    return _apply_legacy_adapter(
+        model, model_path, resident_fraction, model_settings
+    )
+
+
+def _apply_legacy_adapter(
+    model,
+    model_path: str | Path,
+    resident_fraction: float = 0.25,
+    model_settings=None,
+) -> int:
+    """Legacy fetch-on-miss adapter (legacy-owned types + unit tests).
+
+    Unchanged behavior: wraps covered stock SwitchGLUs in OffloadSwitchGLU.
+    Must run before lazy weights are materialized for the memory saving
+    to exist.
+    """
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
         return 0
@@ -557,6 +959,7 @@ def apply_moe_expert_offload(
         return 0
 
     wrapped = 0
+    wrapped_mods: list = []
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
         view, reason = _resolve_store_view(glu, store, path)
@@ -577,17 +980,57 @@ def apply_moe_expert_offload(
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
         new = OffloadSwitchGLU(glu, capacity, view)
+        new._layer = wrapped  # wrap order == LegacyOffloadState index
         if isinstance(parent, nn.Module):
             setattr(parent, key, new)  # registers via Module.__setattr__
         else:
             parent[key] = new  # plain list / plain dict
+        wrapped_mods.append(new)
         wrapped += 1
         # Dropped source buffers land in the MLX pool, which the server pins
-        # to total RAM, so drain per layer to bound the load transient
-        # (same reasoning as the gate/up fusion patch, #2304).
+        # to total RAM, so drain per layer to bound the load transient.
         _sync_and_clear_cache()
 
     if wrapped:
+        try:
+            # The scheduler serializes requests on this marker — concurrent
+            # requests would thrash an LRU sized for a single stream. The
+            # store doubles as the shutdown
+            # handle — shutdown_expert_streaming() calls close() on it.
+            model._expert_streaming_backing = store  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            # Governor-facing aggregate over the per-layer caches (same
+            # duck-type as the V4.1 backing): pressure shrinks/clears the
+            # ceilings, proven decode hunger grows them. Precedence is the
+            # shared _dynamic_armed rule — explicit setting > env > auto.
+            from .expert_streaming import _dynamic_armed, _io_overrides
+
+            io_ov = _io_overrides(model_settings)
+            _mg = io_ov.get("expert_streaming_dynamic_max_gib")
+            _ng = io_ov.get("expert_streaming_dynamic_min_gib")
+            state = LegacyOffloadState(
+                [m.cache for m in wrapped_mods],
+                dynamic=_dynamic_armed(
+                    io_ov.get("expert_streaming_dynamic"), model_settings
+                ),
+                max_budget_bytes=(
+                    int(_mg * 1024**3) if _mg is not None else None
+                ),
+                min_budget_bytes=(
+                    int(_ng * 1024**3) if _ng is not None else None
+                ),
+                stall_target=io_ov.get(
+                    "expert_streaming_dynamic_stall_target"
+                ),
+                min_cap=minimum,
+            )
+            for m in wrapped_mods:
+                m._state = state
+            model._moe_offload_legacy_state = state  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("legacy offload state wiring failed", exc_info=True)
         logger.info(
             "moe expert offload: wrapped %d layers at %.1f%% residency "
             "(expert tables: %.2f GB total, %.2f GB resident)",
@@ -596,6 +1039,126 @@ def apply_moe_expert_offload(
             total_bytes / 1e9,
             resident_bytes / 1e9,
         )
+    return wrapped
+
+
+def _read_config_model_type(model_path: str | Path) -> str | None:
+    """Effective config model_type (top level wins, text_config fallback)."""
+    try:
+        model_dir = _resolve_model_dir(model_path)
+        if model_dir is None:
+            return None
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+        for cand in (cfg, cfg.get("text_config") or {}):
+            mt = cand.get("model_type")
+            if mt:
+                return str(mt)
+    except Exception:
+        return None
+    return None
+
+
+def _streaming_owns_model(model_path: str | Path) -> bool:
+    """True when expert_streaming covers this model type (unified backend)."""
+    try:
+        from .expert_streaming.residency import (
+            SUPPORTED_TYPES,
+            normalize_model_type,
+        )
+    except Exception:
+        return False
+    mt = _read_config_model_type(model_path)
+    return bool(mt) and normalize_model_type(mt) in SUPPORTED_TYPES
+
+
+def _apply_via_streaming(
+    model,
+    model_path: str | Path,
+    resident_fraction: float,
+    model_settings=None,
+) -> int:
+    """Convert via the expert_streaming stack; 0 when it converts nothing."""
+    import dataclasses
+
+    from .expert_streaming import convert_model_to_streaming
+    from .expert_streaming.residency import expert_streaming_estimate
+    from ..model_settings import ModelSettings
+
+    est = expert_streaming_estimate(str(model_path))
+    if not est.supported:
+        return 0
+    if getattr(model, "_expert_streaming_backing", None) is not None:
+        # Already converted by the engine's direct streaming path (both
+        # engines stamp the backing on the model): do NOT reconvert —
+        # just report the layer count so fusion-skip/materialize logic
+        # downstream keeps working. Canonical keys win on double opt-in.
+        return int(est.num_moe_layers or 0)
+    table_gib = float(est.expert_bytes or 0) / 1024**3
+    if table_gib > 0:
+        # Honor the user's chosen residency as the STARTING budget; the
+        # governor adapts from there (dynamic=True forces it over a pin).
+        budget_gib: float | None = max(
+            0.5, min(64.0, float(resident_fraction) * table_gib)
+        )
+    else:
+        budget_gib = None  # unknown tables: RAM-scaled auto budget
+    if isinstance(model_settings, ModelSettings):
+        # The alias contract must not discard the user's streaming
+        # tunables (io_depth, pins, cache policy, governor knobs): clone
+        # the original settings and force only the fields the alias owns
+        # — enabled, a translated budget when none is pinned, and the
+        # dynamic governor's default-on.
+        overrides: dict = {"expert_streaming_enabled": True}
+        if getattr(model_settings, "expert_streaming_dynamic", None) is None:
+            overrides["expert_streaming_dynamic"] = True
+        if (
+            budget_gib is not None
+            and not any(
+                getattr(model_settings, a, None) is not None
+                for a in (
+                    "expert_streaming_budget_gib",
+                    "expert_cache_budget_gib",
+                    "expert_streaming_budget_mib",
+                    "expert_cache_budget_mib",
+                )
+            )
+        ):
+            overrides["expert_streaming_budget_gib"] = budget_gib
+        settings = dataclasses.replace(model_settings, **overrides)
+    else:
+        settings = ModelSettings(
+            expert_streaming_enabled=True,
+            expert_streaming_budget_gib=budget_gib,
+            expert_streaming_dynamic=True,
+        )
+    try:
+        _, backing = convert_model_to_streaming(model, model_path, settings)
+    except Exception:
+        # Never crash a load the legacy adapter could still serve: fall
+        # through to it.
+        logger.warning(
+            "moe expert offload: streaming backend failed for %s; falling "
+            "back to the legacy fetch-on-miss adapter",
+            model_path,
+            exc_info=True,
+        )
+        return 0
+    if backing is None:
+        return 0
+    try:
+        # Keep mmap readers alive for the model lifetime (cf. batched.py).
+        model._expert_streaming_backing = backing  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    wrapped = int(est.num_moe_layers or 0)
+    logger.info(
+        "moe expert offload: unified backend (expert_streaming) converted "
+        "%d layers (initial budget %s from %.0f%% residency, dynamic "
+        "governor on)",
+        wrapped,
+        f"{budget_gib:.2f} GiB" if budget_gib else "auto",
+        100 * float(resident_fraction),
+    )
     return wrapped
 
 
@@ -626,15 +1189,41 @@ def estimate_offload_admission_bytes(
         config_path = Path(model_dir) / "config.json"
         if config_path.exists():
             kind = json.loads(config_path.read_text()).get("model_type", "")
-            if kind.startswith("deepseek_v4") or kind in ("glm5_next", "glm_moe_dsa"):
+            # Unified-streaming types: the converter serves any stacked
+            # expert bank (quantized or dense), so savings come from the
+            # structural estimate — the regex mirror below only describes
+            # the legacy adapter's quantized-only contract.
+            try:
+                from .expert_streaming.residency import (
+                    SUPPORTED_TYPES as _STREAMING_TYPES,
+                    expert_streaming_estimate,
+                    normalize_model_type,
+                )
+
+                if normalize_model_type(kind) in _STREAMING_TYPES:
+                    est = expert_streaming_estimate(model_dir)
+                    if not est.supported or est.experts_per_layer <= 0:
+                        return full_size
+                    n = int(est.experts_per_layer)
+                    capacity = min(
+                        n, max(minimum, round(n * resident_fraction))
+                    )
+                    saved = int(
+                        est.expert_bytes * (1.0 - capacity / n)
+                    )
+                    return full_size - saved if saved > 0 else full_size
+            except Exception:
+                logger.debug(
+                    "streaming-estimate admission fallback failed",
+                    exc_info=True,
+                )
+            if kind == "deepseek_v41":
                 return full_size
         # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
         # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
         # Field completeness is tracked PER EXPERT, not container-wide: the
         # wrapper verifies every expert's tensors, so one complete expert
-        # must not vouch for 31 incomplete ones (reported: 1 complete + 31
-        # gate-only experts estimated 972,736 from 1,000,000 while zero
-        # modules wrapped).
+        # must not vouch for 31 incomplete ones.
         stacked: dict[str, dict] = {}
         per_expert: dict[str, dict] = {}
 
@@ -703,8 +1292,7 @@ def materialize_offload_state(model) -> int:
     attributes, so the engine's ``materialize_lazy_state`` walk never reaches
     them. Left lazy, they stay bound to the loader thread's stream and the
     first request from another thread dies with ``RuntimeError: There is no
-    Stream(gpu, N) in current thread``. Reproduced live on a 24GB M5 Pro the
-    moment the VLM path ran with offload enabled. Call this right after
+    Stream(gpu, N) in current thread``. Call this right after
     ``apply_moe_expert_offload``; returns the number of layers materialized.
     """
     arrays = []

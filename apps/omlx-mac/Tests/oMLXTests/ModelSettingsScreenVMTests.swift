@@ -35,6 +35,41 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
     }
 
+    func testExpertStreamingBlocksSpeculativeTogglesExceptMtpOnDeepseekV41() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "moe", configModelType: "qwen3_5_moe")
+        vm.expertStreamingEnabled = true
+
+        XCTAssertNotNil(vm.mtpConflictReason)
+        XCTAssertNotNil(vm.vlmMtpConflictReason)
+
+        // deepseek_v41 runs DSpark verify under frozen residency — the
+        // backend permits Lightning MTP under expert offload there
+        // (validate_moe_expert_offload); VLM MTP is never exempt.
+        vm.model = makeModel(id: "v41", configModelType: "deepseek_v41")
+        XCTAssertNil(vm.mtpConflictReason)
+        XCTAssertNotNil(vm.vlmMtpConflictReason)
+    }
+
+    func testLightningMtpBlocksExpertStreamingUnlessSupportedOrV41() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        vm.expertStreamingSupported = false
+        vm.model = makeModel(id: "legacy", configModelType: "olmoe")
+        XCTAssertNotNil(vm.expertStreamingConflictReason)
+
+        // The unified streaming backend converts MTP-stage MoE banks on
+        // the types it owns, so MTP+streaming is supported there.
+        vm.expertStreamingSupported = true
+        XCTAssertNil(vm.expertStreamingConflictReason)
+
+        // deepseek_v41 stays exempt even though only the legacy adapter
+        // serves it (expertStreamingSupported is false for that type).
+        vm.expertStreamingSupported = false
+        vm.model = makeModel(id: "v41", configModelType: "deepseek_v41")
+        XCTAssertNil(vm.expertStreamingConflictReason)
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"
@@ -473,6 +508,12 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             qwen4PleSsdOffloadForced: nil,
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
+            expertStreamingSupported: nil,
+            moeExpertOffloadSupported: nil,
+            deepseekV41EngramSsdOffloadSupported: nil,
+            deepseekV41EngramSsdOffloadForced: nil,
+            deepseekV41EngramResidentBytes: nil,
+            deepseekV41EngramMmapBytes: nil,
             virtual: nil,
             settings: nil
         )

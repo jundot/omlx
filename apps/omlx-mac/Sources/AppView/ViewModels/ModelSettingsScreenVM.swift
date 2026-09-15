@@ -29,6 +29,10 @@ final class ModelSettingsScreenVM {
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, qwen4PleSsdOffload
+        case expertStreamingEnabled, moeExpertResidentFraction, engramSsdOffload
+        case expertBudgetAuto, expertBudgetGib
+        case expertDynamicMode, expertDynamicMaxGib
+        case expertDynamicMinGib, expertDynamicStall, expertPrefillGib
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -243,6 +247,31 @@ final class ModelSettingsScreenVM {
     var qwen4PleSsdOffload: Bool = false
     var qwen4PleSsdOffloadSupported: Bool = false
     var qwen4PleSsdOffloadForced: Bool = false
+    // MoE expert streaming (unified backend; also serves the legacy
+    // moe_expert_offload_* alias on save — see the WebUI modal).
+    var expertStreamingEnabled: Bool = false
+    /// True for the legacy-adapter-only types (deepseek_v41 / gemma4 /
+    /// olmoe) the unified streaming converter doesn't own. The expert
+    /// section gates on `expertStreamingSupported || this`; the resident
+    /// fraction row shows only for these.
+    var moeExpertOffloadSupported: Bool = false
+    // Legacy-adapter resident fraction (0,1] as a select string.
+    var moeExpertResidentFraction: String = "0.25"
+    // DeepSeek V4.1 Engram SSD offload (per-model; mirrors the Qwen4 PLE row).
+    var engramSsdOffload: Bool = false
+    var engramSsdOffloadSupported: Bool = false
+    var engramSsdOffloadForced: Bool = false
+    // Dynamic expert budget (auto default, user-overridable). Gib/stall
+    // fields are strings: empty = auto/cleared, numeric = pinned.
+    // expertDynamicMode: 0 = auto, 1 = on, 2 = off.
+    var expertBudgetAuto: Bool = true
+    var expertBudgetGib: String = ""
+    var expertDynamicMode: Int = 0
+    var expertDynamicMaxGib: String = ""
+    var expertDynamicMinGib: String = ""
+    var expertDynamicStall: String = ""
+    var expertPrefillGib: String = ""
+    var expertStreamingSupported: Bool = false
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -420,12 +449,55 @@ final class ModelSettingsScreenVM {
             .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
     }
 
+    var isDeepseekV41: Bool {
+        // Prefix match, not exact — the backend (model_settings.py:96)
+        // and WebUI both exempt deepseek_v41* variants; an exact ==
+        // would diverge if a deepseek_v41_* type ever ships.
+        (model?.configModelType ?? "")
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .hasPrefix("deepseek_v41")
+    }
+
+    /// Why the expert-streaming toggle is locked, mirroring the server's
+    /// exclusivity contract (validate_moe_expert_offload): DFlash and VLM
+    /// MTP never run the streaming converter; Lightning MTP is supported
+    /// only where the unified streaming backend owns the model type —
+    /// and on deepseek_v41, whose DSpark verify runs under frozen
+    /// residency (the legacy adapter suspends LRU reordering in verify).
+    var expertStreamingConflictReason: String? {
+        if dflashEnabled {
+            return String(localized: "settings.expert_streaming.conflict.dflash",
+                          defaultValue: "Disable DFlash before enabling expert streaming.",
+                          comment: "Sublabel/tooltip when expert streaming can't be enabled because DFlash is on")
+        }
+        if vlmMtpEnabled {
+            return String(localized: "settings.expert_streaming.conflict.vlm_mtp",
+                          defaultValue: "Disable VLM MTP before enabling expert streaming.",
+                          comment: "Sublabel/tooltip when expert streaming can't be enabled because VLM MTP is on")
+        }
+        if mtpEnabled && !expertStreamingSupported && !isDeepseekV41 {
+            return String(localized: "settings.expert_streaming.conflict.mtp",
+                          defaultValue: "Disable Lightning MTP before enabling expert streaming on this model.",
+                          comment: "Sublabel/tooltip when expert streaming can't be enabled because Lightning MTP is on for a legacy-only model")
+        }
+        return nil
+    }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .qwen4PleSsdOffload,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
+            return true
+        case .expertStreamingEnabled, .moeExpertResidentFraction,
+             .engramSsdOffload,
+             .expertBudgetAuto, .expertBudgetGib,
+             .expertDynamicMode, .expertDynamicMaxGib,
+             .expertDynamicMinGib, .expertDynamicStall, .expertPrefillGib:
+            // MoE expert streaming targets MoE language models; the
+            // fused bank never applies to diffusion models.
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
@@ -571,6 +643,39 @@ final class ModelSettingsScreenVM {
                     m.qwen4PleSsdOffloadSupported ?? false
                 self.qwen4PleSsdOffload = self.qwen4PleSsdOffloadForced
                     || (s?.qwen4PleSsdOffload ?? false)
+                self.expertStreamingSupported =
+                    m.expertStreamingSupported ?? false
+                self.moeExpertOffloadSupported =
+                    m.moeExpertOffloadSupported ?? false
+                // Effective enable ORs the legacy alias — the server
+                // routes both into the same unified backend.
+                self.expertStreamingEnabled =
+                    (s?.expertStreamingEnabled ?? false)
+                    || (s?.moeExpertOffloadEnabled ?? false)
+                self.moeExpertResidentFraction =
+                    s?.moeExpertOffloadResidentFraction.map { String($0) } ?? "0.25"
+                self.engramSsdOffloadSupported =
+                    m.deepseekV41EngramSsdOffloadSupported ?? false
+                self.engramSsdOffloadForced =
+                    m.deepseekV41EngramSsdOffloadForced ?? false
+                self.engramSsdOffload = self.engramSsdOffloadForced
+                    || (s?.deepseekV41EngramSsdOffload ?? false)
+                self.expertBudgetAuto =
+                    s?.expertStreamingBudgetAuto ?? true
+                self.expertBudgetGib =
+                    s?.expertStreamingBudgetGib.map { String($0) } ?? ""
+                self.expertDynamicMode = {
+                    guard let v = s?.expertStreamingDynamic else { return 0 }
+                    return v ? 1 : 2
+                }()
+                self.expertDynamicMaxGib =
+                    s?.expertStreamingDynamicMaxGib.map { String($0) } ?? ""
+                self.expertDynamicMinGib =
+                    s?.expertStreamingDynamicMinGib.map { String($0) } ?? ""
+                self.expertDynamicStall =
+                    s?.expertStreamingDynamicStallTarget.map { String($0) } ?? ""
+                self.expertPrefillGib =
+                    s?.expertStreamingPrefillBudgetGib.map { String($0) } ?? ""
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -718,6 +823,90 @@ final class ModelSettingsScreenVM {
             guard isQwen4Exp, qwen4PleSsdOffloadSupported,
                   !qwen4PleSsdOffloadForced else { return }
             patch.qwen4PleSsdOffload = qwen4PleSsdOffload
+        case .expertStreamingEnabled:
+            guard expertStreamingSupported || moeExpertOffloadSupported else { return }
+            // Mirror the server contract — never arm streaming while an
+            // incompatible speculative decoder is on (validate_*
+            // would reject the PUT after the switch already flipped).
+            if expertStreamingEnabled, expertStreamingConflictReason != nil { return }
+            patch.expertStreamingEnabled = expertStreamingEnabled
+            // Migrate the legacy alias off on every explicit save so a
+            // stored `true` cannot re-arm offload (WebUI sends the same pair).
+            patch.moeExpertOffloadEnabled = false
+        case .moeExpertResidentFraction:
+            guard moeExpertOffloadSupported else { return }
+            guard let v = Double(moeExpertResidentFraction), v > 0, v <= 1 else {
+                lastError = "Resident fraction must be a number in (0, 1]."
+                return
+            }
+            patch.moeExpertOffloadResidentFraction = v
+        case .engramSsdOffload:
+            guard isDeepseekV41, engramSsdOffloadSupported,
+                  !engramSsdOffloadForced else { return }
+            patch.deepseekV41EngramSsdOffload = engramSsdOffload
+        case .expertBudgetAuto:
+            guard expertStreamingSupported else { return }
+            patch.expertStreamingBudgetAuto = expertBudgetAuto
+        case .expertBudgetGib:
+            guard expertStreamingSupported else { return }
+            // Empty clears the pin back to auto (JSON null); a number pins
+            // manual mode (an explicit budget always wins over auto
+            // server-side, including 0 = page-cache only).
+            if expertBudgetGib.isEmpty {
+                patch.expertStreamingBudgetGib = .some(nil)
+            } else if let v = Double(expertBudgetGib), v >= 0, v <= 64 {
+                patch.expertStreamingBudgetGib = .some(v)
+            } else {
+                lastError = "Expert budget must be a number in [0, 64] GiB."
+                return
+            }
+        case .expertDynamicMode:
+            guard expertStreamingSupported else { return }
+            switch expertDynamicMode {
+            case 1: patch.expertStreamingDynamic = .some(true)
+            case 2: patch.expertStreamingDynamic = .some(false)
+            default: patch.expertStreamingDynamic = .some(nil) // auto
+            }
+        case .expertDynamicMaxGib:
+            guard expertStreamingSupported else { return }
+            if expertDynamicMaxGib.isEmpty {
+                patch.expertStreamingDynamicMaxGib = .some(nil)
+            } else if let v = Double(expertDynamicMaxGib), v > 0, v <= 64 {
+                patch.expertStreamingDynamicMaxGib = .some(v)
+            } else {
+                lastError = "Governor ceiling must be a number in (0, 64] GiB."
+                return
+            }
+        case .expertDynamicMinGib:
+            guard expertStreamingSupported else { return }
+            if expertDynamicMinGib.isEmpty {
+                patch.expertStreamingDynamicMinGib = .some(nil)
+            } else if let v = Double(expertDynamicMinGib), v >= 0, v <= 64 {
+                patch.expertStreamingDynamicMinGib = .some(v)
+            } else {
+                lastError = "Governor floor must be a number in [0, 64] GiB."
+                return
+            }
+        case .expertDynamicStall:
+            guard expertStreamingSupported else { return }
+            if expertDynamicStall.isEmpty {
+                patch.expertStreamingDynamicStallTarget = .some(nil)
+            } else if let v = Double(expertDynamicStall), v >= 0, v <= 0.9 {
+                patch.expertStreamingDynamicStallTarget = .some(v)
+            } else {
+                lastError = "Stall target must be a number in [0, 0.9]."
+                return
+            }
+        case .expertPrefillGib:
+            guard expertStreamingSupported else { return }
+            if expertPrefillGib.isEmpty {
+                patch.expertStreamingPrefillBudgetGib = .some(nil)
+            } else if let v = Double(expertPrefillGib), v > 0, v <= 64 {
+                patch.expertStreamingPrefillBudgetGib = .some(v)
+            } else {
+                lastError = "Prefill budget must be a number in (0, 64] GiB."
+                return
+            }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:
@@ -1102,6 +1291,15 @@ final class ModelSettingsScreenVM {
                           defaultValue: "Disable VLM MTP before enabling Lightning MTP.",
                           comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
+        // Effective expert offload blocks Lightning MTP (the working
+        // toggle already ORs the served legacy alias) — except on
+        // deepseek_v41, whose DSpark verify runs under frozen residency
+        // (validate_moe_expert_offload exempts it).
+        if expertStreamingEnabled && !isDeepseekV41 {
+            return String(localized: "settings.mtp.conflict.expert_streaming",
+                          defaultValue: "Disable expert streaming before enabling Lightning MTP.",
+                          comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because expert streaming is on")
+        }
         return nil
     }
 
@@ -1128,6 +1326,15 @@ final class ModelSettingsScreenVM {
     /// other speculative-decoding / KV-quant features. Mirrors the HTML
     /// editor's gating so the toggle disables itself and surfaces why.
     var vlmMtpConflictReason: String? {
+        // Effective expert offload never coexists with VLM MTP — the
+        // mlx-vlm MTP loop can't drive the streaming converter, and the
+        // backend rejects either spelling (validate_moe_expert_offload).
+        // No deepseek_v41 exemption here: that covers Lightning MTP only.
+        if expertStreamingEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.expert_streaming",
+                          defaultValue: "Disable expert streaming before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because expert streaming is on")
+        }
         if dflashEnabled {
             return String(localized: "settings.vlm_mtp.conflict.dflash",
                           defaultValue: "Disable DFlash before enabling VLM MTP.",
@@ -1246,6 +1453,47 @@ final class ModelSettingsScreenVM {
 
         // Model-specific — experimental
         if !isDiffusion {
+            // Unified expert streaming (+ legacy adapter fields where the
+            // converter doesn't own the model type). Mirrors the WebUI's
+            // formValuesForProfile: auto budget / dynamic auto are written
+            // as their tri-state values; an explicit GiB pin wins.
+            if expertStreamingSupported || moeExpertOffloadSupported {
+                putBool(ProfileSettingsKey.expertStreamingEnabled, expertStreamingEnabled)
+                // The canonical save migrates the legacy alias off — the
+                // profile carries the same pair so apply() matches.
+                putBool(ProfileSettingsKey.moeExpertOffloadEnabled, false)
+                if moeExpertOffloadSupported && !expertStreamingSupported {
+                    putDouble(ProfileSettingsKey.moeExpertOffloadResidentFraction,
+                              moeExpertResidentFraction)
+                }
+                if expertStreamingSupported {
+                    if !expertBudgetAuto,
+                       let gib = Double(
+                           expertBudgetGib.trimmingCharacters(in: .whitespaces)
+                       ),
+                       !expertBudgetGib.trimmingCharacters(in: .whitespaces).isEmpty {
+                        // Pinned manual budget — wins over budget_auto.
+                        out[ProfileSettingsKey.expertStreamingBudgetGib] = AnyCodable(gib)
+                    } else {
+                        // true = RAM-scaled auto; false = page-cache only.
+                        putBool(ProfileSettingsKey.expertStreamingBudgetAuto,
+                                expertBudgetAuto)
+                    }
+                    switch expertDynamicMode {
+                    case 1: out[ProfileSettingsKey.expertStreamingDynamic] = AnyCodable(true)
+                    case 2: out[ProfileSettingsKey.expertStreamingDynamic] = AnyCodable(false)
+                    default: break // auto — omit
+                    }
+                    putDouble(ProfileSettingsKey.expertStreamingDynamicMaxGib,
+                              expertDynamicMaxGib)
+                    putDouble(ProfileSettingsKey.expertStreamingDynamicMinGib,
+                              expertDynamicMinGib)
+                    putDouble(ProfileSettingsKey.expertStreamingDynamicStallTarget,
+                              expertDynamicStall)
+                    putDouble(ProfileSettingsKey.expertStreamingPrefillBudgetGib,
+                              expertPrefillGib)
+                }
+            }
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
@@ -1439,6 +1687,7 @@ final class ModelSettingsScreenVM {
         let cleanName = "p-" + UUID().uuidString.lowercased().prefix(28)
         guard !displayName.isEmpty, scope != .preset else { return }
         guard validateAneWorkingSettings() else { return }
+        guard validateExpertWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1483,6 +1732,7 @@ final class ModelSettingsScreenVM {
         let targetModelID = modelID
         guard scope != .preset else { return }
         guard validateAneWorkingSettings() else { return }
+        guard validateExpertWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1563,6 +1813,52 @@ final class ModelSettingsScreenVM {
         case .success: return true
         case .failure(let error): lastError = error.message; return false
         }
+    }
+
+    /// Same contract the per-field `save()` path enforces, applied to the
+    /// working-profile write: non-empty numeric strings must parse and sit
+    /// inside the server's bounds (`_validate_expert_streaming_bounds` in
+    /// admin/routes.py). A silent drop would save a profile that doesn't
+    /// match what the editor shows.
+    private func validateExpertWorkingSettings() -> Bool {
+        func invalid(_ message: String) -> Bool {
+            lastError = message
+            return false
+        }
+        func check(_ raw: String, _ range: ClosedRange<Double>,
+                   loOpen: Bool, _ name: String) -> Bool {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { return true }
+            guard let v = Double(t) else {
+                return invalid("\(name) must be a number.")
+            }
+            let ok = loOpen ? (v > range.lowerBound && v <= range.upperBound)
+                            : range.contains(v)
+            let bound = loOpen
+                ? "(\(range.lowerBound), \(range.upperBound)]"
+                : "[\(range.lowerBound), \(range.upperBound)]"
+            return ok ? true : invalid("\(name) must be in \(bound).")
+        }
+        if moeExpertOffloadSupported && !expertStreamingSupported
+            && expertStreamingEnabled {
+            guard let v = Double(
+                moeExpertResidentFraction.trimmingCharacters(in: .whitespaces)
+            ), v > 0, v <= 1 else {
+                return invalid("Resident fraction must be a number in (0, 1].")
+            }
+        }
+        guard expertStreamingSupported else { return true }
+        guard check(expertBudgetGib, 0...64, loOpen: false,
+                    "Expert budget") else { return false }
+        guard check(expertDynamicMaxGib, 0...64, loOpen: true,
+                    "Governor ceiling") else { return false }
+        guard check(expertDynamicMinGib, 0...64, loOpen: false,
+                    "Governor floor") else { return false }
+        guard check(expertDynamicStall, 0...0.9, loOpen: false,
+                    "Stall target") else { return false }
+        guard check(expertPrefillGib, 0...64, loOpen: true,
+                    "Prefill budget") else { return false }
+        return true
     }
 
     /// Discard working changes by reloading the server's view.

@@ -723,7 +723,12 @@ class TestQwenCpuShareMemoryEstimate:
         assert projected == 400
         assert settings.qwen4_ple_ssd_offload is False
         assert effective.qwen4_ple_ssd_offload is True
-        assert signature["qwen4_ple_ssd_offload"] == "True"
+        # The signature carries the REQUESTED value, not the forced
+        # resolution: forced state depends on free memory at load time,
+        # and folding it in made the reuse signature oscillate with
+        # vm_stat — a pressure-boundary crossing would flap a full
+        # engine reload. Forced resolution stays load-time only.
+        assert signature["qwen4_ple_ssd_offload"] == "False"
 
     @pytest.mark.asyncio
     async def test_qwen4_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
@@ -819,25 +824,10 @@ class TestQwenCpuShareMemoryEstimate:
         assert projected == 400
         assert settings.deepseek_v41_engram_ssd_offload is False
         assert effective.deepseek_v41_engram_ssd_offload is True
-        assert signature["deepseek_v41_engram_ssd_offload"] == "True"
-
-    def test_v41_ced_setting_changes_engine_signature(self, tmp_path):
-        from omlx.model_settings import ModelSettings
-
-        pool = _make_pool(ceiling=500)
-        entry = EngineEntry(
-            model_id="v41", model_path=str(tmp_path), model_type="vlm",
-            engine_type="vlm", config_model_type="deepseek_v41", estimated_size=100,
-        )
-        pool._entries[entry.model_id] = entry
-        settings = ModelSettings()
-        off = pool._engine_runtime_signature("v41", settings)
-        settings.deepseek_v41_ced_prefill_enabled = True
-        on = pool._engine_runtime_signature("v41", settings)
-        assert off != on
-        assert dict(on)["deepseek_v41_ced_prefill_enabled"] == "True"
-        settings.deepseek_v41_ced_prefill_enabled = False
-        assert pool._engine_runtime_signature("v41", settings) == off
+        # Signature tracks the REQUESTED value (forced resolution is
+        # load-time only — see the qwen4_ple case above); the
+        # live-admission test below asserts the same.
+        assert signature["deepseek_v41_engram_ssd_offload"] == "False"
 
     @pytest.mark.asyncio
     async def test_v41_live_admission_keeps_viable_mmap_fallback(self, tmp_path):

@@ -87,6 +87,7 @@ from .utils.metal_sync import (
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
     clear_thread_streams,
+    should_clear_cache,
 )
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -1588,6 +1589,48 @@ def _model_declares_llama4(model: Any) -> bool:
     return False
 
 
+def _streaming_backing_of(model: Any) -> Any | None:
+    """Find the ExpertBackingStore anywhere on the model's wrapper chain.
+
+    The converter stamps ``_expert_streaming_backing`` on the object the
+    engine converted — the bare LM for text models, the inner VLM for
+    vision adapters (``language_model``/``model``/``_vlm_model``/
+    ``_language_model`` hops). A bare getattr misses the nested cases:
+    requests would stream without serialization and the prefill guard
+    would never charge the mini-bank transient. The depth cap bounds
+    adapter property loops.
+    """
+    cur: Any = model
+    for _ in range(5):
+        if cur is None:
+            return None
+        backing = getattr(cur, "_expert_streaming_backing", None)
+        if backing is not None:
+            return backing
+        nxt = (
+            getattr(cur, "language_model", None)
+            or getattr(cur, "model", None)
+            or getattr(cur, "_vlm_model", None)
+            or getattr(cur, "_language_model", None)
+        )
+        if nxt is cur:
+            return None
+        cur = nxt
+    return None
+
+
+def _model_uses_expert_streaming(model: Any) -> bool:
+    """Return True if the model was converted to MoE expert streaming.
+
+    The converter attaches the ExpertBackingStore to both the engine and the
+    model object, so its presence is the ground truth — not the per-model
+    setting (which EnginePool may force on, and which the conversion may have
+    declined). Read at Scheduler construction, which happens after the
+    conversion in both engine/batched.py and engine/vlm.py.
+    """
+    return _streaming_backing_of(model) is not None
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -1847,6 +1890,17 @@ class Scheduler:
             logger.info(
                 "Llama 4 detected; serializing requests because ChunkedKVCache "
                 "does not support multi-row batching yet"
+            )
+        # Expert streaming serves one request at a time: the LRU is budgeted
+        # for a single stream's working set and the IO pool is a
+        # process-wide singleton. Both the webUI and the doc promised this
+        # already; until now nothing enforced it, so a concurrent second
+        # request thrashed the cache instead of being queued.
+        self._serialize_streaming_requests = _model_uses_expert_streaming(model)
+        if self._serialize_streaming_requests and self.config.max_num_seqs > 1:
+            logger.info(
+                "Expert streaming detected; serializing requests because the "
+                "expert LRU is budgeted for a single stream"
             )
 
         # Load additional EOS tokens from generation_config.json.
@@ -2428,6 +2482,91 @@ class Scheduler:
         if interval <= 0 or self._step_counter % interval != 0:
             return False
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
+
+    def _clear_cache_if_pool_large(self) -> bool:
+        """Trim the MLX pool, but only once it is big enough to be worth it.
+
+        Fase J Etapa D. Prefill clears the pool at every chunk boundary; on
+        a long streaming prefill that is dozens of unconditional walks of the
+        allocator, and the re-reads they force on the mmap'd expert shards
+        are what Fase G measured as ~8x full-bank re-reads at a 30.4 GiB
+        pool. Gating on pool size keeps the reclaim without the thrash — the
+        threshold (OMLX_EXPERT_STREAMING_CACHE_THRESH, 2 GiB) bounds the
+        steady-state pool.
+
+        Exception: Qwen4 flat prefill accounting (#3465) prices reallocation
+        from what a clear actually releases (record_flat_reclaim), so its
+        first-chunk clear must always run — otherwise reclaim debt stays 0
+        and every later chunk is priced as if nothing can be reallocated.
+
+        The clear itself still goes through _sync_and_clear_cache, so this
+        module keeps one patchable sync-before-clear choke point.
+        Returns True when a clear ran.
+        """
+        if Scheduler._qwen4_prefill_accounting_enabled(self):
+            Scheduler._clear_cache(self)
+            return True
+        if not should_clear_cache():
+            return False
+        _sync_and_clear_cache(self._stream)
+        return True
+
+    def _should_release_streaming_pool(self) -> bool:
+        """Byte-threshold pool release for expert-streaming models.
+
+        Streaming prefills/decodes leave a large freed-but-retained MLX
+        buffer pool (server.py sizes it to total memory) that the 512-step
+        periodic gate never reaches: a <512-step prefill plus a short
+        decode can end without a single release. That pool is real wired
+        memory the OS cannot otherwise reclaim, and on budget-0 expert
+        streaming it evicts the page cache the demand loads depend on
+        (measured 30.4 GiB pool, ~8x full-bank re-reads on an 8k prefill —
+        Fase G). Streaming models therefore release whenever the pool
+        exceeds the same threshold, off the step boundary.
+
+        The threshold (>= 2 GiB) bounds the clear frequency, and every
+        release still goes through ``_sync_and_clear_cache`` (sync before
+        clear, ``_mx_buffer_access_lock``), so the #978/#1040 panic-class
+        gating semantics are preserved.
+        """
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
+        pool = mx.get_cache_memory()
+        if not info:
+            # Diagnostic: the streaming hooks are inert without the backing's
+            # guard info — surface it (rate-limited) whenever the tail runs.
+            now = time.monotonic()
+            if now - getattr(self, "_last_streaming_skip_log", 0.0) > 30.0:
+                self._last_streaming_skip_log = now
+                logger.info(
+                    "Streaming pool release skipped: no streaming guard info "
+                    "on the model tree (pool %.1f GiB)",
+                    pool / 1024**3,
+                )
+            return False
+        if not getattr(self, "_streaming_release_armed_logged", False):
+            self._streaming_release_armed_logged = True
+            logger.info(
+                "Streaming pool release armed: layers=%s experts/layer=%s "
+                "threshold=%.1f GiB (pool %.1f GiB)",
+                info.get("num_moe_layers"),
+                info.get("experts_per_layer"),
+                self._periodic_clear_threshold_bytes() / 1024**3,
+                pool / 1024**3,
+            )
+        return pool > self._periodic_clear_threshold_bytes()
+
+    def _note_streaming_release(self) -> None:
+        """Rate-limited log (30s) for the off-boundary streaming release."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_streaming_release_log", 0.0) < 30.0:
+            return
+        self._last_streaming_release_log = now
+        logger.info(
+            "Streaming pool release: %.1f GiB MLX buffer pool (off-boundary)",
+            mx.get_cache_memory() / 1024**3,
+        )
 
     @staticmethod
     def _collect_arrays_from_extracted_cache(
@@ -3681,7 +3820,8 @@ class Scheduler:
             n_to_process = min(prefill_step_size, remaining)
 
             if processed_tokens == 0:
-                Scheduler._clear_cache(self)
+                # Etapa D: gated — see _clear_cache_if_pool_large.
+                self._clear_cache_if_pool_large()
 
             # Boundary-limited step size
             if boundary_enabled and block_size > 0:
@@ -3724,7 +3864,7 @@ class Scheduler:
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
-            _throttle_pre = get_phys_footprint()
+            _throttle_pre = self._throttle_probe_bytes()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
@@ -3784,7 +3924,7 @@ class Scheduler:
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-            _throttle_post = get_phys_footprint()
+            _throttle_post = self._throttle_probe_bytes()
             if Scheduler._qwen4_prefill_accounting_enabled(self):
                 actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
                     prompt_cache, gathered_core
@@ -3932,7 +4072,12 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            Scheduler._clear_cache(self)
+            # Etapa D: gated on pool size — a long prefill runs this once per
+            # chunk and an unconditional clear each time is what produced the
+            # 30.4 GiB pool / ~8x full-bank re-read pattern of Fase G. The
+            # end-of-prefill clear below stays unconditional so decode always
+            # starts from a trimmed pool.
+            self._clear_cache_if_pool_large()
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
             if getattr(request, "benchmark_trace", False):
@@ -3981,7 +4126,11 @@ class Scheduler:
                     request, prompt_cache, total_tokens
                 )
 
-        Scheduler._clear_cache(self)
+        # Etapa D: deliberately UNGATED. This is the one clear a prefill is
+        # guaranteed to reach, and it is the handoff point to decode — the
+        # steady-state pool must not carry the whole prefill's working set
+        # into the decode loop. Every other clear in this loop is gated.
+        _sync_and_clear_cache(self._stream)
 
         # Restore _rope_deltas after cached VLM prefill (for decode capture)
         if vlm_embeds is not None and _saved_rope_deltas is not None:
@@ -4032,8 +4181,120 @@ class Scheduler:
     # scales with query_len * kv_len, so per-token cost grows with context
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
+
+    # Streaming expert mini-banks: predicted unique experts touched per layer
+    # per chunk, as a fraction of chunk tokens. Measured ~0.145 on qwen4_exp
+    # (215 uniq experts/layer at 1488-token chunks — real-text expert selection
+    # follows a power law and saturates far below 512); 0.2 keeps ~40%
+    # headroom without over-predicting mid-size chunks into guard rejection.
+    # Env-overridable.
+    _STREAMING_BANK_TOKEN_RATIO: float = float(
+        os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.10
+    )
+    # Definitive streaming guard: when a per-layer eval boundary is live the
+    # lazy graph no longer retains one streaming mini-bank per MoE layer,
+    # and charging all of them makes the guard reject/undersize chunks that
+    # would actually fit (the 26 GB term on qwen4_exp; the ~38 GB rejection
+    # of GLM-5.3 benchmark prompts on a 48 GB box whose real peak is ~12 GB).
+    #
+    # DEFAULT ON — the converter publishes a per-model ``boundary_active``
+    # verdict (wrapped qwen decoder, or an inline-honoring decoder such as
+    # Glm5NextDecoderLayer), so trusting it charges what is really live:
+    # min(2, projections) banks plus one activation instead of one bank per
+    # MoE layer. Models with no boundary keep the conservative per-layer
+    # charge. OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT=0 restores the always-
+    # conservative charge (escape hatch; also re-bases chunk admission back
+    # to the pre-fix sizes, hence GEMM shapes/logits, for benchmark
+    # comparability work).
+    _STREAMING_BANK_BOUNDARY_ACCOUNT: bool = (
+        os.environ.get("OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT", "1") != "0"
+    )
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
+
+    _streaming_guard_info: dict | None = None
+    _streaming_backing = None
+    # App-level expert LRU heap (stashed at guard-info resolve) and its last
+    # sampled size: the tracker subtracts this heap's growth from the
+    # measured chunk delta so a budget-bounded LRU fill is not linearized
+    # as a per-token transient rate.
+    _streaming_lru_cache: Any = None
+    _streaming_lru_bytes_last: int | None = None
+
+    def _streaming_bank_bytes(self, n_tokens: int) -> int:
+        """Predicted live expert mini-bank bytes for one streaming chunk.
+
+        The chunk forward is lazy: every MoE layer's assembled mini-bank stays
+        referenced by the graph until the chunk-end eval, so the peak carries
+        roughly one bank per layer simultaneously. The static transient model
+        (SDPA + KV) cannot see this term — without it the guard admits 400+
+        token chunks whose real peak reaches ~26 GB on qwen4_exp (48 layers x
+        ~215 uniq experts x ~2.5 MB) and starves the machine (F1 finding).
+        """
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
+        if not info:
+            return 0
+        uniq = min(
+            int(info["experts_per_layer"]),
+            int(self._STREAMING_BANK_TOKEN_RATIO * max(0, n_tokens)),
+        )
+        tile_bytes = uniq * int(info["per_expert_bytes"])
+        # With a live per-layer eval boundary the decoder layer's output is
+        # evaluated as soon as the layer returns, so layer N's bank is freed
+        # before layer N+1 assembles its own: the live set collapses from one
+        # bank per layer to the bank under construction plus at most one
+        # rolling prefetch (min(2, projections)), plus one layer's
+        # materialized activation. On qwen4_exp that is ~1.1 GB instead of
+        # ~26 GB. The flag is published per-model by the converter only when
+        # a boundary actually runs on this model's layers, so models that
+        # never got one keep the conservative per-layer charge.
+        if self._STREAMING_BANK_BOUNDARY_ACCOUNT and info.get("boundary_active"):
+            projections = max(1, int(info.get("projections") or 1))
+            activation = int(info.get("activation_bytes_per_token") or 0) * max(
+                0, n_tokens
+            )
+            return min(2, projections) * tile_bytes + activation
+        return int(info["num_moe_layers"]) * tile_bytes
+
+    def _resolve_streaming_guard_info(self) -> dict:
+        """Find the streaming backing's guard metadata on the model tree.
+
+        The scheduler's model may be a bare language model, a VLM wrapper, or
+        the VLMModelAdapter (which holds the VLM under ``_vlm_model`` /
+        ``_language_model``) — walk whichever exists. The backing lives on
+        the converted model (engine/vlm.py sets ``_expert_streaming_backing``).
+        """
+        self._streaming_guard_info = {}
+        self._streaming_lru_cache = None
+        self._streaming_lru_bytes_last = None
+        self._streaming_backing = None
+        # One wrapper-chain walk for every streaming lookup (the same walk
+        # decides request serialization at construction — see
+        # _model_uses_expert_streaming).
+        backing = _streaming_backing_of(getattr(self, "model", None))
+        self._streaming_backing = backing
+        info = getattr(backing, "streaming_guard_info", None)
+        if info:
+            self._streaming_guard_info = dict(info)
+            # Stash the app-level LRU heap and snapshot its baseline
+            # BEFORE the first chunk runs, so the warmup fill is
+            # corrected too. Missing/unreadable cache disables the
+            # tracker correction (raw deltas flow through).
+            self._streaming_lru_cache = getattr(
+                backing, "_streaming_cache", None
+            )
+            try:
+                probe = getattr(
+                    self._streaming_lru_cache, "resident_bytes", None
+                )
+                self._streaming_lru_bytes_last = (
+                    int(probe()) if callable(probe) else None
+                )
+            except Exception:
+                self._streaming_lru_bytes_last = None
+        return self._streaming_guard_info
 
     def _predicted_chunk_transient(
         self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
@@ -4060,6 +4321,16 @@ class Scheduler:
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
             per_token = static_per_token
+            # Expert streaming: the chunk's expert mini-bank transient
+            # ( uniq experts per layer, see _streaming_bank_bytes) rides
+            # on top of the static estimate. Zero for non-streaming models.
+            try:
+                bank_bytes = self._streaming_bank_bytes(n_tokens)
+            except Exception:  # noqa: BLE001
+                bank_bytes = 0
+            if bank_bytes > 0:
+                static_per_token += bank_bytes / n_tokens
+                per_token = max(per_token, static_per_token)
         qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
         if tracker is not None:
             if qwen4_flat_overhead:
@@ -4117,10 +4388,16 @@ class Scheduler:
         )
         tracker = self._prefill_transient_tracker
         if tracker is not None:
-            bound = max(
-                bound,
-                float(tracker.observed_max_bytes_for(gathered_core)),
-            )
+            floor = float(tracker.observed_max_bytes_for(gathered_core))
+            if floor > 0 and self._streaming_bank_bytes(n_tokens) > 0:
+                # Streaming bank transients scale ~linearly with chunk size
+                # (uniq experts per layer grows with tokens), so a large
+                # chunk's measured transient must not floor-limit smaller
+                # chunks — otherwise the guard rejects every shrunken chunk
+                # and the prefill dies with PrefillMemoryExceededError.
+                n_obs = max(int(tracker.last_n_tokens_for(gathered_core)), 1)
+                floor = min(floor, floor * n_tokens / n_obs)
+            bound = max(bound, floor)
         return bound
 
     def _prefill_abort_cap(self) -> int:
@@ -4720,11 +4997,54 @@ class Scheduler:
         Scheduler steps run on the MLX executor thread, so they can refresh
         mx.get_active_memory() safely. Event-loop callers such as early
         preflight use the cached executor sample and phys_footprint instead.
+
+        Streaming models (budget-0 page-cache mode): the phys footprint also
+        carries the clean, evictable file pages of every expert slice read
+        from the mmap'd shards — pages the OS drops under pressure without
+        swapping, not a memory commitment. Charging them makes the guard
+        reject every long prompt once enough experts have streamed through
+        (measured: phys 21.5GB while Metal active stayed 4.5GB). For a
+        streaming backing, only the live Metal allocation counts.
         """
         active = self._last_mlx_active_memory_bytes
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
+        if self._streaming_guard_info is None:
+            # Lazy-resolve so even the first guard/throttle call (before any
+            # _streaming_bank_bytes invocation) sees the streaming model.
+            self._resolve_streaming_guard_info()
+        if (
+            self._streaming_guard_info
+            or getattr(self, "_streaming_backing", None) is not None
+        ):
+            # Streaming backing resolved: active Metal is the real
+            # commitment — with two corrections. The mlock'd pin pages on
+            # the backing are wired RAM outside the Metal allocator (never
+            # in `active`), and a heap still lazy would under-report there
+            # too. The floor charges the cache's own accounting + pins;
+            # a materialized heap already inside `active` stays single-
+            # counted via the max().
+            floor = 0
+            cache = getattr(self, "_streaming_lru_cache", None)
+            probe = getattr(cache, "resident_bytes", None)
+            if callable(probe):
+                try:
+                    floor += max(0, int(probe()))
+                except Exception:
+                    pass
+            floor += max(
+                0,
+                int(
+                    getattr(
+                        getattr(self, "_streaming_backing", None),
+                        "pinned_bytes",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            return max(active, floor)
         hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
         if callable(hot_cache_cpu_bytes):
             hot_cache_bytes = hot_cache_cpu_bytes()
@@ -4928,6 +5248,55 @@ class Scheduler:
             return False
         return current >= self._memory_limit_bytes
 
+    def _streaming_lru_heap_growth(self) -> int:
+        """App-level LRU heap growth since the previous chunk record.
+
+        Returns 0 when no streaming cache is stashed or it cannot be read
+        (raw deltas flow through, today's behavior). The baseline snapshot
+        is taken when the guard info first resolves — before the first
+        chunk runs — so the warmup fill is corrected too. LRU shrink
+        (eviction/governor pressure) reports 0, never a negative credit.
+        """
+        cache = getattr(self, "_streaming_lru_cache", None)
+        probe = getattr(cache, "resident_bytes", None)
+        if not callable(probe):
+            return 0
+        try:
+            now = int(probe())
+        except Exception:
+            return 0
+        if now < 0:
+            return 0
+        last = getattr(self, "_streaming_lru_bytes_last", None)
+        self._streaming_lru_bytes_last = now
+        if last is None:
+            return 0
+        return max(0, now - last)
+
+    def _throttle_probe_bytes(self) -> int:
+        """Footprint probe for the per-chunk transient tracker.
+
+        The phys footprint delta is the legacy signal, but on streaming models
+        it also carries the mmap'd shard's clean file pages that ride along
+        with every expert read — evictable cache, not a commitment (measured:
+        a 512-token chunk "grew" 20GB of phys while Metal active grew ~5GB).
+        That poisons the tracker into charging the page cache at admission
+        and rejecting every later chunk. For a streaming backing, track the
+        Metal active high-water instead: exactly the banks + activations the
+        chunk really commits.
+        """
+        if self._streaming_guard_info is None:
+            self._resolve_streaming_guard_info()
+        if (
+            self._streaming_guard_info
+            or getattr(self, "_streaming_backing", None) is not None
+        ):
+            # Backing presence (not just guard metadata): the V4.1 and
+            # legacy adapters stream through mmap'd shards too — their
+            # clean file pages poison the phys probe identically.
+            return max(0, int(mx.get_active_memory()))
+        return get_phys_footprint()
+
     def _clear_cache(self) -> None:
         """Clear the Metal pool and account for Qwen4 buffers that may return."""
         tracker = getattr(self, "_prefill_transient_tracker", None)
@@ -4961,6 +5330,23 @@ class Scheduler:
         replace representative overhead or full-step measurements.
         """
         delta = post_bytes - pre_bytes
+        # Streaming LRU de-poison: the app-level expert heap filling up
+        # (bounded by its budget) is residency, not a per-token transient —
+        # linearizing it poisons the EWMA rate for every later chunk. The
+        # fill still raises the next admission's ``current`` baseline, so
+        # nothing is lost by excluding it here.
+        lru_growth = self._streaming_lru_heap_growth()
+        if lru_growth:
+            logger.debug(
+                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
+                "lru_growth=%.2fMB (excluded: budget-bounded fill)",
+                loop_label,
+                request_id,
+                n_tokens,
+                delta / 1024**2,
+                lru_growth / 1024**2,
+            )
+            delta -= lru_growth
         monitor = getattr(self, "memory_monitor", None)
         if (
             MemoryMonitor is not None
@@ -5484,7 +5870,8 @@ class Scheduler:
         n = min(prefill_step_size, remaining)
 
         if state.tokens_processed == 0:
-            Scheduler._clear_cache(self)
+            # Etapa D: gated, same rationale as the external prefill path.
+            self._clear_cache_if_pool_large()
             Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None)
             # Known horizon: size the QSA indexer once instead of doubling
             # mid-prefill (see _reserve_qsa_index_capacity).
@@ -5536,7 +5923,7 @@ class Scheduler:
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
-        _throttle_pre = get_phys_footprint()
+        _throttle_pre = self._throttle_probe_bytes()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
@@ -5567,7 +5954,7 @@ class Scheduler:
                 prefill_model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-        _throttle_post = get_phys_footprint()
+        _throttle_post = self._throttle_probe_bytes()
         actual_gathered_core = gathered_core
         if qwen4_accounting:
             actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
@@ -5690,6 +6077,9 @@ class Scheduler:
 
         if self._should_clear_after_chunk():
             Scheduler._clear_cache(self)
+        elif self._should_release_streaming_pool():
+            self._note_streaming_release()
+            _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
         if getattr(state.request, "benchmark_trace", False):
             _ane_sequence = int(
@@ -9991,7 +10381,11 @@ class Scheduler:
     def _effective_max_num_seqs(self) -> int:
         """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
+        if (
+            self._serialize_llama4_requests
+            or self._serialize_streaming_requests
+            or self._generation_overflow_recovery_ids
+        ):
             return 1
         return max(1, self.config.max_num_seqs)
 
@@ -12767,6 +13161,14 @@ class Scheduler:
         # Periodic Metal cache cleanup
         self._step_counter += 1
         should_clear = self._should_periodic_clear_cache()
+        # Streaming pool release: expert-streaming prefills/decodes leave a
+        # large freed-but-retained pool that the step-boundary gate above
+        # never reaches (a <512-step prefill + short decode can end without
+        # a single release). Release it off-boundary once it crosses the
+        # byte threshold — Fase G.
+        if not should_clear and self._should_release_streaming_pool():
+            should_clear = True
+            self._note_streaming_release()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
         if (
@@ -12957,6 +13359,10 @@ class Scheduler:
                     layer.self_attn.cache = None
 
         # Release model and tokenizer references for GC
+        self._streaming_guard_info = None
+        self._streaming_backing = None
+        self._streaming_lru_cache = None
+        self._streaming_lru_bytes_last = None
         self.model = None
         self.tokenizer = None
 
@@ -13182,8 +13588,13 @@ class Scheduler:
             head_dim = _cfg_get(config, "head_dim")
             hidden_size = _cfg_get(config, "hidden_size") or _cfg_get(config, "n_embd")
 
-            # Calculate head_dim if not directly available
-            if head_dim is None and hidden_size and num_kv_heads:
+            # Calculate head_dim if not directly available. Some MLA configs
+            # (e.g. glm5_next TextConfig) spell an unset head_dim as 0
+            # instead of omitting it — 0 is not a usable dimension, so treat
+            # it exactly like a missing value and derive it. Without this
+            # the monitor stays dim-less for those models and the guard
+            # prices neither KV nor the attention transient.
+            if (head_dim is None or head_dim == 0) and hidden_size and num_kv_heads:
                 num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
                 head_dim = hidden_size // num_heads
 
@@ -13298,6 +13709,11 @@ class Scheduler:
                     config,
                     compute_dtype_size=base_dtype_size,
                     wsdpa_dtype_supported=_dtype_matches(model_dtype, mx.bfloat16),
+                    num_kv_cache_layers=(
+                        actual_kv_cache_layers
+                        if isinstance(actual_kv_cache_layers, int)
+                        else None
+                    ),
                 )
                 if make_prefill_memory_profile is not None
                 else None

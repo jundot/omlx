@@ -30,7 +30,6 @@ import importlib
 import inspect
 import json
 import logging
-import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -65,6 +64,24 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _output_tokens(output: Any) -> list[int]:
+    """Token IDs from an engine output; [] when absent/non-iterable (K8).
+
+    Production outputs carry output_token_ids (cumulative). Test doubles
+    and exotic engines may not, and a mocked attribute is not iterable;
+    degrade to [] instead of breaking the call. The bench's --gate-tokens
+    fail-high still catches a REAL path that never populates the list.
+    """
+    try:
+        oid = getattr(output, "output_token_ids", None)
+        if oid is None:
+            return []
+        return [int(t) for t in oid]
+    except Exception:  # noqa: BLE001
+        return []
+
 
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
@@ -1861,18 +1878,17 @@ class VLMBatchedEngine(BaseEngine):
 
                 model_type = _read_config_model_type(self._model_name)
                 if model_type == "deepseek_v41":
+                    from ..model_settings import moe_offload_requested
                     from ..patches.deepseek_v41.loading import load
 
-                    return load(
+                    # Unified predicate: the canonical expert_streaming_enabled
+                    # key and the legacy alias both arm the offload path, and
+                    # the OMLX_MOE_EXPERT_OFFLOAD=0 kill switch still wins.
+                    loaded = load(
                         self._model_name,
                         moe_expert_offload_resident_fraction=(
                             self._model_settings.moe_expert_offload_resident_fraction
-                            if getattr(
-                                self._model_settings,
-                                "moe_expert_offload_enabled",
-                                False,
-                            )
-                            and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+                            if moe_offload_requested(self._model_settings)
                             else None
                         ),
                         engram_ssd_offload=bool(
@@ -1882,14 +1898,19 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
-                        ced_prefill=bool(
-                            getattr(
-                                self._model_settings,
-                                "deepseek_v41_ced_prefill_enabled",
-                                False,
+                        # Converted checkpoints can't auto-derive from
+                        # is_mtp_active() — forward the request or the
+                        # resident DSpark head is dropped on load.
+                        preserve_mtp=(
+                            True
+                            if getattr(
+                                self._model_settings, "mtp_enabled", False
                             )
+                            else None
                         ),
                     )
+                    self._attach_v41_dynamic_residency(loaded)
+                    return loaded
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
@@ -1901,15 +1922,43 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                    # Single predicate shared with EnginePool and the
+                    # converter (engine/batched.py carries the same call).
+                    #
+                    # The old two-element tuple left every supported MoE VLM
+                    # except these two (glm_moe_dsa, deepseek_v4, ...) fully
+                    # materializing its banks at load — with expert streaming
+                    # enabled that is the OOM path, since the converter only
+                    # reaches the banks on a lazy model.
+                    #
+                    # Still not gated on expert_streaming_enabled: lazy
+                    # loading is a peak-memory win on its own for these
+                    # checkpoints, and dropping it would regress loads with
+                    # the feature turned off. Because that makes this run on
+                    # EVERY VLM load, the cheap allowlist test short-circuits
+                    # the header scan for everything else — the estimate would
+                    # reject those anyway (it requires the same allowlist), so
+                    # this is an optimization, not a second opinion.
+                    from ..patches.expert_streaming import is_supported_model_type
+                    from ..patches.expert_streaming.residency import (
+                        expert_streaming_estimate,
+                    )
+
+                    if is_supported_model_type(model_type) and expert_streaming_estimate(
+                        self._model_name
+                    ).supported:
+                        # Lazy-load so giant MoE checkpoints (Qwen3.8-Flash-Next
+                        # 99G, GLM-5.3-Flash-oQ4e 190G) stream from SSD instead of
+                        # materializing fully in RAM; expert streaming replaces
+                        # the MoE projections afterwards.
                         load_kwargs["lazy"] = True
                     # Expert offload wraps BEFORE materialization so non-resident
                     # experts never load; keep the load lazy only when the feature
                     # is on. Threads into main's load_kwargs path (lazy is idempotent
-                    # with the QWEN4_EXP case above).
-                    if getattr(
-                        self._model_settings, "moe_expert_offload_enabled", False
-                    ):
+                    # with the QWEN4_EXP case above). Unified backend: either key.
+                    from ..model_settings import moe_offload_requested
+
+                    if moe_offload_requested(self._model_settings):
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
@@ -1946,48 +1995,33 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_name,
                 )
 
+        # Expert streaming (SSD): keep hot experts resident, stream the rest.
+        # Runs BEFORE materialize_lazy_state on purpose. On lazy-loaded
+        # checkpoints (qwen4_exp, glm5_next) every tensor is a plain mx.array
+        # and materialize_lazy_state would evaluate the entire tree — including
+        # the multi-hundred-GB MoE expert banks (OOM). Converting to streaming
+        # first drops those arrays (GC'd), so the materialize that follows only
+        # evaluates dense weights, RoPE freqs and vision/audio towers.
+        # Also runs before gate+up fusion (fusion would change the stacked
+        # layout).
         # MoE expert offload for the VLM path: Gemma 4 checkpoints are
         # detected as VLMs, so this — not BatchedEngine — is their default
-        # engine. Same sequence as batched.py: wrap on the MLX executor
-        # BEFORE materialize so non-resident experts never load.
-        moe_offload_wrapped = 0
-        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
-            from ..patches.moe_expert_offload import (
-                apply_moe_expert_offload,
-                materialize_offload_state,
-            )
+        # engine. Same shared sequence as batched.py: wrap on the MLX
+        # executor BEFORE materialize so non-resident experts never load.
+        from ..patches.expert_streaming import streaming_offload_load
 
-            fraction = float(
-                getattr(
-                    self._model_settings,
-                    "moe_expert_offload_resident_fraction",
-                    0.25,
-                )
-            )
-            moe_offload_wrapped = await loop.run_in_executor(
-                get_mlx_executor(),
-                apply_moe_expert_offload,
-                self._vlm_model,
-                self._model_name,
-                fraction,
-            )
-            if moe_offload_wrapped:
-                # The caches' slot maps and resident slots live on plain
-                # attributes outside the module tree, so the lazy-state
-                # materialization below never reaches them; left lazy they
-                # stay bound to the loader stream and the first request from
-                # an inference thread dies with "There is no Stream(gpu, N)
-                # in current thread". Same executor as the apply, so the
-                # arrays realize on the stream that created them.
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    materialize_offload_state,
-                    self._vlm_model,
-                )
-        self._moe_offload_wrapped = moe_offload_wrapped
+        _es_backing, self._moe_offload_wrapped = await streaming_offload_load(
+            self._vlm_model,
+            self._model_name,
+            self._model_settings,
+            label="VLM",
+        )
+        if _es_backing is not None:
+            self._expert_streaming_backing = _es_backing
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
+        # Post-streaming: the MoE banks are gone, so this stays bounded.
         from ..utils.model_loading import materialize_lazy_state
 
         await loop.run_in_executor(
@@ -2015,6 +2049,7 @@ class VLMBatchedEngine(BaseEngine):
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
         # the MLX executor because it rewrites weights in place.
+        # Merged: skip fusion when EITHER offload system is active.
         if getattr(self, "_moe_offload_wrapped", 0):
             logger.info(
                 "moe expert offload active (%d layers): skipping gate/up "
@@ -2024,6 +2059,7 @@ class VLMBatchedEngine(BaseEngine):
         elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
+            and not getattr(self._model_settings, "expert_streaming_enabled", False)
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (
@@ -2102,17 +2138,6 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
-        if (
-            self._adapter.model_type == "deepseek_v41"
-            and self._adapter.config.ced_prefill
-            and scheduler_config.paged_ssd_cache_dir
-        ):
-            # Approximate decoder states must not become hits in full-prefill
-            # mode (or vice versa) after reloading the model with new settings.
-            scheduler_config.paged_ssd_cache_dir = str(
-                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
-            )
-
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
@@ -2529,6 +2554,83 @@ class VLMBatchedEngine(BaseEngine):
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
+    def _attach_v41_dynamic_residency(self, loaded: Any) -> None:
+        """Arm the model-agnostic dynamic budget over V4.1 native slots.
+
+        The fraction setting becomes the INITIAL per-layer budget; the
+        governor then grows/shrinks it from pressure + decode hunger.
+        Precedence: explicit ``expert_streaming_dynamic`` > env > auto-ON.
+        Generic budget pins are ignored here on purpose: they are inert
+        for V4.1 mechanics, and honoring them as "manual mode" would
+        static-ify V4.1 by accident (the bench CLI defaults to a pinned
+        budget). Only expert_streaming_dynamic=false opts out. Fail-clean:
+        without a plan or on any error the static adapter keeps serving.
+        """
+        try:
+            model = loaded[0] if isinstance(loaded, tuple) else loaded
+            plan = getattr(model, "_moe_offload_plan", None)
+            if plan is None:
+                return
+            from ..patches.deepseek_v41.moe_offload import OffloadedExpert
+            from ..patches.deepseek_v41.streaming_backing import (
+                V41StreamingBacking,
+            )
+            from ..patches.expert_streaming import _dynamic_armed
+
+            layers = []
+            for idx, layer in enumerate(model.language_model.layers):
+                experts = getattr(getattr(layer, "ffn", None), "experts", None)
+                if isinstance(experts, OffloadedExpert):
+                    layers.append((idx, experts.slots))
+            if not layers:
+                return
+            settings = self._model_settings
+            # settings=None: skip the generic pinned-budget rule (see
+            # docstring). Env opt-out still applies inside _dynamic_armed.
+            dyn = _dynamic_armed(
+                getattr(settings, "expert_streaming_dynamic", None), None
+            )
+            max_gib = getattr(
+                settings, "expert_streaming_dynamic_max_gib", None
+            )
+            min_gib = getattr(
+                settings, "expert_streaming_dynamic_min_gib", None
+            )
+            stall = getattr(
+                settings, "expert_streaming_dynamic_stall_target", None
+            )
+            backing = V41StreamingBacking(
+                plan,
+                layers,
+                dynamic=bool(dyn),
+                max_budget_bytes=(
+                    int(max_gib * 1024**3) if max_gib is not None else None
+                ),
+                min_budget_bytes=(
+                    int(min_gib * 1024**3) if min_gib is not None else None
+                ),
+                stall_target=stall,
+            )
+            self._expert_streaming_backing = backing
+            try:
+                model._expert_streaming_backing = backing  # type: ignore[attr-defined]
+            except Exception:
+                # The engine-side reference above still works, but the
+                # scheduler's guard/admission path resolves the backing off
+                # the model — surface the miss instead of silently degrading.
+                logger.warning(
+                    "V4.1 dynamic residency: could not stamp "
+                    "_expert_streaming_backing on the model",
+                    exc_info=True,
+                )
+            logger.info(
+                "V4.1 dynamic expert residency %s (per-layer %d slots)",
+                "armed" if backing.governor is not None else "static",
+                backing.base_cap,
+            )
+        except Exception:
+            logger.debug("V4.1 dynamic residency attach failed", exc_info=True)
+
     def set_vlm_mtp_drafter(self, drafter: Any) -> None:
         """Attach a loaded MTP drafter for VLM MTP decoding.
 
@@ -2559,6 +2661,23 @@ class VLMBatchedEngine(BaseEngine):
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
+        # Persist the learned expert-pin profile while the backing is still
+        # reachable (teardown below drops it with the model).
+        from omlx.patches.expert_streaming import (
+            resolve_streaming_backing,
+            save_expert_pin_profile,
+            shutdown_expert_streaming,
+        )
+
+        save_expert_pin_profile(self)
+        try:
+            shutdown_expert_streaming(resolve_streaming_backing(self))
+        except Exception:
+            pass
+        try:
+            self._expert_streaming_backing = None
+        except Exception:
+            pass
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
@@ -3899,6 +4018,7 @@ class VLMBatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
+            tokens=_output_tokens(output),
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
@@ -4015,8 +4135,10 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         finished_normally = False
+        last_output = None
         try:
             async for output in engine.stream_outputs(request_id):
+                last_output = output
                 text = clean_special_tokens(output.output_text)
 
                 if output.finished:
@@ -4024,6 +4146,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
+    
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -4057,6 +4180,27 @@ class VLMBatchedEngine(BaseEngine):
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await engine.abort_request(request_id)
+            else:
+                self._log_streaming_summary(
+                    prompt_tokens=int(
+                        getattr(last_output, "prompt_tokens", 0) or 0
+                    ),
+                    completion_tokens=int(
+                        getattr(last_output, "completion_tokens", 0) or 0
+                    ),
+                )
+
+    def _log_streaming_summary(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """Parity with BatchedEngine: one-line MoE streaming health log."""
+        from ..patches.expert_streaming import log_expert_streaming_summary
+
+        log_expert_streaming_summary(
+            self,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     async def chat(
         self,
@@ -4121,7 +4265,7 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
 
-        return await self.generate(
+        output = await self.generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -4138,6 +4282,18 @@ class VLMBatchedEngine(BaseEngine):
             tools=tools,
             **kwargs,
         )
+        # Parity with BatchedEngine.generate: per-request streaming summary
+        # + dynamic-governor observe. VLM chat is the path the bench and the
+        # largest streaming checkpoints use; without this the governor never
+        # fires here (found 2026-09-11: actions stayed 0 across requests).
+        try:
+            self._log_streaming_summary(
+                prompt_tokens=getattr(output, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(output, "completion_tokens", 0) or 0,
+            )
+        except Exception:
+            pass
+        return output
 
     async def preflight_chat(
         self,
