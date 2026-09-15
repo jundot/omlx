@@ -2,15 +2,19 @@
 """Tests for the head_dim=256 long-context prefill SDPA patch.
 
 Covers (without needing the full Qwen3.6 model):
-  - the forced native kernel matches default MLX SDPA numerically
+  - the forced native fused kernel matches default MLX SDPA numerically
     (square causal, chunked-prefill non-square causal, and decode shapes);
+  - the q-split route matches the reference and the tiled route, calls the
+    stock kernel per sub-tile, and evals between sub-tiles (the pool-growth fix);
   - the route gate engages only for head_dim=256 / qL>1 / causal / long kv;
   - the patched SDPA passes through unchanged for non-256 / decode / short kv;
   - the memory-monitor estimator switches head_dim=256 prefill to O(L) once
     registered, and stays O(L^2) otherwise;
-  - memory-aware routing (issue #2204): with a headroom provider registered
-    the route prefers the faster unfused fallback whenever its transient
-    fits, and falls back to forced fused without headroom info.
+  - memory-aware routing (issue #2204, extended for q-split #2991): with a
+    headroom provider registered the route prefers the faster unfused fallback
+    whenever its transient fits, narrows to q-split then tiled as headroom
+    shrinks, prices every sizing site at the fp32 score dtype the unfused path
+    actually materializes (#3461), and ratchets q_sub down within a request.
 """
 
 import logging
@@ -242,44 +246,186 @@ def test_portable_sinks_and_value_dimension_match_reference(monkeypatch):
     assert _max_abs(out, ref) < 2e-2
 
 
+# --- q-split correctness --------------------------------------------------
+
+
+def _stock_sdpa256(q, k, v, cache, scale, mask, sinks):
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+
+@pytest.mark.parametrize("q_len,k_len,q_sub", [(2048, 2048, 512), (4096, 4096, 384)])
+def test_qsplit_square_causal_matches_reference(q_len, k_len, q_sub):
+    from omlx.patches.sdpa256_attention import _unfused_qsplit_sdpa
+
+    q, k, v = _qkv(q_len, k_len)
+    out = _unfused_qsplit_sdpa(
+        q, k, v, None, SCALE_256, "causal", None, _stock_sdpa256, q_sub
+    )
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask="causal")
+    mx.eval(out, ref)
+    assert out.shape == ref.shape
+    assert _max_abs(out, ref) < 2e-2
+
+
+@pytest.mark.parametrize(
+    "q_len,k_len,q_sub,tol",
+    [(128, 4096, 64, 2e-2), (2048, 8192, 500, 2e-2), (2048, 20480, 384, 1e-1)],
+)
+def test_qsplit_chunked_prefill_offset_causal_matches_reference(q_len, k_len, q_sub, tol):
+    """Chunked prefill (k_len > q_len, cached prefix) at a q_sub that does not
+    evenly divide q_len -- exercises the ragged final sub-tile.
+
+    The largest case uses a looser tolerance: fp16 softmax/accumulation error
+    over a much longer kv_len grows with the reduction length and is
+    hardware-dependent (summation order differs across Metal GPU
+    generations/drivers). 1e-1 stays far below the O(1) error a real q-split
+    correctness bug (wrong offset, dropped rows, mis-narrowed keys) would
+    produce."""
+    from omlx.patches.sdpa256_attention import _unfused_qsplit_sdpa
+
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
+    out = _unfused_qsplit_sdpa(
+        q, k, v, None, SCALE_256, "causal", None, _stock_sdpa256, q_sub
+    )
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask="causal")
+    mx.eval(out, ref)
+    assert out.shape == ref.shape
+    assert _max_abs(out, ref) < tol
+
+
+def test_qsplit_matches_flash_sdpa256():
+    """Both alternate routes for the same shape must agree with each other, not
+    just the reference -- catches a routing bug that happens to pass the
+    reference check via coincidental cancellation."""
+    from omlx.patches.sdpa256_attention import _flash_sdpa256, _unfused_qsplit_sdpa
+
+    q, k, v = _qkv(2048, 8192)
+    qsplit_out = _unfused_qsplit_sdpa(
+        q, k, v, None, SCALE_256, "causal", None, _stock_sdpa256, 384
+    )
+    tiled_out = _flash_sdpa256(q, k, v, SCALE_256, "causal")
+    mx.eval(qsplit_out, tiled_out)
+    assert _max_abs(qsplit_out, tiled_out) < 2e-2
+
+
+def test_qsplit_no_mask_matches_reference():
+    from omlx.patches.sdpa256_attention import _unfused_qsplit_sdpa
+
+    q, k, v = _qkv(1024, 1024)
+    out = _unfused_qsplit_sdpa(
+        q, k, v, None, SCALE_256, None, None, _stock_sdpa256, 384
+    )
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask=None)
+    mx.eval(out, ref)
+    assert _max_abs(out, ref) < 2e-2
+
+
+def test_qsplit_calls_original_sdpa_per_subtile():
+    """Confirms the loop actually shrinks each call's query axis instead of
+    passing the full tensor through once -- a no-op wrapper would still pass the
+    reference-match tests above."""
+    from omlx.patches.sdpa256_attention import _unfused_qsplit_sdpa
+
+    calls = []
+
+    def counting_sdpa(q, k, v, cache, scale, mask, sinks):
+        calls.append((q.shape[-2], k.shape[-2]))
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+    q, k, v = _qkv(2048, 2048)
+    mx.eval(
+        _unfused_qsplit_sdpa(
+            q, k, v, None, SCALE_256, "causal", None, counting_sdpa, 512
+        )
+    )
+    assert len(calls) == 4  # 2048 / 512
+    assert [c[0] for c in calls] == [512, 512, 512, 512]  # query rows per call
+    assert [c[1] for c in calls] == [512, 1024, 1536, 2048]  # narrowed kv per call
+
+
+def test_qsplit_evals_each_subtile_before_the_next(monkeypatch):
+    """Regression for the pool-growth fix: without an eval between sub-tiles,
+    MLX's laziness lets every sub-call's graph -- including its own score-matrix
+    transient -- stay unmaterialized and pile up simultaneously instead of being
+    bounded to one sub-tile at a time (the assumption q_sub's sizing depends
+    on). This asserts the eval that fixes it is actually called, once per
+    sub-tile, before the next sub-tile's (larger) call is issued."""
+    import mlx.core as real_mx
+
+    from omlx.patches.sdpa256_attention import _unfused_qsplit_sdpa
+
+    q, k, v = _qkv(2048, 2048)
+    original_eval = real_mx.eval
+    eval_order = []
+
+    def tracking_eval(*arrays):
+        eval_order.append("eval")
+        return original_eval(*arrays)
+
+    def counting_sdpa(q, k, v, cache, scale, mask, sinks):
+        eval_order.append("call")
+        return real_mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=mask
+        )
+
+    monkeypatch.setattr(
+        "omlx.patches.sdpa256_attention.mx.eval", tracking_eval
+    )
+    original_eval(
+        _unfused_qsplit_sdpa(
+            q, k, v, None, SCALE_256, "causal", None, counting_sdpa, 512
+        )
+    )
+    assert eval_order == ["call", "eval"] * 4
+
+
 # --- route gate ----------------------------------------------------------
 
 
 def test_should_route_gate():
+    """No headroom provider is registered here, so any shape that reaches the
+    routing decision at all lands on tiled (the memory-safe default) -- the
+    point of this test is the shape gates upstream of that decision. Array masks
+    and sinks stay eligible for the bounded route (#3461); only q-split excludes
+    them."""
     from omlx.patches import sdpa256_attention as sdpa256
 
     q, k, _ = _qkv(2048, 16384)  # 256, prefill, long
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-    assert sdpa256._should_route(q, k, None, None, None) is True
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
+    assert sdpa256._should_route(q, k, None, None, None) == ("tiled", 0)
     # decode (qL==1) -> fused vector kernel handles 256
     qd, kd, _ = _qkv(1, 16384)
-    assert sdpa256._should_route(qd, kd, None, "causal", None) is False
-    # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
-    # tiny-query fused routing is already handled by MLX's vector kernel
+    assert sdpa256._should_route(qd, kd, None, "causal", None) == ("unfused", 0)
+    # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path
     for q_len in (2, 4, 9, 15):
         qv, kv, _ = _qkv(q_len, 16384)
-        assert sdpa256._should_route(qv, kv, None, "causal", None) is False
+        assert sdpa256._should_route(qv, kv, None, "causal", None) == ("unfused", 0)
     qv, kv, _ = _qkv(16, 16384)
-    assert sdpa256._should_route(qv, kv, None, "causal", None) is True
+    assert sdpa256._should_route(qv, kv, None, "causal", None) == ("tiled", 0)
     # short kv -> keep the faster fallback
     qs, ks, _ = _qkv(2048, 4096)
-    assert sdpa256._should_route(qs, ks, None, "causal", None) is False
+    assert sdpa256._should_route(qs, ks, None, "causal", None) == ("unfused", 0)
     # wrong head_dim
     qh, kh, _ = _qkv(2048, 16384, head_dim=128)
-    assert sdpa256._should_route(qh, kh, None, "causal", None) is False
-    # Boolean/additive masks and attention sinks remain memory-bounded.
+    assert sdpa256._should_route(qh, kh, None, "causal", None) == ("unfused", 0)
+    # Boolean/additive array masks and attention sinks stay bounded (they reach
+    # the array-tiled/native-fused bounded kernel, never q-split).
     bool_mask = mx.ones((1, 1, 1, 16384), dtype=mx.bool_)
     additive_mask = mx.zeros((1, 1, 1, 16384), dtype=mx.float16)
     sinks = mx.zeros((24,), dtype=mx.float32)
-    assert sdpa256._should_route(q, k, None, bool_mask, None) is True
-    assert sdpa256._should_route(q, k, None, additive_mask, None) is True
-    assert sdpa256._should_route(q, k, None, "causal", sinks) is True
+    assert sdpa256._should_route(q, k, None, bool_mask, None) == ("tiled", 0)
+    assert sdpa256._should_route(q, k, None, additive_mask, None) == ("tiled", 0)
+    assert sdpa256._should_route(q, k, None, "causal", sinks) == ("tiled", 0)
 
     # quantized KV cache (has .bits) -> passthrough to the quant-aware SDPA
     class _QuantCache:
         bits = 4
 
-    assert sdpa256._should_route(q, k, _QuantCache(), "causal", None) is False
+    assert sdpa256._should_route(q, k, _QuantCache(), "causal", None) == (
+        "unfused",
+        0,
+    )
 
 
 # --- patched dispatcher passthrough vs route -----------------------------
@@ -318,7 +464,8 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
     assert sdpa256.apply_sdpa256_attention_patch(min_kv_len=512) is True
     patched = mlx_base.scaled_dot_product_attention
     try:
-        # head_dim 256 routed prefill -> flash kernel. Kernel numerical
+        # head_dim 256 routed prefill -> no provider registered here, so the
+        # memory-safe tiled default engages -> flash kernel. Kernel numerical
         # correctness is covered above; keep this dispatcher test small so it
         # does not re-run the O(L^2) MLX reference path under full-suite memory
         # pressure.
@@ -422,17 +569,21 @@ def test_unfused_call_bytes_shared_with_guard_estimator():
     )
 
 
-# --- memory-aware routing (issue #2204) -----------------------------------
+# --- memory-aware routing (issue #2204, q-split #2991) --------------------
 
 
 class _HeadroomOwner:
-    """Stand-in for the Scheduler side of set_unfused_headroom_provider."""
+    """Stand-in for the Scheduler side of set_unfused_headroom_provider.
+
+    The provider is called with (kv_len, q_len) (#2991 pool-reuse credit
+    keying); route_changes records the boolean bounded/unbounded notifications
+    the scheduler acts on to retire EWMA history (#3461)."""
 
     def __init__(self, value):
         self.value = value
         self.route_changes = []
 
-    def headroom(self):
+    def headroom(self, kv_len, q_len):
         return self.value
 
     def _sdpa256_bounded_route_changed(self, active):
@@ -441,7 +592,7 @@ class _HeadroomOwner:
 
 @pytest.fixture
 def _sdpa256_provider_reset(monkeypatch):
-    """Isolate the thread-local provider/override state and restore it."""
+    """Isolate the thread-local provider/override/route-log state and restore."""
     import threading
 
     from omlx.patches import sdpa256_attention as sdpa256
@@ -450,11 +601,16 @@ def _sdpa256_provider_reset(monkeypatch):
         sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local(), raising=False
     )
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
-    monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
+    monkeypatch.setattr(sdpa256, "_QSPLIT_ENABLED", True, raising=False)
+    monkeypatch.setattr(sdpa256, "_LAST_ROUTE_DECISION", None, raising=False)
     return sdpa256
 
 
 def test_route_prefers_stock_when_unfused_fits(_sdpa256_provider_reset):
+    """Full unfused when it fits; narrow to q-split as headroom tightens; tiled
+    only once even the q-split floor won't fit. Pricing uses the fp32 score
+    dtype the unfused fallback actually materializes (#3461), so headroom
+    thresholds here are computed with SDPA256_UNFUSED_SCORE_DTYPE_SIZE."""
     sdpa256 = _sdpa256_provider_reset
     from omlx.memory_monitor import (
         SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
@@ -464,28 +620,38 @@ def test_route_prefers_stock_when_unfused_fits(_sdpa256_provider_reset):
     q, k, _ = _qkv(2048, 16384)
     owner = _HeadroomOwner(1 << 40)  # ~1 TB headroom: unfused clearly fits
     sdpa256.set_unfused_headroom_provider(owner.headroom)
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("unfused", 0)
 
     # Exactly at the fp32-priced transient the unfused path still fits...
     need = estimate_unfused_sdpa_call_bytes(
         24, 2048, 16384, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
     )
     owner.value = need
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
-    # ...one byte short -> forced fused.
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("unfused", 0)
+    # ...one byte short -> the full call doesn't fit, but a narrower q-split
+    # slice still does, so it stays on the fast kernel instead of tiled.
     owner.value = need - 1
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
+    route, q_sub = sdpa256._should_route(q, k, None, "causal", None)
+    assert route == "qsplit"
+    assert sdpa256._QSPLIT_MIN_Q <= q_sub < 2048
+
+    # Headroom below even the q-split floor (128 rows) -> tiled.
+    owner.value = 1
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
 
     # Negative headroom = no active ceiling -> memory-safe default.
     owner.value = -1
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-    assert owner.route_changes == [False, False, True, True]
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
+
+    # Route-flip notifications: unfused=False; qsplit and tiled both bounded.
+    assert owner.route_changes == [False, False, True, True, True]
 
 
 def test_route_prices_bf16_fallback_at_fp32(_sdpa256_provider_reset):
     """The unfused fallback materializes fp32 scores even for bf16 queries;
     pricing at the query dtype (2B) admitted the O(L^2) matrix when only the
-    bf16-sized transient fit and produced the ~33GiB VLM prefill spike."""
+    bf16-sized transient fit and produced the ~33GiB VLM prefill spike. The
+    q-split sizing path must inherit the same fp32 price, not the query dtype."""
     sdpa256 = _sdpa256_provider_reset
     from omlx.memory_monitor import (
         SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
@@ -505,14 +671,131 @@ def test_route_prices_bf16_fallback_at_fp32(_sdpa256_provider_reset):
     assert fp32_price > bf16_price
 
     # Headroom fits the bf16-sized matrix but not the real fp32 one -> the
-    # router must force the bounded path.
+    # router must NOT take the full unfused call (it narrows or bounds instead).
     owner = _HeadroomOwner(int((bf16_price + fp32_price) / 2))
     sdpa256.set_unfused_headroom_provider(owner.headroom)
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
+    assert sdpa256._should_route(q, k, None, "causal", None)[0] != "unfused"
 
     # Full fp32 headroom restores the faster stock path.
     owner.value = fp32_price
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("unfused", 0)
+
+
+def test_route_qsplit_disabled_falls_straight_to_tiled(_sdpa256_provider_reset):
+    """OMLX_SDPA256_QSPLIT=0 restores pre-q-split behavior: once the full
+    unfused call doesn't fit, go straight to tiled without trying a narrower
+    slice."""
+    sdpa256 = _sdpa256_provider_reset
+    sdpa256._QSPLIT_ENABLED = False
+    from omlx.memory_monitor import (
+        SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
+        estimate_unfused_sdpa_call_bytes,
+    )
+
+    q, k, _ = _qkv(2048, 16384)
+    need = estimate_unfused_sdpa_call_bytes(
+        24, 2048, 16384, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    )
+    owner = _HeadroomOwner(need - 1)
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
+
+
+def test_route_hysteresis_never_climbs_back_to_unfused(_sdpa256_provider_reset):
+    """Once a request's cache has needed q-split or tiled, later chunks must not
+    flip back to full unfused even if that chunk's own estimate looks like it
+    fits -- kv_len is monotone within a request, so a route shed earlier
+    reflects pressure that cannot have relaxed. Regression for a live run that
+    flickered qsplit->unfused 16 seconds before the reactive guard aborted."""
+    sdpa256 = _sdpa256_provider_reset
+
+    class _Cache:
+        pass
+
+    cache = _Cache()
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1 << 40)  # ample headroom: fast path every time
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+
+    # First call: plenty of headroom, stays unfused, no downgrade recorded.
+    assert sdpa256._should_route(q, k, cache, "causal", None) == ("unfused", 0)
+    assert getattr(cache, "_sdpa256_q_sub_ceiling", None) is None
+
+    # Headroom tightens (real pressure) and the route sheds to tiled; the cache
+    # now carries a permanent downgrade marker.
+    owner.value = 0
+    assert sdpa256._should_route(q, k, cache, "causal", None) == ("tiled", 0)
+    assert cache._sdpa256_q_sub_ceiling == 0
+
+    # Headroom "recovers" -- without hysteresis this would flip back to unfused.
+    owner.value = 1 << 40
+    assert sdpa256._should_route(q, k, cache, "causal", None) != ("unfused", 0)
+
+    # A fresh request (new cache object) is unaffected by the downgrade.
+    fresh_cache = _Cache()
+    assert sdpa256._should_route(q, k, fresh_cache, "causal", None) == (
+        "unfused",
+        0,
+    )
+
+
+def test_route_hysteresis_caps_q_sub_not_just_the_route_label(
+    _sdpa256_provider_reset,
+):
+    """A request downgraded to qsplit must not have q_sub float back up to q_len
+    (a full-size transient, byte-for-byte identical to unfused) just because a
+    later chunk's headroom estimate looks momentarily generous again.
+
+    Headroom values here are derived from ``_total_qsplit_bytes`` (the true
+    summed causal cost, #2991) at the fp32 score dtype the router prices with
+    (#3461), rather than a naive per-row multiplication."""
+    from omlx.memory_monitor import SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    from omlx.patches.sdpa256_attention import _total_qsplit_bytes
+
+    sdpa256 = _sdpa256_provider_reset
+
+    class _Cache:
+        pass
+
+    cache = _Cache()
+    q, k, _ = _qkv(2048, 16384)
+    n_q_heads, q_len, kv_len, hd = 24, 2048, 16384, 256
+    dtype_size = SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+
+    def true_cost(q_sub):
+        return _total_qsplit_bytes(
+            n_q_heads, q_len, kv_len, True, q_sub, hd, dtype_size
+        )
+
+    # First call: headroom fits exactly the true (summed) cost of a 1024-row
+    # split, not the full 2048 -> qsplit, ceiling latches to that q_sub.
+    owner = _HeadroomOwner(true_cost(1024))
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub == 1024
+    assert cache._sdpa256_q_sub_ceiling == 1024
+
+    # Headroom "recovers" to ample -- without capping q_sub itself, this would
+    # compute q_sub=2048 (== q_len), a full-size transient.
+    owner.value = 1 << 40
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub <= 1024
+    assert cache._sdpa256_q_sub_ceiling <= 1024
+
+    # Headroom tightens further -> ceiling ratchets down, never back up.
+    owner.value = true_cost(256)
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub == 256
+    assert cache._sdpa256_q_sub_ceiling == 256
+
+    # Recovers again -- still held at the smallest q_sub ever proven safe.
+    owner.value = 1 << 40
+    route, q_sub = sdpa256._should_route(q, k, cache, "causal", None)
+    assert route == "qsplit"
+    assert q_sub <= 256
 
 
 def test_route_defaults_to_tiled_when_provider_owner_dies(_sdpa256_provider_reset):
@@ -522,10 +805,10 @@ def test_route_defaults_to_tiled_when_provider_owner_dies(_sdpa256_provider_rese
     q, k, _ = _qkv(2048, 16384)
     owner = _HeadroomOwner(1 << 40)
     sdpa256.set_unfused_headroom_provider(owner.headroom)
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("unfused", 0)
     del owner
     gc.collect()
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
 
 
 def test_provider_binding_is_idempotent_and_replaceable(_sdpa256_provider_reset):
@@ -547,7 +830,8 @@ def test_provider_binding_is_idempotent_and_replaceable(_sdpa256_provider_reset)
 def test_worker_provider_survives_other_scheduler_teardown(
     _sdpa256_provider_reset,
 ):
-    """A later engine must not replace or clear a surviving engine's provider."""
+    """A later engine must not replace or clear a surviving engine's provider
+    (thread-local, #3333)."""
     import concurrent.futures
     import gc
 
@@ -572,16 +856,18 @@ def test_worker_provider_survives_other_scheduler_teardown(
             sdpa256.set_unfused_headroom_provider, later.headroom
         ).result()
 
-        assert route(first_worker) is False
-        assert route(second_worker) is True
+        # Surviving worker: ample headroom -> unfused. Later worker: 1 byte ->
+        # not even the q-split floor fits -> tiled.
+        assert route(first_worker) == ("unfused", 0)
+        assert route(second_worker) == ("tiled", 0)
         assert surviving.route_changes == [False]
         assert later.route_changes == [True]
 
         del later
         gc.collect()
 
-        assert route(first_worker) is False
-        assert route(second_worker) is True
+        assert route(first_worker) == ("unfused", 0)
+        assert route(second_worker) == ("tiled", 0)
         assert surviving.route_changes == [False, False]
 
 
@@ -589,13 +875,13 @@ def test_route_defaults_to_tiled_when_provider_raises(_sdpa256_provider_reset):
     sdpa256 = _sdpa256_provider_reset
 
     class _Boom:
-        def headroom(self):
+        def headroom(self, kv_len, q_len):
             raise RuntimeError("no headroom info")
 
     boom = _Boom()
     sdpa256.set_unfused_headroom_provider(boom.headroom)
     q, k, _ = _qkv(2048, 16384)
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
 
 
 def test_force_tiled_override(_sdpa256_provider_reset, monkeypatch):
@@ -607,17 +893,17 @@ def test_force_tiled_override(_sdpa256_provider_reset, monkeypatch):
     sdpa256.set_unfused_headroom_provider(owner.headroom)
     # 1: always tiled even though unfused fits.
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
     assert owner.route_changes == [True]
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", False, raising=False)
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("unfused", 0)
     assert owner.route_changes == [True, False]
-    # 0: never tiled even without headroom info.
+    # 0: never tiled (or q-split) even without headroom info.
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", False, raising=False)
     monkeypatch.setattr(
         sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local(), raising=False
     )
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert sdpa256._should_route(q, k, None, "causal", None) == ("unfused", 0)
 
 
 def test_parse_force_tiled_env(monkeypatch):
@@ -629,6 +915,17 @@ def test_parse_force_tiled_env(monkeypatch):
     assert sdpa256._parse_force_tiled_env() is True
     monkeypatch.setenv("OMLX_SDPA256_TILED", "0")
     assert sdpa256._parse_force_tiled_env() is False
+
+
+def test_parse_qsplit_env(monkeypatch):
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    monkeypatch.delenv("OMLX_SDPA256_QSPLIT", raising=False)
+    assert sdpa256._parse_qsplit_env() is True
+    monkeypatch.setenv("OMLX_SDPA256_QSPLIT", "1")
+    assert sdpa256._parse_qsplit_env() is True
+    monkeypatch.setenv("OMLX_SDPA256_QSPLIT", "0")
+    assert sdpa256._parse_qsplit_env() is False
 
 
 def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
@@ -651,45 +948,152 @@ def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
 
 
-# --- bounded-route engagement logging (issue #2283) ------------------------
+# --- q-split sizing math (#2991) ------------------------------------------
 
 
-def _tiled_log_records(caplog):
-    return [
+def test_max_q_sub_for_headroom_noncausal_matches_single_subtile_inversion():
+    """Non-causal: every sub-tile is the same (kv_len-wide) size, so the Metal
+    pool genuinely reuses one buffer across the loop -- sizing degrades to
+    inverting a single sub-tile's transient."""
+    from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+    from omlx.patches.sdpa256_attention import _max_q_sub_for_headroom
+
+    n_q, q_len, kv_len, hd, dtype_size = 24, 2048, 16384, 256, 2.0
+    for n_rows in (128, 512, 2048):
+        headroom = estimate_unfused_sdpa_call_bytes(
+            n_q, n_rows, kv_len, hd, dtype_size
+        )
+        assert (
+            _max_q_sub_for_headroom(n_q, q_len, kv_len, False, hd, dtype_size, headroom)
+            == n_rows
+        )
+        short_headroom = (
+            estimate_unfused_sdpa_call_bytes(n_q, n_rows - 128, kv_len, hd, dtype_size)
+            + 1
+        )
+        assert (
+            _max_q_sub_for_headroom(
+                n_q, q_len, kv_len, False, hd, dtype_size, short_headroom
+            )
+            == n_rows - 128
+        )
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, False, hd, dtype_size, 0) == 0
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, False, hd, dtype_size, -1) == 0
+
+
+def test_max_q_sub_for_headroom_causal_accounts_for_retained_pool_growth():
+    """Causal: sub-tiles narrow keys/values to each sub-tile's own causal end,
+    so every sub-tile is a *different* size and the pool cannot reuse across the
+    loop (#2991) -- the true cost is the SUM of every sub-tile's transient, not
+    one sub-tile's. The fix must pick a strictly smaller (or equal) q_sub than
+    the naive single-tile inversion whenever a split actually happens."""
+    from omlx.patches.sdpa256_attention import (
+        _max_q_sub_for_headroom,
+        _total_qsplit_bytes,
+    )
+
+    n_q, q_len, kv_len, hd, dtype_size = 24, 8192, 16384, 256, 2.0
+    per_row = n_q * (kv_len * dtype_size + hd * 4)
+    target = 2048
+
+    # headroom = the TRUE summed cost of splitting at `target`. The old (buggy)
+    # single-sub-tile formula would have inverted this same headroom to a q_sub
+    # *larger* than `target`, proving the naive formula is unsafe here.
+    headroom = _total_qsplit_bytes(n_q, q_len, kv_len, True, target, hd, dtype_size)
+    assert int(headroom // per_row) > target
+
+    q_sub = _max_q_sub_for_headroom(n_q, q_len, kv_len, True, hd, dtype_size, headroom)
+    assert q_sub == target
+    assert (
+        _total_qsplit_bytes(n_q, q_len, kv_len, True, q_sub, hd, dtype_size)
+        <= headroom
+    )
+
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, True, hd, dtype_size, 0) == 0
+    assert _max_q_sub_for_headroom(n_q, q_len, kv_len, True, hd, dtype_size, -1) == 0
+
+
+def test_qsplit_sizing_priced_at_fp32_not_query_dtype(_sdpa256_provider_reset):
+    """Wiring guard (#2991 rebase reconciliation): the q-split sizing path in
+    _route_decision MUST price the transient at SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    (the fp32 scores the unfused fallback materializes), never at the bf16 query
+    dtype. Pricing at the query dtype would pick a q_sub ~2x too large -- half
+    the real fp32-scored footprint -- reintroducing the OOM class #3461 closed,
+    now in the q-split route. This asserts the q_sub the router hands back fits
+    the fp32-priced cost, and would NOT fit the query-dtype-priced cost."""
+    from omlx.memory_monitor import SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    from omlx.patches.sdpa256_attention import _total_qsplit_bytes
+
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384, dtype=mx.bfloat16)
+    n_q_heads, q_len, kv_len, hd = 24, 2048, 16384, 256
+    assert q.dtype.size == 2 and SDPA256_UNFUSED_SCORE_DTYPE_SIZE == 4
+
+    # Headroom that fits a 1024-row split priced at the *real* fp32 score dtype.
+    headroom = _total_qsplit_bytes(
+        n_q_heads, q_len, kv_len, True, 1024, hd, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    )
+    owner = _HeadroomOwner(headroom)
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    route, q_sub = sdpa256._should_route(q, k, None, "causal", None)
+    assert route == "qsplit"
+
+    # The chosen q_sub must fit the fp32-priced summed cost...
+    fp32_cost = _total_qsplit_bytes(
+        n_q_heads, q_len, kv_len, True, q_sub, hd, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    )
+    assert fp32_cost <= headroom
+    # ...and had the router mistakenly priced at the bf16 query dtype it would
+    # have picked a strictly larger q_sub whose real fp32 cost blows headroom.
+    bf16_cost = _total_qsplit_bytes(
+        n_q_heads, q_len, kv_len, True, q_sub, hd, q.dtype.size
+    )
+    assert bf16_cost < fp32_cost  # the query-dtype price understates the truth
+    assert q_sub == 1024
+
+
+# --- route engagement logging (issue #2283) -------------------------------
+
+
+def _route_log_records(caplog, route=None):
+    records = [
         r
         for r in caplog.records
-        if r.levelname == "INFO" and "memory-bounded path" in r.getMessage()
+        if r.levelname == "INFO" and r.getMessage().startswith("sdpa256: route -> ")
     ]
+    if route is None:
+        return records
+    return [r for r in records if r.getMessage().startswith(f"sdpa256: route -> {route}")]
 
 
 def test_tiled_route_logs_once_when_no_provider(_sdpa256_provider_reset, caplog):
-    """Guard-off servers land on forced fused silently (issue #2283); the
+    """Guard-off servers land on the tiled path silently (issue #2283); the
     first engagement must say so at INFO, repeats must stay quiet."""
     sdpa256 = _sdpa256_provider_reset
     q, k, _ = _qkv(2048, 16384)
     with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-        records = _tiled_log_records(caplog)
+        assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
+        records = _route_log_records(caplog)
         assert len(records) == 1
         msg = records[0].getMessage()
         assert "no guard headroom provider" in msg
         assert "OMLX_SDPA256_TILED" in msg
-        # Second engagement for the same reason: no new record.
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-        assert len(_tiled_log_records(caplog)) == 1
+        # Second engagement, same decision: no new record (transition-only).
+        assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
+        assert len(_route_log_records(caplog)) == 1
 
 
 def test_tiled_route_logs_headroom_numbers(_sdpa256_provider_reset, caplog):
     sdpa256 = _sdpa256_provider_reset
     q, k, _ = _qkv(2048, 16384)
-    owner = _HeadroomOwner(1)  # 1 byte of headroom: unfused can't fit
+    owner = _HeadroomOwner(1)  # 1 byte of headroom: not even q-split fits
     sdpa256.set_unfused_headroom_provider(owner.headroom)
     with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-    records = _tiled_log_records(caplog)
+        assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
+    records = _route_log_records(caplog, "tiled")
     assert len(records) == 1
     msg = records[0].getMessage()
-    assert "exceeds live guard headroom" in msg
+    assert "exceeds" in msg
     assert "kv_len=16384" in msg
     assert "MiB" in msg
 
@@ -699,74 +1103,245 @@ def test_tiled_route_logs_forced_env(_sdpa256_provider_reset, caplog, monkeypatc
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
     q, k, _ = _qkv(2048, 16384)
     with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-    records = _tiled_log_records(caplog)
+        assert sdpa256._should_route(q, k, None, "causal", None) == ("tiled", 0)
+    records = _route_log_records(caplog, "tiled")
     assert len(records) == 1
     assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
 
 
-def test_unfused_route_logs_nothing(_sdpa256_provider_reset, caplog):
+def test_unfused_route_logs_nothing_extra(_sdpa256_provider_reset, caplog):
+    """The unfused route logs its own transition (useful for confirming a
+    request stayed on the fast path), but must not produce a *tiled*-labeled
+    record."""
     sdpa256 = _sdpa256_provider_reset
     q, k, _ = _qkv(2048, 16384)
     owner = _HeadroomOwner(1 << 40)  # ample headroom: fast path
     sdpa256.set_unfused_headroom_provider(owner.headroom)
     with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is False
-    assert _tiled_log_records(caplog) == []
+        assert sdpa256._should_route(q, k, None, "causal", None) == ("unfused", 0)
+    assert _route_log_records(caplog, "tiled") == []
+    assert len(_route_log_records(caplog, "unfused")) == 1
 
 
-def test_scheduler_headroom_provider_math():
-    """_sdpa256_unfused_headroom mirrors the adaptive throttle target:
-    hard ceiling x headroom safety, clamped by the abort cap, minus usage."""
-    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
+def test_qsplit_route_logs_transition(_sdpa256_provider_reset, caplog):
+    sdpa256 = _sdpa256_provider_reset
+    from omlx.memory_monitor import (
+        SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
+        estimate_unfused_sdpa_call_bytes,
+    )
 
-    gib = 1024**3
+    q, k, _ = _qkv(2048, 16384)
+    need = estimate_unfused_sdpa_call_bytes(
+        24, 2048, 16384, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    )
+    owner = _HeadroomOwner(need - 1)
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        route, q_sub = sdpa256._should_route(q, k, None, "causal", None)
+        assert route == "qsplit"
+    records = _route_log_records(caplog, "qsplit")
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert f"q_sub={q_sub}" in msg
+    assert "kv_len=16384" in msg
+
+
+# --- scheduler headroom provider (#2204, #2991) ---------------------------
+
+
+def _sdpa256_headroom_fake(gib, usage_bytes=None):
+    """Shared fake scaffold for _sdpa256_unfused_headroom tests."""
+    from omlx.scheduler import Scheduler
 
     class _Fake:
         _memory_hard_limit_bytes = 0
+        _memory_hard_watermark_bytes = 0
         _memory_abort_limit_bytes = 0
         _memory_limits_propagated = False
         _prefill_memory_guard = False
         _sdpa256_unguarded_logged = False
+        _sdpa256_last_call_shape = None
         _prefill_headroom_safety = 0.90
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
         _prefill_abort_cap = Scheduler._prefill_abort_cap
+        _admission_limit_bytes = Scheduler._admission_limit_bytes
 
-        def _current_usage_bytes(self):
+        def _current_usage_bytes(self, *, credit_cache_memory=False):
+            return usage_bytes
+
+    return _Fake()
+
+
+def test_scheduler_headroom_provider_math():
+    """_sdpa256_unfused_headroom targets _admission_limit_bytes (the hard
+    watermark the reactive enforcer kills at) x headroom safety, clamped by the
+    abort cap (the Metal-crash line), minus usage, then charges 2x by halving
+    the result."""
+    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
+
+    gib = 1024**3
+    fake = _sdpa256_headroom_fake(gib, usage_bytes=10 * gib)
+    kv_len, q_len = 16384, 2048
+    # Nothing propagated yet: guard state unknown -> negative sentinel keeps the
+    # tiled default even though the flag reads False.
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == -1
+
+    # Enforcer has spoken and the guard is explicitly off: unbounded headroom.
+    fake._memory_limits_propagated = True
+    assert (
+        Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len)
+        == _SDPA256_UNBOUNDED_HEADROOM
+    )
+
+    # Guard on but ceiling not landed yet (startup race): memory-safe default.
+    fake._prefill_memory_guard = True
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == -1
+
+    # Watermark not propagated yet: _admission_limit_bytes falls back to the
+    # hard limit; abort cap (100*0.95=95) does not bind below target (100*0.90).
+    fake._memory_hard_limit_bytes = 100 * gib
+    target = int(100 * gib * 0.90)
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == (
+        target - 10 * gib
+    ) // 2
+
+    # Watermark binds once propagated and lower than the hard limit.
+    fake._memory_hard_watermark_bytes = 85 * gib
+    target = int(85 * gib * 0.90)
+    assert Scheduler._sdpa256_unfused_headroom(fake, kv_len, q_len) == (
+        target - 10 * gib
+    ) // 2
+
+
+def test_scheduler_headroom_clamps_to_abort_cap_on_wired_hardware():
+    """Reconciliation guard: when the abort cap (the Metal async-OOM crash
+    line) sits BELOW the admission-watermark target -- the wired-memory case
+    that motivated keeping main's clamp during the #2991 rebase -- the route
+    must size against the abort cap, not the looser watermark, or it can hand
+    back a transient that trips the uncatchable async OOM."""
+    from omlx.scheduler import Scheduler
+
+    gib = 1024**3
+    fake = _sdpa256_headroom_fake(gib, usage_bytes=10 * gib)
+    fake._memory_limits_propagated = True
+    fake._prefill_memory_guard = True
+    fake._memory_hard_limit_bytes = 100 * gib
+    fake._memory_hard_watermark_bytes = 98 * gib  # admission target 98*0.90
+    # A tight static abort limit (e.g. wired cap): 60GiB * 0.95 = 57GiB, well
+    # below the 98*0.90 = 88.2GiB admission target -> the abort cap must win.
+    fake._memory_abort_limit_bytes = 60 * gib
+    target = int(60 * gib * 0.95)
+    assert Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048) == (
+        target - 10 * gib
+    ) // 2
+
+
+def test_sdpa256_headroom_charges_2x_transient():
+    """A call only clears the route gate when its transient fits HALF the raw
+    (target - usage) headroom -- pricing in the same-size predecessor transient
+    that kv_len monotonicity guarantees is still sitting unreclaimed in the
+    pool. Proven necessary, not just defensive, by a live run where the 1x
+    version still rode the fast path to the same abort point as the bug."""
+    from omlx.scheduler import Scheduler
+
+    gib = 1024**3
+    fake = _sdpa256_headroom_fake(gib, usage_bytes=10 * gib)
+    fake._memory_limits_propagated = True
+    fake._prefill_memory_guard = True
+    fake._memory_hard_limit_bytes = 100 * gib
+
+    raw_headroom = int(100 * gib * 0.90) - 10 * gib
+    charged = Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
+    assert charged == raw_headroom // 2
+    assert charged < raw_headroom
+
+
+def test_sdpa256_headroom_credits_pool_only_on_repeated_shape():
+    """Regression for the pool-growth memory regression found via a live
+    258k-token run: crediting mx.get_cache_memory() unconditionally let the
+    router keep choosing the big-transient route as the retained pool inflated.
+    Only a genuine same-(kv_len, q_len) repeat call is guaranteed a same-size
+    freed transient to reuse; the first call at a new kv_len is not, and neither
+    is a same-kv_len call at a different q_len (#2991)."""
+    from omlx.scheduler import Scheduler
+
+    gib = 1024**3
+
+    class _Fake:
+        _memory_hard_limit_bytes = 100 * gib
+        _memory_hard_watermark_bytes = 0
+        _memory_abort_limit_bytes = 0
+        _memory_limits_propagated = True
+        _prefill_memory_guard = True
+        _sdpa256_unguarded_logged = False
+        _sdpa256_last_call_shape = None
+        _prefill_headroom_safety = 0.90
+        _PREFILL_HEADROOM_SAFETY = 0.90
+        _prefill_abort_margin = 0.95
+        _prefill_abort_cap = Scheduler._prefill_abort_cap
+        _admission_limit_bytes = Scheduler._admission_limit_bytes
+
+        def __init__(self):
+            self.credit_calls = []
+
+        def _current_usage_bytes(self, *, credit_cache_memory=False):
+            self.credit_calls.append(credit_cache_memory)
             return 10 * gib
 
     fake = _Fake()
-    # Nothing propagated yet: guard state is unknown, so the negative
-    # sentinel keeps the bounded default even though the flag reads False.
-    assert Scheduler._sdpa256_unfused_headroom(fake) == -1
+    # First call at (kv_len=A, q_len=X): no same-shape call yet -> uncredited.
+    Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
+    # Second call, same shape (layer 2 of the chunk) -> credited.
+    Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
+    # Third call, same kv_len but different q_len -> uncredited (#2991).
+    Scheduler._sdpa256_unfused_headroom(fake, 16384, 512)
+    # Fourth call, new larger kv_len -> uncredited even though the pool has
+    # entries.
+    Scheduler._sdpa256_unfused_headroom(fake, 18432, 2048)
+    # Fifth call, repeats the fourth's shape -> credited.
+    Scheduler._sdpa256_unfused_headroom(fake, 18432, 2048)
 
-    # Enforcer has spoken and the guard is explicitly off: the user opted
-    # out of memory management, so the route gets unbounded headroom and
-    # keeps the unfused fast path (#2283).
-    fake._memory_limits_propagated = True
-    assert (
-        Scheduler._sdpa256_unfused_headroom(fake) == _SDPA256_UNBOUNDED_HEADROOM
-    )
+    assert fake.credit_calls == [False, True, False, False, True]
 
-    # Guard on but the ceiling has not landed yet (startup race): stay on
-    # the memory-safe default.
-    fake._prefill_memory_guard = True
-    assert Scheduler._sdpa256_unfused_headroom(fake) == -1
 
-    # Throttle target binds: abort cap (100 * 0.95) > target (100 * 0.90).
-    fake._memory_hard_limit_bytes = 100 * gib
-    assert Scheduler._sdpa256_unfused_headroom(fake) == int(100 * gib * 0.90) - 10 * gib
+def test_current_usage_bytes_credits_cache_memory_on_the_phys_side(monkeypatch):
+    """credit_cache_memory=True subtracts mx.get_cache_memory() from the
+    phys-footprint side only -- it must never pull the result below
+    mx.get_active_memory(), and must have no effect when active already wins."""
+    from omlx.scheduler import Scheduler
 
-    # Abort cap binds when lower than the throttle target.
-    fake._memory_abort_limit_bytes = 80 * gib
-    assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.95) - 10 * gib
+    gib = 1024**3
+
+    class _Fake:
+        _last_mlx_active_memory_bytes = 0
+        _hot_cache_cpu_bytes = staticmethod(lambda: 0)
+
+    fake = _Fake()
+
+    monkeypatch.setattr("omlx.scheduler.get_phys_footprint", lambda: 40 * gib)
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 5 * gib)
+
+    # phys (40GiB) dominates active (5GiB); a pool of 15GiB credits back.
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 15 * gib)
+    uncredited = Scheduler._current_usage_bytes(fake, credit_cache_memory=False)
+    credited = Scheduler._current_usage_bytes(fake, credit_cache_memory=True)
+    assert uncredited == 40 * gib
+    assert credited == 25 * gib
+
+    # An oversized pool credit must floor at active, not go negative.
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 100 * gib)
+    assert Scheduler._current_usage_bytes(fake, credit_cache_memory=True) == 5 * gib
+
+    # active already dominates phys: crediting has nothing to do.
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 45 * gib)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 15 * gib)
+    assert Scheduler._current_usage_bytes(fake, credit_cache_memory=True) == 45 * gib
 
 
 def test_unguarded_fast_path_logs_once(caplog):
-    """Guard-off fast routing runs without a memory ceiling, which is the
-    one state worth a breadcrumb (#2283): exactly one INFO naming the OOM
-    trade and the recovery levers, then silence."""
+    """Guard-off fast routing runs without a memory ceiling, worth a breadcrumb
+    (#2283): exactly one INFO naming the OOM trade and the recovery levers."""
     from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
 
     class _Fake:
@@ -778,11 +1353,11 @@ def test_unguarded_fast_path_logs_once(caplog):
     fake = _Fake()
     with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
         assert (
-            Scheduler._sdpa256_unfused_headroom(fake)
+            Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
             == _SDPA256_UNBOUNDED_HEADROOM
         )
         assert (
-            Scheduler._sdpa256_unfused_headroom(fake)
+            Scheduler._sdpa256_unfused_headroom(fake, 16384, 2048)
             == _SDPA256_UNBOUNDED_HEADROOM
         )
     records = [
@@ -794,7 +1369,9 @@ def test_unguarded_fast_path_logs_once(caplog):
 
 
 def test_scheduler_step_registers_headroom_provider(_sdpa256_provider_reset):
-    """Scheduler.step must bind its provider on the model execution thread."""
+    """Scheduler.step must bind its provider on the model execution thread
+    (thread-local, #3333). A rename that silently skips registration would
+    revert #2204 to always-tiled."""
     from unittest.mock import MagicMock
 
     from omlx.scheduler import Scheduler, SchedulerConfig
@@ -814,8 +1391,8 @@ def test_scheduler_step_registers_headroom_provider(_sdpa256_provider_reset):
     bound = sdpa256._get_unfused_headroom_provider()
     assert bound is not None
     assert bound.__self__ is scheduler
-    # Ceiling not propagated yet -> negative sentinel keeps the bounded default.
-    assert bound() == -1
+    # Ceiling not propagated yet -> negative sentinel keeps the tiled default.
+    assert bound(16384, 2048) == -1
 
 
 # --- mlx-vlm coverage (issue: VLM engine head-256 prefill unprotected) ----
@@ -896,7 +1473,8 @@ def test_vlm_submodule_rebind_covers_copied_reference(
             is language.scaled_dot_product_attention
         )
 
-        # Routed shape through the module the VLM model actually calls.
+        # Routed shape through the module the VLM model actually calls. No
+        # provider registered -> tiled default -> flash kernel.
         q, k, v = _qkv(128, 512)
         mx.eval(language.scaled_dot_product_attention(q, k, v, None, SCALE_256, "causal"))
         assert flash_calls["n"] == 1
@@ -918,8 +1496,7 @@ def test_production_install_order_covers_vlm_language(
     """Both engines install sdpa256 first and fa256 second. fa256 captures
     whatever mlx_vlm.models.base holds at that point as its "original", so
     sdpa256 must have already rebound the submodules — otherwise the identity
-    sweep misses qwen3_5.language and the VLM engine keeps the unfused path
-    (the baseline defect this suite pins)."""
+    sweep misses qwen3_5.language and the VLM engine keeps the unfused path."""
     sdpa256 = _sdpa256_provider_reset
     import omlx.patches.qwen35_fa256_attention as fa256
 

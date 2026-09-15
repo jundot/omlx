@@ -71,7 +71,9 @@ def test_bool_mask_uses_tiled_sdpa_and_matches_dense(monkeypatch):
     mask[..., 64:] = True
     mx.eval(queries, keys, values, mask)
 
-    assert sdpa256._should_route(queries, keys, None, mask, None) is True
+    # Array masks stay eligible for the bounded route but never q-split; with
+    # no headroom provider registered the memory-safe tiled default engages.
+    assert sdpa256._should_route(queries, keys, None, mask, None) == ("tiled", 0)
     tiled = sdpa256._flash_sdpa256(queries, keys, values, 256**-0.5, mask)
     dense = mx.fast.scaled_dot_product_attention(
         queries, keys, values, scale=256**-0.5, mask=mask
@@ -204,8 +206,12 @@ def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
     }
     min_kv_len_snap = sdpa256._SDPA256_MIN_KV_LEN
     routes_snap = memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.get(256)
+    import threading
+
     monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
-    monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
+    monkeypatch.setattr(
+        sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local(), raising=False
+    )
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
     assert sdpa256.apply_sdpa256_attention_patch(min_kv_len=32) is True
 
