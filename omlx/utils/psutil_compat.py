@@ -29,6 +29,11 @@ _VM_STATS_MIN_COUNT = 4
 # against `vm_stat` output on Apple Silicon.
 _VM_SPECULATIVE_INDEX = 23
 _VM_COMPRESSOR_INDEX = 32
+# Keep the initial request within both the 40-entry and 62-entry SDK layouts;
+# newer kernels can report a larger required count and trigger a safe retry.
+_HOST_INFO64_INITIAL_COUNT = _VM_COMPRESSOR_INDEX + 1
+# mach_vm.h's MIG_ARRAY_TOO_LARGE return value (KERN_INVALID_ARGUMENT - 307).
+_MIG_ARRAY_TOO_LARGE = -307
 _VM_PAGE_SIZE = 16384
 _SYSCTL = "/usr/sbin/sysctl"
 _VM_STAT = "/usr/bin/vm_stat"
@@ -104,19 +109,29 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     """Return macOS vm_statistics64 page counters in bytes.
 
     The first four counters are stable across SDK versions. The oversized
-    host_info64_t buffer avoids binding oMLX to an SDK-specific struct tail.
-    "speculative" and "compressed" sit further into the struct and are only
-    reported when the kernel filled that far, so callers must treat them as
-    optional.
+    host_info64_t buffer avoids binding oMLX to an SDK-specific struct tail,
+    while the initial count covers every field oMLX reads in both known SDK
+    layouts. If a newer kernel reports that it needs more entries, the call is
+    retried with that count when it still fits the allocation. "speculative"
+    and "compressed" sit further into the struct and are only reported when
+    the kernel filled that far, so callers must treat them as optional.
     """
     if _libc is None or _MACH_HOST is None:
         return None
     try:
         stats = (ctypes.c_int * _HOST_INFO64_MAX_COUNT)()
-        count = ctypes.c_uint(_HOST_INFO64_MAX_COUNT)
+        count = ctypes.c_uint(_HOST_INFO64_INITIAL_COUNT)
         rc = _libc.host_statistics64(
             _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
         )
+        if rc == _MIG_ARRAY_TOO_LARGE:
+            required_count = int(count.value)
+            if not (_VM_STATS_MIN_COUNT <= required_count <= _HOST_INFO64_MAX_COUNT):
+                return None
+            count = ctypes.c_uint(required_count)
+            rc = _libc.host_statistics64(
+                _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
+            )
         if rc != 0 or count.value < _VM_STATS_MIN_COUNT:
             return None
         ps = _VM_PAGE_SIZE
