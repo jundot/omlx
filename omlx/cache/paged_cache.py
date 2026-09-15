@@ -50,17 +50,14 @@ def resolve_block_extra_keys(
     """Resolve which cache key salt applies to a block ending at ``block_end``.
 
     ``extra_key_ranges`` takes precedence over ``extra_keys`` and is intended
-    for segmented VLM cache keying.
-
-    ``extra_key_ranges`` must be sorted ascending by start position. The
-    function uses early break on the first non-matching entry, so unsorted
-    input will produce incorrect results.
+    for segmented VLM cache keying. Unsorted ranges (possible after a client
+    compacts a long VLM conversation) cannot be resolved positionally, so
+    they are ignored and resolution falls back to whole-request keying.
     """
-    if extra_key_ranges:
-        assert all(
-            extra_key_ranges[i][0] <= extra_key_ranges[i + 1][0]
-            for i in range(len(extra_key_ranges) - 1)
-        ), "extra_key_ranges must be sorted ascending by start position"
+    if extra_key_ranges and all(
+        extra_key_ranges[i][0] <= extra_key_ranges[i + 1][0]
+        for i in range(len(extra_key_ranges) - 1)
+    ):
         selected = None
         for start, keys in extra_key_ranges:
             if block_end > start:
@@ -68,6 +65,8 @@ def resolve_block_extra_keys(
             else:
                 break
         return selected
+    if extra_key_ranges:
+        logger.debug("Ignoring unsorted extra_key_ranges for cache key resolution")
     if extra_keys is not None and (
         extra_key_token_start is None or block_end > extra_key_token_start
     ):
