@@ -5416,6 +5416,33 @@ async def stream_chat_completion(
                             )
                         ):
                             stream_tool_sequence_safe = False
+                            # The filter suppressed this envelope from content deltas, so a
+                            # silent drop here loses the turn payload when nothing else
+                            # recovers it (#3660: unregistered or malformed function on the
+                            # early-stream gate). Honor the filter contract - a rejected
+                            # attempt is returned intact - flush the captured envelope as a
+                            # visible content delta; terminal parse_tool_calls may still
+                            # recover it via XML fallback / name remap, and clients at worst
+                            # see the raw call as text instead of an empty reply (#3660).
+                            if segment.text:
+                                reject_chunk = ChatCompletionChunk(
+                                    id=response_id,
+                                    model=request.model,
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(
+                                                content=segment.text,
+                                            ),
+                                            finish_reason=None,
+                                        ),
+                                    ],
+                                )
+                                mark_visible_delta()
+                                yield (
+                                    "data: "
+                                    + reject_chunk.model_dump_json(exclude_none=True)
+                                    + "\n\n"
+                                )
                             continue
                         if not stream_tool_sequence_safe:
                             continue

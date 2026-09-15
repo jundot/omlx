@@ -29,7 +29,11 @@ def test_matches_mx_fast(dtype, B, H, Hkv, qL, kL, D):
     v = mx.random.normal((B, Hkv, kL, D)).astype(dtype)
     scale = 1.0 / (D ** 0.5)
     causal = qL > 1
-    assert fast._ext.sdpa_decode_supported(q, k, v)
+    if not fast._ext.sdpa_decode_supported(q, k, v):
+        # Device reports the selected pipeline occupancy below the fixed
+        # threadgroup size; the wrapper would fail closed to portable SDPA
+        # (parity contract lives in test_head_dim_256_never_silently_corrupts).
+        pytest.skip("device kernel occupancy below fixed group size")
     out = fast._ext.sdpa_decode(q, k, v, scale, causal)
     if causal:
         mask = mx.triu(mx.full((qL, kL), float("-inf")), k=kL - qL + 1)
@@ -37,6 +41,33 @@ def test_matches_mx_fast(dtype, B, H, Hkv, qL, kL, D):
         ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
     else:
         ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+    mx.eval(out, ref)
+    tol = 1e-5 if dtype == mx.float32 else 5e-3
+    assert mx.allclose(out, ref, atol=tol, rtol=tol).item()
+
+
+# jundot/omlx#3660: Flash-Next QSA geometry (D=V=256, gqa 12). The heavy
+# D=256/D=192 one-pass instantiations exceed the fixed 1024-thread group on
+# some GPUs (832 on air64_v28); Metal then drops the dispatch silently and
+# leaves the output unwritten. The support gate must fail closed so the
+# wrapper falls back to portable SDPA; where the kernel is resident it must
+# match directly. Either way parity is required, so this test is red on any
+# device whose dispatch silently corrupts these shapes.
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("H,Hkv,kL,D,V", [
+    (24, 2, 512, 256, 256),   # one-pass zone on s/d-class arch chars
+    (24, 2, 800, 256, 256),   # odd kL, one-pass zone
+    (24, 2, 2051, 256, 256),  # production gathered QSA widths
+    (8, 2, 512, 192, 128),    # qk 192 / value 128 instantiation
+])
+def test_head_dim_256_never_silently_corrupts(dtype, H, Hkv, kL, D, V):
+    mx.random.seed(0)
+    q = mx.random.normal((1, H, 1, D)).astype(dtype)
+    k = mx.random.normal((1, Hkv, kL, D)).astype(dtype)
+    v = mx.random.normal((1, Hkv, kL, V)).astype(dtype)
+    scale = 1.0 / (D ** 0.5)
+    out = fast.sdpa_decode(q, k, v, scale)
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
     mx.eval(out, ref)
     tol = 1e-5 if dtype == mx.float32 else 5e-3
     assert mx.allclose(out, ref, atol=tol, rtol=tol).item()
