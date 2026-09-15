@@ -529,6 +529,31 @@ class ModelInfo(BaseModel):
     # effective context window from the listing without a separate call
     # to /v1/models/status (see #1308).
     max_model_len: int | None = None
+    # Claude Desktop (Anthropic gateway mode) extensions. Only serialized on
+    # derived Claude tier alias entries (see ClaudeTierModelInfo below);
+    # excluded by default so the standard OpenAI listing is byte-identical
+    # to previous releases.
+    display_name: str | None = Field(default=None, exclude=True)
+    created_at: str | None = Field(default=None, exclude=True)
+    anthropic_family_tier: str | None = Field(default=None, exclude=True)
+    is_family_default: bool | None = Field(default=None, exclude=True)
+    max_tokens: int | None = Field(default=None, exclude=True)
+
+
+class ClaudeTierModelInfo(ModelInfo):
+    """ModelInfo for derived Claude Desktop tier aliases.
+
+    Re-includes the Anthropic gateway metadata fields that the base class
+    excludes, so only tier-alias entries carry ``display_name`` /
+    ``created_at`` / ``anthropic_family_tier`` / ``is_family_default`` /
+    ``max_tokens`` in /v1/models.
+    """
+
+    display_name: str | None = None
+    created_at: str | None = None
+    anthropic_family_tier: str | None = None
+    is_family_default: bool | None = None
+    max_tokens: int | None = None
 
 
 class ModelsResponse(BaseModel):

@@ -809,6 +809,50 @@
                                         <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.haiku_hint') }}</p>
                                     </div>
                                 </div>
+                                <!-- Claude Desktop tier aliases -->
+                                <div class="mt-4 pt-4 border-t border-neutral-100">
+                                    <div class="flex items-center gap-3">
+                                        <button type="button"
+                                                @click="globalSettings.claude_code.desktop_enabled = !globalSettings.claude_code.desktop_enabled; saveClaudeCodeSettings()"
+                                                :class="globalSettings.claude_code.desktop_enabled ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                                            <span :class="globalSettings.claude_code.desktop_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
+                                        </button>
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('status.claude_code.desktop') }}</span>
+                                        <span class="text-xs px-2 py-0.5 rounded-full"
+                                              :class="claudeDesktop.configured ? 'bg-green-100 text-green-700' : 'bg-neutral-100 text-neutral-500'"
+                                              x-text="claudeDesktop.configured ? window.t('status.claude_code.desktop_configured') : window.t('status.claude_code.desktop_not_configured')"></span>
+                                    </div>
+                                    <p class="mt-1.5 text-xs text-neutral-400">{{ t('status.claude_code.desktop_hint') }}</p>
+                                    <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.desktop_side_effect') }}</p>
+                                    <div class="mt-2 flex items-center gap-2">
+                                        <button type="button"
+                                                @click="reapplyClaudeDesktopConfig()"
+                                                :disabled="claudeDesktop.working"
+                                                class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white hover:bg-neutral-50 disabled:opacity-50 transition-all">
+                                            <span x-text="claudeDesktop.working ? window.t('status.claude_code.desktop_working') : window.t('status.claude_code.desktop_reapply')"></span>
+                                        </button>
+                                        <button type="button"
+                                                @click="restoreClaudeDesktopConfig()"
+                                                :disabled="claudeDesktop.working"
+                                                class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white hover:bg-neutral-50 disabled:opacity-50 transition-all">
+                                            <span x-text="claudeDesktop.working ? window.t('status.claude_code.desktop_restoring') : window.t('status.claude_code.desktop_restore')"></span>
+                                        </button>
+                                        <span x-show="claudeDesktop.message" x-cloak class="text-xs text-neutral-500" x-text="claudeDesktop.message"></span>
+                                    </div>
+                                    <div class="mt-2 flex items-center gap-2 min-w-0">
+                                        <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="claudeDesktopCommand"></code>
+                                        <button x-data="{ copied: false }"
+                                                @click="copyToClipboard(claudeDesktopCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                class="p-2 rounded-lg transition-all flex-shrink-0"
+                                                :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                                :title="window.t('status.integrations.copy_command_tooltip')">
+                                            <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                            <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
