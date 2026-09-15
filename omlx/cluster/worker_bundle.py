@@ -92,9 +92,13 @@ def build_cuda_join_command(
         '-o "$omlx_join_tmp" && '
         f"printf '%s  %s\\n' {shlex.quote(digest)} \"$omlx_join_tmp\" "
         "| sha256sum -c - && "
-        'sudo python3 "$omlx_join_tmp" '
+        # Feed the one-time key through stdin so it never shows up in the
+        # bootstrap process's argv (e.g. `ps` output) for the duration of
+        # the join.
+        f"printf '%s' {shlex.quote(join_key)} "
+        f"| sudo python3 \"$omlx_join_tmp\" "
         f"--controller {shlex.quote(controller_url)} "
-        f"--join-key {shlex.quote(join_key)} "
+        "--join-key-stdin "
         "--controller-key-fingerprint "
         f"{shlex.quote(controller_key_fingerprint)} "
         f"--source-digest {source_digest})"

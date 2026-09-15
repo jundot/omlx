@@ -18,6 +18,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 SESSION_COOKIE_NAME = "omlx_admin_session"
 SESSION_MAX_AGE = 86400  # 24 hours in seconds
 REMEMBER_ME_MAX_AGE = 2592000  # 30 days in seconds
+AUTO_LOGIN_MAX_AGE = 30  # seconds — window for /admin/auto-login exchange
 
 # Secret key for signing session tokens
 # Use environment variable if set, otherwise generate a random key
@@ -235,6 +236,30 @@ def validate_api_key(api_key: str) -> tuple[bool, str]:
     if not api_key.isascii():
         return False, "API key must contain only ASCII characters"
     return True, ""
+
+
+def create_auto_login_token() -> str:
+    """Create a short-lived signed token for the /admin/auto-login exchange.
+
+    Unlike the session cookie, this token has no admin meaning by itself:
+    it is a brief proof-of-possession that the bearer presented the real
+    main API key to the token endpoint moments ago. It lets the macOS app
+    open the dashboard in the browser without ever placing the permanent
+    API key in a URL. The short expiry caps replay value if the token
+    leaks into history/logs.
+    """
+    return _serializer.dumps({"auto_login": True}, salt="auto-login")
+
+
+def verify_auto_login_token(token: str) -> bool:
+    """Return True iff ``token`` is a fresh, valid auto-login token."""
+    if not token:
+        return False
+    try:
+        data = _serializer.loads(token, salt="auto-login", max_age=AUTO_LOGIN_MAX_AGE)
+        return data.get("auto_login", False) is True
+    except (BadSignature, SignatureExpired):
+        return False
 
 
 def verify_session(request: Request) -> bool:

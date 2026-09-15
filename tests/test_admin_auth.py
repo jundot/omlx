@@ -22,6 +22,16 @@ def _mock_global_settings(api_key=None):
     return mock
 
 
+def _fake_request(host="127.0.0.1"):
+    class _Client:
+        def __init__(self, host):
+            self.host = host
+    class _Req:
+        def __init__(self, host):
+            self.client = _Client(host)
+    return _Req(host)
+
+
 def _patch_getter(mock_settings):
     """Replace the module-level _get_global_settings with a lambda returning mock."""
     original = admin_routes._get_global_settings
@@ -35,15 +45,23 @@ def _restore_getter(original):
 
 
 class TestAutoLogin:
-    """Tests for GET /admin/auto-login endpoint."""
+    """Tests for GET /admin/auto-login endpoint (token-based flow)."""
+
+    def _make_token(self):
+        from omlx.admin.auth import create_auto_login_token
+
+        return create_auto_login_token()
 
     def test_auto_login_success_redirects_to_dashboard(self):
-        """Valid API key should redirect to the specified path with session cookie."""
+        """Valid token should redirect to the specified path with session cookie."""
         mock_settings = _mock_global_settings(api_key="test-key")
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(
+                    http_request=_fake_request(),
+                    auth_token=self._make_token(), redirect="/admin/dashboard"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin/dashboard"
@@ -54,25 +72,31 @@ class TestAutoLogin:
             _restore_getter(original)
 
     def test_auto_login_success_redirects_to_chat(self):
-        """Valid API key should redirect to chat page."""
+        """Valid token should redirect to chat page."""
         mock_settings = _mock_global_settings(api_key="test-key")
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/chat")
+                admin_routes.auto_login(
+                    http_request=_fake_request(),
+                    auth_token=self._make_token(), redirect="/admin/chat"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin/chat"
         finally:
             _restore_getter(original)
 
-    def test_auto_login_invalid_key_redirects_to_login(self):
-        """Invalid API key should redirect to login page without session cookie."""
-        mock_settings = _mock_global_settings(api_key="correct-key")
+    def test_auto_login_invalid_token_redirects_to_login(self):
+        """Invalid token should redirect to login page without session cookie."""
+        mock_settings = _mock_global_settings(api_key="test-key")
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="wrong-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(
+                    http_request=_fake_request(),
+                    auth_token="not-a-real-token", redirect="/admin/dashboard"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -81,26 +105,16 @@ class TestAutoLogin:
         finally:
             _restore_getter(original)
 
-    def test_auto_login_empty_key_redirects_to_login(self):
-        """Empty API key should redirect to login page."""
+    def test_auto_login_empty_token_redirects_to_login(self):
+        """Empty token should redirect to login page."""
         mock_settings = _mock_global_settings(api_key="test-key")
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="", redirect="/admin/dashboard")
-            )
-            assert result.status_code == 302
-            assert result.headers["location"] == "/admin"
-        finally:
-            _restore_getter(original)
-
-    def test_auto_login_no_server_key_redirects_to_login(self):
-        """No server API key configured should redirect to login page."""
-        mock_settings = _mock_global_settings(api_key=None)
-        original = _patch_getter(mock_settings)
-        try:
-            result = asyncio.run(
-                admin_routes.auto_login(key="any-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(
+                    http_request=_fake_request(),
+                    auth_token="", redirect="/admin/dashboard"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -115,7 +129,8 @@ class TestAutoLogin:
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
                     admin_routes.auto_login(
-                        key="test-key", redirect="https://evil.com"
+                    http_request=_fake_request(),
+                        auth_token=self._make_token(), redirect="https://evil.com"
                     )
                 )
             assert exc_info.value.status_code == 400
@@ -129,12 +144,123 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin")
+                admin_routes.auto_login(
+                    http_request=_fake_request(),
+                    auth_token=self._make_token(), redirect="/admin"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
         finally:
             _restore_getter(original)
+
+    def test_auto_login_cookie_secure_on_non_loopback(self):
+        """Non-loopback clients get a Secure session cookie."""
+        mock_settings = _mock_global_settings(api_key="test-key")
+        original = _patch_getter(mock_settings)
+        try:
+            result = asyncio.run(
+                admin_routes.auto_login(
+                    http_request=_fake_request(host="192.168.1.50"),
+                    auth_token=self._make_token(), redirect="/admin/dashboard"
+                )
+            )
+            assert "Secure" in result.headers.get("set-cookie", "")
+        finally:
+            _restore_getter(original)
+
+    def test_auto_login_cookie_not_secure_on_loopback(self):
+        """Loopback clients keep a non-Secure session cookie (plain HTTP)."""
+        mock_settings = _mock_global_settings(api_key="test-key")
+        original = _patch_getter(mock_settings)
+        try:
+            result = asyncio.run(
+                admin_routes.auto_login(
+                    http_request=_fake_request(host="127.0.0.1"),
+                    auth_token=self._make_token(), redirect="/admin/dashboard"
+                )
+            )
+            assert "Secure" not in result.headers.get("set-cookie", "")
+        finally:
+            _restore_getter(original)
+
+
+class TestAutoLoginTokenEndpoint:
+    """Tests for POST /admin/api/auto-login-token."""
+
+    async def _call(self, key):
+        return await admin_routes.create_auto_login_token_route(
+            admin_routes.AutoLoginTokenRequest(key=key)
+        )
+
+    def test_token_exchange_success(self):
+        mock_settings = _mock_global_settings(api_key="test-key")
+        original = _patch_getter(mock_settings)
+        try:
+            result = asyncio.run(self._call("test-key"))
+            assert isinstance(result["token"], str) and result["token"]
+        finally:
+            _restore_getter(original)
+
+    def test_token_exchange_wrong_key_401(self):
+        mock_settings = _mock_global_settings(api_key="correct-key")
+        original = _patch_getter(mock_settings)
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(self._call("wrong-key"))
+            assert exc_info.value.status_code == 401
+        finally:
+            _restore_getter(original)
+
+    def test_token_exchange_no_server_key_401(self):
+        mock_settings = _mock_global_settings(api_key=None)
+        original = _patch_getter(mock_settings)
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(self._call("any-key"))
+            assert exc_info.value.status_code == 401
+        finally:
+            _restore_getter(original)
+
+    def test_exchanged_token_works_on_auto_login(self):
+        """Token minted by the endpoint is accepted by /admin/auto-login."""
+        mock_settings = _mock_global_settings(api_key="test-key")
+        original = _patch_getter(mock_settings)
+        try:
+            minted = asyncio.run(self._call("test-key"))["token"]
+            result = asyncio.run(
+                admin_routes.auto_login(
+                    http_request=_fake_request(),
+                    auth_token=minted, redirect="/admin/dashboard"
+                )
+            )
+            assert result.status_code == 302
+            assert result.headers["location"] == "/admin/dashboard"
+        finally:
+            _restore_getter(original)
+
+
+class TestAutoLoginTokenHelpers:
+    """Tests for the signed auto-login token helpers in auth.py."""
+
+    def test_create_and_verify_roundtrip(self):
+        from omlx.admin import auth
+
+        token = auth.create_auto_login_token()
+        assert auth.verify_auto_login_token(token) is True
+
+    def test_wrong_salt_is_rejected(self):
+        from omlx.admin import auth
+
+        # A session token (different salt/purpose) must not pass.
+        session_token = auth.create_session_token()
+        assert auth.verify_auto_login_token(session_token) is False
+
+    def test_empty_and_garbage_rejected(self):
+        from omlx.admin import auth
+
+        assert auth.verify_auto_login_token("") is False
+        assert auth.verify_auto_login_token("garbage") is False
 
 
 class TestLoginPage:

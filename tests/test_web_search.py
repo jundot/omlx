@@ -17,6 +17,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import httpcore
+
 import omlx.websearch as websearch
 from omlx.api import websearch_routes
 from omlx.settings import IntegrationSettings
@@ -475,6 +477,49 @@ class TestSsrfGuard:
         with pytest.raises(WebSearchError) as exc_info:
             await websearch._assert_public_host("nope.invalid")
         assert exc_info.value.code == "request_failed"
+
+    async def test_backend_pins_connect_to_public_ip(self, monkeypatch):
+        """Connect-time backend resolves and connects to a validated IP."""
+
+        async def resolve(host):
+            return [PUBLIC_IP]
+
+        monkeypatch.setattr(websearch, "_resolve_host", resolve)
+
+        class FakeStream:
+            async def aclose(self):
+                return None
+
+        resolved_host = None
+        inner_backend = httpcore.AsyncNetworkBackend()
+
+        async def fake_connect_tcp(
+            host, port, timeout=None, local_address=None, socket_options=None
+        ):
+            nonlocal resolved_host
+            resolved_host = host
+            return FakeStream()
+
+        inner_backend.connect_tcp = fake_connect_tcp  # type: ignore[method-assign]
+        backend = websearch._SSRFGuardBackend(inner_backend)
+
+        await backend.connect_tcp("example.com", 443)
+        assert resolved_host == PUBLIC_IP
+
+    async def test_backend_blocks_private_connect(self, monkeypatch):
+        async def resolve(host):
+            return ["10.0.0.5"]
+
+        monkeypatch.setattr(websearch, "_resolve_host", resolve)
+        backend = websearch._SSRFGuardBackend(httpcore.AsyncNetworkBackend())
+        with pytest.raises(WebSearchError):
+            await backend.connect_tcp("example.com", 443)
+
+    async def test_guard_transport_wires_backend(self):
+        transport = websearch._SSRFGuardTransport()
+        assert isinstance(
+            transport._pool._network_backend, websearch._SSRFGuardBackend
+        )
 
 
 class TestFetchUrl:
