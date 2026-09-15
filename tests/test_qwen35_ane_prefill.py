@@ -2519,6 +2519,35 @@ def test_prefill_status_flags_attempted_but_empty():
     assert status["configured"] is False
 
 
+def test_release_qwen35_ane_prefill_drops_all_native_state_and_is_idempotent():
+    """Unload releases ordinary, fused, and GDN ANE state exactly once."""
+    ordinary = SimpleNamespace(_omlx_ane_prefill_state=object())
+    fused = SimpleNamespace(_omlx_ane_fused_down_state=object())
+    gdn = SimpleNamespace(_omlx_ane_gdn_state=object())
+    model = SimpleNamespace(
+        modules=lambda: (ordinary, fused, gdn),
+        _omlx_ane_mlp_prefill_count=2,
+        _omlx_ane_gdn_prefill_count=1,
+        _omlx_ane_dual_prefill_count=3,
+        _omlx_ane_resident_program_count=7,
+    )
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (3, 7)
+    assert ordinary._omlx_ane_prefill_state is None
+    assert ordinary._omlx_ane_prefill_failed is True
+    assert fused._omlx_ane_fused_down_state is None
+    assert fused._omlx_ane_prefill_failed is True
+    assert gdn._omlx_ane_gdn_state is None
+    assert gdn._omlx_ane_gdn_failed is True
+    assert model._omlx_ane_prefill_shed is True
+    assert model._omlx_ane_mlp_prefill_count == 0
+    assert model._omlx_ane_gdn_prefill_count == 0
+    assert model._omlx_ane_dual_prefill_count == 0
+    assert model._omlx_ane_resident_program_count == 0
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+
+
 def test_prefill_status_safe_on_untouched_model():
     status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
     assert status["attempted"] is False
