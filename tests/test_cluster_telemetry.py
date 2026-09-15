@@ -952,3 +952,60 @@ def test_rank_hot_clear_reaches_live_prompt_cache_instances(monkeypatch):
     assert cache.entries == 0
     assert handler.status == 200
     assert json.loads(handler.wfile.getvalue())["hot_cleared"] == 3
+
+
+def test_sequential_prefill_cancellation_halts_prompt_processing(monkeypatch):
+    """A client abort during sequential prefill stops generation immediately."""
+
+    from queue import Queue
+
+    import mlx_lm.server as mlx_server
+
+    from omlx.cluster.telemetry import _TelemetryQueue
+
+    cancelled_during_prefill = False
+    chunks_processed = []
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self._is_distributed = False
+
+        def _serve_single(self, request):
+            rqueue, _req, _args = request
+            ctx = mlx_server.GenerationContext(
+                has_tool_calling=False,
+                has_thinking=False,
+                tool_parser=lambda *_args: {},
+                sequences={},
+                prompt=[1, 2, 3, 4],
+            )
+            rqueue.put(ctx)
+
+            def progress(processed, total):
+                rqueue.put((processed, total))
+
+            # Simulate chunked prefill steps
+            try:
+                chunks_processed.append(1)
+                progress(1, 4)
+                # Client abort arrives during prefill
+                ctx.stop()
+                chunks_processed.append(2)
+                progress(2, 4)
+                # Should not reach subsequent chunks
+                chunks_processed.append(3)
+                progress(3, 4)
+            except InterruptedError:
+                nonlocal cancelled_during_prefill
+                cancelled_during_prefill = True
+
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+
+    with install_server_telemetry(_Marker()) as telemetry:
+        generator = mlx_server.ResponseGenerator()
+        q = Queue()
+        wrapped_queue = _TelemetryQueue(q, telemetry)
+        generator._serve_single((wrapped_queue, "request", "args"))
+
+    assert cancelled_during_prefill is True
+    assert chunks_processed == [1, 2]
