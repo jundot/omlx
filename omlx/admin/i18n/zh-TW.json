@@ -634,6 +634,8 @@
   "modal.model_settings.temperature": "溫度",
   "modal.model_settings.repetition_penalty": "重複懲罰",
   "modal.model_settings.repetition_penalty_short": "重複懲罰",
+  "modal.model_settings.repetition_context_size": "重複上下文大小",
+  "modal.model_settings.repetition_context_size_hint": "重複懲罰所考慮的先前 token 數量。預設值：20。",
   "modal.model_settings.min_p": "Min P",
   "modal.model_settings.presence_penalty": "存在懲罰",
   "modal.model_settings.top_p": "Top P",

@@ -634,6 +634,8 @@
   "modal.model_settings.temperature": "温度",
   "modal.model_settings.repetition_penalty": "繰り返しペナルティ",
   "modal.model_settings.repetition_penalty_short": "Rep. Penalty",
+  "modal.model_settings.repetition_context_size": "繰り返しコンテキストサイズ",
+  "modal.model_settings.repetition_context_size_hint": "繰り返しペナルティで考慮する過去のトークン数。デフォルト: 20。",
   "modal.model_settings.min_p": "Min P",
   "modal.model_settings.presence_penalty": "Presence Penalty",
   "modal.model_settings.top_p": "Top P",

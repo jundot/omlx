@@ -761,7 +761,7 @@ class TestCompletionModels:
     """Tests for text completion models."""
 
     def test_repetition_context_size_defaults_to_none(self):
-        """The penalty window rides along only when a client sends it."""
+        """Requests omit the repetition-window override by default."""
         chat = ChatCompletionRequest.model_validate(
             {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
         )

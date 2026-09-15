@@ -634,6 +634,8 @@
   "modal.model_settings.temperature": "Température",
   "modal.model_settings.repetition_penalty": "Pénalité de répétition",
   "modal.model_settings.repetition_penalty_short": "Pénalité rép.",
+  "modal.model_settings.repetition_context_size": "Taille du contexte de répétition",
+  "modal.model_settings.repetition_context_size_hint": "Nombre de tokens précédents pris en compte pour la pénalité de répétition. Par défaut : 20.",
   "modal.model_settings.min_p": "Min P",
   "modal.model_settings.presence_penalty": "Pénalité de présence",
   "modal.model_settings.top_p": "Top P",
