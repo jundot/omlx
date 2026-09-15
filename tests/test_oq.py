@@ -536,6 +536,132 @@ class TestMuseGlimmerQuantPredicate:
         assert isinstance(result, dict) and result["bits"] >= 6
 
 
+class TestSpark25QuantPredicate:
+    """Spark-X2.5 (fused QKV + headwise gate) predicate behavior."""
+
+    @pytest.fixture
+    def spark_config(self):
+        return {
+            "model_type": "spark2_5",
+            "num_hidden_layers": 36,
+            "hidden_size": 2560,
+        }
+
+    @pytest.fixture
+    def module(self):
+        return MagicMock(spec=[])
+
+    def test_head_gate_protected(self, spark_config, module):
+        # The per-head sigmoid gate must stay at source precision to mirror
+        # the model's own quant_predicate.
+        assert (
+            universal_quant_predicate(
+                "model.layers.10.self_attn.g_proj", module, spark_config
+            )
+            is False
+        )
+
+    def test_mlp_gate_proj_quantized(self, spark_config, module):
+        # The MLP SwiGLU gate is a normal dense projection — quantized.
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.gate_proj", module, spark_config
+        )
+        assert result is not False
+
+    def test_fused_qkv_quantized(self, spark_config, module):
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.q_k_v_proj", module, spark_config
+        )
+        assert result is not False
+
+    def test_out_proj_quantized(self, spark_config, module):
+        # Dense-model out_proj quantizes at base bits (the o_proj 5-bit rule
+        # targets fused v_o_proj-style layouts).
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.out_proj", module, spark_config
+        )
+        assert result is True
+
+    def test_down_proj_protected(self, spark_config, module):
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.down_proj", module, spark_config
+        )
+        assert isinstance(result, dict) and result["bits"] == 5
+
+    def test_gate_rule_does_not_leak_to_other_models(self, module):
+        # Non-spark configs must not skip self_attn.g_proj.
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.g_proj",
+            module,
+            {"model_type": "llama", "num_hidden_layers": 32},
+        )
+        assert result is not False
+
+
+class TestSpark25ImatrixDiscovery:
+    """oQe imatrix calibration must discover Spark's HF-style embedding."""
+
+    @pytest.fixture
+    def model(self):
+        from mlx_lm.models.spark2_5 import Model, ModelArgs
+
+        args = ModelArgs(
+            model_type="spark2_5",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1000,
+            sliding_window=32,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        return Model(args)
+
+    def test_find_model_layers_finds_embedding_style(self, model):
+        from omlx.oq import _find_model_layers
+
+        embed_fn, layers = _find_model_layers(model)
+        assert layers is model.model.layers
+        assert embed_fn is model.model.embedding
+
+    def test_prepare_layer_inputs_generic_masks(self, model):
+        from omlx.oq import _prepare_layer_inputs
+
+        inputs = mx.random.normal((1, 8, 128))
+        calib = mx.zeros((1, 8), dtype=mx.int32)
+        out, masks, position_ids = _prepare_layer_inputs(
+            model, model.model.layers, calib, inputs
+        )
+        assert out is inputs
+        assert len(masks) == 4
+        assert all(m is not None for m in masks)
+        assert position_ids.shape == (1, 8)
+
+    def test_forward_layer_result_runs_spark_block(self, model):
+        from omlx.oq import _forward_layer_result
+
+        inputs = mx.random.normal((1, 8, 128))
+        mask = mx.zeros((8, 8), dtype=mx.float32) * -1e9
+        position_ids = mx.arange(8)[None, :]
+        out, aux = _forward_layer_result(
+            model.model.layers[0], inputs, mask, position_ids
+        )
+        assert aux is None
+        assert out is not None
+        assert out.shape == (1, 8, 128)
+
+
 # =============================================================================
 # Test helper functions
 # =============================================================================

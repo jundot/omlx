@@ -55,9 +55,15 @@ def test_pre_load_dispatch_skips_spark2_5_for_other_models(tmp_path, monkeypatch
 
 
 def test_spark2_5_patch_registers_model_module():
+    import importlib.util
+
     from omlx.patches.spark2_5 import apply_spark2_5_patch
 
-    assert apply_spark2_5_patch() is True
+    upstream = importlib.util.find_spec("mlx_lm.models.spark2_5") is not None
+    # With upstream mlx-lm providing spark2_5 the patch self-disables
+    # (return False); otherwise it registers the vendored module (True).
+    assert apply_spark2_5_patch() is not upstream
+    assert importlib.import_module("mlx_lm.models.spark2_5") is not None
 
     import mlx_lm.models.spark2_5 as spark2_5
 
