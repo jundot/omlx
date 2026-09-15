@@ -50,6 +50,12 @@ class FakeLanguageModel:
     def speculative_logits_from_hidden(self, hidden):
         return hidden
 
+    def speculative_argmax_from_hidden(self, hidden):
+        return mx.argmax(hidden, axis=-1)
+
+    def speculative_verify_logits(self, *args, **kwargs):
+        raise AssertionError("mRoPE proxy must hide token-producing shortcuts")
+
 
 class FakeVLMAdapter:
     """Mimics VLMModelAdapter with _language_model and patched methods."""
@@ -58,6 +64,7 @@ class FakeVLMAdapter:
         self._language_model = FakeLanguageModel()
         self._uses_mrope = uses_mrope
         self.forward_called = False
+        self.forward_kwargs = None
         if expose_rollback:
             # Mimic _patch_vlm_model_adapter() which delegates to _language_model.
             self.rollback_speculative_cache = (
@@ -66,6 +73,7 @@ class FakeVLMAdapter:
 
     def __call__(self, *args, **kwargs):
         self.forward_called = True
+        self.forward_kwargs = kwargs
         return self._language_model(*args, **kwargs)
 
     def set_batch_rope_deltas(self, deltas):
@@ -135,13 +143,47 @@ class TestVLMAdapterMTPProxy:
         proxy.rollback_speculative_cache([], [], 0, 4)
         assert adapter._language_model.rollback_called
 
-    def test_mrope_proxy_hides_fast_path_attrs_but_keeps_rollback(self):
+    def test_mrope_proxy_exposes_positioned_projection_but_hides_fast_paths(self):
         adapter = FakeVLMAdapter(expose_rollback=False, uses_mrope=True)
+        adapter.speculative_argmax_from_hidden = lambda hidden: hidden
+        adapter.speculative_verify_logits = lambda *args, **kwargs: None
         proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
 
         assert hasattr(proxy, "rollback_speculative_cache")
         assert not hasattr(proxy, "model")
-        assert not hasattr(proxy, "speculative_logits_from_hidden")
+        assert hasattr(proxy, "speculative_verify_hidden")
+        assert hasattr(proxy, "speculative_logits_from_hidden")
+        assert not hasattr(proxy, "speculative_argmax_from_hidden")
+        assert not hasattr(proxy, "speculative_verify_logits")
+
+        hidden, shared_kv, gdn_states = proxy.speculative_verify_hidden(
+            mx.array([[1, 2, 3]]),
+            [],
+        )
+        projected = proxy.speculative_logits_from_hidden(hidden)
+
+        assert adapter.forward_called
+        assert adapter.forward_kwargs == {
+            "cache": [],
+            "capture_layer_ids": [],
+            "return_hidden": True,
+            "return_shared_kv": True,
+            "skip_logits": True,
+        }
+        assert hidden.shape == (1, 1, 8)
+        assert shared_kv == {}
+        assert gdn_states == []
+        assert projected is hidden
+
+    def test_mrope_proxy_supports_adapter_projection_with_adapter_verify(self):
+        adapter = FakeVLMAdapter(expose_rollback=False, uses_mrope=True)
+        adapter._language_model.speculative_logits_from_hidden = None
+        adapter.speculative_logits_from_hidden = lambda hidden: hidden
+        proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
+
+        assert proxy.positioned_sampling_available()
+        assert hasattr(proxy, "speculative_verify_hidden")
+        assert hasattr(proxy, "speculative_logits_from_hidden")
 
     def test_mtp_rounds_sees_no_language_model(self):
         """Simulates the hasattr check in _mtp_rounds / _mtp_rounds_batch."""
