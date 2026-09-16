@@ -29,6 +29,7 @@ from ..cluster.liveness import (
     check_peers,
     describe_failure,
     marker_age_seconds,
+    marker_owner_is_live,
     read_marker,
 )
 from ..reasoning_effort import _fallback_candidate, _normalized_input
@@ -910,12 +911,17 @@ raise SystemExit(2)
         quiescence evidence an abort or unload should wait for (G5).
         """
 
+        if self.runtime_failed_reason is not None:
+            return 0
+
         marker = read_marker(
             Path(self._supervisor.state_dir).expanduser()
             / f"{self.deployment.deployment_id}-rank-0.json"
         )
         if not isinstance(marker, dict):
             return None
+        if not marker_owner_is_live(marker) or marker.get("error"):
+            return 0
         metrics = marker.get("metrics")
         if not isinstance(metrics, dict):
             return None
@@ -1903,6 +1909,8 @@ raise SystemExit(2)
         return None
 
     def has_active_requests(self) -> bool:
+        if self.runtime_failed_reason is not None:
+            return False
         # Sweep finished-but-abandoned requests first so a leaked generator
         # cannot hold quiescence-gated unload open forever (G4).
         self.reap_orphaned_generators()

@@ -475,7 +475,17 @@ class TestExceptionHandlers:
     @pytest.fixture
     def client(self):
         """Create a test client for the FastAPI app."""
-        return TestClient(app, raise_server_exceptions=False)
+        from omlx.server import _server_state
+
+        original_key = _server_state.api_key
+        original_settings = _server_state.global_settings
+        _server_state.api_key = None
+        _server_state.global_settings = None
+        try:
+            yield TestClient(app, raise_server_exceptions=False)
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_settings
 
     def test_http_exception_logged(self, client, caplog):
         """Test that HTTPException responses are logged."""

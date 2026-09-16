@@ -177,6 +177,10 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.applyModelProfile(id, name))
     }
 
+    func applyModelTemplate(id: String, name: String) async throws -> ApplyProfileResponse {
+        try await postEmpty(AdminAPI.applyModelTemplate(id, name))
+    }
+
     func listProfileTemplates() async throws -> TemplateListResponse {
         try await get(AdminAPI.profileTemplates)
     }

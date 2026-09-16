@@ -2010,6 +2010,57 @@ class TestParseToolCallsSyntaxError:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseNakedQwenFunctionCalls:
+    """Regression coverage for Qwen-Coder omitting the outer <tool_call> tag."""
+
+    def _qwen_tok(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = None
+        return tok
+
+    def test_naked_function_call_is_recovered(self):
+        tok = self._qwen_tok()
+
+        text = (
+            "I'll inspect it.\n"
+            "<function=read_file>\n"
+            "<parameter=path>/tmp/example.py</parameter>\n"
+            "<parameter=limit>20</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == "I'll inspect it."
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "path": "/tmp/example.py",
+            "limit": 20,
+        }
+
+    def test_multiple_naked_function_calls_are_recovered(self):
+        tok = self._qwen_tok()
+
+        text = (
+            "<function=first><parameter=value>true</parameter></function>"
+            "<function=second><parameter=name>alpha</parameter></function>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert [tc.function.name for tc in tool_calls] == ["first", "second"]
+        assert json.loads(tool_calls[0].function.arguments) == {"value": True}
+        assert json.loads(tool_calls[1].function.arguments) == {"name": "alpha"}
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 
@@ -3651,6 +3702,62 @@ class TestSchemaAwareFallbackCoercion:
         args = json.loads(calls[0].function.arguments)
         assert args["edits"] == self.REPAIRED_EDITS
 
+    FRAGMENTED = '["a"]\n["b"]\n["c"]'
+    REC_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "submit_recommendations",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "recommendations": {"type": "array", "items": {"type": "string"}},
+                    "matrix": {"type": "array", "items": {"type": "array"}},
+                    "note": {"type": "string"},
+                },
+            },
+        },
+    }
+
+    def _rec_text(self, param, val):
+        return (
+            "<tool_call>\n<function=submit_recommendations>\n"
+            f"<parameter={param}>\n{val}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    def test_line_separated_arrays_merge_into_declared_array(self):
+        """One-element arrays on separate lines concatenate when items are scalars."""
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == ["a", "b", "c"]
+
+    def test_line_separated_arrays_wrap_when_items_are_arrays(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("matrix", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["matrix"] == [["a"], ["b"], ["c"]]
+
+    def test_line_separated_scalars_wrap_into_declared_array(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", '"a"\n"b"'), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == ["a", "b"]
+
+    def test_fragments_with_trailing_prose_keep_raw_string(self):
+        val = '["a"]\n["b"] and that is all'
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", val), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == val
+
+    def test_mixed_fragments_keep_raw_string(self):
+        val = '["a"]\n{"k": 1}'
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", val), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == val
+
+    def test_fragments_never_merge_for_declared_string_param(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("note", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["note"] == self.FRAGMENTED
+
     def test_declared_string_param_not_json_coerced(self):
         """A numeric-looking value for a declared string param stays a string."""
         tool = {
@@ -4519,3 +4626,315 @@ def test_bracket_deep_decode_never_runs_raw_arguments():
         for call in calls or []:
             if call.function.name == "bad":
                 assert not call.function.arguments.startswith('{"raw":')
+
+
+# =============================================================================
+# _parse_xml_tool_calls / _parse_namespaced_tool_calls bug fixes
+#
+# (1) unconditional json.loads() coercion of parsed XML param values, which
+#     silently turns a string-typed schema param whose value looks like
+#     "123"/"true" into an int/bool. TestSchemaAwareFallbackCoercion above
+#     covers the qwen/GLM XML branches and namespaced malformed-array
+#     repair (_coerce_param_value); the two classes below add the plain
+#     string-not-coerced case for the namespaced parser and the
+#     native-tool_parser passthrough contract, which aren't covered there.
+# (2) a \w+-based regex for the tool/function name that rejects hyphens and
+#     dots, so a hyphenated or dotted tool name that is otherwise valid per
+#     the model's own schema/output would fail to parse. Covered by
+#     TestParseXmlToolCallsHyphenatedName below.
+# =============================================================================
+
+class TestParseXmlToolCallsHyphenatedName:
+    """Regex fix: <function=NAME> must accept hyphens and dots in NAME."""
+
+    @pytest.mark.parametrize("function_name", ["123lookup", "날씨", "get-weather"])
+    @pytest.mark.parametrize("parameter_name", ["123", "도시", "filter.lang"])
+    def test_existing_names_survive_xml_fallback(self, function_name, parameter_name):
+        text = (
+            f"<tool_call><function={function_name}>"
+            f"<parameter={parameter_name}>Paris</parameter>"
+            "</function></tool_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, None)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == function_name
+        assert json.loads(tool_calls[0].function.arguments) == {parameter_name: "Paris"}
+
+    def test_hyphenated_function_name_parses(self):
+        text = (
+            "<tool_call>\n<function=get-weather>\n"
+            "<parameter=location>\nParis\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get-weather"
+
+    def test_dotted_function_name_parses(self):
+        text = (
+            "<tool_call>\n<function=web.search>\n"
+            "<parameter=query>\nhello\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "web.search"
+
+    def test_plain_underscored_name_still_parses(self):
+        """Regression guard: the common \\w+ case (underscores) still works."""
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            "<parameter=location>\nParis\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "get_weather"
+
+    def test_hyphenated_parameter_name_round_trips(self):
+        """Sibling bug: _XML_PARAMETER_OPEN_RE had the same \\w+ regex, so a
+        hyphenated *parameter* name (not just a hyphenated function name)
+        would fail to match and the whole <parameter=...> element -- name
+        AND value -- was silently dropped, leaving `arguments` empty even
+        though the tool name parsed fine.
+        """
+        text = (
+            "<tool_call>\n<function=get-weather>\n"
+            "<parameter=unit-type>\ncelsius\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get-weather"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"unit-type": "celsius"}
+
+    def test_dotted_parameter_name_round_trips(self):
+        text = (
+            "<tool_call>\n<function=web.search>\n"
+            "<parameter=filter.lang>\nen\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"filter.lang": "en"}
+
+
+class TestParseNamespacedToolCallsStringCoercion:
+    """String-not-coerced case for the namespaced (MiniMax-style) parser.
+
+    TestSchemaAwareFallbackCoercion above covers this scenario for the
+    qwen/GLM XML branches (and malformed-array repair for all three
+    branches, including namespaced), but not the plain string-not-coerced
+    case specifically through _parse_namespaced_tool_calls.
+    """
+
+    STRING_PARAM_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+            },
+        },
+    }]
+
+    def test_numeric_looking_string_param_stays_string(self):
+        text = (
+            '<minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">123</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>'
+        )
+        _, tool_calls = _parse_namespaced_tool_calls(
+            text, "minimax", tools=self.STRING_PARAM_TOOLS
+        )
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "123"
+        assert isinstance(args["location"], str)
+
+
+class TestParseToolCallsNativeParserPreservesTypes:
+    """GLM (and other mlx-lm-native) tool calls go through parse_tool_calls'
+    ``tokenizer.tool_parser`` branch first, *not* through
+    ``_parse_xml_tool_calls`` -- that fallback only runs when the tokenizer
+    has no native tool parser configured. This is not a second, unpatched
+    coercion path: mlx-lm's own tool parsers (e.g. ``glm47.py``) already do
+    their own schema-aware string-vs-bare-token coercion internally, and
+    parse_tool_calls trusts whatever typed ``arguments`` dict the native
+    parser returns without re-coercing it. These tests pin that contract
+    down so a future change to parse_tool_calls doesn't introduce a second,
+    naive ``json.loads`` pass on top of an already-typed native result.
+    """
+
+    def test_native_parser_string_value_passed_through_unmodified(self):
+        """A native tool_parser that already preserved a numeric-looking
+        string (per its own schema awareness) must not be re-coerced by
+        parse_tool_calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "get_weather",
+            "arguments": {"location": "123"},  # native parser kept it a str
+        }
+
+        text = "<tool_call>get_weather<arg_key>location</arg_key><arg_value>123</arg_value></tool_call>"
+        _, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "123"
+        assert isinstance(args["location"], str)
+
+    def test_native_parser_numeric_value_passed_through_unmodified(self):
+        """A genuinely numeric argument from the native parser is untouched too."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "get_weather",
+            "arguments": {"count": 42},
+        }
+
+        text = "<tool_call>get_weather<arg_key>count</arg_key><arg_value>42</arg_value></tool_call>"
+        _, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["count"] == 42
+        assert isinstance(args["count"], int)
+
+
+class TestNakedQwenFollowup:
+    @staticmethod
+    def tokenizer():
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = parse_tool_call
+        return tok
+
+    @staticmethod
+    def tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "enabled": {"type": "boolean"},
+                            "items": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def block(value):
+        return f"<function=write><parameter=content>{value}</parameter></function>"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "123",
+            "true",
+            '{"a": 1}',
+            'print("</function>")',
+            'print("</parameter>")',
+            "see <parameter=x> here",
+            "literal </function></tool_call> tail",
+            "한글 日本語 😀",
+        ],
+    )
+    @pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+    def test_arguments_and_stream_boundaries(self, value, chunk_size):
+        raw = "Before " + self.block(value) + "\n</tool_call> After"
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == "Before  After"
+        assert len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {"content": value}
+        filt = ToolCallStreamFilter(self.tokenizer(), capture_ordered_segments=True)
+        emitted = (
+            "".join(
+                filt.feed(raw[i : i + chunk_size])
+                for i in range(0, len(raw), chunk_size)
+            )
+            + filt.finish()
+        )
+        assert emitted == "Before  After"
+        envelopes = filt.take_completed_envelopes()
+        assert envelopes == [self.block(value)]
+
+    def test_schema_types_and_mixed_repeated_calls(self):
+        first = (
+            "<function=write><parameter=count>20</parameter>"
+            "<parameter=enabled>true</parameter>"
+            "<parameter=items>[1,2]</parameter></function>"
+        )
+        second = self.block("123")
+        raw = first + "<tool_call>" + second + "</tool_call>" + second
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == ""
+        assert [json.loads(c.function.arguments) for c in calls] == [
+            {"count": 20, "enabled": True, "items": [1, 2]},
+            {"content": "123"},
+            {"content": "123"},
+        ]
+        assert len({c.id for c in calls}) == 3
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "<function=ping></function>",
+            "<function=ping>\n</function>\n</tool_call>",
+            "<function=ping>" + " " * 1000 + "</function>",
+        ],
+    )
+    def test_zero_argument_calls(self, raw):
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer())
+        assert cleaned == ""
+        assert json.loads(calls[0].function.arguments) == {}
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == ""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '<function=write><parameter=content>print("</function>")',
+            "<function=write><parameter=content>unfinished",
+        ],
+    )
+    def test_incomplete_call_is_recoverable_without_execution(self, raw):
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert calls is None
+        assert cleaned == raw
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == ""
+        assert filt.take_recovery_candidate() == raw
+
+    def test_unrelated_close_tag_in_prose_is_preserved(self):
+        raw = self.block("ok") + " After mentioning </tool_call> in prose."
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == "After mentioning </tool_call> in prose."
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == " " + cleaned

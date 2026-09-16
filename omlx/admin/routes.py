@@ -36,9 +36,15 @@ from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
-from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..model_profiles import (
+    EXCLUDED_FROM_PROFILES,
+    filter_profile_fields,
+    filter_universal_fields,
+)
 from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
+    ModelSettings,
+    resolve_vlm_mtp_conflicts,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -238,8 +244,10 @@ class ModelSettingsRequest(BaseModel):
     # Keep  thinking blocks in historical turns (None = auto, True when the
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
+    cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
+    deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -310,6 +318,72 @@ class ModelSettingsRequest(BaseModel):
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
 
+    @field_validator("turboquant_kv_bits")
+    @classmethod
+    def validate_turboquant_bits(cls, value: float | None) -> float | None:
+        if value is None or value == 0:
+            return 4 if value == 0 else None
+        if value not in (2, 2.5, 3, 3.5, 4, 6, 8):
+            raise ValueError("turboquant_kv_bits must be 2, 2.5, 3, 3.5, 4, 6, or 8")
+        return value
+
+    @field_validator("dflash_verify_mode")
+    @classmethod
+    def validate_dflash_verify_mode(cls, value: str | None) -> str | None:
+        if value not in (None, "", "dflash", "adaptive", "ddtree", "off"):
+            raise ValueError(
+                "dflash_verify_mode must be dflash, adaptive, ddtree, or off"
+            )
+        return value or None
+
+    @field_validator("dflash_in_memory_cache_max_entries")
+    @classmethod
+    def validate_dflash_cache_entries(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("dflash_in_memory_cache_max_entries must be non-negative")
+        return 4 if value == 0 else value
+
+    @field_validator("reasoning_parser")
+    @classmethod
+    def validate_reasoning_parser(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        parsers = _grammar_parser_options()
+        if parsers is None:
+            logger.warning(
+                "Cannot validate reasoning_parser %r: xgrammar unavailable", value
+            )
+        elif value not in {parser["value"] for parser in parsers}:
+            raise ValueError(f"Unknown reasoning_parser: {value}")
+        return value
+
+    @field_validator(
+        "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
+    )
+    @classmethod
+    def validate_draft_path(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        # Match local references without resolving or downloading HF repo IDs.
+        if (
+            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
+        ) and not (path / "config.json").is_file():
+            raise ValueError(f"Draft model has no config.json: {value}")
+        return value
+
+
+def _normalize_profile_settings(
+    value: dict[str, Any] | None, *, universal: bool = False
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    filtered = (filter_universal_fields if universal else filter_profile_fields)(value)
+    # Reuse the settings API's types and validators, preserving absent fields.
+    return ModelSettingsRequest.model_validate(filtered).model_dump(
+        exclude_unset=True, exclude_none=True
+    )
+
 
 class CreateProfileRequest(BaseModel):
     """Request body for creating a per-model profile."""
@@ -322,6 +396,11 @@ class CreateProfileRequest(BaseModel):
     also_save_as_template: bool = False
     source_template: str | None = None
     expose_as_model: bool = False
+
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value)
 
 
 class UpdateProfileRequest(BaseModel):
@@ -336,6 +415,11 @@ class UpdateProfileRequest(BaseModel):
     expose_as_model: bool | None = None
     also_save_as_template: bool = False
 
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value)
+
 
 class CreateTemplateRequest(BaseModel):
     """Request body for creating a global template."""
@@ -345,6 +429,11 @@ class CreateTemplateRequest(BaseModel):
     description: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value, universal=True)
+
 
 class UpdateTemplateRequest(BaseModel):
     """Request body for updating/renaming a global template."""
@@ -353,6 +442,11 @@ class UpdateTemplateRequest(BaseModel):
     display_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] | None = None
+
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value, universal=True)
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -1411,6 +1505,18 @@ def set_hf_uploader(uploader):
 # =============================================================================
 
 
+def _active_bind_host(global_settings) -> str:
+    """Return the bind address in use until the next server restart."""
+
+    server_state = _get_server_state() if _get_server_state is not None else None
+    active_host = (
+        getattr(server_state, "bind_host", None)
+        if getattr(server_state, "global_settings", None) is global_settings
+        else None
+    )
+    return active_host or global_settings.server.host
+
+
 def format_size(size_bytes: int) -> str:
     """
     Format a byte size as a human-readable string.
@@ -1569,9 +1675,12 @@ async def login_page(request: Request):
 
     global_settings = _get_global_settings()
 
-    # Skip login page when skip_api_key_verification is enabled
+    # Skip login only when no-auth mode is confined to loopback.
     if global_settings is not None and global_settings.auth.skip_api_key_verification:
-        return RedirectResponse(url="/admin/dashboard", status_code=302)
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(global_settings)):
+            return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
@@ -1689,7 +1798,11 @@ async def login(request: LoginRequest, response: Response):
 
 
 @router.post("/api/setup-api-key")
-async def setup_api_key(request: SetupApiKeyRequest, response: Response):
+async def setup_api_key(
+    request: SetupApiKeyRequest,
+    response: Response,
+    http_request: Request,
+):
     """
     Set up the initial API key when none is configured.
 
@@ -1700,6 +1813,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     Args:
         request: SetupApiKeyRequest with api_key and api_key_confirm.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request used to verify the peer address.
 
     Returns:
         JSON response with success status.
@@ -1711,6 +1825,20 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     from ..server import _server_state
 
     global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    from ..utils.network import is_loopback_bind, is_loopback_bind_host
+
+    peer_host = getattr(getattr(http_request, "client", None), "host", None)
+    if (
+        not is_loopback_bind(_active_bind_host(global_settings))
+        or not is_loopback_bind_host(peer_host)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Initial API key setup is only available over loopback.",
+        )
 
     # Only allow setup if no API key is currently configured
     if global_settings and global_settings.auth.api_key:
@@ -1927,8 +2055,7 @@ def _models_from_docstring(fn) -> list[str]:
     ]
 
 
-@router.get("/api/grammar/parsers")
-async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+def _grammar_parser_options() -> list[dict] | None:
     """Return available reasoning parser names from xgrammar.
 
     Supports both API generations:
@@ -1939,7 +2066,7 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
       ``get_builtin_structural_tag_supported_models()``.
 
-    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    Returns ``None`` if xgrammar is missing, fails to load (e.g. broken native
     binding on macOS arm64), or has neither API available.
     """
     # Install the torch stub BEFORE any xgrammar import. If this lives
@@ -1976,7 +2103,12 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
         ]
     except Exception as e:
         logger.warning("xgrammar parser discovery unavailable: %s", e)
-        return []
+        return None
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    return _grammar_parser_options() or []
 
 
 # =============================================================================
@@ -2321,9 +2453,12 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     """Allow admin session OR a valid Bearer API key (for CLI use)."""
     gs = _get_global_settings() if _get_global_settings else None
 
-    # No-auth mode: always allow
+    # No-auth mode is restricted to loopback-only binds.
     if gs is not None and gs.auth.skip_api_key_verification:
-        return True
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(gs)):
+            return True
 
     # Valid admin session cookie
     if verify_session(request):
@@ -2553,6 +2688,11 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
+    if "deepseek_v41_ced_prefill_enabled" in sent:
+        is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
+        current_settings.deepseek_v41_ced_prefill_enabled = bool(
+            request.deepseek_v41_ced_prefill_enabled and is_v41
+        )
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
@@ -2918,12 +3058,7 @@ async def update_model_settings(
             int(value) if value is not None and value > 0 else None
         )
     if "dflash_verify_mode" in sent:
-        value = request.dflash_verify_mode
-        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
-        # Anything else (including empty string) → revert to dflash default.
-        current_settings.dflash_verify_mode = (
-            value if value in ("dflash", "adaptive", "ddtree", "off") else None
-        )
+        current_settings.dflash_verify_mode = request.dflash_verify_mode
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -3052,6 +3187,8 @@ async def update_model_settings(
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
+    if "cache_reasoning_output" in sent:
+        current_settings.cache_reasoning_output = request.cache_reasoning_output
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
     if "guided_grammar_enabled" in sent:
@@ -3362,6 +3499,14 @@ def _validate_model_settings(entry, settings):
             kwargs["enable_thinking"] = settings["enable_thinking"]
         validate_chat_template_kwargs(kwargs)
 
+    if not _entry_is_diffusion_model(entry):
+        # Use the same conflict rules and output-setting precedence as profile apply.
+        resolved, _ = resolve_vlm_mtp_conflicts(settings)
+        try:
+            ModelSettings.from_dict(resolved)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
 
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
@@ -3379,7 +3524,7 @@ async def create_model_profile(
     request: CreateProfileRequest,
     is_admin: bool = Depends(require_admin),
 ):
-    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+    from ..model_profiles import InvalidProfileNameError
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
@@ -3424,7 +3569,7 @@ async def update_model_profile(
     request: UpdateProfileRequest,
     is_admin: bool = Depends(require_admin),
 ):
-    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+    from ..model_profiles import InvalidProfileNameError
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
@@ -3501,6 +3646,29 @@ async def apply_model_profile(
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(applied)
         mgr.set_settings(model_id, applied)
+    return {"model_id": model_id, "settings": applied.to_dict()}
+
+
+@router.post("/api/models/{model_id}/profile-templates/{name}/apply")
+async def apply_model_template(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    entry = _require_model(model_id)
+
+    def sanitizer(settings):
+        if _entry_is_diffusion_model(entry):
+            _sanitize_diffusion_settings_dict(settings)
+        _validate_model_settings(entry, settings)
+
+    try:
+        applied = mgr.apply_template(model_id, name, settings_sanitizer=sanitizer)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if applied is None:
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
     return {"model_id": model_id, "settings": applied.to_dict()}
 
 
@@ -4036,6 +4204,60 @@ async def update_global_settings(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    from ..utils.network import (
+        is_loopback_bind,
+        is_valid_bind_host,
+        network_auth_error,
+    )
+
+    candidate_host = (
+        request.host
+        if request.host is not None
+        else getattr(global_settings.server, "host", "127.0.0.1")
+    )
+    host_parts = [host.strip() for host in candidate_host.split(",") if host.strip()]
+    if not host_parts:
+        raise HTTPException(status_code=400, detail="Host cannot be empty")
+    for host in host_parts:
+        if not is_valid_bind_host(host):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid host: {host!r} (must be a hostname or IP address)",
+            )
+
+    if request.api_key is not None:
+        is_valid, error_msg = validate_api_key(request.api_key)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+    candidate_api_key = (
+        request.api_key
+        if request.api_key is not None
+        else global_settings.auth.api_key
+    )
+    candidate_skip_verification = (
+        request.skip_api_key_verification
+        if request.skip_api_key_verification is not None
+        else global_settings.auth.skip_api_key_verification
+    )
+    if auth_error := network_auth_error(
+        candidate_host,
+        candidate_api_key,
+        candidate_skip_verification,
+    ):
+        raise HTTPException(status_code=400, detail=auth_error)
+    if (
+        request.skip_api_key_verification is True
+        and not is_loopback_bind(_active_bind_host(global_settings))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "API key verification cannot be skipped while the running server "
+                "is bound to a non-loopback host. Save a loopback host and restart "
+                "the server first."
+            ),
+        )
+
     # Track which settings were applied at runtime
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
@@ -4043,17 +4265,6 @@ async def update_global_settings(
 
     # Apply server settings
     if request.host is not None:
-        from ..utils.network import is_valid_bind_host
-
-        parts = [h.strip() for h in request.host.split(",") if h.strip()]
-        if not parts:
-            raise HTTPException(status_code=400, detail="Host cannot be empty")
-        for part in parts:
-            if not is_valid_bind_host(part):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid host: {part!r} (must be a hostname or IP address)",
-                )
         global_settings.server.host = request.host
     if request.port is not None:
         global_settings.server.port = request.port
@@ -4890,10 +5101,6 @@ async def update_global_settings(
     if request.api_key is not None:
         from ..server import _server_state
 
-        is_valid, error_msg = validate_api_key(request.api_key)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=error_msg)
-
         global_settings.auth.api_key = request.api_key
         _server_state.api_key = request.api_key
         runtime_applied.append("api_key")
@@ -5576,13 +5783,14 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for subdir in "0123456789abcdef":
-                subdir_path = cache_dir / subdir
-                if not subdir_path.exists():
-                    continue
-                for f in subdir_path.glob("*.safetensors"):
-                    num_files += 1
-                    total_bytes += f.stat().st_size
+            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                for subdir in "0123456789abcdef":
+                    subdir_path = root / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        num_files += 1
+                        total_bytes += f.stat().st_size
             payload["total_num_files"] = num_files
             payload["total_size_bytes"] = total_bytes
         except Exception as exc:
@@ -6147,16 +6355,17 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for subdir in "0123456789abcdef":
-                    subdir_path = cache_dir / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
-                        try:
-                            f.unlink()
-                            total_deleted += 1
-                        except OSError:
-                            pass
+                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                    for subdir in "0123456789abcdef":
+                        subdir_path = root / subdir
+                        if not subdir_path.exists():
+                            continue
+                        for f in subdir_path.glob("*.safetensors"):
+                            try:
+                                f.unlink()
+                                total_deleted += 1
+                            except OSError:
+                                pass
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 

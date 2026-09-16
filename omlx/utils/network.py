@@ -104,6 +104,64 @@ def is_valid_bind_host(value: str) -> bool:
     return is_valid_hostname(value)
 
 
+def is_loopback_bind_host(value: str) -> bool:
+    """Return whether a bind host is explicitly limited to loopback."""
+
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate.rstrip(".").lower() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    return bool(
+        isinstance(address, ipaddress.IPv6Address)
+        and address.ipv4_mapped is not None
+        and address.ipv4_mapped.is_loopback
+    )
+
+
+def is_loopback_bind(value: str) -> bool:
+    """Return whether every configured bind host is loopback-only."""
+
+    if not isinstance(value, str):
+        return False
+    bind_hosts = [part.strip() for part in value.split(",") if part.strip()]
+    return bool(bind_hosts) and all(
+        is_loopback_bind_host(part) for part in bind_hosts
+    )
+
+
+def network_auth_error(
+    host: str,
+    api_key: str | None,
+    skip_api_key_verification: bool,
+) -> str | None:
+    """Reject unauthenticated servers that bind beyond loopback."""
+
+    if not isinstance(host, str):
+        return "Server host must be a string."
+    if is_loopback_bind(host):
+        return None
+    if skip_api_key_verification:
+        return (
+            "API key verification cannot be skipped when binding to a "
+            f"non-loopback host ({host})."
+        )
+    if not isinstance(api_key, str) or not api_key.strip():
+        return (
+            f"An API key is required when binding to a non-loopback host ({host}). "
+            "Set --api-key or OMLX_API_KEY, or bind to 127.0.0.1."
+        )
+    return None
+
+
 def _local_ipv4_addresses() -> list[str]:
     """Best-effort enumeration of non-loopback IPv4 addresses.
 

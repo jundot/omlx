@@ -92,14 +92,18 @@ final class ServerProcess: @unchecked Sendable {
         case portConflict(PortConflict)
     }
 
-    enum StartError: Error, CustomStringConvertible {
+    enum StartError: Error, LocalizedError, CustomStringConvertible {
         case spawnFailed(String)
+        case invalidPort
 
         var description: String {
             switch self {
             case .spawnFailed(let m): return "Spawn failed: \(m)"
+            case .invalidPort: return "Port must be a number between 1 and 65535."
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     static let stateDidChangeNotification = Notification.Name("OMLXServerProcessStateDidChange")
@@ -188,8 +192,8 @@ final class ServerProcess: @unchecked Sendable {
     var serverLogURL: URL { logURL }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
-    /// already up, or .portConflict if the port is busy. Throws only on
-    /// spawn-syscall failure.
+    /// already up, or .portConflict if the port is busy. Throws on invalid
+    /// persisted settings or spawn failure.
     @discardableResult
     func start() throws -> StartResult {
         switch state {
@@ -198,6 +202,17 @@ final class ServerProcess: @unchecked Sendable {
         default:
             break
         }
+
+        // Web settings may have changed since the previous child was launched.
+        let saved = try AppConfig.readSettings(basePath: basePath.path)
+        let env = ProcessInfo.processInfo.environment
+        let nextHost = env["OMLX_HOST"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? saved.bindAddress ?? bindAddress
+        let nextPort = env["OMLX_PORT"].flatMap(Int.init) ?? saved.port ?? port
+        guard (1...65535).contains(nextPort) else {
+            throw StartError.invalidPort
+        }
+        try reconfigure(bindAddress: nextHost, port: nextPort)
 
         // Sync probe — fast enough on local connect refused.
         if resolver.isPortInUseSync() {
@@ -394,7 +409,8 @@ final class ServerProcess: @unchecked Sendable {
             guard case .starting = self.state else { return }
 
             do {
-                try self.doStart()
+                self.update(.stopped)
+                try self.start()
             } catch {
                 self.update(.failed(message: "Auto-restart failed: \(error)"))
             }

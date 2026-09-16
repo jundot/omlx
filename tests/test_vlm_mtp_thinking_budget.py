@@ -17,17 +17,23 @@ rollback, positioned sampling) is exercised without model weights.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
 
 import omlx.scheduler as scheduler_mod
 from omlx.api.thinking import ThinkingBudgetProcessor
-from omlx.scheduler import Scheduler
+from omlx.engine_core import EngineConfig, EngineCore
+from omlx.output_collector import RequestOutputCollector
+from omlx.request import Request, RequestStatus, SamplingParams
+from omlx.scheduler import Scheduler, _VLMMTPDecodeState
 from omlx.speculative.processing_sampler import (
     MTPProcessingSampler,
+    MTPProcessorContractError,
     supports_vlm_mtp_processing,
 )
 from omlx.speculative.vlm_mtp import (
@@ -179,15 +185,22 @@ class TestMTPProcessingSampler:
         assert not hasattr(proc, "_accepted_up_to")
         assert sampler._history == PROMPT
 
-    def test_missing_positions_degrades_loudly(self, caplog):
+    def test_missing_positions_fails_closed(self, caplog):
         _, sampler, _ = self._fresh(budget=4)
         with caplog.at_level(
-            logging.WARNING, logger="omlx.speculative.processing_sampler"
+            logging.ERROR, logger="omlx.speculative.processing_sampler"
         ):
-            out = sampler.sample_target(_positioned_logprobs(2))
+            with pytest.raises(MTPProcessorContractError):
+                sampler.sample_target(_positioned_logprobs(2))
         assert sampler._degraded
-        assert "NOT enforced" in caplog.text
-        assert [int(t) for t in out.tolist()] == [THINK, THINK]
+        assert "continuing would bypass" in caplog.text
+
+        # A caller cannot catch the first error and silently reuse the
+        # degraded sampler without its processors.
+        with pytest.raises(MTPProcessorContractError):
+            sampler.sample_target(
+                _positioned_logprobs(1), row_ids=[0], positions=[1]
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -603,3 +616,120 @@ class TestPositionedHookVisibility:
         assert uid is None
         assert "positioned verify sampling is unavailable" not in caplog.text
         assert "last_tokens empty" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "positions, slots",
+    [(None, 2), ([1], 2), ([9], 1), ([1, 3], 2)],
+)
+def test_contract_violations_never_resume_unprocessed(positions, slots):
+    _, sampler, _ = _wrapped_sampler(4)
+    with pytest.raises(MTPProcessorContractError):
+        sampler.sample_target(_positioned_logprobs(slots), positions=positions)
+    with pytest.raises(MTPProcessorContractError):
+        sampler.sample_target(_positioned_logprobs(1), positions=[1])
+
+
+def test_positionless_sampling_without_processors_is_unchanged():
+    sampler = MTPProcessingSampler(_argmax_sampler, [], PROMPT)
+    assert sampler.sample_target(_positioned_logprobs(2)).tolist() == [THINK, THINK]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_waiting", [False, True])
+async def test_contract_error_isolated_in_engine_loop(
+    mock_model, mock_tokenizer, peer_waiting
+):
+    with patch("omlx.engine_core.get_registry"):
+        engine = EngineCore(
+            mock_model, mock_tokenizer, EngineConfig(decode_burst_max_steps=1)
+        )
+    scheduler = engine.scheduler
+    closed = []
+
+    def failing_rounds():
+        try:
+            _, sampler, _ = _wrapped_sampler(4)
+            sampler.sample_target(_positioned_logprobs(2))
+            yield THINK
+        finally:
+            closed.append(True)
+
+    def install_mtp(request_id, uid, generator):
+        request = Request(request_id, PROMPT, SamplingParams(max_tokens=2))
+        request.status = RequestStatus.RUNNING
+        scheduler.requests[request_id] = request
+        scheduler.running[request_id] = request
+        scheduler.request_id_to_uid[request_id] = uid
+        scheduler.uid_to_request_id[uid] = request_id
+        scheduler._vlm_mtp_active[uid] = _VLMMTPDecodeState(
+            generator,
+            request,
+            [],
+            _argmax_sampler,
+            None,
+            2,
+            stop_token_ids={mock_tokenizer.eos_token_id},
+        )
+        collector = RequestOutputCollector()
+        engine._output_collectors[request_id] = collector
+        return request, collector
+
+    bad, bad_collector = install_mtp("bad", -1, failing_rounds())
+    peer = Request("peer", PROMPT, SamplingParams(max_tokens=2))
+    peer.status = RequestStatus.RUNNING
+    scheduler.requests["peer"] = peer
+    if peer_waiting:
+        peer.status = RequestStatus.WAITING
+        scheduler.waiting.append(peer)
+    else:
+        scheduler.running["peer"] = peer
+    scheduler.request_id_to_uid["peer"] = 1
+    scheduler.uid_to_request_id[1] = "peer"
+    peer_collector = RequestOutputCollector()
+    engine._output_collectors["peer"] = peer_collector
+    batch = MagicMock()
+    batch.next_generated.return_value = (
+        []
+        if peer_waiting
+        else [SimpleNamespace(uid=1, token=THINK, finish_reason=None, logprobs=None)]
+    )
+    scheduler.batch_generator = batch
+    scheduler._schedule_waiting = lambda: ([], [])
+    scheduler._boundary_cache_snapshots["bad"] = {1: []}
+    try:
+        await engine.start()
+        bad_output = await asyncio.wait_for(bad_collector.get(), 5)
+        if not peer_waiting:
+            peer_output = await asyncio.wait_for(peer_collector.get(), 5)
+        await engine.stop()
+        assert bad_output.finish_reason == "error"
+        assert bad_output.error == "sample_target called without positions"
+        if peer_waiting:
+            assert peer in scheduler.waiting
+            assert peer_collector.get_nowait() is None
+        else:
+            assert not peer_output.error
+            assert peer.num_output_tokens >= 1
+        assert closed == [True]
+        assert bad.num_output_tokens == 0
+        assert "bad" not in scheduler.requests
+        assert "bad" not in scheduler.request_id_to_uid
+        assert "bad" not in scheduler._boundary_cache_snapshots
+        assert -1 not in scheduler.uid_to_request_id
+        assert not scheduler._vlm_mtp_active
+        assert scheduler.requests["peer"] is peer
+        batch.remove.assert_not_called()
+
+        # A subsequent MTP request must complete through normal response handling.
+        scheduler._do_abort_request("peer")
+        scheduler.batch_generator = None
+        _, next_collector = install_mtp("next", -2, iter([mock_tokenizer.eos_token_id]))
+        await engine.start()
+        next_output = await asyncio.wait_for(next_collector.get(), 5)
+        assert next_output.finish_reason == "stop"
+        assert not next_output.error
+        assert not scheduler._vlm_mtp_active
+    finally:
+        await engine.stop()
+        engine.close()
