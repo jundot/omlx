@@ -428,6 +428,12 @@ class VLMModelAdapter(nn.Module):
         if hook is not None:
             hook(next_ids, current_ids)
 
+    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+        """Forward the scheduler's cache-only contract to DeepSeek V4.1."""
+        if self.model_type == "deepseek_v41":
+            kwargs["_ced_prefill"] = True
+        return self(input_ids, cache=cache, **kwargs)
+
     def __call__(
         self,
         input_ids: mx.array,

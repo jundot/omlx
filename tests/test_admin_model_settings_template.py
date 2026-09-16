@@ -1,7 +1,11 @@
 """Regression tests for admin model-settings UI gates."""
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 def _model_settings_template() -> str:
@@ -52,18 +56,6 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     )
 
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
-
-
-def test_apply_profile_surfaces_server_validation_error():
-    script = _dashboard_script()
-    method = script.split("async applyProfileToForm(profile) {", 1)[1].split(
-        "async applyTemplateToForm(template) {", 1
-    )[0]
-
-    assert "this.profileError = '';" in method
-    assert "const data = await r.json().catch(() => ({}));" in method
-    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
-    assert "this.profileError = String(e);" in method
 
 
 def test_reasoning_effort_has_presets_and_custom_input():
@@ -264,10 +256,12 @@ def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
     script = _dashboard_script()
 
     assert "validateQwenAneSettings()" in script
-    assert "ANE prompt block must be a multiple of 64." in script
-    assert "MLP ANE and CPU fractions must total less than 1.0." in script
-    assert "GDN ANE and CPU fractions must total less than 1.0." in script
-    assert "CPU worker count must be between 0 and 64." in script
+    # The messages are localised now, so assert the keys the validator returns
+    # rather than the English copy.
+    assert "window.t('js.error.ane_prompt_block_multiple')" in script
+    assert "window.t('js.error.mlp_ane_cpu_total')" in script
+    assert "window.t('js.error.gdn_ane_cpu_total')" in script
+    assert "window.t('js.error.cpu_workers_range')" in script
     assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
     assert "qwen35_ane_prefill_fraction: Number(" in script
 
@@ -372,6 +366,43 @@ def test_oq_a8_i18n_keys_exist_in_every_locale():
         assert not missing, f"{path.name} is missing {sorted(missing)}"
 
 
+def test_profile_api_toggle_state_uses_i18n_keys():
+    """Both expose-as-API toggles localise their ON/OFF state.
+
+    The state was hardcoded before the migration; `API` itself stays a Latin
+    literal because it is the product's own acronym for an API-addressable
+    model, and this PR leaves acronyms untranslated.
+    """
+    html = _model_settings_template()
+
+    # New-profile form and the inline edit form share the one key pair.
+    assert html.count("t('modal.model_settings.profiles.expose_as_model_on')") == 2
+    assert html.count("t('modal.model_settings.profiles.expose_as_model_off')") == 2
+    assert "'ON'" not in html
+    assert "'OFF'" not in html
+
+    assert [line.strip() for line in html.splitlines()].count("API") == 2
+
+
+def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    english = {
+        "modal.model_settings.profiles.expose_as_model_on": "ON",
+        "modal.model_settings.profiles.expose_as_model_off": "OFF",
+    }
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        missing = set(english) - set(catalog)
+        assert not missing, f"{path.name} is missing {sorted(missing)}"
+        # Extraction only: every locale renders the English source, exactly as
+        # the button did before. Translations land in the companion PR.
+        for key, value in english.items():
+            assert catalog[key] == value, (
+                f"{path.name} {key} is not the English fallback"
+            )
+
+
 def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     """Offload is incompatible with speculative verification paths."""
     html = _model_settings_template()
@@ -381,3 +412,143 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     assert ":disabled" in section
     for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
         assert f"modelSettings.{key}" in section
+
+
+def test_profile_editor_behavior():
+    """Execute the dashboard methods, including async response and edit races."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+// The dashboard resolves its copy through window.t, so feed the component the
+// shipped English catalog exactly as base.html does; the assertions below then
+// read the strings the app really renders.
+const catalog = JSON.parse(fs.readFileSync('omlx/admin/i18n/en.json', 'utf8'));
+function setup(fetch) {
+    const context = {
+        localStorage: {getItem: () => null},
+        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        window: {t: key => (catalog[key] !== undefined ? catalog[key] : key)},
+        navigator: {language: 'en'}, document: {}, fetch,
+    };
+    const state = vm.runInNewContext(source + '\n dashboard;', context)();
+    state.selectedModel = {id: 'model-a'};
+    state.models = [state.selectedModel];
+    state.loadProfilesForModel = async () => {};
+    return state;
+}
+
+test('Template apply uses server identity and effective settings', async () => {
+    const requests = [];
+    const state = setup(async (url, options) => {
+        requests.push([url, options.method]);
+        return {ok: true, json: async () => ({settings: {active_profile_name: 'copy-2', temperature: 0.9}})};
+    });
+    state.profiles = [{name:'coding', settings:{temperature:0.1}}];
+    await state.applyTemplateToForm({name:'coding', settings:{temperature:0.2}});
+    assert.deepEqual(requests, [['/admin/api/models/model-a/profile-templates/coding/apply', 'POST']]);
+    assert.equal(state.activeProfileName, 'copy-2');
+    assert.equal(state.modelSettings.temperature, 0.9);
+});
+
+test('Failed template application keeps the form and surfaces the error', async () => {
+    const state = setup(async () => ({ok:false, status:400, json:async()=>({detail:'Rejected'})}));
+    state.modelSettings.temperature = 0.1;
+    await state.applyTemplateToForm({name:'coding'});
+    assert.equal(state.profileError, 'Rejected');
+    assert.equal(state.modelSettings.temperature, 0.1);
+});
+
+test('Save as new invokes the corresponding apply action', async () => {
+    for (const global of [false, true]) {
+        const state = setup(async (url, options) => ({
+            ok: true, json: async () => ({[global ? 'template' : 'profile']: JSON.parse(options.body)}),
+        }));
+        let applied;
+        state.loadTemplates = async () => {};
+        const apply = global ? 'applyTemplateToForm' : 'applyProfileToForm';
+        state[apply] = async profile => { applied = profile; };
+        if (global) {
+            state.newTemplate = {display_name:'Coding', description:''};
+            await state.createTemplate();
+        } else {
+            state.newProfile = {display_name:'Coding', api_name:'coding', description:''};
+            await state.createProfile();
+        }
+        assert.equal(applied.display_name, 'Coding');
+    }
+});
+
+test('Focus refresh updates clean forms and preserves edits made while fetching', async () => {
+    const state = setup();
+    state.showModelSettingsModal = true;
+    state._modelSettingsBaseline = JSON.stringify(state.modelSettings);
+    let opened = 0;
+    state.openModelSettings = async()=>{opened++;};
+    state.loadModels = async()=>{};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    state.loadModels = async()=>{state.modelSettings.temperature = 0.3;};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    await state.refreshOpenModelSettings();
+    assert.equal(state.modelSettings.temperature, 0.3);
+    assert.equal(opened, 1);
+});
+
+test('Apply response cannot replace another model editor', async () => {
+    let resolve;
+    const state = setup(() => new Promise(r => {resolve=r;}));
+    const pending = state.applyTemplateToForm({name:'coding'});
+    state.selectedModel = {id:'model-b'};
+    state.modelSettings.temperature = 0.4;
+    resolve({ok:true, json:async()=>({settings:{temperature:0.9}})});
+    await pending;
+    assert.equal(state.modelSettings.temperature, 0.4);
+});
+
+test('Only a current linked copy marks a global template active', () => {
+    const state = setup();
+    state.templates = [{name:'coding',settings:{temperature:0.9}}];
+    const independent = {name:'coding',settings:{temperature:0.1}};
+    const copy = {name:'copy',source_template:'coding',settings:{temperature:0.9}};
+    state.profiles = [independent, copy];
+    state.activeProfileName = 'coding';
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 1);
+    state.activeProfileName = 'copy';
+    assert.equal(state.activeTemplateName, 'coding');
+    copy.settings.temperature = 0.2;
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 2);
+    copy.settings.temperature = 0.9;
+    copy.expose_as_model = true;
+    assert.equal(state.visibleModelProfiles.length, 2);
+    state.templates = [];
+    assert.equal(state.visibleModelProfiles.length, 2);
+});
+
+
+test('Template matching ignores nested dictionary ordering', () => {
+    const state = setup();
+    state.templates = [{name:'coding', settings:{chat_template_kwargs:{enable_thinking:true,custom:1}}}];
+    const copy = {name:'copy', source_template:'coding', settings:{chat_template_kwargs:{custom:1,enable_thinking:true}}};
+    assert.equal(state.matchingProfileTemplate(copy).name, 'coding');
+    copy.settings.chat_template_kwargs.custom = 2;
+    assert.equal(state.matchingProfileTemplate(copy), null);
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -1408,6 +1408,25 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
     return is_helper_model_config(config)
 
 
+def _is_deepseek_v41_loadable_config(config) -> bool:
+    """True for DeepSeek V4.1 checkpoints the V4.1 loader reads unconverted.
+
+    The loader gates source checkpoints on the model type alone (the FP8/FP4
+    release, or bf16), and reads oMLX conversions by their
+    ``omlx_deepseek_v41`` spec (e.g. ``Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp``).
+    Shards exported before #3583 declare no ``format: mlx`` metadata and the
+    repo names carry no MLX token, so the generic heuristics skip them.
+    MLX affine conversions without the spec (a top-level ``quantization``
+    dict) are not accepted: the loader has no path for them.
+    """
+    if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
+        return False
+    spec = config.get("omlx_deepseek_v41")
+    if isinstance(spec, dict):
+        return spec.get("version") == 1
+    return spec is None and "quantization" not in config
+
+
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
     if not _is_model_dir(model_dir):
@@ -1432,6 +1451,12 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     if not list(model_dir.glob("model*.safetensors")):
         logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
         return False
+    if _is_deepseek_v41_loadable_config(config):
+        logger.info(
+            "Treating HF cache model as MLX-compatible DeepSeek V4.1 checkpoint: "
+            f"{source_repo_id}"
+        )
+        return True
     if _safetensors_has_mlx_metadata(model_dir):
         return True
 

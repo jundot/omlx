@@ -56,6 +56,9 @@ class TestServerSettings:
         assert settings.distributed_inference_enabled is False
         assert settings.max_audio_upload_size == "100MB"
         assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
+        assert settings.max_image_upload_size == "50MB"
+        assert settings.max_image_upload_bytes() == 50 * 1024 * 1024
+        assert settings.max_image_side_length == 2048
 
     def test_custom_values(self):
         """Test custom values."""
@@ -86,6 +89,8 @@ class TestServerSettings:
             "preserve_mid_system_cache": True,
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
+            "max_image_upload_size": "50MB",
+            "max_image_side_length": 2048,
         }
 
     def test_from_dict_distributed_inference_is_opt_in(self):
@@ -151,6 +156,26 @@ class TestServerSettings:
             ServerSettings(max_audio_upload_size="0MB").max_audio_upload_bytes()
         with pytest.raises(ValueError, match="must be positive"):
             ServerSettings(max_audio_upload_size="-1MB").max_audio_upload_bytes()
+
+    def test_from_dict_max_image_upload_size(self):
+        """max_image_upload_size round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"max_image_upload_size": "20MB"})
+        assert settings.max_image_upload_size == "20MB"
+        assert settings.max_image_upload_bytes() == 20 * 1024 * 1024
+        assert settings.to_dict()["max_image_upload_size"] == "20MB"
+
+    def test_from_dict_max_image_side_length(self):
+        """max_image_side_length round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"max_image_side_length": 1024})
+        assert settings.max_image_side_length == 1024
+        assert settings.to_dict()["max_image_side_length"] == 1024
+
+    def test_max_image_upload_bytes_rejects_non_positive(self):
+        """0MB / negative sizes parse as integers but are not usable limits."""
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_image_upload_size="0MB").max_image_upload_bytes()
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_image_upload_size="-1MB").max_image_upload_bytes()
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -1088,6 +1113,53 @@ class TestGlobalSettings:
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
 
+    @pytest.mark.parametrize(
+        "host",
+        ["127.0.0.1", "127.12.34.56", "localhost", "LOCALHOST.", "::1"],
+    )
+    def test_loopback_bind_does_not_require_api_key(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        assert not any("API key is required" in error for error in settings.validate())
+
+    @pytest.mark.parametrize(
+        "host",
+        ["0.0.0.0", "::", "192.168.1.10", "my-mac.local", "127.0.0.1,0.0.0.0"],
+    )
+    def test_network_bind_requires_api_key(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        assert any("API key is required" in error for error in settings.validate())
+
+    def test_network_bind_with_api_key_is_valid(self):
+        settings = GlobalSettings()
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "secret-key"
+
+        assert settings.validate() == []
+
+    def test_network_bind_rejects_api_key_bypass(self):
+        settings = GlobalSettings()
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "secret-key"
+        settings.auth.skip_api_key_verification = True
+
+        errors = settings.validate()
+
+        assert any("cannot be skipped" in error for error in errors)
+
+    @pytest.mark.parametrize("host", ["", "   ", "999.999.999.999"])
+    def test_invalid_bind_host_is_reported(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        errors = settings.validate()
+
+        assert any("host" in error.lower() for error in errors)
+        assert not any("API key is required" in error for error in errors)
+
     def test_get_effective_model_dirs_includes_hf_cache_between_dirs(
         self, tmp_path, monkeypatch
     ):
@@ -1528,6 +1600,37 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert not any("max_audio_upload_size" in e for e in errors)
 
+    def test_validate_invalid_max_image_upload_size(self):
+        """Validation rejects unparseable or non-positive image upload limits."""
+        settings = GlobalSettings()
+        settings.server.max_image_upload_size = "bogus"
+        errors = settings.validate()
+        assert any("max_image_upload_size" in e for e in errors)
+
+        settings = GlobalSettings()
+        settings.server.max_image_upload_size = "0MB"
+        errors = settings.validate()
+        assert any("max_image_upload_size" in e for e in errors)
+
+    def test_validate_valid_max_image_upload_size(self):
+        """Validation accepts human-readable image upload sizes."""
+        settings = GlobalSettings()
+        settings.server.max_image_upload_size = "250MB"
+        errors = settings.validate()
+        assert not any("max_image_upload_size" in e for e in errors)
+
+    def test_validate_max_image_side_length(self):
+        """Validation rejects negative side length."""
+        settings = GlobalSettings()
+        settings.server.max_image_side_length = -1
+        errors = settings.validate()
+        assert any("max_image_side_length" in e for e in errors)
+
+        settings = GlobalSettings()
+        settings.server.max_image_side_length = 0
+        errors = settings.validate()
+        assert not any("max_image_side_length" in e for e in errors)
+
     def test_validate_memory_guard_tier_valid(self):
         """Test validation accepts each known tier."""
         for tier in ("safe", "balanced", "aggressive"):
@@ -1761,6 +1864,38 @@ class TestGlobalSettings:
             )
             assert settings.server.max_audio_upload_size == "500MB"
             assert settings.server.max_audio_upload_bytes() == 500 * 1024 * 1024
+
+    def test_env_override_max_image_settings(self):
+        """OMLX_MAX_IMAGE_UPLOAD_SIZE and OMLX_MAX_IMAGE_SIDE_LENGTH override defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMLX_MAX_IMAGE_UPLOAD_SIZE": "25MB",
+                    "OMLX_MAX_IMAGE_SIDE_LENGTH": "1024",
+                },
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.server.max_image_upload_size == "25MB"
+                assert settings.server.max_image_upload_bytes() == 25 * 1024 * 1024
+                assert settings.server.max_image_side_length == 1024
+
+    def test_cli_override_max_image_settings(self):
+        """--max-image-upload-size and --max-image-side-length are applied via CLI overrides."""
+        from argparse import Namespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings.load(
+                base_path=tmpdir,
+                cli_args=Namespace(
+                    max_image_upload_size="30MB",
+                    max_image_side_length=1500,
+                ),
+            )
+            assert settings.server.max_image_upload_size == "30MB"
+            assert settings.server.max_image_upload_bytes() == 30 * 1024 * 1024
+            assert settings.server.max_image_side_length == 1500
 
     def test_env_override_model(self):
         """Test environment variable override for model settings."""

@@ -375,6 +375,23 @@ final class ModelSettingsScreenVM {
         return .defaults
     }
 
+    func profileDisplayName(scope: ProfileScope, name: String) -> String {
+        let collection = scope == .model ? profiles : templates
+        return collection.first(where: { $0.name == name })?.displayName ?? name
+    }
+
+    var displayProfileState: ActiveProfileState {
+        switch activeProfileState {
+        case .named(let scope, let name):
+            return .named(scope: scope, name: profileDisplayName(scope: scope, name: name))
+        case .working(let basedOn):
+            return .working(basedOn: basedOn.map {
+                .init(scope: $0.scope, name: profileDisplayName(scope: $0.scope, name: $0.name))
+            })
+        case .defaults: return .defaults
+        }
+    }
+
     var isDiffusionModel: Bool {
         let type = (model?.configModelType ?? "")
             .lowercased()
@@ -509,7 +526,12 @@ final class ModelSettingsScreenVM {
     /// chat-template kwargs editor's add / remove buttons).
     func markProfileDirty() { self.profileDirty = true }
 
-    func load(modelID: String, client: OMLXClient) async {
+    private var loadSequence = 0
+
+    func load(modelID: String, client: OMLXClient, preservingEdits: Bool = false) async {
+        if preservingEdits && profileDirty { return }
+        loadSequence += 1
+        let sequence = loadSequence
         if self.modelID != modelID {
             aneTuningID = nil
             aneTuningIsRunning = false
@@ -518,6 +540,11 @@ final class ModelSettingsScreenVM {
         self.modelID = modelID
         do {
             let models = try await client.listModels().models
+            let profiles = try await client.listModelProfiles(id: modelID).profiles
+            let templates = try await client.listProfileTemplates().templates
+            let defaults = try await client.getGlobalSettings().sampling
+            guard sequence == loadSequence else { return }
+            if preservingEdits && profileDirty { return }
             self.allModels = models
             if let m = models.first(where: { $0.id == modelID }) {
                 self.model = m
@@ -614,9 +641,9 @@ final class ModelSettingsScreenVM {
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
                 self.activeProfileName = s?.activeProfileName
             }
-            self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
-            self.templates = (try? await client.listProfileTemplates().templates) ?? []
-            self.serverDefaultSampling = (try? await client.getGlobalSettings().sampling)
+            self.profiles = profiles
+            self.templates = templates
+            self.serverDefaultSampling = defaults
             // Resolve display scope from the source_template of the active
             // model profile (if any) — so applying the "Balanced" preset
             // lights up the Preset chip, not the local model copy.
@@ -1310,6 +1337,7 @@ final class ModelSettingsScreenVM {
     /// receives the bundle entry directly since presets aren't stored as
     /// server templates.
     func applyChip(scope: ProfileScope, name: String, client: OMLXClient) async {
+        let targetModelID = modelID
         do {
             switch scope {
             case .preset:
@@ -1318,44 +1346,25 @@ final class ModelSettingsScreenVM {
                 // hit a template lookup that's guaranteed to miss.
                 return
             case .model:
-                _ = try await client.applyModelProfile(id: modelID, name: name)
+                _ = try await client.applyModelProfile(id: targetModelID, name: name)
             case .global:
-                // Templates aren't directly applicable — seed a model
-                // profile from the template, then apply it. Reuse the
-                // template's name; if a same-named model profile already
-                // exists we leave it alone (server returns 409, we
-                // silently fall through to apply).
-                if !self.profiles.contains(where: { $0.name == name }) {
-                    if let tpl = self.templates.first(where: { $0.name == name }) {
-                        _ = try? await client.createModelProfile(
-                            id: modelID,
-                            body: CreateProfileRequest(
-                                name: tpl.name,
-                                displayName: tpl.displayName,
-                                description: tpl.description,
-                                sourceTemplate: tpl.name,
-                                settings: tpl.settings
-                            )
-                        )
-                    }
-                }
-                _ = try await client.applyModelProfile(id: modelID, name: name)
+                _ = try await client.applyModelTemplate(id: targetModelID, name: name)
             }
-            await load(modelID: modelID, client: client)
+            if modelID == targetModelID {
+                await load(modelID: targetModelID, client: client)
+            }
         } catch {
             self.lastError = error.omlxDescription
         }
     }
 
     /// Rename a global template via PUT /api/profile-templates/{name}.
-    /// Server validates the slug + duplicate; we already pre-checked
-    /// in ProfileGroup, but the server stays the source of truth for
-    /// the activated state — reload after success.
+    /// Keep the internal reference stable when editing the display name.
     func renameTemplate(from original: String, to renamed: String, client: OMLXClient) async {
         do {
             _ = try await client.updateProfileTemplate(
                 name: original,
-                body: UpdateTemplateRequest(newName: renamed)
+                body: UpdateTemplateRequest(displayName: renamed)
             )
             await load(modelID: modelID, client: client)
         } catch {
@@ -1364,14 +1373,13 @@ final class ModelSettingsScreenVM {
     }
 
     /// Rename a per-model profile via PUT /api/models/{id}/profiles/{name}.
-    /// If the renamed profile was active, the server carries the active
-    /// pointer to the new name; reload to pick that up.
+    /// Editing the display name leaves the active reference and API ID intact.
     func renameModelProfile(from original: String, to renamed: String, client: OMLXClient) async {
         do {
             _ = try await client.updateModelProfile(
                 id: modelID,
                 name: original,
-                body: UpdateProfileRequest(newName: renamed)
+                body: UpdateProfileRequest(displayName: renamed)
             )
             await load(modelID: modelID, client: client)
         } catch {
@@ -1426,8 +1434,10 @@ final class ModelSettingsScreenVM {
     /// Active Profile banner's "Save as new" and a chip group's
     /// "Save current as new" pill.
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
-        let cleanName = name.trimmingCharacters(in: .whitespaces)
-        guard !cleanName.isEmpty, scope != .preset else { return }
+        let targetModelID = modelID
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName = "p-" + UUID().uuidString.lowercased().prefix(28)
+        guard !displayName.isEmpty, scope != .preset else { return }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
@@ -1436,35 +1446,31 @@ final class ModelSettingsScreenVM {
                 _ = try await client.createProfileTemplate(
                     body: CreateTemplateRequest(
                         name: cleanName,
-                        displayName: cleanName,
+                        displayName: displayName,
                         description: nil,
-                        settings: settings
-                    )
-                )
-                // Seed a per-model profile from the new template and apply it.
-                _ = try? await client.createModelProfile(
-                    id: modelID,
-                    body: CreateProfileRequest(
-                        name: cleanName,
-                        displayName: cleanName,
-                        sourceTemplate: cleanName,
                         settings: settings
                     )
                 )
             case .model:
                 _ = try await client.createModelProfile(
-                    id: modelID,
+                    id: targetModelID,
                     body: CreateProfileRequest(
                         name: cleanName,
-                        displayName: cleanName,
+                        displayName: displayName,
                         settings: settings
                     )
                 )
             case .preset:
                 return
             }
-            _ = try await client.applyModelProfile(id: modelID, name: cleanName)
-            await load(modelID: modelID, client: client)
+            if scope == .global {
+                _ = try await client.applyModelTemplate(id: targetModelID, name: cleanName)
+            } else {
+                _ = try await client.applyModelProfile(id: targetModelID, name: cleanName)
+            }
+            if modelID == targetModelID {
+                await load(modelID: targetModelID, client: client)
+            }
         } catch {
             self.lastError = error.omlxDescription
         }
@@ -1474,6 +1480,7 @@ final class ModelSettingsScreenVM {
     /// settings. Used by the Active Profile banner's "Update X" and the
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
+        let targetModelID = modelID
         guard scope != .preset else { return }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
@@ -1484,18 +1491,9 @@ final class ModelSettingsScreenVM {
                     name: name,
                     body: UpdateTemplateRequest(settings: settings)
                 )
-                // Update the same-named model profile too so the next
-                // /apply lands the latest settings.
-                if self.profiles.contains(where: { $0.name == name }) {
-                    _ = try? await client.updateModelProfile(
-                        id: modelID,
-                        name: name,
-                        body: UpdateProfileRequest(settings: settings)
-                    )
-                }
             case .model:
                 _ = try await client.updateModelProfile(
-                    id: modelID,
+                    id: targetModelID,
                     name: name,
                     body: UpdateProfileRequest(settings: settings)
                 )
@@ -1504,10 +1502,16 @@ final class ModelSettingsScreenVM {
             }
             // If this profile is the active one, re-apply so the runtime
             // picks up the new values; if not, just reload.
-            if activeProfileName == name {
-                _ = try? await client.applyModelProfile(id: modelID, name: name)
+            if activeProfileName == name && activeProfileScope == scope {
+                if scope == .global {
+                    _ = try await client.applyModelTemplate(id: targetModelID, name: name)
+                } else {
+                    _ = try await client.applyModelProfile(id: targetModelID, name: name)
+                }
             }
-            await load(modelID: modelID, client: client)
+            if modelID == targetModelID {
+                await load(modelID: targetModelID, client: client)
+            }
         } catch {
             self.lastError = error.omlxDescription
         }
@@ -1570,12 +1574,12 @@ final class ModelSettingsScreenVM {
     func suggestSaveAsName() -> String {
         let base: String
         if case .working(let basedOn) = activeProfileState, let basedOn {
-            base = "\(basedOn.name)-copy"
+            base = "\(profileDisplayName(scope: basedOn.scope, name: basedOn.name))-copy"
         } else {
             base = "profile-1"
         }
         let taken = Set(
-            templates.map(\.name) + profiles.map(\.name)
+            templates.map(\.displayName) + profiles.map(\.displayName)
         )
         if !taken.contains(base) { return base }
         var n = 2
@@ -1627,23 +1631,8 @@ final class ModelSettingsScreenVM {
     }
 
     func applyTemplate(template: ProfileDTO, client: OMLXClient) async {
-        do {
-            _ = try await client.createModelProfile(
-                id: modelID,
-                body: CreateProfileRequest(
-                    name: template.name,
-                    displayName: template.displayName,
-                    description: template.description,
-                    sourceTemplate: template.name,
-                    settings: template.settings
-                )
-            )
-            self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
-        } catch {
-            self.lastError = error.omlxDescription
-        }
+        await applyChip(scope: .global, name: template.name, client: client)
     }
-
 
     /// `4.0` → `"4"`, `2.5` → `"2.5"`. The TurboQuant Popup options are
     /// declared as strings; preserving an integral display avoids the

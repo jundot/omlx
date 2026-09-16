@@ -177,4 +177,5 @@ def make_sampler(
     sampler.min_p = min_p
     sampler.top_k = top_k
     sampler.min_tokens_to_keep = min_tokens_to_keep
+    sampler.xtc_probability = xtc_probability
     return sampler

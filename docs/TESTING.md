@@ -1,3 +1,7 @@
+# Cache-preserving engine teardown tests
+
+Run `python -m pytest -q tests/test_engine_teardown.py tests/test_engine_core.py tests/test_scheduler.py tests/test_paged_ssd_cache.py tests/test_hot_cache.py tests/test_engine_pool.py tests/test_batched_engine.py tests/test_vlm_engine.py` to check the 60-second teardown budget and one progress-gated extension to 120 seconds. Clock tests cover the deadlines; short-budget subprocesses exercise fatal exits. Real writer-thread cases verify primary/draft flushes and in-flight prefix stores survive a saturated queue and can be reused after reload. Async cases cover event-loop responsiveness, cancellation, and leases during another model's unload.
+
 # Claude launcher tests
 
 Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check model selection, saved tier precedence, and the final Claude Code environment. Mixed-context cases verify that the selected initial model is passed through `ANTHROPIC_MODEL` and that the process-wide context and auto-compact limits use the smallest known context window across the initial model and configured tiers. Larger models consequently compact at that shared limit; models without reported limits cannot contribute a limit.
@@ -30,6 +34,10 @@ For a two-Mac smoke test, start isolated servers with separate base paths. Reque
 
 # DeepSeek V4.1 offline tests
 
+CED scheduler prefill, short suffix positions, full-logit scoring, and DSpark
+continuity: `python -m pytest tests/test_deepseek_v41_ced.py tests/test_deepseek_v41_ssd.py -q`.
+Replay is approximate; cache restoration is compared with the same chunk boundaries.
+
 Run `python -m pytest -q tests/test_deepseek_v41.py` for the text/vision port. Synthetic weights and small recorded official outputs cover prefill/decode, DSpark, Engram and vision numerics without a checkpoint download or vendored reference implementation. See `tests/fixtures/deepseek_v41_expected.md` for provenance and reference corrections. PyTorch is optional for the independent FP8/FP4 arithmetic checks. Other cases cover BatchGenerator admission, cache restoration, DSML and VLM engine execution.
 
 FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek_v41_activation.py -q`. These compare fused FP8 and weighted SwiGLU kernels against reference arithmetic across rounding ties, scale transitions, clipping, intermediate casts and floating-point dtypes.
@@ -49,7 +57,11 @@ Engram storage and prefetch lifecycle: `python -m pytest tests/test_deepseek_v41
 V4.1 expert reads, MXFP4/MXFP8 and mixed-bit affine arithmetic, repeated
 evictions, sorted routes, load/inference thread separation, Engram coexistence,
 draft-weight exclusion, and memory estimates. The load probe rejects whole
-expert reads from shared shards. Run alongside `test_deepseek_v41_offload.py`,
+expert reads from shared shards and any expert slab read through the Engram
+mapping. Further cases check that consumed read buffers are released within the
+in-flight byte window and pin the serial LRU order under concurrent reads,
+expert-boundary chunking of sorted routes, and the fit-to-budget residency
+helper against the admission arithmetic. Run alongside `test_deepseek_v41_offload.py`,
 `test_moe_expert_offload.py`, and the engine-pool/model-settings suites.
 `node tests/moe_expert_offload_ui.test.cjs` checks the actual dashboard
 save/reopen payload and speculative-decoding toggle exclusion.
@@ -59,3 +71,34 @@ save/reopen payload and speculative-decoding toggle exclusion.
 evictions. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
 checkpoint completeness, dense-model exclusion, API/runtime rejection, and
 PLE/Engram metadata after expert savings.
+
+# macOS port persistence tests
+
+Run the `AppConfigTests`, `ServerProcessIntegrationTests`, `ServerScreenVMStorageDiffTests`, `AppServicesPathTests`, and `MenubarControllerPortTests` targets with `xcodebuild test`. For process tests, set `TEST_RUNNER_OMLX_INTEGRATION=1`, `TEST_RUNNER_OMLX_PYTHON_OVERRIDE` to a Python interpreter with oMLX dependencies, `TEST_RUNNER_PYTHONPATH` to the repository root, and `TEST_RUNNER_OMLX_BASE_PATH` to a fresh temporary directory so the test host does not start the user's configured server. Leave `TEST_RUNNER_OMLX_DEV_SERVER_SCRIPT` unset to exercise the real Python API and CLI with empty model directories. Setting it to `apps/omlx-mac/Scripts/dev_server.py` instead runs the lightweight process fixture.
+
+The port cases cover offline Apply, recovery from an occupied port, web API saves followed by manual and automatic restarts, native Apply while running, client endpoint synchronization, and persistence across subsequent starts. Each child uses a temporary settings directory and an OS-selected port, and teardown stops the children. Endpoint-only persistence also checks that unrelated settings and corrupt files are preserved.
+
+# Accuracy benchmark worker tests
+
+Run `python -m pytest -q tests/test_eval_worker_pool.py tests/test_eval.py tests/test_accuracy_benchmark.py tests/test_admin_external_accuracy_diagnostics.py tests/test_accuracy_upload.py`. Worker tests cover slot refilling, thinking-mode retries, sequential code scoring without blocking generation, and repeated cancellation during scoring. Real HumanEval, MBPP, and LiveCodeBench subprocess cases verify normal completion, cancellation draining, and temporary-file cleanup with a controlled engine; no model checkpoint is required.
+
+# Profile API exposure tests
+
+Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/test_admin_profiles_api.py tests/test_model_settings_profiles.py`. The new-profile tests check toggle bindings, the OFF reset, and request serialization. Existing API tests cover the edit form, persistence, exposed model IDs, and name collisions.
+
+### Lightning MTP with XTC sampling
+
+Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
+
+# VLM cache boundary tests
+
+Run `python -m pytest -q tests/test_vlm_cache_boundaries.py tests/test_vlm_engine.py tests/test_prefix_cache.py tests/test_paged_cache.py` to check image-aware prefix keys. Boundary cases cover reasoning-dependent template prefixes, final grid token positions, adjacent images, multiple images per turn, block edges, invalid metadata, and isolation when earlier or later images change. These tests use synthetic processor inputs and KV arrays; checkpoint preprocessing and inference comparisons require local models.
+
+
+### Profile consistency
+
+Run `python -m pytest tests/test_model_settings_profiles.py tests/test_admin_profiles_api.py tests/test_admin_model_settings_template.py -q`. The editor behavior test executes the dashboard JavaScript with Node.js and is skipped if Node.js is unavailable. The cases cover latest-template application, same-name model preservation, renamed and deleted template references, persistence rollback, create-and-apply behavior, and preserving edits during focus refresh. The macOS `ProfileScopeTests` cover source references, stale copies, orphan visibility, and display names. For a manual cross-client check, edit a global profile in the web UI, apply it from the app, and verify the model's effective settings; repeat with an independent same-name model profile and with an unsaved editor open.
+
+Global and model profiles may share display names while retaining separate IDs. Applying a global template reads its latest settings; deleting it preserves model copies as independent profiles. Both editors save and apply new profiles, and focus refresh preserves unsaved edits.
+
+Startup reference repair is covered in `tests/test_model_settings_profiles.py`: missing references are cleared without replacing saved values, originals are backed up under `<base_path>/profile-reference-backup-*`, and subsequent loads do not write again. Retries with unchanged originals reuse the same content-hash backup directory and fill missing files. Mismatched backups prevent repair. Invalid storage, unsupported versions, backup failures, and failed writes must not persist inferred repairs. A rollback failure aborts startup and logs the backup path.

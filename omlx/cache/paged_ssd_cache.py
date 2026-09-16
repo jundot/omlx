@@ -37,6 +37,7 @@ import numpy as np
 
 from omlx.utils.formatting import format_bytes
 
+from ..utils.fatal import fatal_exit
 from .interface import CacheManager
 from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
@@ -1780,6 +1781,10 @@ class PagedSSDCacheManager(CacheManager):
         # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
         # _enqueue_ssd_write (holds _pending_write_hashes_lock).
         self._pending_write_buffers: dict[bytes, dict] = {}
+        self._persistence_progress_lock = threading.Lock()
+        self._persistence_last_success = None
+        self._persistence_failed = False
+        self._persistence_io_threads: set[int] = set()
         self._writer_shutdown = threading.Event()
         # Writer thread is only needed when writing to SSD.
         self._writer_thread = None
@@ -1944,7 +1949,8 @@ class PagedSSDCacheManager(CacheManager):
             # Non-blocking callers (hot-cache LRU spill) also wait so a
             # transient writer backlog doesn't silently drop blocks. Blocking
             # callers (shutdown flush) use the same bounded wait.
-            self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
+            with self._persistence_io():
+                self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
@@ -2981,6 +2987,26 @@ class PagedSSDCacheManager(CacheManager):
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
             return None
 
+    @contextlib.contextmanager
+    def _persistence_io(self):
+        thread_id = threading.get_ident()
+        with self._persistence_progress_lock:
+            self._persistence_io_threads.add(thread_id)
+        try:
+            yield
+        finally:
+            with self._persistence_progress_lock:
+                self._persistence_io_threads.discard(thread_id)
+
+    def persistence_progress(self, thread_id: int | None = None) -> float | None:
+        """Return the last successful write only for the requested I/O waiter."""
+        with self._persistence_progress_lock:
+            if self._persistence_failed:
+                return None
+            if thread_id is not None and thread_id not in self._persistence_io_threads:
+                return None
+            return self._persistence_last_success
+
     def _write_block_file(
         self,
         block_hash: bytes,
@@ -2991,72 +3017,78 @@ class PagedSSDCacheManager(CacheManager):
         source: str,
     ) -> bool:
         """Write one serialized block to disk from raw tensor bytes."""
-        temp_path = None
-        try:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
-            actual_size = _write_safetensors_no_mx(
-                str(temp_path), tensors_raw, metadata
-            )
-
-            os.rename(str(temp_path), str(file_path))
-            _fsync_parent_dir(file_path)
-
-            # The block is now durable on disk; bump the persist counter
-            # before any cleanup so ``saves_persisted`` reflects rename
-            # success even if the post-rename eviction check below unlinks it.
-            self._stats["saves_persisted"] += 1
-            self._index.update_file_size(block_hash, actual_size)
-
-            # Check if block was evicted while write was pending.
-            if not self._index.contains(block_hash):
-                logger.debug(
-                    "Block %s evicted during %s write, cleaning up file",
-                    block_hash.hex()[:16],
-                    source,
+        with self._persistence_io():
+            temp_path = None
+            try:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+                actual_size = _write_safetensors_no_mx(
+                    str(temp_path), tensors_raw, metadata
                 )
-                with contextlib.suppress(Exception):
-                    file_path.unlink()
-            return True
-        except Exception as e:
-            if isinstance(e, OSError) and e.errno in (
-                errno.ENOSPC,
-                errno.EDQUOT,
-            ):
-                # Background writes may fail after save_block already returned
-                # True, while inline fallbacks can still report False to the
-                # caller. In both cases, surface disk pressure at ERROR level
-                # and force the next save to recompute available space.
-                logger.error(
-                    "SSD cache disk full, cannot write block %s via %s: %s "
-                    "(subsequent saves will recompute disk pressure)",
-                    block_hash.hex()[:16],
-                    source,
-                    e,
-                )
-                # Invalidate the 30s disk-usage snapshot so the next
-                # save sees the true (now-critical) free space and evicts
-                # aggressively rather than trusting a stale inflated limit.
-                # In-flight saves that already passed
-                # _enforce_size_limit_for_new_block are still queued and may
-                # ENOSPC again; invalidation only protects the next round of
-                # save_block calls.
-                with self._lock:
-                    self._disk_usage_cache = None
-            else:
-                logger.error(
-                    "SSD cache %s write failed for %s: %s",
-                    source,
-                    block_hash.hex()[:16],
-                    e,
-                )
-            self._stats["errors"] += 1
-            self._index.remove(block_hash)
-            for p in (temp_path, file_path):
-                with contextlib.suppress(Exception):
-                    if p is not None and isinstance(p, Path) and p.exists():
-                        p.unlink()
-            return False
+
+                os.rename(str(temp_path), str(file_path))
+                _fsync_parent_dir(file_path)
+
+                # The block is now durable on disk; bump the persist counter
+                # before any cleanup so ``saves_persisted`` reflects rename
+                # success even if the post-rename eviction check below unlinks it.
+                self._stats["saves_persisted"] += 1
+                with self._persistence_progress_lock:
+                    self._persistence_last_success = time.monotonic()
+                    self._persistence_failed = False
+                self._index.update_file_size(block_hash, actual_size)
+
+                # Check if block was evicted while write was pending.
+                if not self._index.contains(block_hash):
+                    logger.debug(
+                        "Block %s evicted during %s write, cleaning up file",
+                        block_hash.hex()[:16],
+                        source,
+                    )
+                    with contextlib.suppress(Exception):
+                        file_path.unlink()
+                return True
+            except Exception as e:
+                if isinstance(e, OSError) and e.errno in (
+                    errno.ENOSPC,
+                    errno.EDQUOT,
+                ):
+                    # Background writes may fail after save_block already returned
+                    # True, while inline fallbacks can still report False to the
+                    # caller. In both cases, surface disk pressure at ERROR level
+                    # and force the next save to recompute available space.
+                    logger.error(
+                        "SSD cache disk full, cannot write block %s via %s: %s "
+                        "(subsequent saves will recompute disk pressure)",
+                        block_hash.hex()[:16],
+                        source,
+                        e,
+                    )
+                    # Invalidate the 30s disk-usage snapshot so the next
+                    # save sees the true (now-critical) free space and evicts
+                    # aggressively rather than trusting a stale inflated limit.
+                    # In-flight saves that already passed
+                    # _enforce_size_limit_for_new_block are still queued and may
+                    # ENOSPC again; invalidation only protects the next round of
+                    # save_block calls.
+                    with self._lock:
+                        self._disk_usage_cache = None
+                else:
+                    logger.error(
+                        "SSD cache %s write failed for %s: %s",
+                        source,
+                        block_hash.hex()[:16],
+                        e,
+                    )
+                self._stats["errors"] += 1
+                with self._persistence_progress_lock:
+                    self._persistence_failed = True
+                self._index.remove(block_hash)
+                for p in (temp_path, file_path):
+                    with contextlib.suppress(Exception):
+                        if p is not None and isinstance(p, Path) and p.exists():
+                            p.unlink()
+                return False
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False
@@ -3087,6 +3119,8 @@ class PagedSSDCacheManager(CacheManager):
         standard file I/O operations.
         """
         while True:
+            if self._writer_shutdown.is_set() and self._write_queue.empty():
+                break
             item = None
             try:
                 item = self._write_queue.get(timeout=1.0)
@@ -3531,10 +3565,11 @@ class PagedSSDCacheManager(CacheManager):
             # transient bursts (faster than the writer can drain) don't
             # immediately punch holes in the cache chain.
             try:
-                self._write_queue.put(
-                    (block_hash, tensors_raw, metadata, file_path),
-                    timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
-                )
+                with self._persistence_io():
+                    self._write_queue.put(
+                        (block_hash, tensors_raw, metadata, file_path),
+                        timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
+                    )
             except queue.Full:
                 self._stats["ssd_inline_write_fallbacks"] += 1
                 logger.warning(
@@ -4987,7 +5022,7 @@ class PagedSSDCacheManager(CacheManager):
                 **self._stats,
             }
 
-    def close(self) -> None:
+    def close(self, *, teardown=None) -> None:
         """Close the SSD cache manager, flushing hot cache and pending writes."""
         logger.info("Shutting down PagedSSDCacheManager...")
 
@@ -5033,8 +5068,12 @@ class PagedSSDCacheManager(CacheManager):
 
             # Wait for writer to finish — longer timeout to allow flush
             timeout = 120 if self._hot_cache_enabled else 60
+            if teardown is not None:
+                timeout = teardown.remaining()
             self._writer_thread.join(timeout=timeout)
             if self._writer_thread.is_alive():
+                if teardown is not None:
+                    fatal_exit("SSD cache writer survived engine teardown")
                 logger.warning(
                     f"SSD cache writer thread did not stop within {timeout}s"
                 )

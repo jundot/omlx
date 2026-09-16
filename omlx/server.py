@@ -262,6 +262,9 @@ class ServerState:
     mcp_executor: Optional[object] = None
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
+    # Bind address snapshot for security checks. Unlike GlobalSettings.server.host,
+    # this remains unchanged until the process restarts on the new address.
+    bind_host: str | None = None
     settings_manager: Optional[object] = None  # ModelSettingsManager
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
@@ -318,21 +321,35 @@ async def verify_api_key(
     request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
-    """Verify API key if configured.
+    """Verify API key unless an explicitly loopback-only server allows no auth.
 
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
     from .admin.auth import fingerprint_key, verify_any_api_key
+    from .utils.network import is_loopback_bind
 
-    # No auth required if no API key is configured
+    global_settings = _server_state.global_settings
+    configured_host = getattr(
+        getattr(global_settings, "server", None), "host", None
+    )
+    if not isinstance(configured_host, str):
+        configured_host = None
+    bind_host = getattr(_server_state, "bind_host", None)
+    active_host = bind_host if isinstance(bind_host, str) else configured_host
+    loopback_only = active_host is None or is_loopback_bind(active_host)
+
+    # A missing key is accepted only when the configured bind is loopback-only.
     if _server_state.api_key is None:
-        return True
+        if loopback_only:
+            return True
+        raise HTTPException(status_code=401, detail="API key required")
 
     # Skip verification if enabled
     if (
-        _server_state.global_settings is not None
-        and _server_state.global_settings.auth.skip_api_key_verification
+        global_settings is not None
+        and global_settings.auth.skip_api_key_verification
+        and loopback_only
     ):
         return True
 
@@ -347,8 +364,8 @@ async def verify_api_key(
 
     # Check main key and sub keys
     sub_keys = (
-        _server_state.global_settings.auth.sub_keys
-        if _server_state.global_settings is not None
+        global_settings.auth.sub_keys
+        if global_settings is not None
         else []
     )
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
@@ -2074,15 +2091,29 @@ def init_server(
         - Sampling parameters (max_tokens, temperature, etc.) are per-model settings
 
     Raises:
-        ValueError: If model directory doesn't exist or no models found
+        ValueError: If network authentication is unsafe, the model directory
+            doesn't exist, or no models are found.
     """
     from pathlib import Path
 
     from .model_settings import ModelSettingsManager
+    from .utils.network import network_auth_error
+
+    if global_settings is not None:
+        auth_error = network_auth_error(
+            global_settings.server.host,
+            api_key,
+            global_settings.auth.skip_api_key_verification,
+        )
+        if auth_error:
+            raise ValueError(auth_error)
 
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    _server_state.bind_host = (
+        global_settings.server.host if global_settings is not None else None
+    )
     from .cluster.exposure import distributed_inference_enabled as is_enabled
 
     _server_state.distributed_inference_enabled = is_enabled(global_settings)
@@ -6911,18 +6942,19 @@ async def create_response(
             else:
                 compiled_grammar = None
 
-        # Merge MCP tools
-        effective_tools = (
-            None
-            if (
-                getattr(engine, "is_diffusion_model", False)
-                and not getattr(engine, "supports_tool_calling", False)
-            )
-            else openai_tools
+        # Merge MCP tools, matching create_chat_completion's tools_disabled
+        # semantics: tool_choice="none" suppresses tool exposure to the chat
+        # template, and the MCP merge itself must run even when the client
+        # sent no tools of its own, since MCP servers can offer tools the
+        # client never listed.
+        tools_disabled = request.tool_choice == "none" or (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
         )
+        effective_tools = None if tools_disabled else openai_tools
         if (
             _server_state.mcp_manager
-            and effective_tools
+            and not tools_disabled
             and mcp_tools_exposed()
         ):
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
@@ -8082,8 +8114,8 @@ model and sampling defaults are managed via the admin page.
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
+        default=None,
+        help="Host to bind to (default: settings or 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
@@ -8096,6 +8128,12 @@ model and sampling defaults are managed via the admin page.
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for authentication (required for non-loopback binds)",
     )
 
     args = parser.parse_args()
@@ -8114,6 +8152,15 @@ model and sampling defaults are managed via the admin page.
     from .settings import init_settings
 
     settings = init_settings()
+    if args.host is not None:
+        settings.server.host = args.host
+    if args.api_key is not None:
+        settings.auth.api_key = args.api_key
+    errors = settings.validate()
+    if errors:
+        for error in errors:
+            print(f"Configuration error: {error}")
+        raise SystemExit(1)
     settings.ensure_directories()
 
     # Match the cli.py launcher: keep freed GPU buffers in the pool so
@@ -8136,7 +8183,7 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=settings.server.host, port=args.port)
 
 
 if __name__ == "__main__":

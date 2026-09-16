@@ -1287,3 +1287,60 @@ async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
         await engine.preflight_chat([{"role": "user", "content": "hi"}])
     finally:
         await engine._client.aclose()
+
+
+def test_failed_runtime_quiescence_evidence(tmp_path, monkeypatch):
+    """A failed runtime or dead rank process must report 0 active requests."""
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    engine._supervisor.state_dir = str(tmp_path)
+    marker_path = tmp_path / "engine-test-rank-0.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999999,
+                "metrics": {"active_requests": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Marker exists with active_requests=3, but pid is dead
+    monkeypatch.setattr(distributed, "marker_owner_is_live", lambda m: False)
+    assert engine.rank_side_active_requests() == 0
+
+    # If pid is live, it reports active_requests
+    monkeypatch.setattr(distributed, "marker_owner_is_live", lambda m: True)
+    assert engine.rank_side_active_requests() == 3
+
+    # If marker has an error, it reports 0
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 1234,
+                "error": "Metal GPU watchdog timeout",
+                "metrics": {"active_requests": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert engine.rank_side_active_requests() == 0
+
+    # If runtime_failed_reason is set on engine, rank_side_active_requests is 0
+    # and has_active_requests is False even if local counter or marker is positive
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 1234,
+                "metrics": {"active_requests": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    engine._active_requests = 2
+    assert engine.has_active_requests() is True
+    assert engine.rank_side_active_requests() == 3
+
+    engine._mark_runtime_failed("worker terminated unexpectedly")
+    assert engine.rank_side_active_requests() == 0
+    assert engine.has_active_requests() is False
+

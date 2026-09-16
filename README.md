@@ -355,9 +355,16 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 # API key authentication
 omlx serve --model-dir ~/models --api-key your-secret-key
 # Localhost-only: skip verification via admin panel global settings
+
+# Network access requires authentication
+OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
 ```
 
 All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+Set the main API key before changing the server host to a LAN address or
+`0.0.0.0`, or save both settings together. oMLX refuses to start on any
+non-loopback address without an API key, and API key verification can only be
+skipped for loopback-only binds.
 
 <details>
 <summary>Architecture</summary>
