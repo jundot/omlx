@@ -425,8 +425,12 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
         catalog = json.loads(path.read_text())
         missing = set(english) - set(catalog)
         assert not missing, f"{path.name} is missing {sorted(missing)}"
-        # Extraction only: every locale renders the English source, exactly as
-        # the button did before. Translations land in the companion PR.
+        if path.name == "zh.json":
+            # Simplified Chinese carries its own labels; every other locale
+            # keeps the English fallback until its own translation lands.
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
+            continue
         for key, value in english.items():
             assert (
                 catalog[key] == value

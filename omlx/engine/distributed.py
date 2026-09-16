@@ -238,7 +238,7 @@ class DistributedBatchedEngine(BatchedEngine):
     def runtime_failed_reason(self) -> str | None:
         """Terminal worker failure observed by the coordinator, if any."""
 
-        if self._runtime_failed_reason is None and self._loaded:
+        if self._runtime_failed_reason is None and getattr(self, "_supervisor", None) is not None:
             status = self._supervisor.status()
             reason = status.failure_reason
             if reason is None and status.returncode is not None:
@@ -921,6 +921,9 @@ raise SystemExit(2)
         if not isinstance(marker, dict):
             return None
         if not marker_owner_is_live(marker) or marker.get("error"):
+            return 0
+        age = marker_age_seconds(marker)
+        if age is not None and age > _DEFAULT_STALE_AFTER:
             return 0
         metrics = marker.get("metrics")
         if not isinstance(metrics, dict):

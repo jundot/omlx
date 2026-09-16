@@ -1285,11 +1285,19 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if entry is None:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            if entry.engine is not None:
+                failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
+                if not (isinstance(failed_reason, str) and failed_reason.strip()):
+                    self._raise_if_reload_busy(entry, "activate distributed cluster")
+            pending_task = self._pending_unload_tasks.pop(model_id, None)
+            if pending_task is not None and not pending_task.done():
+                pending_task.cancel()
+            entry.pending_unload_reason = None
+            entry.pending_unload_allow_pinned = False
+            entry.abort_requested = False
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            if not getattr(entry.engine, "runtime_failed_reason", None):
-                self._raise_if_reload_busy(entry, "activate distributed cluster")
             await self._unload_engine(model_id)
             self._clear_load_failure(entry)
 
@@ -1427,6 +1435,9 @@ class EnginePool:
         engine = entry.engine
         if engine is None:
             return False
+        failed_reason = getattr(engine, "runtime_failed_reason", None)
+        if isinstance(failed_reason, str) and failed_reason.strip():
+            return False
         has_active_requests = getattr(engine, "has_active_requests", None)
         if not callable(has_active_requests):
             return False
@@ -1470,6 +1481,9 @@ class EnginePool:
 
     def _entry_is_quiescent(self, entry: EngineEntry) -> bool:
         """Return True only after leases, collectors, and scheduler work drain."""
+        failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
+        if isinstance(failed_reason, str) and failed_reason.strip():
+            return True
         return not (
             entry.in_use > 0
             or self._entry_has_active_requests(entry)

@@ -1659,6 +1659,92 @@ class TestSettingsSnapshotRoutes:
             }
         ]
 
+    @pytest.mark.parametrize("ssd_available", [False, True])
+    def test_recipe_checks_inactive_dflash_ssd_cache(self, client, ssd_available):
+        from omlx.admin.benchmark import _filter_uploaded_settings
+
+        c, mgr = client
+        admin_routes._get_engine_pool()._scheduler_config = SimpleNamespace(
+            paged_ssd_cache_dir="/cache" if ssd_available else None
+        )
+        source = ModelSettings(
+            temperature=0.2, dflash_enabled=False, dflash_ssd_cache=True
+        )
+        recipe = settings_recipe.encode_recipe(_filter_uploaded_settings(source))
+        response = c.post(
+            "/admin/api/models/model-a/settings/recipe", json={"recipe": recipe}
+        )
+        assert response.status_code == 200, response.text
+        saved = mgr.get_settings("model-a")
+        assert saved.temperature == 0.2
+        assert saved.dflash_enabled is False
+        assert saved.dflash_ssd_cache is ssd_available
+        assert [item["feature"] for item in response.json()["skipped"]] == (
+            [] if ssd_available else ["dflash_ssd_cache"]
+        )
+
+    @pytest.mark.parametrize(
+        "engine_type,target_type,draft_type,mismatch,accepted",
+        [
+            ("batched", "llama", "gemma4_assistant", None, False),
+            ("vlm", "qwen3_5", "gemma4_assistant", None, False),
+            ("vlm", "qwen3_5", "qwen3_5_mtp", "hidden_size", False),
+            ("vlm", "qwen3_5", "qwen3_5_mtp", "vocab_size", False),
+            ("vlm", "qwen3_5", "qwen3_5_mtp", None, True),
+            ("vlm", "gemma4", "gemma4_assistant", None, True),
+            ("vlm", "gemma4_unified", "gemma4_unified_assistant", None, True),
+        ],
+    )
+    def test_recipe_checks_vlm_mtp_pair(
+        self, client, tmp_path, engine_type, target_type, draft_type, mismatch, accepted
+    ):
+        c, mgr = client
+        pool = admin_routes._get_engine_pool()
+        target = pool.get_entry("model-a")
+        target.engine_type = engine_type
+        target.config_model_type = target_type
+        draft = _FakeEntry("assistant", config_model_type=draft_type)
+        pool._entries["assistant"] = draft
+        text_config = {"hidden_size": 1536, "vocab_size": 262144}
+        draft_text = dict(text_config)
+        if mismatch:
+            draft_text[mismatch] //= 2
+        if draft_type.startswith("gemma4"):
+            draft_text["hidden_size"] = 768
+        for name, entry, config in (
+            ("target", target, {"model_type": target_type, "text_config": text_config}),
+            (
+                "draft",
+                draft,
+                {
+                    "model_type": draft_type,
+                    "text_config": draft_text,
+                    "backbone_hidden_size": 1536,
+                },
+            ),
+        ):
+            path = tmp_path / name
+            path.mkdir()
+            (path / "config.json").write_text(json.dumps(config))
+            entry.model_path = str(path)
+        recipe = settings_recipe.encode_recipe(
+            {
+                "temperature": 0.2,
+                "vlm_mtp_enabled": True,
+                "vlm_mtp_draft_model": "assistant",
+            }
+        )
+        response = c.post(
+            "/admin/api/models/model-a/settings/recipe", json={"recipe": recipe}
+        )
+        assert response.status_code == 200, response.text
+        saved = mgr.get_settings("model-a")
+        assert saved.temperature == 0.2
+        assert saved.vlm_mtp_enabled is accepted
+        assert [item["feature"] for item in response.json()["skipped"]] == (
+            [] if accepted else ["vlm_mtp"]
+        )
+
     def test_recipe_resolves_installed_draft_by_basename(
         self, client, monkeypatch, tmp_path
     ):

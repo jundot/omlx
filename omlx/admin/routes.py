@@ -3806,6 +3806,47 @@ def _resolve_draft(snapshot: dict, key: str, refs, *, use_path: bool) -> str | N
     return None
 
 
+def _vlm_mtp_recipe_problem(entry, draft_id: str) -> str | None:
+    if entry.engine_type != "vlm":
+        return "VLM MTP requires a VLM engine"
+    draft_entry = _get_engine_pool().get_entry(draft_id)
+    try:
+        target = json.loads((Path(entry.model_path) / "config.json").read_text())
+        draft = json.loads((Path(draft_entry.model_path) / "config.json").read_text())
+    except (OSError, ValueError) as error:
+        return f"cannot read VLM MTP model configuration: {error}"
+    if not isinstance(target, dict) or not isinstance(draft, dict):
+        return "VLM MTP model configurations must be JSON objects"
+    target_type = str(target.get("model_type", "")).replace("-", "_").lower()
+    draft_type = draft.get("model_type")
+    if target_type in ("gemma4", "gemma4_unified", "gemma4_text"):
+        compatible = draft_type in ("gemma4_assistant", "gemma4_unified_assistant")
+    elif target_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
+        compatible = draft_type == "qwen3_5_mtp"
+    else:
+        compatible = False
+    if not compatible:
+        return f"VLM MTP drafter '{draft_type}' is not compatible with '{target_type}'"
+    target_text = target.get("text_config") or target
+    draft_text = draft.get("text_config") or draft
+    if not isinstance(target_text, dict) or not isinstance(draft_text, dict):
+        return "VLM MTP text configurations must be JSON objects"
+    for key in ("hidden_size", "vocab_size"):
+        target_value = target_text.get(key)
+        draft_value = (
+            draft.get("backbone_hidden_size")
+            if key == "hidden_size" and draft_type.startswith("gemma4")
+            else draft_text.get(key)
+        )
+        if (
+            target_value is not None
+            and draft_value is not None
+            and target_value != draft_value
+        ):
+            return f"VLM MTP target and drafter have different {key} values"
+    return None
+
+
 def _feature_problem(
     entry, group: FeatureGroup, snapshot: dict, refs, skipped: list
 ) -> str | None:
@@ -3823,12 +3864,15 @@ def _feature_problem(
     if name in _NOT_FOR_DIFFUSION and _entry_is_diffusion_model(entry):
         return "not supported for diffusion models"
     if name == "dflash":
-        ok, reason = _dflash_compat_for_model(info)
-        if not ok:
-            return reason or "DFlash is not available for this model"
-        problem = _resolve_draft(snapshot, "dflash_draft_model", refs, use_path=True)
-        if problem:
-            return problem
+        if group_enabled(snapshot, group):
+            ok, reason = _dflash_compat_for_model(info)
+            if not ok:
+                return reason or "DFlash is not available for this model"
+            problem = _resolve_draft(
+                snapshot, "dflash_draft_model", refs, use_path=True
+            )
+            if problem:
+                return problem
         if snapshot.get("dflash_ssd_cache"):
             in_memory = snapshot.get(
                 "dflash_in_memory_cache", DEFAULTS["dflash_in_memory_cache"]
@@ -3845,7 +3889,10 @@ def _feature_problem(
     if name == "specprefill":
         return _resolve_draft(snapshot, "specprefill_draft_model", refs, use_path=True)
     if name == "vlm_mtp":
-        return _resolve_draft(snapshot, "vlm_mtp_draft_model", refs, use_path=False)
+        problem = _resolve_draft(snapshot, "vlm_mtp_draft_model", refs, use_path=False)
+        if problem:
+            return problem
+        return _vlm_mtp_recipe_problem(entry, snapshot["vlm_mtp_draft_model"])
     if name == "mtp":
         ok, reason = _mtp_compat_for_model(info)
         if not ok:
@@ -3917,8 +3964,12 @@ async def _apply_settings_snapshot(
             )
         refs = _installed_model_refs()
         for group in FEATURE_GROUPS:
-            # Inactive ANE controls still have backend-specific limits.
-            if not group_enabled(cleaned, group) and group.name != "ane_prefill":
+            # Inactive controls can still require local validation.
+            if (
+                not group_enabled(cleaned, group)
+                and group.name != "ane_prefill"
+                and not (group.name == "dflash" and cleaned.get("dflash_ssd_cache"))
+            ):
                 continue
             try:
                 reason = _feature_problem(entry, group, cleaned, refs, skipped)
