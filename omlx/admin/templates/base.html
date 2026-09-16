@@ -122,6 +122,14 @@
             outline-offset: 2px;
         }
 
+        /* Dashboard nav tabs: subtle focus ring that reads naturally next to the
+           selected-state pill instead of a stark default blue outline. Keyboard-only
+           (:focus-visible) so a mouse click never leaves a lingering ring. */
+        [role="tab"]:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(0,0,0,0.12);
+        }
+
         /* Respect "Reduce Motion" (accessibility): collapse CSS transitions
            and animations so the UI does not animate for users who ask for it. */
         @media (prefers-reduced-motion: reduce) {
