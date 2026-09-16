@@ -64,7 +64,6 @@ from .exceptions import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
-from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
@@ -571,12 +570,6 @@ _uid_row_registry_lock = threading.Lock()
 # rest to DEBUG so the signal survives without flooding the logs.
 _UID_ROW_DRIFT_WARNING_INTERVAL_S = 60.0
 _uid_row_drift_last_warning = float("-inf")
-
-# Headroom sentinel handed to the sdpa256 route gate when the memory guard
-# is explicitly disabled: the user opted out of memory management, so route
-# selection must not slow prefill down on its behalf (#2283). Far above any
-# real unfused-transient estimate, so the gate always picks the fast path.
-_SDPA256_UNBOUNDED_HEADROOM = 1 << 62
 
 
 def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
@@ -1981,14 +1974,6 @@ class Scheduler:
         # must steer the user to that knob instead of "close other apps".
         self._memory_guard_tier: str = "balanced"
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
-        # True once ProcessMemoryEnforcer has pushed guard state at least
-        # once. Until then _prefill_memory_guard=False means "unknown", not
-        # "user disabled the guard", and the sdpa256 route keeps its
-        # memory-safe tiled default (#2283).
-        self._memory_limits_propagated: bool = False
-        # One-shot marker for the guard-off fast-path INFO emitted by
-        # _sdpa256_unfused_headroom.
-        self._sdpa256_unguarded_logged: bool = False
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
@@ -2052,7 +2037,6 @@ class Scheduler:
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
-        self._sdpa256_bounded_route_active: bool | None = None
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -4175,48 +4159,6 @@ class Scheduler:
         base_cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
         safety_cap = self._prefill_abort_cap()
         return base_cap, safety_cap, self._prefill_abort_margin
-
-    def _sdpa256_bounded_route_changed(self, active: bool) -> None:
-        """Retire measurements when SDPA256 changes memory regimes."""
-        previous = getattr(self, "_sdpa256_bounded_route_active", None)
-        active = bool(active)
-        self._sdpa256_bounded_route_active = active
-        if previous != active and (previous is not None or active):
-            self._prefill_transient_tracker.reset_history()
-
-    def _sdpa256_unfused_headroom(self) -> int:
-        """Live headroom (bytes) for one unfused SDPA transient, under the
-        same target the adaptive prefill throttle enforces (hard ceiling x
-        headroom safety, clamped by the abort cap). Negative when the
-        ceiling is unknown (enforcer not propagated yet), which tells the
-        sdpa256 route to keep its memory-bounded default. When the guard
-        is explicitly disabled there is no ceiling to respect: the user
-        opted out of memory management, so the route gets unbounded
-        headroom and keeps the unfused fast path (#2283). Called from
-        the route gate on the MLX step thread mid-prefill, where refreshing
-        the active-memory sample is safe (issue #2204)."""
-        hard_cap = self._memory_hard_limit_bytes
-        if hard_cap <= 0:
-            if self._memory_limits_propagated and not self._prefill_memory_guard:
-                if not self._sdpa256_unguarded_logged:
-                    self._sdpa256_unguarded_logged = True
-                    logger.info(
-                        "sdpa256: memory guard disabled, head-dim-256 "
-                        "prefill keeps the unfused fast path with no memory "
-                        "ceiling (long-context OOM protection off). Enable "
-                        "the memory guard or set OMLX_SDPA256_TILED=1 for "
-                        "the memory-bounded path."
-                    )
-                return _SDPA256_UNBOUNDED_HEADROOM
-            return -1
-        headroom_safety = getattr(
-            self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
-        )
-        target = int(hard_cap * headroom_safety)
-        abort_cap = self._prefill_abort_cap()
-        if abort_cap > 0:
-            target = min(target, abort_cap)
-        return target - self._current_usage_bytes()
 
     # Two pauses, not one: a marginal pooled-buffer reclaim can satisfy the
     # first pass's target check while buying only a couple of minutes of KV
@@ -12686,11 +12628,6 @@ class Scheduler:
         Returns:
             SchedulerOutput with results of this step
         """
-        # Bind on the thread that runs model forwards. Scheduler construction
-        # can happen on a shared event-loop thread, while every engine executes
-        # steps on its own worker. The setter is idempotent for repeated steps.
-        set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
-
         output = SchedulerOutput()
 
         # Publish decode activity for cross-engine prefill fairness (a
