@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for admin profile/template API routes."""
 
+import base64
+import json
+import re
+import zlib
+from types import SimpleNamespace
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from omlx.admin import recipe as settings_recipe
 from omlx.admin import routes as admin_routes
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 
@@ -1080,3 +1087,427 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
     )
     assert c.post(url + "/a8/apply").status_code == 200
     assert mgr.get_settings("model-a").qwen35_oq_a8_enabled
+
+
+# ---------------------------------------------------------------------------
+# Settings snapshots: recipe codec, reset, recipe and optimal endpoints
+# ---------------------------------------------------------------------------
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+class TestSettingsRecipeCodec:
+    def test_round_trip_drops_benchmark_context(self):
+        settings = {
+            "benchmark_context": "Code (Python)",
+            "temperature": 0.6,
+            "turboquant_kv_enabled": True,
+            "turboquant_kv_bits": 4,
+            "dflash_draft_model": "Qwen3-4B-DFlash-b16",
+        }
+        text = settings_recipe.encode_recipe(settings)
+        assert re.fullmatch(r"omlx-recipe:1:[A-Za-z0-9_-]+", text)
+        expected = {k: v for k, v in settings.items() if k != "benchmark_context"}
+        assert settings_recipe.decode_recipe("  " + text + "\n") == expected
+
+    def test_body_is_a_zlib_stream_like_the_site_encoder(self):
+        text = settings_recipe.encode_recipe({"top_p": 0.9})
+        body = text.split(":", 2)[2]
+        raw = zlib.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        assert json.loads(raw) == {"top_p": 0.9}
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "hello",
+            "omlx-recipe:2:abc",
+            "omlx-recipe:1:",
+            "omlx-recipe:1:not base64!",
+            "omlx-recipe:1:" + _b64url(b"not a zlib stream"),
+            "omlx-recipe:1:" + _b64url(zlib.compress(b"[1, 2]")),
+            "omlx-recipe:1:" + _b64url(zlib.compress(b'{"a": null}'))[:-4] + "AAAA",
+        ],
+    )
+    def test_rejects_malformed_text(self, text):
+        with pytest.raises(settings_recipe.RecipeError):
+            settings_recipe.decode_recipe(text)
+
+    def test_rejects_oversized_payload(self):
+        bomb = zlib.compress(b'{"a": "' + b"x" * 200000 + b'"}', 9)
+        with pytest.raises(settings_recipe.RecipeError, match="too large"):
+            settings_recipe.decode_recipe("omlx-recipe:1:" + _b64url(bomb))
+
+    def test_resolve_draft_reference(self):
+        entries = [
+            ("z-lab/Qwen3-4B-DFlash-b16", "/models/z-lab/Qwen3-4B-DFlash-b16"),
+            ("other", "/models/other"),
+        ]
+        resolve = settings_recipe.resolve_draft_reference
+        assert resolve("z-lab/Qwen3-4B-DFlash-b16", entries)[1] == (
+            "/models/z-lab/Qwen3-4B-DFlash-b16"
+        )
+        assert resolve("/models/other", entries) == ("other", "/models/other")
+        assert resolve("Qwen3-4B-DFlash-b16", entries)[0] == "z-lab/Qwen3-4B-DFlash-b16"
+        assert resolve("/elsewhere/Qwen3-4B-DFlash-b16/", entries)[0] == (
+            "z-lab/Qwen3-4B-DFlash-b16"
+        )
+        assert resolve("missing", entries) == (None, None)
+        assert resolve("", entries) == (None, None)
+
+    def test_settings_diff_sends_dataclass_defaults_not_null(self):
+        current = {"qwen35_ane_prefill_sequence_length": 4096, "temperature": 0.5}
+        scope = {"qwen35_ane_prefill_sequence_length", "temperature", "top_p"}
+        diff = settings_recipe.settings_diff({}, current, scope)
+        assert diff == {"qwen35_ane_prefill_sequence_length": 2048, "temperature": None}
+
+    def test_search_url_targets_the_leaderboard_filters(self):
+        url = settings_recipe.search_url("M3", "Ultra", "Qwen3.8-27B-4bit", 4096, 512)
+        assert "memory_max=512" in url
+        assert url.startswith("https://omlx.ai/benchmarks/performance?")
+        assert "model_exact=Qwen3.8-27B-4bit" in url
+        assert "context=4096" in url
+        assert "%22M3%22" in url and "%22Ultra%22" in url
+
+
+class TestSettingsSnapshotRoutes:
+    def _install_draft(self):
+        pool = admin_routes._get_engine_pool()
+        entry = _FakeEntry("z-lab/Qwen3-4B-DFlash-b16")
+        entry.model_path = "/models/Qwen3-4B-DFlash-b16"
+        pool._entries["z-lab/Qwen3-4B-DFlash-b16"] = entry
+
+    def test_reset_returns_every_field_to_defaults(self, client):
+        c, mgr = client
+        state = admin_routes._get_server_state()
+        pool = admin_routes._get_engine_pool()
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(
+                temperature=0.1,
+                is_pinned=True,
+                is_default=True,
+                ttl_seconds=300,
+                model_alias="alias",
+                display_name="Nice name",
+                description="notes",
+                trust_remote_code=True,
+                turboquant_kv_enabled=True,
+                qwen35_ane_prefill_sequence_length=4096,
+                active_profile_name="p",
+            ),
+        )
+        state.default_model = "model-a"
+        pool.get_entry("model-a").is_pinned = True
+
+        r = c.post("/admin/api/models/model-a/settings/reset")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["changed"] is True
+        assert body["applied"] == {}
+        assert body["skipped"] == []
+        assert body["settings"] == ModelSettings().to_dict()
+        assert mgr.get_settings("model-a").to_dict() == ModelSettings().to_dict()
+        assert state.default_model is None
+        assert pool.get_entry("model-a").is_pinned is False
+
+        again = c.post("/admin/api/models/model-a/settings/reset").json()
+        assert again["changed"] is False
+
+    def test_reset_unknown_model_404(self, client):
+        c, _ = client
+        assert c.post("/admin/api/models/nope/settings/reset").status_code == 404
+
+    def test_recipe_replaces_scoped_fields_and_keeps_the_rest(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(
+                temperature=0.9,
+                top_p=0.5,
+                ttl_seconds=300,
+                chat_template_kwargs={"a": 1},
+            ),
+        )
+        recipe = settings_recipe.encode_recipe(
+            {
+                "benchmark_context": "Novel (English)",
+                "temperature": 0.2,
+                "turboquant_kv_enabled": True,
+                "turboquant_kv_bits": 3,
+                "display_name": "must be ignored",
+            }
+        )
+        r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        settings = body["settings"]
+        assert settings["temperature"] == 0.2
+        assert "top_p" not in settings
+        assert settings["turboquant_kv_enabled"] is True
+        assert settings["turboquant_kv_bits"] == 3
+        assert settings["ttl_seconds"] == 300
+        assert settings["chat_template_kwargs"] == {"a": 1}
+        assert "display_name" not in settings
+        assert body["skipped"] == []
+        assert body["applied"]["temperature"] == 0.2
+        assert "top_p" not in body["applied"]
+        assert mgr.get_settings("model-a").temperature == 0.2
+
+    def test_recipe_drops_feature_whose_draft_is_missing(self, client, monkeypatch):
+        c, mgr = client
+        monkeypatch.setattr(
+            admin_routes, "_dflash_compat_for_model", lambda info: (True, "")
+        )
+        recipe = settings_recipe.encode_recipe(
+            {
+                "dflash_enabled": True,
+                "dflash_draft_model": "Missing-DFlash",
+                "dflash_block_size": 16,
+                "temperature": 0.3,
+            }
+        )
+        r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["settings"]["dflash_enabled"] is False
+        assert "dflash_draft_model" not in body["settings"]
+        assert "dflash_block_size" not in body["settings"]
+        assert body["settings"]["temperature"] == 0.3
+        assert body["skipped"] == [
+            {
+                "feature": "dflash",
+                "reason": "draft model 'Missing-DFlash' is not installed",
+            }
+        ]
+
+    def test_recipe_resolves_installed_draft_by_basename(self, client, monkeypatch):
+        import omlx.engine.dflash as dflash_engine
+
+        c, mgr = client
+        self._install_draft()
+        monkeypatch.setattr(
+            admin_routes, "_dflash_compat_for_model", lambda info: (True, "")
+        )
+        # The settings PUT re-checks the target with the engine helper.
+        monkeypatch.setattr(dflash_engine, "is_dflash_compatible", lambda p: (True, ""))
+        recipe = settings_recipe.encode_recipe(
+            {"dflash_enabled": True, "dflash_draft_model": "Qwen3-4B-DFlash-b16"}
+        )
+        r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["dflash_enabled"] is True
+        assert (
+            r.json()["settings"]["dflash_draft_model"] == "/models/Qwen3-4B-DFlash-b16"
+        )
+        assert r.json()["skipped"] == []
+
+    def test_recipe_skips_feature_the_model_cannot_run(self, client):
+        c, _ = client
+        recipe = settings_recipe.encode_recipe(
+            {"mtp_enabled": True, "mtp_num_draft_tokens": 3, "max_tokens": 64}
+        )
+        r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["settings"]["mtp_enabled"] is False
+        assert "mtp_num_draft_tokens" not in body["settings"]
+        assert body["settings"]["max_tokens"] == 64
+        assert [s["feature"] for s in body["skipped"]] == ["mtp"]
+
+    @pytest.mark.parametrize(
+        "recipe",
+        [
+            "garbage",
+            settings_recipe.encode_recipe({"benchmark_context": "x"}),
+            settings_recipe.encode_recipe({"display_name": "not shareable"}),
+        ],
+    )
+    def test_recipe_rejects_unusable_input(self, client, recipe):
+        c, mgr = client
+        before = mgr.get_settings("model-a").to_dict()
+        r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
+        assert r.status_code == 400, r.text
+        assert mgr.get_settings("model-a").to_dict() == before
+
+    def _fake_omlx_ai(self, monkeypatch, handler):
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((url, params))
+            status, payload = handler(url, params)
+            return SimpleNamespace(status_code=status, json=lambda: payload, text="")
+
+        monkeypatch.setattr(admin_routes, "requests", SimpleNamespace(get=fake_get))
+        monkeypatch.setattr(
+            admin_routes,
+            "_local_device_info",
+            lambda: {
+                "chip_name": "M3",
+                "chip_variant": "Ultra",
+                "memory_gb": 512,
+                "gpu_cores": 80,
+            },
+        )
+        return calls
+
+    @staticmethod
+    def _row(bid, pp, tg, settings, memory_gb=512):
+        return {
+            "id": bid,
+            "url": f"https://omlx.ai/benchmarks/performance/{bid}",
+            "pp_tps": pp,
+            "tg_tps": tg,
+            "quantization": "4bit",
+            "memory_gb": memory_gb,
+            "model_settings": settings,
+        }
+
+    def test_optimal_candidates_grouped_by_pp_and_tg(self, client, monkeypatch):
+        c, _ = client
+        rows = {
+            "pp": [self._row("aaa", 900, 40, {"temperature": 0.1})],
+            "tg": [
+                self._row("bbb", 800, 60, {"temperature": 0.2}, memory_gb=256),
+                self._row("aaa", 900, 40, {"temperature": 0.1}),
+            ],
+        }
+        calls = self._fake_omlx_ai(
+            monkeypatch, lambda url, params: (200, {"results": rows[params["sort"]]})
+        )
+        r = c.get("/admin/api/models/model-a/settings/optimal")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["found"] is True
+        assert body["model_name"] == "model-a"
+        assert body["context_length"] == 4096
+        assert [x["benchmark_id"] for x in body["by_pp"]] == ["aaa"]
+        assert [x["benchmark_id"] for x in body["by_tg"]] == ["bbb", "aaa"]
+        assert body["by_tg"][0]["tg_tps"] == 60
+        assert body["by_tg"][0]["memory_gb"] == 256
+        assert "model_settings" not in body["by_pp"][0]
+        assert [call[1]["sort"] for call in calls] == ["pp", "tg"]
+        assert calls[0][1] == {
+            "chip": "M3",
+            "variant": "Ultra",
+            "memory_gb": 512,
+            "model": "model-a",
+            "context": 4096,
+            "limit": 3,
+            "sort": "pp",
+        }
+
+    def test_optimal_candidates_none_found(self, client, monkeypatch):
+        c, _ = client
+        self._fake_omlx_ai(monkeypatch, lambda url, params: (200, {"results": []}))
+        body = c.get("/admin/api/models/model-a/settings/optimal").json()
+        assert body["found"] is False
+        assert body["by_pp"] == [] and body["by_tg"] == []
+        assert "model_exact=model-a" in body["search_url"]
+        assert "context=4096" in body["search_url"]
+        assert "memory_max=512" in body["search_url"]
+
+    def test_optimal_apply_selected_candidate(self, client, monkeypatch):
+        c, mgr = client
+        calls = self._fake_omlx_ai(
+            monkeypatch,
+            lambda url, params: (
+                200,
+                self._row(
+                    "bbb",
+                    800,
+                    60,
+                    {"benchmark_context": "x", "temperature": 0.2, "mtp_enabled": True},
+                ),
+            ),
+        )
+        r = c.post(
+            "/admin/api/models/model-a/settings/optimal", json={"benchmark_id": "bbb"}
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert calls == [(f"{admin_routes.OMLX_AI_API_URL}/bbb", None)]
+        assert body["benchmark_id"] == "bbb"
+        assert body["benchmark_url"].endswith("/bbb")
+        assert body["pp_tps"] == 800
+        assert body["settings"]["temperature"] == 0.2
+        assert [s["feature"] for s in body["skipped"]] == ["mtp"]
+        assert mgr.get_settings("model-a").temperature == 0.2
+
+    def test_optimal_apply_rejects_bad_id_and_upstream_failure(
+        self, client, monkeypatch
+    ):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/settings/optimal", json={"benchmark_id": "../x"}
+        )
+        assert r.status_code == 422
+        self._fake_omlx_ai(monkeypatch, lambda url, params: (404, {"error": "nope"}))
+        r = c.post(
+            "/admin/api/models/model-a/settings/optimal", json={"benchmark_id": "zzz"}
+        )
+        assert r.status_code == 502
+
+    def test_snapshot_never_imports_guided_grammar(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(guided_grammar_enabled=True, guided_grammar='root ::= "YES"'),
+        )
+        recipe = settings_recipe.encode_recipe(
+            {"temperature": 0.4, "guided_grammar_enabled": False, "guided_grammar": "x"}
+        )
+        r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
+        assert r.status_code == 200, r.text
+        settings = r.json()["settings"]
+        assert settings["temperature"] == 0.4
+        assert settings["guided_grammar_enabled"] is True
+        assert settings["guided_grammar"] == 'root ::= "YES"'
+        assert "guided_grammar" not in r.json()["applied"]
+
+    def test_dashboard_wires_snapshot_actions(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        js = (root / "omlx/admin/static/js/dashboard.js").read_text()
+        modal = (
+            root / "omlx/admin/templates/dashboard/_modal_model_settings.html"
+        ).read_text()
+        apply_modal = (
+            root / "omlx/admin/templates/dashboard/_modal_settings_apply.html"
+        ).read_text()
+        dashboard = (root / "omlx/admin/templates/dashboard.html").read_text()
+        en = json.loads((root / "omlx/admin/i18n/en.json").read_text())
+        ko = json.loads((root / "omlx/admin/i18n/ko.json").read_text())
+
+        assert "dashboard/_modal_settings_apply.html" in dashboard
+        for mode in ("reset", "optimal", "recipe"):
+            assert f"openSettingsApply('{mode}')" in modal
+        assert "/settings/${path}`" in js
+        assert "_settingsActionRequest('POST', 'reset')" in js
+        assert "_settingsActionRequest('GET', 'optimal')" in js
+        assert "_settingsActionRequest('POST', 'recipe'" in js
+        assert "applyOptimalCandidate(item.benchmark_id)" in apply_modal
+        assert "by_pp" in js and "by_tg" in js
+        for key in (
+            "modal.model_settings.actions.reset_confirm",
+            "modal.model_settings.actions.group_pp",
+            "modal.model_settings.actions.group_tg",
+            "modal.model_settings.actions.none_body",
+            "js.error.settings_apply_failed",
+        ):
+            assert key in en and key in ko
+
+    def test_cache_reasoning_output_round_trips_through_put(self, client):
+        c, mgr = client
+        r = c.put(
+            "/admin/api/models/model-a/settings", json={"cache_reasoning_output": True}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["cache_reasoning_output"] is True
+        r = c.put(
+            "/admin/api/models/model-a/settings", json={"cache_reasoning_output": None}
+        )
+        assert "cache_reasoning_output" not in r.json()["settings"]

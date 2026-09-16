@@ -306,6 +306,13 @@ final class ModelSettingsScreenVM {
     var aneTuningAllowCPUGDN: Bool = true
     var aneTuningAllowCPUSharedResource: Bool = true
 
+    // Header snapshot actions: reset / optimal (omlx.ai) / custom recipe.
+    var isApplyingSettings: Bool = false
+    var pendingReset: Bool = false
+    var applyOutcome: SettingsApplyOutcome?
+    /// Error shown inside the snapshot sheet so the user can retry.
+    var applyError: String?
+
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
     var indexCacheFreq: String = "4"
@@ -1421,6 +1428,91 @@ final class ModelSettingsScreenVM {
         }
     }
 
+
+    // MARK: - Snapshot actions
+
+    func resetDefaults(client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        defer { isApplyingSettings = false }
+        do {
+            _ = try await client.resetModelSettings(id: modelID)
+            await load(modelID: modelID, client: client)
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
+    func loadOptimalCandidates(client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        applyOutcome = .optimalCandidates(nil)
+        defer { isApplyingSettings = false }
+        do {
+            let candidates = try await client.listOptimalCandidates(id: modelID)
+            applyOutcome = .optimalCandidates(candidates)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    func applyOptimalCandidate(_ benchmarkId: String, client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        defer { isApplyingSettings = false }
+        do {
+            let result = try await client.applyOptimalCandidate(id: modelID, benchmarkId: benchmarkId)
+            await load(modelID: modelID, client: client)
+            applyOutcome = .optimal(result)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    func applyRecipe(_ recipe: String, client: OMLXClient) async {
+        let text = recipe.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        defer { isApplyingSettings = false }
+        do {
+            let result = try await client.applyRecipe(id: modelID, recipe: text)
+            await load(modelID: modelID, client: client)
+            applyOutcome = .recipe(result)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    /// One line per skipped feature for the result sheet.
+    nonisolated static func summarizeSkipped(_ skipped: [SkippedFeatureDTO]?) -> [String] {
+        (skipped ?? []).map { "\($0.feature): \($0.reason)" }
+    }
+
+    /// Pretty JSON of the applied values, keys sorted so the sheet is stable.
+    nonisolated static func appliedJSON(_ applied: [String: AnyCodable]?) -> String {
+        guard let applied, !applied.isEmpty else { return "{}" }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(applied),
+              let text = String(data: data, encoding: .utf8) else { return "{}" }
+        return text
+    }
+
+    /// "PP 1309.1 tok/s · TG 59.6 tok/s · 128 GB · 4bit · oMLX 0.7.0" for a candidate row.
+    nonisolated static func candidateStats(pp: Double?, tg: Double?, memoryGb: Int? = nil,
+                                           quantization: String?, omlxVersion: String?) -> String {
+        var parts: [String] = []
+        if let pp { parts.append(String(format: "PP %.1f tok/s", pp)) }
+        if let tg { parts.append(String(format: "TG %.1f tok/s", tg)) }
+        if let memoryGb { parts.append("\(memoryGb) GB") }
+        if let quantization, !quantization.isEmpty { parts.append(quantization) }
+        if let omlxVersion, !omlxVersion.isEmpty { parts.append("oMLX \(omlxVersion)") }
+        return parts.joined(separator: " · ")
+    }
+
     /// Save the current working settings as a new profile (model scope)
     /// or template (global scope), then activate it. Used by both the
     /// Active Profile banner's "Save as new" and a chip group's
@@ -1801,4 +1893,13 @@ enum QwenAneSettingsValidator {
         }
         return .success(value)
     }
+}
+
+/// Sheet state for the header snapshot actions on ModelSettingsScreen.
+/// `optimalCandidates(nil)` is the loading state while omlx.ai is queried.
+enum SettingsApplyOutcome {
+    case recipeInput
+    case optimalCandidates(OptimalCandidatesDTO?)
+    case optimal(SettingsApplyResultDTO)
+    case recipe(SettingsApplyResultDTO)
 }

@@ -155,6 +155,24 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.modelSettings(id), body: patch)
     }
 
+    func resetModelSettings(id: String) async throws -> SettingsApplyResultDTO {
+        try await postEmpty(AdminAPI.modelSettingsReset(id))
+    }
+
+    /// Server-side lookup of the best omlx.ai benchmarks for this device
+    /// and model (proxied like the preset refresh).
+    func listOptimalCandidates(id: String) async throws -> OptimalCandidatesDTO {
+        try await get(AdminAPI.modelSettingsOptimal(id))
+    }
+
+    func applyOptimalCandidate(id: String, benchmarkId: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsOptimal(id), body: ApplyOptimalRequest(benchmarkId: benchmarkId))
+    }
+
+    func applyRecipe(id: String, recipe: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsRecipe(id), body: ApplyRecipeRequest(recipe: recipe))
+    }
+
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
         try await get(AdminAPI.modelProfiles(id))
     }

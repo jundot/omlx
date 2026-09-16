@@ -22,15 +22,29 @@
                  x-transition:leave-end="opacity-0 scale-95">
 
                 <!-- Header -->
-                <div class="flex items-center justify-between mb-6">
-                    <div>
+                <div class="flex items-start justify-between gap-4 mb-6">
+                    <div class="min-w-0">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">{{ t('modal.model_settings.section_label') }}</h3>
-                        <h4 class="text-xl font-bold tracking-tight text-neutral-900" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
+                        <h4 class="text-xl font-bold tracking-tight text-neutral-900 break-words" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
                     </div>
-                    <button @click="showModelSettingsModal = false"
-                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
-                        <i data-lucide="x" class="w-5 h-5"></i>
-                    </button>
+                    <div class="flex items-start gap-2 flex-shrink-0">
+                        <!-- Snapshot actions: reset / optimal (omlx.ai) / custom recipe -->
+                        <div class="flex flex-wrap items-center justify-end gap-2 pt-1">
+                            <button type="button" @click="openSettingsApply('reset')"
+                                    :disabled="savingModelSettings || settingsApply.phase === 'loading'"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-full border border-neutral-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.reset') }}</button>
+                            <button type="button" @click="openSettingsApply('optimal')"
+                                    :disabled="savingModelSettings || settingsApply.phase === 'loading'"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-full border border-neutral-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.optimal') }}</button>
+                            <button type="button" @click="openSettingsApply('recipe')"
+                                    :disabled="savingModelSettings || settingsApply.phase === 'loading'"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-full border border-neutral-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.recipe') }}</button>
+                        </div>
+                        <button @click="showModelSettingsModal = false"
+                                class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
+                            <i data-lucide="x" class="w-5 h-5"></i>
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Profiles / Templates / Presets section -->
