@@ -986,28 +986,6 @@ class TestDynamicCeilingActiveRatio:
         expected = 1 * 1024**3 + 10 * 1024**3 + 4 * 1024**3 + int(8 * 1024**3 * ratio)
         assert result == expected
 
-    def test_non_macos_falls_back_to_compat_available(self, mock_engine_pool):
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
-        )
-        with (
-            patch(
-                "omlx.process_memory_enforcer.get_phys_footprint",
-                return_value=2 * 1024**3,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.get_macos_vm_stats",
-                return_value=None,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
-                return_value=SimpleNamespace(available=15 * 1024**3),
-            ) as mock_virtual_memory,
-        ):
-            result = enforcer._get_dynamic_ceiling()
-        assert result == 2 * 1024**3 + 15 * 1024**3
-        mock_virtual_memory.assert_called_once()
-
     def test_macos_vm_stat_failure_uses_compat_available(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"

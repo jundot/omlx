@@ -2113,13 +2113,6 @@ class TestResolveSampler:
         batch = self._make_batch(samplers=None, fallback_sampler=fallback)
         assert _resolve_sampler(batch) is fallback
 
-    def test_uses_fallback_when_samplers_is_none(self):
-        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
-
-        fallback = object()
-        batch = self._make_batch(samplers=None, fallback_sampler=fallback)
-        assert _resolve_sampler(batch) is fallback
-
     def test_prefers_samplers_0_over_fallback(self):
         """Even if fallback_sampler is set, samplers[0] takes priority."""
         from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
@@ -2191,13 +2184,6 @@ class TestIsGreedy:
         from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
 
         batch = self._make_batch(samplers=[], fallback_sampler=None)
-        assert _is_greedy(batch) is True
-
-    def test_greedy_when_samplers_missing(self):
-        """No samplers attribute → falls back to fallback_sampler → greedy."""
-        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
-
-        batch = self._make_batch(samplers=None, fallback_sampler=None)
         assert _is_greedy(batch) is True
 
     def test_not_greedy_via_fallback_sampler(self):

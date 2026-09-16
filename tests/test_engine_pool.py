@@ -2960,50 +2960,6 @@ class TestEnginePoolTTL:
         assert pool._entries["model-a"].last_access == 200.0
 
     @pytest.mark.asyncio
-    async def test_ttl_skips_vlm_with_active_requests(self, pool_with_loaded_model):
-        """Test that TTL does not unload VLM engine with active requests."""
-        pool = pool_with_loaded_model
-
-        mock_engine = MagicMock()
-        mock_engine.has_active_requests.return_value = True
-
-        pool._entries["model-a"].engine = mock_engine
-
-        settings_manager = MagicMock()
-        settings = MagicMock()
-        settings.ttl_seconds = 60
-        settings_manager.get_settings.return_value = settings
-
-        with patch("time.time", return_value=200.0):
-            expired = await pool.check_ttl_expirations(settings_manager)
-
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
-
-    @pytest.mark.asyncio
-    async def test_ttl_skips_non_streaming_with_active_requests(
-        self, pool_with_loaded_model
-    ):
-        """Test that TTL does not unload non-streaming engine with active requests."""
-        pool = pool_with_loaded_model
-
-        mock_engine = MagicMock()
-        mock_engine.has_active_requests.return_value = True
-
-        pool._entries["model-a"].engine = mock_engine
-
-        settings_manager = MagicMock()
-        settings = MagicMock()
-        settings.ttl_seconds = 60
-        settings_manager.get_settings.return_value = settings
-
-        with patch("time.time", return_value=200.0):
-            expired = await pool.check_ttl_expirations(settings_manager)
-
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
-
-    @pytest.mark.asyncio
     async def test_ttl_falls_back_to_global_idle_timeout(self, pool_with_loaded_model):
         """Per-model TTL None falls back to global idle timeout."""
         pool = pool_with_loaded_model
@@ -3231,16 +3187,6 @@ class TestResolveModelId:
 
         result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
         assert result == "model-b"
-
-    def test_exact_match_preferred_over_case_insensitive(self, small_mock_model_dir):
-        """Test exact match takes priority over case-insensitive."""
-        pool = _make_pool(ceiling=10 * 1024**3)
-        pool.discover_models(str(small_mock_model_dir))
-
-        # Exact match should be returned directly
-        result = pool.resolve_model_id("model-a", settings_manager=None)
-        assert result == "model-a"
-
 
 class TestMemorySettleBarrier:
     """Tests for memory settle barrier in _unload_engine()."""

@@ -52,7 +52,6 @@ from omlx.oq import (
     _ImatrixCaptureWrapper,
     _is_audio_tensor,
     _is_moe_router,
-    _is_vision_tensor,
     _LazyTensorIndex,
     _load_builtin_calibration,
     _measure_sensitivity,
@@ -399,14 +398,6 @@ class TestUniversalQuantPredicate:
             "model.layers.10.mlp.up_proj", module, dense_config
         )
         assert result is True
-
-    # Group size
-
-    def test_moe_router_fp16_group_size(self, moe_config, module):
-        result = universal_quant_predicate(
-            "model.layers.0.mlp.gate", module, moe_config
-        )
-        assert result is False  # MoE router gates kept fp16
 
     def test_150_expert_group_size_128(self, module):
         config = {

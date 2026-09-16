@@ -340,13 +340,9 @@ class TestAdminAuth:
     def test_verify_session_token_expired(self):
         """Test expired session token verification."""
         from omlx.admin.auth import create_session_token, verify_session_token
-        import time
 
         token = create_session_token()
-        # Wait a moment and verify with very short max_age
-        time.sleep(0.1)
-        # With max_age=0, token should be expired after any delay
-        # Note: itsdangerous rounds to nearest second, so we use a small delay
+        # A negative max_age is expired immediately and does not need a delay.
         assert verify_session_token(token, max_age=-1) is False
 
     def test_verify_api_key_constant_time(self):
