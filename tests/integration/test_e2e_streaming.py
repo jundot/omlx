@@ -4532,3 +4532,122 @@ def test_k2_responses_normalizes_assistant_history(monkeypatch, stream, tool_his
         assert "response.failed" not in response.text
     else:
         assert response.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("chunk_size", [1, 7])
+@pytest.mark.parametrize("value", ["123", 'print("</function>")'])
+async def test_naked_qwen_calls_preserve_arguments_without_streamed_xml(
+    api, chunk_size, value
+):
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    from omlx.api.anthropic_models import MessagesRequest
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import (
+        stream_anthropic_messages,
+        stream_chat_completion,
+        stream_responses_api,
+    )
+
+    engine = MockBaseEngine()
+    engine._supports_early_tool_call_streaming = True
+    engine.tokenizer.has_tool_calling = True
+    engine.tokenizer.tool_call_start = "<tool_call>"
+    engine.tokenizer.tool_call_end = "</tool_call>"
+    engine.tokenizer.tool_parser = parse_tool_call
+    block = f"<function=write><parameter=content>{value}</parameter></function>"
+    raw = "Before " + block + "\n</tool_call> After"
+    outputs = [
+        MockGenerationOutput(
+            text=raw[: i + chunk_size],
+            new_text=raw[i : i + chunk_size],
+            completion_tokens=10,
+        )
+        for i in range(0, len(raw), chunk_size)
+    ]
+    outputs.append(
+        MockGenerationOutput(
+            text=raw,
+            new_text="",
+            completion_tokens=10,
+            finished=True,
+            finish_reason="stop",
+        )
+    )
+    engine.set_stream_outputs(outputs)
+    schema = {"type": "object", "properties": {"content": {"type": "string"}}}
+    tools = [{"type": "function", "function": {"name": "write", "parameters": schema}}]
+    messages = [{"role": "user", "content": "Write a file"}]
+    if api == "chat":
+        request = ChatCompletionRequest(
+            model="test-model", messages=messages, stream=True, tools=tools
+        )
+        iterator = stream_chat_completion(
+            engine, messages, request, tools=tools, max_tokens=256
+        )
+    elif api == "anthropic":
+        request = MessagesRequest(
+            model="test-model",
+            messages=messages,
+            stream=True,
+            max_tokens=256,
+            tools=[{"name": "write", "input_schema": schema}],
+        )
+        iterator = stream_anthropic_messages(
+            engine, messages, request, tools=tools, max_tokens=256
+        )
+    else:
+        request = ResponsesRequest(
+            model="test-model", input="Write a file", stream=True
+        )
+        iterator = stream_responses_api(
+            engine, messages, request, tools=tools, max_tokens=256, store_response=False
+        )
+    events = [event async for event in iterator]
+    payloads = [
+        json.loads(line[6:])
+        for event in events
+        for line in event.splitlines()
+        if line.startswith("data: {")
+    ]
+    if api == "chat":
+        deltas = [c.get("delta", {}) for p in payloads for c in p.get("choices", [])]
+        content = "".join(d.get("content", "") or "" for d in deltas)
+        calls = [tc for d in deltas for tc in d.get("tool_calls", [])]
+        assert len(calls) == 1
+        arguments = calls[0]["function"]["arguments"]
+        assert any(
+            c.get("finish_reason") == "tool_calls"
+            for p in payloads
+            for c in p.get("choices", [])
+        )
+    elif api == "anthropic":
+        content = "".join(p.get("delta", {}).get("text", "") for p in payloads)
+        calls = [
+            p for p in payloads if p.get("content_block", {}).get("type") == "tool_use"
+        ]
+        assert len(calls) == 1
+        arguments = "".join(
+            p.get("delta", {}).get("partial_json", "") for p in payloads
+        )
+        assert any(
+            p.get("delta", {}).get("stop_reason") == "tool_use" for p in payloads
+        )
+    else:
+        content = "".join(
+            p["delta"]
+            for p in payloads
+            if p.get("type") == "response.output_text.delta"
+        )
+        calls = [
+            p
+            for p in payloads
+            if p.get("type") == "response.function_call_arguments.done"
+        ]
+        assert len(calls) == 1
+        arguments = calls[0]["arguments"]
+    assert content == "Before  After"
+    assert json.loads(arguments) == {"content": value}

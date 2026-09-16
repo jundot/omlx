@@ -618,7 +618,14 @@ def _mock_global_settings(api_key=None):
     """Create a mock GlobalSettings with the given API key."""
     mock = MagicMock()
     mock.auth.api_key = api_key
+    mock.auth.skip_api_key_verification = False
+    mock.server.host = "127.0.0.1"
     return mock
+
+
+def _loopback_http_request():
+    """Create the request state accepted by the loopback-only setup endpoint."""
+    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _patch_getter(mock_settings):
@@ -636,6 +643,26 @@ def _restore_getter(original):
 class TestSetupApiKeyEndpoint:
     """Tests for POST /admin/api/setup-api-key endpoint logic."""
 
+    def test_setup_returns_503_when_settings_are_unavailable(self):
+        from fastapi import HTTPException
+
+        original = _patch_getter(None)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 503
+            assert "not initialized" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
     def test_setup_rejects_when_key_already_set(self):
         """Setup should fail if API key is already configured."""
         from fastapi import HTTPException
@@ -647,7 +674,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="newkey", api_key_confirm="newkey"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "already configured" in exc_info.value.detail
         finally:
@@ -664,7 +695,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="key1", api_key_confirm="key2"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "do not match" in exc_info.value.detail
         finally:
@@ -681,7 +716,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="abc", api_key_confirm="abc"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "at least 4" in exc_info.value.detail
         finally:
@@ -698,9 +737,59 @@ class TestSetupApiKeyEndpoint:
                 api_key="ab cd", api_key_confirm="ab cd"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "whitespace" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_configured_bind(self):
+        """Initial setup is unavailable once the server is network-facing."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        mock_settings.server.host = "0.0.0.0"
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_client(self):
+        """A remote peer cannot claim the first key on a loopback setup."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        remote_request = SimpleNamespace(client=SimpleNamespace(host="192.168.1.50"))
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(request, MagicMock(), remote_request)
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
         finally:
             _restore_getter(original)
 
@@ -720,7 +809,9 @@ class TestSetupApiKeyEndpoint:
                     api_key="validkey123", api_key_confirm="validkey123"
                 )
                 result = asyncio.run(
-                    admin_routes.setup_api_key(request, mock_response)
+                    admin_routes.setup_api_key(
+                        request, mock_response, _loopback_http_request()
+                    )
                 )
 
                 assert result["success"] is True

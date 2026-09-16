@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 import pytest
-from test_deepseek_v41 import tiny
+from test_deepseek_v41 import tiny, tiny_ced
 
 from omlx.cache.boundary_snapshot_store import BoundarySnapshotSSDStore
 from omlx.cache.deepseek_v41_delta import compact_state, restore_chain
@@ -86,8 +86,9 @@ def test_legacy_anchor_and_invalid_metadata():
 @pytest.mark.parametrize("block_size", [3, 4])
 @pytest.mark.parametrize("engram", [False, True])
 @pytest.mark.parametrize("extend_prefix", [False, True])
+@pytest.mark.parametrize("decoder_replay", [False, True])
 def test_real_ssd_reopen_full_and_partial_prefix(
-    tmp_path, block_size, engram, extend_prefix
+    tmp_path, block_size, engram, extend_prefix, decoder_replay
 ):
     apply_patch()
     mx.random.seed(18)
@@ -104,7 +105,9 @@ def test_real_ssd_reopen_full_and_partial_prefix(
         if engram
         else {}
     )
-    model = LanguageModel(tiny(**cfg_args))
+    if decoder_replay:
+        cfg_args["window_size"] = 2  # Both block sizes must actually skip tokens.
+    model = LanguageModel(tiny_ced(**cfg_args) if decoder_replay else tiny(**cfg_args))
     if engram:
         model.set_token_map(np.arange(64))
     state = model.make_cache()
@@ -138,9 +141,13 @@ def test_real_ssd_reopen_full_and_partial_prefix(
     store = BoundarySnapshotSSDStore(tmp_path / "boundary")
     try:
         prefix = open_prefix(ssd)
-        assert not prefix._gdn_split_layout_supported(["DeepseekV41Cache"] * 5)
+        assert not prefix._gdn_split_layout_supported(["DeepseekV41Cache"] * len(model.layers))
         for end in range(block_size, 13, block_size):
-            mx.eval(model(mx.array([tokens[end - block_size : end]]), cache=state))
+            mx.eval(
+                model._omlx_prefill(
+                    mx.array([tokens[end - block_size : end]]), cache=state
+                )
+            )
             assert store.save("probe", end, state, extract, block_size=block_size)
         _wait_empty(lambda: store._pending_writes)
         snapshots = {
@@ -198,7 +205,18 @@ def test_real_ssd_reopen_full_and_partial_prefix(
                 assert cache.state[2].dtype == mx.uint8
                 assert cache.state[3].dtype == mx.uint8
             actual = model(mx.array([[20, 21]]), cache=restored)
-            fresh = model(mx.array([tokens[:count] + [20, 21]]))[:, -2:]
+            if decoder_replay:
+                # Replay approximates each chunk boundary. Compare restoration
+                # with the identical uncached execution, not full-depth prefill.
+                fresh_cache = model.make_cache()
+                for start in range(0, count, block_size):
+                    model._omlx_prefill(
+                        mx.array([tokens[start : start + block_size]]),
+                        cache=fresh_cache,
+                    )
+                fresh = model(mx.array([[20, 21]]), cache=fresh_cache)
+            else:
+                fresh = model(mx.array([tokens[:count] + [20, 21]]))[:, -2:]
             np.testing.assert_allclose(actual, fresh, atol=1e-5)
     finally:
         store.shutdown()

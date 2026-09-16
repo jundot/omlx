@@ -423,7 +423,9 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
         return False
     if _has_grammar_processors(gen_batch):
         return False
-    return True
+    # XTC changes the target distribution but is absent from acceptance math.
+    # Resolve each active row's sampler because the generator is reused.
+    return not _has_xtc_sampler(gen_batch)
 
 
 _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
@@ -630,6 +632,8 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     uids = getattr(gen_batch, "uids", None)
     if uids is None:
         return "GenerationBatch has no uids"
+    if _has_xtc_sampler(gen_batch):
+        return "XTC sampling is not supported by Lightning MTP acceptance math"
     if len(uids) != 1:
         if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
             return "pending prompt work may still merge into this batch"
@@ -857,6 +861,21 @@ def _maybe_finish_mtp_reentry_probe(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _has_xtc_sampler(gen_batch: Any) -> bool:
+    samplers = getattr(gen_batch, "samplers", None)
+    fallback = getattr(gen_batch, "fallback_sampler", None)
+    for idx in range(len(gen_batch.uids)):
+        sampler = _row_value(samplers, idx)
+        if sampler is None:
+            sampler = fallback
+        if (
+            getattr(sampler, "temp", 0.0) != 0.0
+            and getattr(sampler, "xtc_probability", 0.0) > 0.0
+        ):
+            return True
+    return False
 
 
 def _resolve_sampler(gen_batch: Any):

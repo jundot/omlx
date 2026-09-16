@@ -36,7 +36,11 @@ class ShardWriter:
         if not self._values:
             return
         name = f".model-shard-{len(self._shards) + 1:05d}.safetensors"
-        mx.save_safetensors(str(self.destination / name), self._values)
+        mx.save_safetensors(
+            str(self.destination / name),
+            self._values,
+            metadata={"format": "mlx"},
+        )
         self._shards.append((name, tuple(self._values)))
         self._values = {}
         self._bytes = 0

@@ -35,6 +35,9 @@ enum AdminAPI {
     static func applyModelProfile(_ id: String, _ name: String) -> String {
         "\(models)/\(id)/profiles/\(name)/apply"
     }
+    static func applyModelTemplate(_ id: String, _ name: String) -> String {
+        "\(models)/\(id)/profile-templates/\(name)/apply"
+    }
     static let profileTemplates = "\(prefix)/profile-templates"
     static func profileTemplate(_ name: String) -> String {
         "\(profileTemplates)/\(name)"

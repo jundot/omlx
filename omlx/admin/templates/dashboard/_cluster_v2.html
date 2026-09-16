@@ -11,10 +11,9 @@
         <!-- Header: outcome-first title. -->
         <div class="mb-6">
             <div>
-                <h2 class="text-2xl font-bold tracking-tight text-neutral-900">Your Macs, one computer</h2>
+                <h2 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('cluster.v2.header.title') }}</h2>
                 <p class="text-sm text-neutral-500 mt-2 max-w-2xl">
-                    oMLX finds other Macs on your network by itself. Pair them with one
-                    code and models split across the whole pool automatically.
+                    {{ t('cluster.v2.header.subtitle') }}
                 </p>
             </div>
         </div>
@@ -22,8 +21,7 @@
         <div x-show="join.cleanup_pending" x-cloak
              class="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
              role="status" data-cluster-v2-join-cleanup>
-            The previous join is cancelled on this Mac. Cleanup on the other Mac
-            will be retried while this tab is visible. You can join a different Mac.
+            {{ t('cluster.v2.join.cleanup_pending') }}
         </div>
 
         <!-- Where you are. Five steps, derived from the live snapshot. -->
@@ -84,7 +82,7 @@
                       x-text="activationProgressPercent() + '%'">0%</span>
             </div>
             <div class="mt-2 h-2 rounded-full bg-blue-100 overflow-hidden"
-                 role="progressbar" aria-label="Cluster activation progress"
+                 role="progressbar" aria-label="{{ t('cluster.v2.progress.aria_label') }}"
                  :aria-valuenow="activationProgressPercent()" aria-valuemin="0" aria-valuemax="100">
                 <div class="h-full rounded-full bg-blue-600 transition-[width] duration-500 ease-out"
                      :style="'width: ' + activationProgressPercent() + '%'"
@@ -99,17 +97,16 @@
             <div class="flex items-start gap-3 px-4 py-3 text-sm text-red-800">
                 <i data-lucide="circle-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
                 <div class="min-w-0 flex-1">
-                    <div class="font-semibold">Can't reach the cluster service on this Mac</div>
+                    <div class="font-semibold">{{ t('cluster.v2.error.title') }}</div>
                     <div class="text-xs text-red-700 mt-1">
-                        The discovery backend did not answer. Confirm distributed inference is
-                        enabled, then restart oMLX and try again.
+                        {{ t('cluster.v2.error.detail') }}
                     </div>
                     <div class="text-[11px] font-mono text-red-700 mt-2 break-all" x-text="devicesError"></div>
                     <div class="flex flex-wrap gap-2 mt-3">
                         <button type="button" @click="retryConnection()"
                                 class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-red-800 bg-white border border-red-300 rounded-lg hover:bg-red-100">
                             <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
-                            Try again
+                            {{ t('cluster.v2.error.retry') }}
                         </button>
                     </div>
                 </div>
@@ -123,14 +120,13 @@
                 <div class="flex items-start gap-3 text-sm text-amber-800">
                     <i data-lucide="triangle-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
                     <div class="min-w-0 flex-1">
-                        <div class="font-semibold">Version mismatch across your Macs</div>
+                        <div class="font-semibold">{{ t('cluster.v2.version_mismatch.title') }}</div>
                         <template x-for="mismatch in versionMismatches()" :key="mismatch.name">
                             <div class="text-xs text-amber-700 mt-1"
-                                 x-text="`${mismatch.name} runs v${mismatch.peerVersion}, this Mac runs v${mismatch.selfVersion}.`"></div>
+                                 x-text="window.t('cluster.v2.version_mismatch.row').replace('{name}', mismatch.name).replace('{peer}', mismatch.peerVersion).replace('{self}', mismatch.selfVersion)"></div>
                         </template>
                         <div class="text-xs text-amber-700 mt-1">
-                            Update the older Mac to the same build before activating — the app
-                            auto-updates; with Homebrew run <code class="font-mono">brew upgrade omlx</code>.
+                            {{ t('cluster.v2.version_mismatch.update_hint') }} <code class="font-mono">brew upgrade omlx</code>.
                         </div>
                     </div>
                 </div>
@@ -145,19 +141,18 @@
                 <div class="w-12 h-12 rounded-2xl bg-neutral-100 flex items-center justify-center mx-auto">
                     <i data-lucide="laptop" class="w-6 h-6 text-neutral-500"></i>
                 </div>
-                <h3 class="text-lg font-semibold text-neutral-900 mt-4">Set up this Mac first</h3>
+                <h3 class="text-lg font-semibold text-neutral-900 mt-4">{{ t('cluster.v2.empty.title') }}</h3>
                 <p class="text-sm text-neutral-500 mt-2">
-                    This Mac hasn't introduced itself to the network yet. oMLX does that by itself
-                    once distributed inference is on — then a second Mac is all you add.
+                    {{ t('cluster.v2.empty.body') }}
                 </p>
                 <ol class="text-left text-sm text-neutral-700 space-y-3 mt-6">
                     <li class="flex items-start gap-3">
                         <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">1</span>
-                        <span>Open <span class="font-semibold">Settings → Advanced</span> and enable <span class="font-semibold">Distributed Inference</span>, then restart oMLX.</span>
+                        <span>{{ t('cluster.v2.empty.step1_open') }} <span class="font-semibold">{{ t('cluster.v2.empty.step1_settings') }}</span> {{ t('cluster.v2.empty.step1_and_enable') }} <span class="font-semibold">{{ t('cluster.v2.empty.step1_distributed') }}</span>{{ t('cluster.v2.empty.step1_then') }}</span>
                     </li>
                     <li class="flex items-start gap-3">
                         <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">2</span>
-                        <span>On your other Mac, install oMLX with one line:</span>
+                        <span>{{ t('cluster.v2.empty.step2_install') }}</span>
                     </li>
                 </ol>
                 <div class="mt-3 flex items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2">
@@ -165,23 +160,21 @@
                     <button type="button" @click="copyInstallCommand()"
                             class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-600 border border-neutral-200 rounded-md hover:bg-neutral-100">
                         <i data-lucide="copy" class="w-3 h-3"></i>
-                        <span x-text="installCommandCopied ? 'Copied!' : 'Copy'"></span>
+                        <span x-text="installCommandCopied ? window.t('cluster.v2.common.copied') : window.t('cluster.v2.common.copy')"></span>
                     </button>
                 </div>
                 <p class="text-xs text-neutral-400 mt-3">
-                    Or download the app from Releases and drag it to Applications — same result.
-                    Once both Macs run oMLX, they find each other here automatically.
+                    {{ t('cluster.v2.empty.releases_hint') }}
                 </p>
                 <div class="mt-5 border-t border-neutral-100 pt-4 text-left" data-cluster-v2-manual-add>
-                    <div class="text-[11px] font-semibold text-neutral-600">Add by IP</div>
+                    <div class="text-[11px] font-semibold text-neutral-600">{{ t('cluster.v2.manual.add_by_ip') }}</div>
                     <p class="text-[11px] text-neutral-400 mt-0.5">
-                        Already running on the other Mac but nothing shows up? Type its address —
-                        this Mac shows a code and the other Mac approves it.
+                        {{ t('cluster.v2.manual.blurb_empty') }}
                     </p>
                     <div class="mt-2 flex items-center gap-2">
                         <input type="text" x-model="manualAddr"
                                @keydown.enter="submitManualPeer()"
-                               placeholder="192.168.1.50 or 192.168.1.50:8000"
+                               placeholder="{{ t('cluster.v2.manual.placeholder') }}"
                                class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                data-cluster-v2-manual-input>
                         <button type="button" @click="submitManualPeer()"
@@ -189,7 +182,7 @@
                                 class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap"
                                 data-cluster-v2-manual-submit>
                             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
-                            <span x-text="manualBusy ? 'Checking…' : 'Add & show code'"></span>
+                            <span x-text="manualBusy ? window.t('cluster.v2.manual.checking') : window.t('cluster.v2.manual.add_show_code')"></span>
                         </button>
                     </div>
                     <div class="text-[11px] text-red-600 mt-1.5" x-show="manualError" x-text="manualError"></div>
@@ -209,28 +202,25 @@
                     </div>
                 </div>
                 <h3 class="text-lg font-semibold text-neutral-900 mt-4"
-                    x-text="selfDevice() ? 'Looking for other Macs…' : 'Waking up discovery…'"></h3>
+                    x-text="selfDevice() ? window.t('cluster.v2.discovering.looking') : window.t('cluster.v2.discovering.waking')"></h3>
                 <p class="text-sm text-neutral-500 mt-2">
-                    <span x-show="selfDevice()">This Mac is on the network as
-                        <span class="font-semibold text-neutral-700" x-text="deviceName(selfDevice())"></span>.
-                        New devices appear here by themselves — nothing to type.</span>
-                    <span x-show="!selfDevice()">Still introducing this Mac to the network.</span>
+                    <span x-show="selfDevice()">{{ t('cluster.v2.discovering.on_network_as') }}
+                        <span class="font-semibold text-neutral-700" x-text="deviceName(selfDevice())"></span>{{ t('cluster.v2.discovering.appears') }}</span>
+                    <span x-show="!selfDevice()">{{ t('cluster.v2.discovering.still_introducing') }}</span>
                 </p>
                 <p class="text-xs text-neutral-400 mt-4">
-                    Nothing showing up? Make sure the other Mac runs oMLX with Distributed
-                    Inference enabled, and that macOS allowed oMLX under
-                    <span class="font-medium">System Settings → Privacy &amp; Security → Local Network</span>.
+                    {{ t('cluster.v2.discovering.nothing_showing') }}
+                    <span class="font-medium">{{ t('cluster.v2.discovering.local_network') }}</span>.
                 </p>
                 <div class="mt-5 border-t border-neutral-100 pt-4" data-cluster-v2-manual-add>
-                    <div class="text-[11px] font-semibold text-neutral-600">Add by IP</div>
+                    <div class="text-[11px] font-semibold text-neutral-600">{{ t('cluster.v2.manual.add_by_ip') }}</div>
                     <p class="text-[11px] text-neutral-400 mt-0.5">
-                        Multicast can't reach every network — a direct Thunderbolt or wired
-                        address always works.
+                        {{ t('cluster.v2.manual.blurb_discovering') }}
                     </p>
                     <div class="mt-2 flex items-center gap-2">
                         <input type="text" x-model="manualAddr"
                                @keydown.enter="submitManualPeer()"
-                               placeholder="192.168.1.50 or 192.168.1.50:8000"
+                               placeholder="{{ t('cluster.v2.manual.placeholder') }}"
                                class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                data-cluster-v2-manual-input>
                         <button type="button" @click="submitManualPeer()"
@@ -238,7 +228,7 @@
                                 class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap"
                                 data-cluster-v2-manual-submit>
                             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
-                            <span x-text="manualBusy ? 'Checking…' : 'Add & show code'"></span>
+                            <span x-text="manualBusy ? window.t('cluster.v2.manual.checking') : window.t('cluster.v2.manual.add_show_code')"></span>
                         </button>
                     </div>
                     <div class="text-[11px] text-red-600 mt-1.5" x-show="manualError" x-text="manualError"></div>
@@ -251,41 +241,41 @@
                  x-cloak class="mb-6" data-cluster-v2-state="device_card">
             <div class="flex items-center justify-between gap-3 mb-3">
                 <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">
-                    Your devices
+                    {{ t('cluster.v2.devices.title') }}
                     <span class="text-neutral-300 normal-case font-medium"
                           x-text="combinedMemoryLabel()"></span>
                 </div>
                 <div class="flex items-center gap-2">
                     <span class="inline-flex items-center gap-1.5 text-[10px] text-neutral-400">
                         <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-                        Listening for new devices
+                        {{ t('cluster.v2.devices.listening') }}
                     </span>
                     <button type="button" @click="toggleMembershipPanel()"
                             class="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100"
                             data-cluster-v2-plan-add-mac>
                         <i :data-lucide="membershipPanelOpen ? 'x' : 'plus'" class="w-3.5 h-3.5"></i>
-                        <span x-text="membershipPanelOpen ? 'Close' : 'Add Mac'"></span>
+                        <span x-text="membershipPanelOpen ? window.t('cluster.v2.common.close') : window.t('cluster.v2.membership.add_mac')"></span>
                     </button>
                 </div>
             </div>
             <div x-show="membershipPanelOpen && !configuredDeployment()" x-cloak
                  class="mb-4 rounded-xl border border-neutral-200 bg-white px-4 py-3"
                  data-cluster-v2-plan-add-mac-panel>
-                <div class="text-xs font-semibold text-neutral-900">Add another Mac</div>
+                <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.v2.membership.add_another') }}</div>
                 <p class="text-[10px] text-neutral-600 mt-1">
-                    Automatic discovery keeps listening. Or find it directly below. On the new Mac, open Cluster and join this Mac; its six-digit approval request appears here. Your selected model and serving settings stay intact.
+                    {{ t('cluster.v2.membership.add_another_blurb') }}
                 </p>
                 <div class="mt-2 flex items-center gap-2">
                     <input type="text" x-model="manualAddr"
                            @keydown.enter="submitManualPeer({ beginJoin: false })"
-                           placeholder="192.168.1.50 or 192.168.1.50:8000"
+                           placeholder="{{ t('cluster.v2.manual.placeholder') }}"
                            class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                            data-cluster-v2-plan-add-mac-input>
                     <button type="button" @click="submitManualPeer({ beginJoin: false })"
                             :disabled="manualBusy"
                             class="px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                             data-cluster-v2-plan-add-mac-submit>
-                        <span x-text="manualBusy ? 'Checking…' : 'Find Mac'"></span>
+                        <span x-text="manualBusy ? window.t('cluster.v2.manual.checking') : window.t('cluster.v2.manual.find_mac')"></span>
                     </button>
                 </div>
                 <div class="text-[10px] text-red-700 mt-1" x-show="manualError" x-text="manualError"></div>
@@ -325,15 +315,15 @@
                                     class="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800"
                                     data-cluster-v2-pair-button>
                                 <i data-lucide="link-2" class="w-3.5 h-3.5"></i>
-                                Pair
+                                {{ t('cluster.v2.device.pair') }}
                             </button>
                             <button type="button" @click="beginJoinAsJoiner(device)"
                                     :disabled="join.busy"
-                                    title="This Mac shows the code; approve it on the other Mac"
+                                    title="{{ t('cluster.v2.device.show_code_tooltip') }}"
                                     class="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-600 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-50 disabled:opacity-50"
                                     data-cluster-v2-show-code>
                                 <i data-lucide="key-round" class="w-3.5 h-3.5"></i>
-                                Show code instead
+                                {{ t('cluster.v2.device.show_code_instead') }}
                             </button>
                         </div>
                         <div class="mt-4" x-show="!device.is_self && device.paired">
@@ -344,7 +334,7 @@
                                         : 'text-neutral-500 border-neutral-200 hover:bg-neutral-50'"
                                     data-cluster-v2-unpair>
                                 <i data-lucide="unlink" class="w-3 h-3"></i>
-                                <span x-text="confirmUnpairFor === device.node_id ? 'Click again to unpair' : 'Unpair'"></span>
+                                <span x-text="confirmUnpairFor === device.node_id ? window.t('cluster.v2.device.unpair_confirm') : window.t('cluster.v2.device.unpair')"></span>
                             </button>
                         </div>
                     </div>
@@ -355,15 +345,15 @@
             <div class="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3"
                  x-show="wizardState() === 'device_card' && pairedDevices().length && !checks.started">
                 <div class="min-w-0">
-                    <div class="text-xs font-semibold text-neutral-900">Ready when you are</div>
+                    <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.v2.device_card.ready_title') }}</div>
                     <div class="text-[10px] text-neutral-500 mt-0.5">
-                        oMLX will verify the connection, versions and RDMA before splitting anything.
+                        {{ t('cluster.v2.device_card.ready_blurb') }}
                     </div>
                 </div>
                 <button type="button" @click="startChecks()"
                         class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 whitespace-nowrap">
                     <i data-lucide="shield-check" class="w-3.5 h-3.5"></i>
-                    Run automatic checks
+                    {{ t('cluster.v2.device_card.run_checks') }}
                 </button>
             </div>
         </section>
@@ -377,16 +367,16 @@
                 <template x-if="joinActive()">
                     <div class="mb-5 rounded-xl border border-neutral-900 ring-1 ring-neutral-900 p-4"
                          data-cluster-v2-joining>
-                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">This Mac is joining</div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.pairing.joining') }}</div>
                         <h4 class="text-base font-semibold text-neutral-900 mt-2"
-                            x-text="'Joining ' + joinTargetName() + '\'s cluster'"></h4>
+                            x-text="window.t('cluster.v2.pairing.joining_title').replace('{name}', joinTargetName())"></h4>
 
                         <template x-if="join.state === 'awaiting_approval' && join.code">
                             <div>
                                 <p class="text-xs text-neutral-600 mt-2">
-                                    Show this code on this Mac — type it on
+                                    {{ t('cluster.v2.pairing.show_code_on') }}
                                     <span class="font-semibold" x-text="joinTargetName()"></span>
-                                    to approve the join.
+                                    {{ t('cluster.v2.pairing.to_approve') }}
                                 </p>
                                 <div class="mt-3 flex items-center justify-center gap-1.5 select-all"
                                      data-cluster-v2-join-code>
@@ -399,36 +389,36 @@
                                 <div class="mt-2 flex items-center justify-center gap-2 text-[11px] text-neutral-500">
                                     <span class="inline-flex items-center gap-1.5">
                                         <svg class="animate-spin h-3 w-3" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                        Waiting for approval on the other Mac…
+                                        {{ t('cluster.v2.pairing.waiting') }}
                                     </span>
-                                    <span aria-label="Code expires in"
+                                    <span aria-label="{{ t('cluster.v2.pairing.code_expires_in') }}"
                                           data-cluster-v2-join-countdown
-                                          x-text="'expires in ' + joinCountdownLabel()"></span>
+                                          x-text="window.t('cluster.v2.pairing.expires_in').replace('{time}', joinCountdownLabel())"></span>
                                 </div>
                             </div>
                         </template>
 
                         <div class="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
                              x-show="join.state === 'error'">
-                            <span x-text="join.error || 'The pairing code expired.'"></span>
+                            <span x-text="join.error || window.t('cluster.v2.pairing.code_expired')"></span>
                             <button type="button" @click="restartJoin()"
                                     :disabled="join.busy"
                                     class="ml-2 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold text-red-800 bg-white border border-red-300 rounded-md hover:bg-red-100 disabled:opacity-50"
                                     data-cluster-v2-join-restart>
                                 <i data-lucide="rotate-ccw" class="w-3 h-3"></i>
-                                Start again
+                                {{ t('cluster.v2.pairing.start_again') }}
                             </button>
                         </div>
                         <div class="text-[11px] text-amber-700 mt-2"
                              x-show="join.state === 'awaiting_approval' && join.error"
-                             x-text="'Still waiting — ' + join.error"></div>
+                             x-text="window.t('cluster.v2.pairing.still_waiting').replace('{error}', join.error)"></div>
 
                         <div class="mt-3">
                             <button type="button" @click="cancelJoin()"
                                     class="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-neutral-500 border border-neutral-200 rounded-lg hover:bg-neutral-50"
                                     data-cluster-v2-join-cancel>
                                 <i data-lucide="x" class="w-3.5 h-3.5"></i>
-                                Cancel join
+                                {{ t('cluster.v2.pairing.cancel_join') }}
                             </button>
                         </div>
                     </div>
@@ -437,7 +427,7 @@
                 <!-- Pending approval arriving from another Mac. -->
                 <template x-if="pendingApprovals().length && !pairing.target">
                     <div>
-                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">A Mac wants to join</div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.pairing.wants_join') }}</div>
                         <template x-for="device in pendingApprovals()" :key="device.node_id">
                             <div class="mt-3 rounded-xl border border-neutral-900 ring-1 ring-neutral-900 p-4">
                                 <div class="flex items-center justify-between gap-3">
@@ -451,18 +441,17 @@
                                             class="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-neutral-500 border border-neutral-200 rounded-lg hover:bg-neutral-50"
                                             data-cluster-v2-deny>
                                         <i data-lucide="x" class="w-3.5 h-3.5"></i>
-                                        Deny
+                                        {{ t('cluster.v2.pairing.deny') }}
                                     </button>
                                 </div>
                                 <p class="text-xs text-neutral-600 mt-3">
-                                    Its screen shows a 6-digit code. Type it here to approve — a wrong
-                                    code three times locks pairing for 10 minutes.
+                                    {{ t('cluster.v2.pairing.approval_blurb') }}
                                 </p>
                                 <div class="flex items-center gap-2 mt-2">
                                     <input type="text" inputmode="numeric" maxlength="6"
                                            x-model="pairing.code"
                                            @keydown.enter="submitPairApproval(device)"
-                                           placeholder="6-digit code"
+                                           placeholder="{{ t('cluster.v2.pairing.code_placeholder') }}"
                                            class="w-36 px-3 py-2 text-center text-lg font-mono tracking-[0.3em] border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                            data-cluster-v2-pair-code>
                                     <button type="button" @click="submitPairApproval(device)"
@@ -470,7 +459,7 @@
                                             class="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50"
                                             data-cluster-v2-approve>
                                         <i data-lucide="check" class="w-3.5 h-3.5"></i>
-                                        Approve
+                                        {{ t('cluster.v2.pairing.approve') }}
                                     </button>
                                 </div>
                                 <div class="text-xs text-red-600 mt-2" x-show="pairing.error" x-text="pairing.error"></div>
@@ -482,26 +471,25 @@
                 <!-- User pressed Pair on a discovered card. -->
                 <template x-if="pairing.target">
                     <div>
-                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Pair a new Mac</div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.pairing.new_mac') }}</div>
                         <h4 class="text-base font-semibold text-neutral-900 mt-2"
-                            x-text="'Pair with ' + deviceName(pairing.target)"></h4>
+                            x-text="window.t('cluster.v2.pairing.pair_with').replace('{name}', deviceName(pairing.target))"></h4>
                         <ol class="text-sm text-neutral-600 space-y-2 mt-3">
                             <li class="flex items-start gap-2.5">
                                 <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">1</span>
-                                <span>On <span class="font-semibold" x-text="deviceName(pairing.target)"></span>,
-                                    open its oMLX dashboard and press <span class="font-semibold">Show code instead</span>
-                                    on this Mac's card — it shows a 6-digit code.</span>
+                                <span>{{ t('cluster.v2.pairing.step1_on') }} <span class="font-semibold" x-text="deviceName(pairing.target)"></span>{{ t('cluster.v2.pairing.step1_open') }} <span class="font-semibold">{{ t('cluster.v2.device.show_code_instead') }}</span>
+                                    {{ t('cluster.v2.pairing.step1_card') }}</span>
                             </li>
                             <li class="flex items-start gap-2.5">
                                 <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">2</span>
-                                <span>Type that code here. The code expires after 10 minutes.</span>
+                                <span>{{ t('cluster.v2.pairing.step2_type') }}</span>
                             </li>
                         </ol>
                         <div class="flex items-center gap-2 mt-4">
                             <input type="text" inputmode="numeric" maxlength="6"
                                    x-model="pairing.code"
                                    @keydown.enter="submitPairApproval(pairing.target)"
-                                   placeholder="6-digit code"
+                                   placeholder="{{ t('cluster.v2.pairing.code_placeholder') }}"
                                    class="w-36 px-3 py-2 text-center text-lg font-mono tracking-[0.3em] border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                    data-cluster-v2-pair-code>
                             <button type="button" @click="submitPairApproval(pairing.target)"
@@ -509,11 +497,11 @@
                                     class="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50"
                                     data-cluster-v2-approve>
                                 <svg x-show="pairing.busy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                <span x-text="pairing.busy ? 'Approving…' : 'Approve & pair'"></span>
+                                <span x-text="pairing.busy ? window.t('cluster.v2.pairing.approving') : window.t('cluster.v2.pairing.approve_pair')"></span>
                             </button>
                             <button type="button" @click="cancelPairing()"
                                     class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700">
-                                Cancel
+                                {{ t('cluster.v2.common.cancel') }}
                             </button>
                         </div>
                         <div class="text-xs text-red-600 mt-2" x-show="pairing.error" x-text="pairing.error"></div>
@@ -521,7 +509,7 @@
                             <button type="button" @click="submitPairDenial(pairing.target)"
                                     class="text-[10px] text-neutral-400 hover:text-neutral-600 underline underline-offset-2"
                                     data-cluster-v2-deny>
-                                Not your device? Deny the request instead
+                                {{ t('cluster.v2.pairing.deny_instead') }}
                             </button>
                         </div>
                     </div>
@@ -536,17 +524,16 @@
             <div class="p-5 sm:p-6">
                 <div class="flex items-start justify-between gap-3">
                     <div>
-                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Automatic checks</div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.checks.title') }}</div>
                         <p class="text-xs text-neutral-500 mt-1">
-                            Everything oMLX needs before it splits a model. Rows fix themselves
-                            when the underlying condition does.
+                            {{ t('cluster.v2.checks.blurb') }}
                         </p>
                     </div>
                     <button type="button" @click="runChecks()"
                             :disabled="checks.running"
                             class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50 whitespace-nowrap">
                         <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
-                        Re-run checks
+                        {{ t('cluster.v2.checks.rerun') }}
                     </button>
                 </div>
 
@@ -568,7 +555,7 @@
                                         <button x-show="row.key === 'benchmark' && selectedModelPath && !checks.benchmarkRunning"
                                                 type="button" @click="runBenchmark()"
                                                 class="text-[10px] font-medium text-neutral-500 border border-neutral-200 rounded-md px-2 py-1 hover:bg-neutral-50"
-                                                x-text="checks.benchmark ? 'Run again' : 'Run benchmark'"></button>
+                                                x-text="checks.benchmark ? window.t('cluster.v2.checks.run_again') : window.t('cluster.v2.checks.run_benchmark')"></button>
                                     </div>
                                     <div class="text-xs mt-0.5"
                                          :class="{
@@ -593,17 +580,16 @@
                 <div class="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                     <p class="text-[11px] text-neutral-400"
                        x-show="!checksBlockingPass()">
-                        The split unlocks once SSH and matching versions pass. RDMA and the
-                        benchmark only change how fast the result is.
+                        {{ t('cluster.v2.checks.unlock_hint') }}
                     </p>
                     <p class="text-[11px] text-green-600" x-show="checksBlockingPass()">
-                        All clear — your Macs are ready to share a model.
+                        {{ t('cluster.v2.checks.all_clear') }}
                     </p>
                     <button type="button" @click="enterPlan()"
                             :disabled="!checksBlockingPass()"
                             class="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                             data-cluster-v2-continue-plan>
-                        Continue to the model split
+                        {{ t('cluster.v2.checks.continue') }}
                         <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
                     </button>
                 </div>
@@ -615,10 +601,9 @@
                  class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
                  data-cluster-v2-state="plan" data-cluster-v2-plan>
             <div class="p-5 sm:p-6">
-                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Split a model across the pool</div>
+                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.plan.title') }}</div>
                 <p class="text-xs text-neutral-500 mt-1">
-                    Pick a downloaded model. oMLX measures it and gives each Mac a contiguous
-                    slice of its layers — heavier slices go to bigger Macs.
+                    {{ t('cluster.v2.plan.blurb') }}
                 </p>
 
                 <!-- Model picker -->
@@ -626,7 +611,7 @@
                     <div class="relative">
                         <i data-lucide="search" class="w-3.5 h-3.5 text-neutral-400 pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"></i>
                         <input type="text" x-model="modelSearch"
-                               placeholder="Search downloaded models"
+                               placeholder="{{ t('cluster.v2.plan.search_placeholder') }}"
                                class="w-full pl-9 pr-3 py-2 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                     </div>
                     <div class="mt-2 max-h-56 overflow-y-auto divide-y divide-neutral-100 border border-neutral-200 rounded-xl">
@@ -640,7 +625,7 @@
                             </template>
                         </div>
                         <div x-show="!modelsLoading && !filteredModels().length" class="px-4 py-3 text-xs text-neutral-400"
-                             x-text="modelsError || 'No downloaded models found. Download one in the Models tab first.'"></div>
+                             x-text="modelsError || window.t('cluster.v2.plan.no_models')"></div>
                         <template x-for="model in filteredModels()" :key="model.model_path">
                             <button type="button" @click="selectModel(model)"
                                     class="w-full text-left px-4 py-2.5 hover:bg-neutral-50 flex items-center justify-between gap-3"
@@ -700,8 +685,8 @@
                      are continuously batched automatically. -->
                 <div class="mt-4" data-cluster-v2-serving-profile>
                     <div class="flex items-center justify-between gap-3 mb-2">
-                        <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Serving profile</div>
-                        <span class="text-[10px] text-neutral-400">Auto-tuned down if memory requires it</span>
+                        <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.plan.serving_profile') }}</div>
+                        <span class="text-[10px] text-neutral-400">{{ t('cluster.v2.plan.auto_tuned') }}</span>
                     </div>
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
                         <template x-for="option in executionProfileOptions()" :key="option.key">
@@ -721,7 +706,7 @@
                         </template>
                     </div>
                     <p class="text-[10px] text-neutral-500 mt-1.5">
-                        There is no separate batching switch: these are admission limits, and compatible requests that overlap are coalesced continuously up to the batch target.
+                        {{ t('cluster.v2.plan.batching_note') }}
                     </p>
                 </div>
 
@@ -729,16 +714,16 @@
                      data-cluster-v2-context-reservation>
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                         <span class="min-w-0">
-                            <span class="block text-xs font-semibold text-neutral-900">Context reservation</span>
+                            <span class="block text-xs font-semibold text-neutral-900">{{ t('cluster.v2.plan.context_reservation') }}</span>
                             <span class="block text-[10px] text-neutral-500 mt-0.5">
-                                Reserve KV capacity on every rank for the largest prompt you expect. The planner refuses a value the smallest Mac cannot hold.
+                                {{ t('cluster.v2.plan.context_blurb') }}
                             </span>
                         </span>
                         <select :value="targetContextTokens"
                                 @change="setTargetContextTokens($event.target.value)"
                                 :disabled="planLoading || !selectedModelPath"
                                 class="text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 bg-white focus:ring-2 focus:ring-neutral-900 focus:border-transparent disabled:opacity-40"
-                                aria-label="Distributed context reservation">
+                                aria-label="{{ t('cluster.v2.plan.context_aria') }}">
                             <template x-for="tokens in contextReservationOptions()" :key="tokens">
                                 <option :value="tokens" x-text="contextReservationLabel(tokens)"></option>
                             </template>
@@ -752,27 +737,27 @@
                 <label class="mt-4 flex items-start justify-between gap-4 rounded-xl border border-neutral-200 px-3 py-2.5"
                        data-cluster-v2-prompt-cache-ssd>
                     <span class="min-w-0">
-                        <span class="block text-xs font-semibold text-neutral-900">Persistent prompt reuse</span>
+                        <span class="block text-xs font-semibold text-neutral-900">{{ t('cluster.v2.plan.prompt_reuse') }}</span>
                         <span class="block text-[10px] text-neutral-500 mt-0.5">
-                            Save aligned prompt snapshots on each Mac so prefixes survive restarts. Snapshots are written during request processing and may add latency. Memory reuse stays on either way.
+                            {{ t('cluster.v2.plan.prompt_reuse_blurb') }}
                         </span>
                     </span>
                     <span class="inline-flex items-center gap-2 flex-shrink-0 pt-0.5">
                         <span class="text-[10px] font-semibold text-neutral-500"
-                              x-text="promptCacheSsd ? 'On' : 'Off'"></span>
+                              x-text="promptCacheSsd ? window.t('cluster.v2.common.on') : window.t('cluster.v2.common.off')"></span>
                         <input type="checkbox"
                                x-model="promptCacheSsd"
                                @change="runPlan()"
                                :disabled="planLoading"
                                class="h-4 w-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 disabled:opacity-40"
-                               aria-label="Persist distributed prompt snapshots to SSD"
+                               aria-label="{{ t('cluster.v2.plan.persist_aria') }}"
                                data-cluster-v2-prompt-cache-ssd-toggle>
                     </span>
                 </label>
                 <label x-show="promptCacheSsd" x-cloak
                        class="mt-2 block rounded-xl border border-neutral-200 px-3 py-2.5"
                        data-cluster-v2-prompt-cache-ssd-cap>
-                    <span class="block text-xs font-semibold text-neutral-900">SSD budget per rank</span>
+                    <span class="block text-xs font-semibold text-neutral-900">{{ t('cluster.v2.plan.ssd_budget') }}</span>
                     <span class="mt-2 inline-flex items-center gap-2">
                         <input type="number"
                                x-model.number="promptCacheSsdMaxGiB"
@@ -782,11 +767,11 @@
                                step="1"
                                :disabled="planLoading"
                                class="w-24 text-xs border border-neutral-200 rounded-lg px-2 py-1.5 focus:ring-2 focus:ring-neutral-900 focus:border-transparent disabled:opacity-40"
-                               aria-label="Persistent prompt snapshot SSD budget per rank">
+                               aria-label="{{ t('cluster.v2.plan.ssd_budget_aria') }}">
                         <span class="text-xs text-neutral-600">GiB</span>
                     </span>
                     <span class="block text-[10px] text-neutral-500 mt-1">
-                        Oldest aligned snapshots are evicted deterministically at this limit. Default: 20 GiB on each rank.
+                        {{ t('cluster.v2.plan.ssd_evict') }}
                     </span>
                 </label>
 
@@ -794,7 +779,7 @@
                      Default is unchanged (this Mac = Workstation, peers =
                      Headless); changing one re-runs the plan. -->
                 <div class="mt-4" data-cluster-v2-node-roles>
-                    <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Memory each Mac contributes</div>
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400 mb-2">{{ t('cluster.v2.plan.memory_contributes') }}</div>
                     <div class="space-y-2">
                         <template x-for="device in planRoleDevices()" :key="device.node_id">
                             <div class="flex items-center justify-between gap-3 rounded-xl border border-neutral-200 px-3 py-2">
@@ -812,13 +797,13 @@
                                                 ? 'bg-neutral-900 text-white'
                                                 : 'text-neutral-600 hover:bg-neutral-50'"
                                             class="px-2.5 py-1 text-[10px] font-semibold transition-colors"
-                                            data-cluster-v2-role-workstation>Workstation</button>
+                                            data-cluster-v2-role-workstation>{{ t('cluster.v2.plan.role_workstation') }}</button>
                                     <button type="button" @click="setNodeRole(device, 'headless')"
                                             :class="nodeRole(device.node_id, !!device.is_self) === 'headless'
                                                 ? 'bg-neutral-900 text-white'
                                                 : 'text-neutral-600 hover:bg-neutral-50'"
                                             class="px-2.5 py-1 text-[10px] font-semibold transition-colors border-l border-neutral-200"
-                                            data-cluster-v2-role-headless>Headless</button>
+                                            data-cluster-v2-role-headless>{{ t('cluster.v2.plan.role_headless') }}</button>
                                 </div>
                             </div>
                         </template>
@@ -828,7 +813,7 @@
                 <!-- Planning progress / error -->
                 <div class="mt-4 flex items-center gap-2 text-xs text-neutral-500" x-show="planLoading">
                     <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                    Measuring the model and balancing layers…
+                    {{ t('cluster.v2.plan.measuring') }}
                 </div>
                 <div class="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
                      x-show="planError" x-text="planError"></div>
@@ -838,13 +823,13 @@
                 <div x-show="planFitFailure" x-cloak
                      class="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
                      data-cluster-v2-fit-banner>
-                    <span x-text="fitShortfallLabel() + ' more memory is needed than these roles allow. Headless Macs keep only a 10% margin; Workstation keeps at least half for whoever is using it.'"></span>
+                    <span x-text="window.t('cluster.v2.plan.fit_shortfall').replace('{amount}', fitShortfallLabel())"></span>
                     <button type="button"
                             x-show="planFitFailure && planFitFailure.canFixWithHeadless"
                             @click="switchAllToHeadless()"
                             class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-semibold text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100"
                             data-cluster-v2-fit-switch-headless>
-                        Switch all to Headless and retry
+                        {{ t('cluster.v2.plan.switch_headless') }}
                     </button>
                 </div>
 
@@ -853,9 +838,9 @@
                     <div class="mt-5" data-cluster-v2-split-bar>
                         <div class="flex items-center justify-between gap-3 mb-2">
                             <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
-                                  x-text="planIsTensor() ? tensorCaptionLabel() : 'Model order · early to late layers'"></span>
+                                  x-text="planIsTensor() ? tensorCaptionLabel() : window.t('cluster.v2.split.model_order')"></span>
                             <span class="text-[10px] text-neutral-500"
-                                  x-text="planIsTensor() ? backendLabel() : planTotalLayers() + ' layers total · ' + backendLabel()"></span>
+                                  x-text="planIsTensor() ? backendLabel() : window.t('cluster.v2.split.layers_total').replace('{count}', planTotalLayers()).replace('{backend}', backendLabel())"></span>
                         </div>
                         <!-- Tensor split: every Mac holds a 1/N slice of EVERY
                              layer, so equal-width segments with TP ranks
@@ -870,7 +855,7 @@
                                          :style="'width: ' + (100 / Math.max(planAssignments().length, 1)) + '%'"
                                          :title="planNodeName(assignment) + ' · ' + tensorShareLabel()">
                                         <span class="text-[10px] sm:text-xs font-semibold truncate"
-                                              x-text="planNodeName(assignment) + ' · rank ' + (assignment.tensor_parallel_rank ?? index)"></span>
+                                              x-text="planNodeName(assignment) + window.t('cluster.v2.split.rank_label').replace('{rank}', (assignment.tensor_parallel_rank ?? index))"></span>
                                     </div>
                                 </template>
                             </div>
@@ -916,7 +901,7 @@
                                          x-text="stagingOverallLabel()"></div>
                                     <button type="button" @click="dismissStaging()"
                                             class="text-[10px] font-semibold text-neutral-400 hover:text-neutral-600"
-                                            data-cluster-v2-staging-dismiss>Dismiss</button>
+                                            data-cluster-v2-staging-dismiss>{{ t('cluster.v2.common.dismiss') }}</button>
                                 </div>
                                 <template x-for="node in stagingNodes()" :key="node.node_id">
                                     <div class="py-1" data-cluster-v2-staging-node>
@@ -940,10 +925,9 @@
                                      x-text="stagingError"></div>
                             </div>
                             <div class="min-w-0">
-                                <div class="text-xs font-semibold text-neutral-900">Exactly this split will launch</div>
+                                <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.v2.plan.exact_split') }}</div>
                                 <div class="text-[10px] text-neutral-500 mt-0.5">
-                                    Activation is signed against what you see — if anything changes,
-                                    oMLX rebuilds the plan instead of launching the wrong one.
+                                    {{ t('cluster.v2.plan.exact_split_blurb') }}
                                 </div>
                             </div>
                             <button type="button" @click="activatePlan()"
@@ -951,7 +935,7 @@
                                     class="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                                     data-cluster-v2-activate>
                                 <svg x-show="activateBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                <span x-text="activateBusy ? (stagingJob && !stagingJob.ready ? stagingButtonLabel() : 'Activating…') : 'Activate cluster'"></span>
+                                <span x-text="activateBusy ? (stagingJob && !stagingJob.ready ? stagingButtonLabel() : window.t('cluster.v2.plan.activating')) : window.t('cluster.v2.plan.activate')"></span>
                             </button>
                         </div>
                     </div>
@@ -976,7 +960,7 @@
                            x-text="deploymentCacheLabel()"
                            data-cluster-v2-active-cache-mode></p>
                         <p class="text-[10px] text-neutral-600 mt-1"
-                           x-text="deploymentFabricLabel() + ' · device links below are control/discovery routes'"
+                           x-text="window.t('cluster.v2.active.fabric_note').replace('{fabric}', deploymentFabricLabel())"
                            data-cluster-v2-active-fabric></p>
                     </div>
                     <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border self-start"
@@ -998,16 +982,16 @@
                      data-cluster-v2-serving-status>
                     <div class="flex items-center justify-between gap-3 px-4 py-2.5 bg-neutral-50 border-b border-neutral-200">
                         <div>
-                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Batching &amp; concurrency</div>
-                            <div class="text-[10px] text-neutral-600 mt-0.5">Resolved worker limits · changes require a signed re-plan</div>
+                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">{{ t('cluster.v2.active.batching_heading') }}</div>
+                            <div class="text-[10px] text-neutral-600 mt-0.5">{{ t('cluster.v2.active.resolved_limits') }}</div>
                         </div>
                         <span class="text-[10px] font-semibold text-neutral-500"
-                              x-text="deploymentExecutionProfileLabel() + ' profile'"></span>
+                              x-text="window.t('cluster.v2.active.profile_suffix').replace('{profile}', deploymentExecutionProfileLabel())"></span>
                     </div>
                     <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-neutral-100">
                         <div class="px-4 py-3" data-cluster-v2-batching-state>
                             <div class="flex items-center justify-between gap-2">
-                                <span class="text-[9px] uppercase tracking-wider text-neutral-600">Continuous batching</span>
+                                <span class="text-[9px] uppercase tracking-wider text-neutral-600">{{ t('cluster.v2.active.continuous_batching') }}</span>
                                 <span class="inline-flex rounded-full border px-2 py-0.5 text-[9px] font-semibold"
                                       :class="deploymentBatchStatus().tone"
                                       x-text="deploymentBatchStatus().label"></span>
@@ -1016,17 +1000,17 @@
                                  x-text="deploymentBatchStatus().detail"></div>
                         </div>
                         <div class="px-4 py-3" data-cluster-v2-decode-concurrency>
-                            <div class="text-[9px] uppercase tracking-wider text-neutral-600">Decode concurrency</div>
+                            <div class="text-[9px] uppercase tracking-wider text-neutral-600">{{ t('cluster.v2.active.decode_concurrency') }}</div>
                             <div class="text-lg font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                  x-text="deploymentExecution()?.decode_concurrency ?? '—'"></div>
-                            <div class="text-[10px] text-neutral-600">maximum in-flight decode requests</div>
+                            <div class="text-[10px] text-neutral-600">{{ t('cluster.v2.active.max_inflight') }}</div>
                         </div>
                         <div class="px-4 py-3" data-cluster-v2-prompt-concurrency>
-                            <div class="text-[9px] uppercase tracking-wider text-neutral-600">Prompt concurrency</div>
+                            <div class="text-[9px] uppercase tracking-wider text-neutral-600">{{ t('cluster.v2.active.prompt_concurrency') }}</div>
                             <div class="text-lg font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                  x-text="deploymentExecution()?.prompt_concurrency ?? '—'"></div>
                             <div class="text-[10px] text-neutral-600"
-                                 x-text="'maximum prefills · batch target ' + (deploymentBatchStatus().target || '—')"></div>
+                                 x-text="window.t('cluster.v2.active.max_prefills').replace('{target}', (deploymentBatchStatus().target || '—'))"></div>
                         </div>
                     </div>
                     <div class="px-4 py-2 border-t border-neutral-100 text-[10px] text-neutral-600"
@@ -1036,8 +1020,8 @@
                          data-cluster-v2-serving-replan>
                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                             <div>
-                                <div class="text-[10px] font-semibold text-neutral-700">Change serving profile</div>
-                                <div class="text-[9px] text-neutral-600 mt-0.5">Select to preview a signed plan. Applying waits for request quiescence, reloads the ranks, and runs readiness again.</div>
+                                <div class="text-[10px] font-semibold text-neutral-700">{{ t('cluster.v2.active.change_profile') }}</div>
+                                <div class="text-[9px] text-neutral-600 mt-0.5">{{ t('cluster.v2.active.change_profile_blurb') }}</div>
                             </div>
                             <div class="inline-flex rounded-lg border border-neutral-200 overflow-hidden self-start sm:self-auto">
                                 <template x-for="option in executionProfileOptions()" :key="'active-' + option.key">
@@ -1059,17 +1043,17 @@
                              data-cluster-v2-serving-replan-confirm>
                             <div class="text-[10px] text-amber-800">
                                 <span class="font-semibold" x-text="executionReplan ? executionReplan.profile.charAt(0).toUpperCase() + executionReplan.profile.slice(1) : ''"></span>
-                                <span> is previewed and signed. The current cluster remains live until you apply it.</span>
+                                <span> {{ t('cluster.v2.active.previewed') }}</span>
                             </div>
                             <div class="flex items-center gap-2 flex-shrink-0">
                                 <button type="button" @click="executionReplan = null"
                                         :disabled="executionReplanBusy"
-                                        class="px-2.5 py-1 text-[10px] font-semibold text-neutral-600 border border-neutral-200 rounded-lg hover:bg-neutral-50 disabled:opacity-40">Cancel</button>
+                                        class="px-2.5 py-1 text-[10px] font-semibold text-neutral-600 border border-neutral-200 rounded-lg hover:bg-neutral-50 disabled:opacity-40">{{ t('cluster.v2.common.cancel') }}</button>
                                 <button type="button" @click="applyExecutionProfileReplan()"
                                         :disabled="executionReplanBusy"
                                         class="px-2.5 py-1 text-[10px] font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
                                         data-cluster-v2-serving-replan-apply>
-                                    <span x-text="executionReplanBusy ? 'Applying…' : 'Apply signed re-plan'"></span>
+                                    <span x-text="executionReplanBusy ? window.t('cluster.v2.active.applying') : window.t('cluster.v2.active.apply_replan')"></span>
                                 </button>
                             </div>
                         </div>
@@ -1084,15 +1068,15 @@
                      data-cluster-v2-request-speeds>
                     <div class="flex items-center justify-between gap-3 px-4 py-2.5 bg-neutral-50 border-b border-neutral-200">
                         <div>
-                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Request speeds</div>
-                            <div class="text-[10px] text-neutral-600 mt-0.5">Independent end-to-end rates from the coordinator</div>
+                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">{{ t('cluster.v2.active.request_speeds') }}</div>
+                            <div class="text-[10px] text-neutral-600 mt-0.5">{{ t('cluster.v2.active.request_speeds_blurb') }}</div>
                         </div>
                         <span class="text-[10px] font-semibold text-neutral-500"
                               x-text="deploymentRequestCountLabel()"></span>
                     </div>
                     <template x-if="!deploymentRequestMetrics().length">
                         <div class="px-4 py-3 text-xs text-neutral-600">
-                            No request measured yet. Prefill and decode rates appear here when inference starts.
+                            {{ t('cluster.v2.active.no_requests') }}
                         </div>
                     </template>
                     <div class="divide-y divide-neutral-100"
@@ -1104,23 +1088,23 @@
                                 <div class="min-w-0">
                                     <div class="flex items-center gap-2">
                                         <span class="text-xs font-semibold text-neutral-900"
-                                              x-text="request.request_id == null ? (request._history ? 'Last request' : 'Current request') : 'Request #' + request.request_id"></span>
+                                              x-text="request.request_id == null ? (request._history ? window.t('cluster.v2.active.last_request') : window.t('cluster.v2.active.current_request')) : window.t('cluster.v2.active.request_number').replace('{id}', request.request_id)"></span>
                                         <span class="inline-flex px-2 py-0.5 rounded-full border text-[9px] font-semibold"
                                               :class="requestPhaseTone(request)"
-                                              x-text="requestPhaseLabel(request)"></span>
+                                              x-text="window.t('cluster.v2.phase.' + requestPhaseLabel(request))"></span>
                                     </div>
                                     <div class="text-[10px] text-neutral-600 mt-1"
                                          x-text="requestPromptDetail(request)"></div>
                                 </div>
                                 <div data-cluster-v2-request-prefill-rate>
-                                    <div class="text-[9px] uppercase tracking-wider text-blue-700">Prefill</div>
+                                    <div class="text-[9px] uppercase tracking-wider text-blue-700">{{ t('cluster.v2.active.prefill') }}</div>
                                     <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                          x-text="requestPrefillRate(request)"></div>
                                     <div class="text-[10px] text-neutral-600 mt-0.5"
                                          x-text="requestPrefillDetail(request)"></div>
                                 </div>
                                 <div data-cluster-v2-request-decode-rate>
-                                    <div class="text-[9px] uppercase tracking-wider text-green-700">Decode</div>
+                                    <div class="text-[9px] uppercase tracking-wider text-green-700">{{ t('cluster.v2.active.decode') }}</div>
                                     <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                          x-text="requestDecodeRate(request)"></div>
                                     <div class="text-[10px] text-neutral-600 mt-0.5"
@@ -1138,16 +1122,16 @@
                      data-cluster-v2-membership>
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 py-3 bg-neutral-50">
                         <div>
-                            <div class="text-xs font-semibold text-neutral-900">Cluster Macs</div>
+                            <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.v2.active.cluster_macs') }}</div>
                             <div class="text-[10px] text-neutral-600 mt-0.5"
-                                 x-text="membershipActiveCount() + ' active in this model' + (membershipCandidates().length ? ' · ' + membershipCandidates().length + ' paired and ready to add' : '')"></div>
+                                 x-text="window.t('cluster.v2.active.membership_count').replace('{count}', membershipActiveCount()) + (membershipCandidates().length ? window.t('cluster.v2.active.membership_candidates').replace('{count}', membershipCandidates().length) : '')"></div>
                         </div>
                         <button type="button" @click="toggleMembershipPanel()"
                                 :disabled="clusterLifecycleBusy || activateBusy"
                                 class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-neutral-200 bg-white text-neutral-700 rounded-lg hover:bg-neutral-100 disabled:opacity-40 self-start sm:self-auto"
                                 data-cluster-v2-add-mac>
                             <i :data-lucide="membershipPanelOpen ? 'x' : 'laptop-minimal-check'" class="w-3.5 h-3.5"></i>
-                            <span x-text="membershipPanelOpen ? 'Close' : 'Add Mac'"></span>
+                            <span x-text="membershipPanelOpen ? window.t('cluster.v2.common.close') : window.t('cluster.v2.membership.add_mac')"></span>
                         </button>
                     </div>
 
@@ -1155,18 +1139,17 @@
                          class="border-t border-neutral-200 px-4 py-4 space-y-4"
                          data-cluster-v2-membership-panel>
                         <div class="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2.5 text-xs text-blue-900">
-                            <span class="font-semibold">On the new Mac:</span>
-                            open oMLX → Cluster, choose Add by IP, and enter
-                            <code class="font-mono" x-text="coordinatorAddrFor(selfDevice()) || 'this Mac’s address'"></code>.
-                            It shows a six-digit code; approve that request below. Pairing does not interrupt the running model.
+                            <span class="font-semibold">{{ t('cluster.v2.active.on_new_mac') }}</span>
+                            {{ t('cluster.v2.active.on_new_mac_blurb') }}
+                            <code class="font-mono" x-text="coordinatorAddrFor(selfDevice()) || window.t('cluster.v2.active.this_mac_address')"></code>{{ t('cluster.v2.active.on_new_mac_blurb2') }}
                         </div>
 
                         <div>
-                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Find a Mac by IP</div>
+                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">{{ t('cluster.v2.active.find_by_ip') }}</div>
                             <div class="mt-2 flex items-center gap-2">
                                 <input type="text" x-model="manualAddr"
                                        @keydown.enter="submitManualPeer({ beginJoin: false })"
-                                       placeholder="192.168.1.50 or 192.168.1.50:8000"
+                                       placeholder="{{ t('cluster.v2.manual.placeholder') }}"
                                        class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
                                        data-cluster-v2-membership-manual-input>
                                 <button type="button"
@@ -1174,7 +1157,7 @@
                                         :disabled="manualBusy"
                                         class="px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                                         data-cluster-v2-membership-manual-submit>
-                                    <span x-text="manualBusy ? 'Checking…' : 'Find Mac'"></span>
+                                    <span x-text="manualBusy ? window.t('cluster.v2.manual.checking') : window.t('cluster.v2.manual.find_mac')"></span>
                                 </button>
                             </div>
                             <div class="text-[10px] text-red-700 mt-1" x-show="manualError" x-text="manualError"></div>
@@ -1185,25 +1168,25 @@
                                  data-cluster-v2-membership-pending>
                                 <div class="flex items-center justify-between gap-3">
                                     <div>
-                                        <div class="text-xs font-semibold text-amber-900" x-text="deviceName(device) + ' wants to join'"></div>
-                                        <div class="text-[10px] text-amber-800 mt-0.5">Enter the six digits shown on that Mac.</div>
+                                        <div class="text-xs font-semibold text-amber-900" x-text="window.t('cluster.v2.active.wants_to_join').replace('{name}', deviceName(device))"></div>
+                                        <div class="text-[10px] text-amber-800 mt-0.5">{{ t('cluster.v2.active.enter_six') }}</div>
                                     </div>
                                     <button type="button" @click="beginPairing(device)"
                                             x-show="pairing.target?.node_id !== device.node_id"
-                                            class="px-3 py-1.5 text-xs font-semibold text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100">Approve</button>
+                                            class="px-3 py-1.5 text-xs font-semibold text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100">{{ t('cluster.v2.pairing.approve') }}</button>
                                 </div>
                                 <div x-show="pairing.target?.node_id === device.node_id" class="mt-2 flex items-center gap-2">
                                     <input type="text" inputmode="numeric" maxlength="6"
                                            x-model="pairing.code"
                                            @keydown.enter="submitPairApproval(device)"
-                                           placeholder="000000"
+                                           placeholder="{{ t('cluster.v2.active.code_numeric_placeholder') }}"
                                            class="w-28 px-3 py-2 text-sm tracking-[0.3em] font-mono border border-amber-300 rounded-lg bg-white"
-                                           aria-label="Pairing code">
+                                           aria-label="{{ t('cluster.v2.active.pairing_code_aria') }}">
                                     <button type="button" @click="submitPairApproval(device)"
                                             :disabled="pairing.busy"
-                                            class="px-3 py-2 text-xs font-semibold text-white bg-amber-800 rounded-lg hover:bg-amber-900 disabled:opacity-40">Pair Mac</button>
+                                            class="px-3 py-2 text-xs font-semibold text-white bg-amber-800 rounded-lg hover:bg-amber-900 disabled:opacity-40">{{ t('cluster.v2.active.pair_mac') }}</button>
                                     <button type="button" @click="cancelPairing()"
-                                            class="px-2 py-2 text-xs text-amber-900">Cancel</button>
+                                            class="px-2 py-2 text-xs text-amber-900">{{ t('cluster.v2.common.cancel') }}</button>
                                 </div>
                                 <div x-show="pairing.target?.node_id === device.node_id && pairing.error"
                                      class="text-[10px] text-red-700 mt-1" x-text="pairing.error"></div>
@@ -1214,9 +1197,9 @@
                             <div class="rounded-lg border border-neutral-200 px-3 py-2.5 flex items-center justify-between gap-3">
                                 <div>
                                     <div class="text-xs font-semibold text-neutral-900" x-text="deviceName(device)"></div>
-                                    <div class="text-[10px] text-neutral-600">Found · start Join on that Mac to display its approval code here.</div>
+                                    <div class="text-[10px] text-neutral-600">{{ t('cluster.v2.active.found') }}</div>
                                 </div>
-                                <span class="text-[10px] font-semibold text-neutral-500">Not paired</span>
+                                <span class="text-[10px] font-semibold text-neutral-500">{{ t('cluster.v2.active.not_paired') }}</span>
                             </div>
                         </template>
 
@@ -1228,7 +1211,7 @@
                                             <div class="text-xs font-semibold text-green-900" x-text="deviceName(device)"></div>
                                             <div class="text-[10px] text-green-800" x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device)"></div>
                                         </div>
-                                        <span class="text-[10px] font-semibold text-green-800">Paired · ready to plan</span>
+                                        <span class="text-[10px] font-semibold text-green-800">{{ t('cluster.v2.active.paired_ready') }}</span>
                                     </div>
                                 </template>
                                 <button type="button" @click="previewMembershipExpansion()"
@@ -1236,7 +1219,7 @@
                                         class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
                                         data-cluster-v2-membership-preview>
                                     <svg x-show="membershipBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                    <span x-text="membershipBusy ? 'Measuring expanded pool…' : 'Preview re-shard across ' + (membershipActiveCount() + membershipCandidates().length) + ' Macs'"></span>
+                                    <span x-text="membershipBusy ? window.t('cluster.v2.membership.measuring') : window.t('cluster.v2.membership.preview_reshard').replace('{count}', membershipActiveCount() + membershipCandidates().length)"></span>
                                 </button>
                             </div>
                         </template>
@@ -1250,9 +1233,9 @@
                              data-cluster-v2-membership-plan>
                             <div class="px-3 py-2.5 bg-neutral-50 border-b border-neutral-200">
                                 <div class="text-xs font-semibold text-neutral-900"
-                                     x-text="'Signed ' + membershipPlanAssignments().length + '-Mac plan'"></div>
+                                     x-text="window.t('cluster.v2.membership.signed_plan').replace('{count}', membershipPlanAssignments().length)"></div>
                                 <div class="text-[10px] text-neutral-600 mt-0.5"
-                                     x-text="(membershipProposal?.backend || 'ring').toUpperCase() + ' · ' + (membershipProposal?.summary || 'automatic placement')"></div>
+                                     x-text="(membershipProposal?.backend || 'ring').toUpperCase() + ' · ' + (membershipProposal?.summary || window.t('cluster.v2.membership.automatic_placement'))"></div>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <template x-for="assignment in membershipPlanAssignments()" :key="'membership-plan-' + assignment.node_id">
@@ -1263,12 +1246,12 @@
                                 </template>
                             </div>
                             <div class="px-3 py-3 border-t border-neutral-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-                                <div class="text-[10px] text-neutral-600">Applying waits for active requests, syncs missing model files, replaces the signed rank map, reloads, and runs readiness again.</div>
+                                <div class="text-[10px] text-neutral-600">{{ t('cluster.v2.membership.apply_blurb') }}</div>
                                 <button type="button" @click="applyMembershipExpansion()"
                                         :disabled="membershipBusy || activateBusy || !proposalCanProceed(membershipProposal)"
                                         class="px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                                         data-cluster-v2-membership-apply>
-                                    Add Mac &amp; re-shard
+                                    {{ t('cluster.v2.membership.add_reshard') }}
                                 </button>
                             </div>
                         </div>
@@ -1296,8 +1279,8 @@
                 <div class="mt-4 flex flex-wrap items-center gap-2"
                      data-cluster-v2-model-lifecycle>
                     <select x-show="deploymentsPayload.length > 1" x-model="selectedDeploymentId"
-                            aria-label="Saved cluster setup" class="rounded-lg border px-3 py-2 text-xs">
-                        <option value="">Current cluster setup</option>
+                            aria-label="{{ t('cluster.v2.active.saved_setup_aria') }}" class="rounded-lg border px-3 py-2 text-xs">
+                        <option value="">{{ t('cluster.v2.active.current_setup') }}</option>
                         <template x-for="saved in deploymentsPayload" :key="saved.deployment_id">
                             <option :value="saved.deployment_id" x-text="displayModelName(saved)"></option>
                         </template>
@@ -1309,7 +1292,7 @@
                             class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
                             data-cluster-v2-change-model>
                         <i data-lucide="shuffle" class="w-3.5 h-3.5"></i>
-                        Change model
+                        {{ t('cluster.v2.active.change_model') }}
                     </button>
                     <button type="button"
                             x-show="deploymentRuntimeState(configuredDeployment()) === 'ready'"
@@ -1321,7 +1304,7 @@
                                 : 'text-neutral-600 border-neutral-200 hover:bg-neutral-50'"
                             data-cluster-v2-unload-weights>
                         <i data-lucide="archive" class="w-3.5 h-3.5"></i>
-                        <span x-text="confirmUnloadFor === configuredDeployment()?.deployment_id ? 'Confirm unload weights' : 'Unload weights'"></span>
+                        <span x-text="confirmUnloadFor === configuredDeployment()?.deployment_id ? window.t('cluster.v2.active.confirm_unload_weights') : window.t('cluster.v2.active.unload_weights')"></span>
                     </button>
                     <button type="button"
                             x-show="['failed', 'configured'].includes(deploymentRuntimeState(configuredDeployment()))"
@@ -1330,7 +1313,7 @@
                             class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
                             data-cluster-v2-load-weights>
                         <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                        <span x-text="deploymentRuntimeState() === 'failed' ? 'Retry load' : 'Load weights'"></span>
+                        <span x-text="deploymentRuntimeState() === 'failed' ? window.t('cluster.v2.active.retry_load') : window.t('cluster.v2.active.load_weights')"></span>
                     </button>
                     <button type="button" @click="deactivateDeployment(configuredDeployment())"
                             :disabled="clusterLifecycleBusy"
@@ -1340,7 +1323,7 @@
                                 : 'text-neutral-600 border-neutral-200 hover:bg-neutral-50'"
                             data-cluster-v2-deactivate>
                         <i data-lucide="octagon-x" class="w-3 h-3"></i>
-                        <span x-text="confirmDeactivateFor === configuredDeployment()?.deployment_id ? 'Confirm remove setup' : 'Remove cluster setup'"></span>
+                        <span x-text="confirmDeactivateFor === configuredDeployment()?.deployment_id ? window.t('cluster.v2.active.confirm_remove') : window.t('cluster.v2.active.remove_setup')"></span>
                     </button>
                 </div>
 
@@ -1350,21 +1333,21 @@
                      data-cluster-v2-change-model-confirm>
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                         <div>
-                            <div class="text-xs font-semibold text-amber-900">Unload these shards and choose a new model?</div>
+                            <div class="text-xs font-semibold text-amber-900">{{ t('cluster.v2.active.change_model_confirm') }}</div>
                             <div class="text-[10px] text-amber-800 mt-0.5">
-                                oMLX waits for active requests, verifies both ranks stopped, keeps the Macs paired, then reopens the existing model picker with this profile, cache policy, memory roles and context reservation prefilled.
+                                {{ t('cluster.v2.active.change_model_blurb') }}
                             </div>
                         </div>
                         <div class="flex items-center gap-2 flex-shrink-0">
                             <button type="button" @click="cancelModelChange()"
                                     :disabled="clusterLifecycleBusy"
-                                    class="px-3 py-1.5 text-xs font-medium text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100 disabled:opacity-40">Cancel</button>
+                                    class="px-3 py-1.5 text-xs font-medium text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100 disabled:opacity-40">{{ t('cluster.v2.common.cancel') }}</button>
                             <button type="button" @click="changeClusterModel(configuredDeployment())"
                                     :disabled="clusterLifecycleBusy"
                                     class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-amber-800 rounded-lg hover:bg-amber-900 disabled:opacity-40"
                                     data-cluster-v2-change-model-confirm-action>
                                 <svg x-show="clusterLifecycleBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                <span x-text="clusterLifecycleBusy ? 'Stopping ranks…' : 'Unload & choose model'"></span>
+                                <span x-text="clusterLifecycleBusy ? window.t('cluster.v2.active.stopping') : window.t('cluster.v2.active.unload_choose')"></span>
                             </button>
                         </div>
                     </div>
@@ -1382,8 +1365,8 @@
                     class="w-full flex items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3 text-left hover:bg-neutral-50"
                     data-cluster-v2-advanced-toggle>
                 <span>
-                    <span class="block text-sm font-semibold text-neutral-800">Advanced tools</span>
-                    <span class="block text-xs text-neutral-500 mt-0.5">Add CUDA workers, verify ConnectX, or save a diagnostic report</span>
+                    <span class="block text-sm font-semibold text-neutral-800">{{ t('cluster.v2.advanced.title') }}</span>
+                    <span class="block text-xs text-neutral-500 mt-0.5">{{ t('cluster.v2.advanced.blurb') }}</span>
                 </span>
                 <i data-lucide="chevron-down"
                    class="w-4 h-4 text-neutral-400 transition-transform"
@@ -1397,15 +1380,15 @@
                      data-cluster-v2-cuda-enrollment>
                     <div class="flex items-start justify-between gap-3">
                         <div>
-                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">CUDA workers</div>
-                            <h3 class="text-sm font-semibold text-neutral-900 mt-1">Add a Linux GPU box</h3>
+                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.cuda.workers') }}</div>
+                            <h3 class="text-sm font-semibold text-neutral-900 mt-1">{{ t('cluster.v2.cuda.add_box') }}</h3>
                             <p class="text-xs text-neutral-500 mt-1 leading-relaxed">
-                                Generate one expiring, single-use command. It installs the bounded worker runtime and enrolls its SSH identity into this pool.
+                                {{ t('cluster.v2.cuda.blurb') }}
                             </p>
                         </div>
                         <span x-show="cudaNodes().length" x-cloak
                               class="flex-shrink-0 rounded-full border border-green-200 bg-green-50 px-2 py-1 text-[10px] font-semibold text-green-700"
-                              x-text="`${cudaNodes().length} joined`"></span>
+                              x-text="window.t('cluster.v2.cuda.joined').replace('{count}', cudaNodes().length)"></span>
                     </div>
 
                     <div x-show="cudaNodes().length" x-cloak
@@ -1416,16 +1399,16 @@
                                     <span class="block text-xs font-semibold text-neutral-800 truncate" x-text="node.hostname || node.node_id"></span>
                                     <span class="block text-[10px] font-mono text-neutral-500 truncate" x-text="node.ssh"></span>
                                 </span>
-                                <span class="text-[10px] font-bold uppercase tracking-wider text-green-700">CUDA</span>
+                                <span class="text-[10px] font-bold uppercase tracking-wider text-green-700">{{ t('cluster.v2.cuda.badge') }}</span>
                             </div>
                         </template>
                     </div>
 
                     <label class="block mt-4">
-                        <span class="block text-xs font-medium text-neutral-700 mb-1.5">This Mac’s LAN IPv4 address</span>
+                        <span class="block text-xs font-medium text-neutral-700 mb-1.5">{{ t('cluster.v2.cuda.controller_ip') }}</span>
                         <input type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
                                x-model.trim="cudaJoin.controllerIp"
-                               :placeholder="cudaJoinSuggestedIp() || '192.168.1.20'"
+                               :placeholder="cudaJoinSuggestedIp() || window.t('cluster.v2.cuda.ip_placeholder')"
                                @keydown.enter.prevent="generateCudaJoinCommand()"
                                class="w-full rounded-lg border border-neutral-200 px-3 py-2 text-xs font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                     </label>
@@ -1434,7 +1417,7 @@
                             class="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 px-3 py-2 text-xs font-semibold text-white hover:bg-neutral-800 disabled:opacity-40"
                             data-cluster-v2-generate-cuda-join>
                         <i data-lucide="key-round" class="w-3.5 h-3.5"></i>
-                        <span x-text="cudaJoin.loading ? 'Generating…' : (cudaJoin.command ? 'Generate another' : 'Generate join command')"></span>
+                        <span x-text="cudaJoin.loading ? window.t('cluster.v2.cuda.generating') : (cudaJoin.command ? window.t('cluster.v2.cuda.generate_another') : window.t('cluster.v2.cuda.generate'))"></span>
                     </button>
 
                     <div x-show="cudaJoin.command" x-cloak
@@ -1446,10 +1429,10 @@
                                 <button type="button" @click="copyCudaJoinCommand()"
                                         :disabled="!cudaJoinCommandUsable()"
                                         class="rounded-md bg-white px-2 py-1 text-[10px] font-semibold text-neutral-900 disabled:opacity-40"
-                                        x-text="cudaJoin.copied ? 'Copied!' : 'Copy'"></button>
+                                        x-text="cudaJoin.copied ? window.t('cluster.v2.common.copied') : window.t('cluster.v2.common.copy')"></button>
                                 <button type="button" @click="revokeCudaJoinCommand()"
                                         x-show="cudaJoinCommandUsable()"
-                                        class="rounded-md border border-neutral-700 px-2 py-1 text-[10px] font-medium text-neutral-300 hover:bg-neutral-900">Revoke</button>
+                                        class="rounded-md border border-neutral-700 px-2 py-1 text-[10px] font-medium text-neutral-300 hover:bg-neutral-900">{{ t('cluster.v2.cuda.revoke') }}</button>
                             </span>
                         </div>
                         <pre class="max-h-40 overflow-auto whitespace-pre-wrap break-all p-3 text-[10px] leading-relaxed text-green-300" x-text="cudaJoin.command"></pre>
@@ -1458,8 +1441,8 @@
                     <div x-show="cudaNodes().length >= 2" x-cloak
                          class="mt-4 rounded-xl border border-blue-200 bg-blue-50 px-3 py-3"
                          data-cluster-v2-connectx-verify>
-                        <div class="text-xs font-semibold text-blue-900">Verify a CUDA pair</div>
-                        <div class="text-[11px] text-blue-700 mt-0.5">Prove the selected workers’ ConnectX/NCCL direct link before the planner groups them as one fast pair.</div>
+                        <div class="text-xs font-semibold text-blue-900">{{ t('cluster.v2.cuda.verify_pair') }}</div>
+                        <div class="text-[11px] text-blue-700 mt-0.5">{{ t('cluster.v2.cuda.verify_blurb') }}</div>
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
                             <select x-model="cudaFabricMemberA"
                                     class="rounded-lg border border-blue-200 bg-white px-2 py-1.5 text-xs text-blue-900">
@@ -1477,8 +1460,8 @@
                         <button type="button" @click="verifyCudaFabric()"
                                 :disabled="cudaFabricLoading || !cudaFabricMemberA || !cudaFabricMemberB || cudaFabricMemberA === cudaFabricMemberB"
                                 class="mt-2 rounded-lg border border-blue-300 bg-white px-3 py-1.5 text-xs font-semibold text-blue-800 hover:bg-blue-100 disabled:opacity-40"
-                                x-text="cudaFabricLoading ? 'Verifying…' : 'Verify ConnectX'"></button>
-                        <div x-show="cudaFabricResult" class="text-[11px] text-green-700 mt-2">Direct link verified.</div>
+                                x-text="cudaFabricLoading ? window.t('cluster.v2.cuda.verifying') : window.t('cluster.v2.cuda.verify_connectx')"></button>
+                        <div x-show="cudaFabricResult" class="text-[11px] text-green-700 mt-2">{{ t('cluster.v2.cuda.direct_verified') }}</div>
                         <div x-show="cudaFabricError" class="text-[11px] text-red-700 mt-2" x-text="cudaFabricError"></div>
                     </div>
                     <div x-show="cudaJoin.error" class="mt-3 text-xs text-red-600" x-text="cudaJoin.error"></div>
@@ -1486,17 +1469,17 @@
 
                 <div class="rounded-2xl border border-neutral-200 bg-white p-5"
                      data-cluster-v2-diagnostics>
-                    <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Diagnostics</div>
-                    <h3 class="text-sm font-semibold text-neutral-900 mt-1">Save a redacted support report</h3>
+                    <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.diagnostics.title') }}</div>
+                    <h3 class="text-sm font-semibold text-neutral-900 mt-1">{{ t('cluster.v2.diagnostics.save_report') }}</h3>
                     <p class="text-xs text-neutral-500 mt-1 leading-relaxed">
-                        Captures device health, runtime ownership, staging state, transport evidence, and recent failures. Credentials and sensitive fields are redacted by the server.
+                        {{ t('cluster.v2.diagnostics.blurb') }}
                     </p>
                     <button type="button" @click="downloadClusterDiagnostics()"
                             :disabled="diagnosticsLoading"
                             class="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3 py-2 text-xs font-semibold text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
                             data-cluster-v2-download-diagnostics>
                         <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                        <span x-text="diagnosticsLoading ? 'Building report…' : 'Download diagnostic report'"></span>
+                        <span x-text="diagnosticsLoading ? window.t('cluster.v2.diagnostics.building') : window.t('cluster.v2.diagnostics.download')"></span>
                     </button>
                     <div x-show="diagnosticsError" class="mt-3 text-xs text-red-600" x-text="diagnosticsError"></div>
                 </div>
@@ -1516,7 +1499,7 @@
                     <span class="flex-1 min-w-0" x-text="toast.message"></span>
                     <button type="button" @click="dismissToast(toast.id)"
                             class="p-0.5 opacity-50 hover:opacity-100 flex-shrink-0"
-                            aria-label="Dismiss">
+                            aria-label="{{ t('cluster.v2.common.dismiss') }}">
                         <i data-lucide="x" class="w-3 h-3"></i>
                     </button>
                 </div>

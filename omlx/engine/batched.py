@@ -6,6 +6,7 @@ This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 """
 
+import asyncio
 import copy
 import logging
 from collections.abc import AsyncIterator
@@ -24,6 +25,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -786,11 +788,12 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        cancelled = False
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
                 try:
-                    self._engine.engine.close()
+                    cancelled = await _close_engine_core(self._engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
         _clear_teardown_references(
@@ -805,6 +808,8 @@ class BatchedEngine(BaseEngine):
         )
         self._loaded = False
         logger.info("BatchedEngine stopped")
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _apply_chat_template(
         self,
