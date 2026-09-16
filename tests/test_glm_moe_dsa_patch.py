@@ -638,7 +638,8 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     assert topk_indices.shape == (1, 1, 2, 2048)
 
 
-def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
+@pytest.mark.parametrize("routes", (192, 8193))
+def test_deepseek_affine_block_moe_kernels_match_gather_qmm_for_oq_bits(routes):
     mx = pytest.importorskip("mlx.core")
 
     try:
@@ -651,13 +652,14 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
     if not fast.has_symbol("deepseek_affine_gather_qmm_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
+    from omlx.oq import _weighted_affine_quantize
     from omlx.patches.deepseek_v4.switch_layers import (
         _block_config,
         _build_mxfp4_blocks,
     )
 
     mx.random.seed(11)
-    experts, output_dims, input_dims, routes = 8, 64, 128, 192
+    experts, output_dims, input_dims = 8, 64, 128
     indices = mx.array(
         sorted((i * 7) % experts for i in range(routes)),
         dtype=mx.int32,
@@ -667,7 +669,10 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
 
     for dtype in (mx.bfloat16, mx.float16):
         x = mx.random.normal((routes, 1, input_dims), dtype=dtype)
-        for bits in (2, 3):
+        # oQ and oQe share this affine group-64 runtime layout. Exercise the
+        # targeted oQ bit widths so the native single and paired expert kernels
+        # remain interchangeable with MLX's stock gather_qmm implementation.
+        for bits in (2, 3, 4, 6, 8):
             w0 = mx.random.normal(
                 (experts, output_dims, input_dims),
                 dtype=dtype,
@@ -676,75 +681,149 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
                 (experts, output_dims, input_dims),
                 dtype=dtype,
             )
-            q0, s0, b0 = mx.quantize(
-                w0,
-                group_size=64,
-                bits=bits,
-                mode="affine",
-            )
-            q1, s1, b1 = mx.quantize(
-                w1,
-                group_size=64,
-                bits=bits,
-                mode="affine",
-            )
+            quantized_pairs = [
+                (
+                    mx.quantize(w0, group_size=64, bits=bits, mode="affine"),
+                    mx.quantize(w1, group_size=64, bits=bits, mode="affine"),
+                )
+            ]
+            if bits in (4, 6, 8):
+                importance = mx.linspace(0.125, 4.0, input_dims)
+                quantized_pairs.append(
+                    (
+                        _weighted_affine_quantize(w0, 64, bits, importance),
+                        _weighted_affine_quantize(w1, 64, bits, importance),
+                    )
+                )
 
-            y_ref = mx.gather_qmm(
-                x,
-                q0,
-                s0,
-                b0,
-                rhs_indices=indices,
-                transpose=True,
-                group_size=64,
-                bits=bits,
-                mode="affine",
-                sorted_indices=True,
-            )
-            y_native = fast.deepseek_affine_gather_qmm_blocks(
-                x,
-                q0,
-                s0,
-                b0,
-                block_meta,
-                block_count,
-                64,
-                bits,
-                block_variant,
-            )
-            y_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks(
-                x,
-                q0,
-                s0,
-                b0,
-                q1,
-                s1,
-                b1,
-                block_meta,
-                block_count,
-                64,
-                bits,
-                block_variant,
-            )
-            y1_ref = mx.gather_qmm(
-                x,
-                q1,
-                s1,
-                b1,
-                rhs_indices=indices,
-                transpose=True,
-                group_size=64,
-                bits=bits,
-                mode="affine",
-                sorted_indices=True,
-            )
+            for (q0, s0, b0), (q1, s1, b1) in quantized_pairs:
+                y_ref = mx.gather_qmm(
+                    x,
+                    q0,
+                    s0,
+                    b0,
+                    rhs_indices=indices,
+                    transpose=True,
+                    group_size=64,
+                    bits=bits,
+                    mode="affine",
+                    sorted_indices=True,
+                )
+                y_native = fast.deepseek_affine_gather_qmm_blocks(
+                    x,
+                    q0,
+                    s0,
+                    b0,
+                    block_meta,
+                    block_count,
+                    64,
+                    bits,
+                    block_variant,
+                )
+                y_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks(
+                    x,
+                    q0,
+                    s0,
+                    b0,
+                    q1,
+                    s1,
+                    b1,
+                    block_meta,
+                    block_count,
+                    64,
+                    bits,
+                    block_variant,
+                )
+                y1_ref = mx.gather_qmm(
+                    x,
+                    q1,
+                    s1,
+                    b1,
+                    rhs_indices=indices,
+                    transpose=True,
+                    group_size=64,
+                    bits=bits,
+                    mode="affine",
+                    sorted_indices=True,
+                )
 
-            y0_pair = y_pair[..., :output_dims]
-            y1_pair = y_pair[..., output_dims:]
-            mx.eval(y_ref, y_native, y0_pair, y1_ref, y1_pair)
-            assert float(mx.max(mx.abs(y_ref - y_native)).item()) == 0.0
-            assert float(mx.max(mx.abs(y_ref - y0_pair)).item()) == 0.0
-            assert float(mx.max(mx.abs(y1_ref - y1_pair)).item()) == 0.0
+                y0_pair = y_pair[..., :output_dims]
+                y1_pair = y_pair[..., output_dims:]
+                mx.eval(y_ref, y_native, y0_pair, y1_ref, y1_pair)
+                assert float(mx.max(mx.abs(y_ref - y_native)).item()) == 0.0
+                assert float(mx.max(mx.abs(y_ref - y0_pair)).item()) == 0.0
+                assert float(mx.max(mx.abs(y1_ref - y1_pair)).item()) == 0.0
+
+
+def test_deepseek_affine_bit_capability_fails_closed_for_stale_extension(
+    monkeypatch,
+):
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    monkeypatch.setattr(fast, "_EXT_HAS_AFFINE_Q468", False, raising=False)
+
+    assert fast.affine_moe_supports_bits(2)
+    assert fast.affine_moe_supports_bits(3)
+    assert not fast.affine_moe_supports_bits(4)
+    assert not fast.affine_moe_supports_bits(6)
+    assert not fast.affine_moe_supports_bits(8)
+
+
+@pytest.mark.parametrize("bits", (4, 6, 8))
+def test_deepseek_affine_route_rejects_new_bits_on_stale_extension(
+    monkeypatch, bits
+):
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.deepseek_v4.switch_layers import QuantizedSwitchLinear
+
+    layer = QuantizedSwitchLinear(
+        128,
+        64,
+        8,
+        bias=False,
+        group_size=64,
+        bits=bits,
+        mode="affine",
+    )
+    layer.scales = layer.scales.astype(mx.bfloat16)
+    layer.biases = layer.biases.astype(mx.bfloat16)
+    from omlx.patches.deepseek_v4 import switch_layers
+
+    x = mx.zeros(
+        (switch_layers._AFFINE_NATIVE_MIN_ROUTES, 1, 128), dtype=mx.bfloat16
+    )
+
+    monkeypatch.setattr(fast, "has_symbol", lambda _name: True)
+    monkeypatch.setattr(fast, "_EXT_HAS_AFFINE_Q468", True)
+    assert layer._can_use_affine_blocks(x, sorted_indices=True)
+    monkeypatch.setattr(fast, "_EXT_HAS_AFFINE_Q468", False)
+
+    assert not layer._can_use_affine_blocks(x, sorted_indices=True)
+
+
+@pytest.mark.parametrize("bits", (2, 3, 4, 6, 8))
+def test_deepseek_affine_route_respects_current_threshold(monkeypatch, bits):
+    mx = pytest.importorskip("mlx.core")
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.deepseek_v4 import switch_layers
+
+    monkeypatch.setattr(switch_layers, "_AFFINE_NATIVE_MIN_ROUTES", 1024)
+    monkeypatch.setattr(fast, "has_symbol", lambda _name: True)
+    monkeypatch.setattr(fast, "_EXT_HAS_AFFINE_Q468", True)
+    layer = switch_layers.QuantizedSwitchLinear(
+        128, 64, 8, bias=False, group_size=64, bits=bits, mode="affine"
+    )
+    layer.scales = layer.scales.astype(mx.bfloat16)
+    layer.biases = layer.biases.astype(mx.bfloat16)
+
+    assert not layer._can_use_affine_blocks(
+        mx.zeros((1023, 1, 128), dtype=mx.bfloat16), sorted_indices=True
+    )
+    assert layer._can_use_affine_blocks(
+        mx.zeros((1024, 1, 128), dtype=mx.bfloat16), sorted_indices=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -774,7 +853,11 @@ def test_deepseek_block_thresholds_are_scoped_by_native_kind(
     assert switch_layers._block_config(num_routes, native_kind) == expected
 
 
-def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
+@pytest.mark.parametrize("native_capable", (True, False))
+@pytest.mark.parametrize("bits", (2, 3, 4, 6, 8))
+def test_deepseek_switchglu_uses_affine_block_kernels(
+    monkeypatch, bits, native_capable
+):
     mx = pytest.importorskip("mlx.core")
 
     try:
@@ -787,14 +870,19 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
-    from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+    from omlx.patches.deepseek_v4.switch_layers import (
+        QuantizedSwitchLinear,
+        SwitchGLU,
+    )
+
+    monkeypatch.setattr(fast, "_EXT_HAS_AFFINE_Q468", native_capable)
 
     mx.random.seed(13)
 
     def quantized_affine(layer):
         layer = layer.to_quantized(
             group_size=64,
-            bits=3,
+            bits=bits,
             mode="affine",
         )
         layer.scales = layer.scales.astype(mx.bfloat16)
@@ -831,10 +919,20 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     mx.eval(y)
 
     assert y.shape == (1, 512, 2, 128)
-    assert calls == {"pair": 1, "single": 1}
+    expected = 1 if native_capable or bits in (2, 3) else 0
+    assert calls == {"pair": expected, "single": expected}
+
+    with monkeypatch.context() as stock:
+        stock.setattr(
+            QuantizedSwitchLinear, "_native_block_kind", lambda *a, **k: None
+        )
+        reference = model(x, indices)
+        mx.eval(reference)
+    assert mx.allclose(y, reference, atol=1e-3, rtol=1e-3).item()
 
 
-def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch):
+@pytest.mark.parametrize("bits", (2, 3, 4, 6, 8))
+def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch, bits):
     mx = pytest.importorskip("mlx.core")
 
     try:
@@ -854,7 +952,7 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
     def quantized_affine(layer):
         layer = layer.to_quantized(
             group_size=64,
-            bits=3,
+            bits=bits,
             mode="affine",
         )
         layer.scales = layer.scales.astype(mx.float16)
@@ -1332,7 +1430,8 @@ def test_glm_adaptive_decode_clears_only_on_the_512_step_cadence():
     assert streams == []
 
 
-def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatch):
+@pytest.mark.parametrize("bits", (2, 3, 4, 6, 8))
+def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatch, bits):
     """Small affine windows use stock gather_qmm after sorting."""
     mx = pytest.importorskip("mlx.core")
     pytest.importorskip("mlx.nn")
@@ -1348,7 +1447,7 @@ def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatc
     mx.random.seed(23)
     model = SwitchGLU(128, 64, 8)
     for name in ("gate_proj", "up_proj", "down_proj"):
-        layer = getattr(model, name).to_quantized(group_size=64, bits=2, mode="affine")
+        layer = getattr(model, name).to_quantized(group_size=64, bits=bits, mode="affine")
         layer.scales = layer.scales.astype(mx.float16)
         layer.biases = layer.biases.astype(mx.float16)
         setattr(model, name, layer)
