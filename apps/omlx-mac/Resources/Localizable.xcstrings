@@ -3859,7 +3859,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "结果反映基准测试时的可用内存和内存防护层级；对任一重大更改后请重新运行。"
+            "value" : "结果反映基准测试时的可用内存和内存防护层级；两者任一发生重大变化后，请重新运行。"
           }
         }
       }
@@ -4231,7 +4231,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "提示词处理 TPS"
           }
         }
       }
@@ -4279,7 +4279,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "生成 TPS"
           }
         }
       }
@@ -5005,7 +5005,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "提示词处理 TPS"
           }
         }
       }
@@ -5053,7 +5053,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "生成 TPS"
           }
         }
       }
@@ -5125,7 +5125,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "TTFT (ms)"
+            "value" : "TTFT（毫秒）"
           }
         }
       }
@@ -6370,7 +6370,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "https://hf-mirror.com （空 = huggingface.co）"
+            "value" : "https://hf-mirror.com（空 = huggingface.co）"
           }
         }
       }
@@ -6514,7 +6514,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "https://modelscope.cn （空 = ModelScope 默认值）"
+            "value" : "https://modelscope.cn（空 = ModelScope 默认值）"
           }
         }
       }
@@ -6682,7 +6682,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ModelScope"
+            "value" : "魔搭社区"
           }
         }
       }
@@ -6850,7 +6850,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已排队"
+            "value" : "排队中"
           }
         }
       }
@@ -8858,7 +8858,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "与 oMLX 对话"
+            "value" : "与 oMLX 聊天"
           }
         }
       }
@@ -9122,7 +9122,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "全部时间"
+            "value" : "累计"
           }
         }
       }
@@ -9554,7 +9554,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "没有已加载的模型"
+            "value" : "尚未加载模型"
           }
         }
       }
@@ -13578,7 +13578,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "标准 oQ 的功能"
+            "value" : "标准 oQ 的作用"
           }
         }
       }
@@ -13962,7 +13962,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "加权量化误差。"
+            "value" : "对量化误差加权。"
           }
         }
       }
@@ -13986,7 +13986,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在仿射量化期间，oQe 通过最小化 sum(importance * (weight - dequantized_weight)^2) 来选择缩放/偏移候选，而不是简单的未加权 MSE。"
+            "value" : "在仿射量化期间，oQe 通过最小化 sum(importance * (weight - dequantized_weight)^2) 来选择 scale/bias 候选，而非普通的未加权 MSE。"
           }
         }
       }
@@ -14058,7 +14058,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "位分配"
+            "value" : "位宽分配"
           }
         }
       }
@@ -14202,7 +14202,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "相同 oQ 计划"
+            "value" : "相同的 oQ 方案"
           }
         }
       }
@@ -24428,7 +24428,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "下载器"
+            "value" : "下载"
           }
         },
         "zh-Hant" : {
@@ -24816,7 +24816,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仪表盘"
+            "value" : "服务器"
           }
         },
         "zh-Hant" : {
@@ -24857,7 +24857,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务统计"
+            "value" : "状态"
           }
         },
         "zh-Hant" : {
@@ -29292,7 +29292,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "没有可用的模型"
+            "value" : "暂无可用模型"
           }
         },
         "zh-Hant" : {
