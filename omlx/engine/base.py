@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 import mlx.core as mx
 
+from omlx.api.tool_calling import convert_tools_for_template
 from omlx.engine_core import get_mlx_executor
 
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
@@ -220,6 +221,41 @@ class BaseEngine(ABC):
     Both SimpleEngine and BatchedEngine implement this interface,
     allowing the server to use either without code changes.
     """
+
+    def prepare_chat_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Normalize chat messages for this engine (Harmony / K2 adapters).
+
+        Engines that need no normalization return the list unchanged.  Kept
+        separate from :meth:`render_chat_prompt` because callers that render a
+        prompt also reuse the prepared messages (SpecPrefill boundaries).
+        """
+        preprocess = getattr(self, "_preprocess_messages", None)
+        return preprocess(messages) if preprocess is not None else messages
+
+    def render_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        *,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> str:
+        """Render prepared chat messages into the prompt string of a real turn.
+
+        Tool-schema conversion plus the model chat template — the last two
+        steps before tokenization.  ``chat``/``stream_chat`` and the cache
+        probe / cache-artifact export all render through here: the prompt block
+        cache is keyed on the resulting token ids, so a second implementation
+        silently misses every cached block (#3615).  Pass messages through
+        :meth:`prepare_chat_messages` first.
+        """
+        template_tools = convert_tools_for_template(tools) if tools else None
+        return self._apply_chat_template(
+            messages,
+            template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
 
     @property
     def supports_early_tool_call_streaming(self) -> bool:

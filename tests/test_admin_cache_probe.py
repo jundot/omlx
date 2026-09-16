@@ -9,7 +9,9 @@ import pytest
 from fastapi import HTTPException
 
 import omlx.admin.routes as admin_routes
-import omlx.server  # noqa: F401 — triggers set_admin_getters
+import omlx.server as omlx_server  # triggers set_admin_getters
+from omlx.api.openai_models import ChatCompletionRequest
+from omlx.api.utils import extract_text_content
 from omlx.cache.paged_cache import compute_block_hash
 from omlx.model_settings import ModelSettings, merge_chat_template_kwargs
 
@@ -65,13 +67,29 @@ def _make_engine_entry(
     """Build the engine_pool._entries[model_id] namespace chain."""
     engine_ns = SimpleNamespace(
         _tokenizer=tokenizer,
+        tokenizer=tokenizer,
         _engine=SimpleNamespace(
             engine=SimpleNamespace(scheduler=scheduler),
         ),
     )
     if has_apply_chat_template:
         engine_ns._apply_chat_template = lambda msgs, tools, **kw: "rendered prompt"
-    return SimpleNamespace(engine=engine_ns)
+        # Bind the production render helpers so the fake behaves like a real
+        # BaseEngine (prepare -> render -> tokenize) instead of faking the
+        # canonical sequence a second time.
+        from omlx.engine.base import BaseEngine
+
+        engine_ns.prepare_chat_messages = BaseEngine.prepare_chat_messages.__get__(
+            engine_ns
+        )
+        engine_ns.render_chat_prompt = BaseEngine.render_chat_prompt.__get__(
+            engine_ns
+        )
+        engine_ns.count_chat_tokens = lambda msgs, tools=None, **kw: len(
+            tokenizer.encode("rendered prompt")
+        )
+    # Real EngineEntry always exposes these; the turn preparation reads both.
+    return SimpleNamespace(engine=engine_ns, preserve_thinking_default=None)
 
 
 def _make_scheduler(
@@ -104,17 +122,18 @@ def _pool_with(entries):
 # ---------------------------------------------------------------------------
 
 
-class TestCacheProbeToolCallNormalization:
-    """Verify cache probing mirrors chat-path tool argument normalization."""
+class TestCacheProbeToolCallParity:
+    """A tool-using conversation probes through the same extraction chat uses.
 
-    @pytest.mark.parametrize(
-        ("arguments", "expected"),
-        [
-            ('{"city":"Seoul"}', {"city": "Seoul"}),
-            ("   ", {}),
-        ],
-    )
-    def test_normalizes_arguments_before_rendering(self, arguments, expected):
+    Regression: the probe parsed echoed tool_call arguments itself and handed
+    raw dicts to the template, while a real turn runs ``extract_text_content``
+    first (which renders assistant tool calls as text for templates without a
+    native tool role). Two renderers meant two prompts, and the probe reported
+    misses for prompts that were cached (#3615).
+    """
+
+    @pytest.mark.parametrize("arguments", ['{"city":"Seoul"}', "   "])
+    def test_probe_renders_tool_turn_like_the_chat_path(self, arguments):
         messages = [
             {"role": "user", "content": "Check the weather."},
             {
@@ -148,15 +167,18 @@ class TestCacheProbeToolCallNormalization:
         pool = _pool_with({MODEL_ID: entry})
 
         with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
-            asyncio.run(admin_routes.probe_cache(request, is_admin=True))
+            result = asyncio.run(admin_routes.probe_cache(request, is_admin=True))
 
-        normalized_arguments = rendered_messages[1]["tool_calls"][0]["function"][
-            "arguments"
-        ]
-        assert normalized_arguments == expected
-        assert (
-            request.messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
+        served = extract_text_content(
+            ChatCompletionRequest(
+                model=MODEL_ID, messages=messages, max_tokens=1
+            ).messages,
+            None,
+            tokenizer,
+            native_reasoning_content=False,
         )
+        assert rendered_messages == served
+        assert result["total_tokens"] == 4
 
 
 class TestCacheProbeErrors:
@@ -500,7 +522,9 @@ class TestCacheProbeChatTemplateKwargs:
                 "_get_engine_pool",
                 return_value=_pool_with({MODEL_ID: entry}),
             ),
-            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            # The serving turn preparation reads settings from server state —
+            # one source of truth for probe, export and chat.
+            patch.object(omlx_server._server_state, "settings_manager", manager),
         ):
             asyncio.run(admin_routes.probe_cache(request, is_admin=True))
         return seen["ct"]
@@ -567,12 +591,20 @@ class TestCacheProbeChatTemplateKwargs:
         rendered = self._rendered_kwargs(settings, {"enable_thinking": True})
         assert rendered == {"enable_thinking": False}
 
-    def test_settings_lookup_failure_falls_back_to_request_kwargs(self):
-        """A settings failure must degrade, not break probing outright."""
-        rendered = self._rendered_kwargs(
-            None, {"enable_thinking": True}, lookup_raises=True
-        )
-        assert rendered == {"enable_thinking": True}
+    def test_settings_lookup_failure_surfaces(self):
+        """A broken settings store fails the probe instead of lying about hits.
+
+        The probe used to fall back to the request's own kwargs, which renders
+        a prompt nobody served and answers "cold" for a fully cached prefix. It
+        now replays the serving turn, so the same store outage that breaks a
+        chat turn breaks the probe — visibly.
+        """
+        with pytest.raises(HTTPException) as excinfo:
+            self._rendered_kwargs(
+                None, {"enable_thinking": True}, lookup_raises=True
+            )
+        assert excinfo.value.status_code == 400
+        assert "settings store unavailable" in str(excinfo.value.detail)
 
     def test_no_settings_and_no_kwargs_renders_none(self):
         assert self._rendered_kwargs(None) is None

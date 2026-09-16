@@ -25,7 +25,6 @@ from typing import Any
 import mlx.core as mx
 
 from ..adapter.output_parser import detect_output_parser
-from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.observability import CacheRateTracker
 from ..exceptions import PrefillMemoryAbortedError
@@ -956,10 +955,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         Returns:
             Number of prompt tokens
         """
-        template_tools = convert_tools_for_template(tools) if tools else None
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
+        prompt = self.render_chat_prompt(
+            self.prepare_chat_messages(messages),
+            tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
@@ -1889,12 +1887,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 **kwargs,
             )
 
-        template_tools = convert_tools_for_template(tools) if tools else None
+        messages = self.prepare_chat_messages(messages)
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         is_partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = self.render_chat_prompt(
             messages,
-            template_tools,
+            tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=is_partial,
         )
@@ -1969,12 +1967,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 yield output
             return
 
-        template_tools = convert_tools_for_template(tools) if tools else None
+        messages = self.prepare_chat_messages(messages)
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         is_partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = self.render_chat_prompt(
             messages,
-            template_tools,
+            tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=is_partial,
         )

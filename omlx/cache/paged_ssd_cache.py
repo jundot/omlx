@@ -29,6 +29,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,9 @@ _PENDING_WRITES_HARD_RAM_FRACTION = 0.30
 _PENDING_WRITES_SOFT_FLOOR = 32
 _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
+# Per-block wait budget for flush_blocks(): the background writer normally
+# commits a forced flush in milliseconds; this is a stall backstop.
+_FLUSH_BLOCKS_WAIT_SECONDS = 30.0
 
 # Conservative defaults for the per-block cost estimator. The actual
 # bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
@@ -5090,6 +5094,57 @@ class PagedSSDCacheManager(CacheManager):
 
         logger.debug("PagedSSDCacheManager closed")
 
+    def flush_blocks(self, block_hashes: Iterable[bytes]) -> int:
+        """Force-write the given hot-cache blocks to SSD synchronously.
+
+        In write-back retention a freshly saved block lives in the hot cache
+        with no SSD index entry and no queued write — it only reaches disk on
+        eviction or shutdown, so on a lightly loaded machine a fresh session
+        stays in RAM indefinitely. Callers that need durable files for a
+        specific set of blocks (e.g. cache artifact export) force their
+        writes here: each dirty block is enqueued blocking, so its file
+        exists and its index entry exists when this returns.
+
+        Args:
+            block_hashes: Block content hashes to flush.
+
+        Returns:
+            Number of blocks materialized to SSD by this call (files verified
+            on disk; the writer is waited on per block).
+        """
+        if not HAS_MLX or self._hot_cache_only or not self._hot_cache_enabled:
+            return 0
+        with self._hot_cache_lock:
+            entries = [
+                (block_hash, self._hot_cache[block_hash])
+                for block_hash in block_hashes
+                if block_hash in self._hot_cache
+            ]
+        flushed = 0
+        deadline = time.monotonic() + _FLUSH_BLOCKS_WAIT_SECONDS
+        for block_hash, entry in entries:
+            if self._writer_thread is not None and not self._writer_thread.is_alive():
+                break
+            if not entry.get("dirty", True):
+                continue
+            block_metadata = entry.get("block_metadata")
+            if block_metadata is not None and block_metadata.file_path.exists():
+                continue
+            if not self._enqueue_ssd_write(block_hash, entry, blocking=True):
+                continue
+            # Enqueueing guarantees queue space, not completion: wait for the
+            # writer to clear this block's pending entry, then count the file
+            # that actually exists (failed writes stay dirty for a retry).
+            while self._pending_write_buffer_get(block_hash) is not None:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            if block_metadata.file_path.exists():
+                flushed += 1
+        if flushed:
+            logger.info(f"Flushed {flushed} hot cache blocks to SSD on demand")
+        return flushed
+
     def __repr__(self) -> str:
         return (
             f"PagedSSDCacheManager(dir={self._cache_dir}, "
@@ -5191,3 +5246,8 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
+
+    @property
+    def hot_cache_only(self) -> bool:
+        """True when retention is RAM-only (no SSD I/O is performed)."""
+        return self._hot_cache_only
