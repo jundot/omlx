@@ -328,8 +328,15 @@ class VisionFeatureSSDCache:
             try:
                 if oldest.file_path.exists():
                     oldest.file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                # The index entry is already gone; a leftover file would be
+                # orphaned and the tracked size would drift. Surface it so
+                # eviction failures are not silently invisible.
+                logger.warning(
+                    "Failed to remove evicted vision cache file %s: %s",
+                    oldest.file_path,
+                    e,
+                )
 
     def _load_from_ssd(self, key: str) -> Optional[Any]:
         """Load cached features from SSD.
@@ -391,8 +398,12 @@ class VisionFeatureSSDCache:
             try:
                 if file_path.exists():
                     file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove unusable vision cache file %s: %s",
+                    file_path,
+                    e,
+                )
             return None
 
     def _scan_existing_files(self) -> None:
@@ -502,8 +513,10 @@ class VisionFeatureSSDCache:
                     try:
                         if p is not None and p.exists():
                             p.unlink()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to clean up vision cache file %s: %s", p, e
+                        )
             finally:
                 with self._pending_lock:
                     self._pending_write_keys.discard(key)
