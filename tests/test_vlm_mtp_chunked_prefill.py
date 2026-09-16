@@ -52,6 +52,7 @@ def _make_fixture(monkeypatch, drafter_returns_uid):
         _finalize_chunked_prefill_cache_for_insert=lambda req, cache: None,
         _stream=mx.default_stream(mx.default_device()),
         batch_generator=SimpleNamespace(insert=fake_bg_insert),
+        block_aware_cache=None,  # ordinary scheduler with prefix caching disabled
         model=SimpleNamespace(),  # no register_rope_delta attr -> skipped
         request_id_to_uid={},
         uid_to_request_id={},
