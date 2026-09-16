@@ -33,6 +33,7 @@ struct ModelSettingsScreen: View {
                     .padding(.trailing, 14)
                     .padding(.bottom, 10)
             }
+            .zIndex(1)
 
             SectionPicker(selection: $vm.section)
 
@@ -128,42 +129,52 @@ private struct SnapshotActions: View {
     let vm: ModelSettingsScreenVM
     let client: OMLXClient
     @Environment(\.omlxTheme) private var theme
+    @State private var hoveredAction: String?
 
     var body: some View {
         HStack(spacing: 6) {
             if vm.isApplyingSettings {
                 ProgressView().controlSize(.small)
             }
-            Button {
-                vm.pendingReset = true
-            } label: {
-                actionLabel(String(localized: "settings.actions.reset",
+            actionButton(String(localized: "settings.actions.reset",
                           defaultValue: "Reset defaults",
                           comment: "Header button that returns every setting of the model to its default"),
-                            systemImage: "arrow.counterclockwise")
+                         systemImage: "arrow.counterclockwise") {
+                vm.pendingReset = true
             }
-            Button {
-                Task { await vm.loadOptimalCandidates(client: client) }
-            } label: {
-                actionLabel(String(localized: "settings.actions.optimal",
+            actionButton(String(localized: "settings.actions.optimal",
                           defaultValue: "Apply optimal settings",
                           comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"),
-                            systemImage: "wand.and.stars")
+                         systemImage: "wand.and.stars") {
+                Task { await vm.loadOptimalCandidates(client: client) }
             }
-            Button {
-                vm.applyError = nil
-                vm.applyOutcome = .recipeInput
-            } label: {
-                actionLabel(String(localized: "settings.actions.recipe",
+            actionButton(String(localized: "settings.actions.recipe",
                           defaultValue: "Apply custom recipe",
                           comment: "Header button that opens the paste-a-recipe sheet"),
-                            systemImage: "doc.on.clipboard")
+                         systemImage: "doc.on.clipboard") {
+                vm.applyError = nil
+                vm.applyOutcome = .recipeInput
             }
         }
         .buttonStyle(.omlx(.normal, size: .small))
         .buttonBorderShape(.roundedRectangle(radius: 6))
         .fixedSize(horizontal: true, vertical: false)
         .disabled(vm.isApplyingSettings)
+        .overlay(alignment: .topTrailing) {
+            if let hoveredAction {
+                Text(hoveredAction)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    .shadow(color: .black.opacity(0.12), radius: 3, y: 2)
+                    .fixedSize()
+                    .offset(y: 34)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
         .confirmationDialog(
             String(localized: "settings.actions.reset.confirm_title",
                    defaultValue: "Reset every setting of this model?",
@@ -199,13 +210,26 @@ private struct SnapshotActions: View {
         }
     }
 
-    private func actionLabel(_ title: String, systemImage: String) -> some View {
-        Label(title, systemImage: systemImage)
-            .labelStyle(.iconOnly)
-            .font(.omlxText(12))
-            .frame(width: 20, height: 22)
-            .help(title)
-            .accessibilityLabel(title)
+    private func actionButton(
+        _ title: String, systemImage: String, action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            hoveredAction = nil
+            action()
+        } label: {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.iconOnly)
+                .font(.omlxText(12))
+                .frame(width: 20, height: 22)
+        }
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            if hovering {
+                hoveredAction = title
+            } else if hoveredAction == title {
+                hoveredAction = nil
+            }
+        }
     }
 }
 
