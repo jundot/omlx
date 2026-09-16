@@ -115,7 +115,8 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
       return true;
     }
     if (q_latent.shape(3) != 512 || kv_latent.shape(3) != 512 ||
-        q_pe.shape(3) != 64 || k_pe.shape(3) != 64) {
+        q_pe.shape(3) != k_pe.shape(3) ||
+        (q_pe.shape(3) != 0 && q_pe.shape(3) != 64)) {
       return true;
     }
     if (q_latent.shape(2) <= 1 || topk_indices.shape(3) < 16 ||
@@ -182,7 +183,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
     const int bk = (q_latent.shape(1) == 32) ? 128 : 256;
     constexpr int dc = 32;
     constexpr int d_latent = 512;
-    constexpr int d_pe = 64;
+    const int d_pe = q_pe.shape(3);
 
     const int B = q_latent.shape(0);
     const int H = q_latent.shape(1);
@@ -461,6 +462,42 @@ array glm_dsa_sparse_mla_attention(
           topk_length.has_value(),
           causal_prefix_rows),
       std::move(inputs));
+}
+
+array glm_dsa_nope_sparse_mla_attention(
+    const array& q_latent,
+    const array& q_pe,
+    const array& kv_latent,
+    const array& k_pe,
+    const array& topk_indices,
+    float scale,
+    bool causal,
+    bool topk_valid_prefix,
+    bool causal_prefix_indices,
+    const std::optional<array>& topk_length,
+    int causal_prefix_rows,
+    StreamOrDevice s) {
+  if (q_pe.ndim() != 4 || k_pe.ndim() != 4 || q_pe.shape(3) != 0 ||
+      k_pe.shape(3) != 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_nope_sparse_mla_attention] expected "
+           "zero-width q_pe and k_pe, got "
+        << q_pe.shape() << " and " << k_pe.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  return glm_dsa_sparse_mla_attention(
+      q_latent,
+      q_pe,
+      kv_latent,
+      k_pe,
+      topk_indices,
+      scale,
+      causal,
+      topk_valid_prefix,
+      causal_prefix_indices,
+      topk_length,
+      causal_prefix_rows,
+      s);
 }
 
 } // namespace omlx::glm_kernels
