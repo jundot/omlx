@@ -6,9 +6,11 @@ flags, and metadata.
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
+import tempfile
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -588,10 +590,122 @@ class ModelSettingsManager:
         # Ensure base directory exists
         self.base_path.mkdir(parents=True, exist_ok=True)
 
-        # Load existing settings
+        # Repair raw references before normal loading can normalize old records.
+        self._repair_profile_references()
         self._load()
         self._load_profiles()
         self._load_templates()
+
+    def _repair_profile_references(self) -> None:
+        """Detach missing references without changing saved settings or IDs."""
+        originals = {}
+        documents = {}
+        try:
+            for path, key, version in (
+                (self.settings_file, "models", SETTINGS_VERSION),
+                (self.profiles_file, "profiles", PROFILES_VERSION),
+                (self.templates_file, "templates", TEMPLATES_VERSION),
+            ):
+                if path.exists():
+                    originals[path] = path.read_bytes()
+                    document = json.loads(originals[path])
+                else:
+                    document = {"version": version, key: {}}
+                if (
+                    not isinstance(document, dict)
+                    or document.get("version", 1) != version
+                ):
+                    raise ValueError(f"Unsupported profile storage format: {path.name}")
+                records = document.get(key, {})
+                if not isinstance(records, dict) or any(
+                    not isinstance(record, dict) for record in records.values()
+                ):
+                    raise ValueError(f"Invalid profile records: {path.name}")
+                documents[path] = document
+
+            profiles = documents[self.profiles_file].get("profiles", {})
+            templates = documents[self.templates_file].get("templates", {})
+            settings = documents[self.settings_file].get("models", {})
+            detached = cleared = 0
+            for model_profiles in profiles.values():
+                for profile in model_profiles.values():
+                    if not isinstance(profile, dict):
+                        raise ValueError("Invalid model profile record")
+                    source = profile.get("source_template")
+                    if source is not None and source not in templates:
+                        profile["source_template"] = None
+                        detached += 1
+            for model_id, model_settings in settings.items():
+                active = model_settings.get("active_profile_name")
+                if active is not None and active not in profiles.get(model_id, {}):
+                    model_settings["active_profile_name"] = None
+                    cleared += 1
+        except (OSError, ValueError, TypeError) as error:
+            logger.warning("Skipped profile reference repair: %s", error)
+            return
+
+        changed = []
+        if detached:
+            changed.append(self.profiles_file)
+        if cleared:
+            changed.append(self.settings_file)
+        if not changed:
+            return
+
+        digest = hashlib.sha256()
+        for path, content in originals.items():
+            digest.update(path.name.encode("utf-8") + b"\0")
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        backup = self.base_path / f"profile-reference-backup-{digest.hexdigest()}"
+        written = []
+        try:
+            backup.mkdir(exist_ok=True)
+            for path, content in originals.items():
+                target = backup / path.name
+                if not target.exists():
+                    self._write_profile_repair(target, content)
+                if target.read_bytes() != content:
+                    raise OSError(f"Profile backup does not match original: {target}")
+            for path in changed:
+                content = json.dumps(
+                    documents[path], indent=2, ensure_ascii=False
+                ).encode("utf-8")
+                self._write_profile_repair(path, content)
+                written.append(path)
+        except OSError:
+            try:
+                for path in written:
+                    self._write_profile_repair(path, originals[path])
+            except OSError:
+                logger.exception(
+                    "Profile reference repair rollback failed; recover originals from %s",
+                    backup,
+                )
+                raise
+            logger.exception("Profile reference repair failed; original files retained")
+            return
+        logger.info(
+            "Repaired profile references: %d detached copies, %d cleared active references; backup: %s",
+            detached,
+            cleared,
+            backup,
+        )
+
+    @staticmethod
+    def _write_profile_repair(path: Path, content: bytes) -> None:
+        """Replace one raw document atomically, including when rolling back."""
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _load(self) -> None:
         """Load settings from the JSON file.
@@ -1351,28 +1465,9 @@ class ModelSettingsManager:
 
             settings_snapshot = copy.deepcopy(self._settings)
 
-            current = self._settings.get(model_id)
-            if current is None:
-                current = ModelSettings()
-            # Universal fields: the profile is authoritative — absent keys
-            # reset to ModelSettings defaults. Model-specific fields keep
-            # additive overlay so preset/template chips (materialized as
-            # universal-only profiles) never disturb engine settings.
-            merged = {
-                k: v
-                for k, v in current.to_dict().items()
-                if k not in UNIVERSAL_FIELDS_SET
-            }
-            merged.update(filter_profile_fields(profile_settings))
-            merged["active_profile_name"] = name
-            if settings_sanitizer is not None:
-                settings_sanitizer(merged)
-            # Keep persistent profile application consistent with request-time
-            # profile overlays: output-shaping settings win over the speed-only
-            # VLM MTP toggle when the merged settings need logits processors.
-            merged, _ = resolve_vlm_mtp_conflicts(merged)
-            merged, _ = resolve_qwen35_prefill_conflicts(merged)
-            new_settings = ModelSettings.from_dict(merged)
+            new_settings = self._applied_profile_settings_locked(
+                model_id, name, profile_settings, settings_sanitizer
+            )
             self._settings[model_id] = new_settings
             try:
                 self._save()
@@ -1380,6 +1475,104 @@ class ModelSettingsManager:
                 self._settings = settings_snapshot
                 raise
             return ModelSettings.from_dict(new_settings.to_dict())
+
+    def _applied_profile_settings_locked(
+        self,
+        model_id: str,
+        name: str,
+        profile_settings: dict[str, Any],
+        settings_sanitizer: Callable[[dict[str, Any]], None] | None,
+    ) -> ModelSettings:
+        current = self._settings.get(model_id)
+        if current is None:
+            current = ModelSettings()
+        # Universal fields: the profile is authoritative — absent keys
+        # reset to ModelSettings defaults. Model-specific fields keep
+        # additive overlay so preset/template chips (materialized as
+        # universal-only profiles) never disturb engine settings.
+        merged = {
+            k: v for k, v in current.to_dict().items() if k not in UNIVERSAL_FIELDS_SET
+        }
+        merged.update(filter_profile_fields(profile_settings))
+        merged["active_profile_name"] = name
+        if settings_sanitizer is not None:
+            settings_sanitizer(merged)
+        # Keep persistent profile application consistent with request-time
+        # profile overlays: output-shaping settings win over the speed-only
+        # VLM MTP toggle when the merged settings need logits processors.
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
+        merged, _ = resolve_qwen35_prefill_conflicts(merged)
+        new_settings = ModelSettings.from_dict(merged)
+        return new_settings
+
+    def apply_template(
+        self,
+        model_id: str,
+        template_name: str,
+        settings_sanitizer: Callable[[dict[str, Any]], None] | None = None,
+    ) -> ModelSettings | None:
+        """Apply the latest template without replacing an unrelated model profile."""
+        with self._lock:
+            template = self._templates.get(template_name)
+            if template is None:
+                return None
+            per_model = self._profiles.get(model_id, {})
+            copies = [
+                p
+                for p in per_model.values()
+                if p.get("source_template") == template_name
+            ]
+            active = self._settings.get(model_id)
+            profile = next(
+                (
+                    p
+                    for p in copies
+                    if active and p["name"] == active.active_profile_name
+                ),
+                copies[0] if copies else None,
+            )
+            now = utcnow().isoformat()
+            if profile is None:
+                name = self._dedupe_profile_api_name(template_name, set(per_model))
+                profile = {
+                    "name": name,
+                    "api_name": self._allocate_profile_api_name_locked(
+                        per_model,
+                        None,
+                        display_name=template["display_name"],
+                        internal_name=name,
+                    ),
+                    "created_at": now,
+                    "expose_as_model": False,
+                }
+            else:
+                profile = dict(profile)
+            profile.update(
+                display_name=template["display_name"],
+                description=template.get("description"),
+                source_template=template_name,
+                settings=filter_universal_fields(template.get("settings", {})),
+                updated_at=now,
+            )
+            applied = self._applied_profile_settings_locked(
+                model_id, profile["name"], profile["settings"], settings_sanitizer
+            )
+            profiles_snapshot = copy.deepcopy(self._profiles)
+            settings_snapshot = copy.deepcopy(self._settings)
+            self._profiles.setdefault(model_id, {})[profile["name"]] = profile
+            self._settings[model_id] = applied
+            profiles_saved = False
+            try:
+                self._save_profiles()
+                profiles_saved = True
+                self._save()
+            except Exception:
+                self._profiles = profiles_snapshot
+                self._settings = settings_snapshot
+                if profiles_saved:
+                    self._save_profiles()
+                raise
+            return ModelSettings.from_dict(applied.to_dict())
 
     # ==================== Templates ====================
 
@@ -1517,19 +1710,48 @@ class ModelSettingsManager:
             if settings is not None:
                 template["settings"] = filter_universal_fields(settings)
             template["updated_at"] = utcnow().isoformat()
+            templates_snapshot = copy.deepcopy(self._templates)
+            profiles_snapshot = copy.deepcopy(self._profiles)
             if target != name:
                 del self._templates[name]
+                for profiles in self._profiles.values():
+                    for profile in profiles.values():
+                        if profile.get("source_template") == name:
+                            profile["source_template"] = target
             self._templates[target] = template
-            self._save_templates()
+            self._save_template_references(templates_snapshot, profiles_snapshot)
             return dict(template)
 
     def delete_template(self, name: str) -> bool:
         with self._lock:
             if name not in self._templates:
                 return False
+            templates_snapshot = copy.deepcopy(self._templates)
+            profiles_snapshot = copy.deepcopy(self._profiles)
             del self._templates[name]
-            self._save_templates()
+            for profiles in self._profiles.values():
+                for profile in profiles.values():
+                    if profile.get("source_template") == name:
+                        profile["source_template"] = None
+            self._save_template_references(templates_snapshot, profiles_snapshot)
             return True
+
+    def _save_template_references(
+        self, templates_snapshot: dict, profiles_snapshot: dict
+    ) -> None:
+        profiles_changed = self._profiles != profiles_snapshot
+        profiles_saved = False
+        try:
+            if profiles_changed:
+                self._save_profiles()
+                profiles_saved = True
+            self._save_templates()
+        except Exception:
+            self._templates = templates_snapshot
+            self._profiles = profiles_snapshot
+            if profiles_saved:
+                self._save_profiles()
+            raise
 
 
 def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:

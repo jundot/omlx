@@ -189,11 +189,11 @@
                                                     <div class="flex items-center gap-1.5 text-xs text-neutral-400 min-w-0">
                                                         <span class="w-2 h-2 rounded-full bg-neutral-300 shrink-0"></span>
                                                         <span class="min-w-0"
-                                                              x-text="'idle' + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ~' + formatDurationShort(m.ttl_remaining_seconds) + ' left' : '')"></span>
+                                                              x-text="window.t('status.active_models.idle') + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ~' + formatDurationShort(m.ttl_remaining_seconds) + ' left' : '')"></span>
                                                     </div>
                                                 </template>
                                                 <div class="text-xs text-neutral-400 font-mono min-w-0 break-all"
-                                                     x-text="(m.is_loading ? 'est. ' : '') + modelSizeLabel(m)"></div>
+                                                     x-text="(m.is_loading ? window.t('status.active_models.est_prefix') : '') + modelSizeLabel(m)"></div>
                                             </div>
                                         </div>
                                         <div x-show="!m.is_loading" class="relative shrink-0 self-center">
@@ -251,7 +251,7 @@
                                                 <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
                                                     <div class="flex items-center gap-1.5 flex-wrap">
                                                         <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
-                                                        <span class="text-xs text-neutral-400">idle</span>
+                                                        <span class="text-xs text-neutral-400">{{ t('status.active_models.idle') }}</span>
                                                         <template x-if="m.idle_seconds != null">
                                                             <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(m.idle_seconds)"></span>
                                                         </template>
@@ -371,7 +371,7 @@
                                                     <span class="w-2 h-2 rounded-full bg-amber-300"></span>
                                                     <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
-                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="'prompt: ' + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
+                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="window.t('status.active_models.waiting_prompt_tokens').replace('{count}', formatTokenCount(wait.prompt_tokens))"></span>
                                                 </div>
                                             </template>
                                         </div>
@@ -620,7 +620,7 @@
                                                     <td class="px-3 py-2 text-right">
                                                         <span x-show="m.has_sub_block_cache"
                                                               class="text-amber-600"
-                                                              x-text="'cached (' + (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))) + ' tokens)'">
+                                                              x-text="window.t('status.active_models.cached_tokens').replace('{count}', (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))))">
                                                         </span>
                                                         <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>
                                                     </td>
@@ -657,7 +657,7 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
                             </div>
                             <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
-                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">Host</label>
+                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.api.host') }}</label>
                                 <select id="server-alias-select"
                                         x-model="selectedAlias"
                                         class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">
@@ -826,10 +826,10 @@
                             <!-- Claude Code -->
                             <div class="flex items-center gap-4 px-6 py-4 group">
                                 <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                                    <img src="/admin/static/img/integrations/claude.png" alt="Claude Code" class="w-full h-full object-cover">
+                                    <img src="/admin/static/img/integrations/claude.png" alt="{{ t('status.integrations.claude_code') }}" class="w-full h-full object-cover">
                                 </div>
                                 <div class="flex-1 min-w-0">
-                                    <div class="text-sm font-semibold text-neutral-800">Claude Code</div>
+                                    <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.claude_code') }}</div>
                                     <code class="text-xs text-neutral-500 font-mono" x-text="claudeCommand"></code>
                                 </div>
                                 <button x-data="{ copied: false }"
@@ -845,10 +845,10 @@
                             <!-- Codex -->
                             <div class="flex items-start gap-4 px-6 py-4 group">
                                 <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                                    <img src="/admin/static/img/integrations/codex.png" alt="Codex" class="w-full h-full object-cover">
+                                    <img src="/admin/static/img/integrations/codex.png" alt="{{ t('status.integrations.codex') }}" class="w-full h-full object-cover">
                                 </div>
                                 <div class="flex-1 min-w-0 space-y-2">
-                                    <div class="text-sm font-semibold text-neutral-800">Codex</div>
+                                    <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.codex') }}</div>
                                     <div class="space-y-1.5">
                                         <div class="flex items-center gap-2 min-w-0">
                                             <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">CLI</span>
@@ -863,7 +863,7 @@
                                             </button>
                                         </div>
                                         <div class="flex items-center gap-2 min-w-0">
-                                            <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">App</span>
+                                            <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">{{ t('status.integrations.app') }}</span>
                                             <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexAppCommand"></code>
                                             <button x-data="{ copied: false }"
                                                     @click="copyToClipboard(codexAppCommand); copied = true; setTimeout(() => copied = false, 2000)"
@@ -881,10 +881,10 @@
                             <!-- OpenCode -->
                             <div class="flex items-center gap-4 px-6 py-4 group">
                                 <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                                    <img src="/admin/static/img/integrations/opencode.png" alt="OpenCode" class="w-full h-full object-cover">
+                                    <img src="/admin/static/img/integrations/opencode.png" alt="{{ t('status.integrations.opencode') }}" class="w-full h-full object-cover">
                                 </div>
                                 <div class="flex-1 min-w-0">
-                                    <div class="text-sm font-semibold text-neutral-800">OpenCode</div>
+                                    <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.opencode') }}</div>
                                     <code class="text-xs text-neutral-500 font-mono" x-text="opencodeCommand"></code>
                                 </div>
                                 <button x-data="{ copied: false }"
@@ -900,19 +900,19 @@
                             <!-- OpenClaw -->
                             <div class="flex items-center gap-4 px-6 py-4 group">
                                 <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                                    <img src="/admin/static/img/integrations/openclaw.png" alt="OpenClaw" class="w-full h-full object-cover">
+                                    <img src="/admin/static/img/integrations/openclaw.png" alt="{{ t('status.integrations.openclaw') }}" class="w-full h-full object-cover">
                                 </div>
                                 <div class="flex-1 min-w-0">
-                                    <div class="text-sm font-semibold text-neutral-800">OpenClaw</div>
+                                    <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.openclaw') }}</div>
                                     <code class="text-xs text-neutral-500 font-mono" x-text="openclawCommand"></code>
                                 </div>
                                 <select x-model="globalSettings.integrations.openclaw_tools_profile"
                                         @change="saveIntegrationSettings()"
                                         class="text-xs border border-neutral-200 rounded-md px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300 flex-shrink-0">
-                                    <option value="minimal">Minimal</option>
-                                    <option value="coding">Coding</option>
-                                    <option value="messaging">Messaging</option>
-                                    <option value="full">Full</option>
+                                    <option value="minimal">{{ t('status.integrations.tools_profile_minimal') }}</option>
+                                    <option value="coding">{{ t('status.integrations.tools_profile_coding') }}</option>
+                                    <option value="messaging">{{ t('status.integrations.tools_profile_messaging') }}</option>
+                                    <option value="full">{{ t('status.integrations.tools_profile_full') }}</option>
                                 </select>
                                 <button x-data="{ copied: false }"
                                         @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
@@ -927,10 +927,10 @@
                             <!-- Hermes Agent -->
                             <div class="flex items-center gap-4 px-6 py-4 group">
                                 <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                                    <img src="/admin/static/img/integrations/hermes.svg" alt="Hermes Agent" class="w-full h-full object-cover">
+                                    <img src="/admin/static/img/integrations/hermes.svg" alt="{{ t('status.integrations.hermes_agent') }}" class="w-full h-full object-cover">
                                 </div>
                                 <div class="flex-1 min-w-0">
-                                    <div class="text-sm font-semibold text-neutral-800">Hermes Agent</div>
+                                    <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.hermes_agent') }}</div>
                                     <code class="text-xs text-neutral-500 font-mono" x-text="hermesCommand"></code>
                                 </div>
                                 <button x-data="{ copied: false }"
@@ -946,10 +946,10 @@
                             <!-- Pi -->
                             <div class="flex items-center gap-4 px-6 py-4 group">
                                 <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                                    <img src="/admin/static/img/integrations/pi.svg" alt="Pi" class="w-full h-full object-cover">
+                                    <img src="/admin/static/img/integrations/pi.svg" alt="{{ t('status.integrations.pi') }}" class="w-full h-full object-cover">
                                 </div>
                                 <div class="flex-1 min-w-0">
-                                    <div class="text-sm font-semibold text-neutral-800">Pi</div>
+                                    <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.pi') }}</div>
                                     <code class="text-xs text-neutral-500 font-mono" x-text="piCommand"></code>
                                 </div>
                                 <button x-data="{ copied: false }"
@@ -965,10 +965,10 @@
                             <!-- Copilot CLI -->
                             <div class="flex items-center gap-4 px-6 py-4 group">
                                 <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
-                                    <img src="/admin/static/img/integrations/copilot.svg" alt="Copilot CLI" class="w-full h-full object-cover">
+                                    <img src="/admin/static/img/integrations/copilot.svg" alt="{{ t('status.integrations.copilot_cli') }}" class="w-full h-full object-cover">
                                 </div>
                                 <div class="flex-1 min-w-0">
-                                    <div class="text-sm font-semibold text-neutral-800">Copilot CLI</div>
+                                    <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.copilot_cli') }}</div>
                                     <code class="text-xs text-neutral-500 font-mono" x-text="copilotCommand"></code>
                                 </div>
                                 <button x-data="{ copied: false }"

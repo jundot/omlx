@@ -1180,7 +1180,8 @@ def test_qwen4_lightning_mtp_fusion_and_runtime_attachment(tmp_path):
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
-def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
+@pytest.mark.parametrize("mtp_num_experts", [None, 6, 3])
+def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path, mtp_num_experts):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
@@ -1197,15 +1198,16 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
                     tie_word_embeddings=False,
                     num_hidden_layers=1,
                     num_experts=4,
+                    mtp_num_experts=mtp_num_experts,
                 )
             )
         )
         weights = {}
-        for root in (
-            "model.language_model.layers.0.mlp",
-            "mtp.layers.0.mlp",
+        for root, count in (
+            ("model.language_model.layers.0.mlp", 4),
+            ("mtp.layers.0.mlp", mtp_num_experts or 4),
         ):
-            for expert in range(4):
+            for expert in range(count):
                 for projection in ("gate_proj", "up_proj", "down_proj"):
                     key = f"{root}.experts.{expert}.{projection}.weight"
                     weights[key] = mx.to_fp8(mx.ones((2, 2), dtype=mx.float32))
@@ -1216,7 +1218,8 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
         base_key = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
         mtp_key = "mtp.layers.0.mlp.switch_mlp.gate_proj.weight"
         assert result[base_key].shape == (4, 2, 2)
-        assert result[mtp_key].shape == (4, 2, 2)
+        assert result[mtp_key].shape == (mtp_num_experts or 4, 2, 2)
+        assert not any(".experts." in key for key in result)
         assert result[base_key].dtype == mx.bfloat16
         assert not any(key.endswith("weight_scale_inv") for key in result)
     finally:

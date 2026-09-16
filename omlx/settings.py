@@ -178,12 +178,23 @@ class ServerSettings:
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
+    # Maximum raw image payload size accepted ("50MB", "100MB").
+    max_image_upload_size: str = "50MB"
+    # Maximum side length in pixels for VLM input images (0 to disable downscaling).
+    max_image_side_length: int = 2048
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
         size = parse_size(self.max_audio_upload_size)
         if size <= 0:
             raise ValueError("max_audio_upload_size must be positive")
+        return size
+
+    def max_image_upload_bytes(self) -> int:
+        """Configured image upload limit in bytes. Non-positive sizes raise ValueError."""
+        size = parse_size(self.max_image_upload_size)
+        if size <= 0:
+            raise ValueError("max_image_upload_size must be positive")
         return size
 
     def to_dict(self) -> dict[str, Any]:
@@ -209,6 +220,8 @@ class ServerSettings:
                 False,
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
+            max_image_upload_size=data.get("max_image_upload_size", "50MB"),
+            max_image_side_length=data.get("max_image_side_length", 2048),
         )
 
 
@@ -1120,6 +1133,17 @@ class GlobalSettings:
             )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size
+        if max_image_upload_size := (
+            os.getenv("OMLX_MAX_IMAGE_UPLOAD_SIZE") or os.getenv("OMLX_MAX_IMAGE_BYTES")
+        ):
+            self.server.max_image_upload_size = max_image_upload_size
+        if max_image_side_length := os.getenv("OMLX_MAX_IMAGE_SIDE_LENGTH"):
+            try:
+                self.server.max_image_side_length = int(max_image_side_length)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_MAX_IMAGE_SIDE_LENGTH value: {max_image_side_length}"
+                )
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
@@ -1271,6 +1295,16 @@ class GlobalSettings:
             and args.max_audio_upload_size is not None
         ):
             self.server.max_audio_upload_size = args.max_audio_upload_size
+        if (
+            hasattr(args, "max_image_upload_size")
+            and args.max_image_upload_size is not None
+        ):
+            self.server.max_image_upload_size = args.max_image_upload_size
+        if (
+            hasattr(args, "max_image_side_length")
+            and args.max_image_side_length is not None
+        ):
+            self.server.max_image_side_length = args.max_image_side_length
 
         # Model settings
         if hasattr(args, "model_dir") and args.model_dir is not None:
@@ -1572,6 +1606,16 @@ class GlobalSettings:
                 errors.append("max_audio_upload_size must be positive")
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid max_audio_upload_size: {e}")
+
+        try:
+            image_upload_size = parse_size(self.server.max_image_upload_size)
+            if image_upload_size <= 0:
+                errors.append("max_image_upload_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_image_upload_size: {e}")
+
+        if self.server.max_image_side_length < 0:
+            errors.append("max_image_side_length must be non-negative")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:

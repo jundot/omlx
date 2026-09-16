@@ -3981,6 +3981,8 @@ class TestEnginePoolInUseLease:
         pool = _make_pool(ceiling=0)
         entry = self._loaded_entry("leased")
         entry.in_use = 1
+        entry.pending_unload_reason = "manual unload"
+        pool._unload_engine = AsyncMock()
         pool._entries = {"leased": entry}
 
         await pool._lock.acquire()
@@ -4536,3 +4538,98 @@ def test_qwen4_moe_savings_precede_ple_force_decision(
         _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
         assert is_forced is forced
         assert pool._entry_runtime_resident_size(entry, settings) == expected
+
+
+@pytest.mark.asyncio
+async def test_prepare_cluster_reload_unloads_failed_engine_without_busy_error():
+    """A failed distributed engine must reload cleanly even if busy check would otherwise trigger."""
+    pool = _make_pool()
+    engine = MagicMock()
+    engine.runtime_failed_reason = "rank 1 process died unexpectedly"
+    engine.has_active_requests.return_value = True
+
+    entry = EngineEntry(
+        model_id="test-model",
+        model_path="/fake/path",
+        model_type="llm",
+        engine_type="distributed_batched",
+        estimated_size=1000,
+        engine=engine,
+        in_use=1,
+    )
+    pool._entries["test-model"] = entry
+
+    # Because engine has runtime_failed_reason, prepare_cluster_reload must not raise ModelBusyError
+    unloaded = []
+    pool._unload_engine = AsyncMock(side_effect=lambda mid: unloaded.append(mid))
+
+    await pool.prepare_cluster_reload("test-model")
+    assert unloaded == ["test-model"]
+
+
+@pytest.mark.asyncio
+async def test_loaded_model_acquire_and_release_bypass_unrelated_unload_lock():
+    pool = _make_pool(ceiling=0)
+    entry = TestEnginePoolInUseLease._loaded_entry("ready")
+    pool._entries = {"ready": entry}
+    pool._unloading_models.add("other")
+    async with pool._lock:
+        engine = await asyncio.wait_for(pool.get_engine("ready", _lease=True), 0.2)
+        assert engine is entry.engine
+        assert entry.in_use == 1
+        await asyncio.wait_for(pool.release_engine("ready"), 0.2)
+        assert entry.in_use == 0
+
+
+@pytest.mark.asyncio
+async def test_unloading_model_cannot_use_loaded_fast_path():
+    pool = _make_pool(ceiling=0)
+    entry = TestEnginePoolInUseLease._loaded_entry("closing")
+    pool._entries = {"closing": entry}
+    pool._unloading_models.add("closing")
+    assert pool._acquire_loaded_engine("closing", False, True, None) is None
+    assert entry.in_use == 0
+
+
+@pytest.mark.asyncio
+async def test_unload_marker_exists_before_stop_yields_and_clears_on_error():
+    pool = _make_pool(ceiling=0)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stop(model_id):
+        assert model_id in pool._unloading_models
+        entered.set()
+        await release.wait()
+        raise RuntimeError("stop failed")
+
+    pool._stop_and_unload_engine = stop
+    task = asyncio.create_task(pool._unload_engine("closing"))
+    await entered.wait()
+    with pytest.raises(ModelBusyError):
+        await pool._unload_engine("closing")
+    release.set()
+    with pytest.raises(RuntimeError):
+        await task
+    assert not pool._unloading_models
+
+
+@pytest.mark.asyncio
+async def test_cancelled_unload_retains_marker_until_stop_finishes():
+    pool = _make_pool(ceiling=0)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stop(model_id):
+        entered.set()
+        await release.wait()
+
+    pool._stop_and_unload_engine = stop
+    task = asyncio.create_task(pool._unload_engine("closing"))
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert "closing" in pool._unloading_models
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not pool._unloading_models

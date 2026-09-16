@@ -46,9 +46,9 @@ from ..api.utils import (
 )
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
-from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
@@ -59,6 +59,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -1193,6 +1194,8 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
 
     import safetensors
 
+    from ..patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import ple_load_resources
+
     original_safe_open = safetensors.safe_open
     is_target_shard = _model_shard_matcher(model_dir)
 
@@ -1230,7 +1233,8 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
             model_type,
             model_dir.name,
         )
-        yield
+        with ple_load_resources():
+            yield
     finally:
         safetensors.safe_open = original_safe_open
 
@@ -1331,6 +1335,35 @@ _QWEN_VISION_MODELS = {
 
 # Grid-based VLMs whose flat vision features can be split with grid_thw.
 _GRID_VISION_MODELS = _QWEN_VISION_MODELS | {"glm5_next"}
+
+
+def _grid_image_token_starts(
+    token_ids: list[int], image_grid_thw: Any, image_token_id: int, merge_size: int
+) -> list[int]:
+    """Locate each grid image in the final, expanded processor token sequence."""
+    grid = (
+        image_grid_thw.tolist()
+        if hasattr(image_grid_thw, "tolist")
+        else image_grid_thw
+    )
+    counts = []
+    for t, h, w in grid:
+        patches = int(t) * int(h) * int(w)
+        if merge_size <= 0 or patches <= 0 or patches % (merge_size**2):
+            raise ValueError("Invalid image grid for cache boundaries")
+        counts.append(patches // (merge_size**2))
+    positions = [i for i, token in enumerate(token_ids) if token == image_token_id]
+    if sum(counts) != len(positions):
+        raise ValueError("Image grids do not match the final image tokens")
+    starts = []
+    offset = 0
+    for count in counts:
+        start = positions[offset]
+        if positions[offset + count - 1] != start + count - 1:
+            raise ValueError("Image token span is not contiguous")
+        starts.append(start)
+        offset += count
+    return starts
 
 
 # Conservative fallback upper bound on image-placeholder tokens per image
@@ -1490,9 +1523,10 @@ def _count_image_tokens_real(
     processor: Any,
     *,
     upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+    images: list[Any] | None = None,
 ) -> int:
-    """Sum the *real* per-image token contribution from actual image
-    dimensions, instead of charging every image the model's ``max_pixels``
+    """Sum per-image tokens using processed images when supplied, otherwise
+    source dimensions, instead of charging every image the model's ``max_pixels``
     ceiling. Falls back to ``upper_bound`` per image when the dimensions can't
     be read decode-free or the processor isn't a Qwen-style one, so the guard
     still never under-counts."""
@@ -1510,26 +1544,32 @@ def _count_image_tokens_real(
         and isinstance(getattr(ip, "max_image_tokens", None), int)
     )
 
+    if images is not None:
+        dimensions = [image.size for image in images]
+    else:
+        dimensions = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in ("image_url", "image", "input_image"):
+                    continue
+                dimensions.append(_read_image_dims(part))
+
     total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") not in ("image_url", "image", "input_image"):
-                continue
-            wh = _read_image_dims(part) if qwen_ok or glm_ok else None
-            if wh is None:
+    for wh in dimensions:
+        if wh is None or not (qwen_ok or glm_ok):
+            total += upper_bound
+        elif glm_ok:
+            try:
+                total += int(patch_counter(wh[1], wh[0]) // (ms**2))
+            except Exception:
                 total += upper_bound
-            elif glm_ok:
-                try:
-                    total += int(patch_counter(wh[1], wh[0]) // (ms**2))
-                except Exception:
-                    total += upper_bound
-            else:
-                total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
+        else:
+            total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
     return total
 
 
@@ -2422,6 +2462,8 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from ..utils.model_loading import (
                         lm_load_compat as mlx_lm_load,
+                    )
+                    from ..utils.model_loading import (
                         maybe_load_custom_quantization,
                     )
                     from ..utils.tokenizer import get_tokenizer_config
@@ -2516,6 +2558,7 @@ class VLMBatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        cancelled = False
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
@@ -2553,13 +2596,15 @@ class VLMBatchedEngine(BaseEngine):
         if engine:
             if hasattr(engine, "engine") and engine.engine is not None:
                 try:
-                    engine.engine.close()
+                    cancelled = await _close_engine_core(engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _inject_tool_calling(self, tokenizer) -> None:
         """Inject tool calling attributes into VLM tokenizer.
@@ -3329,10 +3374,27 @@ class VLMBatchedEngine(BaseEngine):
         pixel_values = inputs.get("pixel_values")
         attention_mask = inputs.get("attention_mask")
 
+        token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
         image_cache_key_start = 0
         image_cache_key_ranges: list[Tuple[int, str]] = []
         if image_message_ranges:
             try:
+                image_starts = None
+                if (
+                    model_type in _GRID_VISION_MODELS
+                    and inputs.get("image_grid_thw") is not None
+                ):
+                    image_starts = _grid_image_token_starts(
+                        token_ids,
+                        inputs["image_grid_thw"],
+                        self._vlm_model.config.image_token_id,
+                        self._processor.image_processor.merge_size,
+                    )
+                    if (
+                        len(image_starts) != num_images
+                        or sum(count for _, count in image_message_ranges) != num_images
+                    ):
+                        raise ValueError("Image boundary count does not match images")
                 prefix_template_kwargs = {
                     "tokenize": False,
                     "add_generation_prompt": False,
@@ -3349,7 +3411,9 @@ class VLMBatchedEngine(BaseEngine):
                 for msg_idx, msg_num_images in image_message_ranges:
                     prefix_messages = formatted_messages[:msg_idx]
                     boundary_tokens = 0
-                    if prefix_messages:
+                    if image_starts is not None:
+                        boundary_tokens = image_starts[images_consumed]
+                    elif prefix_messages:
                         try:
                             prefix_prompt = (
                                 apply_chat_template_with_reasoning_effort_fallback(
@@ -3382,16 +3446,29 @@ class VLMBatchedEngine(BaseEngine):
                             ),
                         )
                         prefix_ids = prefix_inputs["input_ids"]
-                        boundary_tokens = (
-                            len(prefix_ids[0].tolist())
+                        prefix_tokens = (
+                            prefix_ids[0].tolist()
                             if prefix_ids.ndim > 1
-                            else len(prefix_ids.tolist())
+                            else prefix_ids.tolist()
                         )
+                        # Rendering a shorter conversation can retain reasoning
+                        # that the full template removes. Only a matching token
+                        # prefix is a valid position in the final model input.
+                        for actual, prefix in zip(token_ids, prefix_tokens):
+                            if actual != prefix:
+                                break
+                            boundary_tokens += 1
 
                     images_consumed += msg_num_images
                     cumulative_hash = compute_image_hash(images[:images_consumed])
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
+                # A later image's prefix can diverge earlier. Its cumulative
+                # hash must apply there, including all preceding images.
+                for i in range(len(image_cache_key_ranges) - 2, -1, -1):
+                    start, image_key = image_cache_key_ranges[i]
+                    next_start = image_cache_key_ranges[i + 1][0]
+                    image_cache_key_ranges[i] = (min(start, next_start), image_key)
                 image_cache_key_start = image_cache_key_ranges[0][0]
             except Exception:
                 logger.debug(
@@ -3440,15 +3517,30 @@ class VLMBatchedEngine(BaseEngine):
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
                 ]
 
+                # Per-image entries are keyed by the image alone, but the
+                # number of soft tokens an image encodes to depends on the
+                # resize regime, which depends on the *other* images in the
+                # request (Gemma 4 per-image resize: 1024x1024 -> 256 tokens,
+                # 1536x640 -> 250). Entries cached from separate single-image
+                # requests can therefore disagree, and mx.concatenate raises
+                # before _vision_features_match_image_tokens below ever gets to
+                # reject them. Check the shapes agree first and fall through to
+                # the whole-request entry (and then a recompute) when they do
+                # not.
+                per_image_usable = (
+                    all(f is not None for f in cached_per_image)
+                    and len({f.shape[1:] for f in cached_per_image}) == 1
+                )
+
                 cached_whole = None
-                if not all(f is not None for f in cached_per_image):
+                if not per_image_usable:
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
                     cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
                 used_cached_features = False
-                if all(f is not None for f in cached_per_image):
+                if per_image_usable:
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
                     if self._vision_features_match_image_tokens(
@@ -3554,11 +3646,6 @@ class VLMBatchedEngine(BaseEngine):
                 getattr(self._vlm_model, "language_model", None), extra_kwargs
             )
 
-            # Extract token IDs as list
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            )
-
             return (
                 token_ids,
                 embed_features.inputs_embeds,
@@ -3569,9 +3656,6 @@ class VLMBatchedEngine(BaseEngine):
             )
         else:
             # Text-only (no images in this message)
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            )
             return token_ids, None, None, None, 0, []
 
     def _apply_chat_template(
@@ -4119,7 +4203,7 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, _, _ = extract_images_from_messages(messages)
+        text_messages, images, _ = extract_images_from_messages(messages)
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
@@ -4142,11 +4226,12 @@ class VLMBatchedEngine(BaseEngine):
                 type(e).__name__,
             )
             return
-        # Count images from the ORIGINAL messages (the stripped
-        # ``text_messages`` no longer has the image content-parts).
+        # Use the decoded dimensions, including resizing and EXIF orientation,
+        # so the memory estimate matches the images passed to the processor.
         image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
+            images=images,
             upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),
