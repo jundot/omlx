@@ -29446,6 +29446,492 @@
           }
         }
       }
+    },
+    "common.close" : {
+      "comment" : "Generic close button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "닫기"
+          }
+        }
+      }
+    },
+    "settings.actions.reset" : {
+      "comment" : "Header button that returns every setting of the model to its default",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset defaults"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값으로 초기화"
+          }
+        }
+      }
+    },
+    "settings.actions.optimal" : {
+      "comment" : "Header button that lists the best omlx.ai benchmark settings for this device and model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply optimal settings"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최적 설정 적용"
+          }
+        }
+      }
+    },
+    "settings.actions.recipe" : {
+      "comment" : "Header button that opens the paste-a-recipe sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply custom recipe"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커스텀 레시피 적용"
+          }
+        }
+      }
+    },
+    "settings.actions.reset.confirm_title" : {
+      "comment" : "Confirmation dialog title before resetting all model settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset every setting of this model?"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 모델의 모든 설정을 초기화할까요?"
+          }
+        }
+      }
+    },
+    "settings.actions.reset.confirm_message" : {
+      "comment" : "Body text inside the reset-settings confirmation dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling, acceleration, pinned/default flags, aliases and the display name all return to their defaults."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "샘플링, 가속, 고정/기본 모델 플래그, 별칭, 표시 이름이 모두 기본값으로 돌아갑니다."
+          }
+        }
+      }
+    },
+    "settings.actions.reset.confirm_button" : {
+      "comment" : "Destructive button inside the reset-settings confirmation dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초기화"
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.title" : {
+      "comment" : "Title of the paste-a-recipe sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply custom recipe"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커스텀 레시피 적용"
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.hint" : {
+      "comment" : "Hint explaining where a settings recipe can be copied from",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Paste a recipe copied from the Recipe row of a benchmark detail page on omlx.ai."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "omlx.ai 벤치마크 상세 페이지의 Recipe 행에서 복사한 레시피를 붙여넣으세요."
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.applying" : {
+      "comment" : "Progress text while a pasted recipe is being applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applying the recipe..."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "레시피를 적용하는 중..."
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.apply" : {
+      "comment" : "Primary button of the paste-a-recipe sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용"
+          }
+        }
+      }
+    },
+    "settings.apply.optimal.loading" : {
+      "comment" : "Progress text while omlx.ai candidates are fetched",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fetching the best benchmark results from omlx.ai..."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "omlx.ai에서 최고의 벤치마크 결과를 가져오는 중..."
+          }
+        }
+      }
+    },
+    "settings.apply.optimal.applying" : {
+      "comment" : "Progress text while a chosen benchmark snapshot is applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applying the benchmark settings..."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "벤치마크 설정을 적용하는 중..."
+          }
+        }
+      }
+    },
+    "settings.apply.choose.hint" : {
+      "comment" : "Hint above the benchmark candidate list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pick a benchmark result to apply its settings. Rows are the best matches for this chip and model with the same or less memory, at a 4k prompt."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용할 벤치마크 결과를 고르세요. 같은 칩·같은 모델에서 내 메모리 이하 구성의 4k 프롬프트 최고 결과입니다."
+          }
+        }
+      }
+    },
+    "settings.apply.choose.group_pp" : {
+      "comment" : "Label above the candidates ranked by prompt processing speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Best prompt processing (PP)"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PP 우선 (프롬프트 처리)"
+          }
+        }
+      }
+    },
+    "settings.apply.choose.group_tg" : {
+      "comment" : "Label above the candidates ranked by token generation speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Best token generation (TG)"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TG 우선 (토큰 생성)"
+          }
+        }
+      }
+    },
+    "settings.apply.result.title_recipe" : {
+      "comment" : "Title of the result sheet after applying a pasted recipe",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Custom recipe applied"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커스텀 레시피 적용 결과"
+          }
+        }
+      }
+    },
+    "settings.apply.result.title_optimal" : {
+      "comment" : "Title of the optimal-settings sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optimal settings from omlx.ai"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "omlx.ai 최적 설정"
+          }
+        }
+      }
+    },
+    "settings.apply.result.none_title" : {
+      "comment" : "Headline when omlx.ai has no benchmark for the current device and model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No benchmark result matches this device and model."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "벤치마크에 동일한 사양과 모델의 결과가 없네요."
+          }
+        }
+      }
+    },
+    "settings.apply.result.none_body" : {
+      "comment" : "Guidance shown when no matching benchmark exists",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Find a similar model on the community benchmarks and apply its recipe with Apply custom recipe."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비슷한 모델의 설정을 찾아서 커스텀 레시피를 적용해 보세요!"
+          }
+        }
+      }
+    },
+    "settings.apply.result.open_search" : {
+      "comment" : "Link button that opens the omlx.ai performance leaderboard",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open community benchmarks"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커뮤니티 벤치마크 열기"
+          }
+        }
+      }
+    },
+    "settings.apply.result.no_change" : {
+      "comment" : "Result line when the snapshot equals the current settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings already matched; nothing changed."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미 같은 설정이라 변경된 항목이 없습니다."
+          }
+        }
+      }
+    },
+    "settings.apply.result.done_recipe" : {
+      "comment" : "Result line after a pasted recipe was applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The settings below were applied from the recipe!"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "레시피의 아래 설정으로 적용되었습니다!"
+          }
+        }
+      }
+    },
+    "settings.apply.result.done_optimal" : {
+      "comment" : "Result line after a chosen benchmark snapshot was applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The settings below were applied from the selected benchmark!"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택한 벤치마크의 아래 설정으로 적용되었습니다!"
+          }
+        }
+      }
+    },
+    "settings.apply.result.skipped" : {
+      "comment" : "Label above the list of features the server dropped while applying a snapshot",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Skipped on this machine"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 머신에서 제외된 기능"
+          }
+        }
+      }
+    },
+    "settings.apply.result.applied" : {
+      "comment" : "Label above the JSON of the applied settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applied settings"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용된 설정"
+          }
+        }
+      }
+    },
+    "settings.apply.result.reload_note" : {
+      "comment" : "Note shown when applied settings only take effect at model load",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The model will use the new settings after its next load."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다음 로드부터 새 설정이 적용됩니다."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

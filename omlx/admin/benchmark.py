@@ -344,6 +344,10 @@ _UPLOADED_SETTING_FIELDS = (
     "turboquant_kv_enabled",
     "turboquant_kv_bits",
     "turboquant_skip_last",
+    "qwen35_oq_a8_enabled",
+    "qwen35_oq_a8_min_tokens",
+    "moe_expert_offload_enabled",
+    "moe_expert_offload_resident_fraction",
     "specprefill_enabled",
     "specprefill_draft_model",
     "specprefill_keep_pct",
@@ -357,7 +361,9 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_max_ctx",
     "dflash_in_memory_cache",
     "dflash_in_memory_cache_max_entries",
+    "dflash_in_memory_cache_max_bytes",
     "dflash_ssd_cache",
+    "dflash_ssd_cache_max_bytes",
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
     "dflash_block_size",
@@ -394,7 +400,9 @@ _PATH_VALUED_SETTING_FIELDS = frozenset(
     }
 )
 
-_MAX_UPLOADED_SETTINGS_BYTES = 4096
+# omlx.ai accepts up to 8192 bytes; the margin leaves room for the
+# benchmark_context label that is prepended at upload time.
+_MAX_UPLOADED_SETTINGS_BYTES = 6144
 
 
 def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
@@ -1263,6 +1271,7 @@ async def _run_external_batch_test(
 
 
 OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
+OMLX_AI_BEST_URL = f"{OMLX_AI_API_URL}/best"
 
 # The leaderboard accepts model_name up to 150 characters.
 _MAX_MODEL_NAME_LEN = 150
