@@ -36,6 +36,7 @@
   "navbar.tab.logs": "Logs",
   "navbar.tab.bench": "Benchmark",
   "navbar.tab.chat": "Chat",
+  "navbar.tablist_label": "Seções do painel",
   "navbar.dropdown.manager": "Gerenciador",
   "navbar.dropdown.downloader": "Downloader",
   "navbar.dropdown.quantizer": "Quantização oQ",

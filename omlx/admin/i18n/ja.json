@@ -36,6 +36,7 @@
   "navbar.tab.logs": "ログ",
   "navbar.tab.bench": "ベンチマーク",
   "navbar.tab.chat": "チャット",
+  "navbar.tablist_label": "ダッシュボードのセクション",
   "navbar.dropdown.manager": "管理",
   "navbar.dropdown.downloader": "ダウンロード",
   "navbar.dropdown.quantizer": "oQ量子化",

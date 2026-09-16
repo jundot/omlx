@@ -36,6 +36,7 @@
   "navbar.tab.logs": "로그",
   "navbar.tab.bench": "벤치마크",
   "navbar.tab.chat": "채팅",
+  "navbar.tablist_label": "대시보드 섹션",
   "navbar.dropdown.manager": "관리",
   "navbar.dropdown.downloader": "다운로드",
   "navbar.dropdown.quantizer": "oQ 양자화",

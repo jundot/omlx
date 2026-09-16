@@ -8,7 +8,7 @@
     ('applications', '_applications.html'),
     ('engine_versions', '_engine_versions.html'),
 ] %}
-            <div x-show="mainTab === 'status'" x-cloak>
+            <div x-show="mainTab === 'status'" x-cloak role="tabpanel" id="panel-status" aria-labelledby="tab-status">
                 <div class="animate-fade-in-up">
                     <!-- Layout toolbar (edit mode). The entry button lives in the navbar. -->
                     <div x-show="dashEditing" x-cloak class="flex flex-wrap items-center justify-end gap-2 mb-4">
