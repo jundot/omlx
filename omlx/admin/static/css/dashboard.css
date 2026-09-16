@@ -252,6 +252,36 @@
     [data-theme="dark"] .text-red-500 { color: #f87171 !important; }
     [data-theme="dark"] .text-red-600 { color: #ef4444 !important; }
     [data-theme="dark"] .text-red-700 { color: #fca5a5 !important; }
+    [data-theme="dark"] .bg-emerald-50 { background-color: rgba(16, 185, 129, 0.15) !important; }
+    [data-theme="dark"] .hover\:bg-emerald-100:hover { background-color: rgba(16, 185, 129, 0.25) !important; }
+    [data-theme="dark"] .border-emerald-200 { border-color: rgba(16, 185, 129, 0.3) !important; }
+    [data-theme="dark"] .text-emerald-600 { color: #34d399 !important; }
+    [data-theme="dark"] .text-emerald-700 { color: #6ee7b7 !important; }
+    [data-theme="dark"] .bg-cyan-50 { background-color: rgba(6, 182, 212, 0.15) !important; }
+    [data-theme="dark"] .border-cyan-200 { border-color: rgba(6, 182, 212, 0.3) !important; }
+    [data-theme="dark"] .text-cyan-700 { color: #67e8f9 !important; }
+    [data-theme="dark"] .bg-sky-50 { background-color: rgba(14, 165, 233, 0.15) !important; }
+    [data-theme="dark"] .border-sky-200 { border-color: rgba(14, 165, 233, 0.3) !important; }
+    [data-theme="dark"] .text-sky-600 { color: #38bdf8 !important; }
+    [data-theme="dark"] .text-sky-700 { color: #7dd3fc !important; }
+    [data-theme="dark"] .bg-indigo-50 { background-color: rgba(99, 102, 241, 0.15) !important; }
+    [data-theme="dark"] .border-indigo-200 { border-color: rgba(99, 102, 241, 0.3) !important; }
+    [data-theme="dark"] .text-indigo-700 { color: #a5b4fc !important; }
+    [data-theme="dark"] .bg-violet-50 { background-color: rgba(139, 92, 246, 0.15) !important; }
+    [data-theme="dark"] .border-violet-200 { border-color: rgba(139, 92, 246, 0.3) !important; }
+    [data-theme="dark"] .text-violet-600 { color: #a78bfa !important; }
+    [data-theme="dark"] .text-violet-700 { color: #c4b5fd !important; }
+    [data-theme="dark"] .bg-pink-50 { background-color: rgba(236, 72, 153, 0.15) !important; }
+    [data-theme="dark"] .border-pink-200 { border-color: rgba(236, 72, 153, 0.3) !important; }
+    [data-theme="dark"] .text-pink-700 { color: #f9a8d4 !important; }
+    [data-theme="dark"] .bg-rose-50 { background-color: rgba(244, 63, 94, 0.15) !important; }
+    [data-theme="dark"] .border-rose-200 { border-color: rgba(244, 63, 94, 0.3) !important; }
+    [data-theme="dark"] .text-rose-700 { color: #fda4af !important; }
+    [data-theme="dark"] .bg-teal-50 { background-color: rgba(20, 184, 166, 0.15) !important; }
+    [data-theme="dark"] .border-teal-200 { border-color: rgba(20, 184, 166, 0.3) !important; }
+    [data-theme="dark"] .text-teal-700 { color: #5eead4 !important; }
+    /* Small "API" tag inside the emerald profile pill. */
+    [data-theme="dark"] .bg-white\/70 { background-color: rgba(255, 255, 255, 0.12) !important; }
 
     /* === Gradient background effect === */
     [data-theme="dark"] .from-neutral-50 { --tw-gradient-from: var(--bg-secondary) !important; }
@@ -1129,3 +1159,120 @@
             animation-iteration-count: 1 !important;
         }
     }
+
+    /* === Dashboard layout grid (GridStack) === */
+    .dash-grid > .dash-block-parked { display: none; }
+    /* Item content is absolutely positioned by GridStack; let shadows, tooltips
+       and select popovers escape in view mode. */
+    /* gridstack.css forces overflow-y on .size-to-content items with a
+       5-class selector, so !important is the only way to keep view mode open. */
+    .dash-grid > .grid-stack-item > .grid-stack-item-content { overflow: visible !important; }
+    .dash-grid.dash-editing > .grid-stack-item > .grid-stack-item-content {
+        overflow: hidden !important;
+        border-radius: 1rem;
+        outline: 1px dashed var(--border-normal);
+        outline-offset: -1px;
+    }
+    .dash-grid.dash-editing .dash-block-body { pointer-events: none; opacity: 0.85; }
+    .dash-grid.dash-editing {
+        background-image: repeating-linear-gradient(
+            to right,
+            var(--border-faint) 0 1px,
+            transparent 1px calc(100% / 24)
+        );
+        border-radius: 1rem;
+    }
+
+    .dash-block-chrome {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        padding: 0.375rem 0.75rem;
+        background: var(--bg-tertiary);
+        color: var(--text-secondary);
+        border-bottom: 1px solid var(--border-faint);
+        font-size: 0.75rem;
+        font-weight: 600;
+        user-select: none;
+    }
+    .dash-block-handle {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex: 1;
+        cursor: grab;
+    }
+    .dash-block-handle:active { cursor: grabbing; }
+    .dash-block-remove {
+        display: inline-flex;
+        padding: 0.25rem;
+        border-radius: 0.375rem;
+        color: var(--text-tertiary);
+    }
+    .dash-block-remove:hover { color: var(--text-primary); background: var(--border-faint); }
+
+    /* Tray pills live outside the grid, so undo GridStack's absolute item layout. */
+    .dash-tray-pill { position: relative; width: auto; min-width: 0; }
+    .dash-tray-pill .grid-stack-item-content {
+        position: static;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        padding: 0.375rem 0.75rem;
+        border: 1px solid var(--border-normal);
+        border-radius: 9999px;
+        background: var(--bg-primary);
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: grab;
+        overflow: visible;
+    }
+    .dash-tray-pill.ui-draggable-dragging { opacity: 0.85; z-index: 100; }
+
+    .dash-grid .grid-stack-placeholder > .placeholder-content {
+        background: rgba(0, 0, 0, 0.06);
+        border: 2px dashed var(--border-normal);
+        border-radius: 1rem;
+    }
+    [data-theme="dark"] .dash-grid .grid-stack-placeholder > .placeholder-content {
+        background: rgba(255, 255, 255, 0.06);
+    }
+    .dash-grid .ui-resizable-handle.ui-resizable-se {
+        width: 18px;
+        height: 18px;
+        right: 2px;
+        bottom: 2px;
+        background: none;
+        border-right: 2px solid var(--border-normal);
+        border-bottom: 2px solid var(--border-normal);
+        border-bottom-right-radius: 0.75rem;
+        transform: none;
+    }
+    .dash-grid .ui-resizable-handle.ui-resizable-e,
+    .dash-grid .ui-resizable-handle.ui-resizable-w { width: 12px; }
+
+    /* Instant hover tooltip for navbar icon buttons (native title waits ~1s). */
+    .nav-tooltip { position: relative; }
+    .nav-tooltip::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.375rem;
+        background: var(--text-primary);
+        color: var(--bg-primary);
+        font-size: 0.6875rem;
+        font-weight: 500;
+        line-height: 1.2;
+        white-space: nowrap;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.1s ease-out;
+        z-index: 60;
+    }
+    .nav-tooltip:hover::after,
+    .nav-tooltip:focus-visible::after { opacity: 1; }

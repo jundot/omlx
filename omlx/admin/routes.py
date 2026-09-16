@@ -30,15 +30,21 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
-from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..model_profiles import (
+    EXCLUDED_FROM_PROFILES,
+    filter_profile_fields,
+    filter_universal_fields,
+)
 from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
+    ModelSettings,
+    resolve_vlm_mtp_conflicts,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -238,6 +244,7 @@ class ModelSettingsRequest(BaseModel):
     # Keep  thinking blocks in historical turns (None = auto, True when the
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
+    cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
@@ -311,6 +318,72 @@ class ModelSettingsRequest(BaseModel):
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
 
+    @field_validator("turboquant_kv_bits")
+    @classmethod
+    def validate_turboquant_bits(cls, value: float | None) -> float | None:
+        if value is None or value == 0:
+            return 4 if value == 0 else None
+        if value not in (2, 2.5, 3, 3.5, 4, 6, 8):
+            raise ValueError("turboquant_kv_bits must be 2, 2.5, 3, 3.5, 4, 6, or 8")
+        return value
+
+    @field_validator("dflash_verify_mode")
+    @classmethod
+    def validate_dflash_verify_mode(cls, value: str | None) -> str | None:
+        if value not in (None, "", "dflash", "adaptive", "ddtree", "off"):
+            raise ValueError(
+                "dflash_verify_mode must be dflash, adaptive, ddtree, or off"
+            )
+        return value or None
+
+    @field_validator("dflash_in_memory_cache_max_entries")
+    @classmethod
+    def validate_dflash_cache_entries(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("dflash_in_memory_cache_max_entries must be non-negative")
+        return 4 if value == 0 else value
+
+    @field_validator("reasoning_parser")
+    @classmethod
+    def validate_reasoning_parser(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        parsers = _grammar_parser_options()
+        if parsers is None:
+            logger.warning(
+                "Cannot validate reasoning_parser %r: xgrammar unavailable", value
+            )
+        elif value not in {parser["value"] for parser in parsers}:
+            raise ValueError(f"Unknown reasoning_parser: {value}")
+        return value
+
+    @field_validator(
+        "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
+    )
+    @classmethod
+    def validate_draft_path(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        # Match local references without resolving or downloading HF repo IDs.
+        if (
+            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
+        ) and not (path / "config.json").is_file():
+            raise ValueError(f"Draft model has no config.json: {value}")
+        return value
+
+
+def _normalize_profile_settings(
+    value: dict[str, Any] | None, *, universal: bool = False
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    filtered = (filter_universal_fields if universal else filter_profile_fields)(value)
+    # Reuse the settings API's types and validators, preserving absent fields.
+    return ModelSettingsRequest.model_validate(filtered).model_dump(
+        exclude_unset=True, exclude_none=True
+    )
+
 
 class CreateProfileRequest(BaseModel):
     """Request body for creating a per-model profile."""
@@ -323,6 +396,11 @@ class CreateProfileRequest(BaseModel):
     also_save_as_template: bool = False
     source_template: str | None = None
     expose_as_model: bool = False
+
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value)
 
 
 class UpdateProfileRequest(BaseModel):
@@ -337,6 +415,11 @@ class UpdateProfileRequest(BaseModel):
     expose_as_model: bool | None = None
     also_save_as_template: bool = False
 
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value)
+
 
 class CreateTemplateRequest(BaseModel):
     """Request body for creating a global template."""
@@ -346,6 +429,11 @@ class CreateTemplateRequest(BaseModel):
     description: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value, universal=True)
+
 
 class UpdateTemplateRequest(BaseModel):
     """Request body for updating/renaming a global template."""
@@ -354,6 +442,63 @@ class UpdateTemplateRequest(BaseModel):
     display_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] | None = None
+
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value, universal=True)
+
+
+# Dashboard layout grid contract. Keep in sync with static/js/dashboard_layout.js.
+DASHBOARD_COLUMNS = 24
+DASHBOARD_BLOCK_MIN_W = 6
+DASHBOARD_BLOCK_IDS = (
+    "serving_stats",
+    "usage_history",
+    "active_models",
+    "cache_observability",
+    "api_endpoints",
+    "claude_code",
+    "applications",
+    "engine_versions",
+)
+
+
+class DashboardLayoutBlock(BaseModel):
+    """One placed dashboard block in grid units."""
+
+    id: str
+    x: int = Field(ge=0, lt=DASHBOARD_COLUMNS)
+    y: int = Field(ge=0)
+    w: int = Field(ge=DASHBOARD_BLOCK_MIN_W, le=DASHBOARD_COLUMNS)
+
+    @model_validator(mode="after")
+    def _fits_grid(self):
+        if self.x + self.w > DASHBOARD_COLUMNS:
+            raise ValueError(f"block {self.id!r} exceeds {DASHBOARD_COLUMNS} columns")
+        return self
+
+
+class DashboardLayoutRequest(BaseModel):
+    """Saved dashboard block layout."""
+
+    version: Literal[1] = 1
+    width: Literal["default", "wide", "wider", "full"] = "default"
+    blocks: list[DashboardLayoutBlock] = Field(default_factory=list)
+
+    @field_validator("blocks")
+    @classmethod
+    def _known_unique_blocks(cls, blocks):
+        # Unknown ids are dropped for forward compatibility; duplicates keep
+        # the first occurrence.
+        seen: set[str] = set()
+        kept = []
+        for block in blocks:
+            if block.id not in DASHBOARD_BLOCK_IDS or block.id in seen:
+                continue
+            seen.add(block.id)
+            kept.append(block)
+        return kept
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -468,6 +613,8 @@ class GlobalSettingsRequest(BaseModel):
 
     # UI settings
     ui_language: str | None = None
+    # Explicit null restores the default dashboard layout.
+    ui_dashboard_layout: DashboardLayoutRequest | None = None
 
     # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
@@ -1962,8 +2109,7 @@ def _models_from_docstring(fn) -> list[str]:
     ]
 
 
-@router.get("/api/grammar/parsers")
-async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+def _grammar_parser_options() -> list[dict] | None:
     """Return available reasoning parser names from xgrammar.
 
     Supports both API generations:
@@ -1974,7 +2120,7 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
       ``get_builtin_structural_tag_supported_models()``.
 
-    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    Returns ``None`` if xgrammar is missing, fails to load (e.g. broken native
     binding on macOS arm64), or has neither API available.
     """
     # Install the torch stub BEFORE any xgrammar import. If this lives
@@ -2011,7 +2157,12 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
         ]
     except Exception as e:
         logger.warning("xgrammar parser discovery unavailable: %s", e)
-        return []
+        return None
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    return _grammar_parser_options() or []
 
 
 # =============================================================================
@@ -2961,12 +3112,7 @@ async def update_model_settings(
             int(value) if value is not None and value > 0 else None
         )
     if "dflash_verify_mode" in sent:
-        value = request.dflash_verify_mode
-        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
-        # Anything else (including empty string) → revert to dflash default.
-        current_settings.dflash_verify_mode = (
-            value if value in ("dflash", "adaptive", "ddtree", "off") else None
-        )
+        current_settings.dflash_verify_mode = request.dflash_verify_mode
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -3095,6 +3241,8 @@ async def update_model_settings(
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
+    if "cache_reasoning_output" in sent:
+        current_settings.cache_reasoning_output = request.cache_reasoning_output
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
     if "guided_grammar_enabled" in sent:
@@ -3405,6 +3553,14 @@ def _validate_model_settings(entry, settings):
             kwargs["enable_thinking"] = settings["enable_thinking"]
         validate_chat_template_kwargs(kwargs)
 
+    if not _entry_is_diffusion_model(entry):
+        # Use the same conflict rules and output-setting precedence as profile apply.
+        resolved, _ = resolve_vlm_mtp_conflicts(settings)
+        try:
+            ModelSettings.from_dict(resolved)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
 
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
@@ -3422,7 +3578,7 @@ async def create_model_profile(
     request: CreateProfileRequest,
     is_admin: bool = Depends(require_admin),
 ):
-    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+    from ..model_profiles import InvalidProfileNameError
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
@@ -3467,7 +3623,7 @@ async def update_model_profile(
     request: UpdateProfileRequest,
     is_admin: bool = Depends(require_admin),
 ):
-    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+    from ..model_profiles import InvalidProfileNameError
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
@@ -3544,6 +3700,29 @@ async def apply_model_profile(
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(applied)
         mgr.set_settings(model_id, applied)
+    return {"model_id": model_id, "settings": applied.to_dict()}
+
+
+@router.post("/api/models/{model_id}/profile-templates/{name}/apply")
+async def apply_model_template(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    entry = _require_model(model_id)
+
+    def sanitizer(settings):
+        if _entry_is_diffusion_model(entry):
+            _sanitize_diffusion_settings_dict(settings)
+        _validate_model_settings(entry, settings)
+
+    try:
+        applied = mgr.apply_template(model_id, name, settings_sanitizer=sanitizer)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if applied is None:
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
     return {"model_id": model_id, "settings": applied.to_dict()}
 
 
@@ -4045,6 +4224,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "ui": {
             "language": global_settings.ui.language,
+            "dashboard_layout": global_settings.ui.dashboard_layout,
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
@@ -4960,6 +5140,13 @@ async def update_global_settings(
         runtime_applied.append("ui_language")
         _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
+
+    if "ui_dashboard_layout" in request.model_fields_set:
+        layout = request.ui_dashboard_layout
+        global_settings.ui.dashboard_layout = (
+            layout.model_dump() if layout is not None else None
+        )
+        runtime_applied.append("ui_dashboard_layout")
 
     # Apply idle timeout settings (Live)
     # Use model_fields_set to distinguish "explicitly sent as null" (disable)

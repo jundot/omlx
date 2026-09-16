@@ -207,11 +207,7 @@ func resolveActiveProfileDisplay(
     guard let activeName, !activeName.isEmpty else { return nil }
 
     if let profile = modelProfiles.first(where: { $0.name == activeName }),
-       let source = profile.sourceTemplate,
-       let template = templates.first(where: { $0.name == source }) {
-        return (template.templateScope, template.name)
-    }
-    if let template = templates.first(where: { $0.name == activeName }) {
+       let template = profile.matchingTemplate(in: templates) {
         return (template.templateScope, template.name)
     }
     if modelProfiles.contains(where: { $0.name == activeName }) {

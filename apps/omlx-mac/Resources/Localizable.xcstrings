@@ -18715,25 +18715,25 @@
       }
     },
     "server.profile.pin_in_memory.note" : {
-      "comment" : "Note marking Pin in memory as per-model only",
+      "comment" : "Note explaining where to configure Pin in memory",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Per-model only."
+            "value" : "Per-model only - see Models > [model] > Advanced."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Только для модели."
+            "value" : "Только для модели — см. Модели → [модель] → Дополнительно."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型。"
+            "value" : "仅每个模型 — 参见 模型 → [模型] → 高级。"
           }
         }
       }

@@ -42,6 +42,21 @@ def ssd_cache(tmp_cache_dir):
     cache.close()
 
 
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _write_finished(cache, image_hash, model_name):
+    key = _composite_key(model_name, image_hash)
+    with cache._pending_lock:
+        return key not in cache._pending_write_keys
+
+
 class TestCompositeKey:
     def test_composite_key_format(self):
         key = _composite_key("model-a", "hash123")
@@ -144,8 +159,7 @@ class TestSSDCache:
         mx.eval(features)
         ssd_cache.put("img_hash", "model_a", features)
 
-        # Wait for background writer
-        time.sleep(0.5)
+        assert _wait_until(lambda: _write_finished(ssd_cache, "img_hash", "model_a"))
 
         # Clear memory cache to force SSD read
         with ssd_cache._memory_lock:
@@ -160,7 +174,8 @@ class TestSSDCache:
         mx.eval(features)
         ssd_cache.put("img_hash", "model_a", features)
 
-        time.sleep(0.5)
+        file_path = ssd_cache._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(file_path.exists)
 
         # Check safetensors file exists
         safetensors_files = list(tmp_cache_dir.rglob("*.safetensors"))
@@ -181,7 +196,10 @@ class TestSSDCache:
             features = mx.ones((4, 8))
             mx.eval(features)
             ssd_cache.put("img_hash", "model_a", features)
-            time.sleep(0.5)
+            file_path = ssd_cache._file_path_for_key(
+                _composite_key("model_a", "img_hash")
+            )
+            assert _wait_until(file_path.exists)
 
         safetensors_files = list(tmp_cache_dir.rglob("*.safetensors"))
         assert len(safetensors_files) == 1
@@ -193,7 +211,8 @@ class TestSSDCache:
         features = mx.ones((4, 8))
         mx.eval(features)
         cache1.put("img_hash", "model_a", features)
-        time.sleep(0.5)
+        file_path = cache1._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(file_path.exists)
         cache1.close()
 
         # Phase 2: create new cache instance — should scan existing files
@@ -219,7 +238,9 @@ class TestSSDCache:
             mx.eval(f)
             cache.put(f"img_{i}", "model", f)
 
-        time.sleep(0.5)
+        assert _wait_until(
+            lambda: all(_write_finished(cache, f"img_{i}", "model") for i in range(3))
+        )
 
         # SSD index should have evicted older entries
         assert cache._ssd_total_size <= 100 or len(cache._ssd_index) <= 1
@@ -229,7 +250,8 @@ class TestSSDCache:
         features = mx.ones((4, 8))
         mx.eval(features)
         ssd_cache.put("img_hash", "model_a", features)
-        time.sleep(0.5)
+        file_path = ssd_cache._file_path_for_key(_composite_key("model_a", "img_hash"))
+        assert _wait_until(file_path.exists)
 
         # Clear memory cache
         with ssd_cache._memory_lock:
@@ -284,7 +306,8 @@ class TestMultiTensorFeatures:
         for f in features:
             mx.eval(f)
         ssd_cache.put("multi_img", "model", features)
-        time.sleep(0.5)
+        file_path = ssd_cache._file_path_for_key(_composite_key("model", "multi_img"))
+        assert _wait_until(file_path.exists)
 
         # Clear memory to force SSD load
         with ssd_cache._memory_lock:

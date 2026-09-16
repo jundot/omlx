@@ -327,14 +327,14 @@ class TestGrammarRowAdvance:
 def _bare_generation_batch(uid, logits_processors):
     """Build a GenerationBatch via __new__ with plain-list state.
 
-    ``filter()`` and ``extend()`` never touch the model, so a bare instance
-    is enough to exercise the real mlx-lm bookkeeping without loading
-    weights. Mirrors the ``__class__.__new__`` idiom of
-    ``_patched_ppb_split`` in omlx/scheduler.py.
+    Filtering and extending do not execute the model, but runtime patches
+    use its identity to release request-owned state. Supply that identity
+    without loading weights.
     """
     from mlx_lm.generate import GenerationBatch
 
     batch = GenerationBatch.__new__(GenerationBatch)
+    batch.model = object()
     batch.uids = [uid]
     batch.prompt_cache = []
     batch.tokens = [[1, 2, 3]]

@@ -659,6 +659,8 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    _omlx_mtp_batch_rollback_cache = True
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance._left_padding = None

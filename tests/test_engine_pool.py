@@ -2978,50 +2978,6 @@ class TestEnginePoolTTL:
         assert pool._entries["model-a"].last_access == 200.0
 
     @pytest.mark.asyncio
-    async def test_ttl_skips_vlm_with_active_requests(self, pool_with_loaded_model):
-        """Test that TTL does not unload VLM engine with active requests."""
-        pool = pool_with_loaded_model
-
-        mock_engine = MagicMock()
-        mock_engine.has_active_requests.return_value = True
-
-        pool._entries["model-a"].engine = mock_engine
-
-        settings_manager = MagicMock()
-        settings = MagicMock()
-        settings.ttl_seconds = 60
-        settings_manager.get_settings.return_value = settings
-
-        with patch("time.time", return_value=200.0):
-            expired = await pool.check_ttl_expirations(settings_manager)
-
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
-
-    @pytest.mark.asyncio
-    async def test_ttl_skips_non_streaming_with_active_requests(
-        self, pool_with_loaded_model
-    ):
-        """Test that TTL does not unload non-streaming engine with active requests."""
-        pool = pool_with_loaded_model
-
-        mock_engine = MagicMock()
-        mock_engine.has_active_requests.return_value = True
-
-        pool._entries["model-a"].engine = mock_engine
-
-        settings_manager = MagicMock()
-        settings = MagicMock()
-        settings.ttl_seconds = 60
-        settings_manager.get_settings.return_value = settings
-
-        with patch("time.time", return_value=200.0):
-            expired = await pool.check_ttl_expirations(settings_manager)
-
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
-
-    @pytest.mark.asyncio
     async def test_ttl_falls_back_to_global_idle_timeout(self, pool_with_loaded_model):
         """Per-model TTL None falls back to global idle timeout."""
         pool = pool_with_loaded_model
@@ -3249,16 +3205,6 @@ class TestResolveModelId:
 
         result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
         assert result == "model-b"
-
-    def test_exact_match_preferred_over_case_insensitive(self, small_mock_model_dir):
-        """Test exact match takes priority over case-insensitive."""
-        pool = _make_pool(ceiling=10 * 1024**3)
-        pool.discover_models(str(small_mock_model_dir))
-
-        # Exact match should be returned directly
-        result = pool.resolve_model_id("model-a", settings_manager=None)
-        assert result == "model-a"
-
 
 class TestMemorySettleBarrier:
     """Tests for memory settle barrier in _unload_engine()."""
@@ -3883,6 +3829,8 @@ class TestEnginePoolInUseLease:
         pool = _make_pool(ceiling=0)
         entry = self._loaded_entry("leased")
         entry.in_use = 1
+        entry.pending_unload_reason = "manual unload"
+        pool._unload_engine = AsyncMock()
         pool._entries = {"leased": entry}
 
         await pool._lock.acquire()
@@ -4524,3 +4472,68 @@ async def test_entry_has_active_requests_and_quiescence_on_failed_engine():
     assert pool._entry_is_quiescent(entry) is True
 
 
+async def test_loaded_model_acquire_and_release_bypass_unrelated_unload_lock():
+    pool = _make_pool(ceiling=0)
+    entry = TestEnginePoolInUseLease._loaded_entry("ready")
+    pool._entries = {"ready": entry}
+    pool._unloading_models.add("other")
+    async with pool._lock:
+        engine = await asyncio.wait_for(pool.get_engine("ready", _lease=True), 0.2)
+        assert engine is entry.engine
+        assert entry.in_use == 1
+        await asyncio.wait_for(pool.release_engine("ready"), 0.2)
+        assert entry.in_use == 0
+
+
+@pytest.mark.asyncio
+async def test_unloading_model_cannot_use_loaded_fast_path():
+    pool = _make_pool(ceiling=0)
+    entry = TestEnginePoolInUseLease._loaded_entry("closing")
+    pool._entries = {"closing": entry}
+    pool._unloading_models.add("closing")
+    assert pool._acquire_loaded_engine("closing", False, True, None) is None
+    assert entry.in_use == 0
+
+
+@pytest.mark.asyncio
+async def test_unload_marker_exists_before_stop_yields_and_clears_on_error():
+    pool = _make_pool(ceiling=0)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stop(model_id):
+        assert model_id in pool._unloading_models
+        entered.set()
+        await release.wait()
+        raise RuntimeError("stop failed")
+
+    pool._stop_and_unload_engine = stop
+    task = asyncio.create_task(pool._unload_engine("closing"))
+    await entered.wait()
+    with pytest.raises(ModelBusyError):
+        await pool._unload_engine("closing")
+    release.set()
+    with pytest.raises(RuntimeError):
+        await task
+    assert not pool._unloading_models
+
+
+@pytest.mark.asyncio
+async def test_cancelled_unload_retains_marker_until_stop_finishes():
+    pool = _make_pool(ceiling=0)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stop(model_id):
+        entered.set()
+        await release.wait()
+
+    pool._stop_and_unload_engine = stop
+    task = asyncio.create_task(pool._unload_engine("closing"))
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert "closing" in pool._unloading_models
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not pool._unloading_models

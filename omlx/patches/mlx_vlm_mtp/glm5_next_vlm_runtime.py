@@ -37,6 +37,9 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..mlx_lm_mtp import prompt_priming
+from .glm5_next_batch_rollback import rollback_rows
+
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
@@ -449,6 +452,7 @@ def _patch_language_model(g5_lang: Any) -> None:
         from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
 
         original_init(self, args, config)
+        self._omlx_mtp_multi_request = True
 
         n_mtp = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
         attach_enabled = bool(is_mtp_attach_enabled())
@@ -484,6 +488,7 @@ def _patch_language_model(g5_lang: Any) -> None:
             # head cache committed-only and run the speculative steps on a
             # per-cycle clone, as DeepSeek-V4 does for its own head cache.
             self._omlx_mtp_head_clone = True
+            self._omlx_mtp_batch_rollback = True
             # Same 8-of-N routing economics as GLM-5.2: each extra verify row
             # pulls a nearly disjoint expert set, so the adaptive depth
             # controller needs a high marginal-cost prior or it over-drafts.
@@ -510,6 +515,8 @@ def _patch_language_model(g5_lang: Any) -> None:
 
         if not return_hidden:
             out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+            if inputs_embeds is None and prompt_priming.capture_eligible(self, cache):
+                prompt_priming.maybe_capture(self, inputs, out, cache)
             nlk = kwargs.get("num_logits_to_keep", 0)
             if nlk:
                 out = out[:, -nlk:, :]
@@ -560,6 +567,8 @@ def _patch_language_model(g5_lang: Any) -> None:
             acc = [int(x) for x in accepted.reshape(-1).tolist()]
         else:
             acc = [int(x) for x in accepted]
+        if len(acc) > 1:
+            return rollback_rows(g5_lang, caches, gdn_states, acc, block_size)
         max_a = max(acc) if acc else 0
         n = max_a + 1
         trim = int(block_size) - n

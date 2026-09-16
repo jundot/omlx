@@ -845,7 +845,9 @@ private struct WelcomeIcon: View {
             .frame(width: size, height: size)
             .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
             .shadow(color: Color.black.opacity(0.10), radius: 12, y: 6)
-            .accessibilityLabel("oMLX")
+            .accessibilityLabel(String(localized: "common.app_name",
+                                       defaultValue: "oMLX",
+                                       comment: "Product name used as the app logo accessibility label"))
     }
 }
 

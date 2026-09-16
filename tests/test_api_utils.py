@@ -1030,11 +1030,21 @@ class TestConvertAnthropicToInternal:
         assert len(image_parts) == 1
         assert "iVBOR" in image_parts[0]["image_url"]["url"]
 
-    def test_document_block_text_plain(self):
-        """Test converting text/plain document block decodes content."""
+    @pytest.mark.parametrize(
+        "source_type,text",
+        [
+            ("base64", "Hello from document"),
+            ("text", "Hello from document\n你好"),
+            ("text", "SGVsbG8="),
+        ],
+    )
+    def test_document_block_text_plain(self, source_type, text):
+        """Document text is decoded only when the source declares base64."""
         import base64
 
-        text_data = base64.b64encode(b"Hello from document").decode()
+        text_data = (
+            base64.b64encode(text.encode()).decode() if source_type == "base64" else text
+        )
         request = MessagesRequest(
             model="claude-3",
             max_tokens=1024,
@@ -1044,7 +1054,7 @@ class TestConvertAnthropicToInternal:
                     content=[
                         ContentBlockDocument(
                             source={
-                                "type": "base64",
+                                "type": source_type,
                                 "media_type": "text/plain",
                                 "data": text_data,
                             },
@@ -1059,8 +1069,7 @@ class TestConvertAnthropicToInternal:
 
         assert len(result) == 1
         assert result[0]["role"] == "user"
-        assert "Hello from document" in result[0]["content"]
-        assert "[Document: notes.txt]" in result[0]["content"]
+        assert result[0]["content"] == f"[Document: notes.txt]\n{text}"
 
     def test_document_block_pdf_placeholder(self):
         """Test converting PDF document block returns placeholder."""

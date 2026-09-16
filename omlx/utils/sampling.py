@@ -151,9 +151,7 @@ def make_sampler(
         if top_p > 0 and top_p < 1.0:
             sampling_methods.append(lambda x: apply_top_p(x, top_p))
         if min_p != 0.0:
-            sampling_methods.append(
-                lambda x: apply_min_p(x, min_p, min_tokens_to_keep)
-            )
+            sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
         if xtc_probability > 0.0:
             sampling_methods.append(
                 lambda x: apply_xtc(
@@ -168,6 +166,40 @@ def make_sampler(
                 logprobs = method(logprobs)
             return categorical_sampling(logprobs, temp)
 
+    if temp > 0 and xtc_probability == 0:
+
+        def sampling_logits(logprobs: mx.array):
+            for method in sampling_methods:
+                logprobs = method(logprobs)
+            return logprobs * (1 / temp)
+
+        def sample_with_logprobs(logprobs: mx.array, *, rowwise: bool = False):
+            # Draft sampling and its acceptance density share the same filters.
+            scaled = sampling_logits(logprobs)
+            if rowwise:
+                token = mx.concatenate(
+                    [
+                        mx.random.categorical(scaled[row : row + 1])
+                        for row in range(scaled.shape[0])
+                    ]
+                )
+            else:
+                token = mx.random.categorical(scaled)
+            density = scaled.astype(mx.float32)
+            density = density - mx.logsumexp(density, axis=-1, keepdims=True)
+            return token, density
+
+        sampler._mtp_sampling_logits = sampling_logits
+        sampler.sample_with_logprobs = sample_with_logprobs
+        if 0 < top_p < 1 or min_p > 0 or top_k > 0:
+            sampler._mtp_batch_sampling_key = (
+                temp,
+                top_p,
+                min_p,
+                min_tokens_to_keep,
+                top_k,
+            )
+
     # Expose sampling params on the returned callable so downstream code
     # (e.g. MTP acceptance check) can rebuild the filtered distribution
     # without re-plumbing the params through the BatchGenerator contract.
@@ -177,4 +209,5 @@ def make_sampler(
     sampler.min_p = min_p
     sampler.top_k = top_k
     sampler.min_tokens_to_keep = min_tokens_to_keep
+    sampler.xtc_probability = xtc_probability
     return sampler

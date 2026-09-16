@@ -52,6 +52,16 @@ class TestMMLU:
         """When no 'answer is' pattern, use last valid letter."""
         assert self.bench.extract_answer("Looking at A and B, B is correct", {}) == "B"
 
+    def test_extract_answer_stated_answer_beats_later_letter(self):
+        """An explicit 'answer is X' wins even when another letter comes after it."""
+        assert self.bench.extract_answer("The answer is B. Note that A is a distractor.", {}) == "B"
+        assert self.bench.extract_answer("Answer: C. Option D looks similar.", {}) == "C"
+
+    def test_extract_answer_stated_answer_any_case(self):
+        """The 'answer is' cue is matched whatever casing the model used."""
+        assert self.bench.extract_answer("ANSWER IS D. A is incorrect.", {}) == "D"
+        assert self.bench.extract_answer("the answer is a, not b", {}) == "A"
+
     def test_check_answer_correct(self):
         assert self.bench.check_answer("A", {"answer": "A"}) is True
 

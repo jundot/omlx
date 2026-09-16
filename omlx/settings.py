@@ -815,15 +815,24 @@ class UISettings:
     """Admin UI settings."""
 
     language: str = "en"
+    # Admin dashboard block layout. None means the built-in default layout.
+    dashboard_layout: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"language": self.language}
+        return {
+            "language": self.language,
+            "dashboard_layout": self.dashboard_layout,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UISettings:
         """Create from dictionary."""
-        return cls(language=data.get("language", "en"))
+        layout = data.get("dashboard_layout")
+        return cls(
+            language=data.get("language", "en"),
+            dashboard_layout=layout if isinstance(layout, dict) else None,
+        )
 
 
 @dataclass

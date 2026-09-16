@@ -1222,6 +1222,7 @@ class ProcessMemoryEnforcer:
                     # executor without a Scheduler, so an unresolvable
                     # scheduler is their normal shape, not a wrapper break.
                     # Warning here reads as a guard regression (#2312).
+                    engine.set_memory_soft_limit(soft_limit)
                     continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made

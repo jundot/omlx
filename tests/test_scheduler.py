@@ -30,6 +30,7 @@ import omlx.scheduler as scheduler_module
 from omlx.cache.stats import PrefixCacheStats
 from omlx.models.vlm import VLMModelAdapter
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
+from omlx.patches.mlx_lm_mtp import batch_generator as bg
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
@@ -6786,6 +6787,7 @@ class TestStopStringOutputBuffer:
     def _setup(self, mock_model):
         tokenizer = _StopSequenceTokenizer()
         scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        tokenizer = scheduler.tokenizer
         scheduler._get_detokenizer = lambda request_id: (
             scheduler._request_detokenizers.setdefault(
                 request_id,
@@ -6848,6 +6850,110 @@ class TestStopStringOutputBuffer:
 
         assert len(outputs) == 1
         assert outputs[0].new_text == "body\n"
+
+    @pytest.mark.parametrize("finish_reason", [None, "length"])
+    @pytest.mark.parametrize(
+        "pieces",
+        [
+            [" START_A", " STOP", "_MARK END_B"],
+            [" START_A STOP", "_MARK END_B"],
+            [" START_A STOP_MARK END_B"],
+            [" START_A ", "S", "T", "O", "P", "_MARK END_B"],
+        ],
+    )
+    def test_contextual_stop_tokens_do_not_leak(
+        self, mock_model, pieces, finish_reason
+    ):
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = ["STOP_MARK"]
+        scheduler.tokenizer.pieces = dict(scheduler.tokenizer.pieces)
+        scheduler.tokenizer.pieces.update(enumerate(pieces, 100))
+        # The standalone stop encoding is [99], unlike these contextual tokens.
+        scheduler._build_state_machine(request)
+        responses = [self._response(100 + i) for i in range(len(pieces))]
+        responses[-1].finish_reason = finish_reason
+
+        outputs, finished = scheduler._process_batch_responses(responses)
+
+        assert finished == {request.request_id}
+        assert "".join(output.new_text for output in outputs) == " START_A "
+        assert outputs[-1].output_text == " START_A "
+        assert outputs[-1].finish_reason == "stop"
+        assert sum(output.finished for output in outputs) == 1
+        assert not request._stop_output_state.pending
+
+    @pytest.mark.parametrize("finish_reason", ["stop", "length", None])
+    def test_contextual_partial_stop_is_preserved(self, mock_model, finish_reason):
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = ["STOP_MARK"]
+        scheduler.tokenizer.pieces = {**scheduler.tokenizer.pieces, 100: " STOP"}
+        scheduler._build_state_machine(request)
+        outputs, _ = scheduler._process_batch_responses([self._response(100)])
+        assert outputs == []
+        token = 2 if finish_reason == "stop" else 88
+        outputs, _ = scheduler._process_batch_responses(
+            [self._response(token, finish_reason=finish_reason)]
+        )
+        expected = " STOP" if finish_reason == "stop" else " STOPx"
+        assert "".join(output.new_text for output in outputs) == expected
+        assert not request._stop_output_state.pending
+
+    @pytest.mark.parametrize("use_parser", [False, True])
+    @pytest.mark.parametrize("terminal_reason", ["length", "stop"])
+    @pytest.mark.parametrize(
+        "pieces, stops, expected",
+        [
+            (["START_A", " STOP", "_MARK", " END_B"], ["STOP_MARK"], "START_A "),
+            (["START_A", " STOP", "_MARK"], ["STOP_MARK"], "START_A "),
+            (["START_A STOP_MARK END_B"], ["STOP_MARK"], "START_A "),
+            (["잠 START_A", " STOP", "_MARK"], ["STOP_MARK"], "잠 START_A "),
+            (["START_A", " <thi"], ["<thi"], "START_A "),
+            (["START_A STOP_MARK END_B"], ["END_B", "STOP_MARK"], "START_A "),
+            (["<think>reason", " STOP", "_MARK"], ["STOP_MARK"], "<think>reason "),
+        ],
+    )
+    def test_text_stop_with_protocol_parser(
+        self,
+        mock_model,
+        monkeypatch,
+        use_parser,
+        terminal_reason,
+        pieces,
+        stops,
+        expected,
+    ):
+        from omlx.patches.deepseek_v41 import output_parser
+
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = stops
+        tokenizer = scheduler.tokenizer
+        tokenizer.pieces = {**tokenizer.pieces, **dict(enumerate(pieces, 100))}
+        scheduler._build_state_machine(request)
+        if use_parser:
+            monkeypatch.setattr(
+                output_parser,
+                "create_streaming_detokenizer",
+                lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+            )
+            session = output_parser.DeepSeekV41OutputParserSession(tokenizer)
+            scheduler._output_parser_sessions[request.request_id] = session
+            scheduler._get_output_parser_session = lambda request_id: session
+        responses = [self._response(100 + i) for i in range(len(pieces))]
+        if terminal_reason == "stop":
+            responses.append(self._response(tokenizer.eos_token_id, "stop"))
+        else:
+            responses[-1].finish_reason = "length"
+
+        outputs, finished = scheduler._process_batch_responses(responses)
+
+        assert finished == {request.request_id}
+        assert "".join(output.new_text for output in outputs) == expected
+        assert outputs[-1].output_text == expected
+        assert outputs[-1].finish_reason == "stop"
+        assert sum(output.finished for output in outputs) == 1
 
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
@@ -7347,3 +7453,96 @@ def test_unsupported_cache_skips_boundary_storage(mock_model, mock_tokenizer, ph
 def test_mock_cache_has_no_implicit_reconstruction_support(mock_model, mock_tokenizer):
     scheduler = Scheduler(mock_model, mock_tokenizer)
     assert not scheduler._cache_layer_is_reconstructible(MagicMock())
+
+
+def _fake_batch(n, max_tokens=None):
+    """A minimal GenerationBatch stand-in for _emit_ragged_responses."""
+    max_tokens = max_tokens or [1000] * n
+
+    class _Batch:
+        # ``_emit_ragged_responses`` builds ``type(gen_batch).Response(...)``.
+        Response = SimpleNamespace
+
+        def __init__(self):
+            self.uids = list(range(n))
+            self.tokens = [[] for _ in range(n)]
+            self._num_tokens = [0] * n
+            self.max_tokens = list(max_tokens)
+            # matcher that never triggers a stop sequence
+            self.state_machines = [
+                SimpleNamespace(match=lambda st, tok: (0, None, None)) for _ in range(n)
+            ]
+            self._matcher_states = [0] * n
+            self.filtered = None
+
+        def extract_cache(self, idx):
+            return f"cache-{idx}"
+
+        def filter(self, keep):
+            self.filtered = list(keep)
+
+    return _Batch()
+
+
+class TestEmitRagged:
+    def test_each_row_emits_its_full_ragged_run(self):
+        # Row 0 commits 3 tokens, row 1 commits 1 — different lengths (ragged).
+        batch = _fake_batch(2)
+        state = SimpleNamespace(states={})  # states absent -> stat bump skipped
+        per_row = {
+            0: [(101, None, "draft"), (102, None, "draft"), (103, None, "verify")],
+            1: [(201, None, "verify")],
+        }
+        responses = bg._emit_ragged_responses(batch, state, per_row)
+
+        # 3 + 1 = 4 Response objects, in order, all with finish_reason None
+        assert len(responses) == 4
+        assert [r.token for r in responses] == [101, 102, 103, 201]
+        assert all(r.finish_reason is None for r in responses)
+        # tokens appended to the right rows, counters advanced
+        assert batch.tokens[0] == [101, 102, 103]
+        assert batch.tokens[1] == [201]
+        assert batch._num_tokens == [3, 1]
+        # no row finished -> batch not filtered
+        assert batch.filtered is None
+
+    def test_length_finish_truncates_row_midrun(self):
+        # Row 0 is allowed only 2 tokens but commits 3 -> stops at the 2nd (length)
+        # and is filtered out; row 1 keeps going.
+        batch = _fake_batch(2, max_tokens=[2, 1000])
+        state = SimpleNamespace(states={})
+        per_row = {
+            0: [(101, None, "draft"), (102, None, "verify"), (103, None, "draft")],
+            1: [(201, None, "verify")],
+        }
+        responses = bg._emit_ragged_responses(batch, state, per_row)
+
+        # row 0 emits only 2 (the 3rd is never reached), row 1 emits 1 -> 3 total
+        row0 = [r for r in responses if r.uid == 0]
+        assert [r.token for r in row0] == [101, 102]
+        assert row0[-1].finish_reason == "length"
+        assert row0[-1].prompt_cache == "cache-0"  # finish path extracts cache
+        assert batch.tokens[0] == [101, 102]
+        # finished row 0 filtered out, kept = [row 1 index]
+        assert batch.filtered == [1]
+
+
+def test_scheduler_ignores_remaining_responses_after_string_stop():
+
+    scheduler = TestStopStringOutputBuffer()._setup(MagicMock())
+    request = scheduler.running["stop-output"]
+    request.sampling_params.stop = ["body"]
+    batch = _fake_batch(2)
+    batch.uids = [99, 100]
+    responses = bg._emit_ragged_responses(
+        batch,
+        SimpleNamespace(states={}),
+        {
+            99: [(10, None, "draft"), (88, None, "bonus")],
+            100: [(88, None, "verify")],
+        },
+    )
+    outputs, finished = scheduler._process_batch_responses(responses)
+    assert finished == {"stop-output"}
+    assert request.output_token_ids == [10]
+    assert all(o.finished for o in outputs)

@@ -2,7 +2,7 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 3..9).
+"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 2..9).
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
@@ -17,8 +17,8 @@ donor kernel: the in-kernel sigmoid uses MLX's own unary formula
 inputs; the RMS applies the ones-weight rounding then the separate scalar
 multiply's rounding — the composed chain's two casts.
 
-S >= 3 is a HARD gate: the next conv state is copied from qkv rows only,
-which is wrong when a state row would still come from the OLD conv state.
+For S=2, the next conv state retains one row from the old conv state.
+Longer verify windows fill the entire next state from the new qkv rows.
 Only the target-verify arm routes here; decode (S=1) and prefill keep the
 stock path.
 """
@@ -41,7 +41,8 @@ _QWEN4_DECODE_ENGAGED_LOGGED = False
 
 _SOURCE = """
     uint lane = thread_position_in_threadgroup.x;
-    uint row = threadgroup_position_in_grid.y;
+    uint batch_idx = threadgroup_position_in_grid.y / uint(S);
+    uint row = threadgroup_position_in_grid.y % uint(S);
     uint logical_head = threadgroup_position_in_grid.z;
     constexpr uint q_heads = uint(HK);
     constexpr uint k_head_base = uint(HK);
@@ -61,8 +62,8 @@ _SOURCE = """
         for (uint tap = 0; tap < 4; ++tap) {
             uint input_row = row + tap;
             const T xv = input_row < uint(NKEEP)
-                ? conv_state[input_row * uint(C) + channel]
-                : qkv[(input_row - uint(NKEEP)) * uint(C) + channel];
+                ? conv_state[(batch_idx * uint(NKEEP) + input_row) * uint(C) + channel]
+                : qkv[(batch_idx * uint(S) + input_row - uint(NKEEP)) * uint(C) + channel];
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
@@ -76,7 +77,7 @@ _SOURCE = """
         sumsq = simd_sum(sumsq);
         float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
         const T scale = is_q ? q_scale : k_scale;
-        uint out_base = (row * uint(HK) + head) * uint(DK) + lane * 4;
+        uint out_base = ((batch_idx * uint(S) + row) * uint(HK) + head) * uint(DK) + lane * 4;
         for (uint i = 0; i < 4; ++i) {
             const T rms = T(1) * T(float(activated[i]) * inv);
             const T value = scale * rms;
@@ -87,15 +88,26 @@ _SOURCE = """
         }
         }
     } else {
-        uint out_base = (row * uint(HV) + head) * uint(DV) + lane * 4;
+        uint out_base = ((batch_idx * uint(S) + row) * uint(HV) + head) * uint(DV) + lane * 4;
         for (uint i = 0; i < 4; ++i) {
             v_out[out_base + i] = activated[i];
         }
     }
+    if (S < NKEEP && row == 0) {
+        for (uint old_row = 0; old_row < uint(NKEEP - S); ++old_row) {
+            uint dst = (batch_idx * uint(NKEEP) + old_row) * uint(C)
+                       + channel_base + lane * 4;
+            uint src = (batch_idx * uint(NKEEP) + old_row + uint(S)) * uint(C)
+                       + channel_base + lane * 4;
+            for (uint i = 0; i < 4; ++i) {
+                conv_out[dst + i] = conv_state[src + i];
+            }
+        }
+    }
     if (row + uint(NKEEP) >= uint(S)) {
         uint state_row = row + uint(NKEEP) - uint(S);
-        uint raw_base = row * uint(C) + channel_base + lane * 4;
-        uint state_base = state_row * uint(C) + channel_base + lane * 4;
+        uint raw_base = (batch_idx * uint(S) + row) * uint(C) + channel_base + lane * 4;
+        uint state_base = (batch_idx * uint(NKEEP) + state_row) * uint(C) + channel_base + lane * 4;
         for (uint i = 0; i < 4; ++i) {
             conv_out[state_base + i] = qkv[raw_base + i];
         }
@@ -263,7 +275,8 @@ def _kernel():
 
 
 def gdn_prework_fused(qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, dk, dv):
-    """One fused dispatch. qkv [1,S,C], conv_state [1,3,C], conv_w [C,4,1]."""
+    """One fused dispatch. qkv [B,S,C], conv_state [B,3,C], conv_w [C,4,1]."""
+    batch_size = qkv.shape[0]
     s_len = qkv.shape[1]
     c_dim = qkv.shape[2]
     outs = _kernel()(
@@ -278,13 +291,13 @@ def gdn_prework_fused(qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, dk, dv)
             ("C", c_dim),
             ("S", s_len),
         ],
-        grid=(32, s_len, 2 * hk + hv),
+        grid=(32, batch_size * s_len, 2 * hk + hv),
         threadgroup=(32, 1, 1),
         output_shapes=[
-            (1, s_len, hk, dk),
-            (1, s_len, hk, dk),
-            (1, s_len, hv, dv),
-            (1, 3, c_dim),
+            (batch_size, s_len, hk, dk),
+            (batch_size, s_len, hk, dk),
+            (batch_size, s_len, hv, dv),
+            (batch_size, 3, c_dim),
         ],
         output_dtypes=[qkv.dtype] * 4,
     )
@@ -581,7 +594,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
         if gdn_sink is None or cache is None:
             return False
-        if inputs.shape[0] != 1 or not (3 <= s_len <= 9):
+        if not (2 <= s_len <= 9):
             return False
         if mask is not None:
             return False
@@ -594,7 +607,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         if getattr(cache, "lengths", None) is not None:
             return False
         conv_state = cache[0]
-        if conv_state is None or conv_state.shape[0] != 1:
+        if conv_state is None or conv_state.shape[0] != inputs.shape[0]:
             return False
         if conv_state.dtype != mx.bfloat16:
             return False
@@ -719,7 +732,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         recurrent_state = cache[1]
         sink_len = len(gdn_sink) if gdn_sink is not None else 0
         try:
-            B = 1
+            B = inputs.shape[0]
             mixed_qkv, z, b, a = q35._target_verify_linears(
                 (self.in_proj_qkv, self.in_proj_z, self.in_proj_b,
                  self.in_proj_a),

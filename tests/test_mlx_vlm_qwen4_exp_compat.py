@@ -1917,3 +1917,24 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
     embedding.prefetch(mx.array([[4]], dtype=mx.int32))
     assert not embedding._pending
     embedding.close()
+
+
+def test_mtp_batched_positions_match_for_identical_rows():
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpMTPModule
+    import mlx.nn as nn
+
+    mx.random.seed(17)
+    head = Qwen4ExpMTPModule(config)
+    head.eval()
+    embed = nn.Embedding(config.vocab_size, config.hidden_size)
+    hidden = mx.repeat(
+        mx.random.normal((1, 5, config.hidden_size * config.hc_count)), 2, axis=0
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]])
+    cache = [QSAKVCache()]
+    for _ in range(2):
+        output, _ = head(hidden, tokens, embed, cache)
+        mx.eval(output)
+        assert mx.allclose(output[0], output[1], atol=1e-6).item()
+    assert cache[0].offset == 10

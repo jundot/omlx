@@ -390,9 +390,7 @@ class TestSchedulerSettings:
         """Defaults on; explicit false round-trips."""
         assert SchedulerSettings.from_dict({}).decode_fairness is True
         assert (
-            SchedulerSettings.from_dict(
-                {"decode_fairness": False}
-            ).decode_fairness
+            SchedulerSettings.from_dict({"decode_fairness": False}).decode_fairness
             is False
         )
 
@@ -530,9 +528,7 @@ class TestCacheSettings:
     def test_from_dict_preserves_legacy_mode_and_fp32_default(
         self, legacy_split, expected_mode
     ):
-        settings = CacheSettings.from_dict(
-            {"gdn_ssd_split_enabled": legacy_split}
-        )
+        settings = CacheSettings.from_dict({"gdn_ssd_split_enabled": legacy_split})
         assert settings.gdn_ssd_split_enabled is legacy_split
         assert settings.get_gdn_snapshot_storage() == expected_mode
         assert settings.gdn_sidecar_state_dtype == "fp32"
@@ -553,7 +549,9 @@ class TestCacheSettings:
             }
         )
         global_settings = GlobalSettings(cache=settings)
-        assert any("gdn_snapshot_storage" in error for error in global_settings.validate())
+        assert any(
+            "gdn_snapshot_storage" in error for error in global_settings.validate()
+        )
 
     def test_auto_policy_embeds_when_cache_is_disabled_or_hot_only(self):
         settings = CacheSettings(enabled=False)
@@ -1720,9 +1718,7 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert not any("gdn_sidecar_state_dtype" in e for e in errors)
 
-    @pytest.mark.parametrize(
-        "dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"]
-    )
+    @pytest.mark.parametrize("dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"])
     def test_validate_accepts_every_dtype_with_split_enabled(self, dtype):
         settings = GlobalSettings()
         settings.cache.gdn_ssd_split_enabled = True
@@ -2470,9 +2466,7 @@ class TestResolveDefaultBasePath:
         self, monkeypatch, tmp_path
     ):
         resolved = tmp_path / "resolved-base"
-        monkeypatch.setattr(
-            "omlx.settings.resolve_default_base_path", lambda: resolved
-        )
+        monkeypatch.setattr("omlx.settings.resolve_default_base_path", lambda: resolved)
 
         settings = GlobalSettings.load()
 
@@ -3001,3 +2995,168 @@ class TestCORSMiddleware:
             assert resp.status_code == 200
             assert "access-control-allow-origin" in resp.headers
             assert resp.headers["access-control-allow-origin"] == "*"
+
+
+class TestUISettings:
+    """UISettings carries the admin dashboard layout next to the language."""
+
+    def test_defaults(self):
+        from omlx.settings import UISettings
+
+        settings = UISettings()
+        assert settings.language == "en"
+        assert settings.dashboard_layout is None
+
+    def test_to_dict_includes_layout(self):
+        from omlx.settings import UISettings
+
+        layout = {"version": 1, "width": "wide", "blocks": []}
+        result = UISettings(language="ko", dashboard_layout=layout).to_dict()
+        assert result == {"language": "ko", "dashboard_layout": layout}
+
+    def test_from_dict_legacy_without_layout(self):
+        from omlx.settings import UISettings
+
+        settings = UISettings.from_dict({"language": "ko"})
+        assert settings.language == "ko"
+        assert settings.dashboard_layout is None
+
+    def test_from_dict_ignores_non_dict_layout(self):
+        from omlx.settings import UISettings
+
+        assert UISettings.from_dict({"dashboard_layout": "x"}).dashboard_layout is None
+        assert UISettings.from_dict({"dashboard_layout": []}).dashboard_layout is None
+
+    def test_layout_round_trips_through_settings_file(self, tmp_path):
+        layout = {
+            "version": 1,
+            "width": "full",
+            "blocks": [{"id": "serving_stats", "x": 0, "y": 0, "w": 12}],
+        }
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.ui.dashboard_layout = layout
+        gs.save()
+
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.ui.dashboard_layout == layout
+
+
+class TestDashboardLayoutRoute:
+    """/api/global-settings validates and persists ui_dashboard_layout."""
+
+    @staticmethod
+    def _layout(**overrides):
+        layout = {
+            "version": 1,
+            "width": "wide",
+            "blocks": [
+                {"id": "serving_stats", "x": 0, "y": 0, "w": 12},
+                {"id": "active_models", "x": 12, "y": 0, "w": 12},
+            ],
+        }
+        layout.update(overrides)
+        return layout
+
+    def test_get_exposes_layout(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.ui.dashboard_layout = self._layout()
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+
+        result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        assert result["ui"]["dashboard_layout"] == self._layout()
+
+    def test_post_persists_layout(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"ui_dashboard_layout": self._layout()}
+        )
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+        assert result["success"] is True
+        assert "ui_dashboard_layout" in result["runtime_applied"]
+        assert gs.ui.dashboard_layout == self._layout()
+        assert GlobalSettings.load(base_path=tmp_path).ui.dashboard_layout == (
+            self._layout()
+        )
+
+    def test_post_explicit_null_restores_default(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.ui.dashboard_layout = self._layout()
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"ui_dashboard_layout": None}
+        )
+        asyncio.run(admin_routes.update_global_settings(request=request, is_admin=True))
+        assert gs.ui.dashboard_layout is None
+
+    def test_post_without_layout_keeps_current(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.ui.dashboard_layout = self._layout()
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+
+        request = admin_routes.GlobalSettingsRequest()
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+        assert "ui_dashboard_layout" not in result["runtime_applied"]
+        assert gs.ui.dashboard_layout == self._layout()
+
+    def test_unknown_and_duplicate_blocks_are_dropped(self):
+        from omlx.admin.routes import DashboardLayoutRequest
+
+        layout = DashboardLayoutRequest.model_validate(
+            self._layout(
+                blocks=[
+                    {"id": "serving_stats", "x": 0, "y": 0, "w": 24},
+                    {"id": "not_a_block", "x": 0, "y": 1, "w": 24},
+                    {"id": "serving_stats", "x": 0, "y": 2, "w": 12},
+                ]
+            )
+        )
+        assert [b.id for b in layout.blocks] == ["serving_stats"]
+        assert layout.blocks[0].w == 24
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {"id": "serving_stats", "x": 20, "y": 0, "w": 12},  # x + w > 24
+            {"id": "serving_stats", "x": 0, "y": 0, "w": 5},  # below min width
+            {"id": "serving_stats", "x": 0, "y": 0, "w": 25},  # above column count
+            {"id": "serving_stats", "x": -1, "y": 0, "w": 12},
+        ],
+    )
+    def test_invalid_block_geometry_is_rejected(self, block):
+        import pydantic
+
+        from omlx.admin.routes import DashboardLayoutRequest
+
+        with pytest.raises(pydantic.ValidationError):
+            DashboardLayoutRequest.model_validate(self._layout(blocks=[block]))
+
+    def test_invalid_width_is_rejected(self):
+        import pydantic
+
+        from omlx.admin.routes import DashboardLayoutRequest
+
+        with pytest.raises(pydantic.ValidationError):
+            DashboardLayoutRequest.model_validate(self._layout(width="huge"))

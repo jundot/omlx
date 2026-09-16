@@ -23,7 +23,17 @@ from omlx.patches.mlx_vlm_glm5_next_compat import (
 if not apply_mlx_vlm_glm5_next_compat_patch():
     pytest.importorskip("mlx_vlm.models.glm5_next")
 
+import copy
+from types import MethodType, SimpleNamespace
+
+from mlx.utils import tree_flatten
+from mlx_vlm.models.glm5_next import language
+
+from omlx.patches.mlx_lm_mtp import batch_generator as bg
+from omlx.patches.mlx_lm_mtp import batched_head
+from omlx.patches.mlx_lm_mtp import prompt_priming as pp
 from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime  # noqa: E402
+from omlx.patches.mlx_vlm_mtp.glm5_next_batch_rollback import rollback_rows
 
 N_MAIN = 45
 N_MTP = 1
@@ -483,6 +493,43 @@ def test_head_cache_is_committed_only(applied, config):
         assert hasattr(pool, "remainder")
 
 
+def test_priming_captures_ordinary_text_but_not_verify_or_embedded_inputs(
+    applied, config, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    hidden = mx.ones((1, 2, config.hidden_size))
+    captures = []
+
+    class Trunk:
+        def __call__(self, inputs, cache=None, inputs_embeds=None, **kwargs):
+            if kwargs.get("hidden_sink") is not None:
+                kwargs["hidden_sink"].append(hidden)
+            return hidden
+
+    host = SimpleNamespace(
+        args=config,
+        model=Trunk(),
+        lm_head=lambda value: value,
+        mtp=object(),
+        _omlx_mtp_decode_enabled=True,
+        _omlx_mtp_chain=True,
+    )
+    monkeypatch.setattr(
+        prompt_priming, "maybe_capture", lambda *args: captures.append(args)
+    )
+    inputs = mx.array([[1, 2]])
+    cache = [object()]
+    applied.LanguageModel.__call__(host, inputs, cache=cache)
+    applied.LanguageModel.__call__(host, inputs, cache=cache, return_hidden=True)
+    applied.LanguageModel.__call__(host, inputs, cache=cache, inputs_embeds=hidden)
+    assert len(captures) == 1
+    assert captures[0][0] is host and captures[0][1] is inputs
+    assert captures[0][2] is hidden and captures[0][3] is cache
+
+
 def _gdn_capture(gate_mask=None, block=4, K=4):
     """One layer's capture tuple, shaped as the verify forward records it."""
     return [(mx.zeros((1, block, 1, 1)),) * 5 + (
@@ -623,3 +670,366 @@ def test_verify_ffn_compilation_stays_bounded(applied, config, batch, width, ver
     x = mx.zeros((batch, width, config.hc_mult, config.hidden_size))
     mx.eval(layer(x, gdn_sink=[] if verify else None))
     assert layer._ffn_c is None
+
+
+def assert_row_states(actual, expected, size):
+    for row in range(size):
+        for left, right in zip(actual, expected):
+            a, b = left.extract(row), right.extract(row)
+            aa, bb = dict(tree_flatten(a.state)), dict(tree_flatten(b.state))
+            assert aa.keys() == bb.keys()
+            for key, value in aa.items():
+                if isinstance(value, mx.array):
+                    assert isinstance(bb[key], mx.array), (
+                        row,
+                        type(left).__name__,
+                        key,
+                        value.shape,
+                        bb[key],
+                    )
+                    assert value.shape == bb[key].shape, (row, type(left).__name__, key)
+                    assert mx.array_equal(value, bb[key]).item(), (
+                        row,
+                        type(left).__name__,
+                        key,
+                    )
+                else:
+                    assert not isinstance(bb[key], mx.array), (
+                        row,
+                        type(left).__name__,
+                        key,
+                        value,
+                        bb[key].shape,
+                    )
+                    assert value == bb[key], (row, type(left).__name__, key)
+            if hasattr(a, "caches"):
+                for ac, bc in zip(a.caches, b.caches):
+                    assert ac.offset == bc.offset
+                    if hasattr(ac, "_processed"):
+                        assert ac._processed == bc._processed
+
+
+def make_host(dtype):
+    assert glm5_next_vlm_runtime.apply()
+    from mlx_vlm.models.glm5_next import language
+    from mlx_vlm.models.glm5_next.config import TextConfig
+
+    values = copy.deepcopy(TINY_TEXT_CONFIG)
+    values["num_hidden_layers"] = 8
+    values["num_nextn_predict_layers"] = 0
+    values["layer_types"] = values["layer_types"][:8]
+    values["mlp_layer_types"] = values["mlp_layer_types"][:8]
+    values["linear_attn_config"]["kda_layers"] = [0, 1, 2, 4, 5, 6]
+    values["linear_attn_config"]["full_attn_layers"] = [3, 7]
+    host = language.LanguageModel(TextConfig.from_dict(values))
+    host.set_dtype(dtype)
+    return host
+
+
+@pytest.mark.parametrize("size", [2, 3, 4])
+@pytest.mark.parametrize("depth", [1, 2, 3, 7])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
+    mx.random.seed(349)
+    host = make_host(dtype)
+    row_caches = []
+    for row in range(size):
+        cache = host.make_cache()
+        tokens = mx.random.randint(0, 512, (1, 5 + row)).astype(mx.uint32)
+        out = host(tokens, cache=cache)
+        mx.eval(out.logits)
+        row_caches.append(cache)
+    cache = bg._merge_row_caches(row_caches)
+    for cycle in range(3):
+        block = mx.random.randint(0, 512, (size, depth + 1)).astype(mx.uint32)
+        out = host(block, cache=cache, return_hidden=True)
+        mx.eval(out.logits)
+        accepted = (
+            [depth] * size
+            if cycle == 2
+            else [(row + cycle * depth) % (depth + 1) for row in range(size)]
+        )
+        restored_rows = []
+        for row, count in enumerate(accepted):
+            scalar = copy.deepcopy(cache)
+            host.rollback_speculative_cache(scalar, out.gdn_states, count, depth + 1)
+            restored_rows.append([layer.extract(row) for layer in scalar])
+        expected = bg._merge_row_caches(restored_rows)
+        rollback_rows(language, cache, out.gdn_states, accepted, depth + 1)
+        assert_row_states(cache, expected, size)
+        # Retained KV batches may have more common left padding than a
+        # freshly merged reference. Normalize both physical layouts before
+        # requiring bitwise equality of subsequent attention reductions.
+        cache = bg._merge_row_caches(
+            [[layer.extract(row) for layer in cache] for row in range(size)]
+        )
+        for step in range(4):
+            next_tokens = mx.random.randint(0, 512, (size, 1)).astype(mx.uint32)
+            x = host(next_tokens, cache=cache).logits
+            y = host(next_tokens, cache=expected).logits
+            mx.eval(x, y)
+            assert mx.array_equal(x, y).item(), (cycle, step, accepted)
+        assert_row_states(cache, expected, size)
+
+
+@pytest.mark.parametrize("size", [2, 3, 4])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_masked_replay_restores_metadata(size, dtype):
+    from mlx_lm.models.cache import ArraysCache
+    from mlx_vlm.models.glm5_next import language
+
+    mx.random.seed(884)
+    host = make_host(dtype)
+    width, heads, dim, kernel = 4, 2, 32, 4
+    q, k, v, a = [
+        mx.random.normal((size, width, heads, dim)).astype(dtype) for _ in range(4)
+    ]
+    b = mx.random.normal((size, width, heads)).astype(dtype)
+    a_log, bias = mx.zeros((heads, 1)), mx.zeros((heads, dim))
+    initial = mx.random.normal((size, heads, dim, dim))
+    conv = mx.random.normal((size, width + kernel - 1, dim)).astype(dtype)
+    mask = mx.array(
+        [
+            [True, False, True, True],
+            [False, True, True, False],
+            [True, True, False, True],
+            [True, True, True, True],
+        ][:size]
+    )
+    entry = (q, k, v, a, b, a_log, bias, initial, conv, kernel, None, mask)
+    cache = ArraysCache(2)
+    cache[0] = conv[:, -kernel + 1 :]
+    _, cache[1] = language.gated_delta_update(
+        q, k, v, a, b, a_log, bias, state=initial, mask=mask
+    )
+    cache.lengths = mx.array([8 + row for row in range(size)])
+    cache.left_padding = mx.array([-4 - row for row in range(size)])
+    counts = [0, 3, 1, 2][:size]
+    refs = []
+    for row, count in enumerate(counts):
+        ref = copy.deepcopy(cache)
+        host.rollback_speculative_cache([ref], [entry], count, width)
+        refs.append(ref)
+    rollback_rows(language, [cache], [entry], counts, width)
+    for row, ref in enumerate(refs):
+        for index in (0, 1):
+            assert mx.array_equal(cache[index][row], ref[index][row]).item()
+        assert cache.lengths[row].item() == ref.lengths[row].item()
+        assert cache.left_padding[row].item() == ref.left_padding[row].item()
+
+
+def test_invalid_vector_does_not_mutate_any_cache():
+    from mlx_lm.models.cache import ArraysCache, CacheList, BatchKVCache
+    from omlx.patches.deepseek_v4.cache_extras import BatchPoolingCache
+
+    cache = ArraysCache(2)
+    cache[0] = mx.zeros((2, 3, 32))
+    cache[1] = mx.zeros((2, 2, 32, 32))
+    kv, pool = BatchKVCache([0, 0]), BatchPoolingCache(4, [0, 0])
+    q = mx.zeros((2, 4, 2, 32))
+    entry = (
+        q,
+        q,
+        q,
+        q,
+        mx.zeros((2, 4, 2)),
+        mx.zeros((2, 1)),
+        mx.zeros((2, 32)),
+        cache[1],
+        mx.zeros((2, 7, 32)),
+        4,
+        None,
+        None,
+    )
+    before = tuple(cache.cache)
+    with pytest.raises(ValueError, match="Pooling cache cannot"):
+        rollback_rows(language, [cache, CacheList(kv, pool)], [entry], [0, 3], 4)
+    assert all(left is right for left, right in zip(before, cache.cache))
+    assert kv.keys is None and kv._idx == 0
+
+
+def test_pool_vector_preserves_scalar_cross_row_replay_decision():
+    from omlx.patches.deepseek_v4.cache_extras import BatchPoolingCache
+
+    mx.random.seed(173)
+    pool = BatchPoolingCache(4, [0, 0])
+    pool.buf_kv = mx.random.normal((2, 4, 32))
+    pool.buf_gate = mx.random.normal((2, 4, 32))
+    pool.remainder = [0, 2]
+    pool._pool_lengths = [2, 2]
+    pool._processed = [8, 10]
+    pool.pooled = mx.random.normal((2, 2, 32))
+    kv, gate = mx.random.normal((2, 4, 32)), mx.random.normal((2, 4, 32))
+    pool.accumulate_windows(kv, gate, 0)
+    pool.pooled = mx.random.normal((2, 3, 32))
+    pool._pool_lengths = [3, 3]
+    scalar = copy.deepcopy(pool)
+    assert scalar.trim(2) == 2
+    expected = scalar.extract(1).state
+    pool.trim_rows([0, 2])
+    actual = pool.extract(1).state
+    assert actual[3] is not None and expected[3] is not None
+    for value, other in zip(actual, expected):
+        if value is None:
+            assert other is None
+        else:
+            assert mx.array_equal(value, other).item()
+
+
+def coupled_sampler(index):
+    key = mx.random.key(190 + index)
+
+    def sampler(lp):
+        return mx.random.categorical(bg._accept_lp_for(sampler, lp), key=key)
+
+    sampler.temp = 0.7
+    sampler.top_p = 0.9
+    return sampler
+
+
+@pytest.mark.parametrize("size", [2, 3, 4])
+@pytest.mark.parametrize("stochastic", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_history_and_clone_match_independent_heads(size, stochastic, quantized):
+    assert glm5_next_vlm_runtime.apply()
+    from mlx_vlm.models.glm5_next import language
+    from mlx_vlm.models.glm5_next.config import TextConfig
+
+    mx.random.seed(918)
+    config = TextConfig.from_dict(dict(TINY_TEXT_CONFIG))
+    host = SimpleNamespace(
+        args=config,
+        mtp=[language.Glm5NextMTPBlock(config)],
+        model=SimpleNamespace(
+            embed_tokens=nn.Embedding(config.vocab_size, config.hidden_size),
+            norm=nn.RMSNorm(config.hidden_size),
+        ),
+        lm_head=nn.Linear(config.hidden_size, config.vocab_size, bias=False),
+        _omlx_mtp_batch_rollback=True,
+    )
+    host.mtp_forward = MethodType(language.LanguageModel.mtp_forward, host)
+    host.make_mtp_cache = MethodType(language.LanguageModel.make_mtp_cache, host)
+    if quantized:
+        # Tiny projection dimensions require g32; the real head probe uses g64.
+        nn.quantize(
+            host.mtp[0],
+            bits=8,
+            group_size=32,
+            class_predicate=lambda path, module: hasattr(module, "to_quantized")
+            and not path.endswith("mlp.gate"),
+        )
+    model = SimpleNamespace(_language_model=host, mtp_forward=host.mtp_forward)
+    states = [
+        bg._MtpState(uid=i, mtp_cache=host.make_mtp_cache(), head_clone=True)
+        for i in range(size)
+    ]
+    refs = [
+        bg._MtpState(uid=i, mtp_cache=host.make_mtp_cache(), head_clone=True)
+        for i in range(size)
+    ]
+    rows = [
+        SimpleNamespace(
+            model=model, samplers=[lambda lp: mx.argmax(lp, -1)], logits_processors=None
+        )
+        for _ in states
+    ]
+    if stochastic:
+        for index, (state, ref, row) in enumerate(zip(states, refs, rows)):
+            sampler = coupled_sampler(index)
+            state.draft_sampler = ref.draft_sampler = sampler
+            row.samplers = [sampler]
+    owner = bg._MtpBatchState(states=dict(enumerate(states)))
+    batch = SimpleNamespace(model=model, _omlx_mtp_batch_state=owner)
+    for cycle, depth in enumerate([2, 4, 1, 3]):
+        jobs = []
+        for index, (state, ref, row) in enumerate(zip(states, refs, rows)):
+            state.depth = ref.depth = depth
+            length = (cycle + index) % 3 + 1
+            hidden = mx.random.normal((1, length, config.hidden_size))
+            tokens = mx.random.randint(0, config.vocab_size, (length,)).astype(
+                mx.uint32
+            )
+            bg._chain_next_drafts(row, ref, hidden, tokens, None)
+            jobs.append((row, state, hidden, tokens, None))
+        assert batched_head.eligible(
+            batch, [(index, row, state) for index, (row, state, *_) in enumerate(jobs)]
+        )
+        batched_head.draft(batch, jobs)
+        assert owner.head.speculative == 0
+        for index, (state, ref) in enumerate(zip(states, refs)):
+            assert state.hist_offset == ref.hist_offset
+            assert mx.array_equal(state.drafts, ref.drafts).item()
+            for actual, expected in zip(state.draft_accept_lps, ref.draft_accept_lps):
+                assert mx.allclose(actual, expected, atol=3e-4, rtol=3e-4).item()
+            for layer, reference in zip(owner.head.cache, ref.mtp_cache):
+                actual = layer.extract(index)
+                assert actual.offset == reference.offset
+                actual_state = dict(tree_flatten(actual.state))
+                reference_state = dict(tree_flatten(reference.state))
+                for key, value in actual_state.items():
+                    expected = reference_state[key]
+                    if isinstance(value, mx.array):
+                        assert value.shape == expected.shape
+                        assert mx.allclose(value, expected, atol=3e-4, rtol=3e-4).item()
+        if cycle == 1:
+            # Exercise extraction and re-merging after ownership changes.
+            batched_head.flush(owner)
+    batched_head.flush(owner)
+    assert owner.head is None
+    assert all(s.mtp_cache is not None for s in states)
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 512])
+@pytest.mark.parametrize("history_length", [3, 17])
+def test_deferred_glm_head_continuation(chunk, history_length):
+    assert glm5_next_vlm_runtime.apply()
+    from mlx_vlm.models.glm5_next import language
+    from mlx_vlm.models.glm5_next.config import TextConfig
+
+    mx.random.seed(12087)
+    config = TextConfig.from_dict(dict(TINY_TEXT_CONFIG))
+    host = SimpleNamespace(
+        args=config,
+        mtp=[language.Glm5NextMTPBlock(config)],
+        model=SimpleNamespace(
+            embed_tokens=nn.Embedding(config.vocab_size, config.hidden_size)
+        ),
+        lm_head=nn.Linear(config.hidden_size, config.vocab_size, bias=False),
+    )
+    host.mtp_forward = MethodType(language.LanguageModel.mtp_forward, host)
+    host.make_mtp_cache = MethodType(language.LanguageModel.make_mtp_cache, host)
+    cache = host.make_mtp_cache()
+    hidden = mx.random.normal((1, history_length + 20, config.hidden_size))
+    tokens = mx.random.randint(0, config.vocab_size, (1, history_length + 20))
+    host.mtp_forward(hidden[:, :history_length], tokens[:, :history_length], cache)
+    reference = copy.deepcopy(cache)
+    ctx = pp._PrimeCtx(
+        mtp_cache=cache, folded=history_length, expected_offset=history_length
+    )
+    ctx.deferred_pairs = []
+    setattr(host, pp._CTX_ATTR, ctx)
+    # The handoff token already ends the last committed head pair.
+    # Capture its hidden without replaying that pair a second time.
+    for position in range(history_length, history_length + 17):
+        pp._capture_deferred_history(
+            host,
+            tokens[:, position : position + 1],
+            hidden[:, position : position + 1],
+            [SimpleNamespace(offset=position + 1)],
+        )
+        if position > history_length:
+            host.mtp_forward(
+                hidden[:, position - 1 : position],
+                tokens[:, position : position + 1],
+                reference,
+            )
+    pp._flush_deferred_history(host, ctx, chunk_size=chunk)
+    assert ctx.folded == history_length + 16
+    for layer, expected in zip(ctx.mtp_cache, reference):
+        assert layer.offset == expected.offset
+    for position in range(history_length + 17, history_length + 20):
+        args = hidden[:, position - 1 : position], tokens[:, position : position + 1]
+        actual = host.mtp_forward(*args, ctx.mtp_cache)
+        expected = host.mtp_forward(*args, reference)
+        mx.eval(actual, expected)
+        assert mx.allclose(actual, expected, atol=3e-4, rtol=3e-4).item()

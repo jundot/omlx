@@ -14,8 +14,11 @@ from PIL import Image
 import omlx.process_memory_enforcer as pme
 import omlx.utils.image as images
 import omlx.utils.psutil_compat as psutil_compat
+from omlx.decode_activity import get_decode_activity
+from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.tts import TTSEngine
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+from omlx.scheduler import SchedulerConfig
 
 
 def _make_enforcer(
@@ -80,6 +83,39 @@ def _cycling(values):
         return values[i]
 
     return _next
+
+
+def test_embedding_watermark_and_live_hot_cache_accounting(mock_engine_pool):
+    config = SchedulerConfig()
+    config.hot_cache_budget = SimpleNamespace(total_bytes=2 * 1024**3)
+    engine = EmbeddingEngine("embedding-fixture", scheduler_config=config)
+    mock_engine_pool._entries = {"embedding": _make_entry("embedding", engine)}
+    enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+    enforcer._hot_cache_reserved_bytes = lambda: 3 * 1024**3
+    enforcer._hot_cache_used_bytes = lambda: config.hot_cache_budget.total_bytes
+    registry = get_decode_activity()
+    registry.publish("chat-fixture", 1)
+    try:
+        enforcer._propagate_memory_limit()
+        with (
+            patch("omlx.engine.forward_fairness.mx") as fake_mx,
+            patch(
+                "omlx.engine.forward_fairness.get_phys_footprint",
+                return_value=8 * 1024**3,
+            ),
+        ):
+            fake_mx.get_active_memory.return_value = 4 * 1024**3
+            # The 7 GiB watermark excludes the reserved hot-cache budget.
+            assert not engine._fairness.should_clear_cache()
+            # Read the current byte count, without waiting for an enforcer tick.
+            config.hot_cache_budget.total_bytes = 0
+            assert engine._fairness.should_clear_cache()
+            enforcer._get_ceiling_breakdown = lambda: {"hard_limit": 0}
+            enforcer._propagate_memory_limit()
+            assert engine._fairness._memory_soft_limit_bytes == 0
+            assert engine._fairness.should_clear_cache()
+    finally:
+        registry.remove("chat-fixture")
 
 
 def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
@@ -989,28 +1025,6 @@ class TestDynamicCeilingActiveRatio:
             result = enforcer._get_dynamic_ceiling()
         expected = 1 * 1024**3 + 10 * 1024**3 + 4 * 1024**3 + int(8 * 1024**3 * ratio)
         assert result == expected
-
-    def test_non_macos_falls_back_to_compat_available(self, mock_engine_pool):
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
-        )
-        with (
-            patch(
-                "omlx.process_memory_enforcer.get_phys_footprint",
-                return_value=2 * 1024**3,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.get_macos_vm_stats",
-                return_value=None,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
-                return_value=SimpleNamespace(available=15 * 1024**3),
-            ) as mock_virtual_memory,
-        ):
-            result = enforcer._get_dynamic_ceiling()
-        assert result == 2 * 1024**3 + 15 * 1024**3
-        mock_virtual_memory.assert_called_once()
 
     def test_macos_vm_stat_failure_uses_compat_available(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(

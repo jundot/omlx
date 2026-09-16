@@ -252,8 +252,21 @@
                 </a>
             </div>
 
-            <!-- Right: Theme Select + Logout -->
+            <!-- Right: Customize Dashboard + Theme Select + Logout -->
             <div class="hidden lg:flex items-center gap-2 ml-auto">
+                <!-- Customize Dashboard (status tab, view mode only) -->
+                <button type="button"
+                        x-show="mainTab === 'status' && !dashEditing && dashEditAvailable"
+                        x-cloak
+                        @click="startDashboardEdit()"
+                        class="nav-tooltip p-2 rounded-full transition-all duration-200 cursor-pointer"
+                        :class="activeTheme === 'dark'
+                            ? 'text-amber-400 hover:bg-neutral-700'
+                            : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                        :data-tooltip="window.t('status.layout.customize')"
+                        :aria-label="window.t('status.layout.customize')">
+                    <i data-lucide="settings-2" class="w-4 h-4"></i>
+                </button>
                 <!-- Theme Select -->
                 <div class="relative"
                      @mouseenter="themeDropdown = true"
@@ -404,6 +417,13 @@
                     <i data-lucide="message-circle" class="w-4 h-4"></i>
                     {{ t('navbar.tab.chat') }}
                 </a>
+                <button x-show="mainTab === 'status' && !dashEditing && dashEditAvailable"
+                        x-cloak
+                        @click="startDashboardEdit(); mobileMenuOpen = false"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50">
+                    <i data-lucide="settings-2" class="w-4 h-4"></i>
+                    {{ t('status.layout.customize') }}
+                </button>
                 <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
                     <div class="flex items-center gap-1">
                         <button @click="setTheme('auto')"

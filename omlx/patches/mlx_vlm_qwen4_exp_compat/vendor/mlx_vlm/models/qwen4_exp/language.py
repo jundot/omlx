@@ -491,6 +491,9 @@ class _QSAIndexerCache:
 class QSAKVCache(_QSAIndexerCache, KVCache):
     """KV cache with the raw indexer keys and multimodal positions used by QSA."""
 
+    _omlx_mtp_verify_attention_cache = True
+    _omlx_mtp_batched_head_cache = True
+
     # Hybrid/TurboQuant caches do not currently expose a way to carry the
     # indexer's unprojected keys. Uniform quantization uses the specialized
     # QSAQuantizedKVCache below; other schemes leave this cache in float.
@@ -625,6 +628,9 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
 class BatchQSAKVCache:
     """Batch KV cache that keeps QSA raw keys and text/MRoPE positions aligned."""
 
+    _omlx_mtp_batch_rollback_cache = True
+    _omlx_mtp_verify_attention_cache = True
+
     def __init__(self, left_padding):
         self.kv_cache = BatchKVCache(left_padding)
         self.index_keys = None
@@ -632,8 +638,23 @@ class BatchQSAKVCache:
         self.index_offset = 0
 
     @property
+    def keys(self):
+        # Parent vector rollback uses this to select prepare/finalize, which
+        # restore both the KV rows and their raw QSA indexer positions.
+        return self.kv_cache.keys
+
+    @property
+    def values(self):
+        return self.kv_cache.values
+
+    @property
     def offset(self):
         return self.kv_cache.offset
+
+    @property
+    def _idx(self):
+        # Parent attention/position code needs the physical padded cache width.
+        return self.kv_cache._idx
 
     @property
     def left_padding(self):
@@ -1130,6 +1151,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
+        if isinstance(start, mx.array) and start.ndim == 1:
+            return mx.maximum(start[:batch], 0)[:, None] + mx.arange(
+                length, dtype=mx.int32
+            )[None, :]
         positions = mx.arange(start, start + length, dtype=mx.int32)
         return mx.broadcast_to(positions[None], (batch, length))
 
@@ -1161,6 +1186,61 @@ class Qwen4ExpQSAIndexer(nn.Module):
         past_len = cache.offset if cache is not None else 0
         if position_ids is None:
             position_ids = self._default_position_ids(batch, past_len, seq_len)
+
+        if (
+            isinstance(cache, BatchQSAKVCache)
+            and (cache.index_offset + seq_len) // self.compress_ratio > self.block_topk
+        ):
+            # Block pooling is anchored at each request's first real token,
+            # not at column zero of the left-padded batch.
+            row_masks = []
+            key_length = cache.index_offset + seq_len
+            for i, padding in enumerate(cache.left_padding.tolist()):
+                input_padding = min(seq_len, max(0, padding - cache.index_offset))
+                width = max(0, key_length - padding)
+                if input_padding == seq_len:
+                    row_masks.append(
+                        mx.zeros((1, 1, seq_len, key_length), dtype=mx.bool_)
+                    )
+                    continue
+                row_cache = QSAKVCache()
+                row_cache.offset = max(0, cache.index_offset - padding)
+                if cache.index_keys is not None:
+                    row_cache.index_keys = cache.index_keys[
+                        i : i + 1, padding : cache.index_offset
+                    ]
+                    positions = cache.index_position_ids
+                    row_cache.index_position_ids = (
+                        positions[:, i : i + 1, padding : cache.index_offset]
+                        if positions.ndim == 3
+                        else positions[i : i + 1, padding : cache.index_offset]
+                    )
+                row_positions = (
+                    position_ids[:, i : i + 1, input_padding:]
+                    if position_ids.ndim == 3
+                    else position_ids[i : i + 1, input_padding:]
+                )
+                row_mask = self.from_projected(
+                    qk[i : i + 1, input_padding:], row_cache, row_positions
+                )
+                if row_mask is None:
+                    ends = (
+                        width
+                        - (seq_len - input_padding)
+                        + mx.arange(seq_len - input_padding)
+                        + 1
+                    )
+                    row_mask = (mx.arange(width)[None, :] < ends[:, None])[None, None]
+                row_masks.append(
+                    mx.pad(row_mask, [(0, 0), (0, 0), (input_padding, 0), (padding, 0)])
+                )
+            raw_keys = qk.reshape(
+                batch, seq_len, self.n_heads + self.kv_heads, self.head_dim
+            )
+            cache.update_indexer(
+                raw_keys[:, :, self.n_heads :].squeeze(2), position_ids
+            )
+            return mx.concatenate(row_masks, axis=0)
 
         qk = qk.reshape(batch, seq_len, self.n_heads + self.kv_heads, self.head_dim)
         query = qk[:, :, : self.n_heads]
@@ -1627,16 +1707,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 else:
                     sparse_bias = mx.where(qsa_mask, 0.0, -mx.inf).astype(mask.dtype)
                     mask = mask + sparse_bias
-            # The specialized left-padded decode path remains dense. It is
-            # uncommon, and preserving its row-specific cache semantics is
-            # preferable to applying an incorrectly aligned sparse mask.
+            elif isinstance(mask, str) and mask == "left_padded_decode":
+                # The indexer mask already includes each row's left padding.
+                mask = qsa_mask
         return super().__call__(
             x,
             mask=mask,
             cache=cache,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
-            target_verify=target_verify,
+            # The inherited ragged verify kernel ignores arbitrary masks.
+            # QSA must use masked attention when the indexer selected keys.
+            target_verify=target_verify
+            and not (qsa_mask is not None and isinstance(cache, BatchQSAKVCache)),
         )
 
 
@@ -3142,22 +3225,35 @@ class Qwen4ExpMTPModule(nn.Module):
         )
         if cache is None:
             cache = [None] * len(self.layers)
-        mask = _create_qwen3_5_attention_mask(
-            hidden_states,
-            cache[0] if cache else None,
-        )
+        if cache and isinstance(cache[0], BatchQSAKVCache):
+            # Head history can have different left padding after every fold.
+            # Keep the full mask through sparse selection and chained decode.
+            mask = cache[0].make_mask(hidden_states.shape[1], return_array=True)
+        else:
+            mask = _create_qwen3_5_attention_mask(
+                hidden_states,
+                cache[0] if cache else None,
+            )
+        # Fused mRoPE indexes position IDs per batch row.
+        offset = cache[0].offset if cache and cache[0] is not None else 0
+        positions = mx.maximum(mx.array(offset), 0).reshape(-1, 1)
+        positions = positions + mx.arange(hidden_states.shape[1])[None]
+        position_ids = mx.broadcast_to(positions, hidden_states.shape[:2])
         for layer, layer_cache in zip(self.layers, cache):
             hidden_states = layer(
                 hidden_states,
                 next_token_ids,
                 mask=mask,
                 cache=layer_cache,
-                position_ids=None,
+                position_ids=position_ids,
             )
         return self.hyper_connection_mixer(hidden_states), hidden_states
 
 
 class LanguageModel(Qwen3_5LanguageModel):
+    _omlx_mtp_multi_request = True
+    _omlx_mtp_batch_rollback = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args

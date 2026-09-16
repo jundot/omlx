@@ -1080,3 +1080,293 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
     )
     assert c.post(url + "/a8/apply").status_code == 200
     assert mgr.get_settings("model-a").qwen35_oq_a8_enabled
+
+
+@pytest.mark.parametrize("operation", ["settings", "create", "update"])
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"turboquant_kv_bits": 5},
+        {"dflash_verify_mode": "typo"},
+        {"dflash_in_memory_cache_max_entries": -1},
+        {"dflash_in_memory_cache_max_entries": 1.5},
+        {"specprefill_enabled": "not-a-boolean"},
+        {"dflash_in_memory_cache": []},
+        {"specprefill_draft_model": "/missing-draft-for-validation"},
+        {"vlm_mtp_draft_model": "./missing-draft-for-validation"},
+        {"reasoning_parser": "unknown-parser"},
+    ],
+)
+def test_invalid_settings_do_not_change_storage(client, monkeypatch, operation, values):
+    c, mgr = client
+    monkeypatch.setattr(admin_routes, "_grammar_parser_options", lambda: [])
+    mgr.set_settings("model-a", ModelSettings(temperature=0.5))
+    url = "/admin/api/models/model-a"
+    response = c.post(
+        url + "/profiles",
+        json={
+            "name": "existing",
+            "display_name": "Existing",
+            "settings": {"temperature": 0.5},
+        },
+    )
+    assert response.status_code == 200, response.text
+    before = {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")}
+    payload = {"temperature": 0.9, **values}
+    if operation == "settings":
+        response = c.put(url + "/settings", json=payload)
+    elif operation == "create":
+        response = c.post(
+            url + "/profiles",
+            json={
+                "name": "new",
+                "display_name": "New",
+                "settings": payload,
+            },
+        )
+    else:
+        response = c.put(url + "/profiles/existing", json={"settings": payload})
+    assert response.status_code == 422, response.text
+    assert {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")} == before
+    assert mgr.get_settings("model-a").temperature == 0.5
+    assert len(mgr.list_profiles("model-a")) == 1
+
+
+@pytest.mark.parametrize("operation", ["settings", "create", "update"])
+def test_valid_settings_are_normalized_and_preserved(client, tmp_path, operation):
+    c, mgr = client
+    draft = tmp_path / "assistant"
+    draft.mkdir()
+    (draft / "config.json").write_text('{"model_type":"muse_glimmer_assistant"}')
+    url = "/admin/api/models/model-a"
+    payload = {
+        "specprefill_enabled": "false",
+        "dflash_in_memory_cache": "false",
+        "cache_reasoning_output": "false",
+        "turboquant_kv_bits": 0,
+        "dflash_in_memory_cache_max_entries": 0,
+        "dflash_draft_model": str(draft),
+    }
+    if operation == "settings":
+        response = c.put(url + "/settings", json=payload)
+    else:
+        response = c.post(
+            url + "/profiles",
+            json={
+                "name": "valid",
+                "display_name": "Valid",
+                "settings": payload if operation == "create" else {},
+                "expose_as_model": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        if operation == "update":
+            response = c.put(url + "/profiles/valid", json={"settings": payload})
+        assert response.status_code == 200, response.text
+        saved = response.json()["profile"]["settings"]
+        assert "temperature" not in saved
+        assert saved["specprefill_enabled"] is False
+        model_id, exposed = mgr.get_exposed_profile_runtime_settings_for_request(
+            "model-a:valid"
+        )
+        assert model_id == "model-a"
+        assert exposed.specprefill_enabled is False
+        assert exposed.dflash_in_memory_cache is False
+        assert exposed.cache_reasoning_output is False
+        response = c.post(url + "/profiles/valid/apply")
+    assert response.status_code == 200, response.text
+    result = mgr.get_settings("model-a")
+    assert result.specprefill_enabled is False
+    assert result.dflash_in_memory_cache is False
+    assert result.cache_reasoning_output is False
+    assert result.turboquant_kv_bits == 4
+    assert result.dflash_in_memory_cache_max_entries == 4
+    assert result.dflash_draft_model == str(draft)
+
+
+def test_profile_empty_values_keep_overlay_semantics(client):
+    c, mgr = client
+    mgr.set_settings(
+        "model-a", ModelSettings(dflash_draft_model="org/draft", temperature=0.9)
+    )
+    response = c.post(
+        "/admin/api/models/model-a/profiles",
+        json={
+            "name": "empty",
+            "display_name": "Empty",
+            "settings": {
+                "temperature": None,
+                "dflash_draft_model": "",
+                "ignored": 1,
+                "is_pinned": True,
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["profile"]["settings"] == {}
+    response = c.post("/admin/api/models/model-a/profiles/empty/apply")
+    assert response.status_code == 200, response.text
+    result = mgr.get_settings("model-a")
+    assert result.dflash_draft_model == "org/draft"
+    assert result.temperature is None
+    assert result.is_pinned is False
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_templates_use_settings_types_and_filter_before_validation(client, operation):
+    c, mgr = client
+    url = "/admin/api/profile-templates"
+    payload = {
+        "enable_thinking": "false",
+        "cache_reasoning_output": "false",
+        "dflash_draft_model": "/ignored",
+    }
+    response = c.post(
+        url, json={"name": "typed", "display_name": "Typed", "settings": payload}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["template"]["settings"] == {
+        "enable_thinking": False,
+        "cache_reasoning_output": False,
+    }
+    before = mgr.templates_file.read_bytes()
+    if operation == "create":
+        response = c.post(
+            url,
+            json={
+                "name": "invalid",
+                "display_name": "Invalid",
+                "settings": {"enable_thinking": []},
+            },
+        )
+    else:
+        response = c.put(url + "/typed", json={"settings": {"enable_thinking": []}})
+    assert response.status_code == 422, response.text
+    assert mgr.templates_file.read_bytes() == before
+
+
+def test_parser_validation_uses_dropdown_registry(client, monkeypatch):
+    c, _ = client
+    monkeypatch.setattr(
+        admin_routes,
+        "_grammar_parser_options",
+        lambda: [
+            {"value": "harmony", "label": "harmony", "models": ["gpt-oss"]},
+        ],
+    )
+    options = c.get("/admin/api/grammar/parsers").json()
+    assert options[0]["value"] == "harmony"
+    response = c.put(
+        "/admin/api/models/model-a/settings",
+        json={"reasoning_parser": options[0]["value"]},
+    )
+    assert response.status_code == 200, response.text
+    response = c.post(
+        "/admin/api/models/model-a/profiles",
+        json={
+            "name": "parser",
+            "display_name": "Parser",
+            "settings": {"reasoning_parser": "harmony"},
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_parser_unavailable_preserves_configuration_and_allows_clearing(
+    client, monkeypatch, caplog
+):
+    c, mgr = client
+    monkeypatch.setattr(admin_routes, "_grammar_parser_options", lambda: None)
+    mgr.set_settings("model-a", ModelSettings(reasoning_parser="harmony"))
+    url = "/admin/api/models/model-a/settings"
+    response = c.put(url, json={"temperature": 0.5})
+    assert response.status_code == 200, response.text
+    assert mgr.get_settings("model-a").reasoning_parser == "harmony"
+    response = c.put(url, json={"reasoning_parser": "harmony"})
+    assert response.status_code == 200, response.text
+    assert "Cannot validate reasoning_parser" in caplog.text
+    response = c.put(url, json={"reasoning_parser": ""})
+    assert response.status_code == 200, response.text
+    assert mgr.get_settings("model-a").reasoning_parser is None
+
+
+@pytest.mark.parametrize("reference", ["org/draft", "draft-name", "./assistant"])
+def test_draft_references_follow_local_path_rules(
+    client, tmp_path, monkeypatch, reference
+):
+    c, _ = client
+    monkeypatch.chdir(tmp_path)
+    draft = tmp_path / "assistant"
+    draft.mkdir()
+    (draft / "config.json").write_text('{"model_type":"muse_glimmer_assistant"}')
+    response = c.put(
+        "/admin/api/models/model-a/settings", json={"dflash_draft_model": reference}
+    )
+    assert response.status_code == 200, response.text
+    response = c.put(
+        "/admin/api/models/model-a/settings", json={"dflash_draft_model": ""}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["settings"].get("dflash_draft_model") is None
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"mtp_enabled": True, "dflash_enabled": True},
+        {"vlm_mtp_enabled": True, "specprefill_enabled": True},
+    ],
+)
+def test_profile_conflicting_flags_rejected_before_storage(client, operation, values):
+    c, mgr = client
+    url = "/admin/api/models/model-a/profiles"
+    response = c.post(url, json={"name": "existing", "display_name": "Existing"})
+    assert response.status_code == 200, response.text
+    before = mgr.profiles_file.read_bytes()
+    if operation == "create":
+        response = c.post(
+            url, json={"name": "new", "display_name": "New", "settings": values}
+        )
+    else:
+        response = c.put(url + "/existing", json={"settings": values})
+    assert response.status_code == 400, response.text
+    assert mgr.profiles_file.read_bytes() == before
+
+
+def test_template_apply_reads_latest_and_preserves_independent_profile(client):
+    c, mgr = client
+    mgr.save_profile("model-a", "coding", "Coding", None, {"temperature": 0.1})
+    mgr.save_template("coding", "Coding", None, {"temperature": 0.2})
+    path = "/admin/api/models/model-a/profile-templates/coding/apply"
+    first = c.post(path)
+    assert first.status_code == 200
+    copy_name = first.json()["settings"]["active_profile_name"]
+    assert copy_name != "coding"
+    assert (
+        c.put(
+            "/admin/api/profile-templates/coding",
+            json={"settings": {"temperature": 0.9}},
+        ).status_code
+        == 200
+    )
+    second = c.post(path)
+    assert second.status_code == 200
+    assert second.json()["settings"]["temperature"] == 0.9
+    assert second.json()["settings"]["active_profile_name"] == copy_name
+    assert mgr.get_profile("model-a", "coding")["settings"]["temperature"] == 0.1
+    assert mgr.get_settings_for_request("model-a").temperature == 0.9
+
+
+def test_template_apply_missing_template_and_model(client):
+    c, mgr = client
+    mgr.save_template("coding", "Coding", None, {})
+    assert (
+        c.post("/admin/api/models/missing/profile-templates/coding/apply").status_code
+        == 404
+    )
+    assert (
+        c.post("/admin/api/models/model-a/profile-templates/missing/apply").status_code
+        == 404
+    )
+    assert mgr.list_profiles("model-a") == []

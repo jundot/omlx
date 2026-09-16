@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import importlib
 import io
 import json
@@ -282,6 +283,51 @@ def test_tiny_text_prefill_decode_and_batch_match():
     assert type(batch_cache[1][1]).__name__ == "BatchPoolingCache"
     assert mx.allclose(batch_logits[:1], left_logits, atol=3e-4).item()
     assert mx.allclose(batch_logits[1:], right_logits, atol=3e-4).item()
+
+
+@pytest.mark.parametrize("batch_size,block_size", [(1, 2), (2, 4), (3, 8), (4, 2)])
+def test_short_verify_keeps_latent_kv_and_matches_decode(
+    batch_size, block_size, monkeypatch
+):
+    from mlx_lm.models.mla import MultiLinear
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    mx.random.seed(937)
+    config = _tiny_config()
+    config.text_config.index_topk = 64
+    model = LanguageModel(config.text_config, config)
+    prompt = mx.arange(batch_size * 12).reshape(batch_size, 12) % 100
+    row_caches = []
+    for row in range(batch_size):
+        row_cache = model.make_cache()
+        mx.eval(model(prompt[row : row + 1, row:], cache=row_cache).logits)
+        row_caches.append(row_cache)
+    cache = [type(rows[0]).merge(rows) for rows in zip(*row_caches)]
+    reference_cache = copy.deepcopy(cache)
+    block = mx.arange(batch_size * block_size).reshape(batch_size, block_size) + 32
+    attention = model.model.layers[1].self_attn
+    projections = []
+    original = MultiLinear.__call__
+
+    def traced(self, x, *args, **kwargs):
+        if self is attention.embed_q or self is attention.unembed_out:
+            projections.append(x.shape[-2])
+        return original(self, x, *args, **kwargs)
+
+    monkeypatch.setattr(MultiLinear, "__call__", traced)
+    verified = model(block, cache=cache).logits
+    mx.eval(verified)
+    # Project the short query/output block, never all cached keys and values.
+    assert projections == [block_size, block_size]
+    sequential = mx.concatenate(
+        [
+            model(block[:, i : i + 1], cache=reference_cache).logits
+            for i in range(block_size)
+        ],
+        axis=1,
+    )
+    mx.eval(sequential)
+    assert mx.allclose(verified, sequential, atol=3e-4, rtol=3e-4).item()
 
 
 def test_variable_length_batch_matches_single_request_greedy_tokens():

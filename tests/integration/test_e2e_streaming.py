@@ -2215,8 +2215,8 @@ class TestStreamingHelperFunctions:
         ]
 
     @pytest.mark.asyncio
-    async def test_unknown_envelope_makes_later_early_sequence_terminal_only(self):
-        """Unknown/malformed siblings cannot create a partial early sequence."""
+    async def test_unknown_envelope_is_delivered_before_later_registered_call(self):
+        """Clients receive unknown calls so they can return a tool error."""
         from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
 
         from omlx.api.openai_models import ChatCompletionRequest, Message
@@ -2286,8 +2286,11 @@ class TestStreamingHelperFunctions:
                 calls.extend(chunk_calls)
                 seen_before_finish |= not engine.last_stream_output_finished
 
-        assert not seen_before_finish
-        assert [call["function"]["name"] for call in calls] == ["get_weather"]
+        assert seen_before_finish
+        assert [call["function"]["name"] for call in calls] == [
+            "hallucinated",
+            "get_weather",
+        ]
 
     def test_semantic_tool_dedupe_preserves_duplicate_occurrences(self):
         from omlx.api.openai_models import FunctionCall, ToolCall
@@ -4532,3 +4535,508 @@ def test_k2_responses_normalizes_assistant_history(monkeypatch, stream, tool_his
         assert "response.failed" not in response.text
     else:
         assert response.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("chunk_size", [1, 7])
+@pytest.mark.parametrize("value", ["123", 'print("</function>")'])
+async def test_naked_qwen_calls_preserve_arguments_without_streamed_xml(
+    api, chunk_size, value
+):
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    from omlx.api.anthropic_models import MessagesRequest
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import (
+        stream_anthropic_messages,
+        stream_chat_completion,
+        stream_responses_api,
+    )
+
+    engine = MockBaseEngine()
+    engine._supports_early_tool_call_streaming = True
+    engine.tokenizer.has_tool_calling = True
+    engine.tokenizer.tool_call_start = "<tool_call>"
+    engine.tokenizer.tool_call_end = "</tool_call>"
+    engine.tokenizer.tool_parser = parse_tool_call
+    block = f"<function=write><parameter=content>{value}</parameter></function>"
+    raw = "Before " + block + "\n</tool_call> After"
+    outputs = [
+        MockGenerationOutput(
+            text=raw[: i + chunk_size],
+            new_text=raw[i : i + chunk_size],
+            completion_tokens=10,
+        )
+        for i in range(0, len(raw), chunk_size)
+    ]
+    outputs.append(
+        MockGenerationOutput(
+            text=raw,
+            new_text="",
+            completion_tokens=10,
+            finished=True,
+            finish_reason="stop",
+        )
+    )
+    engine.set_stream_outputs(outputs)
+    schema = {"type": "object", "properties": {"content": {"type": "string"}}}
+    tools = [{"type": "function", "function": {"name": "write", "parameters": schema}}]
+    messages = [{"role": "user", "content": "Write a file"}]
+    if api == "chat":
+        request = ChatCompletionRequest(
+            model="test-model", messages=messages, stream=True, tools=tools
+        )
+        iterator = stream_chat_completion(
+            engine, messages, request, tools=tools, max_tokens=256
+        )
+    elif api == "anthropic":
+        request = MessagesRequest(
+            model="test-model",
+            messages=messages,
+            stream=True,
+            max_tokens=256,
+            tools=[{"name": "write", "input_schema": schema}],
+        )
+        iterator = stream_anthropic_messages(
+            engine, messages, request, tools=tools, max_tokens=256
+        )
+    else:
+        request = ResponsesRequest(
+            model="test-model", input="Write a file", stream=True
+        )
+        iterator = stream_responses_api(
+            engine, messages, request, tools=tools, max_tokens=256, store_response=False
+        )
+    events = [event async for event in iterator]
+    payloads = [
+        json.loads(line[6:])
+        for event in events
+        for line in event.splitlines()
+        if line.startswith("data: {")
+    ]
+    if api == "chat":
+        deltas = [c.get("delta", {}) for p in payloads for c in p.get("choices", [])]
+        content = "".join(d.get("content", "") or "" for d in deltas)
+        calls = [tc for d in deltas for tc in d.get("tool_calls", [])]
+        assert len(calls) == 1
+        arguments = calls[0]["function"]["arguments"]
+        assert any(
+            c.get("finish_reason") == "tool_calls"
+            for p in payloads
+            for c in p.get("choices", [])
+        )
+    elif api == "anthropic":
+        content = "".join(p.get("delta", {}).get("text", "") for p in payloads)
+        calls = [
+            p for p in payloads if p.get("content_block", {}).get("type") == "tool_use"
+        ]
+        assert len(calls) == 1
+        arguments = "".join(
+            p.get("delta", {}).get("partial_json", "") for p in payloads
+        )
+        assert any(
+            p.get("delta", {}).get("stop_reason") == "tool_use" for p in payloads
+        )
+    else:
+        content = "".join(
+            p["delta"]
+            for p in payloads
+            if p.get("type") == "response.output_text.delta"
+        )
+        calls = [
+            p
+            for p in payloads
+            if p.get("type") == "response.function_call_arguments.done"
+        ]
+        assert len(calls) == 1
+        arguments = calls[0]["arguments"]
+    assert content == "Before  After"
+    assert json.loads(arguments) == {"content": value}
+
+
+# Use the real Qwen parser and SSE handlers with fixed model output.
+_RECOVERY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "parameters": {
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+            },
+        },
+    }
+]
+_RECOVERY_CALL = (
+    "<tool_call><function=write><parameter=content>"
+    "hello</parameter></function></tool_call>"
+)
+
+
+async def _recovery_stream(
+    raw, api="chat", chunk_size=7, finish_reason="stop", closed=None, cancel=False
+):
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    from omlx.api.anthropic_models import MessagesRequest
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import (
+        stream_anthropic_messages,
+        stream_chat_completion,
+        stream_responses_api,
+    )
+
+    engine = MockBaseEngine()
+    engine._supports_early_tool_call_streaming = True
+    engine.tokenizer.has_tool_calling = True
+    engine.tokenizer.tool_call_start = "<tool_call>"
+    engine.tokenizer.tool_call_end = "</tool_call>"
+    engine.tokenizer.tool_parser = parse_tool_call
+    engine.set_stream_outputs(
+        [
+            MockGenerationOutput(
+                text=raw[: i + chunk_size], new_text=raw[i : i + chunk_size]
+            )
+            for i in range(0, len(raw), chunk_size)
+        ]
+        + [MockGenerationOutput(text=raw, finished=True, finish_reason=finish_reason)]
+    )
+    if closed is not None:
+        original_stream = engine.stream_chat
+
+        async def tracked_stream(**kwargs):
+            try:
+                async for output in original_stream(**kwargs):
+                    yield output
+            finally:
+                closed.append(True)
+
+        engine.stream_chat = tracked_stream
+    messages = [{"role": "user", "content": "Write hello"}]
+    if api == "chat":
+        request = ChatCompletionRequest(model="test", messages=messages, stream=True)
+        stream = stream_chat_completion(
+            engine, messages, request, tools=_RECOVERY_TOOLS
+        )
+    elif api == "anthropic":
+        request = MessagesRequest(
+            model="test", messages=messages, max_tokens=1024, stream=True
+        )
+        stream = stream_anthropic_messages(
+            engine, messages, request, tools=_RECOVERY_TOOLS
+        )
+    else:
+        request = ResponsesRequest(model="test", input="Write hello", stream=True)
+        stream = stream_responses_api(
+            engine, messages, request, tools=_RECOVERY_TOOLS, store_response=False
+        )
+    events = []
+    async for event in stream:
+        for line in event.splitlines():
+            if line.startswith("data: {"):
+                events.append(json.loads(line[6:]))
+        if cancel and '"tool_calls"' in event:
+            await stream.aclose()
+            break
+    return events
+
+
+def _recovery_calls(events, api):
+    if api == "chat":
+        return [
+            {"id": tc["id"], **tc["function"]}
+            for e in events
+            for c in e.get("choices", [])
+            for tc in c.get("delta", {}).get("tool_calls", [])
+        ]
+    if api == "anthropic":
+        calls = {}
+        for event in events:
+            block, delta = event.get("content_block", {}), event.get("delta", {})
+            if block.get("type") == "tool_use":
+                calls[event["index"]] = {
+                    "id": block["id"],
+                    "name": block["name"],
+                    "arguments": "",
+                }
+            if delta.get("type") == "input_json_delta":
+                calls[event["index"]]["arguments"] += delta["partial_json"]
+        stopped = {e["index"] for e in events if e.get("type") == "content_block_stop"}
+        assert calls.keys() <= stopped
+        return list(calls.values())
+    return [
+        e["item"]
+        for e in events
+        if e.get("type") == "response.output_item.done"
+        and e["item"]["type"] == "function_call"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [
+        ("chat", 1),
+        ("chat", 7),
+        ("chat", 4096),
+        ("anthropic", 7),
+        ("responses", 7),
+    ],
+)
+@pytest.mark.parametrize(
+    "shape", ["complete", "outer_close_missing", "unknown", "repeated"]
+)
+async def test_qwen_recovery_delivers_calls_once(api, chunk_size, shape):
+    raw = _RECOVERY_CALL
+    if shape == "outer_close_missing":
+        raw = raw.removesuffix("</tool_call>")
+    elif shape == "unknown":
+        raw = raw.replace("function=write", "function=todo_write")
+    elif shape == "repeated":
+        raw += raw.removesuffix("</tool_call>")
+    events = await _recovery_stream("Before " + raw, api, chunk_size)
+    calls = _recovery_calls(events, api)
+    assert [c["name"] for c in calls] == (
+        ["todo_write"]
+        if shape == "unknown"
+        else ["write"] * (2 if shape == "repeated" else 1)
+    )
+    assert all(json.loads(c["arguments"]) == {"content": "hello"} for c in calls)
+    ids = [c.get("call_id", c["id"]) for c in calls]
+    assert all(ids) and len(set(ids)) == len(calls)
+    assert not any("error" in e or e.get("type") == "response.failed" for e in events)
+    if api == "chat":
+        indexes = [
+            tc["index"]
+            for e in events
+            for c in e.get("choices", [])
+            for tc in c.get("delta", {}).get("tool_calls", [])
+        ]
+        assert indexes == list(range(len(calls)))
+        assert [
+            c["finish_reason"]
+            for e in events
+            for c in e.get("choices", [])
+            if c.get("finish_reason")
+        ] == ["tool_calls"]
+        assert (
+            "".join(
+                c.get("delta", {}).get("content", "")
+                for e in events
+                for c in e.get("choices", [])
+            )
+            == "Before "
+        )
+
+    elif api == "anthropic":
+        assert events[-1]["type"] == "message_stop"
+        assert [
+            e["delta"]["stop_reason"]
+            for e in events
+            if e.get("type") == "message_delta"
+        ] == ["tool_use"]
+    else:
+        assert events[-1]["type"] == "response.completed"
+        response = events[-1]["response"]
+        assert response["status"] == "completed"
+        assert [
+            item for item in response["output"] if item["type"] == "function_call"
+        ] == calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "valid_prefix,bad,code",
+    [
+        (
+            False,
+            "<tool_call><function=write><parameter=content>cut",
+            "incomplete_tool_call",
+        ),
+        (
+            True,
+            "<tool_call><function=write><parameter=content>cut",
+            "incomplete_tool_call",
+        ),
+        (False, "<tool_call>not a function</tool_call>", "invalid_tool_call"),
+    ],
+)
+async def test_qwen_unrecoverable_sibling_is_not_success(api, valid_prefix, bad, code):
+    events = await _recovery_stream((_RECOVERY_CALL if valid_prefix else "") + bad, api)
+    calls = _recovery_calls(events, api)
+    assert len(calls) == int(valid_prefix)
+    if api == "responses":
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["error"]["code"] == code
+    else:
+        assert [e["error"]["code"] for e in events if "error" in e] == [code]
+        if api == "anthropic":
+            assert not any(e.get("type") == "message_delta" for e in events)
+    if api == "chat":
+        assert not any(
+            c.get("finish_reason") for e in events for c in e.get("choices", [])
+        )
+
+
+@pytest.mark.asyncio
+async def test_qwen_length_does_not_repair_missing_envelope_close():
+    events = await _recovery_stream(
+        _RECOVERY_CALL.removesuffix("</tool_call>"), finish_reason="length"
+    )
+    assert not _recovery_calls(events, "chat")
+    assert events[-1]["error"]["code"] == "incomplete_tool_call"
+
+
+@pytest.mark.asyncio
+async def test_qwen_closed_envelope_with_unclosed_parameter_never_emits_call():
+    events = await _recovery_stream(
+        "<tool_call><function=write><parameter=content>cut</function></tool_call>"
+    )
+    assert not _recovery_calls(events, "chat")
+    assert events[-1]["error"]["code"] == "invalid_tool_call"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("raw", [_RECOVERY_CALL, "<tool_call><function=write>"])
+async def test_qwen_terminal_processing_closes_model_generator(api, raw):
+    closed = []
+    await _recovery_stream(raw, api, closed=closed)
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delayed", [False, True])
+async def test_tool_generation_error_code_survives_json_keepalive(delayed):
+    import asyncio
+    from types import SimpleNamespace
+
+    from omlx.server import (
+        _ToolCallGenerationError,
+        _with_json_keepalive,
+        http_exception_handler,
+    )
+
+    error = _ToolCallGenerationError(
+        {"code": "incomplete_tool_call", "message": "Incomplete tool call"}
+    )
+    if delayed:
+
+        async def fail():
+            raise error
+
+        task = asyncio.create_task(fail())
+        body = "".join([part async for part in _with_json_keepalive(None, task)])
+        response = json.loads(body)
+    else:
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/chat/completions"), method="POST"
+        )
+        result = await http_exception_handler(request, error)
+        assert result.status_code == 500
+        response = json.loads(result.body)
+    assert response["error"]["code"] == "incomplete_tool_call"
+    assert isinstance(response["error"]["message"], str)
+
+
+@pytest.mark.asyncio
+async def test_qwen_cancel_after_early_call_closes_model_generator():
+    closed = []
+    await _recovery_stream(_RECOVERY_CALL + "more text", closed=closed, cancel=True)
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_qwen_malformed_first_call_does_not_consume_later_valid_call():
+    raw = (
+        "<tool_call><function=write><parameter=content>cut</tool_call>" + _RECOVERY_CALL
+    )
+    events = await _recovery_stream(raw)
+    calls = _recovery_calls(events, "chat")
+    assert len(calls) == 1
+    assert json.loads(calls[0]["arguments"]) == {"content": "hello"}
+    assert events[-1]["error"]["code"] == "invalid_tool_call"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Use <tool_call> for calls",
+        '<tool_call>{"name":"read","arguments":{"path":"/example"}}</tool_call>',
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_attribute_cdata_preserves_write_call_in_stream(
+    api, chunk_size, value, wrapped
+):
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.api.anthropic_models import MessagesRequest
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import (
+        stream_chat_completion,
+        stream_anthropic_messages,
+        stream_responses_api,
+    )
+
+    engine = MockBaseEngine()
+    raw = (
+        '<function name="write"><param name="content"><![CDATA['
+        + value
+        + "]]></param></function>"
+    )
+    if wrapped:
+        raw = "<tool_call>" + raw + "</tool_call>"
+    engine.set_stream_outputs(
+        [
+            MockGenerationOutput(
+                text=raw[: i + chunk_size], new_text=raw[i : i + chunk_size]
+            )
+            for i in range(0, len(raw), chunk_size)
+        ]
+        + [MockGenerationOutput(text=raw, finished=True, finish_reason="stop")]
+    )
+    messages = [{"role": "user", "content": "Write the example"}]
+    request = ChatCompletionRequest(model="test", messages=messages, stream=True)
+    if api == "chat":
+        stream = stream_chat_completion(
+            engine, messages, request, tools=_RECOVERY_TOOLS
+        )
+    elif api == "anthropic":
+        request = MessagesRequest(
+            model="test", messages=messages, max_tokens=1024, stream=True
+        )
+        stream = stream_anthropic_messages(
+            engine, messages, request, tools=_RECOVERY_TOOLS
+        )
+    else:
+        request = ResponsesRequest(model="test", input="Write the example", stream=True)
+        stream = stream_responses_api(
+            engine, messages, request, tools=_RECOVERY_TOOLS, store_response=False
+        )
+    events = []
+    async for event in stream:
+        for line in event.splitlines():
+            if line.startswith("data: {"):
+                events.append(json.loads(line[6:]))
+    calls = _recovery_calls(events, api)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write"
+    assert json.loads(calls[0]["arguments"]) == {"content": value}
+    if api == "chat":
+        choices = [c for event in events for c in event.get("choices", [])]
+        assert not any(c.get("delta", {}).get("content") for c in choices)
+        assert any(c.get("finish_reason") == "tool_calls" for c in choices)
+    elif api == "anthropic":
+        assert not any(e.get("delta", {}).get("text") for e in events)
+    else:
+        assert not any(e.get("type") == "response.output_text.delta" for e in events)
