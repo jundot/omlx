@@ -674,6 +674,26 @@ class ArraysCache(_BaseCache):
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
+    def to_batch(self, left_padding):
+        """Convert the singleton cache into its batch-aware form.
+
+        An ``ArraysCache`` is its own batch form -- singleton and batched rows
+        share the class -- so the only thing a conversion adds is
+        ``left_padding``, exactly as mlx-vlm's own cache maker does for this
+        class. A cache that already carries running state is one unpadded row
+        and is left untouched, the same convention the continuous-batching
+        join path uses for regular singleton caches.
+
+        The hook exists for the conversion paths outside mlx-vlm: mlx-lm's
+        ``_make_cache`` recognises only mlx-lm cache classes and otherwise
+        raises ``ValueError: ... does not yet support batching``, which is the
+        converter Lightning MTP's singleton rebuild goes through.
+        """
+        if any(entry is not None for entry in self.cache):
+            return self
+        self.left_padding = mx.array(left_padding)
+        return self
+
     @property
     def left_padding(self):
         if self._left_padding is None:

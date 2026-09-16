@@ -113,6 +113,60 @@ def test_make_cache_finds_nested_model_owned_batch_conversion():
     assert nested == ("custom-batch", (2, 0))
 
 
+def test_make_cache_converts_vendored_qwen4_exp_linear_cache():
+    """A vendored Qwen4-Exp linear cache must convert without mlx-lm's type table.
+
+    ``mlx_lm.generate._make_cache`` only knows mlx-lm cache classes, so a
+    vendored class without a ``to_batch`` hook raises there. Lightning MTP's
+    singleton rebuild calls exactly that converter, so the cache has to carry
+    its own conversion.
+    """
+    gen = importlib.import_module("mlx_lm.generate")
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.cache import ArraysCache as Qwen4ArraysCache
+
+    class Model:
+        def make_cache(self):
+            return [Qwen4ArraysCache(size=2)]
+
+    caches = gen._make_cache(Model(), [0], None)
+
+    assert isinstance(caches[0], Qwen4ArraysCache)
+    assert caches[0].left_padding.tolist() == [0]
+
+
+def test_make_cache_leaves_running_qwen4_exp_linear_cache_unpadded():
+    """A warm singleton is one unpadded row and keeps its own padding state.
+
+    The continuous-batching join path converts with the same hook, so
+    conversion must not stamp padding onto a cache that is already decoding.
+    """
+    gen = importlib.import_module("mlx_lm.generate")
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.cache import ArraysCache as Qwen4ArraysCache
+
+    warm = Qwen4ArraysCache(size=2)
+    warm[0] = mx.ones((1, 2, 3))
+    mx.eval(warm[0])
+
+    class Model:
+        def make_cache(self):
+            return [warm]
+
+    caches = gen._make_cache(Model(), [0], None)
+
+    assert caches[0] is warm
+    assert warm.left_padding is None
+
+
 def test_prompt_batch_full_split_moves_cache_without_copy():
     arrays = _arrays_cache()
     kv = _kv_cache(3)
