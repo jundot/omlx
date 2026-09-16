@@ -29,6 +29,7 @@ from .hyper_connection import (
 )
 from .kernels import packed_index_scores, packed_index_topk, packed_sparse_attention
 from .mtp import DSparkMixin
+from ..deepseek_v4.switch_layers import SwitchGLU
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
 
@@ -366,6 +367,23 @@ class Attention(nn.Module):
         return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
 
 
+@mx.compile
+def _limited_swiglu(gate, up, limit):
+    if limit:
+        gate = mx.minimum(gate, limit)
+        up = mx.clip(up, -limit, limit)
+    return nn.silu(gate) * up
+
+
+class LimitedSwiGLU(nn.Module):
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, x, gate):
+        return _limited_swiglu(gate, x, self.limit)
+
+
 class Expert(nn.Module):
     def __init__(self, c, switched=False):
         super().__init__()
@@ -620,9 +638,41 @@ class MoE(nn.Module):
             Expert(c, True),
             Expert(c),
         )
+        self._switch_mlp = None
+
+    def _routed_switch_mlp(self):
+        """Reuse loaded expert banks via our SwitchGLU decode path.
+
+        Upstream Expert decode uses FP8 act-quant + lhs/rhs gather_qmm and
+        walks ~7GB/layer/token. SwitchGLU keeps bf16 activations and rhs-only
+        gather (same as perf/dsv41-decode-attn), which is the ~27 tok/s path.
+        Prefill still uses the sorted Expert/block kernels below.
+        """
+        if self._switch_mlp is None:
+            for proj in (self.experts.w1, self.experts.w3, self.experts.w2):
+                if isinstance(proj, QuantizedProjection):
+                    proj.quantize_input = False
+            switch = SwitchGLU.__new__(SwitchGLU)
+            nn.Module.__init__(switch)
+            switch.gate_proj = self.experts.w1
+            switch.up_proj = self.experts.w3
+            switch.down_proj = self.experts.w2
+            switch.activation = LimitedSwiGLU(self.experts._limit)
+            self._switch_mlp = switch
+        return self._switch_mlp
 
     def __call__(self, x, image_mask):
         idx, weights = self.gate(x, image_mask)
+        # Decode / short verify: SwitchGLU path (rhs-only, no act-quant thrash).
+        if not (x.shape[1] >= 32 and idx.size >= 64):
+            routed = self._routed_switch_mlp()(x, idx, scores=weights)
+            if routed.ndim == weights.ndim + 1:
+                routed = (routed * weights[..., None].astype(routed.dtype)).sum(-2)
+            shared = self.shared_experts(x)
+            return (routed.astype(mx.float32) + shared.astype(mx.float32)).astype(
+                x.dtype
+            )
+
         routed_quantized = self.experts.quantizes_input
         shared_quantized = self.shared_experts.quantizes_input
         # Quantization is row-local; reuse it before routing duplicates token rows.
@@ -630,38 +680,27 @@ class MoE(nn.Module):
             quantize_activation(x) if routed_quantized or shared_quantized else x
         )
         routed_input = quantized if routed_quantized else x
-        if x.shape[1] >= 32 and idx.size >= 64:
-            shape = idx.shape
-            flat = idx.reshape(-1)
-            order = mx.argsort(flat)
-            inverse = mx.argsort(order)
-            selected = routed_input.reshape(-1, x.shape[-1])[order // shape[-1]][
-                :, None, :
-            ]
-            routed = self.experts(
-                selected,
-                flat[order],
-                weights.reshape(-1)[order],
-                sorted_indices=True,
-                input_quantized=routed_quantized,
-            )
-            shared = self.shared_experts(
-                quantized if shared_quantized else x, input_quantized=shared_quantized
-            )
-            combined = combine_sorted_experts(routed, inverse, shared)
-            if combined is not None:
-                return combined
-            routed = routed[inverse].reshape(*shape, x.shape[-1])
-        else:
-            routed = self.experts(
-                routed_input[..., None, None, :],
-                idx,
-                weights,
-                input_quantized=routed_quantized,
-            ).squeeze(-2)
-            shared = self.shared_experts(
-                quantized if shared_quantized else x, input_quantized=shared_quantized
-            )
+        shape = idx.shape
+        flat = idx.reshape(-1)
+        order = mx.argsort(flat)
+        inverse = mx.argsort(order)
+        selected = routed_input.reshape(-1, x.shape[-1])[order // shape[-1]][
+            :, None, :
+        ]
+        routed = self.experts(
+            selected,
+            flat[order],
+            weights.reshape(-1)[order],
+            sorted_indices=True,
+            input_quantized=routed_quantized,
+        )
+        shared = self.shared_experts(
+            quantized if shared_quantized else x, input_quantized=shared_quantized
+        )
+        combined = combine_sorted_experts(routed, inverse, shared)
+        if combined is not None:
+            return combined
+        routed = routed[inverse].reshape(*shape, x.shape[-1])
         return (routed.astype(mx.float32).sum(-2) + shared.astype(mx.float32)).astype(
             x.dtype
         )
@@ -704,8 +743,6 @@ def hc_mixes(x, fn, scale, base, c):
         x, fn, scale, base, c.hc_mult, c.norm_eps, c.hc_eps, c.hc_sinkhorn_iters
     )
 
-
-@mx.compile
 def hc_pre(x, pre):
     return mx.sum(x.astype(mx.float32) * pre[..., None], axis=-2).astype(x.dtype)
 
