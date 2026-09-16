@@ -1502,7 +1502,9 @@ class TestSettingsSnapshotRoutes:
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["changed"] is True
-        assert body["applied"] == {}
+        assert body["applied"]["temperature"] is None
+        assert body["applied"]["display_name"] is None
+        assert body["applied"]["is_pinned"] is False
         assert body["skipped"] == []
         assert body["settings"] == ModelSettings().to_dict()
         assert mgr.get_settings("model-a").to_dict() == ModelSettings().to_dict()
@@ -1549,8 +1551,86 @@ class TestSettingsSnapshotRoutes:
         assert "display_name" not in settings
         assert body["skipped"] == []
         assert body["applied"]["temperature"] == 0.2
-        assert "top_p" not in body["applied"]
+        assert body["applied"]["top_p"] is None
         assert mgr.get_settings("model-a").temperature == 0.2
+
+    @pytest.mark.parametrize("target_type", ["qwen3_5", "k2_horizon"])
+    def test_recipe_handles_inactive_ane_controls_for_target(self, client, target_type):
+        from omlx.admin.benchmark import _filter_uploaded_settings
+        from omlx.model_settings import validate_ane_prefill
+
+        c, mgr = client
+        admin_routes._get_engine_pool().get_entry("model-a").config_model_type = (
+            target_type
+        )
+        source = ModelSettings(
+            temperature=0.2,
+            qwen35_ane_prefill_enabled=False,
+            qwen35_ane_prefill_sequence_length=128,
+        )
+        validate_ane_prefill(source.to_dict(), "k2_horizon")
+        recipe = settings_recipe.encode_recipe(_filter_uploaded_settings(source))
+        response = c.post(
+            "/admin/api/models/model-a/settings/recipe", json={"recipe": recipe}
+        )
+        assert response.status_code == 200, response.text
+        saved = mgr.get_settings("model-a")
+        assert saved.temperature == 0.2
+        assert saved.qwen35_ane_prefill_enabled is False
+        assert saved.qwen35_ane_prefill_sequence_length == (
+            2048 if target_type == "qwen3_5" else 128
+        )
+        assert [item["feature"] for item in response.json()["skipped"]] == (
+            ["ane_prefill"] if target_type == "qwen3_5" else []
+        )
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            {"temperature": {"bad": 1}},
+            {"qwen35_ane_prefill_fraction": {"bad": 1}},
+        ],
+    )
+    def test_recipe_invalid_value_types_leave_storage_unchanged(self, client, invalid):
+        c, mgr = client
+        mgr.set_settings("model-a", ModelSettings(temperature=0.7))
+        before = {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")}
+        recipe = settings_recipe.encode_recipe({"temperature": 0.2, **invalid})
+        response = c.post(
+            "/admin/api/models/model-a/settings/recipe", json={"recipe": recipe}
+        )
+        assert response.status_code == 400, response.text
+        assert {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")} == before
+        assert mgr.get_settings("model-a").temperature == 0.7
+
+    def test_recipe_reports_persisted_values_and_resets(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a", ModelSettings(top_p=0.5, turboquant_kv_enabled=True)
+        )
+        recipe = settings_recipe.encode_recipe(
+            {"temperature": 0.2, "index_cache_freq": 1}
+        )
+        response = c.post(
+            "/admin/api/models/model-a/settings/recipe", json={"recipe": recipe}
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["applied"]["top_p"] is None
+        assert body["applied"]["turboquant_kv_enabled"] is False
+        assert body["applied"]["index_cache_freq"] is None
+        saved = mgr.get_settings("model-a")
+        assert body["applied"] == {
+            key: getattr(saved, key) for key in body["applied"]
+        }
+
+    def test_reset_reports_metadata_only_change(self, client):
+        c, mgr = client
+        mgr.set_settings("model-a", ModelSettings(display_name="Custom name"))
+        body = c.post("/admin/api/models/model-a/settings/reset").json()
+        assert body["changed"] is True
+        assert body["applied"]["display_name"] is None
+        assert mgr.get_settings("model-a").display_name is None
 
     def test_recipe_drops_feature_whose_draft_is_missing(self, client, monkeypatch):
         c, mgr = client

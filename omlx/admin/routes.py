@@ -3917,9 +3917,13 @@ async def _apply_settings_snapshot(
             )
         refs = _installed_model_refs()
         for group in FEATURE_GROUPS:
-            if not group_enabled(cleaned, group):
+            # Inactive ANE controls still have backend-specific limits.
+            if not group_enabled(cleaned, group) and group.name != "ane_prefill":
                 continue
-            reason = _feature_problem(entry, group, cleaned, refs, skipped)
+            try:
+                reason = _feature_problem(entry, group, cleaned, refs, skipped)
+            except (TypeError, ValueError) as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
             if reason is None:
                 continue
             cleaned = drop_group(cleaned, group)
@@ -3937,14 +3941,13 @@ async def _apply_settings_snapshot(
     try:
         ModelSettings.from_dict(candidate)
         _validate_model_settings(entry, candidate)
-    except ValueError as error:
+        diff = settings_diff(candidate, current, scope)
+        request = ModelSettingsRequest(**diff)
+    except (TypeError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    diff = settings_diff(candidate, current, scope)
     if diff:
-        result = await update_model_settings(
-            model_id, ModelSettingsRequest(**diff), is_admin=True
-        )
+        result = await update_model_settings(model_id, request, is_admin=True)
     else:
         result = {
             "success": True,
@@ -3964,8 +3967,17 @@ async def _apply_settings_snapshot(
         settings.active_profile_name = None
         mgr.set_settings(model_id, settings)
         result["settings"] = settings.to_dict()
-    applied = {key: candidate[key] for key in sorted(scope) if key in candidate}
-    return {**result, "applied": applied, "skipped": skipped, "changed": bool(diff)}
+    saved = result["settings"]
+    applied = {
+        key: saved.get(key, DEFAULTS[key])
+        for key in sorted(ALL_FIELDS if reset else scope)
+    }
+    return {
+        **result,
+        "applied": applied,
+        "skipped": skipped,
+        "changed": saved != current,
+    }
 
 
 async def _fetch_omlx_ai(url: str, params: dict | None = None) -> dict:
