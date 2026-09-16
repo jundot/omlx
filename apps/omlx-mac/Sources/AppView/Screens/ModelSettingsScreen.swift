@@ -139,14 +139,16 @@ private struct SnapshotActions: View {
             } label: {
                 actionLabel(String(localized: "settings.actions.reset",
                           defaultValue: "Reset defaults",
-                          comment: "Header button that returns every setting of the model to its default"))
+                          comment: "Header button that returns every setting of the model to its default"),
+                            systemImage: "arrow.counterclockwise")
             }
             Button {
                 Task { await vm.loadOptimalCandidates(client: client) }
             } label: {
                 actionLabel(String(localized: "settings.actions.optimal",
                           defaultValue: "Apply optimal settings",
-                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"))
+                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"),
+                            systemImage: "wand.and.stars")
             }
             Button {
                 vm.applyError = nil
@@ -154,10 +156,11 @@ private struct SnapshotActions: View {
             } label: {
                 actionLabel(String(localized: "settings.actions.recipe",
                           defaultValue: "Apply custom recipe",
-                          comment: "Header button that opens the paste-a-recipe sheet"))
+                          comment: "Header button that opens the paste-a-recipe sheet"),
+                            systemImage: "doc.on.clipboard")
             }
         }
-        .buttonStyle(.omlx(.normal))
+        .buttonStyle(.omlx(.normal, size: .small))
         .buttonBorderShape(.roundedRectangle(radius: 6))
         .fixedSize(horizontal: true, vertical: false)
         .disabled(vm.isApplyingSettings)
@@ -196,14 +199,13 @@ private struct SnapshotActions: View {
         }
     }
 
-    private func actionLabel(_ title: String) -> some View {
-        Text(title)
-            .font(.omlxText(13))
-            .multilineTextAlignment(.center)
-            .lineLimit(2)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(width: 104)
-            .frame(minHeight: 34)
+    private func actionLabel(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .labelStyle(.iconOnly)
+            .font(.omlxText(12))
+            .frame(width: 20, height: 22)
+            .help(title)
+            .accessibilityLabel(title)
     }
 }
 
