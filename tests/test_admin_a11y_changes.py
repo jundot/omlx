@@ -176,3 +176,31 @@ def test_navbar_tablist_label_is_present_in_each_locale(locale):
     assert isinstance(value, str) and value.strip(), (
         f"{locale}.json navbar.tablist_label must be a non-empty string"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. the expose-as-API toggles announce their pressed state
+# ---------------------------------------------------------------------------
+
+
+def test_expose_as_model_toggles_declare_aria_pressed():
+    """Both expose-as-API toggles are two-state buttons.
+
+    Their label already flips between ON and OFF, but a toggle button should
+    expose the state through `aria-pressed` as well, so assistive technology
+    announces a toggle with a state rather than an ordinary button whose text
+    happens to change.
+    """
+    # Both toggles are the buttons that carry the expose-as-API tooltip.
+    marker = "t('modal.model_settings.profiles.expose_as_model')"
+    toggles = [
+        block for block in re.findall(r"<button\b[^>]*>", MODAL_MODEL) if marker in block
+    ]
+    assert len(toggles) == 2, (
+        "expected the new-profile and edit-profile API toggles, "
+        f"found {len(toggles)}"
+    )
+    for block in toggles:
+        assert ':aria-pressed="' in block, (
+            f"the expose-as-API toggle must bind aria-pressed: {block!r}"
+        )

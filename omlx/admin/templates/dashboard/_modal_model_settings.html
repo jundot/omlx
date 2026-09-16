@@ -239,6 +239,7 @@
                             <button type="button"
                                     @click="newProfile.expose_as_model = !newProfile.expose_as_model"
                                     :title="t('modal.model_settings.profiles.expose_as_model')"
+                                    :aria-pressed="!!newProfile.expose_as_model"
                                     :class="newProfile.expose_as_model
                                         ? 'bg-emerald-600 text-white border-emerald-600'
                                         : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
@@ -275,6 +276,7 @@
                                     <button type="button"
                                             @click="p._editExposeAsModel = !(p._editExposeAsModel ?? p.expose_as_model)"
                                             :title="t('modal.model_settings.profiles.expose_as_model')"
+                                            :aria-pressed="!!(p._editExposeAsModel ?? p.expose_as_model)"
                                             :class="(p._editExposeAsModel ?? p.expose_as_model)
                                                 ? 'bg-emerald-600 text-white border-emerald-600'
                                                 : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
