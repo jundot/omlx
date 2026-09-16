@@ -24,12 +24,17 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     raw = {"model_type": kind, "quantization": {"bits": 4, "group_size": 32}}
     if kind == "olmoe":
         raw.update(text)
+    elif kind == "glm_moe_dsa":
+        # the flagship layout: n_routed_experts, and the first layer dense
+        raw.update(text, n_routed_experts=16, first_k_dense_replace=1)
     else:
         raw["text_config"] = text
     (path / "config.json").write_text(json.dumps(raw))
     tensors = {}
     for layer in range(2):
-        if kind == "olmoe":
+        if kind == "glm_moe_dsa" and layer == 0:
+            continue  # dense layer: no experts to cover
+        if kind in ("olmoe", "glm_moe_dsa"):
             prefix = f"model.layers.{layer}.mlp.switch_mlp"
         elif kind == "gemma4":
             prefix = f"language_model.model.layers.{layer}.experts.switch_glu"
@@ -59,6 +64,7 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
         ("gemma4", False),
         ("olmoe", False),
         ("olmoe", True),
+        ("glm_moe_dsa", False),
     ],
 )
 def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_expert):
@@ -93,12 +99,20 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
     assert error.value.status_code == 400
 
 
-@pytest.mark.parametrize(
-    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4", "qwen3_5_moe"]
-)
+@pytest.mark.parametrize("kind", ["glm5_next", "deepseek_v4", "qwen3_5_moe"])
 def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
     _checkpoint(tmp_path, kind)
     assert moe_offload_compatibility(tmp_path)[0] is False
+
+
+def test_glm_moe_dsa_requires_every_moe_layer(tmp_path):
+    """The dense prefix is skipped; a missing routed layer still hides it."""
+    tensors = _checkpoint(tmp_path, "glm_moe_dsa")
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    del tensors["model.layers.1.mlp.switch_mlp.up_proj.scales"]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False and "layers.1" in reason
 
 
 def test_dense_gemma_is_hidden(tmp_path):
