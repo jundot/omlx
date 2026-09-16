@@ -27,11 +27,11 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 0) {
+            HStack(alignment: .center, spacing: 0) {
                 Header(model: vm.model)
                 SnapshotActions(vm: vm, client: services.client)
                     .padding(.trailing, 14)
-                    .padding(.top, 8)
+                    .padding(.bottom, 10)
             }
 
             SectionPicker(selection: $vm.section)
@@ -134,26 +134,32 @@ private struct SnapshotActions: View {
             if vm.isApplyingSettings {
                 ProgressView().controlSize(.small)
             }
-            Button(String(localized: "settings.actions.reset",
-                          defaultValue: "Reset defaults",
-                          comment: "Header button that returns every setting of the model to its default")) {
+            Button {
                 vm.pendingReset = true
+            } label: {
+                actionLabel(String(localized: "settings.actions.reset",
+                          defaultValue: "Reset defaults",
+                          comment: "Header button that returns every setting of the model to its default"))
             }
-            .buttonStyle(.omlx(.normal, size: .small))
-            Button(String(localized: "settings.actions.optimal",
-                          defaultValue: "Apply optimal settings",
-                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model")) {
+            Button {
                 Task { await vm.loadOptimalCandidates(client: client) }
+            } label: {
+                actionLabel(String(localized: "settings.actions.optimal",
+                          defaultValue: "Apply optimal settings",
+                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"))
             }
-            .buttonStyle(.omlx(.normal, size: .small))
-            Button(String(localized: "settings.actions.recipe",
-                          defaultValue: "Apply custom recipe",
-                          comment: "Header button that opens the paste-a-recipe sheet")) {
+            Button {
                 vm.applyError = nil
                 vm.applyOutcome = .recipeInput
+            } label: {
+                actionLabel(String(localized: "settings.actions.recipe",
+                          defaultValue: "Apply custom recipe",
+                          comment: "Header button that opens the paste-a-recipe sheet"))
             }
-            .buttonStyle(.omlx(.normal, size: .small))
         }
+        .buttonStyle(.omlx(.normal))
+        .buttonBorderShape(.roundedRectangle(radius: 6))
+        .fixedSize(horizontal: true, vertical: false)
         .disabled(vm.isApplyingSettings)
         .confirmationDialog(
             String(localized: "settings.actions.reset.confirm_title",
@@ -188,6 +194,16 @@ private struct SnapshotActions: View {
             SettingsApplySheet(vm: vm, client: client)
                 .environment(\.omlxTheme, theme)
         }
+    }
+
+    private func actionLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.omlxText(13))
+            .multilineTextAlignment(.center)
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(width: 104)
+            .frame(minHeight: 34)
     }
 }
 
