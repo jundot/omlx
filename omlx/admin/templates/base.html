@@ -122,12 +122,20 @@
             outline-offset: 2px;
         }
 
-        /* Dashboard nav tabs: subtle focus ring that reads naturally next to the
-           selected-state pill instead of a stark default blue outline. Keyboard-only
-           (:focus-visible) so a mouse click never leaves a lingering ring. */
-        [role="tab"]:focus-visible {
-            outline: none;
-            box-shadow: 0 0 0 2px rgba(0,0,0,0.12);
+        dialog.dashboard-dialog {
+            margin: 0;
+            padding: 0;
+            border: 0;
+            width: 100%;
+            height: 100%;
+            max-width: none;
+            max-height: none;
+            background: transparent;
+            color: inherit;
+        }
+
+        dialog.dashboard-dialog::backdrop {
+            background: transparent;
         }
 
         /* Respect "Reduce Motion" (accessibility): collapse CSS transitions

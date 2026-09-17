@@ -1,12 +1,14 @@
     <!-- Settings snapshot modal: reset confirmation / omlx.ai candidates / pasted recipe -->
-    <div x-show="settingsApply.open" x-cloak
-         class="fixed inset-0 z-[60] overflow-y-auto"
-         @keydown.escape.window="closeSettingsApply()">
+    <dialog x-effect="settingsApply.open ? $el.showModal() : $el.close()" x-cloak
+         class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"
+         role="dialog" aria-modal="true" aria-labelledby="settings-apply-modal-title"
+         @keydown.tab="trapDialogFocus($event)"
+         @cancel.prevent="closeSettingsApply()">
         <div class="fixed inset-0 bg-black/50" @click="closeSettingsApply()"></div>
         <div class="flex min-h-full items-center justify-center p-4">
             <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-xl p-6" @click.stop>
                 <div class="flex items-center justify-between mb-4">
-                    <h4 class="text-lg font-bold tracking-tight text-neutral-900" x-text="settingsApplyTitle()"></h4>
+                    <h4 id="settings-apply-modal-title" tabindex="-1" autofocus class="text-lg font-bold tracking-tight text-neutral-900" x-text="settingsApplyTitle()"></h4>
                     <button type="button" @click="closeSettingsApply()"
                             :disabled="settingsApply.phase === 'loading'"
                             class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all disabled:opacity-50">
@@ -139,4 +141,4 @@
                 </div>
             </div>
         </div>
-    </div>
+    </dialog>

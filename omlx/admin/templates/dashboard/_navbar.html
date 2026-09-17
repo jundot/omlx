@@ -32,11 +32,13 @@
 
             <!-- Center Navigation -->
             <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2"
-                 role="tablist" aria-label="{{ t('navbar.tablist_label') }}">
+                 role="tablist" aria-label="{{ t('navbar.tablist_label') }}"
+                 @keydown="handleMainTabKeydown($event)">
                 <button
                     @click="setMainTab('status')"
                     id="tab-status"
                     :aria-selected="mainTab === 'status'"
+                    :tabindex="mainTab === 'status' ? 0 : -1"
                     role="tab"
                     aria-controls="panel-status"
                     :class="mainTab === 'status'
@@ -55,6 +57,7 @@
                     id="tab-cluster"
                     aria-controls="panel-cluster"
                     :aria-selected="mainTab === 'cluster'"
+                    :tabindex="mainTab === 'cluster' ? 0 : -1"
                     :class="mainTab === 'cluster'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -70,6 +73,7 @@
                         id="tab-models"
                         aria-controls="panel-models"
                         :aria-selected="mainTab === 'models'"
+                        :tabindex="mainTab === 'models' ? 0 : -1"
                         :class="mainTab === 'models'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -144,6 +148,7 @@
                         id="tab-settings"
                         aria-controls="panel-settings"
                         :aria-selected="mainTab === 'settings'"
+                        :tabindex="mainTab === 'settings' ? 0 : -1"
                         :class="mainTab === 'settings'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -202,6 +207,7 @@
                     id="tab-logs"
                     aria-controls="panel-logs"
                     :aria-selected="mainTab === 'logs'"
+                    :tabindex="mainTab === 'logs' ? 0 : -1"
                     :class="mainTab === 'logs'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -217,6 +223,7 @@
                         id="tab-bench"
                         aria-controls="panel-bench"
                         :aria-selected="mainTab === 'bench'"
+                        :tabindex="mainTab === 'bench' ? 0 : -1"
                         :class="mainTab === 'bench'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"

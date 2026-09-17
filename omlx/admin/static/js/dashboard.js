@@ -845,6 +845,38 @@
                 this.syncTabStateToUrl();
             },
 
+            handleMainTabKeydown(event) {
+                if (!event.target.matches('[role="tab"]')
+                    || event.altKey || event.ctrlKey || event.metaKey) return;
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'))
+                    .filter(tab => !tab.disabled && tab.getClientRects().length);
+                const index = tabs.indexOf(event.target);
+                if (index < 0) return;
+                event.preventDefault();
+                let next;
+                if (event.key === 'Home') next = 0;
+                else if (event.key === 'End') next = tabs.length - 1;
+                else next = (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                this.modelsDropdown = this.settingsDropdown = this.benchDropdown = false;
+                tabs[next].focus();
+                tabs[next].click();
+            },
+
+            trapDialogFocus(event) {
+                const dialog = event.currentTarget;
+                const controls = Array.from(dialog.querySelectorAll(
+                    'a[href], button, input, select, textarea, [tabindex]'
+                )).filter(el => el.tabIndex >= 0 && !el.matches(':disabled')
+                    && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                const index = controls.indexOf(document.activeElement);
+                if (!controls.length || (event.shiftKey ? index <= 0 : index === controls.length - 1)) {
+                    event.preventDefault();
+                    const target = event.shiftKey ? controls.at(-1) : controls[0];
+                    (target || dialog.querySelector('[autofocus]')).focus();
+                }
+            },
+
             setSettingsTab(tab) {
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
@@ -1564,6 +1596,12 @@
 
             showTip(el, text) {
                 if (!text) return;
+                // A tooltip must share the dialog's top layer to remain visible.
+                const tooltip = this.$refs.floatingTooltip;
+                const container = el.closest('dialog') || this.$root;
+                if (tooltip.parentElement !== container) {
+                    Alpine.mutateDom(() => container.appendChild(tooltip));
+                }
                 const rect = el.getBoundingClientRect();
                 this.tip = {
                     visible: true,
