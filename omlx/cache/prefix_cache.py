@@ -2478,13 +2478,6 @@ class BlockAwarePrefixCache(CacheManager):
                     ):
                         pm_snapshot_layer = snapshot_cache_data[layer_idx]
                         pm_snapshot_state = pm_snapshot_layer["state"]
-                    # Scheduler boundary snapshots run through
-                    # compact_pooling_cache_snapshot: a PoolingCache member's
-                    # pooled tensor holds only this block's appended rows and
-                    # the absolute row range rides in pooling_delta_ranges.
-                    pm_pooling_delta_ranges = (
-                        pm_snapshot_layer.get("pooling_delta_ranges") or {}
-                    )
                     # See the rotating-family branch above (A1): a missing
                     # boundary snapshot must fall to the placeholder path
                     # even on the last block, unless the caller has verified
@@ -2519,6 +2512,16 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                         block_slices.append(("__cache_list__", sub_tensors))
                     elif pm_source_ok:
+                        # The scheduler promotes the final boundary into
+                        # cache_data and omits it from intermediate snapshots.
+                        # Read delta ranges from the same source as the state;
+                        # an unmarked final delta would reset the pooled history.
+                        pm_source_layer = (
+                            pm_snapshot_layer if pm_has_snapshot else layer_state
+                        )
+                        pm_pooling_delta_ranges = (
+                            pm_source_layer.get("pooling_delta_ranges") or {}
+                        )
                         sub_tensors = []
                         for sub_idx, sub_state in enumerate(state):
                             if pm_plan[sub_idx] == "slice":
