@@ -18,6 +18,7 @@ import math
 import re
 import threading
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -344,6 +345,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # abort_all_requests() to signal them at the next DFlash event boundary.
         self._stop_events_lock = threading.Lock()
         self._active_stop_events: set[threading.Event] = set()
+        # DFlash bypasses EngineCore/Scheduler, so durable pause state must be
+        # owned here.  The worker records accepted tokens under this lock and
+        # pause_request() sets the stop latch under the same lock; therefore a
+        # token is either wholly before the returned snapshot or rejected.
+        self._primary_request_lock = threading.Lock()
+        self._primary_requests: dict[str, dict[str, Any]] = {}
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
@@ -948,6 +955,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        continuation_token_ids: list[int] | None = None,
     ) -> int:
         """Count prompt tokens for chat messages after applying chat template.
 
@@ -967,7 +975,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer_obj.encode(prompt))
+        return len(self._tokenizer_obj.encode(prompt)) + len(
+            continuation_token_ids or []
+        )
 
     async def preflight_chat(
         self,
@@ -1003,6 +1013,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 tools,
                 chat_template_kwargs=kwargs.get("chat_template_kwargs"),
                 is_partial=kwargs.get("is_partial"),
+                continuation_token_ids=kwargs.get("continuation_token_ids"),
             )
         except Exception as e:
             logger.warning(
@@ -1251,6 +1262,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        activity_id: str | None = None,
+        primary_state: dict[str, Any] | None = None,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -1263,6 +1276,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         event_iter = None
         cache_manager = None
+        # 101 timestamps span exactly the latest 100 emitted-token intervals.
+        token_times: deque[float] = deque(maxlen=101)
+        acceptance_samples: deque[tuple[int, int]] = deque(maxlen=101)
+        recent_tps: float | None = None
+        recent_efficiency: float | None = None
         try:
             self._record_prefill_guard_active_memory()
             if seed is not None:
@@ -1295,6 +1313,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 )
                 if detokenizer is not None:
                     detokenizer.reset()
+            durable_prefix_token_ids = (
+                list(primary_state["output_token_ids"])
+                if primary_state is not None
+                else None
+            )
+            self._replay_durable_parser_state(
+                parser_session, detokenizer, durable_prefix_token_ids
+            )
 
             for event in event_iter:
                 if stop_event.is_set():
@@ -1303,6 +1329,46 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
                 if isinstance(event, TokenEvent):
                     token_id = int(event.token_id)
+                    generated = int(event.generated_tokens)
+                    efficiency = float(event.acceptance_ratio)
+                    # TokenEvent exposes a cumulative output-share ratio but
+                    # not proposal counts. Reconstruct the cumulative accepted
+                    # count for the rolling delta; SummaryEvent supplies the
+                    # exact final accepted_from_draft value.
+                    accepted = min(
+                        generated, max(0, round(generated * efficiency))
+                    )
+                    now = time.monotonic()
+                    token_times.append(now)
+                    acceptance_samples.append((generated, accepted))
+                    if len(token_times) >= 2:
+                        elapsed = token_times[-1] - token_times[0]
+                        recent_tps = (
+                            (len(token_times) - 1) / elapsed if elapsed > 0 else None
+                        )
+                    if len(acceptance_samples) >= 2:
+                        old_generated, old_accepted = acceptance_samples[0]
+                        generated_delta = generated - old_generated
+                        if generated_delta > 0:
+                            accepted_delta = min(
+                                generated_delta,
+                                max(0, accepted - old_accepted),
+                            )
+                            recent_efficiency = accepted_delta / generated_delta
+                    if activity_id is not None:
+                        self._update_activity(
+                            activity_id,
+                            token_count=generated,
+                            generated_tokens=generated,
+                            generation_tokens_per_second_recent=recent_tps,
+                            speculative_decoding_efficiency=efficiency,
+                            speculative_decoding_efficiency_recent=(
+                                recent_efficiency
+                            ),
+                            speculative_accepted_tokens=accepted,
+                            speculative_proposed_tokens=None,
+                            speculative_efficiency_kind="accepted_output_share",
+                        )
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
                         continue
@@ -1314,11 +1380,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         text = detokenizer.last_segment
                     else:
                         text = self._executor_tokenizer.decode([token_id])
-                    # Parser sessions can emit empty stream_text on protocol
-                    # marker tokens — skip the chunk so clients don't see a
-                    # flood of empty deltas.
-                    if not text:
-                        continue
+                    if not self._record_primary_token(
+                        primary_state, token_id, text, stop_event
+                    ):
+                        break
+                    # Empty parser text still carries an authoritative raw
+                    # token for durable continuation metadata.
                     asyncio.run_coroutine_threadsafe(
                         queue.put((text, [token_id], False, None)), loop
                     )
@@ -1361,6 +1428,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        "generation_tps_recent": recent_tps,
+                        "speculative_efficiency": accept_ratio,
+                        "speculative_efficiency_recent": recent_efficiency,
+                        "speculative_accepted_tokens": int(
+                            event.accepted_from_draft
+                        ),
+                        "speculative_proposed_tokens": None,
+                        # dflash-mlx's acceptance_ratio is accepted draft
+                        # output divided by total output, not proposals.
+                        "speculative_efficiency_kind": "accepted_output_share",
                         # Prefix-snapshot hit count, surfaced on the final
                         # (usage) chunk so the API reports cached_tokens (#1441).
                         "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
@@ -1395,6 +1472,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     except Exception as exc:
                         logger.debug(f"event_iter.close() raised: {exc}")
             self._end_runtime_cache_request(cache_manager)
+            self._finish_primary_request(primary_state)
             # Always send a sentinel so the async consumer doesn't deadlock
             # when an abort happened before the dflash summary was emitted.
             asyncio.run_coroutine_threadsafe(
@@ -1415,6 +1493,134 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     def _unregister_stop_event(self, stop_event: threading.Event) -> None:
         with self._stop_events_lock:
             self._active_stop_events.discard(stop_event)
+
+    def _decode_durable_tokens(self, token_ids: list[int]) -> str:
+        """Decode a checkpoint prefix without discarding reasoning markers."""
+        if not token_ids or self._tokenizer_obj is None:
+            return ""
+        try:
+            return str(
+                self._tokenizer_obj.decode(token_ids, skip_special_tokens=False)
+            )
+        except TypeError:
+            try:
+                return str(self._tokenizer_obj.decode(token_ids))
+            except Exception:
+                return ""
+        except Exception:
+            return ""
+
+    def _register_primary_request(
+        self,
+        request_id: str | None,
+        stop_event: threading.Event,
+        *,
+        continuation_token_ids: list[int] | None,
+        starts_in_thinking: bool,
+        synthetic_think_prefix: str = "",
+    ) -> dict[str, Any] | None:
+        """Register one primary request before its executor work is queued."""
+        if not request_id:
+            return None
+        prefix_ids = [int(token_id) for token_id in continuation_token_ids or []]
+        state: dict[str, Any] = {
+            "request_id": request_id,
+            "stop_event": stop_event,
+            "stopped_event": threading.Event(),
+            "output_token_ids": prefix_ids,
+            "output_text": self._decode_durable_tokens(prefix_ids),
+            "starts_in_thinking": bool(starts_in_thinking),
+            "think_end_token_ids": self._resolve_think_end_token_ids(),
+            "synthetic_think_prefix": synthetic_think_prefix,
+            "synthetic_think_prefix_pending": bool(synthetic_think_prefix),
+            "paused": False,
+            "finished": False,
+        }
+        with self._primary_request_lock:
+            self._primary_requests[request_id] = state
+        return state
+
+    def _record_primary_token(
+        self,
+        state: dict[str, Any] | None,
+        token_id: int,
+        text: str,
+        stop_event: threading.Event,
+    ) -> bool:
+        """Atomically accept one raw token and its rendered text."""
+        if state is None:
+            return not stop_event.is_set()
+        with self._primary_request_lock:
+            if state["paused"] or state["finished"] or stop_event.is_set():
+                return False
+            state["output_token_ids"].append(int(token_id))
+            if text:
+                if state["synthetic_think_prefix_pending"]:
+                    state["output_text"] += state["synthetic_think_prefix"]
+                    state["synthetic_think_prefix_pending"] = False
+                state["output_text"] += text
+            return True
+
+    @staticmethod
+    def _replay_durable_parser_state(
+        parser_session: Any | None,
+        detokenizer: Any | None,
+        token_ids: list[int] | None,
+    ) -> None:
+        """Prime request-local parsing state with a prefix without emitting it."""
+        for token_id in token_ids or []:
+            if parser_session is not None:
+                parser_session.process_token(int(token_id))
+            elif detokenizer is not None:
+                detokenizer.add_token(int(token_id))
+
+    def _finish_primary_request(self, state: dict[str, Any] | None) -> None:
+        """Make a completed request unpausable and wake a waiting pause call."""
+        if state is None:
+            return
+        with self._primary_request_lock:
+            state["finished"] = True
+            current = self._primary_requests.get(state["request_id"])
+            if current is state:
+                self._primary_requests.pop(state["request_id"], None)
+            state["stopped_event"].set()
+
+    @staticmethod
+    def _find_token_sequence(tokens: list[int], sequence: list[int]) -> int | None:
+        if not sequence or len(sequence) > len(tokens):
+            return None
+        for index in range(len(tokens) - len(sequence) + 1):
+            if tokens[index : index + len(sequence)] == sequence:
+                return index
+        return None
+
+    def _resolve_think_end_token_ids(self) -> list[int]:
+        """Resolve the raw boundary that closes this model's reasoning phase."""
+        factory = self._output_parser_factory
+        parser_marker = (
+            getattr(factory, "thinking_end_text", None) if factory is not None else None
+        )
+        marker = parser_marker or getattr(self._tokenizer_obj, "think_end", "</think>")
+        if parser_marker is None:
+            think_end_id = self._get_think_token_id("think_end_id")
+            if think_end_id is not None:
+                return [int(think_end_id)]
+        try:
+            try:
+                ids = self._tokenizer_obj.encode(marker, add_special_tokens=False)
+            except TypeError:
+                ids = self._tokenizer_obj.encode(marker)
+            if ids:
+                return [int(token_id) for token_id in ids]
+        except Exception:
+            pass
+        try:
+            token_id = self._tokenizer_obj.convert_tokens_to_ids("</think>")
+            if token_id != getattr(self._tokenizer_obj, "unk_token_id", None):
+                return [int(token_id)]
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+        return []
 
     async def generate(
         self,
@@ -1472,18 +1678,56 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 **kwargs,
             )
 
+        public_request_id = kwargs.pop("request_id", None)
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
+        continuation_in_thinking = bool(
+            kwargs.pop("continuation_in_thinking", False)
+        )
+        durable_prefix_token_ids = kwargs.pop("_durable_prefix_token_ids", None)
         repetition_context_size = kwargs.pop("repetition_context_size", None)
         if repetition_context_size is None:
             repetition_context_size = 20
+
+        needs_think_prefix = (
+            not continuation_in_thinking
+            and self._output_parser_factory is None
+            and self._detect_needs_think_prefix(prompt_tokens)
+        )
+        starts_in_thinking = bool(
+            continuation_in_thinking
+            or needs_think_prefix
+            or (
+                self._output_parser_factory is not None
+                and getattr(
+                    self._output_parser_factory, "thinking_end_text", None
+                )
+            )
+        )
 
         from ..engine_core import get_mlx_executor
 
         stop_event = threading.Event()
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
-        activity_id = self._begin_activity("generate", detail="generating")
+        activity_id = self._begin_activity(
+            "generate",
+            detail="generating",
+            metadata={
+                "public_request_id": public_request_id,
+                "prompt_tokens": len(prompt_tokens),
+                "max_tokens": max_tokens,
+            },
+        )
+        primary_state = self._register_primary_request(
+            public_request_id,
+            stop_event,
+            continuation_token_ids=durable_prefix_token_ids,
+            starts_in_thinking=starts_in_thinking,
+            synthetic_think_prefix=(
+                self._think_prefix_text() if needs_think_prefix else ""
+            ),
+        )
 
         def _run():
             from dflash_mlx.engine.events import SummaryEvent, TokenEvent
@@ -1493,7 +1737,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # Per-request parser session (gemma4 channel markers, harmony
             # channels). Lives only inside the executor thread so the parser
             # state cannot leak across requests.
-            parser_session = self._create_output_parser_session(tools)
+            try:
+                parser_session = self._create_output_parser_session(tools)
+                detokenizer = None
+                if parser_session is None:
+                    detokenizer = create_streaming_detokenizer(
+                        self._executor_tokenizer,
+                        model_path=self._model_name,
+                    )
+                    if detokenizer is not None:
+                        detokenizer.reset()
+                self._replay_durable_parser_state(
+                    parser_session, detokenizer, durable_prefix_token_ids
+                )
+            except Exception:
+                self._finish_primary_request(primary_state)
+                raise
             try:
                 self._record_prefill_guard_active_memory()
                 if seed is not None:
@@ -1527,12 +1786,23 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         token_id = int(event.token_id)
                         if token_id in stop_ids:
                             continue
-                        tokens.append(token_id)
-                        self._update_activity(activity_id, token_count=len(tokens))
+                        state_text = ""
                         if parser_session is not None:
                             result = parser_session.process_token(token_id)
+                            state_text = result.stream_text
                             if result.visible_text:
                                 parsed_visible_parts.append(result.visible_text)
+                        elif detokenizer is not None:
+                            detokenizer.add_token(token_id)
+                            state_text = detokenizer.last_segment
+                        else:
+                            state_text = self._executor_tokenizer.decode([token_id])
+                        if not self._record_primary_token(
+                            primary_state, token_id, state_text, stop_event
+                        ):
+                            break
+                        tokens.append(token_id)
+                        self._update_activity(activity_id, token_count=len(tokens))
                     elif isinstance(event, SummaryEvent):
                         summary = event
                         self._record_speculation_summary(event)
@@ -1559,6 +1829,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         except Exception as exc:
                             logger.debug(f"event_iter.close() raised: {exc}")
                 self._end_runtime_cache_request(cache_manager)
+                self._finish_primary_request(primary_state)
 
         self._register_stop_event(stop_event)
         try:
@@ -1623,7 +1894,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # can split them correctly. Skipped when a parser session is
             # active because gemma4/harmony parsers already emit <think> tags
             # themselves and prepending would double the marker.
-            if self._detect_needs_think_prefix(prompt_tokens):
+            if needs_think_prefix:
                 text = self._think_prefix_text() + text
 
         prompt_token_count = (
@@ -1651,6 +1922,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 else None
             ),
             first_token_at=first_token_at,
+            speculative_efficiency=(
+                float(summary.acceptance_ratio) if summary is not None else None
+            ),
+            speculative_accepted_tokens=(
+                int(summary.accepted_from_draft) if summary is not None else None
+            ),
+            speculative_proposed_tokens=None,
+            speculative_efficiency_kind=(
+                "accepted_output_share" if summary is not None else None
+            ),
         )
 
     async def stream_generate(
@@ -1712,8 +1993,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 yield output
             return
 
+        public_request_id = kwargs.pop("request_id", None)
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
+        continuation_in_thinking = bool(
+            kwargs.pop("continuation_in_thinking", False)
+        )
+        durable_prefix_token_ids = kwargs.pop("_durable_prefix_token_ids", None)
         repetition_context_size = kwargs.pop("repetition_context_size", None)
         if repetition_context_size is None:
             repetition_context_size = 20
@@ -1732,16 +2018,44 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # the parser emits <think> tags itself, so prepending here would
         # double the opening marker — gate it on factory absence.
         needs_think_prefix = (
-            self._output_parser_factory is None
+            not continuation_in_thinking
+            and self._output_parser_factory is None
             and self._detect_needs_think_prefix(prompt_tokens)
         )
         think_prefix_pending = needs_think_prefix
+        starts_in_thinking = bool(
+            continuation_in_thinking
+            or needs_think_prefix
+            or (
+                self._output_parser_factory is not None
+                and getattr(
+                    self._output_parser_factory, "thinking_end_text", None
+                )
+            )
+        )
 
         from ..engine_core import get_mlx_executor
 
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
-        activity_id = self._begin_activity("generate", detail="generating")
+        activity_id = self._begin_activity(
+            "generate",
+            detail="generating",
+            metadata={
+                "public_request_id": public_request_id,
+                "prompt_tokens": prompt_len,
+                "max_tokens": max_tokens,
+            },
+        )
+        primary_state = self._register_primary_request(
+            public_request_id,
+            stop_event,
+            continuation_token_ids=durable_prefix_token_ids,
+            starts_in_thinking=starts_in_thinking,
+            synthetic_think_prefix=(
+                self._think_prefix_text() if needs_think_prefix else ""
+            ),
+        )
         self._register_stop_event(stop_event)
         try:
             future = get_mlx_executor().submit(
@@ -1759,9 +2073,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 queue,
                 loop,
                 stop_event,
+                activity_id,
+                primary_state,
             )
         except Exception:
             self._unregister_stop_event(stop_event)
+            self._finish_primary_request(primary_state)
             self._end_activity(activity_id)
             raise
         # Use the executor future: asyncio cancellation can precede worker exit.
@@ -1811,6 +2128,24 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     finished=finished,
                     finish_reason=finish_reason,
                     tool_calls=(metrics or {}).get("tool_calls"),
+                    generation_tps_recent=(metrics or {}).get(
+                        "generation_tps_recent"
+                    ),
+                    speculative_efficiency=(metrics or {}).get(
+                        "speculative_efficiency"
+                    ),
+                    speculative_efficiency_recent=(metrics or {}).get(
+                        "speculative_efficiency_recent"
+                    ),
+                    speculative_accepted_tokens=(metrics or {}).get(
+                        "speculative_accepted_tokens"
+                    ),
+                    speculative_proposed_tokens=(metrics or {}).get(
+                        "speculative_proposed_tokens"
+                    ),
+                    speculative_efficiency_kind=(metrics or {}).get(
+                        "speculative_efficiency_kind"
+                    ),
                 )
 
                 if finished:
@@ -1902,6 +2237,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=is_partial,
         )
+        continuation_token_ids = kwargs.pop("continuation_token_ids", None)
+        if continuation_token_ids:
+            prompt = list(self._tokenizer_obj.encode(prompt)) + list(
+                continuation_token_ids
+            )
+            kwargs["_durable_prefix_token_ids"] = list(continuation_token_ids)
 
         return await self.generate(
             prompt=prompt,
@@ -1982,6 +2323,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=is_partial,
         )
+        continuation_token_ids = kwargs.pop("continuation_token_ids", None)
+        if continuation_token_ids:
+            prompt = list(self._tokenizer_obj.encode(prompt)) + list(
+                continuation_token_ids
+            )
+            kwargs["_durable_prefix_token_ids"] = list(continuation_token_ids)
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -2052,6 +2399,72 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 stop_event.set()
                 aborted += 1
         return aborted
+
+    async def request_force_output(self, request_id: str) -> str:
+        """DFlash primary decode cannot inject the thinking close sequence."""
+        if self._in_fallback_mode and self._fallback_engine is not None:
+            request_force = getattr(self._fallback_engine, "request_force_output", None)
+            if callable(request_force):
+                return await request_force(request_id)
+        with self._active_lock:
+            belongs_here = any(
+                item.get("public_request_id") == request_id
+                for item in self._activities.values()
+            )
+        return "unsupported" if belongs_here else "not_found"
+
+    async def pause_request(self, request_id: str) -> dict[str, Any]:
+        """Atomically snapshot and stop one primary or fallback request."""
+        if self._in_fallback_mode and self._fallback_engine is not None:
+            pause = getattr(self._fallback_engine, "pause_request", None)
+            if callable(pause):
+                result = await pause(request_id)
+                if result.get("status") == "accepted":
+                    return result
+
+        lock = getattr(self, "_primary_request_lock", None)
+        requests = getattr(self, "_primary_requests", None)
+        if lock is None or requests is None:
+            return {"status": "not_found", "request_id": request_id}
+
+        with lock:
+            state = requests.get(request_id)
+            if state is None or state["paused"] or state["finished"]:
+                return {"status": "not_found", "request_id": request_id}
+
+            # The worker checks and mutates these fields under this same lock.
+            # Once paused is set, no later TokenEvent can enter the prefix.
+            state["paused"] = True
+            state["stop_event"].set()
+            output_token_ids = list(state["output_token_ids"])
+            reasoning_end = self._find_token_sequence(
+                output_token_ids, list(state["think_end_token_ids"])
+            )
+            starts_in_thinking = bool(state["starts_in_thinking"])
+            stopped_event = state["stopped_event"]
+            snapshot = {
+                "status": "accepted",
+                "request_id": request_id,
+                "output_token_ids": output_token_ids,
+                "output_text": str(state["output_text"]),
+                "completion_tokens": len(output_token_ids),
+                "continuation_in_thinking": (
+                    starts_in_thinking and reasoning_end is None
+                ),
+                "reasoning_end_token_index": reasoning_end,
+            }
+
+        # Do not let callers unload the model while the DFlash executor is
+        # still inside a generation cycle.  The worker wakes this only after
+        # closing its event iterator and releasing request-local cache state.
+        await asyncio.to_thread(stopped_event.wait)
+        # Re-decode the immutable raw prefix after the worker has stopped.
+        # Incremental detokenizers may hold an incomplete UTF-8/token piece,
+        # so their streamed text can legitimately lag the accepted IDs.
+        authoritative_text = self._decode_durable_tokens(output_token_ids)
+        if authoritative_text or not output_token_ids:
+            snapshot["output_text"] = authoritative_text
+        return snapshot
 
     def get_stats(self) -> dict[str, Any]:
         return {

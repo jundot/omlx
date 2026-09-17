@@ -891,6 +891,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        continuation_token_ids: list[int] | None = None,
     ) -> int:
         """
         Count prompt tokens for chat messages after applying chat template.
@@ -912,7 +913,7 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer.encode(prompt))
+        return len(self._tokenizer.encode(prompt)) + len(continuation_token_ids or [])
 
     @staticmethod
     def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1043,12 +1044,18 @@ class BatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        continuation_in_thinking = bool(
+            kwargs.pop("continuation_in_thinking", False)
+        )
+        durable_prefix_token_ids = kwargs.pop("_durable_prefix_token_ids", None)
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
+            continuation_token_ids=durable_prefix_token_ids,
+            continuation_in_thinking=continuation_in_thinking,
             **specprefill_kwargs,
         )
 
@@ -1062,6 +1069,20 @@ class BatchedEngine(BaseEngine):
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
+            generation_tps_recent=getattr(output, "generation_tps_recent", None),
+            speculative_efficiency=getattr(output, "speculative_efficiency", None),
+            speculative_efficiency_recent=getattr(
+                output, "speculative_efficiency_recent", None
+            ),
+            speculative_accepted_tokens=getattr(
+                output, "speculative_accepted_tokens", None
+            ),
+            speculative_proposed_tokens=getattr(
+                output, "speculative_proposed_tokens", None
+            ),
+            speculative_efficiency_kind=getattr(
+                output, "speculative_efficiency_kind", None
+            ),
         )
 
     async def stream_generate(
@@ -1122,12 +1143,19 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        continuation_in_thinking = bool(
+            kwargs.pop("continuation_in_thinking", False)
+        )
+        durable_prefix_token_ids = kwargs.pop("_durable_prefix_token_ids", None)
 
         engine = self._engine
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.get("request_id"),
             tools=tools,
+            continuation_token_ids=durable_prefix_token_ids,
+            continuation_in_thinking=continuation_in_thinking,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
@@ -1152,6 +1180,7 @@ class BatchedEngine(BaseEngine):
                 yield GenerationOutput(
                     text=text,
                     new_text=output.new_text,
+                    tokens=list(getattr(output, "new_token_ids", []) or []),
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
                     finished=output.finished,
@@ -1161,6 +1190,24 @@ class BatchedEngine(BaseEngine):
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
                     first_token_at=getattr(output, "first_token_at", None),
+                    generation_tps_recent=getattr(
+                        output, "generation_tps_recent", None
+                    ),
+                    speculative_efficiency=getattr(
+                        output, "speculative_efficiency", None
+                    ),
+                    speculative_efficiency_recent=(
+                        getattr(output, "speculative_efficiency_recent", None)
+                    ),
+                    speculative_accepted_tokens=getattr(
+                        output, "speculative_accepted_tokens", None
+                    ),
+                    speculative_proposed_tokens=getattr(
+                        output, "speculative_proposed_tokens", None
+                    ),
+                    speculative_efficiency_kind=getattr(
+                        output, "speculative_efficiency_kind", None
+                    ),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))
@@ -1244,11 +1291,16 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
-
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(
             messages, prompt, template_tools, ct_kwargs, kwargs
         )
+        continuation_token_ids = kwargs.pop("continuation_token_ids", None)
+        if continuation_token_ids:
+            prompt = list(self._tokenizer.encode(prompt)) + list(
+                continuation_token_ids
+            )
+            kwargs["_durable_prefix_token_ids"] = list(continuation_token_ids)
 
         return await self.generate(
             prompt=prompt,
@@ -1306,7 +1358,9 @@ class BatchedEngine(BaseEngine):
         # through the existing handler chain so the response shape stays
         # consistent.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = len(self._tokenizer.encode(prompt)) + len(
+                kwargs.get("continuation_token_ids") or []
+            )
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
@@ -1402,11 +1456,16 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
-
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(
             messages, prompt, template_tools, ct_kwargs, kwargs
         )
+        continuation_token_ids = kwargs.pop("continuation_token_ids", None)
+        if continuation_token_ids:
+            prompt = list(self._tokenizer.encode(prompt)) + list(
+                continuation_token_ids
+            )
+            kwargs["_durable_prefix_token_ids"] = list(continuation_token_ids)
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -1431,6 +1490,18 @@ class BatchedEngine(BaseEngine):
                 collectors = getattr(inner, "_output_collectors", {})
                 return len(collectors) > 0
         return False
+
+    async def request_force_output(self, request_id: str) -> str:
+        """Force one active request out of its thinking phase."""
+        if not self._loaded or self._engine is None:
+            return "not_found"
+        return await self._engine.request_force_output(request_id)
+
+    async def pause_request(self, request_id: str) -> dict[str, Any]:
+        """Atomically snapshot and stop one active generation request."""
+        if not self._loaded or self._engine is None:
+            return {"status": "not_found", "request_id": request_id}
+        return await self._engine.pause_request(request_id)
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

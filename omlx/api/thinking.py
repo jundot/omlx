@@ -10,6 +10,7 @@ their chain-of-thought reasoning in <think>...</think> tags.
 """
 
 import re
+import threading
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
 
@@ -400,18 +401,24 @@ class ThinkingBudgetProcessor:
 
     Args:
         think_end_token_ids: Token ID(s) for the close-think tag.
-        budget: Maximum number of thinking tokens before forcing close.
+        budget: Maximum number of thinking tokens before forcing close, or
+            ``None`` to disable automatic budget enforcement.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        force_event: Optional request-scoped event for interactively forcing the
+            current thinking block closed.  The signal is monotonic for the
+            lifetime of the processor and is not included in speculative decode
+            snapshots, so a rejected draft cannot consume it.
     """
 
     def __init__(
         self,
         think_end_token_ids: List[int],
-        budget: int,
+        budget: Optional[int],
         think_start_token_id: Optional[int] = None,
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        force_event: Optional[threading.Event] = None,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -423,6 +430,10 @@ class ThinkingBudgetProcessor:
         self._budget = budget
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
+        self._force_event = (
+            force_event if force_event is not None else threading.Event()
+        )
+        self._force_request_lock = threading.Lock()
 
         # State
         self._thinking_tokens: int = 0
@@ -436,6 +447,24 @@ class ThinkingBudgetProcessor:
         self._recent_tokens: List[int] = []
         self._last_token_utf8_complete: bool = True
         self._pending_utf8: bytes = b""
+
+    def request_force(self) -> bool:
+        """Request that thinking close at the next safe UTF-8 boundary.
+
+        Returns ``True`` only for the first request.  Repeated calls are safe
+        no-ops.  The signal intentionally remains set for this processor's
+        lifetime so speculative snapshot restoration cannot lose it.
+        """
+        with self._force_request_lock:
+            if self._force_event.is_set():
+                return False
+            self._force_event.set()
+            return True
+
+    @property
+    def force_requested(self) -> bool:
+        """Whether interactive force-output has been requested."""
+        return self._force_event.is_set()
 
     def __call__(self, tokens, logits):
         """mlx-lm logits processor: (tokens, logits) -> logits."""
@@ -461,18 +490,26 @@ class ThinkingBudgetProcessor:
         if self._waiting_utf8:
             return logits
 
+        if self._in_thinking and self.force_requested:
+            return self._begin_forcing(logits, mx)
+
         if self._in_thinking:
             self._thinking_tokens += 1
-            if self._thinking_tokens >= self._budget:
-                if self._last_token_utf8_complete:
-                    self._forcing = True
-                    self._force_idx = 0
-                    self._recent_tokens = []
-                    return self._force_next_token(logits, mx)
-                self._waiting_utf8 = True
-                self._recent_tokens = []
+            if self._budget is not None and self._thinking_tokens >= self._budget:
+                return self._begin_forcing(logits, mx)
 
         return logits
+
+    def _begin_forcing(self, logits, mx):
+        """Start the close sequence now, or wait for a safe UTF-8 boundary."""
+        self._recent_tokens = []
+        if not self._last_token_utf8_complete:
+            self._waiting_utf8 = True
+            return logits
+
+        self._forcing = True
+        self._force_idx = 0
+        return self._force_next_token(logits, mx)
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""

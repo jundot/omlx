@@ -718,6 +718,11 @@ class _MtpState:
 
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
+    # Telemetry for the most recently executed verify cycle.  It is attached
+    # to exactly one emitted response, then cleared, so scheduler-side totals
+    # remain correct across queued bursts, adaptive parking and reactivation.
+    pending_spec_accepted: int = 0
+    pending_spec_proposed: int = 0
 
 
 @dataclass
@@ -2762,31 +2767,31 @@ def _emit_ragged_responses(
             if gen_batch._matchers[idx].advance(token_id):
                 finish_reason = "stop"
             if finish_reason is not None:
-                responses.append(
-                    Response(
-                        uid=uid,
-                        token=token_id,
-                        logprobs=logprobs_1d,
-                        finish_reason=finish_reason,
-                        prompt_cache=gen_batch.extract_cache(idx),
-                        all_tokens=gen_batch.tokens[idx],
-                    )
+                response = Response(
+                    uid=uid,
+                    token=token_id,
+                    logprobs=logprobs_1d,
+                    finish_reason=finish_reason,
+                    prompt_cache=gen_batch.extract_cache(idx),
+                    all_tokens=gen_batch.tokens[idx],
                 )
+                responses.append(response)
+                _annotate_speculative_response(response, state)
                 if state is not None:
                     _log_mtp_stats(uid, state.stats, finish_reason)
                 finished_uids.append(uid)
                 row_finished = True
                 break
-            responses.append(
-                Response(
-                    uid=uid,
-                    token=token_id,
-                    logprobs=logprobs_1d,
-                    finish_reason=None,
-                    prompt_cache=None,
-                    all_tokens=None,
-                )
+            response = Response(
+                uid=uid,
+                token=token_id,
+                logprobs=logprobs_1d,
+                finish_reason=None,
+                prompt_cache=None,
+                all_tokens=None,
             )
+            responses.append(response)
+            _annotate_speculative_response(response, state)
         if not row_finished:
             keep.append(idx)
 
@@ -2955,7 +2960,7 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     if state.queue:
         token_id, logprobs_1d, source = state.queue.popleft()
         _bump_emit_stat(state, source)
-        return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+        return _emit_response(gen_batch, token_id, logprobs_1d, state)
 
     _run_verify_cycle(gen_batch, state)
     if not state.queue:
@@ -2966,7 +2971,7 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
-    result = _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+    result = _emit_response(gen_batch, token_id, logprobs_1d, state)
     if (
         state.chain
         and state.controller is not None
@@ -3299,6 +3304,8 @@ def _run_verify_cycle_chain(
         else:
             break
     state.stats.accepts += m
+    state.pending_spec_accepted += m
+    state.pending_spec_proposed += k
     if m < k:
         state.stats.rejects += 1
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
@@ -3572,6 +3579,8 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     hidden_at_draft = hidden[:, 1:2, :]
 
     state.stats.cycles += 1
+    state.pending_spec_accepted += int(accept)
+    state.pending_spec_proposed += 1
     if accept:
         state.stats.accepts += 1
         # --- cache cleanup (timed) ---
@@ -3736,7 +3745,7 @@ def _emit_response(
     gen_batch: Any,
     token_id: int,
     logprobs_1d: Any,
-    stats: Optional["_MtpStats"] = None,
+    state: Optional["_MtpState"] = None,
 ) -> List[Any]:
     """Produce a single-element response list, applying the standard
     epilogue (token append + max_tokens / matcher checks) so external
@@ -3766,8 +3775,9 @@ def _emit_response(
             prompt_cache=prompt_cache,
             all_tokens=all_tokens,
         )
-        if stats is not None:
-            _log_mtp_stats(gen_batch.uids[0], stats, finish_reason)
+        _annotate_speculative_response(response, state)
+        if state is not None:
+            _log_mtp_stats(gen_batch.uids[0], state.stats, finish_reason)
         # Drop state *before* filter([]) so the patched_filter epilogue
         # doesn't double-log when the standard finish path already logged.
         if hasattr(gen_batch, "_omlx_mtp_state"):
@@ -3778,8 +3788,7 @@ def _emit_response(
         gen_batch.filter([])
         return [response]
 
-    return [
-        Response(
+    response = Response(
             uid=gen_batch.uids[0],
             token=token_id,
             logprobs=logprobs_1d,
@@ -3787,4 +3796,16 @@ def _emit_response(
             prompt_cache=None,
             all_tokens=None,
         )
-    ]
+    _annotate_speculative_response(response, state)
+    return [response]
+
+
+def _annotate_speculative_response(response: Any, state: Optional["_MtpState"]) -> None:
+    """Attach one cycle's request-local telemetry to an mlx-lm response."""
+    if state is None:
+        return
+    response.speculative_active = True
+    response.speculative_accepted_delta = state.pending_spec_accepted
+    response.speculative_proposed_delta = state.pending_spec_proposed
+    state.pending_spec_accepted = 0
+    state.pending_spec_proposed = 0

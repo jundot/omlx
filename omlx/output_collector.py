@@ -156,6 +156,31 @@ class RequestOutputCollector:
                 if new.generated_until is not None
                 else existing.generated_until
             ),
+            # Windowed values are snapshots, not sparse deltas. In particular,
+            # None can mean that the latest 100-token window no longer has any
+            # speculative proposals after adaptive fallback to ordinary AR.
+            generation_tps_recent=new.generation_tps_recent,
+            speculative_efficiency=(
+                new.speculative_efficiency
+                if new.speculative_efficiency is not None
+                else existing.speculative_efficiency
+            ),
+            speculative_efficiency_recent=new.speculative_efficiency_recent,
+            speculative_accepted_tokens=(
+                new.speculative_accepted_tokens
+                if new.speculative_accepted_tokens is not None
+                else existing.speculative_accepted_tokens
+            ),
+            speculative_proposed_tokens=(
+                new.speculative_proposed_tokens
+                if new.speculative_proposed_tokens is not None
+                else existing.speculative_proposed_tokens
+            ),
+            speculative_efficiency_kind=(
+                new.speculative_efficiency_kind
+                if new.speculative_efficiency_kind is not None
+                else existing.speculative_efficiency_kind
+            ),
             tool_calls=new.tool_calls,  # Preserve tool_calls for Harmony models
             cached_tokens=new.cached_tokens,
             error=new.error or existing.error,

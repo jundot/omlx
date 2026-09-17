@@ -8,7 +8,9 @@ request management system, simplified for MLX backend.
 """
 
 import enum
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -126,8 +128,32 @@ class Request:
     num_computed_tokens: int = 0
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
+    # Exact generated prefix supplied by a durable continuation request.  It
+    # is already part of ``prompt_token_ids`` for KV reconstruction, but is
+    # retained separately so a later pause can return one cumulative
+    # checkpoint rather than only the tokens generated since the last resume.
+    continuation_token_ids: List[int] = field(default_factory=list)
     generation_started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
+    # Request-scoped generation telemetry.  Keeping this on the Request makes
+    # the admin snapshot cheap and ensures stream batching never changes the
+    # measured window.  One hundred and one timestamps span exactly the most
+    # recent 100 emitted-token intervals.
+    generation_timestamps: Any = field(
+        default_factory=lambda: deque(maxlen=101), repr=False
+    )
+    generation_tps_recent: Optional[float] = None
+    speculative_active: bool = False
+    speculative_accepted_tokens: int = 0
+    speculative_proposed_tokens: int = 0
+    speculative_efficiency_kind: Optional[str] = None
+    speculative_events: Any = field(default_factory=deque, repr=False)
+    # Manual force-output is a monotonic, request-local latch.  It can be set
+    # while the request is still prefilling; ThinkingBudgetProcessor receives
+    # the same Event when its logits processor is constructed.
+    force_output_event: threading.Event = field(
+        default_factory=threading.Event, repr=False, compare=False
+    )
 
     # For BatchGenerator integration
     batch_uid: Optional[int] = None  # UID assigned by BatchGenerator
@@ -207,6 +233,11 @@ class Request:
     # Reasoning model support (for models with <think> tags)
     needs_think_prefix: bool = False  # True if prompt ends with <think> token
     preserve_reasoning: bool = False  # history keeps the <think> output, so output tokens are cacheable
+    # True when a durable continuation prefix already contains reasoning tokens
+    # and generation must resume inside the same thinking block.  This is kept
+    # separate from ``needs_think_prefix`` because the latter also asks the
+    # scheduler to synthesize a visible ``<think>`` opener on the first output.
+    continuation_in_thinking: bool = False
     think_prefix_sent: bool = False  # Track if prefix already sent
     # Close-think token matched to the prompt's opener for multi-marker parsers
     think_end_token_id: int | None = None
@@ -263,6 +294,58 @@ class Request:
         self.output_token_ids.append(token_id)
         self.num_computed_tokens += 1
 
+    def record_generation_timestamp(self, timestamp: float) -> None:
+        """Record one emitted token and refresh trailing-window throughput."""
+        self.generation_timestamps.append(float(timestamp))
+        if len(self.generation_timestamps) < 2:
+            self.generation_tps_recent = None
+            return
+        elapsed = self.generation_timestamps[-1] - self.generation_timestamps[0]
+        self.generation_tps_recent = (
+            (len(self.generation_timestamps) - 1) / elapsed if elapsed > 0 else None
+        )
+
+    def record_speculative_cycle(
+        self,
+        *,
+        accepted: int,
+        proposed: int,
+        output_token_count: Optional[int] = None,
+        kind: str = "accepted_over_proposed",
+    ) -> None:
+        """Add one speculative cycle and retain cycles overlapping 100 outputs."""
+        accepted = max(0, int(accepted))
+        proposed = max(0, int(proposed))
+        self.speculative_active = True
+        self.speculative_efficiency_kind = kind
+        self.speculative_accepted_tokens += accepted
+        self.speculative_proposed_tokens += proposed
+        position = (
+            self.num_output_tokens
+            if output_token_count is None
+            else int(output_token_count)
+        )
+        if proposed > 0:
+            self.speculative_events.append((position, accepted, proposed))
+        cutoff = max(0, self.num_output_tokens - 100)
+        while self.speculative_events and self.speculative_events[0][0] <= cutoff:
+            self.speculative_events.popleft()
+
+    @property
+    def speculative_efficiency(self) -> Optional[float]:
+        if not self.speculative_active or self.speculative_proposed_tokens <= 0:
+            return None
+        return self.speculative_accepted_tokens / self.speculative_proposed_tokens
+
+    @property
+    def speculative_efficiency_recent(self) -> Optional[float]:
+        if not self.speculative_active:
+            return None
+        proposed = sum(event[2] for event in self.speculative_events)
+        if proposed <= 0:
+            return None
+        return sum(event[1] for event in self.speculative_events) / proposed
+
     def set_finished(self, status: RequestStatus, reason: Optional[str] = None) -> None:
         """Mark the request as finished."""
         self.status = status
@@ -314,6 +397,12 @@ class RequestOutput:
     # Timestamp of the very first generated token for this request (perf_counter).
     # Set by non-streaming generate() to allow TTFT / prefill-duration estimation.
     first_token_at: Optional[float] = None
+    generation_tps_recent: Optional[float] = None
+    speculative_efficiency: Optional[float] = None
+    speculative_efficiency_recent: Optional[float] = None
+    speculative_accepted_tokens: Optional[int] = None
+    speculative_proposed_tokens: Optional[int] = None
+    speculative_efficiency_kind: Optional[str] = None
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None

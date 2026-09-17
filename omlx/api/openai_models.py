@@ -320,6 +320,10 @@ class StreamOptions(BaseModel):
     """Options for streaming responses."""
 
     include_usage: bool = False
+    # oMLX extension used by the local chat UI to build durable continuation
+    # checkpoints.  Kept opt-in so ordinary OpenAI-compatible streams do not
+    # receive metadata-only token chunks.
+    include_token_ids: bool = False
 
 
 class ChatCompletionRequest(BaseModel):
@@ -372,6 +376,31 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # oMLX durable-continuation extension.  These are raw tokens already
+    # generated after the normal assistant generation prompt.  Engines prefill
+    # them verbatim and continue with the next token, avoiding lossy text
+    # re-tokenization after an unload or process restart.
+    continuation_token_ids: Optional[List[int]] = None
+    continuation_in_thinking: bool = False
+
+    @field_validator("continuation_token_ids")
+    @classmethod
+    def validate_continuation_token_ids(cls, value):
+        if value is None:
+            return value
+        if not value:
+            raise ValueError("continuation_token_ids must not be empty")
+        if any(token_id < 0 for token_id in value):
+            raise ValueError("continuation_token_ids must contain non-negative integers")
+        return value
+
+    @model_validator(mode="after")
+    def validate_continuation_phase(self):
+        if self.continuation_in_thinking and not self.continuation_token_ids:
+            raise ValueError(
+                "continuation_in_thinking requires continuation_token_ids"
+            )
+        return self
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -443,6 +472,13 @@ class Usage(BaseUsage):
     generation_duration: Optional[float] = None
     prompt_tokens_per_second: Optional[float] = None
     generation_tokens_per_second: Optional[float] = None
+    # oMLX extensions: trailing ~100 emitted tokens and speculative decoding.
+    generation_tokens_per_second_recent: Optional[float] = None
+    speculative_decoding_efficiency: Optional[float] = None
+    speculative_decoding_efficiency_recent: Optional[float] = None
+    speculative_accepted_tokens: Optional[int] = None
+    speculative_proposed_tokens: Optional[int] = None
+    speculative_efficiency_kind: Optional[str] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -605,6 +641,11 @@ class ChatCompletionChunkDelta(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[dict]] = None
+    # oMLX opt-in durable-continuation metadata. ``token_ids`` is the raw
+    # incremental batch represented by this stream step; the reasoning count
+    # is cumulative across the supplied continuation prefix and new output.
+    token_ids: Optional[List[int]] = None
+    reasoning_token_count: Optional[int] = None
 
 
 class ChatCompletionChunkChoice(BaseModel):

@@ -688,6 +688,8 @@ class EngineCore:
         benchmark_trace: bool = False,
         benchmark_ane_sequence_length: int = 0,
         tools: list[dict[str, Any]] | None = None,
+        continuation_token_ids: list[int] | None = None,
+        continuation_in_thinking: bool = False,
     ) -> str:
         """
         Add a request for processing.
@@ -730,6 +732,10 @@ class EngineCore:
             preserve_reasoning=preserve_reasoning,
             benchmark_trace=benchmark_trace,
             benchmark_ane_sequence_length=benchmark_ane_sequence_length,
+            continuation_token_ids=[
+                int(token_id) for token_id in (continuation_token_ids or [])
+            ],
+            continuation_in_thinking=continuation_in_thinking,
         )
 
         # SpecPrefill: resolve per-request settings.
@@ -831,6 +837,47 @@ class EngineCore:
         self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
+        return result
+
+    async def request_force_output(self, request_id: str) -> str:
+        """Ask one exact request to leave its thinking phase."""
+        scheduler = getattr(self, "scheduler", None)
+        if getattr(self, "_closed", False) or scheduler is None:
+            return "not_found"
+        result = scheduler.request_force_output(request_id)
+        if result == "accepted":
+            self._wake_engine_loop()
+        return result
+
+    async def pause_request(self, request_id: str) -> dict[str, Any]:
+        """Atomically snapshot and abort one request on the MLX executor."""
+        scheduler = getattr(self, "scheduler", None)
+        if getattr(self, "_closed", False) or scheduler is None:
+            return {"status": "not_found", "request_id": request_id}
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            self._mlx_executor, scheduler.pause_request, request_id
+        )
+        if result.get("status") != "accepted":
+            return result
+
+        # Wake a consumer blocked in stream_outputs(), matching abort_request's
+        # teardown contract. The scheduler-side abort itself remains deferred
+        # and will be drained by the next executor-owned scheduler step.
+        collector = self._output_collectors.get(request_id)
+        if collector is not None:
+            collector.put(
+                RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="abort",
+                    error="Request paused",
+                    error_code="request_paused",
+                )
+            )
+        self._mark_request_finished(request_id)
+        self._wake_engine_loop()
         return result
 
     async def abort_all_requests(
@@ -1459,6 +1506,8 @@ class AsyncEngineCore:
         prompt: Union[str, List[int]],
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
+        continuation_token_ids: list[int] | None = None,
+        continuation_in_thinking: bool = False,
         **kwargs,
     ) -> str:
         """Add a request."""
@@ -1466,6 +1515,8 @@ class AsyncEngineCore:
             prompt=prompt,
             sampling_params=sampling_params,
             request_id=request_id,
+            continuation_token_ids=continuation_token_ids,
+            continuation_in_thinking=continuation_in_thinking,
             **kwargs,
         )
 
@@ -1479,6 +1530,20 @@ class AsyncEngineCore:
             )
             return False
         return await engine.abort_request(request_id)
+
+    async def request_force_output(self, request_id: str) -> str:
+        """Ask one exact request to leave its thinking phase."""
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return "not_found"
+        return await engine.request_force_output(request_id)
+
+    async def pause_request(self, request_id: str) -> dict[str, Any]:
+        """Atomically snapshot and pause one request."""
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return {"status": "not_found", "request_id": request_id}
+        return await engine.pause_request(request_id)
 
     async def abort_all_requests(
         self,

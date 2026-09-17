@@ -87,6 +87,27 @@ class TestUsageExtendedFields:
         assert usage.time_to_first_token == 0.5
         assert usage.generation_tokens_per_second == 33.33
 
+    def test_usage_with_recent_and_speculative_telemetry(self):
+        usage = Usage(
+            prompt_tokens=100,
+            completion_tokens=120,
+            generation_tokens_per_second=20.0,
+            generation_tokens_per_second_recent=15.5,
+            speculative_decoding_efficiency=0.75,
+            speculative_decoding_efficiency_recent=0.5,
+            speculative_accepted_tokens=90,
+            speculative_proposed_tokens=120,
+            speculative_efficiency_kind="accepted_over_proposed",
+        )
+
+        dumped = usage.model_dump(exclude_none=True)
+        assert dumped["generation_tokens_per_second_recent"] == 15.5
+        assert dumped["speculative_decoding_efficiency"] == 0.75
+        assert dumped["speculative_decoding_efficiency_recent"] == 0.5
+        assert dumped["speculative_accepted_tokens"] == 90
+        assert dumped["speculative_proposed_tokens"] == 120
+        assert dumped["speculative_efficiency_kind"] == "accepted_over_proposed"
+
     def test_usage_none_fields_excluded(self):
         """None timing fields should be excluded with exclude_none."""
         usage = Usage(prompt_tokens=10, completion_tokens=5)
@@ -94,6 +115,8 @@ class TestUsageExtendedFields:
         assert "prompt_tokens_details" not in dumped
         assert "time_to_first_token" not in dumped
         assert "model_load_duration" not in dumped
+        assert "generation_tokens_per_second_recent" not in dumped
+        assert "speculative_decoding_efficiency" not in dumped
         # Standard fields should still be present
         assert dumped["prompt_tokens"] == 10
         assert dumped["completion_tokens"] == 5

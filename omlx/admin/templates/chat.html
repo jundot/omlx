@@ -1251,6 +1251,13 @@
                                         <div x-show="contextOpen" x-transition
                                             class="absolute right-0 top-full mt-1 z-50 bg-surface border border-line rounded-lg shadow-lg py-1 min-w-[150px]"
                                             style="min-width: 160px; border-color: var(--border-normal);">
+                                            <button x-show="canThinkMoreMessage(msg, index)"
+                                                @click="thinkMoreMessage(msg, index); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
+                                                style="color: var(--text-primary);">
+                                                <i data-lucide="brain-circuit" class="w-3.5 h-3.5"></i>
+                                                <span x-text="window.t('chat.think_more')"></span>
+                                            </button>
                                             <button @click="branchChat(index); contextOpen = false"
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
                                                 style="color: var(--text-primary);">
@@ -1499,6 +1506,11 @@
                                         title="{{ t('chat.regenerate_tooltip') }}">
                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                     </button>
+                                    <button x-show="canThinkMoreMessage(msg, index)" @click="thinkMoreMessage(msg, index)"
+                                        class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
+                                        :title="window.t('chat.think_more_tooltip')">
+                                        <i data-lucide="brain-circuit" class="w-4 h-4"></i>
+                                    </button>
                                     <div class="relative flex-shrink-0">
                                         <button @click="contextOpen = !contextOpen" @click.outside="contextOpen = false"
                                             class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
@@ -1597,6 +1609,31 @@
                             <div class="message-body markdown-content" data-math-pending="true"
                                 :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
                                 x-html="renderMarkdown(msg.content)"></div>
+                            <div x-show="msg._paused" x-cloak
+                                class="mt-3 rounded-xl border border-line bg-surface-muted px-3 py-2">
+                                <div class="flex items-center justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <div class="text-xs font-medium" style="color: var(--text-primary);"
+                                            x-text="pausedStatusLabel(msg)"></div>
+                                        <div x-show="msg._paused?.error" class="text-[10px] mt-0.5 break-words"
+                                            style="color: var(--text-danger);" x-text="msg._paused?.error"></div>
+                                    </div>
+                                    <div class="flex items-center gap-1 flex-shrink-0">
+                                        <button @click="resumePausedMessage(msg)"
+                                            :disabled="pausedActionBusy(msg) || msg._paused?.state === 'unload_error' || msg._paused?.legacy"
+                                            class="px-2.5 py-1 text-xs font-medium rounded-lg bg-accent text-accent-fg disabled:opacity-50 disabled:cursor-not-allowed"
+                                            x-text="window.t('chat.resume')"></button>
+                                        <button @click="unloadPausedModel(msg)"
+                                            :disabled="pausedActionBusy(msg) || msg._paused?.state === 'unloaded'"
+                                            class="px-2.5 py-1 text-xs rounded-lg border border-line hover:bg-surface-alt disabled:opacity-50 disabled:cursor-not-allowed"
+                                            x-text="window.t('chat.unload_model')"></button>
+                                        <button @click="discardPausedCheckpoint(msg)"
+                                            :disabled="pausedActionBusy(msg)"
+                                            class="px-2.5 py-1 text-xs rounded-lg border border-line hover:bg-surface-alt disabled:opacity-50 disabled:cursor-not-allowed"
+                                            x-text="window.t('chat.discard_pause')"></button>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </template>
@@ -1620,6 +1657,17 @@
                                 :style="currentStream()?.statusTimelineVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
                                 title="{{ t('chat.toggle_info_tooltip') }}">
                                 <i data-lucide="activity" class="w-4 h-4"></i>
+                            </button>
+                            <button x-show="canPauseCurrentStream()" @click="pauseStreaming()"
+                                :disabled="currentStream()?.pauseState === 'pausing'"
+                                class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                                :title="window.t('chat.pause_tooltip')">
+                                <i data-lucide="pause" class="w-4 h-4"></i>
+                            </button>
+                            <button x-show="canThinkMoreCurrentStream()" @click="thinkMoreCurrentStream()"
+                                class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
+                                :title="window.t('chat.think_more_tooltip')">
+                                <i data-lucide="brain-circuit" class="w-4 h-4"></i>
                             </button>
                             <button @click="stopStreaming()"
                                 class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
@@ -1694,6 +1742,16 @@
                                 </svg>
                                 <span class="thinking-text"
                                     x-text="currentStream()?.finalContent ? window.t('chat.thinking_label') : window.t('chat.thinking_progress')"></span>
+                                <button x-show="currentStream()?.thinkingState?.isInThinking"
+                                    @click.stop="forceCurrentStreamOutput()"
+                                    :disabled="currentStream()?.forceOutputState === 'requesting' || currentStream()?.forceOutputState === 'accepted'"
+                                    class="ml-auto px-2 py-0.5 text-[10px] font-medium rounded-md border border-line hover:bg-surface-alt disabled:opacity-50 disabled:cursor-not-allowed"
+                                    :title="window.t('chat.force_output_tooltip')"
+                                    x-text="currentStream()?.forceOutputState === 'requesting'
+                                        ? window.t('chat.force_output_requesting')
+                                        : (currentStream()?.forceOutputState === 'accepted'
+                                            ? window.t('chat.force_output_accepted')
+                                            : window.t('chat.force_output'))"></button>
                                 <svg class="thinking-toggle"
                                     :class="{ collapsed: !currentStream()?.streamingThinkingOpen }" viewBox="0 0 24 24"
                                     fill="none" stroke="currentColor" stroke-width="2">
@@ -2219,6 +2277,18 @@
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
                             style="color: var(--text-primary);">
                     </div>
+                    <div class="space-y-1 pt-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider block"
+                            style="color: var(--text-secondary);">{{ t('chat.think_more_tokens') }}</label>
+                        <input type="number" x-model.number="modelSettings.think_more_budget_tokens"
+                            @input="onModelSettingsChange()" @change="clampThinkMoreBudgetTokens()"
+                            placeholder="4096" min="1" step="1024"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
+                            style="color: var(--text-primary);">
+                        <p class="text-[10px]" style="color: var(--text-tertiary);">
+                            {{ t('chat.think_more_tokens_hint') }}
+                        </p>
+                    </div>
                     <p class="text-[10px]" style="color: var(--text-tertiary);">
                         {{ t('chat.model_settings_advanced_hint') }}
                     </p>
@@ -2345,9 +2415,12 @@
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
                     <span class="text-[9px] font-bold uppercase tracking-wider"
                         style="color: var(--text-tertiary);">{{ t('chat.stats.token_generation') }}</span>
-                    <div class="flex items-end justify-between">
-                        <div class="text-sm font-semibold" style="color: var(--text-primary);"
-                            x-text="recentStats?.avg_generation_tps ? Number(recentStats.avg_generation_tps).toFixed(1) : '0.0'">
+                    <div class="flex items-end justify-between gap-2">
+                        <div class="min-w-0">
+                            <div class="text-sm font-semibold tabular-nums" style="color: var(--text-primary);"
+                                x-text="window.t('chat.stats.now') + ' ' + formatRate(recentStats?.generation_tokens_per_second_recent)"></div>
+                            <div class="text-[10px] tabular-nums" style="color: var(--text-tertiary);"
+                                x-text="window.t('chat.stats.overall') + ' ' + formatRate(recentStats?.avg_generation_tps)"></div>
                         </div>
                         <div class="text-[10px]" style="color: var(--text-primary);"
                             x-show="recentStats?.total_tokens > 0" x-text="recentStats.total_tokens + ' ' + window.t('chat.stats.token_suffix')"></div>
@@ -2371,6 +2444,21 @@
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.total_time ? Number(recentStats.total_time).toFixed(1) : '-'"></div>
+                    </div>
+                </div>
+                <div class="col-span-2 bg-surface-muted p-2 rounded-xl border border-line flex items-center justify-between gap-3"
+                    :title="window.t('chat.stats.speculative_window')
+                        + (recentStats?.speculative_efficiency_kind
+                            ? ' · ' + recentStats.speculative_efficiency_kind : '')">
+                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                        style="color: var(--text-tertiary);">{{ t('chat.stats.speculative_efficiency') }}</span>
+                    <div class="flex items-center gap-3 text-[10px] tabular-nums">
+                        <span style="color: var(--text-primary);"
+                            x-text="window.t('chat.stats.now') + ' ' + formatEfficiency(recentStats?.speculative_decoding_efficiency_recent)"></span>
+                        <span style="color: var(--text-tertiary);"
+                            x-text="window.t('chat.stats.overall') + ' ' + formatEfficiency(recentStats?.speculative_decoding_efficiency)"></span>
+                        <span x-show="recentStats?.speculative_proposed_tokens > 0" style="color: var(--text-tertiary);"
+                            x-text="(recentStats?.speculative_accepted_tokens || 0) + '/' + recentStats.speculative_proposed_tokens"></span>
                     </div>
                 </div>
             </div>
@@ -2527,6 +2615,59 @@
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
     const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
     const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
+    const PAUSED_INFERENCE_DB = 'omlx-paused-inference';
+    const PAUSED_INFERENCE_STORE = 'checkpoints';
+
+    function openPausedInferenceDb() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(PAUSED_INFERENCE_DB, 1);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(PAUSED_INFERENCE_STORE)) {
+                    db.createObjectStore(PAUSED_INFERENCE_STORE, { keyPath: 'id' });
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('IndexedDB unavailable'));
+        });
+    }
+
+    async function withPausedInferenceStore(mode, operation) {
+        const db = await openPausedInferenceDb();
+        try {
+            return await new Promise((resolve, reject) => {
+                const tx = db.transaction(PAUSED_INFERENCE_STORE, mode);
+                const request = operation(tx.objectStore(PAUSED_INFERENCE_STORE));
+                let result;
+                request.onsuccess = () => { result = request.result; };
+                request.onerror = () => reject(request.error || new Error('Checkpoint operation failed'));
+                // Waiting for transaction completion (rather than only request
+                // success) guarantees a read-write checkpoint is committed before
+                // Pause cancels inference transport.
+                tx.oncomplete = () => resolve(result);
+                tx.onerror = () => reject(tx.error || new Error('Checkpoint transaction failed'));
+                tx.onabort = () => reject(tx.error || new Error('Checkpoint transaction aborted'));
+            });
+        } finally {
+            db.close();
+        }
+    }
+
+    function putPausedInferenceCheckpoint(checkpoint) {
+        return withPausedInferenceStore('readwrite', store => store.put(checkpoint));
+    }
+
+    function deletePausedInferenceCheckpoint(id) {
+        return withPausedInferenceStore('readwrite', store => store.delete(id));
+    }
+
+    function getPausedInferenceCheckpoint(id) {
+        return withPausedInferenceStore('readonly', store => store.get(id));
+    }
+
+    function listPausedInferenceCheckpoints() {
+        return withPausedInferenceStore('readonly', store => store.getAll());
+    }
 
     function resolveChatUntitledLabel() {
         if (typeof window.t === 'function') {
@@ -2685,6 +2826,12 @@
             recentStats: {
                 avg_prefill_tps: 0,
                 avg_generation_tps: 0,
+                generation_tokens_per_second_recent: null,
+                speculative_decoding_efficiency: null,
+                speculative_decoding_efficiency_recent: null,
+                speculative_accepted_tokens: 0,
+                speculative_proposed_tokens: 0,
+                speculative_efficiency_kind: null,
                 thinking_time: 0,
                 total_time: 0
             },
@@ -2713,6 +2860,7 @@
                 enable_thinking: null,
                 thinking_budget_enabled: false,
                 thinking_budget_tokens: null,
+                think_more_budget_tokens: 4096,
             },
 
             defaultModelSettings() {
@@ -2727,6 +2875,7 @@
                     enable_thinking: null,
                     thinking_budget_enabled: false,
                     thinking_budget_tokens: null,
+                    think_more_budget_tokens: 4096,
                 };
             },
 
@@ -2754,6 +2903,17 @@
                 if (!Number.isFinite(n)) return 4096;
                 if (n <= 0) return 1;
                 return Math.floor(n);
+            },
+
+            normalizeThinkMoreBudgetTokens(value) {
+                return this.normalizeThinkingBudgetTokens(value);
+            },
+
+            clampThinkMoreBudgetTokens() {
+                this.modelSettings.think_more_budget_tokens = this.normalizeThinkMoreBudgetTokens(
+                    this.modelSettings.think_more_budget_tokens
+                );
+                this.onModelSettingsChange();
             },
 
             stepThinkingBudgetTokens(direction) {
@@ -2821,6 +2981,9 @@
                         this.modelSettings.thinking_budget_tokens
                     );
                 }
+                this.modelSettings.think_more_budget_tokens = this.normalizeThinkMoreBudgetTokens(
+                    this.modelSettings.think_more_budget_tokens
+                );
                 return {
                     modelSettings: this.cloneData(this.modelSettings),
                     speculativeEngine: this.speculativeEngine,
@@ -2855,6 +3018,9 @@
                         this.modelSettings.thinking_budget_tokens
                     );
                 }
+                this.modelSettings.think_more_budget_tokens = this.normalizeThinkMoreBudgetTokens(
+                    this.modelSettings.think_more_budget_tokens
+                );
                 this.speculativeEngine = session.speculativeEngine ?? 'none';
                 this.speculativeDraftModel = session.speculativeDraftModel ?? '';
                 this.modelSettingsDirty = false;
@@ -2901,12 +3067,31 @@
                 return {
                     avg_prefill_tps: 0,
                     avg_generation_tps: 0,
+                    generation_tokens_per_second_recent: null,
+                    speculative_decoding_efficiency: null,
+                    speculative_decoding_efficiency_recent: null,
+                    speculative_accepted_tokens: 0,
+                    speculative_proposed_tokens: 0,
+                    speculative_efficiency_kind: null,
                     thinking_time: 0,
                     total_time: 0,
                     prompt_tokens: 0,
                     thinking_tokens: 0,
                     total_tokens: 0
                 };
+            },
+
+            formatRate(value) {
+                if (value == null || value === '') return '\u2014';
+                return Number.isFinite(Number(value))
+                    ? Number(value).toFixed(1)
+                    : '\u2014';
+            },
+
+            formatEfficiency(value) {
+                if (value == null || value === '') return '\u2014';
+                const n = Number(value);
+                return Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '\u2014';
             },
 
             untitledChatTitle() {
@@ -2969,6 +3154,35 @@
                 if (!messages) return;
                 for (const msg of messages) {
                     if (!msg.id) msg.id = this.newMessageId();
+                }
+            },
+
+            upsertMessageById(messages, message, replaceMessageId = null) {
+                if (!messages || !message?.id) return;
+                const replacedIds = new Set(
+                    [message.id, replaceMessageId].filter(Boolean)
+                );
+                let insertIndex = messages.findIndex(msg => replacedIds.has(msg.id));
+                if (insertIndex < 0) {
+                    messages.push(message);
+                    return;
+                }
+                // A stable-ID replacement must keep the same reactive object.
+                // Alpine's keyed x-for can throw while reconciling even an
+                // in-place array splice when the old and new keys are equal.
+                const existing = messages[insertIndex];
+                if (existing.id === message.id) {
+                    for (const key of Object.keys(existing)) {
+                        if (!(key in message)) delete existing[key];
+                    }
+                    Object.assign(existing, message);
+                } else {
+                    messages.splice(insertIndex, 1, message);
+                }
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (i === insertIndex) continue;
+                    if (!replacedIds.has(messages[i].id)) continue;
+                    messages.splice(i, 1);
                 }
             },
 
@@ -3253,6 +3467,9 @@
 
             applyGenerationSnapshot(generation) {
                 const s = { ...this.defaultModelSettings() };
+                s.think_more_budget_tokens = this.normalizeThinkMoreBudgetTokens(
+                    this.modelSettings?.think_more_budget_tokens
+                );
                 if (!generation || typeof generation !== 'object') {
                     this.modelSettings = s;
                     return;
@@ -3585,7 +3802,7 @@
                         regenChainId,
                     }),
                     stream: true,
-                    stream_options: { include_usage: true },
+                    stream_options: { include_usage: true, include_token_ids: true },
                     ...generation,
                     // One-off per-call overrides (e.g. "regenerate creative") without
                     // mutating the session's saved settings.
@@ -3614,6 +3831,24 @@
                     streamingContent: '',
                     abortController: null,
                     responseReader: null,
+                    requestId: null,
+                    requestBody: null,
+                    baseRequestBody: null,
+                    outputTokenIds: [],
+                    reasoningTokenCount: 0,
+                    continuationInThinking: false,
+                    requestContext: null,
+                    isToolExecuting: false,
+                    pauseState: null,
+                    pauseRequested: false,
+                    pauseCheckpoint: null,
+                    pauseSnapshotPromise: null,
+                    _resolvePauseSnapshot: null,
+                    forceOutputState: null,
+                    forceOutputError: null,
+                    resumeCheckpointId: null,
+                    resumePreviewMessage: null,
+                    thinkMoreRestart: null,
                     thinkingState: this.createThinkingState(),
                     streamingThinking: '',
                     streamingThinkingOpen: false,
@@ -3670,6 +3905,15 @@
                             || (modelData.generating || []).some(g => g.request_id === rid);
                     };
 
+                    // The chat stream adopts the server's first SSE id. The backend
+                    // threads that id into the scheduler, so prefer it over the
+                    // same-model heuristic whenever it is already visible.
+                    if (stream.requestId && isActive(stream.requestId)) {
+                        stream._statsRequestId = stream.requestId;
+                        claimed.add(stream.requestId);
+                        continue;
+                    }
+
                     if (stream._statsRequestId && isActive(stream._statsRequestId)) {
                         claimed.add(stream._statsRequestId);
                         continue;
@@ -3697,6 +3941,18 @@
                         phase: 'generating',
                         generated_tokens: generating.generated_tokens || 0,
                         tokens_per_second: generating.tokens_per_second || 0,
+                        generation_tokens_per_second_recent:
+                            generating.generation_tokens_per_second_recent ?? null,
+                        speculative_decoding_efficiency:
+                            generating.speculative_decoding_efficiency ?? null,
+                        speculative_decoding_efficiency_recent:
+                            generating.speculative_decoding_efficiency_recent ?? null,
+                        speculative_accepted_tokens:
+                            generating.speculative_accepted_tokens || 0,
+                        speculative_proposed_tokens:
+                            generating.speculative_proposed_tokens || 0,
+                        speculative_efficiency_kind:
+                            generating.speculative_efficiency_kind ?? null,
                         prompt_tokens: generating.prompt_tokens || 0,
                     };
                 }
@@ -3735,6 +3991,15 @@
                     if (claimed.prompt_tokens > 0) base.prompt_tokens = claimed.prompt_tokens;
                 } else {
                     base.avg_generation_tps = claimed.tokens_per_second || 0;
+                    base.generation_tokens_per_second_recent =
+                        claimed.generation_tokens_per_second_recent;
+                    base.speculative_decoding_efficiency =
+                        claimed.speculative_decoding_efficiency;
+                    base.speculative_decoding_efficiency_recent =
+                        claimed.speculative_decoding_efficiency_recent;
+                    base.speculative_accepted_tokens = claimed.speculative_accepted_tokens;
+                    base.speculative_proposed_tokens = claimed.speculative_proposed_tokens;
+                    base.speculative_efficiency_kind = claimed.speculative_efficiency_kind;
                     if (claimed.prompt_tokens > 0) base.prompt_tokens = claimed.prompt_tokens;
                     if (claimed.generated_tokens > 0) base.total_tokens = claimed.generated_tokens;
                     if (claimed.prompt_tokens > 0 && stream._ttft > 0) {
@@ -3819,6 +4084,18 @@
                 return {
                     avg_prefill_tps: usage.prompt_tokens_per_second ?? 0,
                     avg_generation_tps: usage.generation_tokens_per_second ?? 0,
+                    generation_tokens_per_second_recent:
+                        usage.generation_tokens_per_second_recent ?? null,
+                    speculative_decoding_efficiency:
+                        usage.speculative_decoding_efficiency ?? null,
+                    speculative_decoding_efficiency_recent:
+                        usage.speculative_decoding_efficiency_recent ?? null,
+                    speculative_accepted_tokens:
+                        usage.speculative_accepted_tokens ?? 0,
+                    speculative_proposed_tokens:
+                        usage.speculative_proposed_tokens ?? 0,
+                    speculative_efficiency_kind:
+                        usage.speculative_efficiency_kind ?? null,
                     thinking_time: stream?._thinkSecs || 0,
                     total_time: totalTime,
                     prompt_tokens: usage.prompt_tokens ?? 0,
@@ -3843,6 +4120,538 @@
 
             stopChatStreaming(chatId) {
                 this.cancelStreamTransport(this.getStreamSession(chatId, false));
+            },
+
+            newClientRequestId() {
+                if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+                return 'chatcmpl-ui-' + Date.now().toString(36) + '-'
+                    + Math.random().toString(36).slice(2, 10);
+            },
+
+            canPauseCurrentStream() {
+                const stream = this.currentStream();
+                return Boolean(
+                    stream?.isStreaming
+                    && stream.requestBody
+                    && stream.responseReader
+                    && !stream.isToolExecuting
+                    && stream.pauseState !== 'pausing'
+                );
+            },
+
+            async forceCurrentStreamOutput() {
+                const stream = this.currentStream();
+                if (!stream?.thinkingState?.isInThinking || !stream.requestId) return;
+                if (stream.forceOutputState === 'requesting' || stream.forceOutputState === 'accepted') return;
+                stream.forceOutputState = 'requesting';
+                stream.forceOutputError = null;
+                try {
+                    const response = await fetch(
+                        '/v1/requests/' + encodeURIComponent(stream.requestId) + '/force-output',
+                        {
+                            method: 'POST',
+                            headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                        }
+                    );
+                    if (response.status === 202) {
+                        stream.forceOutputState = 'accepted';
+                        this.setEngineStatus(this.currentChatId, {
+                            text: window.t('chat.status.force_output_accepted')
+                        });
+                        return;
+                    }
+                    if (response.status === 409) {
+                        stream.forceOutputState = 'accepted';
+                        return;
+                    }
+                    const payload = await response.json().catch(() => ({}));
+                    if (response.status === 404) {
+                        stream.forceOutputState = 'stale';
+                        stream.forceOutputError = window.t('chat.error.force_output_stale');
+                    } else if (response.status === 422) {
+                        stream.forceOutputState = 'unsupported';
+                        stream.forceOutputError = window.t('chat.error.force_output_unsupported');
+                    } else {
+                        throw new Error(payload.detail || `HTTP ${response.status}`);
+                    }
+                    this.setEngineStatus(this.currentChatId, {
+                        text: stream.forceOutputError,
+                        icon: 'error'
+                    });
+                } catch (error) {
+                    stream.forceOutputState = 'error';
+                    stream.forceOutputError = window.t('chat.error.force_output_failed')
+                        .replace('{error}', error.message || String(error));
+                    this.setEngineStatus(this.currentChatId, {
+                        text: stream.forceOutputError,
+                        icon: 'error'
+                    });
+                }
+            },
+
+            pausedPreviewFromStream(stream) {
+                return {
+                    content: (stream?._toolRoundContent || '') + (stream?.streamingContent || ''),
+                    reasoning_content: this.hasVisibleThinking(stream?.streamingThinking)
+                        ? stream.streamingThinking : null,
+                };
+            },
+
+            normalizeOutputTokenIds(value) {
+                if (!Array.isArray(value)) return [];
+                return value.map(Number).filter(Number.isInteger);
+            },
+
+            stripContinuationFields(requestBody) {
+                const base = this.cloneData(requestBody || {});
+                delete base.continuation_token_ids;
+                delete base.continuation_in_thinking;
+                base.stream_options = {
+                    ...(base.stream_options || {}),
+                    include_usage: true,
+                    include_token_ids: true,
+                };
+                return base;
+            },
+
+            buildContinuationRequestBody(baseRequestBody, tokenIds, inThinking, generationOverride = null) {
+                const body = this.stripContinuationFields(baseRequestBody);
+                const ids = this.normalizeOutputTokenIds(tokenIds);
+                // A pause can land during prefill, before any output token is
+                // accepted. In that case resuming the original request is the
+                // exact continuation; the API intentionally rejects an empty
+                // continuation_token_ids array.
+                if (ids.length) {
+                    body.continuation_token_ids = ids;
+                    body.continuation_in_thinking = Boolean(inThinking);
+                }
+                if (generationOverride) Object.assign(body, generationOverride);
+                return body;
+            },
+
+            buildResumeRequestBody(baseRequestBody, tokenIds, inThinking, reasoningTokenCount) {
+                const ids = this.normalizeOutputTokenIds(tokenIds);
+                const body = this.buildContinuationRequestBody(baseRequestBody, ids, inThinking);
+                const originalMax = Number(baseRequestBody?.max_tokens);
+                if (Number.isFinite(originalMax) && originalMax > 0) {
+                    body.max_tokens = Math.max(1, Math.floor(originalMax) - ids.length);
+                }
+                const originalThinkingBudget = Number(baseRequestBody?.thinking_budget);
+                if (inThinking && Number.isFinite(originalThinkingBudget) && originalThinkingBudget > 0) {
+                    body.thinking_budget = Math.max(
+                        1,
+                        Math.floor(originalThinkingBudget)
+                            - Math.max(0, Number(reasoningTokenCount) || 0)
+                    );
+                }
+                return body;
+            },
+
+            previewFromPausedSnapshot(snapshot, fallback) {
+                if (snapshot?.preview && typeof snapshot.preview === 'object') {
+                    return {
+                        content: snapshot.preview.content || '',
+                        reasoning_content: snapshot.preview.reasoning_content || null,
+                    };
+                }
+                if (snapshot?.content != null || snapshot?.reasoning_content != null) {
+                    return {
+                        content: snapshot.content || '',
+                        reasoning_content: snapshot.reasoning_content || null,
+                    };
+                }
+                const raw = typeof snapshot?.output_text === 'string'
+                    ? snapshot.output_text : '';
+                if (!raw) return fallback;
+                const close = raw.lastIndexOf('</think>');
+                if (close >= 0) {
+                    const before = raw.slice(0, close);
+                    const open = before.lastIndexOf('<think>');
+                    return {
+                        reasoning_content: (open >= 0 ? before.slice(open + 7) : before).trim() || null,
+                        content: raw.slice(close + 8).trimStart(),
+                    };
+                }
+                if (snapshot?.continuation_in_thinking) {
+                    const open = raw.lastIndexOf('<think>');
+                    return {
+                        reasoning_content: (open >= 0 ? raw.slice(open + 7) : raw).trimStart() || null,
+                        content: '',
+                    };
+                }
+                return { content: raw, reasoning_content: null };
+            },
+
+            generationStateFromStream(stream) {
+                return {
+                    version: 2,
+                    baseRequestBody: this.cloneData(stream?.baseRequestBody || {}),
+                    outputTokenIds: this.normalizeOutputTokenIds(stream?.outputTokenIds),
+                    reasoningTokenCount: Math.max(0, Number(stream?.reasoningTokenCount) || 0),
+                    continuationInThinking: Boolean(stream?.thinkingState?.isInThinking),
+                };
+            },
+
+            thinkMoreBudgetOverride(baseRequestBody, retainedTokenCount = 0) {
+                const extra = this.normalizeThinkMoreBudgetTokens(
+                    this.modelSettings.think_more_budget_tokens
+                );
+                const originalMax = Number(baseRequestBody?.max_tokens);
+                const answerAllowance = Number.isFinite(originalMax) && originalMax > 0
+                    ? Math.max(1, Math.floor(originalMax) - retainedTokenCount)
+                    : 2048;
+                return {
+                    thinking_budget: extra,
+                    max_tokens: Math.max(answerAllowance, extra + 2048),
+                    chat_template_kwargs: {
+                        ...(baseRequestBody?.chat_template_kwargs || {}),
+                        enable_thinking: true,
+                    },
+                };
+            },
+
+            reasoningPrefixTokenIds(state) {
+                const ids = this.normalizeOutputTokenIds(state?.outputTokenIds);
+                const count = Math.max(0, Math.min(ids.length, Number(state?.reasoningTokenCount) || 0));
+                return ids.slice(0, count);
+            },
+
+            buildPausedMessage(checkpoint) {
+                const preview = checkpoint.preview || {};
+                const message = {
+                    id: checkpoint.targetMessageId,
+                    role: 'assistant',
+                    content: preview.content || '',
+                    reasoning_content: this.hasVisibleThinking(preview.reasoning_content)
+                        ? preview.reasoning_content : null,
+                    model: checkpoint.modelId,
+                    meta: checkpoint.generationMeta || null,
+                    _perfVisible: false,
+                    _thinkingOpen: false,
+                    _paused: {
+                        checkpointId: checkpoint.id,
+                        modelId: checkpoint.modelId,
+                        state: 'paused',
+                        error: checkpoint.version === 2
+                            ? null : window.t('chat.error.checkpoint_legacy'),
+                        legacy: checkpoint.version !== 2,
+                    },
+                };
+                this.attachThinkingToAssistantMessage(message, preview.reasoning_content);
+                this.attachProfileToAssistantMessage(message, checkpoint.context?._profile);
+                if (checkpoint.stats) message._recentStats = this.cloneData(checkpoint.stats);
+                return message;
+            },
+
+            async pauseStreaming() {
+                const stream = this.currentStream();
+                const chatId = this.currentChatId;
+                if (!this.canPauseCurrentStream() || !chatId) return;
+                stream.pauseState = 'pausing';
+                stream.pauseRequested = true;
+                stream.pauseSnapshotPromise = new Promise(resolve => {
+                    stream._resolvePauseSnapshot = resolve;
+                });
+                const historyChat = this.chatHistory.find(chat => chat.id === chatId);
+                const checkpoint = {
+                    id: stream.targetMessageId,
+                    version: 2,
+                    chatId,
+                    targetMessageId: stream.targetMessageId,
+                    requestId: stream.requestId,
+                    baseRequestBody: this.cloneData(stream.baseRequestBody),
+                    outputTokenIds: this.normalizeOutputTokenIds(stream.outputTokenIds),
+                    reasoningTokenCount: Math.max(0, Number(stream.reasoningTokenCount) || 0),
+                    continuationInThinking: Boolean(stream.thinkingState?.isInThinking),
+                    modelId: stream.sourceModel || this.currentModel,
+                    context: this.cloneData(stream.requestContext || {}),
+                    generationMeta: this.captureGenerationContext(
+                        stream.sourceModel || this.currentModel,
+                        stream.sourceSystemPrompt,
+                        stream.sourceProfile
+                    ),
+                    settings: this.captureSessionModelSettings(),
+                    preview: this.pausedPreviewFromStream(stream),
+                    stats: this.cloneData(stream._liveFooterStats || this.recentStats),
+                    toolRoundContext: {
+                        depth: stream.requestContext?._toolDepth || 0,
+                        toolRoundContent: stream._toolRoundContent || '',
+                        statusLog: this.cloneData(stream.statusLog || []),
+                        requestStartedAt: stream._statusStart || Date.now(),
+                    },
+                    chatMeta: historyChat ? {
+                        title: historyChat.title,
+                        manualTitle: historyChat.manualTitle,
+                        pinned: historyChat.pinned,
+                    } : null,
+                    createdAt: new Date().toISOString(),
+                };
+                try {
+                    const response = await fetch(
+                        '/v1/requests/' + encodeURIComponent(stream.requestId) + '/pause',
+                        {
+                            method: 'POST',
+                            headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                        }
+                    );
+                    if (!response.ok) {
+                        const payload = await response.json().catch(() => ({}));
+                        throw new Error(payload.detail || `HTTP ${response.status}`);
+                    }
+                    const snapshot = await response.json();
+                    if (!Array.isArray(snapshot.output_token_ids)) {
+                        throw new Error('Pause snapshot did not include output token IDs');
+                    }
+                    checkpoint.outputTokenIds = this.normalizeOutputTokenIds(
+                        snapshot.output_token_ids
+                    );
+                    checkpoint.continuationInThinking = Boolean(
+                        snapshot.continuation_in_thinking
+                    );
+                    const rawReasoningEnd = snapshot.reasoning_end_token_index;
+                    const reasoningEnd = Number(rawReasoningEnd);
+                    checkpoint.reasoningTokenCount = rawReasoningEnd != null
+                        && Number.isFinite(reasoningEnd)
+                        ? Math.max(0, Math.min(
+                            checkpoint.outputTokenIds.length, Math.floor(reasoningEnd)
+                        ))
+                        : (checkpoint.continuationInThinking
+                            ? checkpoint.outputTokenIds.length : 0);
+                    checkpoint.preview = this.previewFromPausedSnapshot(
+                        snapshot, this.pausedPreviewFromStream(stream)
+                    );
+                    checkpoint.stats = this.cloneData(stream._liveFooterStats || this.recentStats);
+                    await putPausedInferenceCheckpoint(checkpoint);
+                    stream.pauseCheckpoint = checkpoint;
+                    stream._resolvePauseSnapshot?.(true);
+                    stream._resolvePauseSnapshot = null;
+                    this.cancelStreamTransport(stream);
+                } catch (error) {
+                    stream._resolvePauseSnapshot?.(false);
+                    stream._resolvePauseSnapshot = null;
+                    stream.pauseRequested = false;
+                    stream.pauseState = 'error';
+                    this.setEngineStatus(chatId, {
+                        text: window.t('chat.error.pause_failed')
+                            .replace('{error}', error.message || String(error)),
+                        icon: 'error'
+                    });
+                }
+            },
+
+            async finalizePausedStream(context, stream, chatSession) {
+                const checkpoint = stream.pauseCheckpoint;
+                if (!checkpoint) return;
+                checkpoint.stats = this.cloneData(stream._liveFooterStats || this.recentStats);
+                checkpoint.toolRoundContext.statusLog = this.cloneData(stream.statusLog || []);
+                // Alpine wraps objects assigned into reactive stream state in a
+                // Proxy. IndexedDB's structured-clone algorithm rejects Proxy
+                // objects, so unwrap the finalized checkpoint before persisting.
+                const persistedCheckpoint = this.cloneData(checkpoint);
+                await putPausedInferenceCheckpoint(persistedCheckpoint);
+                const pausedMessage = this.buildPausedMessage(persistedCheckpoint);
+        this.upsertMessageById(chatSession.messages, pausedMessage);
+                this._setActiveVariant(chatSession, pausedMessage.id, context._variantUserIndex);
+                this.saveCurrentChat(
+                    checkpoint.chatId,
+                    chatSession.messages,
+                    chatSession.model,
+                    checkpoint.context?.systemPrompt ?? chatSession.systemPrompt
+                );
+                if (this.currentChatId === checkpoint.chatId) {
+                    this.messages = chatSession.messages;
+                    this.applyVariantStats(pausedMessage);
+                    this.scheduleEnhanceMessages();
+                }
+            },
+
+            pausedActionBusy(message) {
+                return ['loading', 'resuming', 'unloading'].includes(message?._paused?.state);
+            },
+
+            pausedStatusLabel(message) {
+                const state = message?._paused?.state || 'paused';
+                const keys = {
+                    paused: 'chat.status.paused_safe',
+                    unloaded: 'chat.status.paused_unloaded',
+                    loading: 'chat.status.loading_model',
+                    resuming: 'chat.status.resuming',
+                    unloading: 'chat.status.unloading_model',
+                    unload_error: 'chat.status.unload_unconfirmed',
+                };
+                return window.t(keys[state] || 'chat.status.paused_safe');
+            },
+
+            async discardPausedCheckpoint(message) {
+                const id = message?._paused?.checkpointId;
+                if (!id) return;
+                try {
+                    await deletePausedInferenceCheckpoint(id);
+                    delete message._paused;
+                    this.saveCurrentChat(this.currentChatId);
+                } catch (error) {
+                    message._paused.error = error.message || String(error);
+                }
+            },
+
+            async unloadPausedModel(message) {
+                const paused = message?._paused;
+                if (!paused || this.pausedActionBusy(message)) return;
+                paused.state = 'unloading';
+                paused.error = null;
+                this.saveCurrentChat(this.currentChatId);
+                try {
+                    const response = await fetch(
+                        '/admin/api/models/' + encodeURIComponent(paused.modelId) + '/unload',
+                        {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                        }
+                    );
+                    if (!response.ok && response.status !== 400) {
+                        const payload = await response.json().catch(() => ({}));
+                        throw new Error(payload.detail || `HTTP ${response.status}`);
+                    }
+                    // A 202 only means the unload was queued. Even a synchronous
+                    // response is verified against model status so Resume cannot
+                    // race a later teardown of its newly loaded engine.
+                    await this.waitForPausedModelUnload(paused.modelId);
+                    paused.state = 'unloaded';
+                } catch (error) {
+                    paused.state = 'unload_error';
+                    paused.error = window.t('chat.error.unload_paused_failed')
+                        .replace('{error}', error.message || String(error));
+                }
+                this.saveCurrentChat(this.currentChatId);
+            },
+
+            async waitForPausedModelUnload(modelId, { timeoutMs = 30000, pollMs = 500 } = {}) {
+                const deadline = Date.now() + timeoutMs;
+                while (Date.now() < deadline) {
+                    const models = await this.fetchAdminModelsList({ force: true });
+                    const model = models.find(candidate => candidate.id === modelId);
+                    if (!model) {
+                        throw new Error(window.t('chat.error.unload_status_missing'));
+                    }
+                    if (!model.loaded && !model.is_loading) return;
+                    await new Promise(resolve => setTimeout(resolve, pollMs));
+                }
+                throw new Error(window.t('chat.error.unload_timeout'));
+            },
+
+            async resumePausedMessage(message) {
+                const paused = message?._paused;
+                if (!paused || paused.state === 'unload_error'
+                    || this.pausedActionBusy(message) || this.isCurrentChatStreaming()) return;
+                const previousState = paused.state;
+                paused.state = 'loading';
+                paused.error = null;
+                let checkpoint;
+                try {
+                    checkpoint = await getPausedInferenceCheckpoint(paused.checkpointId);
+                    if (!checkpoint) throw new Error(window.t('chat.error.checkpoint_missing'));
+                    if (checkpoint.version !== 2 || !checkpoint.baseRequestBody
+                        || !Array.isArray(checkpoint.outputTokenIds)) {
+                        throw new Error(window.t('chat.error.checkpoint_legacy'));
+                    }
+                    const resumeBody = this.buildResumeRequestBody(
+                        checkpoint.baseRequestBody,
+                        checkpoint.outputTokenIds,
+                        checkpoint.continuationInThinking,
+                        checkpoint.reasoningTokenCount
+                    );
+                    const loadResponse = await fetch(
+                        '/admin/api/models/' + encodeURIComponent(checkpoint.modelId) + '/load',
+                        {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                        }
+                    );
+                    if (!loadResponse.ok) {
+                        const payload = await loadResponse.json().catch(() => ({}));
+                        throw new Error(payload.detail || `HTTP ${loadResponse.status}`);
+                    }
+
+                    const chatSession = this.getChatSession(checkpoint.chatId, true);
+                    const index = chatSession.messages.findIndex(m => m.id === checkpoint.targetMessageId);
+                    if (index >= 0) chatSession.messages.splice(index, 1);
+                    if (this.currentChatId === checkpoint.chatId) this.messages = chatSession.messages;
+                    paused.state = 'resuming';
+                    await this.streamResponse({
+                        chatId: checkpoint.chatId,
+                        model: checkpoint.modelId,
+                        systemPrompt: checkpoint.context?.systemPrompt ?? '',
+                        _profile: checkpoint.context?._profile ?? null,
+                        _variantUserIndex: checkpoint.context?._variantUserIndex ?? null,
+                        _excludeVariantsAtUserIndex:
+                            checkpoint.context?._excludeVariantsAtUserIndex ?? null,
+                        _apiVariantChainId: checkpoint.context?._apiVariantChainId ?? null,
+                        _modelOverride: checkpoint.context?._modelOverride ?? null,
+                        _generationOverride: checkpoint.context?._generationOverride ?? null,
+                        _requestBodyOverride: resumeBody,
+                        _baseRequestBody: checkpoint.baseRequestBody,
+                        _initialOutputTokenIds: checkpoint.outputTokenIds,
+                        _initialReasoningTokenCount: checkpoint.reasoningTokenCount,
+                        _initialContinuationInThinking: checkpoint.continuationInThinking,
+                        _initialPreview: checkpoint.preview,
+                        _targetMessageId: checkpoint.targetMessageId,
+                        _resumeCheckpointId: checkpoint.id,
+                        _resumePreviewMessage: this.cloneData(message),
+                        _replaceMessageId: checkpoint.context?._replaceMessageId ?? null,
+                        _replacementPreviewMessage:
+                            checkpoint.context?._replacementPreviewMessage ?? null,
+                        _toolDepth: checkpoint.toolRoundContext?.depth || 0,
+                    }, 0);
+                } catch (error) {
+                    paused.state = previousState === 'unloaded' ? 'unloaded' : 'paused';
+                    paused.error = window.t('chat.error.resume_failed')
+                        .replace('{error}', error.message || String(error));
+                    this.saveCurrentChat(this.currentChatId);
+                }
+            },
+
+            async restorePausedCheckpoints() {
+                try {
+                    const checkpoints = await listPausedInferenceCheckpoints();
+                    let changed = false;
+                    for (const checkpoint of checkpoints) {
+                        const chat = this.chatHistory.find(c => c.id === checkpoint.chatId);
+                        if (!chat) continue;
+                        const messages = chat.messages || (chat.messages = []);
+                        const index = messages.findIndex(m => m.id === checkpoint.targetMessageId);
+                        if (index < 0 || !messages[index]._paused) {
+                            const pausedMessage = this.buildPausedMessage(checkpoint);
+                            if (index >= 0) messages.splice(index, 1, pausedMessage);
+                            else messages.push(pausedMessage);
+                            changed = true;
+                        } else {
+                            const paused = messages[index]._paused;
+                            paused.checkpointId = checkpoint.id;
+                            paused.modelId = checkpoint.modelId;
+                            paused.legacy = checkpoint.version !== 2;
+                            if (paused.legacy) {
+                                paused.state = 'paused';
+                                paused.error = window.t('chat.error.checkpoint_legacy');
+                                changed = true;
+                            } else if (paused.state === 'unloading') {
+                                paused.state = 'unload_error';
+                                paused.error = window.t(
+                                    'chat.error.unload_confirmation_interrupted'
+                                );
+                                changed = true;
+                            } else if (!['unloaded', 'unload_error'].includes(paused.state)) {
+                                if (paused.state !== 'paused' || paused.error) changed = true;
+                                paused.state = 'paused';
+                                paused.error = null;
+                            }
+                        }
+                    }
+                    if (changed) this.saveChatHistory();
+                } catch (error) {
+                    console.error('Failed to restore paused inference checkpoints:', error);
+                }
             },
 
             ensureStatsPollingForCurrentChat() {
@@ -3879,6 +4688,24 @@
                 stream.streamingContent = '';
                 stream.abortController = null;
                 stream.responseReader = null;
+                stream.requestId = null;
+                stream.requestBody = null;
+                stream.baseRequestBody = null;
+                stream.outputTokenIds = [];
+                stream.reasoningTokenCount = 0;
+                stream.continuationInThinking = false;
+                stream.requestContext = null;
+                stream.isToolExecuting = false;
+                stream.pauseState = null;
+                stream.pauseRequested = false;
+                stream.pauseCheckpoint = null;
+                stream.pauseSnapshotPromise = null;
+                stream._resolvePauseSnapshot = null;
+                stream.forceOutputState = null;
+                stream.forceOutputError = null;
+                stream.resumeCheckpointId = null;
+                stream.resumePreviewMessage = null;
+                stream.thinkMoreRestart = null;
                 stream.thinkingState = this.createThinkingState();
                 stream.streamingThinking = '';
                 stream.streamingThinkingOpen = false;
@@ -3932,6 +4759,7 @@
                 await this.loadModelCapabilities(this.currentModel);
             }
             this.loadChatHistory();
+            await this.restorePausedCheckpoints();
             this.fetchMcpTools();
         }
 
@@ -4991,15 +5819,7 @@
         }
         this.fetchStats();
         if (chatId === this.currentChatId) {
-            this.recentStats = {
-                avg_prefill_tps: 0,
-                avg_generation_tps: 0,
-                thinking_time: 0,
-                total_time: 0,
-                prompt_tokens: 0,
-                thinking_tokens: 0,
-                total_tokens: 0,
-            };
+            this.recentStats = this.emptyStats();
         }
     },
 
@@ -6089,6 +6909,20 @@
             _modelOverride: streamContext?._modelOverride ?? null,
             _generationOverride: streamContext?._generationOverride ?? null,
             _requestStartedAt: streamContext?._requestStartedAt ?? null,
+            _requestBodyOverride: streamContext?._requestBodyOverride ?? null,
+            _baseRequestBody: streamContext?._baseRequestBody ?? null,
+            _initialOutputTokenIds: streamContext?._initialOutputTokenIds ?? [],
+            _initialReasoningTokenCount: streamContext?._initialReasoningTokenCount ?? 0,
+            _initialContinuationInThinking:
+                streamContext?._initialContinuationInThinking ?? false,
+            _initialPreview: streamContext?._initialPreview ?? null,
+            _targetMessageId: streamContext?._targetMessageId ?? null,
+            _resumeCheckpointId: streamContext?._resumeCheckpointId ?? null,
+            _resumePreviewMessage: streamContext?._resumePreviewMessage ?? null,
+            _replaceMessageId: streamContext?._replaceMessageId ?? null,
+            _replacementPreviewMessage: streamContext?._replacementPreviewMessage ?? null,
+            _toolDepth: streamContext?._toolDepth ?? depth,
+            _resumeSucceeded: streamContext?._resumeSucceeded ?? false,
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
@@ -6111,7 +6945,7 @@
             this.resetStreamSession(stream);
             context._requestStartedAt = Date.now();
             stream._statusStart = context._requestStartedAt;
-            stream.targetMessageId = this.newMessageId();
+            stream.targetMessageId = context._targetMessageId || this.newMessageId();
             stream.sourceModel = requestModel;
             stream.sourceSystemPrompt = context.systemPrompt;
             stream.sourceProfile = context._profile;
@@ -6129,27 +6963,65 @@
         stream.sourceModel = requestModel;
         stream.sourceSystemPrompt = context.systemPrompt;
         stream.sourceProfile = context._profile;
-        stream.streamingContent = '';
-        stream.streamingThinking = '';
+        stream.streamingContent = context._initialPreview?.content || '';
+        stream.streamingThinking = context._initialPreview?.reasoning_content || '';
         stream.streamingThinkingOpen = false;
         stream.abortController = new AbortController();
+        stream.requestId = this.newClientRequestId();
+        stream.requestContext = this.cloneData({
+            ...context,
+            _requestBodyOverride: null,
+            _resumePreviewMessage: null,
+        });
+        stream.resumeCheckpointId = context._resumeCheckpointId;
+        stream.resumePreviewMessage = context._resumePreviewMessage;
+        stream.isToolExecuting = false;
         this.autoScrollEnabled = true;
               
         if (stream.targetMessageId) {
             context._apiVariantChainId = stream.targetMessageId;
         }
         
-        const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
+        const requestBody = context._requestBodyOverride
+            ? this.cloneData(context._requestBodyOverride)
+            : this.buildChatCompletionBody(chatSession.messages, context, depth);
+        stream.baseRequestBody = context._baseRequestBody
+            ? this.cloneData(context._baseRequestBody)
+            : this.stripContinuationFields(requestBody);
+        stream.outputTokenIds = this.normalizeOutputTokenIds(
+            context._initialOutputTokenIds
+        );
+        stream.reasoningTokenCount = Math.max(
+            0, Number(context._initialReasoningTokenCount) || 0
+        );
+        stream._initialReasoningTokenCount = stream.reasoningTokenCount;
+        stream._initialOutputTokenCount = stream.outputTokenIds.length;
+        stream.continuationInThinking = Boolean(
+            context._initialContinuationInThinking
+        );
+        stream.thinkingState.isInThinking = stream.continuationInThinking;
+        stream.thinkingState.thinkingStartTime = stream.continuationInThinking
+            ? Date.now() : null;
+        stream.finalContent = Boolean(stream.streamingContent.trim());
+        stream.requestBody = this.cloneData(requestBody);
+        context._requestBodyOverride = null;
+        context._baseRequestBody = null;
+        context._initialOutputTokenIds = [];
+        context._initialReasoningTokenCount = 0;
+        context._initialPreview = null;
         stream._toolRoundContent = '';
         this.setEngineStatus(context.chatId, { text: window.t('chat.status.starting') });
         this.startPrefillPolling(context.chatId);
+        let thinkMoreRestart = null;
+        let pauseFinalized = false;
 
         try {
             const response = await fetch('/v1/chat/completions', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.getApiKey()}`
+                    'Authorization': `Bearer ${this.getApiKey()}`,
+                    'X-Request-ID': stream.requestId,
                 },
                 body: JSON.stringify(requestBody),
                 signal: stream.abortController.signal
@@ -6165,7 +7037,6 @@
             const decoder = new TextDecoder();
             let buffer = '';
             const toolCallsMap = {}; // accumulate streaming tool_call chunks by index
-            let finishReason = null;
             let firstToken = false;  // flipped on first content/reasoning delta
             let lastUsage = null;    // filled by the stream_options usage chunk
 
@@ -6183,9 +7054,37 @@
                     if (line.startsWith('data: ')) {
                         try {
                             const data = JSON.parse(line.slice(6));
+                            if (data.error) {
+                                const streamError = new Error(
+                                    data.error.message || data.error.detail || window.t('chat.error.stream_failed')
+                                );
+                                streamError.name = 'StreamError';
+                                throw streamError;
+                            }
+                            if (data.id && data.id !== 'chatcmpl-keepalive') {
+                                // The server pre-mints this id and threads it into the
+                                // scheduler. Request controls must use this authoritative
+                                // id rather than the correlation fallback header.
+                                stream.requestId = data.id;
+                            }
                             const choice = data.choices?.[0];
                             const delta = choice?.delta;
-                            if (choice?.finish_reason) finishReason = choice.finish_reason;
+
+                            if (delta?.token_ids != null) {
+                                const tokenIds = Array.isArray(delta.token_ids)
+                                    ? delta.token_ids : [delta.token_ids];
+                                stream.outputTokenIds.push(...this.normalizeOutputTokenIds(tokenIds));
+                            }
+                            if (delta?.reasoning_token_count != null) {
+                                const reported = Math.max(
+                                    0, Number(delta.reasoning_token_count) || 0
+                                );
+                                const baseCount = stream._initialReasoningTokenCount || 0;
+                                // New servers report a cumulative count. Accept a
+                                // request-local count from older builds defensively.
+                                stream.reasoningTokenCount = baseCount > 0 && reported < baseCount
+                                    ? baseCount + reported : reported;
+                            }
 
                             // Usage chunk arrives as { choices: [], usage: {...} }
                             if (data.usage && !delta) {
@@ -6234,6 +7133,7 @@
                             }
 
                             if (delta?.reasoning_content) {
+                                stream.continuationInThinking = true;
                                 if (!firstToken) {
                                     firstToken = true;
                                     stream._ttft = (Date.now() - stream._statusStart) / 1000;
@@ -6251,6 +7151,7 @@
                             }
 
                             if (delta?.content) {
+                                stream.continuationInThinking = false;
                                 if (!firstToken) {
                                     firstToken = true;
                                     stream._ttft = (Date.now() - stream._statusStart) / 1000;
@@ -6277,10 +7178,27 @@
                                 }
                             }
                         } catch (e) {
+                            if (e?.name === 'StreamError') throw e;
                             console.error('Error parsing SSE:', e);
                         }
                     }
                 }
+            }
+
+            // ReadableStream.cancel() normally resolves the pending read with
+            // done=true instead of throwing AbortError. Handle that completion
+            // mode explicitly so Pause keeps its durable checkpoint and Stop
+            // still follows the existing partial-output abort path.
+            if (stream.pauseRequested) {
+                if (stream.pauseSnapshotPromise) await stream.pauseSnapshotPromise;
+                if (stream.pauseCheckpoint) {
+                    await this.finalizePausedStream(context, stream, chatSession);
+                    pauseFinalized = true;
+                    return;
+                }
+            }
+            if (stream.abortController?.signal.aborted) {
+                throw new DOMException('Stream aborted', 'AbortError');
             }
 
             // If model ended while still thinking (tool-call turn or manual stop), log elapsed and reset
@@ -6313,6 +7231,24 @@
                     ...this.recentStats,
                     avg_prefill_tps: ptps != null ? ptps : (this.recentStats?.avg_prefill_tps || 0),
                     avg_generation_tps: gtps != null ? gtps : (this.recentStats?.avg_generation_tps || 0),
+                    generation_tokens_per_second_recent:
+                        lastUsage.generation_tokens_per_second_recent ??
+                        this.recentStats?.generation_tokens_per_second_recent ?? null,
+                    speculative_decoding_efficiency:
+                        lastUsage.speculative_decoding_efficiency ??
+                        this.recentStats?.speculative_decoding_efficiency ?? null,
+                    speculative_decoding_efficiency_recent:
+                        lastUsage.speculative_decoding_efficiency_recent ??
+                        this.recentStats?.speculative_decoding_efficiency_recent ?? null,
+                    speculative_accepted_tokens:
+                        lastUsage.speculative_accepted_tokens ??
+                        this.recentStats?.speculative_accepted_tokens ?? 0,
+                    speculative_proposed_tokens:
+                        lastUsage.speculative_proposed_tokens ??
+                        this.recentStats?.speculative_proposed_tokens ?? 0,
+                    speculative_efficiency_kind:
+                        lastUsage.speculative_efficiency_kind ??
+                        this.recentStats?.speculative_efficiency_kind ?? null,
                     prompt_tokens: pt != null ? pt : (this.recentStats?.prompt_tokens || 0),
                     total_tokens: ct != null ? ct : (this.recentStats?.total_tokens || 0)
                 };
@@ -6321,6 +7257,10 @@
             const toolCalls = Object.values(toolCallsMap);
             if (toolCalls.length > 0) {
                 const maxToolRounds = this.normalizeMaxToolRounds(this.chatSettings.maxToolRounds);
+                // A resumed request starts a new browser recursion at depth zero,
+                // but its durable context remembers prior tool rounds.
+                const browserDepth = depth;
+                depth = Math.max(depth, context._toolDepth);
                 if (depth >= maxToolRounds) {
                     const assistantId = stream.targetMessageId || this.newMessageId();
                     const errorMsg = {
@@ -6342,7 +7282,9 @@
                     };
                     this.attachThinkingToAssistantMessage(errorMsg, stream.streamingThinking);
                     this.attachProfileToAssistantMessage(errorMsg, context._profile);
-                    chatSession.messages.push(errorMsg);
+                    this.upsertMessageById(
+                        chatSession.messages, errorMsg, context._replaceMessageId
+                    );
                     this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                     this.saveCurrentChat(
                         context.chatId,
@@ -6355,6 +7297,7 @@
                     }
                     return;
                 }
+                depth = browserDepth;
 
                 // Log the resolved tool set once — summarise when count is large
                 const names = toolCalls.map(t => t.function.name).filter(Boolean);
@@ -6392,6 +7335,9 @@
                 // Record per-tool start times for elapsed tracking
                 toolCalls.forEach((tc) => { stream._toolTimers[tc.function.name] = Date.now(); });
 
+                // Pause is intentionally unavailable while tools may be causing
+                // external side effects; it returns when model inference resumes.
+                stream.isToolExecuting = true;
                 // Execute all tools in parallel
                 const results = await Promise.all(toolCalls.map(async (tc, i) => {
                     const toolName = tc.function.name;
@@ -6437,7 +7383,7 @@
                             : null;
                         return { content: msg, error: true, toolName, elapsed, web };
                     }
-                }));
+                })).finally(() => { stream.isToolExecuting = false; });
 
                 // Log each tool outcome to the status timeline
                 results.forEach((result) => {
@@ -6473,6 +7419,7 @@
                 this.resetStreamRenderState(stream);
 
                 // Recurse — model synthesises final answer using tool results
+                context._toolDepth += 1;
                 await this.streamResponse(context, depth + 1);
                 return;
             }
@@ -6497,24 +7444,60 @@
                 ),
                 _perfVisible: false,
                 _thinkingOpen: false,
+                _generationState: this.generationStateFromStream(stream),
             };
             this.attachThinkingToAssistantMessage(assistantMsg, stream.streamingThinking);
             this.attachProfileToAssistantMessage(assistantMsg, context._profile);
-            chatSession.messages.push(assistantMsg);
+            this.upsertMessageById(
+                chatSession.messages, assistantMsg, context._replaceMessageId
+            );
             this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
             this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
+            if (context._resumeCheckpointId) {
+                context._resumeSucceeded = true;
+            }
             if (this.currentChatId === context.chatId) {
                 this.scheduleEnhanceMessages();
             }
 
         } catch (error) {
             console.log('[streamResponse] catch error:', error.name, error.message);
+            // The pause endpoint terminates the live scheduler request with a
+            // typed stream error. Once its authoritative snapshot is durable,
+            // that terminal frame is a successful pause regardless of error name.
+            if (stream.pauseRequested) {
+                try {
+                    if (stream.pauseSnapshotPromise) await stream.pauseSnapshotPromise;
+                    if (stream.pauseCheckpoint) {
+                        await this.finalizePausedStream(context, stream, chatSession);
+                        pauseFinalized = true;
+                        return;
+                    }
+                } catch (checkpointError) {
+                    console.error('Failed to finalize paused inference:', checkpointError);
+                }
+                if (stream.pauseCheckpoint) {
+                    pauseFinalized = true;
+                    return;
+                }
+            }
             if (error.name === 'AbortError') {
                 console.log('[streamResponse] AbortError caught - stream stopped by user');
                 // Reset thinking state (reasoning now lives in streamingThinking, not streamingContent)
                 if (stream.thinkingState.isInThinking) {
                     stream.thinkingState.isInThinking = false;
                     stream.thinkingState.thinkingStartTime = null;
+                }
+                if (stream.thinkMoreRestart) {
+                    thinkMoreRestart = this.cloneData(stream.thinkMoreRestart);
+                    if (context._resumeCheckpointId) {
+                        try {
+                            await deletePausedInferenceCheckpoint(context._resumeCheckpointId);
+                        } catch (checkpointError) {
+                            console.error('Failed to replace resumed checkpoint:', checkpointError);
+                        }
+                    }
+                    return;
                 }
                 // Stream was stopped by user — push whatever was accumulated,
                 // including response text set aside when tool calls began.
@@ -6535,15 +7518,57 @@
                         ),
                         _perfVisible: false,
                         _thinkingOpen: false,
+                        _generationState: this.generationStateFromStream(stream),
                     };
                     this.attachThinkingToAssistantMessage(assistantMsg, stream.streamingThinking);
                     this.attachProfileToAssistantMessage(assistantMsg, context._profile);
-                    chatSession.messages.push(assistantMsg);
+                    this.upsertMessageById(chatSession.messages, assistantMsg);
                     this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                     this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
                     if (this.currentChatId === context.chatId) {
                         this.scheduleEnhanceMessages();
                     }
+                }
+                // Stop remains destructive/non-resumable even when it is pressed
+                // during a resumed request. Pause is the only control that keeps a
+                // restart checkpoint.
+                if (context._resumeCheckpointId) {
+                    try {
+                        await deletePausedInferenceCheckpoint(context._resumeCheckpointId);
+                        context._resumeCheckpointId = null;
+                    } catch (checkpointError) {
+                        console.error('Failed to discard stopped inference checkpoint:', checkpointError);
+                    }
+                }
+            } else if (context._resumeCheckpointId && context._resumePreviewMessage) {
+                console.error('Resumed streaming error:', error);
+                const restored = this.cloneData(context._resumePreviewMessage);
+                restored._paused = restored._paused || {};
+                restored._paused.checkpointId = context._resumeCheckpointId;
+                restored._paused.modelId = requestModel;
+                restored._paused.state = 'paused';
+                restored._paused.error = window.t('chat.error.resume_failed')
+                    .replace('{error}', error.message || String(error));
+                this.upsertMessageById(chatSession.messages, restored);
+                this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
+                if (this.currentChatId === context.chatId) {
+                    this.messages = chatSession.messages;
+                    this.applyVariantStats(restored);
+                    this.scheduleEnhanceMessages();
+                }
+            } else if (context._replacementPreviewMessage) {
+                console.error('Think-more streaming error:', error);
+                const restored = this.cloneData(context._replacementPreviewMessage);
+                this.upsertMessageById(
+                    chatSession.messages, restored, context._replaceMessageId
+                );
+                this.saveCurrentChat(
+                    context.chatId, chatSession.messages, chatSession.model, context.systemPrompt
+                );
+                if (this.currentChatId === context.chatId) {
+                    this.messages = chatSession.messages;
+                    this.applyVariantStats(restored);
+                    this.scheduleEnhanceMessages();
                 }
             } else {
                 console.error('Streaming error:', error);
@@ -6562,7 +7587,9 @@
                     _perfVisible: false,
                 };
                 this.attachProfileToAssistantMessage(errorMsg, context._profile);
-                chatSession.messages.push(errorMsg);
+                this.upsertMessageById(
+                    chatSession.messages, errorMsg, context._replaceMessageId
+                );
                 this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                 this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
                 if (this.currentChatId === context.chatId) {
@@ -6571,7 +7598,7 @@
             }
         } finally {
             // Attach performance timeline and thinking to the final assistant message, once per prompt
-            if (depth === 0) {
+            if (depth === 0 && !thinkMoreRestart && !pauseFinalized) {
                 let msg = stream.targetMessageId
                     ? chatSession.messages.find(m => m.id === stream.targetMessageId)
                     : null;
@@ -6646,7 +7673,26 @@
                 }
                 // Persist perf timeline that was just attached (saved earlier, before finally ran)
                 this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
+                if (context._resumeCheckpointId && context._resumeSucceeded) {
+                    try {
+                        await deletePausedInferenceCheckpoint(context._resumeCheckpointId);
+                    } catch (checkpointError) {
+                        console.error('Failed to delete completed inference checkpoint:', checkpointError);
+                    }
+                }
                 // Recursive tool rounds share one stream; only its root owns cleanup.
+                this.resetStreamSession(stream, { preserveFinalContent: true });
+                this.thinkingAutoScroll = true;
+                this.stopStatsPollingIfIdle();
+                this.ensureStatsPollingForCurrentChat();
+            }
+            if (depth === 0 && thinkMoreRestart) {
+                this.resetStreamSession(stream);
+                this.thinkingAutoScroll = true;
+                this.stopStatsPollingIfIdle();
+                await this.streamResponse(thinkMoreRestart, 0);
+            }
+            if (depth === 0 && pauseFinalized) {
                 this.resetStreamSession(stream, { preserveFinalContent: true });
                 this.thinkingAutoScroll = true;
                 this.stopStatsPollingIfIdle();
@@ -6659,6 +7705,100 @@
         if (this.currentChatId) {
             this.stopChatStreaming(this.currentChatId);
         }
+    },
+
+    canThinkMoreCurrentStream() {
+        const stream = this.currentStream();
+        if (!stream?.isStreaming || !stream.finalContent || stream.isToolExecuting
+            || stream.pauseState === 'pausing') return false;
+        return this.hasVisibleThinking(stream.streamingThinking)
+            && this.reasoningPrefixTokenIds(this.generationStateFromStream(stream)).length > 0;
+    },
+
+    canThinkMoreMessage(message, index) {
+        if (this.isCurrentChatStreaming() || !message || message.role !== 'assistant'
+            || message._ui === false || message._transcription || message._paused
+            || !this.hasVisibleThinking(message._thinking)) return false;
+        const state = message._generationState;
+        if (state?.version !== 2 || this.reasoningPrefixTokenIds(state).length === 0) return false;
+        const session = this.getChatSession(this.currentChatId, false);
+        const userIndex = session ? this.findUserIndexForMessage(session.messages, index) : -1;
+        if (userIndex < 0) return false;
+        const active = this.getActiveVariantForUser(session.messages, userIndex);
+        if (active?.id !== message.id) return false;
+        return !session.messages.slice(index + 1).some(m => m.role === 'user');
+    },
+
+    buildThinkMoreStreamContext(baseContext, state, preview, targetMessageId) {
+        const reasoningIds = this.reasoningPrefixTokenIds(state);
+        if (!reasoningIds.length) return null;
+        const originalBase = this.stripContinuationFields(state.baseRequestBody);
+        const generationOverride = this.thinkMoreBudgetOverride(
+            originalBase, reasoningIds.length
+        );
+        // The stable base records total caps including the retained prefix;
+        // buildResumeRequestBody subtracts that prefix for this request and
+        // for every later pause/resume of it.
+        const thinkMoreBase = {
+            ...originalBase,
+            ...generationOverride,
+            max_tokens: generationOverride.max_tokens + reasoningIds.length,
+            thinking_budget: generationOverride.thinking_budget + reasoningIds.length,
+        };
+        const requestBody = this.buildResumeRequestBody(
+            thinkMoreBase, reasoningIds, true, reasoningIds.length
+        );
+        return {
+            ...this.cloneData(baseContext || {}),
+            _requestBodyOverride: requestBody,
+            _baseRequestBody: thinkMoreBase,
+            _initialOutputTokenIds: reasoningIds,
+            _initialReasoningTokenCount: reasoningIds.length,
+            _initialContinuationInThinking: true,
+            _initialPreview: {
+                content: '',
+                reasoning_content: preview?.reasoning_content || '',
+            },
+            _targetMessageId: targetMessageId,
+            _resumeCheckpointId: null,
+            _resumePreviewMessage: null,
+            _generationOverride: generationOverride,
+        };
+    },
+
+    thinkMoreCurrentStream() {
+        const stream = this.currentStream();
+        if (!this.canThinkMoreCurrentStream()) return;
+        const restart = this.buildThinkMoreStreamContext(
+            stream.requestContext,
+            this.generationStateFromStream(stream),
+            this.pausedPreviewFromStream(stream),
+            stream.targetMessageId
+        );
+        if (!restart) return;
+        stream.thinkMoreRestart = restart;
+        this.cancelStreamTransport(stream);
+    },
+
+    async thinkMoreMessage(message, index) {
+        if (!this.canThinkMoreMessage(message, index)) return;
+        const session = this.getChatSession(this.currentChatId, true);
+        const userIndex = this.findUserIndexForMessage(session.messages, index);
+        const meta = message.meta || {};
+        const context = this.buildThinkMoreStreamContext({
+            chatId: this.currentChatId,
+            model: meta.modelId || message.model || this.currentModel,
+            systemPrompt: meta.systemPrompt ?? this.systemPrompt,
+            _profile: meta.profileName || message._profile || null,
+            _variantUserIndex: userIndex,
+            _modelOverride: meta.modelId || message.model || null,
+        }, message._generationState, {
+            reasoning_content: message._thinking,
+        }, message.id);
+        if (!context) return;
+        context._replaceMessageId = message.id;
+        context._replacementPreviewMessage = this.cloneData(message);
+        await this.streamResponse(context, 0);
     },
 
     async regenerateMessage(index, opts = {}) {

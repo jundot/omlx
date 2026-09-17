@@ -285,6 +285,9 @@ class MockEnginePool:
     def get_model_ids(self) -> List[str]:
         return [m["id"] for m in self._models]
 
+    def get_loaded_model_ids(self) -> List[str]:
+        return [m["id"] for m in self._models if m["loaded"]]
+
     def get_status(self) -> Dict[str, Any]:
         return {
             "models": self._models,
@@ -374,6 +377,50 @@ def client(mock_engine_pool):
     # Restore original state
     _server_state.engine_pool = original_pool
     _server_state.default_model = original_default
+
+
+class TestForceOutputEndpoint:
+    @pytest.mark.parametrize(
+        ("result", "status_code"),
+        [
+            ("accepted", 202),
+            ("already_requested", 409),
+            ("unsupported", 422),
+            ("not_found", 404),
+        ],
+    )
+    def test_force_output_status_mapping(
+        self, client, mock_engine_pool, mock_llm_engine, result, status_code
+    ):
+        mock_llm_engine.request_force_output = AsyncMock(return_value=result)
+        mock_engine_pool._entries["test-model"] = SimpleNamespace(
+            engine=mock_llm_engine
+        )
+
+        response = client.post("/v1/requests/chatcmpl-exact/force-output")
+
+        assert response.status_code == status_code
+        mock_llm_engine.request_force_output.assert_awaited_once_with("chatcmpl-exact")
+
+    def test_force_output_scans_past_loaded_non_owner(self, client, mock_engine_pool):
+        non_owner = SimpleNamespace(
+            request_force_output=AsyncMock(return_value="not_found")
+        )
+        owner = SimpleNamespace(request_force_output=AsyncMock(return_value="accepted"))
+        mock_engine_pool._models = [
+            {"id": "diffusion-model", "loaded": True},
+            {"id": "reasoning-model", "loaded": True},
+        ]
+        mock_engine_pool._entries = {
+            "diffusion-model": SimpleNamespace(engine=non_owner),
+            "reasoning-model": SimpleNamespace(engine=owner),
+        }
+
+        response = client.post("/v1/requests/chatcmpl-exact/force-output")
+
+        assert response.status_code == 202
+        non_owner.request_force_output.assert_awaited_once_with("chatcmpl-exact")
+        owner.request_force_output.assert_awaited_once_with("chatcmpl-exact")
 
 
 class TestHealthEndpoint:
@@ -1158,6 +1205,44 @@ class TestChatCompletionEndpoint:
         assert "choices" in data
         assert data["choices"][0]["message"]["role"] == "assistant"
         assert "usage" in data
+
+    def test_streaming_chat_uses_public_response_id_in_engine(
+        self, client, mock_llm_engine
+    ):
+        captured = {}
+
+        async def recording_stream_chat(messages, **kwargs):
+            captured.update(kwargs)
+            yield MockGenerationOutput(
+                text="Hello",
+                new_text="Hello",
+                finished=False,
+            )
+            yield MockGenerationOutput(
+                text="Hello",
+                new_text="",
+                finished=True,
+                finish_reason="stop",
+            )
+
+        mock_llm_engine.stream_chat = recording_stream_chat
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        first_data = next(
+            line.removeprefix("data: ")
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        )
+        assert captured["request_id"] == json.loads(first_data)["id"]
+        assert captured["request_id"].startswith("chatcmpl-")
 
     def test_chat_completion_with_parameters(self, client):
         """Test chat completion with sampling parameters."""

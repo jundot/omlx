@@ -406,6 +406,297 @@ class TestSchedulerInitialization:
         assert snap["waiting"] == [request]
 
 
+class TestForceOutputRequest:
+    def test_force_output_targets_only_exact_live_request(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        first = Request(
+            request_id="chatcmpl-first",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+            needs_think_prefix=True,
+        )
+        second = Request(
+            request_id="chatcmpl-second",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+            needs_think_prefix=True,
+        )
+        scheduler.requests = {first.request_id: first, second.request_id: second}
+        scheduler._resolve_think_end_token_ids = lambda: [2]
+
+        assert scheduler.request_force_output(first.request_id) == "accepted"
+        assert first.force_output_event.is_set()
+        assert not second.force_output_event.is_set()
+        assert scheduler.request_force_output(first.request_id) == "already_requested"
+        assert scheduler.request_force_output("missing") == "not_found"
+
+    def test_force_output_rejects_non_reasoning_request(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-plain",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+
+        assert scheduler.request_force_output(request.request_id) == "unsupported"
+        assert not request.force_output_event.is_set()
+
+    def test_force_output_can_latch_before_waiting_request_is_admitted(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-waiting",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+        )
+        scheduler._detect_needs_think_prefix = lambda _: True
+        scheduler._resolve_think_end_token_ids = lambda: [2]
+        scheduler.add_request(request)
+
+        assert scheduler.request_force_output(request.request_id) == "accepted"
+        assert request.needs_think_prefix is True
+        assert request.force_output_event.is_set()
+
+    def test_force_output_accepts_mid_thinking_continuation(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-resumed-thinking",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+            continuation_in_thinking=True,
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler._resolve_think_end_token_ids = lambda: [9]
+
+        assert scheduler.request_force_output(request.request_id) == "accepted"
+        assert request.force_output_event.is_set()
+
+
+class TestPauseRequest:
+    def test_continuation_replays_into_fresh_detokenizer_without_emission(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="continued-detokenizer",
+            prompt=[1, 2, 10, 11],
+            sampling_params=SamplingParams(),
+            continuation_token_ids=[10, 11],
+        )
+        scheduler.requests[request.request_id] = request
+        detokenizer = MagicMock()
+
+        with patch(
+            "omlx.scheduler.create_streaming_detokenizer",
+            return_value=detokenizer,
+        ):
+            created = scheduler._get_detokenizer(request.request_id)
+            reused = scheduler._get_detokenizer(request.request_id)
+
+        assert created is detokenizer
+        assert reused is detokenizer
+        detokenizer.reset.assert_called_once_with()
+        assert detokenizer.add_token.call_args_list == [call(10), call(11)]
+
+    def test_continuation_replays_into_fresh_protocol_parser_without_emission(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="continued-protocol",
+            prompt=[1, 2, 20, 21],
+            sampling_params=SamplingParams(),
+            continuation_token_ids=[20, 21],
+            continuation_in_thinking=True,
+        )
+        scheduler.requests[request.request_id] = request
+        parser_session = MagicMock()
+        parser_factory = MagicMock()
+        parser_factory.create_session_with_tools = None
+        parser_factory.create_session.return_value = parser_session
+        scheduler._output_parser_factory = parser_factory
+
+        created = scheduler._get_output_parser_session(request.request_id)
+        reused = scheduler._get_output_parser_session(request.request_id)
+
+        assert created is parser_session
+        assert reused is parser_session
+        parser_session.notify_prefilled_thought.assert_called_once_with()
+        assert parser_session.process_token.call_args_list == [call(20), call(21)]
+
+    def test_mid_thinking_continuation_installs_budget_without_new_prefix(
+        self, mock_model, mock_tokenizer
+    ):
+        from omlx.api.thinking import ThinkingBudgetProcessor
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._resolve_think_end_token_ids = lambda: [90]
+        scheduler._resolve_think_close_pattern = lambda _: ([], [])
+        scheduler._resolve_output_parser_thinking_trailing_ids = lambda: None
+        request = Request(
+            request_id="continued-budget",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(thinking_budget=32),
+            continuation_in_thinking=True,
+        )
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+
+        budget = next(
+            processor
+            for processor in processors
+            if isinstance(processor, ThinkingBudgetProcessor)
+        )
+        assert budget._budget == 32
+        assert request.needs_think_prefix is False
+        assert request.think_prefix_sent is False
+
+    def test_pause_snapshots_exact_prefix_and_reasoning_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-pause",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+            output_token_ids=[10, 11, 90, 91, 12],
+            output_text="<think>reason</think>answer",
+            needs_think_prefix=True,
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler._resolve_think_end_token_ids = lambda: [90, 91]
+
+        snapshot = scheduler.pause_request(request.request_id)
+
+        assert snapshot == {
+            "status": "accepted",
+            "request_id": request.request_id,
+            "output_token_ids": [10, 11, 90, 91, 12],
+            "output_text": "<decoded:5 tokens>",
+            "completion_tokens": 5,
+            "continuation_in_thinking": False,
+            "reasoning_end_token_index": 2,
+        }
+        assert request.request_id in scheduler._pending_abort_ids
+
+        # The durable snapshot must never share its list with live request state.
+        request.output_token_ids.append(13)
+        assert snapshot["output_token_ids"] == [10, 11, 90, 91, 12]
+
+    def test_pause_snapshot_is_cumulative_across_resumes(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-paused-twice",
+            prompt=[1, 2, 10, 11],
+            sampling_params=SamplingParams(),
+            continuation_token_ids=[10, 11],
+            output_token_ids=[12, 13],
+            continuation_in_thinking=True,
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler._resolve_think_end_token_ids = lambda: [90, 91]
+
+        snapshot = scheduler.pause_request(request.request_id)
+
+        assert snapshot["output_token_ids"] == [10, 11, 12, 13]
+        assert snapshot["completion_tokens"] == 4
+        assert snapshot["output_text"] == "<decoded:4 tokens>"
+        assert snapshot["continuation_in_thinking"] is True
+
+    def test_pause_during_prefill_returns_resumable_empty_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-prefill-pause",
+            prompt=[1, 2],
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+
+        snapshot = scheduler.pause_request(request.request_id)
+
+        assert snapshot["status"] == "accepted"
+        assert snapshot["output_token_ids"] == []
+        assert snapshot["output_text"] == ""
+        assert request.request_id in scheduler._pending_abort_ids
+
+    def test_pause_mid_thinking_marks_continuation_phase(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-mid-thought",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+            output_token_ids=[20, 21, 22],
+            output_text="<think>still reasoning",
+            continuation_in_thinking=True,
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler._resolve_think_end_token_ids = lambda: [90, 91]
+
+        snapshot = scheduler.pause_request(request.request_id)
+
+        assert snapshot["continuation_in_thinking"] is True
+        assert snapshot["reasoning_end_token_index"] is None
+
+    def test_pause_plain_request_does_not_claim_thinking(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="chatcmpl-plain-pause",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+            output_token_ids=[20],
+            output_text="hello",
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler._resolve_think_end_token_ids = lambda: [90]
+
+        snapshot = scheduler.pause_request(request.request_id)
+
+        assert snapshot["continuation_in_thinking"] is False
+        assert snapshot["reasoning_end_token_index"] is None
+
+    def test_pause_missing_finished_or_already_aborting_is_not_found(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        finished = Request(
+            request_id="finished",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+            status=RequestStatus.FINISHED_STOPPED,
+        )
+        aborting = Request(
+            request_id="aborting",
+            prompt=[1],
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests = {"finished": finished, "aborting": aborting}
+        scheduler._pending_abort_ids.add("aborting")
+
+        for request_id in ("missing", "finished", "aborting"):
+            assert scheduler.pause_request(request_id) == {
+                "status": "not_found",
+                "request_id": request_id,
+            }
+
+
 class TestSchedulerAddRequest:
     """Tests for Scheduler.add_request()."""
 
@@ -6491,6 +6782,50 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         assert request.rope_deltas == -42.0
+
+    def test_external_vlm_continuation_switches_from_embeds_to_token_ids(
+        self, mock_tokenizer
+    ):
+        """Continuation tokens beyond the image embeddings prefill separately."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=512),
+        )
+        request = Request(
+            request_id="vlm-exact-continuation",
+            prompt=list(range(8)),
+            sampling_params=SamplingParams(max_tokens=1),
+            continuation_token_ids=[5, 6, 7],
+        )
+        request.prompt_token_ids = list(range(8))
+        request.num_prompt_tokens = 8
+        embeds = mx.zeros((1, 5, 64))
+        captured_delta = mx.array([[-42.0]])
+
+        _, last_token = scheduler._do_external_prefill(
+            request,
+            tokens=request.prompt_token_ids,
+            existing_cache=[],
+            vlm_embeds=(
+                embeds,
+                {"_captured_rope_deltas": captured_delta},
+                0,
+            ),
+        )
+
+        assert last_token == [7]
+        assert model.call_count == 2
+        first_args, first_kwargs = model.call_args_list[0]
+        second_args, second_kwargs = model.call_args_list[1]
+        assert first_args[0].shape[1] == 5
+        assert first_kwargs["inputs_embeds"].shape[1] == 5
+        assert second_args[0].shape[1] == 2
+        assert "inputs_embeds" not in second_kwargs
+        model.set_batch_rope_deltas.assert_called_once()
+        bound = model.set_batch_rope_deltas.call_args.args[0]
+        assert float(bound.reshape(-1)[0].item()) == -42.0
 
     def test_schedule_waiting_clears_text_only_position_state(self, mock_tokenizer):
         """Text-only request in _schedule_waiting should clear position state.
