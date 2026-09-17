@@ -394,6 +394,72 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
     return source, model
 
 
+def write_affine_checkpoint(
+    tmp_path, vision=False, bits=2, group_size=64, **config_overrides
+):
+    """A source checkpoint whose projections are mlx_lm-style affine packed.
+
+    ``write_checkpoint`` emits dense tensors only. This repacks every 2-D
+    projection whose width fits the quantization group into a U32 weight plus
+    float scales and biases, records a per-module spec for it, and declares
+    the projections left dense as ``False`` — the layout a community mlx_lm
+    conversion has, including its mixed dense/packed form.
+    """
+    import json
+
+    source, model = write_checkpoint(
+        tmp_path,
+        vision=vision,
+        dim=64,
+        moe_inter_dim=64,
+        **config_overrides,
+    )
+    originals = dict(mx.load(str(source / "model.safetensors")))
+    tensors, quantized = {}, {}
+    for name, value in originals.items():
+        base = name.removesuffix(".weight") if name.endswith(".weight") else ""
+        # A dense linear bias marks a module mlx_lm leaves unpacked — the
+        # router and the attention output projections keep their own bias,
+        # and a QuantizedProjection has no place for it.
+        if (
+            base
+            and value.ndim == 2
+            and base + ".bias" not in originals
+            and value.shape[-1] % group_size == 0
+            and value.shape[-1] >= group_size
+        ):
+            weight, scales, biases = mx.quantize(
+                value.astype(mx.bfloat16),
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+            base = name.removesuffix(".weight")
+            tensors[base + ".weight"] = weight
+            tensors[base + ".scales"] = scales
+            tensors[base + ".biases"] = biases
+            quantized[base] = {"bits": bits, "group_size": group_size, "mode": "affine"}
+        else:
+            tensors[name] = value
+            if name.endswith(".weight"):
+                quantized[name.removesuffix(".weight")] = False
+    # mx.load is lazy: materialize before overwriting the file it reads from.
+    mx.eval(list(tensors.values()))
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+    )
+    config = json.loads((source / "config.json").read_text())
+    config["quantization"] = config["quantization_config"] = {
+        "bits": bits,
+        "group_size": group_size,
+        "mode": "affine",
+        **quantized,
+    }
+    (source / "config.json").write_text(json.dumps(config))
+    return source, model
+
+
 def test_dspark_matches_official_single_pass_reference(expected):
     c = tiny(
         preserve_mtp=True,

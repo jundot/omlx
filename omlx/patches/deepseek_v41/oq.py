@@ -389,7 +389,7 @@ def quantize(
         budget["tensor_bytes"] / 1024**3,
     )
     writer = ShardWriter(destination)
-    tables = source_engram_tables(mapping)
+    tables = source_engram_tables(mapping, config)
     exported_tables = {}
     engram_start, engram_span = (20, 20) if oq_level == 3 else (0, 30)
     projection_start = engram_start + engram_span
