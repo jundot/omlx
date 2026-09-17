@@ -7,7 +7,9 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-_SUPPORTED_TYPES = frozenset({"deepseek_v41", "qwen4_exp", "gemma4", "olmoe"})
+_SUPPORTED_TYPES = frozenset(
+    {"deepseek_v41", "qwen4_exp", "qwen3_5_moe", "gemma4", "olmoe"}
+)
 
 
 def moe_offload_compatibility(model_path):
@@ -63,7 +65,7 @@ def _inspect(path, signature):
         if kind == "olmoe":
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
-        elif kind == "qwen4_exp":
+        elif kind in ("qwen4_exp", "qwen3_5_moe"):
             parent = f"language_model.model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         else:

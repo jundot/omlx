@@ -76,9 +76,11 @@ low residency.
 ## Supported models
 
 The experimental toggle is available for `deepseek_v41`, `qwen4_exp`,
-`gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout passes
-validation. Dense Gemma models and other model types do not show the toggle.
-The settings API and model loader use the same eligibility check.
+`qwen3_5_moe`, `gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout
+passes validation. Dense Gemma models and other model types do not show the
+toggle. The settings API and model loader use the same eligibility check.
+`qwen3_5_moe` checkpoints stack their experts the same way `qwen4_exp` does, so
+both resolve their expert tensors under `...mlp.switch_mlp`.
 
 The common adapter supports stacked `[num_experts, ...]` quantized
 `SwitchGLU` projections and the per-expert layout used by OLMoE conversions.
