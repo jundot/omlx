@@ -34,6 +34,7 @@ class CacheType(Enum):
     BATCH_KVCACHE = "BatchKVCache"
     BATCH_ROTATING_KVCACHE = "BatchRotatingKVCache"
     ARRAYS_CACHE = "ArraysCache"
+    DEEPSEEK_V41 = "DeepseekV41Cache"
     QUANTIZED_KVCACHE = "QuantizedKVCache"
     CACHE_LIST = "CacheList"
     POOLING_CACHE = "PoolingCache"
@@ -851,6 +852,10 @@ class ArraysCacheHandler(CacheTypeHandler):
             return None
 
         states = state.get("states", [])
+        if meta_state and tuple(meta_state) == ("deepseek_v41", "2"):
+            from ..patches.deepseek_v41.cache import DeepseekV41Cache
+
+            return DeepseekV41Cache.from_state(states, meta_state)
         cache = ArraysCache(size=len(states))
         for i, s in enumerate(states):
             cache.cache[i] = s

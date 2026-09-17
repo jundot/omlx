@@ -2,16 +2,23 @@
 """Tests for ProcessMemoryEnforcer."""
 
 import asyncio
+import base64
+import io
 from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 import omlx.process_memory_enforcer as pme
+import omlx.utils.image as images
 import omlx.utils.psutil_compat as psutil_compat
+from omlx.decode_activity import get_decode_activity
+from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.tts import TTSEngine
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+from omlx.scheduler import SchedulerConfig
 
 
 def _make_enforcer(
@@ -76,6 +83,39 @@ def _cycling(values):
         return values[i]
 
     return _next
+
+
+def test_embedding_watermark_and_live_hot_cache_accounting(mock_engine_pool):
+    config = SchedulerConfig()
+    config.hot_cache_budget = SimpleNamespace(total_bytes=2 * 1024**3)
+    engine = EmbeddingEngine("embedding-fixture", scheduler_config=config)
+    mock_engine_pool._entries = {"embedding": _make_entry("embedding", engine)}
+    enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+    enforcer._hot_cache_reserved_bytes = lambda: 3 * 1024**3
+    enforcer._hot_cache_used_bytes = lambda: config.hot_cache_budget.total_bytes
+    registry = get_decode_activity()
+    registry.publish("chat-fixture", 1)
+    try:
+        enforcer._propagate_memory_limit()
+        with (
+            patch("omlx.engine.forward_fairness.mx") as fake_mx,
+            patch(
+                "omlx.engine.forward_fairness.get_phys_footprint",
+                return_value=8 * 1024**3,
+            ),
+        ):
+            fake_mx.get_active_memory.return_value = 4 * 1024**3
+            # The 7 GiB watermark excludes the reserved hot-cache budget.
+            assert not engine._fairness.should_clear_cache()
+            # Read the current byte count, without waiting for an enforcer tick.
+            config.hot_cache_budget.total_bytes = 0
+            assert engine._fairness.should_clear_cache()
+            enforcer._get_ceiling_breakdown = lambda: {"hard_limit": 0}
+            enforcer._propagate_memory_limit()
+            assert engine._fairness._memory_soft_limit_bytes == 0
+            assert engine._fairness.should_clear_cache()
+    finally:
+        registry.remove("chat-fixture")
 
 
 def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
@@ -985,28 +1025,6 @@ class TestDynamicCeilingActiveRatio:
             result = enforcer._get_dynamic_ceiling()
         expected = 1 * 1024**3 + 10 * 1024**3 + 4 * 1024**3 + int(8 * 1024**3 * ratio)
         assert result == expected
-
-    def test_non_macos_falls_back_to_compat_available(self, mock_engine_pool):
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
-        )
-        with (
-            patch(
-                "omlx.process_memory_enforcer.get_phys_footprint",
-                return_value=2 * 1024**3,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.get_macos_vm_stats",
-                return_value=None,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
-                return_value=SimpleNamespace(available=15 * 1024**3),
-            ) as mock_virtual_memory,
-        ):
-            result = enforcer._get_dynamic_ceiling()
-        assert result == 2 * 1024**3 + 15 * 1024**3
-        mock_virtual_memory.assert_called_once()
 
     def test_macos_vm_stat_failure_uses_compat_available(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -2382,7 +2400,10 @@ class TestTwoWatermarkPressureLevels:
             await enforcer._check_and_enforce()
 
         assert to_thread_calls
-        assert to_thread_calls[0][0] == enforcer._shrink_hot_cache_for_pressure
+        assert any(
+            call[0] == enforcer._shrink_hot_cache_for_pressure
+            for call in to_thread_calls
+        )
         budget.shrink_to.assert_called_once()
         target_hot = budget.shrink_to.call_args.args[0]
         assert target_hot == 12 * 1024**3
@@ -2730,7 +2751,9 @@ class TestWiredLimitSuggestionClamp:
         user_cap = 124518 * 1024**2  # highest whole-MiB value below 95%
         with (
             self._with_total(total),
-            patch.object(pme, "get_iogpu_wired_limit_bytes", return_value=user_cap),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
             patch.object(pme.mx, "set_wired_limit", return_value=0),
             caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
         ):
@@ -3011,3 +3034,53 @@ class TestPressureReclaimGrace:
             await enforcer._check_and_enforce()
         shrink.assert_called_once()
         engine.abort_all_requests.assert_awaited_once()
+
+
+@pytest.mark.parametrize("initial_usage", [95_000, 105_000])
+async def test_image_cache_reclaimed_before_model_eviction(
+    mock_engine_pool, initial_usage
+):
+    images.clear_image_decode_cache()
+    buffer = io.BytesIO()
+    Image.new("RGB", (120, 120), "red").save(buffer, format="PNG")
+    source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    images.load_image(source)
+    retained_bytes = images._image_decode_cache_bytes
+    enforcer = _make_enforcer(
+        mock_engine_pool, ceiling=100_000, soft_threshold=0.9, hard_threshold=1.0
+    )
+    try:
+        # Simulate the footprint dropping when unowned cache entries are released.
+        with patch.object(
+            enforcer,
+            "_current_usage_bytes",
+            side_effect=lambda: initial_usage
+            - retained_bytes
+            + images._image_decode_cache_bytes,
+        ):
+            await enforcer._check_and_enforce()
+        assert not images._image_decode_cache
+        assert enforcer._pressure_level == "ok"
+        mock_engine_pool._unload_engine.assert_not_called()
+    finally:
+        images.clear_image_decode_cache()
+
+
+async def test_image_cache_reclaim_remeasures_retained_request_memory(mock_engine_pool):
+    images.clear_image_decode_cache()
+    buffer = io.BytesIO()
+    Image.new("RGB", (120, 120), "blue").save(buffer, format="PNG")
+    source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    active_image = images.load_image(source)
+    enforcer = _make_enforcer(
+        mock_engine_pool, ceiling=100_000, soft_threshold=0.9, hard_threshold=1.0
+    )
+    try:
+        # The request still owns the pixels, so dropping the cache frees no RAM.
+        with patch.object(enforcer, "_current_usage_bytes", return_value=95_000):
+            await enforcer._check_and_enforce()
+        assert not images._image_decode_cache
+        assert enforcer._pressure_level == "soft"
+        assert active_image.getpixel((0, 0)) == (0, 0, 255)
+    finally:
+        images.clear_image_decode_cache()

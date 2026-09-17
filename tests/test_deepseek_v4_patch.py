@@ -162,6 +162,32 @@ class TestUtilsPatch:
             is True
         )
 
+    @pytest.mark.parametrize("location", ["quantization", "quantization_config", "text_quantization", "text_quantization_config"])
+    @pytest.mark.parametrize("bits", [2, 3, 3.5])
+    def test_nested_sub4_override_disables_native_attention(self, location, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        quantization = {"bits": 4, "overrides": [{"layers.0.mlp": {"bits": bits}}]}
+        config = {"model_type": "deepseek_v4"}
+        if location.startswith("text_"):
+            config["text_config"] = {location[5:]: quantization}
+        else:
+            config[location] = quantization
+        assert _native_ratio128_attention_enabled(config) is False
+
+    @pytest.mark.parametrize("bits", [4, 8, True, False, None, "3"])
+    def test_nested_non_sub4_values_keep_existing_dispatch(self, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        config = {"model_type": "deepseek_v4", "quantization": {"layers": {"bits": bits}}}
+        assert _native_ratio128_attention_enabled(config) is True
+        config = {"model_type": "qwen3", "quantization": {"bits": 2}}
+        assert _native_ratio128_attention_enabled(config) is True
+
     @pytest.mark.parametrize(
         ("bits", "expected_enabled"),
         ((4, True), (2, False)),

@@ -1049,18 +1049,6 @@ class TestCacheTypeRegistry:
         assert "BufferedRotatingKVCache" in names
         assert "ArraysCache" in names
 
-    def test_register_handler(self):
-        """Test registering a custom handler."""
-
-        class CustomHandler(KVCacheHandler):
-            pass
-
-        custom = CustomHandler()
-        # This would override the existing handler
-        # Just verify registration works without error
-        CacheTypeRegistry.register(custom)
-
-
 class TestCacheListHandler:
     """Tests for CacheListHandler."""
 

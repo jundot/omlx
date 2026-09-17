@@ -272,6 +272,28 @@ final class ServerScreenVM {
             return
         }
 
+        if services.canSaveSettingsOffline && patchHasFields {
+            guard let nextPort, patch == GlobalSettingsPatch(port: nextPort), !diff.hasChanges else {
+                self.lastError = String(
+                    localized: "server.error.offline_port_only",
+                    defaultValue: "Apply the port change separately while the server is stopped. Start the server before applying other settings.",
+                    comment: "Offline Apply supports port recovery without a running server"
+                )
+                return
+            }
+            Task {
+                do {
+                    try await services.applyServerEndpoint(port: nextPort)
+                    self.effectivePort = nextPort
+                    self.baselinePortText = String(nextPort)
+                    self.lastError = nil
+                } catch {
+                    self.lastError = error.omlxDescription
+                }
+            }
+            return
+        }
+
         if diff.baseChanged { isMovingBasePath = true }
         Task {
             defer {
@@ -457,7 +479,7 @@ final class ServerScreenVM {
     func saveHost(services: AppServices) {
         let next = host
         Task {
-            await commit(GlobalSettingsPatch(host: next))
+            guard await commit(GlobalSettingsPatch(host: next)) else { return }
             do {
                 try await services.applyServerEndpoint(host: next)
                 self.appliedBindAddress = next
@@ -523,7 +545,7 @@ final class ServerScreenVM {
                                     comment: "Server screen error when port value is out of valid range")
             return
         }
-        if portChanged && parsedPort == nil {
+        if parsedPort == nil {
             self.lastError = String(localized: "server.error.port_invalid",
                                     defaultValue: "Port must be a number between 1 and 65535.",
                                     comment: "Server screen error when port value is out of valid range")
@@ -534,10 +556,10 @@ final class ServerScreenVM {
             do {
                 if portChanged || hostChanged {
                     if portChanged, let p = parsedPort {
-                        await commit(GlobalSettingsPatch(port: p))
+                        guard await commit(GlobalSettingsPatch(port: p)) else { return }
                     }
                     if hostChanged {
-                        await commit(GlobalSettingsPatch(host: host))
+                        guard await commit(GlobalSettingsPatch(host: host)) else { return }
                     }
                     try await services.applyServerEndpoint(
                         host: hostChanged ? host : nil,

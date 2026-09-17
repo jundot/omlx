@@ -565,8 +565,8 @@ private struct ServerDefaultProfileEditor: View {
                                                   defaultValue: "Pin in memory",
                                                   comment: "Disabled row label for Pin in memory"),
                                     note: String(localized: "server.profile.pin_in_memory.note",
-                                                 defaultValue: "Per-model only.",
-                                                 comment: "Note marking Pin in memory as per-model only"))
+                                                 defaultValue: "Per-model only - see Models > [model] > Advanced.",
+                                                 comment: "Note explaining where to configure Pin in memory"))
                     perModelOnlyRow(label: String(localized: "server.profile.speculative_decoding",
                                                   defaultValue: "Speculative decoding",
                                                   comment: "Disabled row label for Speculative decoding"),

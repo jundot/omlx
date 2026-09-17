@@ -264,6 +264,19 @@ def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
     return out.reshape(batch, n_q, q_len, value_dim)
 
 
+# ``force_fused=`` arrived in MLX 0.32.2. On an older runtime the keyword is a
+# TypeError, and retrying without it is not a safe substitute -- MLX would then
+# be free to pick the unfused fp32 score matrix, which is the O(L^2) spike this
+# patch exists to bound. Such a runtime routes to the array-tiled path instead,
+# which is bounded by construction.
+#
+# Probed by use rather than by signature: MLX's nanobind functions report
+# ``(*args, **kwargs)``, so the keyword is only visible in the docstring, and
+# ``python -OO`` strips that. One TypeError on the first call is cheaper than a
+# fragile capability check, and the answer is latched.
+_NATIVE_FORCE_FUSED = True
+
+
 def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
     """Use MLX 0.32.2 native fused SDPA on Metal, portable tiling elsewhere.
 
@@ -272,6 +285,8 @@ def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
     unfused fp32 score matrix, which is exactly the O(L^2) spike this patch
     exists to bound. The array-tiled implementation already handles bool and
     additive masks, so route them there directly."""
+    global _NATIVE_FORCE_FUSED
+
     if isinstance(mask, mx.array):
         return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
     native_shape = values.shape[-1] == HEAD_DIM and not (
@@ -279,16 +294,27 @@ def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
         and mask == "causal"
         and queries.shape[-2] > keys.shape[-2]
     )
-    if mx.metal.is_available() and native_shape:
-        return mx.fast.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=scale,
-            mask=mask,
-            sinks=sinks,
-            force_fused=True,
-        )
+    if mx.metal.is_available() and native_shape and _NATIVE_FORCE_FUSED:
+        try:
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=scale,
+                mask=mask,
+                sinks=sinks,
+                force_fused=True,
+            )
+        except TypeError:
+            # Falling through to the tiled path rather than re-raising: it is a
+            # correct implementation of the same op, so a genuinely malformed
+            # call still fails there rather than being swallowed here.
+            _NATIVE_FORCE_FUSED = False
+            logger.warning(
+                "sdpa256: mlx %s has no force_fused= (0.32.2+); using the "
+                "array-tiled bounded route instead of the native fused kernel",
+                getattr(mx, "__version__", "?"),
+            )
     return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
 
 

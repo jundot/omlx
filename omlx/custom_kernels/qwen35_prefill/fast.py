@@ -99,6 +99,11 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_q4_swiglu_down_t",
     "qwen35_ane_dual_q4_swiglu_down_t",
     "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t",
+    "oq_a8_kernels_available",
+    "qwen35_oq_a8_quantize",
+    "qwen35_oq_a8_qmm_t",
+    "qwen35_oq_a8_decode_weights",
+    "qwen35_oq_a8_stage_a_v8",
 )
 
 
@@ -1190,6 +1195,160 @@ def qwen35_moe_weighted_sum(
             stream=stream or mx.gpu,
         )
     raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+
+
+# --- oQ mixed-bit QxA8 (Q4/Q5, GS64, affine) on the M5 tensor units ---------
+
+OQ_A8_VARIANT = int(os.environ.get("OMLX_OQ_A8_VARIANT", "0"))
+OQ_A8_ACT_MODE = int(os.environ.get("OMLX_OQ_A8_ACT_MODE", "0"))
+
+
+def oq_a8_available() -> bool:
+    """True when the INT8 NAX GEMM can actually run on this machine.
+
+    Distinct from ``has_symbol``: the binding can exist in a build whose NAX
+    metallib was skipped (SDK < 26.2) or on hardware without tensor units.
+    """
+    if _ext is None or not hasattr(_ext, "oq_a8_kernels_available"):
+        return False
+    try:
+        return bool(_ext.oq_a8_kernels_available())
+    except Exception:
+        return False
+
+
+def qwen35_oq_a8_quantize(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Stage A: BF16/FP16 activations -> (Qa int8, Sa float32, Ra int16).
+
+    Run this once per shared activation and feed the result to every
+    projection that consumes it, whatever their bit widths.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_quantize"):
+        raise RuntimeError("qwen35_oq_a8_quantize native kernel is unavailable")
+    qa, sa, ra = _ext.qwen35_oq_a8_quantize(
+        x,
+        act_mode,
+        **_native_stream_kwargs(stream),
+    )
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_qmm_t(
+    qa: mx.array,
+    sa: mx.array,
+    ra: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 800,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_qmm_t"):
+        raise RuntimeError("qwen35_oq_a8_qmm_t native kernel is unavailable")
+    return _ext.qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        scales,
+        biases,
+        bits,
+        act_mode,
+        variant,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen35_oq_a8_linear(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    bits: int,
+    act_mode: int = 0,
+    variant: int = 800,
+    *,
+    stream=None,
+) -> mx.array:
+    """Convenience Stage-A + GEMM for a projection with no shared activation."""
+    qa, sa, ra = qwen35_oq_a8_stage_a_v8(x, act_mode, stream=stream)
+    return qwen35_oq_a8_qmm_t(
+        qa,
+        sa,
+        ra,
+        weight,
+        mx.contiguous(scales.T),
+        mx.contiguous(biases.T),
+        bits,
+        act_mode,
+        variant,
+        stream=stream,
+    )
+
+
+def qwen35_oq_a8_stage_a_v8(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Reorder activations for the native GEMM and transpose group metadata.
+
+    Within each GS64 group, slot ``16c + 4t + j`` holds
+    ``k = 16c + 8*(t>>1) + 2j + (t&1)``. This permutation preserves the
+    group sum and requires a temporary contiguous INT8 activation copy.
+    """
+    qa, sa, ra = qwen35_oq_a8_quantize(x, act_mode, stream=stream)
+    shape = qa.shape
+    k = shape[-1]
+    m = qa.size // k
+    # Reshaped back to the input's own rank, not to [M, K]: the op derives the
+    # output shape from Qa, so flattening a [B, S, K] activation here would
+    # hand the caller a [B*S, N] result. With B == 1 that broadcasts against
+    # the residual and hides; with B > 1 it is silently wrong.
+    qa = mx.contiguous(
+        qa.reshape(m, k // 64, 4, 2, 4, 2).transpose(0, 1, 2, 3, 5, 4).reshape(shape)
+    )
+    # Flattened to [M, groups] before transposing, not transposed in place:
+    # mx.transpose reverses *every* axis, so a [B, S, groups] Ra would come
+    # back as [groups, S, B] -- which is the layout the kernel wants only when
+    # B == 1, and silently interleaves the sequences when it is not.
+    ra = mx.contiguous(ra.reshape(m, -1).T)
+    if act_mode != 0:
+        sa = mx.contiguous(sa.reshape(m, -1).T)
+    return qa, sa, ra
+
+
+def qwen35_oq_a8_decode_weights(
+    weight: mx.array,
+    bits: int,
+    group_count: int,
+    *,
+    stream=None,
+) -> mx.array:
+    """Unpack Q4/Q5 codes to INT8.
+
+    Test helper only: the production path never materializes unpacked weights
+    in device memory.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_oq_a8_decode_weights"):
+        raise RuntimeError(
+            "qwen35_oq_a8_decode_weights native kernel is unavailable"
+        )
+    return _ext.qwen35_oq_a8_decode_weights(
+        weight,
+        bits,
+        group_count,
+        **_native_stream_kwargs(stream),
+    )
 
 
 def __getattr__(name: str) -> Any:

@@ -1080,6 +1080,72 @@ class TestFilterUploadedSettings:
         assert out["qwen35_ane_prefill_gdn_fraction"] == 0.5
         assert out["qwen35_ane_prefill_gdn_max_layers"] == 48
 
+    def test_shareable_performance_fields_are_kept(self):
+        out = _filter_uploaded_settings(
+            self._settings(
+                qwen35_oq_a8_enabled=True,
+                qwen35_oq_a8_min_tokens=64,
+                moe_expert_offload_enabled=True,
+                moe_expert_offload_resident_fraction=0.5,
+                dflash_in_memory_cache_max_bytes=123,
+                dflash_ssd_cache_max_bytes=456,
+            )
+        )
+        assert out["qwen35_oq_a8_enabled"] is True
+        assert out["qwen35_oq_a8_min_tokens"] == 64
+        assert out["moe_expert_offload_enabled"] is True
+        assert out["moe_expert_offload_resident_fraction"] == 0.5
+        assert out["dflash_in_memory_cache_max_bytes"] == 123
+        assert out["dflash_ssd_cache_max_bytes"] == 456
+
+    def test_full_snapshot_stays_under_the_size_cap(self):
+        from omlx.admin import benchmark as bench
+
+        out = _filter_uploaded_settings(
+            self._settings(
+                max_context_window=262144,
+                max_tokens=32768,
+                temperature=0.6,
+                top_p=0.95,
+                top_k=20,
+                min_p=0.0,
+                repetition_penalty=1.0,
+                presence_penalty=0.0,
+                enable_thinking=True,
+                thinking_budget_enabled=True,
+                thinking_budget_tokens=8192,
+                reasoning_parser="qwen3",
+                model_type_override="vlm",
+                index_cache_freq=4,
+                turboquant_kv_enabled=True,
+                turboquant_kv_bits=4,
+                specprefill_draft_model="/models/org/Qwen3-0.6B-specprefill-draft",
+                specprefill_keep_pct=0.5,
+                specprefill_threshold=2048,
+                dflash_enabled=True,
+                dflash_draft_model="/models/z-lab/Qwen3.8-27B-DFlash2-b16",
+                dflash_draft_quant_enabled=True,
+                dflash_draft_quant_weight_bits=4,
+                dflash_draft_quant_activation_bits=8,
+                dflash_draft_quant_group_size=64,
+                dflash_max_ctx=131072,
+                dflash_draft_window_size=4096,
+                dflash_draft_sink_size=4,
+                dflash_block_size=16,
+                dflash_verify_mode="adaptive",
+                vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant",
+                vlm_mtp_draft_block_size=8,
+                qwen35_ane_prefill_max_layers=64,
+            )
+        )
+        assert "temperature" in out, "must not fall back to accelerator flags only"
+        assert (
+            len(json.dumps(out, separators=(",", ":")))
+            <= bench._MAX_UPLOADED_SETTINGS_BYTES
+        )
+        # The site prepends the benchmark_context label; keep headroom for it.
+        assert bench._MAX_UPLOADED_SETTINGS_BYTES + 64 <= 8192
+
     def test_free_text_and_organization_fields_are_dropped(self):
         out = _filter_uploaded_settings(
             self._settings(

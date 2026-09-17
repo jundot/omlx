@@ -3980,8 +3980,9 @@ async def load_cluster_deployment(deployment_id: str):
             )
         entry = pool.get_entry(model_id)
         resident = getattr(entry, "engine", None) if entry is not None else None
-        if resident is not None and getattr(
-            resident, "runtime_failed_reason", None
+        if resident is not None and (
+            getattr(resident, "runtime_failed_reason", None)
+            or getattr(entry, "pending_unload_reason", None)
         ):
             await pool.prepare_cluster_reload(model_id)
         engine = await pool.get_engine(model_id)

@@ -133,6 +133,63 @@ class TestListModelsSettings:
         assert model["qwen4_ple_resident_bytes"] == 1000
         assert model["qwen4_ple_mmap_bytes"] == 400
 
+    def test_list_models_reports_forced_deepseek_v41_engram_offload(self, tmp_path):
+        from omlx.patches.deepseek_v41.residency import (
+            EngramResidencyEstimate,
+        )
+
+        model_path = tmp_path / "v41"
+        model_path.mkdir()
+        estimate = EngramResidencyEstimate(
+            supported=True,
+            engram_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "v41",
+                    "model_path": str(model_path),
+                    "config_model_type": "deepseek_v41",
+                    "estimated_size": 1000,
+                }
+            ]
+        }
+        pool._fallback_admission_ceiling.return_value = 500
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {}
+        state = MagicMock(default_model=None)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch.object(
+                admin_routes, "_dflash_compat_for_model", return_value=(False, "")
+            ),
+            patch.object(
+                admin_routes, "_mtp_compat_for_model", return_value=(False, "")
+            ),
+            patch.object(
+                admin_routes, "_paroquant_compat_for_model", return_value=(False, "")
+            ),
+            patch(
+                "omlx.patches.deepseek_v41.residency."
+                "deepseek_v41_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["deepseek_v41_engram_ssd_offload_supported"] is True
+        assert model["deepseek_v41_engram_ssd_offload_forced"] is True
+        assert model["deepseek_v41_engram_resident_bytes"] == 1000
+        assert model["deepseek_v41_engram_mmap_bytes"] == 400
+
     def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
         """Ensure nested model paths only affect UI display names."""
         model_root = tmp_path / "models"
@@ -326,26 +383,31 @@ class TestVerifyAnyApiKey:
 
     def test_matches_main_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
         assert verify_any_api_key("main-key", "main-key", sub_keys) is True
 
     def test_matches_sub_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
         assert verify_any_api_key("sub2", "main-key", sub_keys) is True
 
     def test_no_match(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("wrong", "main-key", sub_keys) is False
 
     def test_empty_api_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("", "main-key", sub_keys) is False
 
     def test_no_main_key_matches_sub(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("sub1", "", sub_keys) is True
 
@@ -360,6 +422,7 @@ class TestVerifyAnyApiKey:
 
     def test_none_main_key_matches_sub(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("sub1", None, sub_keys) is True
 
@@ -555,7 +618,14 @@ def _mock_global_settings(api_key=None):
     """Create a mock GlobalSettings with the given API key."""
     mock = MagicMock()
     mock.auth.api_key = api_key
+    mock.auth.skip_api_key_verification = False
+    mock.server.host = "127.0.0.1"
     return mock
+
+
+def _loopback_http_request():
+    """Create the request state accepted by the loopback-only setup endpoint."""
+    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _patch_getter(mock_settings):
@@ -573,6 +643,26 @@ def _restore_getter(original):
 class TestSetupApiKeyEndpoint:
     """Tests for POST /admin/api/setup-api-key endpoint logic."""
 
+    def test_setup_returns_503_when_settings_are_unavailable(self):
+        from fastapi import HTTPException
+
+        original = _patch_getter(None)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 503
+            assert "not initialized" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
     def test_setup_rejects_when_key_already_set(self):
         """Setup should fail if API key is already configured."""
         from fastapi import HTTPException
@@ -584,7 +674,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="newkey", api_key_confirm="newkey"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "already configured" in exc_info.value.detail
         finally:
@@ -601,7 +695,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="key1", api_key_confirm="key2"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "do not match" in exc_info.value.detail
         finally:
@@ -618,7 +716,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="abc", api_key_confirm="abc"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "at least 4" in exc_info.value.detail
         finally:
@@ -635,9 +737,59 @@ class TestSetupApiKeyEndpoint:
                 api_key="ab cd", api_key_confirm="ab cd"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "whitespace" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_configured_bind(self):
+        """Initial setup is unavailable once the server is network-facing."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        mock_settings.server.host = "0.0.0.0"
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_client(self):
+        """A remote peer cannot claim the first key on a loopback setup."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        remote_request = SimpleNamespace(client=SimpleNamespace(host="192.168.1.50"))
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(request, MagicMock(), remote_request)
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
         finally:
             _restore_getter(original)
 
@@ -657,7 +809,9 @@ class TestSetupApiKeyEndpoint:
                     api_key="validkey123", api_key_confirm="validkey123"
                 )
                 result = asyncio.run(
-                    admin_routes.setup_api_key(request, mock_response)
+                    admin_routes.setup_api_key(
+                        request, mock_response, _loopback_http_request()
+                    )
                 )
 
                 assert result["success"] is True

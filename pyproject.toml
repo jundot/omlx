@@ -54,13 +54,12 @@ dependencies = [
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    # Keep <5.13 until the broader dependency set gets a dedicated resolver
-    # smoke test with transformers 5.13+. The mlx-lm pin above includes the
-    # known NewlineTokenizer registration fix. Floor 5.12.1: AutoTokenizer's
+    # The mlx-lm pin above includes the NewlineTokenizer registration fix
+    # required by transformers 5.13+. Floor 5.12.1: AutoTokenizer's
     # fix_mistral_regex backend gate (used by get_tokenizer_config for
     # mistral-common models) first shipped in 5.12.1 — on older 5.x the kwarg
     # is silently swallowed and Tekken prompts stay corrupted.
-    "transformers>=5.12.1,<5.13",
+    "transformers>=5.12.1,<5.18",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -268,6 +267,7 @@ include = ["omlx*"]
     "bench_corpora/*",
 ]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.patches.deepseek_v41" = ["LICENSE"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]

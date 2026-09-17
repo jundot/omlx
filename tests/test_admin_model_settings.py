@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
+import copy
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -54,7 +55,10 @@ async def _update_settings(
     request: admin_routes.ModelSettingsRequest,
 ) -> dict:
     manager = MagicMock()
-    manager.get_settings.return_value = settings
+    manager.get_settings.return_value = copy.deepcopy(settings)
+    manager.set_settings.side_effect = lambda _, updated: settings.__dict__.update(
+        updated.__dict__
+    )
     state = MagicMock()
 
     with (
@@ -190,6 +194,79 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial, update",
+    [
+        ({"qwen35_ane_prefill_enabled": True}, {"qwen35_oq_a8_enabled": True}),
+        ({"qwen35_oq_a8_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
+        ({}, {"qwen35_oq_a8_enabled": True, "qwen35_ane_prefill_enabled": True}),
+    ],
+)
+async def test_oq_a8_is_refused_while_ane_prefill_is_on(tmp_path, initial, update):
+    from omlx.model_settings import ModelSettingsManager
+
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("ling", ModelSettings(**initial))
+    before = manager.get_settings("ling").to_dict()
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+        patch.object(admin_routes, "_get_server_state", return_value=MagicMock()),
+        patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True),
+        pytest.raises(admin_routes.HTTPException) as excinfo,
+    ):
+        await admin_routes.update_model_settings(
+            "ling", admin_routes.ModelSettingsRequest(**update), is_admin=True
+        )
+    assert excinfo.value.status_code == 400
+    assert "cannot both be enabled" in excinfo.value.detail
+    assert manager.get_settings("ling").to_dict() == before
+    assert ModelSettingsManager(tmp_path).get_settings("ling").to_dict() == before
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_alone_is_persisted():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=256
+            ),
+        )
+
+    assert settings.qwen35_oq_a8_enabled is True
+    assert settings.qwen35_oq_a8_min_tokens == 256
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_needs_native_int8_kernels():
+    """Nothing on this hardware would run faster, so the setting is refused
+    rather than accepted and silently ignored at load."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool,
+                settings,
+                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+            )
+
+    assert excinfo.value.status_code == 400
+    assert "M5-series or newer" in excinfo.value.detail
+    assert settings.qwen35_oq_a8_enabled is False
+
+
+@pytest.mark.asyncio
 async def test_qwen4_ple_ssd_offload_is_persisted_for_qwen4_only():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen4_exp"
@@ -216,6 +293,35 @@ async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
     )
 
     assert settings.qwen4_ple_ssd_offload is False
+
+
+@pytest.mark.asyncio
+async def test_deepseek_v41_engram_ssd_offload_is_persisted_for_v41_only():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v41"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(deepseek_v41_engram_ssd_offload=True),
+    )
+
+    assert settings.deepseek_v41_engram_ssd_offload is True
+
+
+@pytest.mark.asyncio
+async def test_deepseek_v41_engram_ssd_offload_is_ignored_for_other_models():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(deepseek_v41_engram_ssd_offload=True),
+    )
+
+    assert settings.deepseek_v41_engram_ssd_offload is False
 
 
 @pytest.mark.asyncio
@@ -264,9 +370,7 @@ async def test_qwen_ane_prefill_rejects_invalid_block_size():
         await _update_settings(
             pool,
             ModelSettings(),
-            admin_routes.ModelSettingsRequest(
-                qwen35_ane_prefill_sequence_length=2000
-            ),
+            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_sequence_length=2000),
         )
 
 
@@ -298,9 +402,7 @@ async def test_qwen_ane_prefill_rejects_fused_down_above_half_fraction():
         await _update_settings(
             pool,
             settings,
-            admin_routes.ModelSettingsRequest(
-                qwen35_ane_prefill_fused_down=True
-            ),
+            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_fused_down=True),
         )
 
 
@@ -434,10 +536,10 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert "mtp_num_draft_tokens" not in off_keys
 
     # Active MTP: different depths produce different signatures (reload).
-    assert pool._engine_runtime_signature("m", depth_3_on) != pool._engine_runtime_signature(
-        "m", depth_8_on
-    )
+    assert pool._engine_runtime_signature(
+        "m", depth_3_on
+    ) != pool._engine_runtime_signature("m", depth_8_on)
     # Inactive MTP: the value is invisible to the signature (no reload).
-    assert pool._engine_runtime_signature("m", depth_3_off) == pool._engine_runtime_signature(
-        "m", depth_8_off
-    )
+    assert pool._engine_runtime_signature(
+        "m", depth_3_off
+    ) == pool._engine_runtime_signature("m", depth_8_off)

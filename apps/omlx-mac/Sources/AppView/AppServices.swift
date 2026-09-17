@@ -91,6 +91,10 @@ final class AppServices: NSObject {
         // in terminationHandler / @MainActor health-check Task), so we're
         // already on the main thread here.
         serverState = proc.state
+        var updated = config
+        updated.bindAddress = proc.bindAddress
+        updated.port = proc.port
+        updateConfig(updated)
     }
 
     func updateConfig(_ next: AppConfig) {
@@ -110,6 +114,13 @@ final class AppServices: NSObject {
     // MARK: - Server lifecycle (proxied to ServerProcess)
 
     var hasServer: Bool { server != nil }
+
+    var canSaveSettingsOffline: Bool {
+        switch serverState {
+        case .stopped, .failed: return true
+        default: return false
+        }
+    }
 
     @discardableResult
     func startServer() throws -> ServerProcess.StartResult? {
@@ -211,14 +222,12 @@ final class AppServices: NSObject {
             self.config = updated
         }
 
-        // Fold a bundled port change into the same single restart. Mirrors
-        // applyServerEndpoint's persistence rule: the running Python server
-        // owns settings.json, so we only write AppConfig to disk when the
-        // server is offline. The HTTP client always needs the new endpoint.
+        // The child is stopped. Preserve the bundled port even if a storage
+        // save above rewrote the old endpoint from AppConfig.
         if let port {
             var updated = config
             updated.port = port
-            if server == nil { try updated.save() }
+            try AppConfig.saveServerEndpoint(basePath: updated.basePath, port: port)
             self.config = updated
             client.configure(host: updated.host, port: port, apiKey: updated.apiKey)
         }
@@ -386,36 +395,23 @@ final class AppServices: NSObject {
         }
     }
 
-    /// Persist a new host/port to AppConfig, reconfigure the running server
-    /// process, and bounce it. Without this, ServerScreenVM's port path in
-    /// `applyServerSettings` (and `saveHost` for Listen Address) would only
-    /// update the server's `settings.json`, but the next spawn still uses
-    /// the cached --host / --port arguments captured at app launch.
-    ///
-    /// The Python server is the canonical writer of `settings.json` while
-    /// it's running — the caller already PATCHed it before us, so we don't
-    /// double-write here. When the server is offline (wizard dropouts,
-    /// dev), we DO write so the next spawn reads the right values.
+    /// Apply an API-validated endpoint while live, or persist it for the next start.
     func applyServerEndpoint(host: String? = nil, port: Int? = nil) async throws {
+        let wasOffline = canSaveSettingsOffline
         let resolvedBindAddress = host ?? config.bindAddress
         let resolvedPort = port ?? config.port
-
-        var updated = config
-        updated.bindAddress = resolvedBindAddress
-        updated.port = resolvedPort
-        if server == nil {
-            try updated.save()
+        if wasOffline {
+            try AppConfig.saveServerEndpoint(basePath: config.basePath, host: host, port: port)
         }
-        self.config = updated
-
-        // The HTTP client uses the connectable host (normalises 0.0.0.0 → 127.0.0.1).
-        client.configure(host: updated.host, port: resolvedPort, apiKey: updated.apiKey)
-
         if let server {
             await server.stop()
             try server.reconfigure(bindAddress: resolvedBindAddress, port: resolvedPort)
-            _ = try server.start()
         }
+        var updated = config
+        updated.bindAddress = resolvedBindAddress
+        updated.port = resolvedPort
+        updateConfig(updated)
+        if !wasOffline { _ = try server?.start() }
     }
 
     deinit {

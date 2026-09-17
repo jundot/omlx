@@ -17,6 +17,18 @@ test establishes the contract those changes must keep stable.
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
+
+def _wait_for_file(path: Path, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
 
 class TestCacheStateAxisInfoDefault:
     """Default axis_info matches the legacy 2-tuple (keys, values) contract."""
@@ -170,8 +182,6 @@ class TestPagedSSDV3Format:
         """``(keys, values)`` legacy input round-trips as 2-tuple after V3
         polyfill on save and unwrap on load. Existing callers see no
         behavioral change."""
-        import time
-
         import mlx.core as mx
 
         manager = self._make_manager(tmp_path)
@@ -184,11 +194,7 @@ class TestPagedSSDV3Format:
         manager.save_block(
             block_hash, [(original_keys, original_values)], token_count=16
         )
-        # Wait for background write to settle so we exercise the disk path.
-        for _ in range(50):
-            if manager._get_file_path(block_hash).exists():
-                break
-            time.sleep(0.05)
+        assert _wait_for_file(manager._get_file_path(block_hash))
 
         loaded = manager.load_block(block_hash)
         assert loaded is not None
@@ -205,8 +211,6 @@ class TestPagedSSDV3Format:
     def test_v3_three_tuple_state_preserved_as_marker(self, tmp_path):
         """3-tuple state surfaces as ``__nstate__`` marker on load — the
         third element (which V2 silently dropped) is preserved."""
-        import time
-
         import mlx.core as mx
 
         manager = self._make_manager(tmp_path)
@@ -223,10 +227,7 @@ class TestPagedSSDV3Format:
         layer_marker = ("__nstate__", "PoolingCache", [elem0, elem1, elem2])
         manager.save_block(block_hash, [layer_marker], token_count=16)
 
-        for _ in range(50):
-            if manager._get_file_path(block_hash).exists():
-                break
-            time.sleep(0.05)
+        assert _wait_for_file(manager._get_file_path(block_hash))
 
         loaded = manager.load_block(block_hash)
         assert loaded is not None
@@ -249,8 +250,6 @@ class TestPagedSSDV3Format:
     def test_v3_safetensors_keys_use_state_k_naming(self, tmp_path):
         """V3 stores elements as ``layer_{i}_state_{k}`` with a count meta
         entry rather than the V2 ``layer_{i}_keys`` / ``layer_{i}_values``."""
-        import time
-
         import mlx.core as mx
 
         manager = self._make_manager(tmp_path)
@@ -258,12 +257,8 @@ class TestPagedSSDV3Format:
 
         cache_data = [(mx.zeros((1, 4, 4, 8)), mx.ones((1, 4, 4, 8)))]
         manager.save_block(block_hash, cache_data, token_count=4)
-        for _ in range(50):
-            file_path = manager._get_file_path(block_hash)
-            if file_path.exists():
-                break
-            time.sleep(0.05)
-        assert file_path.exists()
+        file_path = manager._get_file_path(block_hash)
+        assert _wait_for_file(file_path)
 
         loaded, meta = mx.load(str(file_path), return_metadata=True)
         # New V3 format
@@ -280,8 +275,6 @@ class TestPagedSSDV3Format:
     def test_unsupported_format_version_rejected(self, tmp_path):
         """Blocks declaring a format version outside the readable set are
         rejected on load (e.g. a future V4 block read by this V3 code)."""
-        import time
-
         import mlx.core as mx
         from safetensors import safe_open  # noqa: F401  # ensure pkg present
 
@@ -295,10 +288,7 @@ class TestPagedSSDV3Format:
             [(mx.zeros((1, 4, 4, 8)), mx.zeros((1, 4, 4, 8)))],
             token_count=4,
         )
-        for _ in range(50):
-            if manager._get_file_path(block_hash).exists():
-                break
-            time.sleep(0.05)
+        assert _wait_for_file(manager._get_file_path(block_hash))
 
         # Load file, inspect metadata. We cannot easily mutate the on-disk
         # safetensors header here without re-implementing the format, so

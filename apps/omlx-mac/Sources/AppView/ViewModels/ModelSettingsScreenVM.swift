@@ -37,6 +37,7 @@ final class ModelSettingsScreenVM {
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
         case qwen35AnePrefillSharedFraction
+        case qwen35OqA8Enabled, qwen35OqA8MinTokens
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
         case qwen35AnePrefillTailPaddingMinTokens
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
@@ -268,6 +269,13 @@ final class ModelSettingsScreenVM {
     var turboquantKvEnabled: Bool = false
     var turboquantKvBits: String = "4"
 
+    // Experimental: oQ mixed-bit INT8-activation prefill kernels. There is no
+    // layout to choose: the kernel reads the checkpoint's own packed weight
+    // stream, so it is both the fastest option and the one that costs no extra
+    // memory. The tile is picked per bit width by the dispatcher.
+    var qwen35OqA8Enabled: Bool = false
+    var qwen35OqA8MinTokens: String = "128"
+
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
     // These defaults are the measured M3 Ultra optimum for the 2,048-token
     // benchmark path. The feature itself remains opt-in.
@@ -297,6 +305,13 @@ final class ModelSettingsScreenVM {
     var aneTuningAllowANEGDN: Bool = true
     var aneTuningAllowCPUGDN: Bool = true
     var aneTuningAllowCPUSharedResource: Bool = true
+
+    // Header snapshot actions: reset / optimal (omlx.ai) / custom recipe.
+    var isApplyingSettings: Bool = false
+    var pendingReset: Bool = false
+    var applyOutcome: SettingsApplyOutcome?
+    /// Error shown inside the snapshot sheet so the user can retry.
+    var applyError: String?
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -367,6 +382,23 @@ final class ModelSettingsScreenVM {
         return .defaults
     }
 
+    func profileDisplayName(scope: ProfileScope, name: String) -> String {
+        let collection = scope == .model ? profiles : templates
+        return collection.first(where: { $0.name == name })?.displayName ?? name
+    }
+
+    var displayProfileState: ActiveProfileState {
+        switch activeProfileState {
+        case .named(let scope, let name):
+            return .named(scope: scope, name: profileDisplayName(scope: scope, name: name))
+        case .working(let basedOn):
+            return .working(basedOn: basedOn.map {
+                .init(scope: $0.scope, name: profileDisplayName(scope: $0.scope, name: $0.name))
+            })
+        case .defaults: return .defaults
+        }
+    }
+
     var isDiffusionModel: Bool {
         let type = (model?.configModelType ?? "")
             .lowercased()
@@ -408,7 +440,8 @@ final class ModelSettingsScreenVM {
             return true
         case .turboquantKvEnabled, .turboquantKvBits:
             return true
-        case .qwen35AnePrefillSharedFraction:
+        case .qwen35AnePrefillSharedFraction,
+             .qwen35OqA8Enabled, .qwen35OqA8MinTokens:
             return true
         case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength,
              .qwen35AnePrefillTailPaddingMinTokens:
@@ -500,7 +533,12 @@ final class ModelSettingsScreenVM {
     /// chat-template kwargs editor's add / remove buttons).
     func markProfileDirty() { self.profileDirty = true }
 
-    func load(modelID: String, client: OMLXClient) async {
+    private var loadSequence = 0
+
+    func load(modelID: String, client: OMLXClient, preservingEdits: Bool = false) async {
+        if preservingEdits && profileDirty { return }
+        loadSequence += 1
+        let sequence = loadSequence
         if self.modelID != modelID {
             aneTuningID = nil
             aneTuningIsRunning = false
@@ -509,6 +547,11 @@ final class ModelSettingsScreenVM {
         self.modelID = modelID
         do {
             let models = try await client.listModels().models
+            let profiles = try await client.listModelProfiles(id: modelID).profiles
+            let templates = try await client.listProfileTemplates().templates
+            let defaults = try await client.getGlobalSettings().sampling
+            guard sequence == loadSequence else { return }
+            if preservingEdits && profileDirty { return }
             self.allModels = models
             if let m = models.first(where: { $0.id == modelID }) {
                 self.model = m
@@ -557,6 +600,8 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
+                self.qwen35OqA8Enabled = s?.qwen35OqA8Enabled ?? false
+                self.qwen35OqA8MinTokens = s?.qwen35OqA8MinTokens.map(String.init) ?? "128"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
                 self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
@@ -603,9 +648,9 @@ final class ModelSettingsScreenVM {
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
                 self.activeProfileName = s?.activeProfileName
             }
-            self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
-            self.templates = (try? await client.listProfileTemplates().templates) ?? []
-            self.serverDefaultSampling = (try? await client.getGlobalSettings().sampling)
+            self.profiles = profiles
+            self.templates = templates
+            self.serverDefaultSampling = defaults
             // Resolve display scope from the source_template of the active
             // model profile (if any) — so applying the "Balanced" preset
             // lights up the Preset chip, not the local model copy.
@@ -713,6 +758,13 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillSharedFraction:
             guard validateAneWorkingSettings() else { return }
             patch.qwen35AnePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
+        case .qwen35OqA8Enabled:  patch.qwen35OqA8Enabled = qwen35OqA8Enabled
+        case .qwen35OqA8MinTokens:
+            guard let value = Int(qwen35OqA8MinTokens), value >= 1 else {
+                lastError = "oQ A8 minimum prompt tokens must be a positive integer."
+                return
+            }
+            patch.qwen35OqA8MinTokens = value
         case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
             guard validateAneWorkingSettings() else { return }
@@ -901,6 +953,12 @@ final class ModelSettingsScreenVM {
     func applyANETuningRecommendation() {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
         qwen35AnePrefillEnabled = recommendation.enabled
+        if recommendation.enabled {
+            // The two prefill accelerators are mutually exclusive, and the
+            // tuner's recommendation is the more specific answer here: it was
+            // measured on this model's own layers.
+            qwen35OqA8Enabled = false
+        }
         qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
         if let fraction = recommendation.mlpFraction { qwen35AnePrefillFraction = String(fraction) }
         if recommendation.backend == "k2" {
@@ -1030,6 +1088,11 @@ final class ModelSettingsScreenVM {
         return Self.dsaConfigModelTypes.contains(type)
     }
 
+    var isQwenOqA8Model: Bool {
+        let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
+    }
+
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
     /// Native Lightning MTP can't co-exist with the other speculative
@@ -1047,6 +1110,25 @@ final class ModelSettingsScreenVM {
                           comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
         return nil
+    }
+
+    /// The oQ INT8-activation kernels and ANE prefill both wrap the same
+    /// Qwen3.5 MLP call, so enabling both leaves whichever patched last in
+    /// charge and the other silently inert. The server rejects the pair; these
+    /// mirror that so the losing toggle disables itself and says why instead
+    /// of the save returning a 400 with the switch already flipped.
+    var qwen35OqA8ConflictReason: String? {
+        guard qwen35AnePrefillEnabled else { return nil }
+        return String(localized: "settings.qwen_oq_a8.conflict.ane",
+                      defaultValue: "Disable Qwen ANE Prefill before enabling INT8 activation prefill.",
+                      comment: "Tooltip / sublabel shown when INT8 activation prefill can't be enabled because ANE prefill is on")
+    }
+
+    var qwen35AnePrefillConflictReason: String? {
+        guard qwen35OqA8Enabled else { return nil }
+        return String(localized: "settings.qwen_ane.conflict.oq_a8",
+                      defaultValue: "Disable Qwen INT8 Activation Prefill before enabling ANE prefill.",
+                      comment: "Tooltip / sublabel shown when ANE prefill can't be enabled because INT8 activation prefill is on")
     }
 
     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
@@ -1175,6 +1257,10 @@ final class ModelSettingsScreenVM {
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
             }
+            putBool(ProfileSettingsKey.qwen35OqA8Enabled, qwen35OqA8Enabled)
+            if qwen35OqA8Enabled {
+                putInt(ProfileSettingsKey.qwen35OqA8MinTokens, qwen35OqA8MinTokens)
+            }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {
                 putInt(ProfileSettingsKey.qwen35AnePrefillSequenceLength, qwen35AnePrefillSequenceLength)
@@ -1258,6 +1344,7 @@ final class ModelSettingsScreenVM {
     /// receives the bundle entry directly since presets aren't stored as
     /// server templates.
     func applyChip(scope: ProfileScope, name: String, client: OMLXClient) async {
+        let targetModelID = modelID
         do {
             switch scope {
             case .preset:
@@ -1266,44 +1353,25 @@ final class ModelSettingsScreenVM {
                 // hit a template lookup that's guaranteed to miss.
                 return
             case .model:
-                _ = try await client.applyModelProfile(id: modelID, name: name)
+                _ = try await client.applyModelProfile(id: targetModelID, name: name)
             case .global:
-                // Templates aren't directly applicable — seed a model
-                // profile from the template, then apply it. Reuse the
-                // template's name; if a same-named model profile already
-                // exists we leave it alone (server returns 409, we
-                // silently fall through to apply).
-                if !self.profiles.contains(where: { $0.name == name }) {
-                    if let tpl = self.templates.first(where: { $0.name == name }) {
-                        _ = try? await client.createModelProfile(
-                            id: modelID,
-                            body: CreateProfileRequest(
-                                name: tpl.name,
-                                displayName: tpl.displayName,
-                                description: tpl.description,
-                                sourceTemplate: tpl.name,
-                                settings: tpl.settings
-                            )
-                        )
-                    }
-                }
-                _ = try await client.applyModelProfile(id: modelID, name: name)
+                _ = try await client.applyModelTemplate(id: targetModelID, name: name)
             }
-            await load(modelID: modelID, client: client)
+            if modelID == targetModelID {
+                await load(modelID: targetModelID, client: client)
+            }
         } catch {
             self.lastError = error.omlxDescription
         }
     }
 
     /// Rename a global template via PUT /api/profile-templates/{name}.
-    /// Server validates the slug + duplicate; we already pre-checked
-    /// in ProfileGroup, but the server stays the source of truth for
-    /// the activated state — reload after success.
+    /// Keep the internal reference stable when editing the display name.
     func renameTemplate(from original: String, to renamed: String, client: OMLXClient) async {
         do {
             _ = try await client.updateProfileTemplate(
                 name: original,
-                body: UpdateTemplateRequest(newName: renamed)
+                body: UpdateTemplateRequest(displayName: renamed)
             )
             await load(modelID: modelID, client: client)
         } catch {
@@ -1312,14 +1380,13 @@ final class ModelSettingsScreenVM {
     }
 
     /// Rename a per-model profile via PUT /api/models/{id}/profiles/{name}.
-    /// If the renamed profile was active, the server carries the active
-    /// pointer to the new name; reload to pick that up.
+    /// Editing the display name leaves the active reference and API ID intact.
     func renameModelProfile(from original: String, to renamed: String, client: OMLXClient) async {
         do {
             _ = try await client.updateModelProfile(
                 id: modelID,
                 name: original,
-                body: UpdateProfileRequest(newName: renamed)
+                body: UpdateProfileRequest(displayName: renamed)
             )
             await load(modelID: modelID, client: client)
         } catch {
@@ -1369,13 +1436,100 @@ final class ModelSettingsScreenVM {
         }
     }
 
+
+    // MARK: - Snapshot actions
+
+    func resetDefaults(client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        defer { isApplyingSettings = false }
+        do {
+            _ = try await client.resetModelSettings(id: modelID)
+            await load(modelID: modelID, client: client)
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
+    func loadOptimalCandidates(client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        applyOutcome = .optimalCandidates(nil)
+        defer { isApplyingSettings = false }
+        do {
+            let candidates = try await client.listOptimalCandidates(id: modelID)
+            applyOutcome = .optimalCandidates(candidates)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    func applyOptimalCandidate(_ benchmarkId: String, client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        defer { isApplyingSettings = false }
+        do {
+            let result = try await client.applyOptimalCandidate(id: modelID, benchmarkId: benchmarkId)
+            await load(modelID: modelID, client: client)
+            applyOutcome = .optimal(result)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    func applyRecipe(_ recipe: String, client: OMLXClient) async {
+        let text = recipe.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        defer { isApplyingSettings = false }
+        do {
+            let result = try await client.applyRecipe(id: modelID, recipe: text)
+            await load(modelID: modelID, client: client)
+            applyOutcome = .recipe(result)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    /// One line per skipped feature for the result sheet.
+    nonisolated static func summarizeSkipped(_ skipped: [SkippedFeatureDTO]?) -> [String] {
+        (skipped ?? []).map { "\($0.feature): \($0.reason)" }
+    }
+
+    /// Pretty JSON of the applied values, keys sorted so the sheet is stable.
+    nonisolated static func appliedJSON(_ applied: [String: AnyCodable]?) -> String {
+        guard let applied, !applied.isEmpty else { return "{}" }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(applied),
+              let text = String(data: data, encoding: .utf8) else { return "{}" }
+        return text
+    }
+
+    /// "PP 1309.1 tok/s · TG 59.6 tok/s · 128 GB · 4bit · oMLX 0.7.0" for a candidate row.
+    nonisolated static func candidateStats(pp: Double?, tg: Double?, memoryGb: Int? = nil,
+                                           quantization: String?, omlxVersion: String?) -> String {
+        var parts: [String] = []
+        if let pp { parts.append(String(format: "PP %.1f tok/s", pp)) }
+        if let tg { parts.append(String(format: "TG %.1f tok/s", tg)) }
+        if let memoryGb { parts.append("\(memoryGb) GB") }
+        if let quantization, !quantization.isEmpty { parts.append(quantization) }
+        if let omlxVersion, !omlxVersion.isEmpty { parts.append("oMLX \(omlxVersion)") }
+        return parts.joined(separator: " · ")
+    }
+
     /// Save the current working settings as a new profile (model scope)
     /// or template (global scope), then activate it. Used by both the
     /// Active Profile banner's "Save as new" and a chip group's
     /// "Save current as new" pill.
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
-        let cleanName = name.trimmingCharacters(in: .whitespaces)
-        guard !cleanName.isEmpty, scope != .preset else { return }
+        let targetModelID = modelID
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName = "p-" + UUID().uuidString.lowercased().prefix(28)
+        guard !displayName.isEmpty, scope != .preset else { return }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
@@ -1384,35 +1538,31 @@ final class ModelSettingsScreenVM {
                 _ = try await client.createProfileTemplate(
                     body: CreateTemplateRequest(
                         name: cleanName,
-                        displayName: cleanName,
+                        displayName: displayName,
                         description: nil,
-                        settings: settings
-                    )
-                )
-                // Seed a per-model profile from the new template and apply it.
-                _ = try? await client.createModelProfile(
-                    id: modelID,
-                    body: CreateProfileRequest(
-                        name: cleanName,
-                        displayName: cleanName,
-                        sourceTemplate: cleanName,
                         settings: settings
                     )
                 )
             case .model:
                 _ = try await client.createModelProfile(
-                    id: modelID,
+                    id: targetModelID,
                     body: CreateProfileRequest(
                         name: cleanName,
-                        displayName: cleanName,
+                        displayName: displayName,
                         settings: settings
                     )
                 )
             case .preset:
                 return
             }
-            _ = try await client.applyModelProfile(id: modelID, name: cleanName)
-            await load(modelID: modelID, client: client)
+            if scope == .global {
+                _ = try await client.applyModelTemplate(id: targetModelID, name: cleanName)
+            } else {
+                _ = try await client.applyModelProfile(id: targetModelID, name: cleanName)
+            }
+            if modelID == targetModelID {
+                await load(modelID: targetModelID, client: client)
+            }
         } catch {
             self.lastError = error.omlxDescription
         }
@@ -1422,6 +1572,7 @@ final class ModelSettingsScreenVM {
     /// settings. Used by the Active Profile banner's "Update X" and the
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
+        let targetModelID = modelID
         guard scope != .preset else { return }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
@@ -1432,18 +1583,9 @@ final class ModelSettingsScreenVM {
                     name: name,
                     body: UpdateTemplateRequest(settings: settings)
                 )
-                // Update the same-named model profile too so the next
-                // /apply lands the latest settings.
-                if self.profiles.contains(where: { $0.name == name }) {
-                    _ = try? await client.updateModelProfile(
-                        id: modelID,
-                        name: name,
-                        body: UpdateProfileRequest(settings: settings)
-                    )
-                }
             case .model:
                 _ = try await client.updateModelProfile(
-                    id: modelID,
+                    id: targetModelID,
                     name: name,
                     body: UpdateProfileRequest(settings: settings)
                 )
@@ -1452,10 +1594,16 @@ final class ModelSettingsScreenVM {
             }
             // If this profile is the active one, re-apply so the runtime
             // picks up the new values; if not, just reload.
-            if activeProfileName == name {
-                _ = try? await client.applyModelProfile(id: modelID, name: name)
+            if activeProfileName == name && activeProfileScope == scope {
+                if scope == .global {
+                    _ = try await client.applyModelTemplate(id: targetModelID, name: name)
+                } else {
+                    _ = try await client.applyModelProfile(id: targetModelID, name: name)
+                }
             }
-            await load(modelID: modelID, client: client)
+            if modelID == targetModelID {
+                await load(modelID: targetModelID, client: client)
+            }
         } catch {
             self.lastError = error.omlxDescription
         }
@@ -1518,12 +1666,12 @@ final class ModelSettingsScreenVM {
     func suggestSaveAsName() -> String {
         let base: String
         if case .working(let basedOn) = activeProfileState, let basedOn {
-            base = "\(basedOn.name)-copy"
+            base = "\(profileDisplayName(scope: basedOn.scope, name: basedOn.name))-copy"
         } else {
             base = "profile-1"
         }
         let taken = Set(
-            templates.map(\.name) + profiles.map(\.name)
+            templates.map(\.displayName) + profiles.map(\.displayName)
         )
         if !taken.contains(base) { return base }
         var n = 2
@@ -1575,23 +1723,8 @@ final class ModelSettingsScreenVM {
     }
 
     func applyTemplate(template: ProfileDTO, client: OMLXClient) async {
-        do {
-            _ = try await client.createModelProfile(
-                id: modelID,
-                body: CreateProfileRequest(
-                    name: template.name,
-                    displayName: template.displayName,
-                    description: template.description,
-                    sourceTemplate: template.name,
-                    settings: template.settings
-                )
-            )
-            self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
-        } catch {
-            self.lastError = error.omlxDescription
-        }
+        await applyChip(scope: .global, name: template.name, client: client)
     }
-
 
     /// `4.0` → `"4"`, `2.5` → `"2.5"`. The TurboQuant Popup options are
     /// declared as strings; preserving an integral display avoids the
@@ -1749,4 +1882,13 @@ enum QwenAneSettingsValidator {
         }
         return .success(value)
     }
+}
+
+/// Sheet state for the header snapshot actions on ModelSettingsScreen.
+/// `optimalCandidates(nil)` is the loading state while omlx.ai is queried.
+enum SettingsApplyOutcome {
+    case recipeInput
+    case optimalCandidates(OptimalCandidatesDTO?)
+    case optimal(SettingsApplyResultDTO)
+    case recipe(SettingsApplyResultDTO)
 }

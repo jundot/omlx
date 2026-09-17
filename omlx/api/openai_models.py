@@ -13,7 +13,7 @@ These models define the request and response schemas for:
 import json
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 from omlx.api.shared_models import (
     BaseUsage,
@@ -203,6 +203,37 @@ class FunctionCall(BaseModel):
         return _coerce_tool_call_arguments(v)
 
 
+def _normalize_tool_namespace(value: Any) -> Any:
+    """Represent explicit tool namespaces in the OpenAI function name."""
+    if not isinstance(value, dict) or not isinstance(value.get("function"), dict):
+        return value
+    function = value["function"]
+    namespace = value.get("namespace", function.get("namespace"))
+    if namespace is None:
+        return value
+    description = namespace.get("description") if isinstance(namespace, dict) else None
+    if description is not None and not isinstance(description, str):
+        raise ValueError("Tool namespace description must be a string")
+    namespace = namespace.get("name") if isinstance(namespace, dict) else namespace
+    if not isinstance(namespace, str) or not namespace or "::" in namespace:
+        raise ValueError("Tool namespace must be a nonempty name without '::'")
+    name = function.get("name", "")
+    if not isinstance(name, str) or not name:
+        raise ValueError("Namespaced tool requires a function name")
+    if "::" in name:
+        prefix, name = name.split("::", 1)
+        if prefix != namespace or not name or "::" in name:
+            raise ValueError("Conflicting tool namespace and qualified name")
+    function = {**function, "name": f"{namespace}::{name}"}
+    function.pop("namespace", None)
+    if description:
+        function_description = function.get("description")
+        if function_description is not None and not isinstance(function_description, str):
+            raise ValueError("Tool function description must be a string")
+        function["description"] = description + "\n" + (function_description or "")
+    return {**value, "function": function}
+
+
 class ToolCall(BaseModel):
     """A tool call from the model."""
 
@@ -210,12 +241,22 @@ class ToolCall(BaseModel):
     type: str = "function"
     function: FunctionCall
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_namespace(cls, value: Any) -> Any:
+        return _normalize_tool_namespace(value)
+
 
 class ToolDefinition(BaseModel):
     """Definition of a tool that can be called by the model."""
 
     type: str = "function"
     function: dict
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_namespace(cls, value: Any) -> Any:
+        return _normalize_tool_namespace(value)
 
 
 # =============================================================================
@@ -314,6 +355,8 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Top-level alias used by OpenAI-compatible clients.
+    enable_thinking: Optional[bool] = None
     # OpenAI-compatible reasoning depth; forwarded to the chat template.
     # Numbers stay numbers: models like Inkling take a numeric effort
     # (0.1-0.99) while Qwen3.8 uses strings ("low".."xhigh") — each chat
@@ -337,6 +380,22 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="after")
+    def normalize_top_level_enable_thinking(self) -> "ChatCompletionRequest":
+        """Preserve the alias and reject contradictory request controls."""
+        if self.enable_thinking is None:
+            return self
+        template_kwargs = dict(self.chat_template_kwargs or {})
+        if "enable_thinking" in template_kwargs and (
+            template_kwargs["enable_thinking"] is not self.enable_thinking
+        ):
+            raise ValueError(
+                "enable_thinking conflicts with chat_template_kwargs.enable_thinking"
+            )
+        template_kwargs["enable_thinking"] = self.enable_thinking
+        self.chat_template_kwargs = template_kwargs
+        return self
 
 
 class AssistantMessage(BaseModel):

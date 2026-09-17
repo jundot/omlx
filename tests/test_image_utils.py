@@ -3,6 +3,9 @@
 
 import base64
 import io
+import struct
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -513,3 +516,431 @@ class TestComputePerImageHashes:
     def test_empty_returns_empty(self):
         """Empty list returns empty list."""
         assert compute_per_image_hashes([]) == []
+
+
+# =============================================================================
+# Tests: load_image decode cache
+#
+# Regression for the multi-turn agent TTFT cliff: an agent loop resends the
+# same historical screenshots on every turn, and load_image re-ran the
+# CPU-bound PNG/JPEG decode for every one of them each turn. Decoded images
+# are now cached by content hash so repeated turns skip the re-decode.
+# =============================================================================
+
+
+def _unique_image(seed: int, width: int = 24, height: int = 24) -> Image.Image:
+    """Build an RGB image whose pixel bytes are unique to ``seed``."""
+    import random
+
+    rng = random.Random(seed)
+    data = bytes(rng.getrandbits(8) for _ in range(width * height * 3))
+    return Image.frombytes("RGB", (width, height), data)
+
+
+class TestLoadImageDecodeCache:
+    """Decoded images are cached by content hash across load_image calls."""
+
+    def setup_method(self):
+        from omlx.utils.image import clear_image_decode_cache
+
+        clear_image_decode_cache()
+
+    def test_identical_image_decoded_once_across_calls(self):
+        """Same bytes on a later turn must not re-open/re-decode the image."""
+        uri = "data:image/png;base64," + _image_to_base64(_unique_image(1))
+        real_open = Image.open
+        calls = {"n": 0}
+
+        def counting_open(*args, **kwargs):
+            calls["n"] += 1
+            return real_open(*args, **kwargs)
+
+        with patch("omlx.utils.image.Image.open", side_effect=counting_open):
+            first = load_image(uri)
+            second = load_image(uri)
+
+        assert calls["n"] == 1
+        assert first.size == second.size == (24, 24)
+        assert first.tobytes() == second.tobytes()
+
+    def test_distinct_images_each_decoded(self):
+        """Different bytes decode independently (no false cache hits)."""
+        uri_a = "data:image/png;base64," + _image_to_base64(_unique_image(2))
+        uri_b = "data:image/png;base64," + _image_to_base64(_unique_image(3))
+        real_open = Image.open
+        calls = {"n": 0}
+
+        def counting_open(*args, **kwargs):
+            calls["n"] += 1
+            return real_open(*args, **kwargs)
+
+        with patch("omlx.utils.image.Image.open", side_effect=counting_open):
+            load_image(uri_a)
+            load_image(uri_b)
+            load_image(uri_a)  # cache hit, no new decode
+
+        assert calls["n"] == 2
+
+    def test_clear_forces_redecode(self):
+        """clear_image_decode_cache() drops entries so the next load decodes."""
+        uri = "data:image/png;base64," + _image_to_base64(_unique_image(4))
+        real_open = Image.open
+        calls = {"n": 0}
+
+        def counting_open(*args, **kwargs):
+            calls["n"] += 1
+            return real_open(*args, **kwargs)
+
+        with patch("omlx.utils.image.Image.open", side_effect=counting_open):
+            load_image(uri)
+            load_image(uri)
+            from omlx.utils.image import clear_image_decode_cache
+
+            clear_image_decode_cache()
+            load_image(uri)
+
+        assert calls["n"] == 2
+
+    def test_cached_pixels_match_source(self):
+        """A cache hit returns pixels identical to a cold decode."""
+        src = _unique_image(5)
+        uri = "data:image/png;base64," + _image_to_base64(src)
+        cold = load_image(uri)
+        warm = load_image(uri)
+        assert cold.mode == warm.mode == "RGB"
+        assert cold.tobytes() == warm.tobytes()
+
+
+class TestDecodeCacheFollowup:
+    @pytest.fixture(autouse=True)
+    def isolate_cache(self):
+        from omlx.utils.image import clear_image_decode_cache
+
+        clear_image_decode_cache()
+        yield
+        clear_image_decode_cache()
+
+    def test_rgb_storage_budget_evicts_at_four_bytes_per_pixel(self, monkeypatch):
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(
+            module,
+            "_IMAGE_DECODE_CACHE_MAX_BYTES",
+            (4 * 24 * 24 + 24 * struct.calcsize("P")),
+        )
+        sources = [
+            "data:image/png;base64," + _image_to_base64(_unique_image(seed))
+            for seed in (91, 92)
+        ]
+        load_image(sources[0])
+        assert module._image_decode_cache_bytes == (
+            4 * 24 * 24 + 24 * struct.calcsize("P")
+        )
+        load_image(sources[1])
+        with patch.object(Image, "open", wraps=Image.open) as opened:
+            load_image(sources[0])
+        assert opened.call_count == 1
+
+    def test_over_capacity_history_preserves_hits_and_image_order(self, monkeypatch):
+        from omlx.utils import image as module
+
+        # Three screenshots with room for only two decoded images.
+        monkeypatch.setattr(
+            module,
+            "_IMAGE_DECODE_CACHE_MAX_BYTES",
+            2 * (4 * 24 * 24 + 24 * struct.calcsize("P")),
+        )
+        originals = [_unique_image(seed) for seed in (101, 102, 103)]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64," + _image_to_base64(img)
+                        },
+                    },
+                ],
+            }
+            for img in originals
+        ]
+        extract_images_from_messages(messages)
+        for _ in range(3):
+            with patch.object(Image, "open", wraps=Image.open) as opened:
+                text, images, audio = extract_images_from_messages(messages)
+            assert opened.call_count == 1
+            assert [img.tobytes() for img in images] == [
+                img.tobytes() for img in originals
+            ]
+            assert text == [{"role": "user", "content": "Describe"}] * 3
+            assert audio == []
+            assert module._image_decode_cache_bytes <= 2 * (
+                4 * 24 * 24 + 24 * struct.calcsize("P")
+            )
+
+    def test_clear_during_decode_does_not_repopulate_cache(self):
+        from omlx.utils import image as module
+
+        entered, resume = Event(), Event()
+        original = _unique_image(201)
+        source = "data:image/png;base64," + _image_to_base64(original)
+        real_open = Image.open
+
+        def blocked_open(*args, **kwargs):
+            entered.set()
+            assert resume.wait(5)
+            return real_open(*args, **kwargs)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                with patch.object(Image, "open", side_effect=blocked_open):
+                    future = pool.submit(load_image, source)
+                    assert entered.wait(5)
+                    module.clear_image_decode_cache()
+                    resume.set()
+                    image = future.result(timeout=5)
+            finally:
+                resume.set()
+        assert image.tobytes() == original.tobytes()
+        assert not module._image_decode_cache
+        assert module._image_decode_cache_bytes == 0
+        load_image(source)
+        assert module._image_decode_cache
+
+    def test_concurrent_duplicate_inserts_keep_exact_budget(self):
+        from omlx.utils import image as module
+
+        barrier = Barrier(4)
+        real_open = Image.open
+        original = _unique_image(301)
+        source = "data:image/png;base64," + _image_to_base64(original)
+
+        def concurrent_open(*args, **kwargs):
+            barrier.wait(timeout=5)
+            return real_open(*args, **kwargs)
+
+        with (
+            patch.object(Image, "open", side_effect=concurrent_open),
+            ThreadPoolExecutor(max_workers=4) as pool,
+        ):
+            images = list(pool.map(load_image, [source] * 4))
+        assert all(image.tobytes() == original.tobytes() for image in images)
+        assert len(module._image_decode_cache) == 1
+        assert module._image_decode_cache_bytes == (
+            4 * 24 * 24 + 24 * struct.calcsize("P")
+        )
+
+    def test_oversized_image_is_returned_without_evicting_existing_hit(
+        self, monkeypatch
+    ):
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "_IMAGE_DECODE_CACHE_MAX_BYTES", 2500)
+        small = "data:image/png;base64," + _image_to_base64(_unique_image(401))
+        large = "data:image/png;base64," + _image_to_base64(_unique_image(402, 48, 48))
+        load_image(small)
+        assert load_image(large).size == (48, 48)
+        with patch.object(Image, "open", wraps=Image.open) as opened:
+            load_image(small)
+        assert opened.call_count == 0
+        assert len(module._image_decode_cache) == 1
+
+
+# =============================================================================
+# Tests: Image size validation and downscaling (Issue #3650)
+# =============================================================================
+
+
+class TestImageSizeAndDownscaling:
+    """Tests for payload size limits, decompression bomb guards, and aspect downscaling."""
+
+    @pytest.fixture(autouse=True)
+    def isolate_cache(self):
+        from omlx.utils.image import clear_image_decode_cache
+
+        clear_image_decode_cache()
+        yield
+        clear_image_decode_cache()
+
+    def test_rejects_oversized_payload(self, monkeypatch):
+        """Images exceeding max payload bytes are rejected before decode."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_bytes", lambda: 100)
+        img = _make_test_image(64, 64, "blue")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum allowed limit"):
+            load_image(uri)
+
+    def test_rejects_oversized_encoded_length_early(self, monkeypatch):
+        """Massive base64 strings are rejected early before b64decode."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_bytes", lambda: 100)
+        fake_b64 = "A" * 2000
+        uri = f"data:image/png;base64,{fake_b64}"
+
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum allowed limit"):
+            load_image(uri)
+
+    def test_downscales_oversized_width_preserving_aspect(self, monkeypatch):
+        """Wide image exceeding max side length is downscaled preserving aspect ratio."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 1024)
+        img = _make_test_image(2048, 1024, "red")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (1024, 512)
+
+    def test_downscales_oversized_height_preserving_aspect(self, monkeypatch):
+        """Tall image exceeding max side length is downscaled preserving aspect ratio."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 1024)
+        img = _make_test_image(1024, 2048, "green")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (512, 1024)
+
+    def test_preserves_dimensions_within_limit(self, monkeypatch):
+        """Images within limits are not resized."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 2048)
+        img = _make_test_image(800, 600, "yellow")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (800, 600)
+
+    def test_downscaling_disabled_when_side_limit_zero(self, monkeypatch):
+        """Setting max side length to 0 disables downscaling."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 0)
+        img = _make_test_image(3000, 1500, "purple")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (3000, 1500)
+
+    def test_decompression_bomb_raises_invalid_request_error(self, monkeypatch):
+        """Decompression bombs detected by Pillow raise InvalidRequestError."""
+        from PIL import Image as PILImage
+
+        monkeypatch.setattr(PILImage, "MAX_IMAGE_PIXELS", 50)
+        img = _make_test_image(20, 20, "red")  # 400 pixels > 50
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        with pytest.raises(InvalidRequestError, match="decompression bomb detected"):
+            load_image(uri)
+
+    def test_extract_images_from_messages_downscales_oversized(self, monkeypatch):
+        """extract_images_from_messages downscales oversized images in messages."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 512)
+        img = _make_test_image(1024, 512, "blue")
+        b64 = _image_to_base64(img)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                    {"type": "text", "text": "Describe"},
+                ],
+            }
+        ]
+
+        text_msgs, images, audio = extract_images_from_messages(messages)
+        assert len(images) == 1
+        assert images[0].size == (512, 256)
+
+    def test_extract_images_from_messages_rejects_oversized_payload(self, monkeypatch):
+        """extract_images_from_messages rejects images exceeding payload limits."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_bytes", lambda: 100)
+        img = _make_test_image(64, 64, "blue")
+        b64 = _image_to_base64(img)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum allowed limit"):
+            extract_images_from_messages(messages)
+
+    def test_cache_stores_downscaled_image_and_accounts_accurately(self, monkeypatch):
+        """Cache holds downscaled image and byte accounting reflects downscaled size."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 100)
+        img = _make_test_image(400, 200, "cyan")
+        b64 = _image_to_base64(img)
+        uri = f"data:image/png;base64,{b64}"
+
+        loaded = load_image(uri)
+        assert loaded.size == (100, 50)
+        expected_bytes = module._decoded_pixel_bytes(loaded)
+        assert module._image_decode_cache_bytes == expected_bytes
+
+        # Subsequent fetch hits cache without redecoding
+        with patch.object(Image, "open", wraps=Image.open) as opened:
+            cached = load_image(uri)
+        assert opened.call_count == 0
+        assert cached.size == (100, 50)
+
+    @pytest.mark.parametrize("cli_override", [False, True])
+    def test_resolved_settings_control_image_processing(
+        self, monkeypatch, tmp_path, cli_override
+    ):
+        from argparse import Namespace
+
+        from omlx import settings as settings_module
+        from omlx.utils.image import get_max_image_bytes, get_max_image_side_length
+
+        monkeypatch.setattr(settings_module, "_global_settings", None)
+        monkeypatch.setenv("OMLX_MAX_IMAGE_UPLOAD_SIZE", "20MB")
+        monkeypatch.setenv("OMLX_MAX_IMAGE_SIDE_LENGTH", "1500")
+        args = Namespace(max_image_upload_size="30MB", max_image_side_length=512)
+        settings_module.init_settings(
+            base_path=tmp_path, cli_args=args if cli_override else None
+        )
+        side = 512 if cli_override else 1500
+        assert get_max_image_bytes() == (30 if cli_override else 20) * 1024 * 1024
+        assert get_max_image_side_length() == side
+        uri = "data:image/png;base64," + _image_to_base64(
+            _make_test_image(3000, 1500, "blue")
+        )
+        assert load_image(uri).size == (side, side // 2)
+
+    def test_uninitialized_settings_use_defaults(self, monkeypatch):
+        from omlx import settings as settings_module
+        from omlx.utils.image import get_max_image_bytes, get_max_image_side_length
+
+        monkeypatch.setattr(settings_module, "_global_settings", None)
+        assert get_max_image_bytes() == 50 * 1024 * 1024
+        assert get_max_image_side_length() == 2048

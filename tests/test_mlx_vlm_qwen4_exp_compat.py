@@ -1180,7 +1180,8 @@ def test_qwen4_lightning_mtp_fusion_and_runtime_attachment(tmp_path):
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
-def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
+@pytest.mark.parametrize("mtp_num_experts", [None, 6, 3])
+def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path, mtp_num_experts):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
@@ -1197,15 +1198,16 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
                     tie_word_embeddings=False,
                     num_hidden_layers=1,
                     num_experts=4,
+                    mtp_num_experts=mtp_num_experts,
                 )
             )
         )
         weights = {}
-        for root in (
-            "model.language_model.layers.0.mlp",
-            "mtp.layers.0.mlp",
+        for root, count in (
+            ("model.language_model.layers.0.mlp", 4),
+            ("mtp.layers.0.mlp", mtp_num_experts or 4),
         ):
-            for expert in range(4):
+            for expert in range(count):
                 for projection in ("gate_proj", "up_proj", "down_proj"):
                     key = f"{root}.experts.{expert}.{projection}.weight"
                     weights[key] = mx.to_fp8(mx.ones((2, 2), dtype=mx.float32))
@@ -1216,7 +1218,8 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
         base_key = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
         mtp_key = "mtp.layers.0.mlp.switch_mlp.gate_proj.weight"
         assert result[base_key].shape == (4, 2, 2)
-        assert result[mtp_key].shape == (4, 2, 2)
+        assert result[mtp_key].shape == (mtp_num_experts or 4, 2, 2)
+        assert not any(".experts." in key for key in result)
         assert result[base_key].dtype == mx.bfloat16
         assert not any(key.endswith("weight_scale_inv") for key in result)
     finally:
@@ -1914,3 +1917,24 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
     embedding.prefetch(mx.array([[4]], dtype=mx.int32))
     assert not embedding._pending
     embedding.close()
+
+
+def test_mtp_batched_positions_match_for_identical_rows():
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpMTPModule
+    import mlx.nn as nn
+
+    mx.random.seed(17)
+    head = Qwen4ExpMTPModule(config)
+    head.eval()
+    embed = nn.Embedding(config.vocab_size, config.hidden_size)
+    hidden = mx.repeat(
+        mx.random.normal((1, 5, config.hidden_size * config.hc_count)), 2, axis=0
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]])
+    cache = [QSAKVCache()]
+    for _ in range(2):
+        output, _ = head(hidden, tokens, embed, cache)
+        mx.eval(output)
+        assert mx.allclose(output[0], output[1], atol=1e-6).item()
+    assert cache[0].offset == 10

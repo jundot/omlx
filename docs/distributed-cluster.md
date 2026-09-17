@@ -125,9 +125,11 @@ with HMAC-SHA256; an unkeyed or altered token is rejected.
 ### CUDA Worker Enrollment
 
 The CUDA card is the normal Linux path; the older two-dashboard key exchange is
-only for peer Macs. The coordinator must listen on a LAN-reachable address. If
-the dashboard URL uses localhost, set **Settings > Server host** to `0.0.0.0`,
-restart oMLX, and enter the Studio's private IPv4 address in the card.
+only for peer Macs. The coordinator must listen on a LAN-reachable address.
+Configure the main API key first, or save it together with **Settings > Server
+host** set to `0.0.0.0`. Then restart oMLX and enter the Studio's private IPv4
+address in the card. oMLX refuses a non-loopback bind until an API key is
+configured.
 
 Select **Generate join command**, copy it, and paste it into one CUDA worker. The
 command expires after thirty minutes and can be claimed only once. It may ask for

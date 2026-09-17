@@ -581,11 +581,9 @@ def test_failed_cancellation_keeps_proof_for_retry(tmp_path):
         raise OSError("coordinator offline")
 
     joiner._http_post = disconnected
-    from omlx.cluster.pairing import PairingRequestError
-
-    with pytest.raises(PairingRequestError):
-        joiner.ui_session.cancel()
-    assert joiner.ui_session.snapshot()["state"] == "error"
+    result = joiner.ui_session.cancel()
+    assert result["state"] == "idle"
+    assert result["cleanup_pending"] is True
     assert coordinator.pending_requests()
     joiner._http_post = original
     assert joiner.ui_session.cancel()["state"] == "idle"

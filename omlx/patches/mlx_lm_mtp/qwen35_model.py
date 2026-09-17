@@ -85,6 +85,7 @@ def apply() -> bool:
         logger.debug("mlx_lm.models.qwen3_5 not importable; skipping MTP patch")
         return False
 
+    q35.TextModel._omlx_mtp_multi_request = True
     # Skip if upstream already merged PR 990: TextModel already has mtp_forward.
     if hasattr(q35.TextModel, "mtp_forward") and not hasattr(
         q35.TextModel, "_omlx_mtp_patched"

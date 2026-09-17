@@ -18,6 +18,7 @@ import copy
 import gc
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -206,7 +207,7 @@ class EngineEntry:
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     runtime_estimated_size: int | None = None  # Includes active load-time variants
-    runtime_settle_size: int | None = None  # Excludes K2 ANE admission headroom
+    runtime_settle_size: int | None = None  # Excludes K2 ANE storage
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -307,6 +308,7 @@ class EnginePool:
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._unloading_models: set[str] = set()
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -355,7 +357,7 @@ class EnginePool:
         base_size: int | None = None,
         include_ane_reservation: bool = True,
     ) -> int:
-        """Include runtime storage and optional K2 ANE admission headroom."""
+        """Include Engram runtime storage and optional K2 ANE reservations."""
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
@@ -363,8 +365,22 @@ class EnginePool:
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
             entry, runtime_settings
         )
-        if qwen4_offload and qwen4_estimate is not None:
-            base = min(base, qwen4_estimate.mmap_bytes)
+        if qwen4_estimate is not None:
+            base = min(
+                base,
+                qwen4_estimate.mmap_bytes
+                if qwen4_offload
+                else qwen4_estimate.resident_bytes,
+            )
+        v41_offload, _, v41_estimate = self._deepseek_v41_engram_offload_status(
+            entry, runtime_settings
+        )
+        if v41_estimate is not None:
+            base = (
+                v41_estimate.mmap_bytes
+                if v41_offload
+                else v41_estimate.resident_bytes
+            )
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -399,6 +415,26 @@ class EnginePool:
                 shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
                 width=runtime_settings.qwen35_ane_prefill_sequence_length,
             )
+        if getattr(runtime_settings, "moe_expert_offload_enabled", False):
+            from .patches.moe_expert_offload import estimate_offload_admission_bytes
+
+            fraction = runtime_settings.moe_expert_offload_resident_fraction
+            if entry.config_model_type == "deepseek_v41":
+                if (
+                    v41_estimate is None
+                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+                ):
+                    from .patches.deepseek_v41.moe_offload import (
+                        estimate_expert_savings,
+                    )
+
+                    base = max(
+                        0, base - estimate_expert_savings(entry.model_path, fraction)
+                    )
+            elif qwen4_estimate is None:
+                base = estimate_offload_admission_bytes(
+                    entry.model_path, base, fraction
+                )
         return base + extra
 
     def _qwen4_ple_offload_status(
@@ -419,6 +455,23 @@ class EnginePool:
             )
 
             estimate = qwen4_exp_residency_estimate(entry.model_path)
+            if getattr(settings, "moe_expert_offload_enabled", False):
+                from .patches.moe_expert_offload import estimate_offload_admission_bytes
+
+                fraction = settings.moe_expert_offload_resident_fraction
+                # Price expert residency before deciding whether PLE must use SSD.
+                # The entry projection consumes these adjusted estimates once.
+                saved = estimate.checkpoint_bytes - estimate_offload_admission_bytes(
+                    entry.model_path, estimate.checkpoint_bytes, fraction
+                )
+                # PLE estimates include a 5% allowance on checkpoint bytes;
+                # offloaded expert bytes must release the same allowance.
+                saved = int(saved * 1.05)
+                estimate = replace(
+                    estimate,
+                    resident_bytes=max(0, estimate.resident_bytes - saved),
+                    mmap_bytes=max(0, estimate.mmap_bytes - saved),
+                )
         except (OSError, TypeError, ValueError):
             logger.debug(
                 "Could not inspect Qwen4-Exp PLE residency for %s",
@@ -469,6 +522,96 @@ class EnginePool:
             return settings
         effective = copy.copy(settings)
         setattr(effective, "qwen4_ple_ssd_offload", True)
+        return effective
+
+    def _deepseek_v41_engram_offload_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced DeepSeek V4.1 Engram mmap mode for this process."""
+
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "deepseek_v41":
+            return False, False, None
+        try:
+            from .patches.deepseek_v41.residency import (
+                deepseek_v41_residency_estimate,
+            )
+
+            estimate = deepseek_v41_residency_estimate(entry.model_path)
+            if not estimate.supported:
+                return False, False, None
+            if (
+                getattr(settings, "moe_expert_offload_enabled", False)
+                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+            ):
+                from .patches.deepseek_v41.moe_offload import estimate_expert_savings
+
+                saved = estimate_expert_savings(
+                    entry.model_path, settings.moe_expert_offload_resident_fraction
+                )
+                estimate = replace(
+                    estimate,
+                    resident_bytes=max(0, estimate.resident_bytes - int(saved * 1.05)),
+                    mmap_bytes=max(0, estimate.mmap_bytes - int(saved * 1.05)),
+                )
+        except (KeyError, OSError, TypeError, ValueError):
+            logger.debug(
+                "Could not inspect DeepSeek V4.1 Engram residency for %s",
+                entry.model_id,
+                exc_info=True,
+            )
+            return False, False, None
+        # Normal residency calls use the stable ceiling so a post-unload
+        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
+        # pass its earlier live ceiling explicitly when only mmap fits.
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB).",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
+        requested = bool(
+            settings is not None
+            and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
+        )
+        return requested or forced, forced, estimate if estimate.supported else None
+
+    def _effective_deepseek_v41_model_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> object | None:
+        """Apply a forced mmap decision without mutating persisted settings."""
+
+        enabled, forced, _ = self._deepseek_v41_engram_offload_status(
+            entry,
+            settings,
+            ceiling=ceiling,
+        )
+        if not enabled or not forced:
+            return settings
+        if settings is None:
+            from .model_settings import ModelSettings
+
+            settings = ModelSettings()
+        effective = copy.copy(settings)
+        effective.deepseek_v41_engram_ssd_offload = True
         return effective
 
     @property
@@ -662,12 +805,29 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+            v41_offload, _, _ = self._deepseek_v41_engram_offload_status(
+                entry, settings
+            )
+            add("deepseek_v41_engram_ssd_offload", v41_offload)
+            add(
+                "deepseek_v41_ced_prefill_enabled",
+                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+            )
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
+
+        # The oQ A8 patch replaces MLP.__call__ process-wide, registers
+        # process-wide projection backends, and caches a prepared plan and
+        # metadata on every module it classifies. None of that can be undone
+        # in place, so a change here has to land on a fresh engine.
+        oq_a8_active = bool(data.get("qwen35_oq_a8_enabled", False))
+        add("qwen35_oq_a8_enabled", oq_a8_active)
+        if oq_a8_active:
+            add("qwen35_oq_a8_min_tokens", data.get("qwen35_oq_a8_min_tokens", 128))
 
         ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
         model_type = entry.config_model_type if entry else None
@@ -735,6 +895,14 @@ class EnginePool:
                     "qwen35_ane_prefill_cpu_shared_resource",
                     data.get("qwen35_ane_prefill_cpu_shared_resource", True),
                 )
+
+        moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
+        add("moe_expert_offload_enabled", moe_offload_active)
+        if moe_offload_active:
+            add(
+                "moe_expert_offload_resident_fraction",
+                data.get("moe_expert_offload_resident_fraction", 0.25),
+            )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
@@ -1117,10 +1285,19 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if entry is None:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            if entry.engine is not None:
+                failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
+                if not (isinstance(failed_reason, str) and failed_reason.strip()):
+                    self._raise_if_reload_busy(entry, "activate distributed cluster")
+            pending_task = self._pending_unload_tasks.pop(model_id, None)
+            if pending_task is not None and not pending_task.done():
+                pending_task.cancel()
+            entry.pending_unload_reason = None
+            entry.pending_unload_allow_pinned = False
+            entry.abort_requested = False
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            self._raise_if_reload_busy(entry, "activate distributed cluster")
             await self._unload_engine(model_id)
             self._clear_load_failure(entry)
 
@@ -1258,6 +1435,9 @@ class EnginePool:
         engine = entry.engine
         if engine is None:
             return False
+        failed_reason = getattr(engine, "runtime_failed_reason", None)
+        if isinstance(failed_reason, str) and failed_reason.strip():
+            return False
         has_active_requests = getattr(engine, "has_active_requests", None)
         if not callable(has_active_requests):
             return False
@@ -1301,6 +1481,9 @@ class EnginePool:
 
     def _entry_is_quiescent(self, entry: EngineEntry) -> bool:
         """Return True only after leases, collectors, and scheduler work drain."""
+        failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
+        if isinstance(failed_reason, str) and failed_reason.strip():
+            return True
         return not (
             entry.in_use > 0
             or self._entry_has_active_requests(entry)
@@ -1525,6 +1708,39 @@ class EnginePool:
             return None
         return entry.pending_unload_reason or "request abort"
 
+    def _acquire_loaded_engine(self, model_id, force_lm, lease, runtime_settings):
+        """Lease a ready engine without waiting for another model's disk drain.
+
+        This path has no await: the unload marker and lease update are atomic
+        on the pool's event loop. Loads and settings changes still take the lock.
+        """
+        entry = self._entries.get(model_id)
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or entry.pending_unload_reason
+            or model_id in self._unloading_models
+            or (force_lm and isinstance(entry.engine, VLMBatchedEngine))
+        ):
+            return None
+        expected = self._engine_runtime_signature(model_id, runtime_settings)
+        if (
+            expected is not None
+            and entry.runtime_settings_signature is not None
+            and expected != entry.runtime_settings_signature
+        ) or (
+            runtime_settings is not None and entry.runtime_settings_signature is None
+        ):
+            return None
+        self._validate_llm_engine_ready(model_id, entry.engine)
+        if entry.runtime_settings_signature is None:
+            entry.runtime_settings_signature = expected
+        entry.last_access = time.time()
+        if lease:
+            entry.in_use += 1
+        return entry.engine
+
     async def get_engine(
         self,
         model_id: str,
@@ -1567,6 +1783,11 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        ready = self._acquire_loaded_engine(
+            model_id, force_lm, _lease, runtime_settings
+        )
+        if ready is not None:
+            return ready
         async with self._lock:
             entry = self._entries.get(model_id)
             if not entry:
@@ -1577,16 +1798,16 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
-            qwen4_admission_ceiling = None
-            if (
-                (entry.config_model_type or "").replace("-", "_").lower()
-                == "qwen4_exp"
-            ):
+            ngram_admission_ceiling = None
+            if (entry.config_model_type or "").replace("-", "_").lower() in {
+                "qwen4_exp",
+                "deepseek_v41",
+            }:
                 candidate = self._current_ceiling()
                 if candidate <= 0:
                     candidate = self._fallback_admission_ceiling()
                 if candidate > 0:
-                    qwen4_admission_ceiling = candidate
+                    ngram_admission_ceiling = candidate
             unloaded_for_admission = False
 
             # Already loaded - just update access time
@@ -1677,11 +1898,14 @@ class EnginePool:
             load_settings = self._effective_qwen4_model_settings(
                 entry,
                 admission_settings,
-                ceiling=qwen4_admission_ceiling,
+                ceiling=ngram_admission_ceiling,
             )
-            qwen4_admission_override = load_settings is not admission_settings
+            load_settings = self._effective_deepseek_v41_model_settings(
+                entry, load_settings, ceiling=ngram_admission_ceiling
+            )
+            ngram_admission_override = load_settings is not admission_settings
             runtime_load_settings = (
-                load_settings if qwen4_admission_override else runtime_settings
+                load_settings if ngram_admission_override else runtime_settings
             )
             admission_size = self._entry_runtime_resident_size(
                 entry,
@@ -1689,6 +1913,7 @@ class EnginePool:
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
+
             ceiling = self._current_ceiling()
             best_effort = False
             if ceiling <= 0:
@@ -1833,7 +2058,7 @@ class EnginePool:
             )
 
             loaded = self._entries[model_id]
-            if qwen4_admission_override and expected_signature is not None:
+            if ngram_admission_override and expected_signature is not None:
                 # Automatic mmap is local to this admission attempt. Keep the
                 # user's requested variant as the reuse key so the next request
                 # does not reload the model merely because pressure recovered.
@@ -1844,6 +2069,12 @@ class EnginePool:
             return loaded.engine
 
     async def _release_engine_lease(self, model_id: str) -> None:
+        # A normal completed request need not wait behind unrelated teardown.
+        entry = self._entries.get(model_id)
+        if entry is not None and not entry.pending_unload_reason:
+            if entry.in_use > 0:
+                entry.in_use -= 1
+            return
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
@@ -1903,7 +2134,7 @@ class EnginePool:
     async def acquire(self, model_id: str, force_lm: bool = False):
         """Acquire an engine with an atomic in-use lease.
 
-        The lease is taken under the pool lock at acquire time and always
+        The lease is taken atomically on the pool event loop and always
         released in finally, so the engine cannot be evicted mid-request even
         on exception.
         """
@@ -2362,6 +2593,24 @@ class EnginePool:
         return False
 
     async def _unload_engine(self, model_id: str) -> None:
+        if model_id in self._unloading_models:
+            raise ModelBusyError(model_id, "unload while teardown is in progress")
+        self._unloading_models.add(model_id)
+        task = asyncio.create_task(self._stop_and_unload_engine(model_id))
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+        finally:
+            self._unloading_models.discard(model_id)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _stop_and_unload_engine(self, model_id: str) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
 
@@ -2385,6 +2634,7 @@ class EnginePool:
             else resident_size
         )
         pre_unload_active = 0 if distributed else mx.get_active_memory()
+        pre_unload_footprint = 0 if distributed else get_phys_footprint()
 
         try:
             await entry.engine.stop()
@@ -2415,28 +2665,10 @@ class EnginePool:
             except Exception as e:
                 logger.warning(f"Error resetting activity counter for {model_id}: {e}")
 
-        # Yield to the event loop before dropping the engine reference.
-        #
-        # When abort_all_requests() fires before _unload_engine(), it sets
-        # asyncio Events for each active request.  Server-side streaming
-        # generators are then scheduled in the asyncio ready queue, but they
-        # cannot run until the event loop gets control.  EngineCore.close()
-        # (called inside stop()) blocks the event loop with synchronous
-        # .result() calls on the MLX executor -- scheduler.shutdown() and
-        # scheduler.deep_reset() -- so those generators are still suspended
-        # when stop() returns.
-        #
-        # If we set entry.engine = None and call gc.collect() immediately,
-        # the generators are still alive with a local 'engine' variable
-        # referencing the BatchedEngine, keeping its refcount above zero.
-        # The model's ~20 GB of MLX weight tensors therefore remain "active"
-        # in Metal memory, the settle barrier times out, and subsequent load
-        # attempts fail with 507 because the ceiling is still exceeded.
-        #
-        # A few asyncio.sleep(0) calls drain the ready queue -- generator
-        # tear-down is at most a few frames deep -- so that by the time we
-        # clear entry.engine and run gc.collect(), no coroutine frame holds
-        # a stale engine reference.
+        # Let cancelled streaming generators release their engine references
+        # before gc.collect() and the Metal memory settle barrier. stop() can
+        # yield while closing the core, but request cleanup may still have
+        # callbacks queued when it returns.
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -2480,6 +2712,8 @@ class EnginePool:
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
 
+        # RAM Engram tables share MLX buffers with CPU views, so their packed
+        # bytes are included in both admission and Metal unload settlement.
         # Memory settle barrier: poll actual freed memory instead of
         # trusting the cumulative _current_model_memory estimate.
         # Scale tolerance with model size: estimated_size includes a 5%
@@ -2496,7 +2730,15 @@ class EnginePool:
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
-            if actual_freed >= min_expected_freed:
+            # Metal can release arrays before macOS updates its footprint
+            # ledger. Admission reads both, so wait for that drop too when
+            # measurable; otherwise an immediate settings reload can fail 507.
+            footprint_pending = (
+                0 < min_expected_freed <= pre_unload_footprint
+                and get_phys_footprint()
+                > pre_unload_footprint - min_expected_freed
+            )
+            if actual_freed >= min_expected_freed and not footprint_pending:
                 settled = True
                 logger.debug(
                     f"Settle round {_settle_round + 1} for '{model_id}': "
@@ -2524,7 +2766,8 @@ class EnginePool:
             logger.debug(
                 f"Settle round {_settle_round + 1} for '{model_id}': "
                 f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)}) - retry"
+                f"(need>={format_size(min_expected_freed)}), "
+                f"footprint_pending={footprint_pending} - retry"
             )
             await asyncio.sleep(0.5)
             gc.collect()
@@ -2686,6 +2929,9 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            model_settings = self._effective_deepseek_v41_model_settings(
+                entry, model_settings
+            )
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 

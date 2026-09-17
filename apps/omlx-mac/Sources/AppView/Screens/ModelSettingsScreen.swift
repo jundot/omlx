@@ -27,7 +27,13 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Header(model: vm.model)
+            HStack(alignment: .center, spacing: 0) {
+                Header(model: vm.model)
+                SnapshotActions(vm: vm, client: services.client)
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 10)
+            }
+            .zIndex(1)
 
             SectionPicker(selection: $vm.section)
 
@@ -61,6 +67,9 @@ struct ModelSettingsScreen: View {
             }
         }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await vm.load(modelID: modelID, client: services.client, preservingEdits: true) }
+        }
     }
 
     @ViewBuilder
@@ -110,6 +119,437 @@ private struct Header: View {
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
+    }
+}
+
+
+// MARK: - Snapshot actions (reset / optimal / recipe)
+
+private struct SnapshotActions: View {
+    let vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+    @State private var hoveredAction: String?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if vm.isApplyingSettings {
+                ProgressView().controlSize(.small)
+            }
+            actionButton(String(localized: "settings.actions.reset",
+                          defaultValue: "Reset defaults",
+                          comment: "Header button that returns every setting of the model to its default"),
+                         systemImage: "arrow.counterclockwise") {
+                vm.pendingReset = true
+            }
+            actionButton(String(localized: "settings.actions.optimal",
+                          defaultValue: "Apply optimal settings",
+                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"),
+                         systemImage: "wand.and.stars") {
+                Task { await vm.loadOptimalCandidates(client: client) }
+            }
+            actionButton(String(localized: "settings.actions.recipe",
+                          defaultValue: "Apply custom recipe",
+                          comment: "Header button that opens the paste-a-recipe sheet"),
+                         systemImage: "doc.on.clipboard") {
+                vm.applyError = nil
+                vm.applyOutcome = .recipeInput
+            }
+        }
+        .buttonStyle(.omlx(.normal, size: .small))
+        .buttonBorderShape(.roundedRectangle(radius: 6))
+        .fixedSize(horizontal: true, vertical: false)
+        .disabled(vm.isApplyingSettings)
+        .overlay(alignment: .topTrailing) {
+            if let hoveredAction {
+                Text(hoveredAction)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    .shadow(color: .black.opacity(0.12), radius: 3, y: 2)
+                    .fixedSize()
+                    .offset(y: 34)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .confirmationDialog(
+            String(localized: "settings.actions.reset.confirm_title",
+                   defaultValue: "Reset every setting of this model?",
+                   comment: "Confirmation dialog title before resetting all model settings"),
+            isPresented: Binding(
+                get: { vm.pendingReset },
+                set: { if !$0 { vm.pendingReset = false } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "settings.actions.reset.confirm_button",
+                          defaultValue: "Reset",
+                          comment: "Destructive button inside the reset-settings confirmation dialog"),
+                   role: .destructive) {
+                vm.pendingReset = false
+                Task { await vm.resetDefaults(client: client) }
+            }
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Generic cancel button"),
+                   role: .cancel) { vm.pendingReset = false }
+        } message: {
+            Text(String(localized: "settings.actions.reset.confirm_message",
+                        defaultValue: "Sampling, acceleration, pinned/default flags, aliases and the display name all return to their defaults.",
+                        comment: "Body text inside the reset-settings confirmation dialog"))
+        }
+        .sheet(isPresented: Binding(
+            get: { vm.applyOutcome != nil },
+            set: { if !$0 && !vm.isApplyingSettings { vm.applyOutcome = nil } }
+        )) {
+            SettingsApplySheet(vm: vm, client: client)
+                .environment(\.omlxTheme, theme)
+        }
+    }
+
+    private func actionButton(
+        _ title: String, systemImage: String, action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            hoveredAction = nil
+            action()
+        } label: {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.iconOnly)
+                .font(.omlxText(12))
+                .frame(width: 20, height: 22)
+        }
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            if hovering {
+                hoveredAction = title
+            } else if hoveredAction == title {
+                hoveredAction = nil
+            }
+        }
+    }
+}
+
+private struct SettingsApplySheet: View {
+    let vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+    @State private var recipeText = ""
+
+    private static let benchmarksURL = URL(string: "https://omlx.ai/benchmarks/performance")!
+
+    var body: some View {
+        Group {
+            switch vm.applyOutcome {
+            case .optimalCandidates(let candidates):
+                candidatesBody(candidates)
+            case .optimal(let result):
+                resultBody(result, fromRecipe: false)
+            case .recipe(let result):
+                resultBody(result, fromRecipe: true)
+            case .recipeInput, nil:
+                inputBody
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .background(theme.windowBg)
+    }
+
+    private var closeButton: some View {
+        Button(String(localized: "common.close",
+                      defaultValue: "Close",
+                      comment: "Generic close button")) { vm.applyOutcome = nil }
+            .buttonStyle(.omlx(.primary, size: .small))
+            .disabled(vm.isApplyingSettings)
+    }
+
+    @ViewBuilder
+    private var errorLine: some View {
+        if let error = vm.applyError {
+            Text(error)
+                .font(.omlxText(12))
+                .foregroundStyle(theme.redDot)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var inputBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(String(localized: "settings.apply.recipe.title",
+                        defaultValue: "Apply custom recipe",
+                        comment: "Title of the paste-a-recipe sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            Text(String(localized: "settings.apply.recipe.hint",
+                        defaultValue: "Paste a recipe copied from the Recipe row of a benchmark detail page on omlx.ai.",
+                        comment: "Hint explaining where a settings recipe can be copied from"))
+                .font(.omlxText(12))
+                .foregroundStyle(theme.textSecondary)
+            linkButton(Self.benchmarksURL,
+                       title: String(localized: "settings.apply.result.open_search",
+                                     defaultValue: "Open community benchmarks",
+                                     comment: "Link button that opens the omlx.ai performance leaderboard"))
+            TextEditor(text: $recipeText)
+                .font(.omlxMono(11))
+                .scrollContentBackground(.hidden)
+                .frame(height: 110)
+                .padding(6)
+                .background(theme.inputBg)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(theme.inputBorder, lineWidth: 0.5)
+                )
+            errorLine
+            HStack(spacing: 10) {
+                if vm.isApplyingSettings {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.recipe.applying",
+                                defaultValue: "Applying the recipe...",
+                                comment: "Progress text while a pasted recipe is being applied"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+                Button(String(localized: "common.cancel",
+                              defaultValue: "Cancel",
+                              comment: "Generic cancel button")) { vm.applyOutcome = nil }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(vm.isApplyingSettings)
+                Button(String(localized: "settings.apply.recipe.apply",
+                              defaultValue: "Apply",
+                              comment: "Primary button of the paste-a-recipe sheet")) {
+                    Task { await vm.applyRecipe(recipeText, client: client) }
+                }
+                .buttonStyle(.omlx(.primary, size: .small))
+                .disabled(recipeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || vm.isApplyingSettings)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func candidatesBody(_ candidates: OptimalCandidatesDTO?) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(String(localized: "settings.apply.result.title_optimal",
+                        defaultValue: "Optimal settings from omlx.ai",
+                        comment: "Title of the optimal-settings sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            if let candidates {
+                if candidates.found {
+                    Text(String(localized: "settings.apply.choose.hint",
+                                defaultValue: "Pick a benchmark result to apply its settings. Rows are the best matches for this chip and model with the same or less memory, at a 4k prompt.",
+                                comment: "Hint above the benchmark candidate list"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            candidateGroup(
+                                String(localized: "settings.apply.choose.group_pp",
+                                       defaultValue: "Best prompt processing (PP)",
+                                       comment: "Label above the candidates ranked by prompt processing speed"),
+                                rows: candidates.byPp)
+                            candidateGroup(
+                                String(localized: "settings.apply.choose.group_tg",
+                                       defaultValue: "Best token generation (TG)",
+                                       comment: "Label above the candidates ranked by token generation speed"),
+                                rows: candidates.byTg)
+                        }
+                    }
+                    .frame(maxHeight: 360)
+                } else {
+                    noneBody(searchUrl: candidates.searchUrl)
+                }
+                errorLine
+            } else if let error = vm.applyError {
+                Text(error)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.redDot)
+                    .textSelection(.enabled)
+            } else {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.optimal.loading",
+                                defaultValue: "Fetching the best benchmark results from omlx.ai...",
+                                comment: "Progress text while omlx.ai candidates are fetched"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                .padding(.vertical, 12)
+            }
+            HStack(spacing: 10) {
+                if vm.isApplyingSettings, candidates != nil {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.optimal.applying",
+                                defaultValue: "Applying the benchmark settings...",
+                                comment: "Progress text while a chosen benchmark snapshot is applied"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+                closeButton
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func candidateGroup(_ label: String, rows: [OptimalCandidateDTO]) -> some View {
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(label)
+                    .font(.omlxText(11, weight: .semibold))
+                    .foregroundStyle(theme.textSecondary)
+                ForEach(rows) { row in
+                    HStack(alignment: .center, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            if let urlText = row.benchmarkUrl, let url = URL(string: urlText) {
+                                linkButton(url, title: urlText)
+                            } else {
+                                Text(row.benchmarkId)
+                                    .font(.omlxMono(11))
+                                    .foregroundStyle(theme.text)
+                            }
+                            Text(ModelSettingsScreenVM.candidateStats(
+                                pp: row.ppTps, tg: row.tgTps, memoryGb: row.memoryGb,
+                                quantization: row.quantization, omlxVersion: row.omlxVersion))
+                                .font(.omlxMono(11))
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                        Spacer()
+                        Button(String(localized: "settings.apply.recipe.apply",
+                                      defaultValue: "Apply",
+                                      comment: "Primary button of the paste-a-recipe sheet")) {
+                            Task { await vm.applyOptimalCandidate(row.benchmarkId, client: client) }
+                        }
+                        .buttonStyle(.omlx(.primary, size: .small))
+                        .disabled(vm.isApplyingSettings)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(theme.groupBg)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(theme.groupBorder, lineWidth: 0.5)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func noneBody(searchUrl: String?) -> some View {
+        Text(String(localized: "settings.apply.result.none_title",
+                    defaultValue: "No benchmark result matches this device and model.",
+                    comment: "Headline when omlx.ai has no benchmark for the current device and model"))
+            .font(.omlxText(13, weight: .medium))
+            .foregroundStyle(theme.text)
+        Text(String(localized: "settings.apply.result.none_body",
+                    defaultValue: "Find a similar model on the community benchmarks and apply its recipe with Apply custom recipe.",
+                    comment: "Guidance shown when no matching benchmark exists"))
+            .font(.omlxText(12))
+            .foregroundStyle(theme.textSecondary)
+        linkButton(URL(string: searchUrl ?? "") ?? Self.benchmarksURL,
+                   title: String(localized: "settings.apply.result.open_search",
+                                 defaultValue: "Open community benchmarks",
+                                 comment: "Link button that opens the omlx.ai performance leaderboard"))
+    }
+
+    @ViewBuilder
+    private func resultBody(_ result: SettingsApplyResultDTO, fromRecipe: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(fromRecipe
+                 ? String(localized: "settings.apply.result.title_recipe",
+                          defaultValue: "Custom recipe applied",
+                          comment: "Title of the result sheet after applying a pasted recipe")
+                 : String(localized: "settings.apply.result.title_optimal",
+                          defaultValue: "Optimal settings from omlx.ai",
+                          comment: "Title of the optimal-settings sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            Text(result.changed == false
+                 ? String(localized: "settings.apply.result.no_change",
+                          defaultValue: "Settings already matched; nothing changed.",
+                          comment: "Result line when the snapshot equals the current settings")
+                 : (fromRecipe
+                    ? String(localized: "settings.apply.result.done_recipe",
+                             defaultValue: "The settings below were applied from the recipe!",
+                             comment: "Result line after a pasted recipe was applied")
+                    : String(localized: "settings.apply.result.done_optimal",
+                             defaultValue: "The settings below were applied from the selected benchmark!",
+                             comment: "Result line after a chosen benchmark snapshot was applied")))
+                .font(.omlxText(13, weight: .medium))
+                .foregroundStyle(theme.text)
+            if let urlText = result.benchmarkUrl, let url = URL(string: urlText) {
+                linkButton(url, title: urlText)
+                Text(ModelSettingsScreenVM.candidateStats(
+                    pp: result.ppTps, tg: result.tgTps,
+                    quantization: result.quantization, omlxVersion: result.omlxVersion))
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            let skipped = ModelSettingsScreenVM.summarizeSkipped(result.skipped)
+            if !skipped.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(String(localized: "settings.apply.result.skipped",
+                                defaultValue: "Skipped on this machine",
+                                comment: "Label above the list of features the server dropped while applying a snapshot"))
+                        .font(.omlxText(12, weight: .semibold))
+                        .foregroundStyle(theme.warningText)
+                    ForEach(skipped, id: \.self) { line in
+                        Text(line)
+                            .font(.omlxText(12))
+                            .foregroundStyle(theme.warningText)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(theme.warningBg)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            Text(String(localized: "settings.apply.result.applied",
+                        defaultValue: "Applied settings",
+                        comment: "Label above the JSON of the applied settings"))
+                .font(.omlxText(11, weight: .medium))
+                .foregroundStyle(theme.textSecondary)
+            ScrollView {
+                Text(ModelSettingsScreenVM.appliedJSON(result.applied))
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.text)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 220)
+            .padding(8)
+            .background(theme.codeBg)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            if result.requiresReload == true {
+                Text(String(localized: "settings.apply.result.reload_note",
+                            defaultValue: "The model will use the new settings after its next load.",
+                            comment: "Note shown when applied settings only take effect at model load"))
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            HStack {
+                Spacer()
+                closeButton
+            }
+        }
+    }
+
+    private func linkButton(_ url: URL, title: String) -> some View {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
+            Label(title, systemImage: "arrow.up.right.square")
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .buttonStyle(.omlx(.plain, size: .small))
     }
 }
 
@@ -164,7 +604,7 @@ private struct ProfilesTab: View {
         VStack(alignment: .leading, spacing: 0) {
             // Active state banner — three variants (working / named / defaults).
             ActiveProfileBanner(
-                state: vm.activeProfileState,
+                state: vm.displayProfileState,
                 isSlim: false,
                 onUpdateBasedOn: {
                     if case .working(let basedOn) = vm.activeProfileState, let basedOn {
@@ -221,6 +661,7 @@ private struct ProfilesTab: View {
                               defaultValue: "Global Profiles",
                               comment: "Section label above the user-defined global profile templates chip group"),
                 names: vm.templates.filter { $0.templateScope == .global }.map(\.name),
+                displayNames: Dictionary(uniqueKeysWithValues: vm.templates.map { ($0.name, $0.displayName) }),
                 activeName: vm.activeProfileState.activeName(in: .global),
                 basedOnName: vm.activeProfileState.basedOnName(in: .global),
                 previewName: preview?.scope == .global ? preview?.name : nil,
@@ -238,8 +679,11 @@ private struct ProfilesTab: View {
                               defaultValue: "Model Profiles · \(vm.model?.id ?? vm.modelID)",
                               comment: "Section label for the per-model profile chip group; placeholder is the model id"),
                 names: vm.profiles
-                    .filter { $0.sourceTemplate == nil }
+                    .filter { profile in
+                        profile.exposeAsModel == true || profile.matchingTemplate(in: vm.templates) == nil
+                    }
                     .map(\.name),
+                displayNames: Dictionary(uniqueKeysWithValues: vm.profiles.map { ($0.name, $0.displayName) }),
                 activeName: vm.activeProfileState.activeName(in: .model),
                 basedOnName: vm.activeProfileState.basedOnName(in: .model),
                 previewName: preview?.scope == .model ? preview?.name : nil,
@@ -288,7 +732,7 @@ private struct ProfilesTab: View {
     private var detailCard: some View {
         if let preview, let tpl = lookupSettings(scope: preview.scope, name: preview.name) {
             ProfileDetailCard(
-                name: preview.name,
+                name: vm.profileDisplayName(scope: preview.scope, name: preview.name),
                 scope: preview.scope,
                 settings: tpl,
                 isActive: vm.activeProfileState.activeName(in: preview.scope) == preview.name,
@@ -328,9 +772,9 @@ private struct ProfilesTab: View {
                     }
                 },
                 onClosePreview: { self.preview = nil },
-                exposeAsModel: modelProfile(named: preview.name)?.exposeAsModel ?? false,
-                exposedModelId: modelProfile(named: preview.name)?.modelId,
-                hasEngineFields: modelProfile(named: preview.name)?.hasEngineFields ?? false,
+                exposeAsModel: modelProfile(scope: preview.scope, named: preview.name)?.exposeAsModel ?? false,
+                exposedModelId: modelProfile(scope: preview.scope, named: preview.name)?.modelId,
+                hasEngineFields: modelProfile(scope: preview.scope, named: preview.name)?.hasEngineFields ?? false,
                 onToggleExpose: preview.scope == .model
                     ? { exposed in
                         Task {
@@ -353,7 +797,9 @@ private struct ProfilesTab: View {
                     settings: vm.currentSettingsDict(),
                     isActive: true,
                     isWorking: true,
-                    basedOn: basedOn,
+                    basedOn: basedOn.map {
+                        .init(scope: $0.scope, name: vm.profileDisplayName(scope: $0.scope, name: $0.name))
+                    },
                     isWorkingBase: false,
                     compact: false,
                     hasWorking: true
@@ -361,7 +807,7 @@ private struct ProfilesTab: View {
             case .named(let scope, let name):
                 let settings = lookupSettings(scope: scope, name: name) ?? [:]
                 ProfileDetailCard(
-                    name: name,
+                    name: vm.profileDisplayName(scope: scope, name: name),
                     scope: scope,
                     settings: settings,
                     isActive: true,
@@ -370,9 +816,9 @@ private struct ProfilesTab: View {
                     isWorkingBase: false,
                     compact: false,
                     hasWorking: false,
-                    exposeAsModel: modelProfile(named: name)?.exposeAsModel ?? false,
-                    exposedModelId: modelProfile(named: name)?.modelId,
-                    hasEngineFields: modelProfile(named: name)?.hasEngineFields ?? false,
+                    exposeAsModel: modelProfile(scope: scope, named: name)?.exposeAsModel ?? false,
+                    exposedModelId: modelProfile(scope: scope, named: name)?.modelId,
+                    hasEngineFields: modelProfile(scope: scope, named: name)?.hasEngineFields ?? false,
                     onToggleExpose: scope == .model
                         ? { exposed in
                             Task {
@@ -403,8 +849,9 @@ private struct ProfilesTab: View {
 
     /// Per-model profile DTO lookup — source of the expose-as-model state
     /// and the derived model ID shown on the detail card.
-    private func modelProfile(named name: String) -> ProfileDTO? {
-        vm.profiles.first { $0.name == name }
+    private func modelProfile(scope: ProfileScope, named name: String) -> ProfileDTO? {
+        if scope == .model { return vm.profiles.first { $0.name == name } }
+        return vm.profiles.first { $0.matchingTemplate(in: vm.templates)?.name == name }
     }
 
     private func previewChip(scope: ProfileScope, name: String) {
@@ -637,7 +1084,7 @@ private struct BasicEditBanner: View {
         default:
             VStack(alignment: .leading, spacing: 0) {
                 ActiveProfileBanner(
-                    state: vm.activeProfileState,
+                    state: vm.displayProfileState,
                     isSlim: true,
                     onUpdateBasedOn: {
                         if case .working(let basedOn) = vm.activeProfileState, let basedOn {
@@ -1164,14 +1611,35 @@ private struct ExperimentalSection: View {
                         }
                     }
                 }
-                if vm.isQwen35AnePrefillModel {
+                if vm.isQwenOqA8Model {
+                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                      defaultValue: "Qwen INT8 Activation Prefill",
+                                      comment: "Row label for the oQ INT8-activation prefill kernels"),
+                        sublabel: qwenOqA8Sublabel) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
+                            .disabled(vm.qwen35OqA8ConflictReason != nil)
+                            .help(vm.qwen35OqA8ConflictReason ?? "")
+                    }
+                    if vm.qwen35OqA8Enabled {
+                        Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
+                                          defaultValue: "Minimum Prompt Tokens",
+                                          comment: "Row label for the oQ A8 minimum prompt length"),
+                            sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
+                                             defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
+                                             comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                                      placeholder: "128", mono: true,
+                                      isNumeric: true, range: 1...262_144,
+                                      step: 64, width: .controlCompact)
+                        }
+                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
-                        sublabel: String(localized: "settings.experimental.qwen_ane.sub",
-                                         defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
-                                         comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
+                        sublabel: qwenAnePrefillSublabel) {
                         RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                            .disabled(vm.qwen35AnePrefillConflictReason != nil)
+                            .help(vm.qwen35AnePrefillConflictReason ?? "")
                     }
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
@@ -1179,17 +1647,36 @@ private struct ExperimentalSection: View {
                                   comment: "Row label for the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
                         if !vm.aneTuningIsRunning && vm.model?.anePrefillBackend != "k2" {
-                            Menu("Tuner overrides") {
-                                Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
-                                Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
+                            Menu(String(localized: "settings.experimental.qwen_ane.tuner.menu",
+                                        defaultValue: "Tuner overrides",
+                                        comment: "Menu label for hardware overrides in the ANE split tuner")) {
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_offload",
+                                              defaultValue: "Allow CPU offload",
+                                              comment: "ANE tuner override: allow offloading work to the CPU"),
+                                       isOn: $vm.aneTuningAllowCPU)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_gate",
+                                              defaultValue: "Allow CPU gate/up",
+                                              comment: "ANE tuner override: allow the gate and up projections on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUGate)
                                     .disabled(!vm.aneTuningAllowCPU)
-                                Toggle("Allow CPU down projection", isOn: $vm.aneTuningAllowCPUDown)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_down",
+                                              defaultValue: "Allow CPU down projection",
+                                              comment: "ANE tuner override: allow the down projection on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUDown)
                                     .disabled(!vm.aneTuningAllowCPU)
-                                Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
-                                Toggle("Allow GDN on CPU", isOn: $vm.aneTuningAllowCPUGDN)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_ane_gdn",
+                                              defaultValue: "Allow GDN on ANE",
+                                              comment: "ANE tuner override: allow GDN layers on the ANE"),
+                                       isOn: $vm.aneTuningAllowANEGDN)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_gdn",
+                                              defaultValue: "Allow GDN on CPU",
+                                              comment: "ANE tuner override: allow GDN layers on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUGDN)
                                     .disabled(!vm.aneTuningAllowCPU || !vm.aneTuningAllowANEGDN)
                                 Toggle(
-                                    "Allow performance-aware CPU scheduling",
+                                    String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_shared",
+                                           defaultValue: "Allow performance-aware CPU scheduling",
+                                           comment: "ANE tuner override: allow performance-aware CPU scheduling"),
                                     isOn: $vm.aneTuningAllowCPUSharedResource
                                 )
                                 .disabled(!vm.aneTuningAllowCPU)
@@ -1213,7 +1700,9 @@ private struct ExperimentalSection: View {
                                 ProgressView()
                                     .controlSize(.small)
                             }
-                            Button("Cancel") {
+                            Button(String(localized: "common.cancel",
+                                          defaultValue: "Cancel",
+                                          comment: "Generic Cancel button label")) {
                                 Task { await vm.cancelANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.destructive, size: .small))
@@ -1223,16 +1712,22 @@ private struct ExperimentalSection: View {
                                 .foregroundStyle(theme.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .multilineTextAlignment(.trailing)
-                            Button("Use result") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.use_result",
+                                          defaultValue: "Use result",
+                                          comment: "Button that applies the ANE tuner recommendation")) {
                                 vm.applyANETuningRecommendation()
                             }
                             .buttonStyle(.omlx(.primary, size: .small))
-                            Button("Tune again") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_again",
+                                          defaultValue: "Tune again",
+                                          comment: "Button that re-runs the ANE split tuner")) {
                                 Task { await vm.startANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         } else {
-                            Button("Tune for this Mac") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_for_mac",
+                                          defaultValue: "Tune for this Mac",
+                                          comment: "Button that starts ANE split tuning for the current Mac")) {
                                 Task { await vm.startANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
@@ -1732,6 +2227,20 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.dflash.ssd_cache.sub",
                       defaultValue: "L2 spill of evicted L1 entries to disk.",
                       comment: "Default sublabel for the DFlash SSD cache toggle")
+    }
+
+    private var qwenOqA8Sublabel: String {
+        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_oq_a8.sub",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      comment: "Sublabel describing the oQ INT8-activation prefill kernels")
+    }
+
+    private var qwenAnePrefillSublabel: String {
+        if let reason = vm.qwen35AnePrefillConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_ane.sub",
+                      defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")
     }
 
     private var vlmMtpToggleDisabled: Bool {

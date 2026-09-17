@@ -6,7 +6,6 @@ This module tests the block-based paged KV cache management following vLLM's
 architecture, adapted for MLX on Apple Silicon.
 """
 
-import time
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -169,12 +168,12 @@ class TestCacheBlock:
         block.reset_hash()
         assert block.block_hash is None
 
-    def test_touch(self):
+    def test_touch(self, monkeypatch):
         """Test touch method updates last_access."""
         block = CacheBlock(block_id=0)
         old_access = block.last_access
 
-        time.sleep(0.01)
+        monkeypatch.setattr("omlx.cache.paged_cache.time.time", lambda: old_access + 1)
         block.touch()
 
         assert block.last_access > old_access
