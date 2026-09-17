@@ -758,6 +758,54 @@ def _glm_pooling_fixture(tmp_path):
     return cache, ssd, stub, kv, pool
 
 
+@pytest.mark.parametrize("refill", ["completion", "parser_stop"])
+@pytest.mark.parametrize("num_blocks", [1, 3])
+def test_glm_pm_promoted_boundary_preserves_pooling_history(tmp_path, refill, num_blocks):
+    """The scheduler promotes the final snapshot out of the intermediate map.
+
+    Its pooled rows are still a delta, even after refilling the blank KV
+    member. Both normal completion and parser-stop storage must retain that
+    delta's range instead of treating the last block as the entire pool.
+    """
+    from omlx.scheduler import Scheduler
+
+    cache, ssd, stub, kv, pool = _glm_pooling_fixture(tmp_path)
+    boundaries = _advance_glm_pooling_boundaries(stub, kv, pool, num_blocks)
+    stub.config = SimpleNamespace(paged_cache_block_size=BLOCK_SIZE)
+    stub._boundary_snapshot_diagnostics = BoundarySnapshotDiagnostics()
+    stub._boundary_snapshot_store = None
+    stub.paged_ssd_cache_manager = ssd
+    stub.requests = {}
+    stub._PREFILL_SNAPSHOT_MARKER = Scheduler._PREFILL_SNAPSHOT_MARKER
+    stub._boundary_cache_snapshots = {
+        "promoted": {
+            tc: (Scheduler._PREFILL_SNAPSHOT_MARKER, snapshot)
+            for tc, snapshot in boundaries.items()
+        }
+    }
+    tokens, final, config, intermediate = Scheduler._get_boundary_store_override(
+        stub, "promoted", list(range(num_blocks * BLOCK_SIZE + 1))
+    )
+    assert len(tokens) not in intermediate
+    full = [_layer_dict(CacheList(kv, pool))]
+    if refill == "completion":
+        source = Scheduler._merge_boundary_with_full_cache(final, full)
+    else:
+        source = Scheduler._refill_blanked_cachelist_members(final, full)
+    assert source is not None
+    table = cache.store_cache(
+        "promoted", tokens, source, config, boundary_snapshots=intermediate
+    )
+    assert table is not None
+    restored = cache.reconstruct_cache(table)
+    assert restored is not None
+    restored_kv, restored_pool = restored[0].caches
+    assert mx.array_equal(restored_kv.state[0], kv.state[0]).item()
+    assert mx.array_equal(restored_kv.state[1], kv.state[1]).item()
+    assert restored_pool.pooled.shape == pool.pooled.shape
+    assert mx.array_equal(restored_pool.pooled, pool.pooled).item()
+
+
 def test_glm_pm_partial_match_restores_truncated_pooling_chain(tmp_path):
     """A partial prefix match (first 2 of 3 blocks) must rebuild the pooled
     chain truncated at the match point — 2 rows in block order — and the KV
