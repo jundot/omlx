@@ -84,7 +84,7 @@ A call's misses are read in parallel with `os.pread` on a shared thread pool. `e
 
 ## Supported models
 
-The experimental toggle is available for `deepseek_v41`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, and `glm_moe_dsa` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
+The experimental toggle is available for `deepseek_v41`, `deepseek_v4`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, `glm_moe_dsa`, and `glm5_next` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
 
 Qwen3.5/3.6 supports stacked expert projections under `language_model.model.layers.*.mlp.switch_mlp` and `model.layers.*.mlp.switch_mlp`. The offload adapter resolves the original checkpoint path after the loader normalizes the text-only naming layout.
 
@@ -96,9 +96,10 @@ and declare their format in the checkpoint's own `quantization` dict.
 All backbone layers must have the expected tensor names, shapes, storage
 dtypes, and quantization metadata. Fused or renamed projections, missing
 experts, unquantized weights, and per-expert linear bias are rejected.
-DeepSeek V4.1 and the GLM-5.x flagship (`glm_moe_dsa`) have their own
-adapters, described below. DeepSeek V4 and GLM-5.3-Flash (`glm5_next`) are
-outside the current support list.
+DeepSeek V4.1, the GLM-5.x flagship (`glm_moe_dsa`), and the DeepSeek V4 /
+GLM-5.3-Flash block (`deepseek_v4`, `glm5_next`) have their own adapters,
+described below. Their eligibility validation checks the stacked
+`ffn.switch_mlp` / `mlp.switch_mlp` slabs the adapters read positionally.
 
 When offload wraps layers, the Qwen gate/up fusion is skipped automatically:
 fusion rewrites stock expert weights in RAM, which cannot apply to experts

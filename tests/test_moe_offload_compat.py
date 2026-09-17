@@ -27,17 +27,30 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     elif kind == "glm_moe_dsa":
         # the flagship layout: n_routed_experts, and the first layer dense
         raw.update(text, n_routed_experts=16, first_k_dense_replace=1)
+    elif kind == "deepseek_v4":
+        # text-only flat config, experts under ffn.switch_mlp
+        raw.update(text, n_routed_experts=16)
+    elif kind == "glm5_next":
+        # VLM text tower with the per-layer sparse selection
+        raw["text_config"] = dict(
+            text,
+            n_routed_experts=16,
+            first_k_dense_replace=1,
+            mlp_layer_types=["dense", "sparse"],
+        )
     else:
         raw["text_config"] = text
     (path / "config.json").write_text(json.dumps(raw))
     tensors = {}
     for layer in range(2):
-        if kind == "glm_moe_dsa" and layer == 0:
+        if kind in ("glm_moe_dsa", "glm5_next") and layer == 0:
             continue  # dense layer: no experts to cover
         if kind in ("olmoe", "glm_moe_dsa"):
             prefix = f"model.layers.{layer}.mlp.switch_mlp"
         elif kind == "gemma4":
             prefix = f"language_model.model.layers.{layer}.experts.switch_glu"
+        elif kind == "deepseek_v4":
+            prefix = f"model.layers.{layer}.ffn.switch_mlp"
         else:
             prefix = f"language_model.model.layers.{layer}.mlp.switch_mlp"
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -66,6 +79,8 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
         ("olmoe", False),
         ("olmoe", True),
         ("glm_moe_dsa", False),
+        ("deepseek_v4", False),
+        ("glm5_next", False),
     ],
 )
 def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_expert):
@@ -100,9 +115,35 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
     assert error.value.status_code == 400
 
 
-@pytest.mark.parametrize("kind", ["glm5_next", "deepseek_v4"])
+@pytest.mark.parametrize("kind", ["mixtral", "llama"])
 def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
     _checkpoint(tmp_path, kind)
+    assert moe_offload_compatibility(tmp_path)[0] is False
+
+
+def test_deepseek_v4_requires_the_stacked_slabs(tmp_path):
+    """The adapter reads ffn.switch_mlp positionally; a gap hides it."""
+    tensors = _checkpoint(tmp_path, "deepseek_v4")
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    del tensors["model.layers.1.ffn.switch_mlp.gate_proj.weight"]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False and "layers.1" in reason
+
+
+def test_glm5_next_dense_layers_skipped_and_routed_required(tmp_path):
+    """mlp_layer_types decides which layers must carry routed experts."""
+    tensors = _checkpoint(tmp_path, "glm5_next")
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    del tensors["language_model.model.layers.1.mlp.switch_mlp.up_proj.scales"]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False and "layers.1" in reason
+    _checkpoint(tmp_path, "glm5_next")
+    path = tmp_path / "config.json"
+    raw = json.loads(path.read_text())
+    raw["text_config"]["mlp_layer_types"] = ["dense", "dense"]
+    path.write_text(json.dumps(raw))
     assert moe_offload_compatibility(tmp_path)[0] is False
 
 
@@ -137,7 +178,7 @@ def test_unsupported_saved_setting_rejected_before_load(tmp_path):
     from omlx.model_settings import ModelSettings
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-    _checkpoint(tmp_path, "glm5_next")
+    _checkpoint(tmp_path, "mixtral")
     with pytest.raises(ValueError, match="not supported for this model type"):
         maybe_apply_pre_load_patches(
             str(tmp_path), ModelSettings(moe_expert_offload_enabled=True)
