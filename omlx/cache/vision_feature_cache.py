@@ -329,9 +329,6 @@ class VisionFeatureSSDCache:
                 if oldest.file_path.exists():
                     oldest.file_path.unlink()
             except Exception as e:
-                # The index entry is already gone; a leftover file would be
-                # orphaned and the tracked size would drift. Surface it so
-                # eviction failures are not silently invisible.
                 logger.warning(
                     "Failed to remove evicted vision cache file %s: %s",
                     oldest.file_path,
