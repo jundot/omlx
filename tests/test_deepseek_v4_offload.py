@@ -268,6 +268,52 @@ def test_common_entry_point_dispatches_dsv4(tmp_path, reference):
     }
 
 
+def test_compile_ffn_layers_stay_eager_when_offloaded(tmp_path, reference):
+    """glm5_next decoder layers compile their FFN block at decode shapes
+    (mlx_vlm language.py ``compile_ffn``). The offloaded block manages
+    slots on the host and cannot be traced — ``tolist()`` inside
+    ``mx.compile`` dies with "eval during function transformations". The
+    wrap must turn that compilation off, and the layer must then run the
+    offloaded block eagerly."""
+
+    class _MoEHost(nn.Module):
+        def __init__(self, glu):
+            super().__init__()
+            self.switch_mlp = glu
+
+    class _CompilingLayer(nn.Module):
+        def __init__(self, glu):
+            super().__init__()
+            self.mlp = _MoEHost(glu)
+            self.compile_ffn = True
+            self._ffn_c = None
+
+        def __call__(self, x):
+            if self.compile_ffn:
+                if self._ffn_c is None:
+                    self._ffn_c = mx.compile(self._ffn_block)
+                return self._ffn_c(x)
+            return self._ffn_block(x)
+
+        def _ffn_block(self, x):
+            return self.mlp.switch_mlp(x, mx.zeros((1, 1, K), dtype=mx.int32))
+
+    glu = _copy(reference)
+    layer = _CompilingLayer(glu)
+    model = nn.Module()
+    model.layers = [layer]
+    prefix = "layers.0.mlp.switch_mlp"
+    _write(tmp_path, _tensors(glu, prefix=prefix))
+
+    assert dsv4.apply_deepseek_v4_moe_expert_offload(model, tmp_path, 0.25) == 1
+    assert layer.compile_ffn is False
+    x = _x(1, 1, D)
+    got = layer(x)  # would raise the eval-during-trace error if compiled
+    ref = reference(x, mx.zeros((1, 1, K), dtype=mx.int32))
+    mx.eval(got, ref)
+    assert bool(mx.array_equal(ref, got))
+
+
 def test_admission_estimate_counts_dsv4_experts(tmp_path):
     glu = _make_glu()
     tensors = _tensors(glu)
