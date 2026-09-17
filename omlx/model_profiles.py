@@ -30,6 +30,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "force_sampling",
     "enable_thinking",
     "preserve_thinking",
+    "cache_reasoning_output",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
     "reasoning_parser",
@@ -49,6 +50,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_sequence_length",
     "qwen35_ane_prefill_tail_padding_min_tokens",
     "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_shared_fraction",
     "qwen35_ane_prefill_fused_down",
     "qwen35_ane_prefill_max_layers",
     "qwen35_ane_prefill_dual_ane",
@@ -61,6 +63,10 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_gdn_fraction",
     "qwen35_ane_prefill_cpu_threads",
     "qwen35_ane_prefill_cpu_shared_resource",
+    "qwen35_oq_a8_enabled",
+    "qwen35_oq_a8_min_tokens",
+    "moe_expert_offload_enabled",
+    "moe_expert_offload_resident_fraction",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",
@@ -104,6 +110,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "ttl_seconds",
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
+        "deepseek_v41_engram_ssd_offload",
+        # Architecture-level prefill strategy; explicit per model.
+        "deepseek_v41_ced_prefill_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

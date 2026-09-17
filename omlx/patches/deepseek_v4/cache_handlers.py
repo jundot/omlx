@@ -35,6 +35,10 @@ class PoolingCacheHandler(CacheTypeHandler):
         # Compressed pool — partial slicing is not meaningful.
         return False
 
+    def serialize_meta_state(self, cache_obj: Any) -> int:
+        # CacheList persists the compression ratio as a scalar.
+        return cache_obj.ratio
+
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         buf_kv, buf_gate, pooled, prev_win_kv, prev_win_gate = cache_obj.state
         return {

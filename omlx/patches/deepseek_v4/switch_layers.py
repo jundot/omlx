@@ -21,6 +21,12 @@ _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
+# Affine 2/3-bit g64 crossovers measured on M1 Ultra. Other formats keep
+# their existing 64-route sorting threshold.
+_SORT_MIN_ROUTES = int(os.environ.get("OMLX_DEEPSEEK_SORT_MIN_ROUTES", "32"))
+_AFFINE_NATIVE_MIN_ROUTES = int(
+    os.environ.get("OMLX_DEEPSEEK_AFFINE_BLOCK_MIN_ROUTES", "1024")
+)
 # Tuned on M3 Ultra. Set this to 8192 to restore the previous crossover on
 # other pre-NAX chips; M5 prefill uses the NAX fallback below.
 _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
@@ -47,6 +53,18 @@ def _nax_prefers_stock(num_routes: int) -> bool:
     if _NAX_STOCK_MODE in ("1", "true", "on"):
         return True
     return num_routes >= _NAX_STOCK_MIN_ROUTES
+
+
+def _sort_threshold(*projections) -> int:
+    if all(
+        isinstance(p, QuantizedSwitchLinear)
+        and p.mode == "affine"
+        and p.bits in (2, 3)
+        and p.group_size == 64
+        for p in projections
+    ):
+        return _SORT_MIN_ROUTES
+    return 64
 
 
 def _gather_sort(x, indices):
@@ -243,6 +261,7 @@ class QuantizedSwitchLinear(nn.Module):
             sorted_indices
             and x.ndim == 3
             and x.shape[-2] == 1
+            and int(x.shape[0]) >= _AFFINE_NATIVE_MIN_ROUTES
             and dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 64
             and self.bits in (2, 3)
@@ -417,7 +436,9 @@ class SwitchGLU(nn.Module):
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
 
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _sort_threshold(
+            self.gate_proj, self.up_proj, self.down_proj
+        )
         idx = indices
         inv_order = None
         if do_sort:
@@ -595,7 +616,7 @@ class SwitchMLP(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _sort_threshold(self.fc1, self.fc2)
         idx = indices
         inv_order = None
         if do_sort:

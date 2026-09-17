@@ -18,6 +18,9 @@ final class ServerScreenVM {
     var basePathText: String = AppConfig.defaultBasePath()
     var modelDirTexts: [String] = [""]
     var hfCacheEnabled: Bool = true
+    /// Live switch; commits through `saveUsageHistory()` like the other
+    /// auto-apply rows rather than the Apply button.
+    var usageHistoryEnabled: Bool = true
     var lastError: String?
     private(set) var isMovingBasePath: Bool = false
 
@@ -81,6 +84,7 @@ final class ServerScreenVM {
                 self.modelDirTexts = modelDirs
             }
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -265,6 +269,28 @@ final class ServerScreenVM {
             self.lastError = String(localized: "server.error.nothing_to_apply",
                                     defaultValue: "Nothing to apply — every field matches the current config.",
                                     comment: "Server screen error when Apply is tapped with no pending changes")
+            return
+        }
+
+        if services.canSaveSettingsOffline && patchHasFields {
+            guard let nextPort, patch == GlobalSettingsPatch(port: nextPort), !diff.hasChanges else {
+                self.lastError = String(
+                    localized: "server.error.offline_port_only",
+                    defaultValue: "Apply the port change separately while the server is stopped. Start the server before applying other settings.",
+                    comment: "Offline Apply supports port recovery without a running server"
+                )
+                return
+            }
+            Task {
+                do {
+                    try await services.applyServerEndpoint(port: nextPort)
+                    self.effectivePort = nextPort
+                    self.baselinePortText = String(nextPort)
+                    self.lastError = nil
+                } catch {
+                    self.lastError = error.omlxDescription
+                }
+            }
             return
         }
 
@@ -453,7 +479,7 @@ final class ServerScreenVM {
     func saveHost(services: AppServices) {
         let next = host
         Task {
-            await commit(GlobalSettingsPatch(host: next))
+            guard await commit(GlobalSettingsPatch(host: next)) else { return }
             do {
                 try await services.applyServerEndpoint(host: next)
                 self.appliedBindAddress = next
@@ -519,7 +545,7 @@ final class ServerScreenVM {
                                     comment: "Server screen error when port value is out of valid range")
             return
         }
-        if portChanged && parsedPort == nil {
+        if parsedPort == nil {
             self.lastError = String(localized: "server.error.port_invalid",
                                     defaultValue: "Port must be a number between 1 and 65535.",
                                     comment: "Server screen error when port value is out of valid range")
@@ -530,10 +556,10 @@ final class ServerScreenVM {
             do {
                 if portChanged || hostChanged {
                     if portChanged, let p = parsedPort {
-                        await commit(GlobalSettingsPatch(port: p))
+                        guard await commit(GlobalSettingsPatch(port: p)) else { return }
                     }
                     if hostChanged {
-                        await commit(GlobalSettingsPatch(host: host))
+                        guard await commit(GlobalSettingsPatch(host: host)) else { return }
                     }
                     try await services.applyServerEndpoint(
                         host: hostChanged ? host : nil,
@@ -559,6 +585,10 @@ final class ServerScreenVM {
 
     func saveSseKeepaliveMode() {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
+    }
+
+    func saveUsageHistory() {
+        Task { await commit(GlobalSettingsPatch(usageHistory: usageHistoryEnabled)) }
     }
 
     func saveAutoStartOnLaunch(services: AppServices) {

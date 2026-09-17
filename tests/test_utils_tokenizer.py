@@ -30,6 +30,14 @@ def _spm_decoder(strip_space=True):
 
 
 class _ByteFallbackTokenizer:
+
+    def __len__(self):
+        return max(self.vocab.values()) + 1
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {v: k for k, v in self.vocab.items()}
+        return [reverse[i] for i in ids]
+
     clean_up_tokenization_spaces = False
     vocab = {
         "<pad>": 0,
@@ -54,6 +62,14 @@ class _ByteFallbackTokenizer:
 
 
 class _BpeTokenizer:
+
+    def __len__(self):
+        return max(self.vocab.values()) + 1
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {v: k for k, v in self.vocab.items()}
+        return [reverse[i] for i in ids]
+
     clean_up_tokenization_spaces = False
     vocab = {"A": 0, "B": 1}
 
@@ -70,6 +86,14 @@ class BPEStreamingDetokenizer:
 
 
 class _MlxVlmBpeTokenizer:
+
+    def __len__(self):
+        return max(self.vocab.values()) + 1
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {v: k for k, v in self.vocab.items()}
+        return [reverse[i] for i in ids]
+
     clean_up_tokenization_spaces = False
 
     def __init__(self, vocab):
@@ -89,13 +113,9 @@ class _ExplicitNoDetokenizer:
 
 
 def _bpe_byte_chars(*byte_values):
-    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+    from mlx_lm.tokenizer_utils import _byte_decoder
 
-    BPEStreamingDetokenizer.make_byte_decoder()
-    byte_encoder = {
-        byte_value: char
-        for char, byte_value in BPEStreamingDetokenizer._byte_decoder.items()
-    }
+    byte_encoder = {byte_value: char for char, byte_value in _byte_decoder().items()}
     return [byte_encoder[byte_value] for byte_value in byte_values]
 
 

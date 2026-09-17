@@ -1,3 +1,10 @@
+import os
+import subprocess
+
+# MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
+# the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
 # SPDX-License-Identifier: Apache-2.0
 """
 Pytest configuration and fixtures for oMLX tests.
@@ -111,11 +118,36 @@ class MockModel:
         """Return model parameters."""
         return self._parameters
 
+    def make_cache(self) -> list:
+        """Build the per-layer prompt cache, like a real mlx-lm model.
+
+        The scheduler probes this to decide whether a stored prefix can be
+        rebuilt faithfully, so the double has to answer it. A plain llama-style
+        model builds ``KVCache`` layers; tests that need another cache class
+        override this attribute.
+        """
+        from mlx_lm.models.cache import KVCache
+
+        return [KVCache() for _ in range(self.config.num_hidden_layers)]
+
 
 @pytest.fixture
 def mock_tokenizer() -> MockTokenizer:
     """Provide a mock tokenizer for tests."""
     return MockTokenizer()
+
+
+@pytest.fixture
+def mock_cluster_ssh(monkeypatch):
+    from omlx.cluster import launch
+
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            [], 0, stdout='{"action": "no-marker"}', stderr=""
+        )
+    )
+    monkeypatch.setattr(launch, "_run_cluster_ssh", runner)
+    return runner
 
 
 @pytest.fixture

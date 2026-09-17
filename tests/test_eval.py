@@ -52,6 +52,16 @@ class TestMMLU:
         """When no 'answer is' pattern, use last valid letter."""
         assert self.bench.extract_answer("Looking at A and B, B is correct", {}) == "B"
 
+    def test_extract_answer_stated_answer_beats_later_letter(self):
+        """An explicit 'answer is X' wins even when another letter comes after it."""
+        assert self.bench.extract_answer("The answer is B. Note that A is a distractor.", {}) == "B"
+        assert self.bench.extract_answer("Answer: C. Option D looks similar.", {}) == "C"
+
+    def test_extract_answer_stated_answer_any_case(self):
+        """The 'answer is' cue is matched whatever casing the model used."""
+        assert self.bench.extract_answer("ANSWER IS D. A is incorrect.", {}) == "D"
+        assert self.bench.extract_answer("the answer is a, not b", {}) == "A"
+
     def test_check_answer_correct(self):
         assert self.bench.check_answer("A", {"answer": "A"}) is True
 
@@ -155,6 +165,23 @@ class TestGSM8K:
     def test_extract_numeric_answer_fallback(self):
         assert _extract_numeric_answer("The answer is 42.") == "42"
         assert _extract_numeric_answer("She has 15 apples and 20 oranges, so 35 total.") == "35"
+
+    def test_extract_numeric_answer_trailing_comma_after_last_number(self):
+        # A bare "," is not a number: punctuation after the final digit must
+        # not become the extracted answer.
+        assert _extract_numeric_answer("The total is 72 clips, altogether.") == "72"
+        assert (
+            _extract_numeric_answer("Thus, the answer is 18, which is the total.")
+            == "18"
+        )
+        assert _extract_numeric_answer("He gave away 8 lollipops,") == "8"
+
+    def test_extract_numeric_answer_keeps_thousands_separator(self):
+        assert _extract_numeric_answer("The final total is 1,234 dollars.") == "1234"
+        assert _extract_numeric_answer("That comes to 1,234.50, in the end.") == "1234.50"
+
+    def test_extract_numeric_answer_commas_only(self):
+        assert _extract_numeric_answer("Well, hmm, no idea,") == ""
 
     def test_extract_numeric_answer_empty(self):
         assert _extract_numeric_answer("I don't know") == ""

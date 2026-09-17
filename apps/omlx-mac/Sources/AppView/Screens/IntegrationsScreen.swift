@@ -25,13 +25,7 @@ struct IntegrationsScreen: View {
             OtherIntegrationsSection(vm: vm, client: services.client)
             MCPSection(vm: vm, client: services.client)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.load(client: services.client) }
     }
@@ -79,7 +73,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.opusModel, save: {
                             Task { await vm.save(.opusModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -90,7 +84,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.sonnetModel, save: {
                             Task { await vm.save(.sonnetModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -106,7 +100,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.haikuModel, save: {
                             Task { await vm.save(.haikuModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -120,10 +114,9 @@ private struct ClaudeCodeSection: View {
                                  comment: "Sublabel for the context scaling toggle"),
                 isLast: !vm.contextScaling
             ) {
-                Toggle("", isOn: vm.bind($vm.contextScaling, save: {
+                RowSwitch(isOn: vm.bind($vm.contextScaling, save: {
                     Task { await vm.save(.contextScaling, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
             if vm.contextScaling {
                 Row(
@@ -139,14 +132,13 @@ private struct ClaudeCodeSection: View {
                         text: $vm.targetContextSizeText,
                         mono: true,
                         suffix: "tk",
-                        width: 130
+                        width: .controlCompact
                     )
                 }
             }
         }
         if vm.contextScaling {
-            HStack {
-                Spacer()
+            FooterBar {
                 Button(String(localized: "integrations.target_context.apply",
                               defaultValue: "Apply",
                               comment: "Apply button for the Claude Code target context size field")) {
@@ -155,8 +147,6 @@ private struct ClaudeCodeSection: View {
                 .buttonStyle(.omlx(.primary))
                 .disabled(!vm.hasPendingContextSizeChange)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
         }
     }
 }
@@ -237,36 +227,18 @@ private struct CommandBlock: View {
                     .strokeBorder(theme.groupBorder, lineWidth: 0.5)
             )
 
-            CopyButton(value: command)
-                .padding(.top, 6)
-                .padding(.trailing, 8)
+            // Same quiet copy affordance as `CodeChip`/`CopyIconButton`
+            // everywhere else — the previous locally-drawn boxed button was a
+            // second copy-button style.
+            CopyIconButton(
+                value: command,
+                helpText: String(localized: "integrations.command.copy",
+                                 defaultValue: "Copy command",
+                                 comment: "Tooltip for the copy button on a shell command block")
+            )
+            .padding(.top, 4)
+            .padding(.trailing, 4)
         }
-    }
-}
-
-private struct CopyButton: View {
-    let value: String
-    @State private var copied = false
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        Button {
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(value, forType: .string)
-            copied = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                copied = false
-            }
-        } label: {
-            Image(systemName: copied ? "checkmark" : "document.on.document")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(copied ? theme.successText : theme.textSecondary)
-                .padding(5)
-                .background(theme.controlBg)
-                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-        }
-        .buttonStyle(.plain)
     }
 }
 
@@ -392,7 +364,7 @@ private struct IntegrationRow: View {
                     Spacer(minLength: 12)
                     Popup(
                         selection: modelBinding,
-                        width: 220,
+                        width: .controlMedium,
                         options: modelOptions
                     )
                 }
@@ -413,7 +385,7 @@ private struct IntegrationRow: View {
                         Spacer(minLength: 12)
                         Popup(
                             selection: profileBinding,
-                            width: 160,
+                            width: .controlMedium,
                             options: [
                                 ("minimal",   String(localized: "integrations.openclaw.profile.minimal",
                                                      defaultValue: "Minimal",
@@ -478,12 +450,11 @@ private struct MCPSection: View {
                     text: $vm.mcpConfigPath,
                     placeholder: "/path/to/mcp.json",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
         }
-        HStack {
-            Spacer()
+        FooterBar {
             Button(String(localized: "integrations.mcp.apply",
                           defaultValue: "Apply",
                           comment: "Apply button for the MCP config path")) {
@@ -492,7 +463,5 @@ private struct MCPSection: View {
             .buttonStyle(.omlx(.primary))
             .disabled(!vm.hasPendingMCPChanges)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 6)
     }
 }

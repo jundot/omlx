@@ -2,9 +2,9 @@
 //   • ServerHeroCard (the same card the Server screen mounts; defined in
 //     ServerScreen.swift)
 //   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
+//   • Active Now — active_models slice from /api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
 //   • Updates — release check status + auto-check/auto-notify prefs
-//   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
 
@@ -67,6 +67,8 @@ struct StatusScreen: View {
                                   comment: "Section header for the currently active models list"))
             ActiveNowList(models: vm.stats?.activeModels.models ?? [])
 
+            UsageHistoryView()
+
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
                                   comment: "Section header for system status rows"),
@@ -125,12 +127,7 @@ struct StatusScreen: View {
                                   comment: "Section header for the updates section"))
             UpdatesSection(updates: services.updates)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18).padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task(id: vm.scope) {
             await vm.start(client: services.client)
@@ -492,8 +489,8 @@ private struct SystemRamTrailing: View {
         guard let used = metrics.ramUsedBytes,
               let total = metrics.ramTotalBytes
         else { return "—" }
-        let u = SystemMetricsPoller.formatBytesAsGB(used)
-        let t = SystemMetricsPoller.formatBytesAsGB(total)
+        let u = SystemMetricsPoller.formatBytesAsGiB(used)
+        let t = SystemMetricsPoller.formatBytesAsGiB(total)
         return "\(u) / \(t) GB"
     }
 }
@@ -619,7 +616,7 @@ private struct UpdatesSection: View {
                         get: { updates.channel },
                         set: { updates.channel = $0 }
                     ),
-                    width: 190,
+                    width: .controlMedium,
                     options: UpdateChannel.allCases.map { ($0, $0.displayName) }
                 )
             }
@@ -631,12 +628,10 @@ private struct UpdatesSection: View {
                                  defaultValue: "Look for updates daily in the background",
                                  comment: "Sublabel for the auto-check toggle")
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoCheck },
                     set: { updates.autoCheck = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
             Row(
                 label: String(localized: "status.updates.auto_download",
@@ -647,12 +642,10 @@ private struct UpdatesSection: View {
                                  comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoNotify },
                     set: { updates.autoNotify = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
         }
     }

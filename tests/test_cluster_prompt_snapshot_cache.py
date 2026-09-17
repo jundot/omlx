@@ -96,7 +96,7 @@ def test_a_rotating_and_recurrent_state_round_trips(tmp_path):
     tokens = list(range(STEP))
     caches = _rotating_and_gdn()
     rot_state = caches[0].state
-    gdn_state = caches[1].state
+    gdn_state = caches[1].cache
 
     assert store.put(MODEL, tokens, caches)
     restored = store.load(MODEL, tokens, STEP)
@@ -106,7 +106,7 @@ def test_a_rotating_and_recurrent_state_round_trips(tmp_path):
     # The window offset and the recurrent slot survive the round trip.
     assert restored[0].offset == caches[0].offset
     assert mx.array_equal(restored[0].state[0], rot_state[0])
-    assert mx.array_equal(restored[1].state[0], gdn_state[0])
+    assert mx.array_equal(restored[1].cache[0], gdn_state[0])
 
 
 def test_kv_segments_reassemble_across_the_chain(tmp_path):
@@ -124,12 +124,12 @@ def test_kv_segments_reassemble_across_the_chain(tmp_path):
     assert restored is not None
     assert type(restored[0]).__name__ == "KVCache"
     assert restored[0].offset == 12
-    assert mx.array_equal(restored[0].state[0], kv.state[0])
-    assert mx.array_equal(restored[0].state[1], kv.state[1])
+    assert mx.array_equal(restored[0].state[0], kv.keys_and_values()[0])
+    assert mx.array_equal(restored[0].state[1], kv.keys_and_values()[1])
 
     interior = store.load(MODEL, tokens, 8)
     assert interior is not None
-    assert mx.array_equal(interior[0].state[0], kv.state[0][..., :8, :])
+    assert mx.array_equal(interior[0].state[0], kv.keys_and_values()[0][..., :8, :])
 
     # One slab per file, not one cumulative copy per boundary.
     sizes = [p.stat().st_size for p in tmp_path.glob("*.safetensors")]
@@ -151,7 +151,7 @@ def test_a_zero_width_value_cache_segments_cleanly(tmp_path):
     restored = store.load(MODEL, tokens, 8)
     assert restored is not None
     assert restored[0].offset == 8
-    assert mx.array_equal(restored[0].state[0], mla.state[0])
+    assert mx.array_equal(restored[0].state[0], mla.keys_and_values()[0])
     assert restored[0].state[1].shape == (1, 2, 8, 0)
 
 
@@ -205,7 +205,7 @@ def test_non_sliceable_members_ride_the_deepest_file(tmp_path):
 
     restored = store.load(MODEL, tokens, 8)
     assert restored is not None
-    assert mx.array_equal(restored[0].state[0], kv.state[0])
+    assert mx.array_equal(restored[0].state[0], kv.keys_and_values()[0])
     assert restored[1].offset == rot.offset
     assert mx.array_equal(restored[1].state[0], rot.state[0])
 
@@ -250,7 +250,7 @@ def test_the_deepseek_layer_shape_round_trips(tmp_path):
     assert mx.array_equal(members[0].state[0], rot_member.state[0])
     _assert_pooling_equal(members[1], pool_small)
     _assert_pooling_equal(members[2], pool_large)
-    assert mx.array_equal(restored[1].state[0], plain.state[0])
+    assert mx.array_equal(restored[1].state[0], plain.keys_and_values()[0])
     # The live cache was wrapped, not rewritten.
     assert pool_small.prev_win_kv is not None
 
@@ -283,7 +283,7 @@ def test_an_empty_pooling_cache_still_round_trips(tmp_path):
     assert restored is not None
     assert type(restored[0]).__name__ == "PoolingCache"
     assert restored[0].empty() and restored[0].ratio == 4
-    assert mx.array_equal(restored[1].state[0], trailing.state[0])
+    assert mx.array_equal(restored[1].state[0], trailing.keys_and_values()[0])
 
 
 def test_an_untouched_rotating_member_round_trips(tmp_path):
@@ -309,7 +309,7 @@ def test_an_untouched_rotating_member_round_trips(tmp_path):
     assert members[0].keys.shape == (1, 2, 0, 4)
     assert members[0].keys.dtype == mx.float16
     _assert_pooling_equal(members[1], pool)
-    assert mx.array_equal(restored[1].state[0], trailing.state[0])
+    assert mx.array_equal(restored[1].state[0], trailing.keys_and_values()[0])
 
 
 def test_a_new_store_reclaims_what_a_dead_process_left(tmp_path):
@@ -323,6 +323,34 @@ def test_a_new_store_reclaims_what_a_dead_process_left(tmp_path):
 
     assert list(tmp_path.iterdir()) == []
     assert store.put(MODEL, list(range(STEP)), _kv())  # still fully usable
+
+
+def test_persistent_store_restores_its_chain_after_rank_restart(tmp_path):
+    tokens = list(range(8))
+    first = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    kv = KVCache()
+    for boundary in (4, 8):
+        _feed(kv, 4)
+        assert first.put(MODEL, tokens[:boundary], [kv])
+
+    manifest = tmp_path / "index.json"
+    assert manifest.is_file()
+    second = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    assert second.present_boundaries(MODEL, tokens) == (8, 4)
+    restored = second.load(MODEL, tokens, 8)
+    assert restored is not None
+    assert mx.array_equal(restored[0].state[0], kv.keys_and_values()[0])
+
+
+def test_invalid_persistent_manifest_fails_closed(tmp_path):
+    (tmp_path / "deadbeef.safetensors").write_bytes(b"stale")
+    (tmp_path / "index.json").write_text('{"version":1,"step":4,"entries":[{}]}')
+
+    store = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+
+    assert len(store) == 0
+    assert not (tmp_path / "deadbeef.safetensors").exists()
+    assert (tmp_path / "index.json").is_file()
 
 
 def test_an_unaligned_prompt_is_rejected(tmp_path):
@@ -429,7 +457,9 @@ def test_an_unserialisable_cache_disables_the_store(tmp_path, monkeypatch):
         raise ValueError("Metadata must be a dictionary with string keys")
 
     monkeypatch.setattr(
-        "mlx_lm.models.cache.save_prompt_cache", _unserialisable, raising=True
+        "omlx.cluster.prompt_snapshot_cache._save_prompt_snapshot",
+        _unserialisable,
+        raising=True,
     )
     assert store.put(MODEL, list(range(STEP)), _kv()) is False
     assert store.put(MODEL, list(range(2 * STEP)), _kv()) is False
@@ -447,7 +477,9 @@ def test_a_disk_error_keeps_the_store_live(tmp_path, monkeypatch):
         calls.append(1)
         raise OSError("no space left on device")
 
-    monkeypatch.setattr("mlx_lm.models.cache.save_prompt_cache", _flaky, raising=True)
+    monkeypatch.setattr(
+        "omlx.cluster.prompt_snapshot_cache._save_prompt_snapshot", _flaky, raising=True
+    )
     assert store.put(MODEL, list(range(STEP)), _kv()) is False
     assert store.put(MODEL, list(range(2 * STEP)), _kv()) is False
     assert len(calls) == 2  # each attempt was made
@@ -459,9 +491,57 @@ def test_a_failed_write_leaves_the_index_unchanged(tmp_path, monkeypatch):
     def _boom(*_a, **_k):
         raise OSError("disk full")
 
-    monkeypatch.setattr("mlx_lm.models.cache.save_prompt_cache", _boom, raising=True)
+    monkeypatch.setattr(
+        "omlx.cluster.prompt_snapshot_cache._save_prompt_snapshot", _boom, raising=True
+    )
     assert store.put(MODEL, list(range(STEP)), _kv()) is False
     assert len(store) == 0
     assert store.present_boundaries(MODEL, list(range(STEP))) == ()
     # No half-written temp file is left behind.
     assert list(tmp_path.glob("*")) == []
+
+
+def test_clear_removes_live_files_without_a_write_behind_flush(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=STEP, persistent=True)
+    assert store.put(MODEL, list(range(STEP)), _kv()) is True
+    assert len(store) == 1
+
+    assert store.clear(timeout=0.01) == 1
+
+    assert len(store) == 0
+    assert store.nbytes == 0
+    assert list(tmp_path.glob("*.safetensors")) == []
+
+
+def test_core_batch_and_quantized_wire_states_round_trip(tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache, QuantizedKVCache
+
+    from omlx.cluster.prompt_snapshot_cache import (
+        _load_prompt_snapshot,
+        _save_prompt_snapshot,
+    )
+
+    caches = [
+        BatchKVCache([0, 1]),
+        BatchRotatingKVCache(8, [0, 1]),
+        QuantizedKVCache(bits=4),
+    ]
+    for cache in caches:
+        rows = 1 if isinstance(cache, QuantizedKVCache) else 2
+        cache.update_and_fetch(
+            mx.ones((rows, 1, 3, 64)), mx.full((rows, 1, 3, 64), 2.0)
+        )
+    path = str(tmp_path / "core.safetensors")
+    _save_prompt_snapshot(path, caches)
+    restored = _load_prompt_snapshot(path)
+    for before, after in zip(caches, restored):
+        assert type(before) is type(after)
+        assert mx.array_equal(mx.array(before.offset), mx.array(after.offset))
+        for (_, a), (_, b) in zip(
+            tree_flatten(before.keys_and_values()),
+            tree_flatten(after.keys_and_values()),
+        ):
+            assert mx.array_equal(a, b)
+        if hasattr(before, "left_padding"):
+            assert mx.array_equal(before.left_padding, after.left_padding)

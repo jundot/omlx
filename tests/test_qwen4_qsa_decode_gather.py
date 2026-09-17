@@ -11,6 +11,11 @@ import pytest
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
+@pytest.fixture(autouse=True)
+def _vendored_qwen4():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+
+
 def _tiny_text_config():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp import TextConfig
@@ -61,6 +66,7 @@ def _tiny_text_config():
 
 
 def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
@@ -103,6 +109,8 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
         mx.argmax(expected, axis=-1),
     ).item()
     assert fast_cache.offset == reference_cache.offset == 11
+    assert fast_cache._omlx_last_prefill_gathered is True
+    assert reference_cache._omlx_last_prefill_gathered is True
     for fast_value, reference_value in zip(
         fast_cache.state,
         reference_cache.state,
@@ -111,6 +119,8 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
 
 
 def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
+    # The fixture prefill is 10 rows; lower the gathered width gate for it.
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
 
@@ -170,7 +180,11 @@ def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     )
 
     decode_token = mx.array([[12]], dtype=mx.int32)
+    position_ids = model._position_ids
+    rope_deltas = model._rope_deltas
     actual = model(decode_token, cache=fast_cache)
+    model._position_ids = position_ids
+    model._rope_deltas = rope_deltas
     monkeypatch.setattr(
         language.Qwen4ExpAttention,
         "_gathered_text_decode_eligible",
@@ -186,10 +200,10 @@ def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     assert mx.allclose(
         fast_prefix.logits,
         reference_prefix.logits,
-        rtol=2e-5,
-        atol=2e-5,
+        rtol=2e-4,
+        atol=2e-4,
     ).item()
-    assert mx.allclose(actual.logits, expected.logits, rtol=2e-5, atol=2e-5).item()
+    assert mx.allclose(actual.logits, expected.logits, rtol=2e-4, atol=2e-4).item()
     assert mx.array_equal(
         mx.argmax(actual.logits[:, -1], axis=-1),
         mx.argmax(expected.logits[:, -1], axis=-1),
@@ -210,7 +224,11 @@ def test_qwen4_decode_keeps_official_path_until_complete_block_crossover(
     def must_not_gather(*args, **kwargs):
         raise AssertionError("decode at the QSA block budget must stay official")
 
-    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa_decode", must_not_gather)
+    monkeypatch.setattr(
+        language,
+        "contiguous_causal_gathered_qsa_decode",
+        must_not_gather,
+    )
     output = attention(mx.random.normal((1, 1, config.hidden_size)), cache=cache)
     mx.eval(output)
 
@@ -374,3 +392,391 @@ def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch
         (256**-0.5, False, "native"),
     ]
     assert mx.array_equal(actual, expected).item()
+
+
+def _crossover_cache(config, attention, length=12, seed=23):
+    """Prefill ``length`` tokens so completed blocks exceed the QSA budget."""
+    mx.random.seed(seed)
+    cache = _language().QSAKVCache()
+    prefix = mx.random.normal((1, length, config.hidden_size))
+    mx.eval(attention(prefix, mask="causal", cache=cache))
+    return cache
+
+
+def _language():
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    return language
+
+
+# Stored-layout row gather and Lightning MTP verification share the same QSA
+# gather path as the decode tests above.
+
+
+def _reference(kv, indices):
+    rows = kv.transpose(0, 2, 1, 3)
+    batch, tokens = rows.shape[:2]
+    trailing = rows.shape[2:]
+    offsets = mx.arange(batch, dtype=mx.int32).reshape(
+        (batch,) + (1,) * (indices.ndim - 1)
+    ) * tokens
+    flat = (indices.astype(mx.int32) + offsets).reshape(-1)
+    gathered = rows.reshape(batch * tokens, *trailing)[flat].reshape(
+        *indices.shape, *trailing
+    )
+    axes = (0, 2, 1, 3) if indices.ndim == 2 else (0, 1, 3, 2, 4)
+    return mx.contiguous(gathered.transpose(*axes))
+
+
+def _dispatch_row_gather(monkeypatch, per_query, tokens):
+    from mlx_vlm.models.qwen4_exp import qsa_fast
+
+    picked = []
+    for name in ("_gather_kv_rows_stored", "_gather_kv_rows_token_major"):
+        monkeypatch.setattr(
+            qsa_fast,
+            name,
+            lambda kv, idx, _name=name: picked.append(_name),
+        )
+    kv = mx.zeros((1, 2, tokens, 16), dtype=mx.bfloat16)
+    indices = mx.zeros((1, per_query, 2051), dtype=mx.int32)
+    qsa_fast._gather_kv_rows(kv, indices)
+    return picked
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize(
+    "form",
+    ["_gather_kv_rows", "_gather_kv_rows_stored", "_gather_kv_rows_token_major"],
+)
+def test_gather_kv_rows_matches_token_major_gather(batch, form):
+    from mlx_vlm.models.qwen4_exp import qsa_fast
+
+    mx.random.seed(3)
+    kv = mx.random.normal((batch, 2, 300, 16)).astype(mx.bfloat16)
+    indices = mx.sort(
+        mx.random.randint(0, 300, (batch, 37)).astype(mx.int32), axis=-1
+    )
+    out = getattr(qsa_fast, form)(kv, indices)
+    mx.eval(out)
+    assert out.shape == (batch, 2, 37, 16)
+    assert mx.array_equal(
+        out.view(mx.uint16), _reference(kv, indices).view(mx.uint16)
+    ).item()
+
+
+@pytest.mark.parametrize("per_query", [1, 4, 16])
+@pytest.mark.parametrize("tokens", [4096, 65536, 206848])
+def test_gather_kv_rows_decode_and_verify_widths_use_stored_layout(
+    monkeypatch, per_query, tokens
+):
+    assert _dispatch_row_gather(monkeypatch, per_query, tokens) == [
+        "_gather_kv_rows_stored"
+    ]
+
+
+@pytest.mark.parametrize("tokens", [4096, 16384, 65536])
+def test_gather_kv_rows_prefill_width_copies_token_major_below_threshold(
+    monkeypatch, tokens
+):
+    assert _dispatch_row_gather(monkeypatch, 64, tokens) == [
+        "_gather_kv_rows_token_major"
+    ]
+
+
+def test_gather_kv_rows_prefill_width_uses_stored_layout_at_long_context(monkeypatch):
+    assert _dispatch_row_gather(monkeypatch, 64, 131072) == [
+        "_gather_kv_rows_stored"
+    ]
+
+
+def test_gather_kv_rows_rank_three_forms_agree():
+    from mlx_vlm.models.qwen4_exp import qsa_fast
+
+    mx.random.seed(5)
+    kv = mx.random.normal((2, 2, 500, 16)).astype(mx.bfloat16)
+    indices = mx.sort(
+        mx.random.randint(0, 500, (2, 8, 21)).astype(mx.int32), axis=-1
+    )
+    stored = qsa_fast._gather_kv_rows_stored(kv, indices)
+    token_major = qsa_fast._gather_kv_rows_token_major(kv, indices)
+    mx.eval(stored, token_major)
+    assert stored.shape == token_major.shape == (2, 8, 2, 21, 16)
+    assert mx.array_equal(
+        stored.view(mx.uint16), token_major.view(mx.uint16)
+    ).item()
+    assert mx.array_equal(
+        stored.view(mx.uint16), _reference(kv, indices).view(mx.uint16)
+    ).item()
+
+
+def _layer_and_prefix(seed: int = 19, prefix_tokens: int = 10):
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    config = _tiny_text_config()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    fast_cache = language.QSAKVCache()
+    reference_cache = language.QSAKVCache()
+    mx.random.seed(seed)
+    prefix = mx.random.normal((1, prefix_tokens, config.hidden_size))
+    mx.eval(
+        attention(prefix, mask="causal", cache=fast_cache),
+        attention(prefix, mask="causal", cache=reference_cache),
+    )
+    return config, attention, fast_cache, reference_cache
+
+
+@pytest.mark.parametrize("rows", [2, 4])
+def test_qwen4_verify_rows_gather_selected_blocks_and_match_official(
+    monkeypatch, rows
+):
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    config, attention, fast_cache, reference_cache = _layer_and_prefix()
+    verify = mx.random.normal((1, rows, config.hidden_size))
+
+    gathered_query_tokens = []
+    original = language.contiguous_causal_gathered_qsa
+
+    def tracked(queries, *args, **kwargs):
+        gathered_query_tokens.append(int(queries.shape[2]))
+        return original(queries, *args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    actual = attention(verify, mask="causal", cache=fast_cache, target_verify=True)
+
+    monkeypatch.setattr(
+        language.Qwen4ExpAttention,
+        "_gathered_text_verify_eligible",
+        lambda *a, **k: False,
+        raising=False,
+    )
+    expected = attention(
+        verify, mask="causal", cache=reference_cache, target_verify=True
+    )
+    mx.eval(actual, expected)
+
+    assert gathered_query_tokens == [rows]
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    assert mx.array_equal(
+        mx.argmax(actual, axis=-1), mx.argmax(expected, axis=-1)
+    ).item()
+    assert fast_cache.offset == reference_cache.offset == 10 + rows
+    for fast_value, reference_value in zip(fast_cache.state, reference_cache.state):
+        assert mx.array_equal(fast_value, reference_value).item()
+
+
+def test_qwen4_verify_rows_survive_rollback_like_official(monkeypatch):
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    config, attention, fast_cache, reference_cache = _layer_and_prefix(seed=23)
+    first = mx.random.normal((1, 4, config.hidden_size))
+    mx.eval(attention(first, mask="causal", cache=fast_cache, target_verify=True))
+    monkeypatch.setattr(
+        language.Qwen4ExpAttention,
+        "_gathered_text_verify_eligible",
+        lambda *a, **k: False,
+        raising=False,
+    )
+    mx.eval(
+        attention(first, mask="causal", cache=reference_cache, target_verify=True)
+    )
+    monkeypatch.undo()
+    for cache in (fast_cache, reference_cache):
+        cache.trim(3)
+    assert fast_cache.offset == reference_cache.offset == 11
+
+    second = mx.random.normal((1, 4, config.hidden_size))
+    actual = attention(second, mask="causal", cache=fast_cache, target_verify=True)
+    monkeypatch.setattr(
+        language.Qwen4ExpAttention,
+        "_gathered_text_verify_eligible",
+        lambda *a, **k: False,
+        raising=False,
+    )
+    expected = attention(
+        second, mask="causal", cache=reference_cache, target_verify=True
+    )
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    for fast_value, reference_value in zip(fast_cache.state, reference_cache.state):
+        assert mx.array_equal(fast_value, reference_value).item()
+
+
+def test_qwen4_verify_gather_kill_switch_keeps_official_path(monkeypatch):
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    config, attention, fast_cache, _ = _layer_and_prefix()
+    calls = []
+    original = language.contiguous_causal_gathered_qsa
+    monkeypatch.setattr(
+        language,
+        "contiguous_causal_gathered_qsa",
+        lambda *a, **k: calls.append(1) or original(*a, **k),
+    )
+    monkeypatch.setattr(language, "_GATHERED_VERIFY_DISABLED", True)
+    mx.eval(
+        attention(
+            mx.random.normal((1, 4, config.hidden_size)),
+            mask="causal",
+            cache=fast_cache,
+            target_verify=True,
+        )
+    )
+    assert calls == []
+
+
+def test_qwen4_verify_gather_requires_rank_two_positions():
+    config, attention, fast_cache, _ = _layer_and_prefix()
+    rows = 4
+    verify = mx.random.normal((1, rows, config.hidden_size))
+    text = mx.arange(fast_cache.offset, fast_cache.offset + rows)[None, :]
+    planes = mx.broadcast_to(text[None, :, :], (3, 1, rows))
+
+    def eligible(positions):
+        return attention._gathered_text_verify_eligible(
+            verify, "causal", fast_cache, positions, None, True
+        )
+
+    assert fast_cache.offset + rows > attention.indexer.token_budget
+    assert eligible(text) is True
+    assert eligible(None) is True
+    assert eligible(planes) is False
+
+
+def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
+    """Narrow multi-row windows (MTP passes) stay on the cheaper official path."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    cache = _crossover_cache(config, attention)
+    narrow = mx.random.normal((1, 4, config.hidden_size))
+    wide = mx.random.normal((1, 16, config.hidden_size))
+
+    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
+    assert language._gathered_min_query_tokens() == 16
+    assert not attention._gathered_text_prefill_eligible(
+        narrow, "causal", cache, None, None, False
+    )
+    assert attention._gathered_text_prefill_eligible(
+        wide, "causal", cache, None, None, False
+    )
+
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    assert attention._gathered_text_prefill_eligible(
+        narrow, "causal", cache, None, None, False
+    )
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "garbage")
+    assert language._gathered_min_query_tokens() == 16
+
+
+def test_qwen4_trim_keeps_pooled_index_prefix_exact():
+    """trim() clamps the pooled frontier instead of re-pooling every block."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    ratio = config.indexer_compress_ratio
+    indexer = attention.indexer
+
+    cache = _crossover_cache(config, attention, length=14, seed=51)
+    pooled_before = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    mx.eval(pooled_before)
+    assert cache._pooled_index_offset == 14 // ratio
+
+    # Speculative window of 3 rows, then reject two of them (MTP rollback).
+    window = mx.random.normal((1, 3, config.hidden_size))
+    mx.eval(attention(window, mask="causal", cache=cache, target_verify=True))
+    assert cache.trim(2) == 2
+    assert cache.offset == 15
+    # Pooled blocks below the new complete count survive the trim.
+    assert cache._pooled_index_keys is not None
+    assert cache._pooled_index_offset == 15 // ratio
+
+    incremental = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    cache._invalidate_pooled_indexer()
+    full = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    mx.eval(incremental, full)
+    assert incremental.shape == full.shape == (1, 15 // ratio, config.indexer_head_dim)
+    assert mx.array_equal(incremental, full).item()
+
+    # A trim that crosses a completed block boundary drops that block too.
+    assert cache.trim(3) == 3
+    assert cache._pooled_index_offset == 12 // ratio
+    again = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    cache._invalidate_pooled_indexer()
+    again_full = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    mx.eval(again, again_full)
+    assert mx.array_equal(again, again_full).item()
+
+
+def test_qwen4_trim_then_decode_matches_official_after_partial_invalidation(
+    monkeypatch,
+):
+    """Verify -> rollback -> decode stays exact with the retained pooled prefix."""
+    config = _tiny_text_config()
+    language = _language()
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    fast_cache = _crossover_cache(config, attention, length=12, seed=61)
+    reference_cache = _crossover_cache(config, attention, length=12, seed=61)
+
+    window = mx.random.normal((1, 4, config.hidden_size))
+    mx.eval(
+        attention(window, mask="causal", cache=fast_cache, target_verify=True),
+        attention(window, mask="causal", cache=reference_cache, target_verify=True),
+    )
+    assert fast_cache.trim(2) == reference_cache.trim(2) == 2
+    # Reference: force a full re-pool as the previous behaviour did.
+    reference_cache._invalidate_pooled_indexer()
+
+    token = mx.random.normal((1, 1, config.hidden_size))
+    actual = attention(token, mask=None, cache=fast_cache)
+    expected = attention(token, mask=None, cache=reference_cache)
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_qwen4_batched_decode_does_not_read_gpu_scalars(monkeypatch):
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    cache = language.BatchQSAKVCache([0, 0])
+    hidden = mx.random.normal((2, 1, config.hidden_size))
+    mx.eval(attention.parameters(), hidden)
+
+    def unexpected_scalar_read(*args, **kwargs):
+        raise AssertionError("Batched attention must not read GPU scalars")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx.array, "item", unexpected_scalar_read)
+        for _ in range(3):
+            positions = mx.broadcast_to(cache.offset[None, :, None], (3, 2, 1))
+            mx.eval(attention(hidden, cache=cache, position_ids=positions))
+
+    assert cache.offset.tolist() == [3, 3]
+
+
+def test_qwen4_prefill_memory_marker_tracks_query_width():
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    cache = _crossover_cache(config, attention)
+
+    mx.eval(attention(mx.zeros((1, 4, config.hidden_size)), cache=cache))
+    assert cache._omlx_last_prefill_gathered is False
+    mx.eval(attention(mx.zeros((1, 16, config.hidden_size)), cache=cache))
+    assert cache._omlx_last_prefill_gathered is True

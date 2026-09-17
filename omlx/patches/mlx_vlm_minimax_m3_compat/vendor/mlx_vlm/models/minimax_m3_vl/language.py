@@ -248,7 +248,7 @@ class MiniMaxM3KVCache:
             )
 
         pad = int(left_padding.item())
-        keys, values = self.kv_cache.state
+        keys, values = self.kv_cache.keys_and_values()
         if pad:
             keys = mx.pad(keys, [(0, 0), (0, 0), (pad, 0), (0, 0)])
             values = mx.pad(values, [(0, 0), (0, 0), (pad, 0), (0, 0)])
@@ -257,6 +257,7 @@ class MiniMaxM3KVCache:
             values,
             mx.array([self.offset], dtype=mx.int32),
             left_padding.astype(mx.int32),
+            keys.shape[2],
         )
 
         if self.index_keys is not None:
@@ -310,7 +311,7 @@ class MiniMaxM3KVCache:
 
     @property
     def state(self):
-        kv_state = None if self.kv_cache.empty() else self.kv_cache.state
+        kv_state = None if self.kv_cache.empty() else self.kv_cache.keys_and_values()
         index_state = (
             None
             if self.index_keys is None
@@ -323,7 +324,8 @@ class MiniMaxM3KVCache:
         kv_state, index_state = value
         self.kv_cache = KVCache()
         if not _is_empty_kv_state(kv_state):
-            self.kv_cache.state = kv_state
+            self.kv_cache.keys, self.kv_cache.values = kv_state
+            self.kv_cache.offset = self.kv_cache.keys.shape[2]
         self.index_keys = index_state
         self.index_offset = 0 if index_state is None else index_state.shape[2]
 
@@ -516,7 +518,11 @@ class MiniMaxM3BatchKVCache:
         kv_state = (
             (None, None, self.kv_cache.offset, self.kv_cache.left_padding)
             if self.kv_cache.empty()
-            else self.kv_cache.state
+            else (
+                *self.kv_cache.keys_and_values(),
+                self.kv_cache.offset,
+                self.kv_cache.left_padding,
+            )
         )
         index_state = (
             None
@@ -534,7 +540,7 @@ class MiniMaxM3BatchKVCache:
             if kv_state is not None and len(kv_state) >= 3 and kv_state[2] is not None:
                 self.kv_cache.offset = kv_state[2]
         else:
-            self.kv_cache.state = kv_state
+            self.kv_cache.state = (*kv_state, kv_state[0].shape[2])
         self.index_keys = index_state
         self.index_offset = 0 if index_state is None else index_state.shape[2]
 

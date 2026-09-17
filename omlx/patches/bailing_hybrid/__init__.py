@@ -84,6 +84,12 @@ def apply_bailing_hybrid_patch() -> bool:
     if ensure_swiglu_clamp(module):
         logger.info("Ling SwiGLU clamp installed on %s", _MODULE_NAME)
 
+    from mlx_lm import utils
+
+    # The upstream alternative lacks the trained clamp and mixed FP8/MXFP4 loader.
+    utils.MODEL_ARCHITECTURE_REMAPPING.pop(
+        ("bailing_hybrid", "BailingMoeV3ForCausalLM"), None
+    )
     _APPLIED = True
 
     if applied:

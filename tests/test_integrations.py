@@ -1402,6 +1402,7 @@ class TestClaudeCodeIntegration:
         assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000"
         assert env["ANTHROPIC_AUTH_TOKEN"] == "secret"
         assert env["ANTHROPIC_API_KEY"] == ""
+        assert env["ANTHROPIC_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5"
@@ -1790,25 +1791,6 @@ class TestClaudeCodeIntegration:
         env = captured["env"]
         assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
         assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
-
-    def test_launch_default_argv_has_no_extra(self):
-        cc = ClaudeCodeIntegration()
-        captured = {}
-
-        def fake_execvpe(binary, argv, env):
-            captured["argv"] = argv
-
-        with (
-            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
-            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
-            patch.object(
-                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
-            ),
-        ):
-            cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
-
-        # No caller extra_args, but the launcher injects its own LSP denial.
-        assert captured["argv"] == ["claude", "--disallowedTools", "LSP"]
 
     def test_launch_forwards_extra_args(self):
         cc = ClaudeCodeIntegration()

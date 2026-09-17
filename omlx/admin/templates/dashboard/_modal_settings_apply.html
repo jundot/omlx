@@ -1,0 +1,142 @@
+    <!-- Settings snapshot modal: reset confirmation / omlx.ai candidates / pasted recipe -->
+    <div x-show="settingsApply.open" x-cloak
+         class="fixed inset-0 z-[60] overflow-y-auto"
+         @keydown.escape.window="closeSettingsApply()">
+        <div class="fixed inset-0 bg-black/50" @click="closeSettingsApply()"></div>
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-xl p-6" @click.stop>
+                <div class="flex items-center justify-between mb-4">
+                    <h4 class="text-lg font-bold tracking-tight text-neutral-900" x-text="settingsApplyTitle()"></h4>
+                    <button type="button" @click="closeSettingsApply()"
+                            :disabled="settingsApply.phase === 'loading'"
+                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all disabled:opacity-50">
+                        <i data-lucide="x" class="w-5 h-5"></i>
+                    </button>
+                </div>
+
+                <!-- Reset confirmation -->
+                <div x-show="settingsApply.phase === 'confirm'" class="space-y-4">
+                    <p class="text-sm text-neutral-700">{{ t('modal.model_settings.actions.reset_confirm') }}</p>
+                    <div class="flex items-center justify-end gap-3">
+                        <button type="button" @click="closeSettingsApply()"
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('models.manager.delete_no') }}</button>
+                        <button type="button" @click="runSettingsApply()"
+                                class="px-6 py-2.5 bg-red-500 text-white text-sm font-semibold rounded-full hover:bg-red-600 transition-all">{{ t('models.manager.delete_yes') }}</button>
+                    </div>
+                </div>
+
+                <!-- Recipe input -->
+                <div x-show="settingsApply.phase === 'input'" class="space-y-3">
+                    <p class="text-sm text-neutral-600">{{ t('modal.model_settings.actions.recipe_hint') }}</p>
+                    <a href="https://omlx.ai/benchmarks/performance" target="_blank" rel="noopener"
+                       class="inline-block text-sm text-neutral-700 underline hover:text-neutral-900">{{ t('modal.model_settings.actions.none_link') }}</a>
+                    <textarea x-model="settingsApply.recipeText" rows="5" spellcheck="false"
+                              :placeholder="t('modal.model_settings.actions.recipe_placeholder')"
+                              class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-xs font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"></textarea>
+                    <div class="flex items-center justify-end gap-3">
+                        <button type="button" @click="closeSettingsApply()"
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.cancel') }}</button>
+                        <button type="button" @click="runSettingsApply()"
+                                :disabled="!settingsApply.recipeText.trim()"
+                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.apply') }}</button>
+                    </div>
+                </div>
+
+                <!-- Loading -->
+                <div x-show="settingsApply.phase === 'loading'" class="flex items-center gap-3 py-6 text-sm text-neutral-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5 animate-spin flex-shrink-0"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                    <span x-text="settingsApplyLoadingText()"></span>
+                </div>
+
+                <!-- Candidate list (optimal) -->
+                <div x-show="settingsApply.phase === 'choose'" class="space-y-4">
+                    <p class="text-sm text-neutral-600">{{ t('modal.model_settings.actions.choose_hint') }}</p>
+                    <template x-for="group in settingsApplyGroups()" :key="group.key">
+                        <div>
+                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2" x-text="group.label"></div>
+                            <div class="space-y-2">
+                                <template x-for="item in group.items" :key="group.key + item.benchmark_id">
+                                    <div class="flex items-center justify-between gap-3 p-3 border border-neutral-200 rounded-xl">
+                                        <div class="min-w-0">
+                                            <a :href="item.benchmark_url" target="_blank" rel="noopener"
+                                               class="text-sm font-mono text-neutral-800 underline hover:text-neutral-900 break-all"
+                                               x-text="item.benchmark_url"></a>
+                                            <div class="text-xs text-neutral-500 mt-1" x-text="settingsApplyStats(item)"></div>
+                                        </div>
+                                        <button type="button" @click="applyOptimalCandidate(item.benchmark_id)"
+                                                class="flex-shrink-0 px-4 py-2 bg-neutral-900 text-white text-xs font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.apply') }}</button>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                    </template>
+                    <div class="flex items-center justify-end">
+                        <button type="button" @click="closeSettingsApply()"
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.cancel') }}</button>
+                    </div>
+                </div>
+
+                <!-- Applied -->
+                <div x-show="settingsApply.phase === 'done'" class="space-y-3">
+                    <p class="text-sm font-medium text-neutral-900" x-text="settingsApplyDoneText()"></p>
+                    <template x-if="settingsApply.result && settingsApply.result.benchmark_url">
+                        <p class="text-sm">
+                            <a :href="settingsApply.result.benchmark_url" target="_blank" rel="noopener"
+                               class="text-neutral-700 underline hover:text-neutral-900 break-all"
+                               x-text="settingsApply.result.benchmark_url"></a>
+                            <span class="block text-xs text-neutral-500 mt-1" x-text="settingsApplyStats(settingsApply.result)"></span>
+                        </p>
+                    </template>
+                    <template x-if="settingsApply.result && settingsApply.result.skipped && settingsApply.result.skipped.length">
+                        <div class="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-3">
+                            <div class="font-semibold mb-1">{{ t('modal.model_settings.actions.skipped_title') }}</div>
+                            <ul class="list-disc pl-4 space-y-0.5">
+                                <template x-for="item in settingsApply.result.skipped" :key="item.feature + item.reason">
+                                    <li x-text="item.feature + ': ' + item.reason"></li>
+                                </template>
+                            </ul>
+                        </div>
+                    </template>
+                    <template x-if="settingsApply.mode !== 'reset'">
+                        <div class="space-y-1">
+                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('modal.model_settings.actions.applied_settings') }}</label>
+                            <textarea readonly rows="10" spellcheck="false"
+                                      class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-xs font-mono bg-neutral-50 text-neutral-700"
+                                      :value="settingsApplyJson()"></textarea>
+                        </div>
+                    </template>
+                    <div class="flex items-center justify-end">
+                        <button type="button" @click="closeSettingsApply()"
+                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.close') }}</button>
+                    </div>
+                </div>
+
+                <!-- No matching benchmark -->
+                <div x-show="settingsApply.phase === 'none'" class="space-y-3">
+                    <p class="text-sm font-medium text-neutral-900">{{ t('modal.model_settings.actions.none_title') }}</p>
+                    <p class="text-sm text-neutral-600">{{ t('modal.model_settings.actions.none_body') }}</p>
+                    <a :href="settingsApply.result && settingsApply.result.search_url ? settingsApply.result.search_url : 'https://omlx.ai/benchmarks/performance'"
+                       target="_blank" rel="noopener"
+                       class="inline-block text-sm text-neutral-700 underline hover:text-neutral-900">{{ t('modal.model_settings.actions.none_link') }}</a>
+                    <div class="flex items-center justify-end">
+                        <button type="button" @click="closeSettingsApply()"
+                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.close') }}</button>
+                    </div>
+                </div>
+
+                <!-- Error -->
+                <div x-show="settingsApply.phase === 'error'" class="space-y-3">
+                    <p class="text-sm font-medium text-neutral-900">{{ t('modal.model_settings.actions.error_title') }}</p>
+                    <p class="text-sm text-red-600 break-words" x-text="settingsApply.error"></p>
+                    <div class="flex items-center justify-end gap-3">
+                        <button type="button" x-show="settingsApply.mode === 'recipe'" @click="settingsApply.phase = 'input'"
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.actions.back') }}</button>
+                        <button type="button" x-show="settingsApply.mode === 'optimal' && settingsApply.candidates" @click="settingsApply.phase = 'choose'"
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.actions.back') }}</button>
+                        <button type="button" @click="closeSettingsApply()"
+                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.close') }}</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>

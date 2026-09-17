@@ -6,6 +6,7 @@ This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 """
 
+import asyncio
 import copy
 import logging
 from collections.abc import AsyncIterator
@@ -13,12 +14,18 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..model_settings import (
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
+)
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -97,6 +104,7 @@ class BatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
+            text_only=True,
         )
 
     @property
@@ -108,6 +116,21 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Opt in only when the local scheduler has no structured parser."""
+
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        return bool(
+            scheduler is not None
+            and hasattr(scheduler, "_output_parser_factory")
+            and scheduler._output_parser_factory is None
+        )
 
     @property
     def model_type(self) -> str | None:
@@ -150,6 +173,9 @@ class BatchedEngine(BaseEngine):
                     model_config = {"model_type": cfg.model_type}
                 elif isinstance(cfg, dict):
                     model_config = cfg
+            if model_config is None and (model_type := self.model_type) is not None:
+                # mlx-lm models expose ``args`` rather than ``config``.
+                model_config = {"model_type": model_type}
             return detect_message_extractor(self._model_name, model_config)
         except Exception:
             return None
@@ -169,14 +195,24 @@ class BatchedEngine(BaseEngine):
             from ..api.grammar import create_grammar_compiler
 
             self._grammar_compiler = create_grammar_compiler(
-                self._tokenizer, self._model
+                self._tokenizer,
+                self._model,
+                cache_limit_bytes=(
+                    64 * 1024**2 if self.model_type == "k2_horizon" else -1
+                ),
             )
             logger.info("GrammarCompiler initialized for %s", self._model_name)
         except Exception:
             from ..utils.install import get_install_method
 
             method = get_install_method()
-            if method == "dmg":
+            if self.model_type == "k2_horizon":
+                logger.info(
+                    "K2 tool grammar is unavailable; generating unconstrained "
+                    "tool calls with normal API parsing. Install omlx[grammar] "
+                    "to enable tool-name constraints."
+                )
+            elif method == "dmg":
                 logger.warning(
                     "GrammarCompiler initialization failed for %s on the "
                     "DMG build. The bundle ships xgrammar against a torch "
@@ -212,7 +248,7 @@ class BatchedEngine(BaseEngine):
         """
         Preprocess messages for model-specific formats.
 
-        Currently handles Harmony (gpt-oss) models.
+        Handles Harmony formatting and required K2 assistant reasoning fields.
 
         Args:
             messages: List of chat messages
@@ -222,6 +258,10 @@ class BatchedEngine(BaseEngine):
         """
         if self.model_type == "gpt_oss" and HAS_HARMONY_ADAPTER:
             return preprocess_harmony_messages(messages)
+        if self.model_type == "k2_horizon":
+            from ..api.utils import extract_k2_horizon_messages
+
+            return extract_k2_horizon_messages(messages)
         return messages
 
     async def start(self) -> None:
@@ -270,6 +310,13 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                # With expert offload the load stays lazy so the wrap below
+                # can drop non-resident expert tensors BEFORE anything
+                # materializes them; materialize_lazy_state then evaluates
+                # what remains. Without offload, load eagerly as before.
+                lazy=bool(
+                    getattr(self._model_settings, "moe_expert_offload_enabled", False)
+                ),
             )
 
         loop = asyncio.get_running_loop()
@@ -285,6 +332,44 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
+        # MoE expert offload: replace covered SwitchGLU layers with a
+        # fetch-on-miss LRU cache streaming experts from the checkpoint's
+        # own safetensors. Must run BEFORE materialize_lazy_state — the load
+        # above stayed lazy when this is enabled, and dropping the stock
+        # modules here is what keeps non-resident experts from ever
+        # materializing. Runs on the MLX executor because it allocates the
+        # resident slot tensors (#1304).
+        moe_offload_wrapped = 0
+        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
+            from ..patches.moe_expert_offload import (
+                apply_moe_expert_offload,
+                materialize_offload_state,
+            )
+
+            fraction = float(
+                getattr(
+                    self._model_settings,
+                    "moe_expert_offload_resident_fraction",
+                    0.25,
+                )
+            )
+            moe_offload_wrapped = await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_moe_expert_offload,
+                self._model,
+                self._model_name,
+                fraction,
+            )
+            if moe_offload_wrapped:
+                # The caches' slot maps and resident slots live on plain
+                # attributes outside the module tree, so materialize_lazy_state
+                # below never reaches them; left lazy they stay bound to this
+                # loader stream and the first request from an inference thread
+                # dies with "There is no Stream(gpu, N) in current thread".
+                await loop.run_in_executor(
+                    get_mlx_executor(), materialize_offload_state, self._model
+                )
+
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
         await loop.run_in_executor(
@@ -295,7 +380,16 @@ class BatchedEngine(BaseEngine):
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
         # executor because it rewrites weights in place.
-        if (
+        if moe_offload_wrapped:
+            # Fusion concatenates the stock SwitchGLU gate/up weights in RAM,
+            # which cannot apply to experts that were never materialized; the
+            # offloaded modules aren't stock SwitchGLU anyway, so fusion
+            # would find nothing. Skip it explicitly and say why.
+            logger.info(
+                "moe expert offload active (%d layers): skipping gate/up fusion",
+                moe_offload_wrapped,
+            )
+        elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
         ):
@@ -393,8 +487,47 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
+        # because it quantizes activations to INT8, which changes numerics;
+        # the patch itself falls through for anything it cannot route.
+        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+            try:
+                from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
+
+                # The model itself is what gets opted in: the patch tags its
+                # modules, so a model loaded with the setting off is never
+                # routed even though the class wrapper is process-wide.
+                apply_qwen35_oq_a8_patch(
+                    self._model,
+                    min_tokens=int(
+                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                    ),
+                )
+            except Exception:
+                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+
+        ane_backend = ane_prefill_backend(self.model_type)
+        ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_enabled:
+            validate_ane_prefill(self._model_settings.to_dict(), self.model_type)
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
+        if ane_enabled and ane_backend == "k2":
+            from ..patches.k2_horizon.ane_prefill import enable_ane_prefill
+
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: enable_ane_prefill(
+                    self._model,
+                    fraction=ane_fraction,
+                    shared_fraction=self._model_settings.qwen35_ane_prefill_shared_fraction,
+                    width=self._model_settings.qwen35_ane_prefill_sequence_length,
+                ),
+            )
+
         ane_prefill_sequence_length = 0
-        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+        if ane_enabled and ane_backend == "qwen":
             try:
                 from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
 
@@ -418,11 +551,7 @@ class BatchedEngine(BaseEngine):
                             )
                             or 0
                         ),
-                        fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fraction",
-                            0.53,
-                        ),
+                        fraction=ane_fraction,
                         max_layers=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_max_layers",
@@ -449,11 +578,7 @@ class BatchedEngine(BaseEngine):
                             True,
                         ),
                         ane_down_fraction=(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fraction",
-                                0.53,
-                            )
+                            ane_fraction
                             if getattr(
                                 self._model_settings,
                                 "qwen35_ane_prefill_fused_down",
@@ -536,9 +661,7 @@ class BatchedEngine(BaseEngine):
 
                 apply_qwen35_moe_weighted_sum_patch()
             except Exception:
-                logger.debug(
-                    "Qwen MoE weighted-sum patch not applied", exc_info=True
-                )
+                logger.debug("Qwen MoE weighted-sum patch not applied", exc_info=True)
 
         if (
             getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
@@ -559,6 +682,11 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        signature = getattr(self._model, "_omlx_k2_ane_signature", None)
+        if signature:
+            scheduler_config.model_name = (
+                (scheduler_config.model_name or self._model_name) + ":" + signature
+            )
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
@@ -660,11 +788,12 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        cancelled = False
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
                 try:
-                    self._engine.engine.close()
+                    cancelled = await _close_engine_core(self._engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
         _clear_teardown_references(
@@ -679,6 +808,8 @@ class BatchedEngine(BaseEngine):
         )
         self._loaded = False
         logger.info("BatchedEngine stopped")
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _apply_chat_template(
         self,
@@ -723,6 +854,13 @@ class BatchedEngine(BaseEngine):
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
 
+            if self.model_type == "k2_horizon":
+                from ..patches.k2_horizon import validate_chat_template_kwargs
+                from ..patches.k2_horizon.tool_grammar import validate_tool_prefix
+
+                validate_chat_template_kwargs(template_kwargs)
+                if tools and self.grammar_compiler is not None:
+                    validate_tool_prefix(messages, tools, is_partial)
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
                     self._tokenizer,
@@ -836,6 +974,16 @@ class BatchedEngine(BaseEngine):
             except Exception as e:
                 logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
+    def _prepare_k2_tool_grammar(self, tools, kwargs):
+        if self.model_type == "k2_horizon" and tools:
+            from ..patches.k2_horizon.tool_grammar import compile_tool_grammar
+
+            kwargs["compiled_grammar"] = compile_tool_grammar(
+                self.grammar_compiler,
+                convert_tools_for_template(tools),
+                kwargs.get("compiled_grammar"),
+            )
+
     async def generate(
         self,
         prompt: str | list[int],
@@ -872,6 +1020,7 @@ class BatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -899,6 +1048,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 
@@ -950,6 +1100,7 @@ class BatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -978,6 +1129,7 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
@@ -1008,6 +1160,7 @@ class BatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    first_token_at=getattr(output, "first_token_at", None),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))
@@ -1137,6 +1290,7 @@ class BatchedEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
+        self._prepare_k2_tool_grammar(tools, kwargs)
         prompt = self._apply_chat_template(
             messages,
             template_tools,

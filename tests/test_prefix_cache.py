@@ -208,8 +208,9 @@ class TestBlockAwarePrefixCache:
         tokens = list(range(8))  # 2 full blocks at block_size=4
         keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
         values = (keys + 100).astype(mx.float32)
-        cache_data = [{"state": (keys, values), "cache_type": "KVCache",
-                       "class_name": "KVCache"}]
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
 
         table = prefix_cache.store_cache("req-store", tokens, cache_data)
         assert table is not None
@@ -279,8 +280,8 @@ class TestBlockAwarePrefixCache:
         first_prefix_cache.release_cache("ordinary-prefix")
         first_ssd_manager.close()
 
-        restarted_prefix_cache, _, restarted_ssd_manager = (
-            self._make_ssd_prefix_cache(cache_directory)
+        restarted_prefix_cache, _, restarted_ssd_manager = self._make_ssd_prefix_cache(
+            cache_directory
         )
 
         try:
@@ -294,7 +295,7 @@ class TestBlockAwarePrefixCache:
                 promote_to_hot_cache=False,
             )
             assert restored_cache is not None
-            restored_keys, restored_values = restored_cache[0].state
+            restored_keys, restored_values = restored_cache[0].keys_and_values()
             assert restored_table.num_tokens == len(tokens)
             assert mx.array_equal(restored_keys, keys).item()
             assert mx.array_equal(restored_values, values).item()
@@ -941,11 +942,101 @@ class TestBlockAwarePrefixCacheWithSSD:
 
         assert restored is not None
         restored_cache = restored[0]
-        restored_keys, restored_values = restored_cache.kv_cache.state
+        restored_keys, restored_values = (
+            restored_cache.kv_cache.keys,
+            restored_cache.kv_cache.values,
+        )
         assert restored_keys.tolist() == keys.tolist()
         assert restored_values.tolist() == values.tolist()
         assert restored_cache.index_keys.tolist() == index_keys.tolist()
         assert restored_cache.index_offset == 8
+
+    def test_qwen4_qsa_misaligned_auxiliary_state_is_not_stored(
+        self, prefix_cache_with_ssd
+    ):
+        """A QSA block with shorter indexer state must fail closed."""
+        mx = pytest.importorskip("mlx.core")
+        keys = mx.zeros((1, 2, 8, 64))
+        values = mx.zeros((1, 2, 8, 64))
+        index_keys = mx.zeros((1, 4, 64))
+        positions = mx.zeros((1, 1, 4), dtype=mx.int32)
+
+        block = prefix_cache_with_ssd._extract_block_tensor_slice(
+            [
+                {
+                    "state": (keys, values, index_keys, positions),
+                    "cache_type": "QSAKVCache",
+                }
+            ],
+            4,
+            8,
+        )
+
+        assert block is None
+
+    def test_qwen4_qsa_sliceable_nstate_blocks_round_trip(self):
+        """Valid QSA blocks preserve K/V, index keys, and positions."""
+        mx = pytest.importorskip("mlx.core")
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        saved_by_hash = {}
+
+        def save_block(**kwargs):
+            saved_by_hash[kwargs["block_hash"]] = (
+                kwargs["cache_data"],
+                {
+                    "model_name": "test-model",
+                    "num_layers": 1,
+                    "block_size": 4,
+                    "layer_cache_types": kwargs["layer_cache_types"],
+                    "layer_meta_states": kwargs["layer_meta_states"],
+                },
+            )
+            return True
+
+        mock_ssd.save_block.side_effect = save_block
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        keys = mx.arange(1 * 2 * 8 * 64, dtype=mx.float32).reshape(1, 2, 8, 64)
+        values = keys + 1_000
+        index_keys = mx.arange(1 * 8 * 64, dtype=mx.float32).reshape(1, 8, 64)
+        positions = mx.arange(8, dtype=mx.int32).reshape(1, 1, 8)
+        mx.eval(keys, values, index_keys, positions)
+        cache_data = [
+            {
+                "state": (keys, values, index_keys, positions),
+                "cache_type": "QSAKVCache",
+                "class_name": "QSAKVCache",
+                "meta_state": (),
+            }
+        ]
+
+        block_table = cache.store_cache("req-qsa", list(range(8)), cache_data)
+
+        assert block_table is not None
+        assert len(block_table.block_ids) == 2
+
+        def load_block_with_metadata(block_hash, **kwargs):
+            return saved_by_hash.get(block_hash, (None, None))
+
+        mock_ssd.load_block_with_metadata.side_effect = load_block_with_metadata
+        restored = cache.reconstruct_cache(block_table)
+
+        assert restored is not None
+        restored_state = restored[0].state
+        assert restored_state[0].tolist() == keys.tolist()
+        assert restored_state[1].tolist() == values.tolist()
+        assert restored_state[2].tolist() == index_keys.tolist()
+        assert restored_state[3].tolist() == positions[:, 0, :].tolist()
 
 
 class TestPrefixIndexOperations:
@@ -1668,9 +1759,7 @@ class TestArraysCacheLastBlockOnly:
         assert stats.last_partial_tokens_skipped == 2
         assert stats.last_tokens_to_next_block == 2
 
-    def test_store_cache_arrayscache_partial_trailing_stores_placeholder(
-        self, mx
-    ):
+    def test_store_cache_arrayscache_partial_trailing_stores_placeholder(self, mx):
         """A1 regression: 7 tokens / block_size=4 stores 1 full block (4
         tokens) and skips 3 trailing partial tokens -- but the ArraysCache
         conv/ssm state passed in is the LIVE state after all 7 tokens, not
@@ -2434,7 +2523,7 @@ class TestArraysCacheLastBlockOnly:
         assert len(reconstructed) == 1
         layer_cache = reconstructed[0]
         if hasattr(layer_cache, "state"):
-            reconstructed_keys, reconstructed_values = layer_cache.state
+            reconstructed_keys, reconstructed_values = layer_cache.keys_and_values()
         elif isinstance(layer_cache, (list, tuple)) and len(layer_cache) == 2:
             reconstructed_keys, reconstructed_values = layer_cache
         else:
@@ -3496,8 +3585,8 @@ class TestTurboQuantFormatMismatchRecovery:
         assert result is not None
         assert isinstance(result[0], SizedArraysCache)
         assert result[0].size() == 4
-        assert len(result[0].state) == 4
-        for expected, actual in zip(states, result[0].state):
+        assert len(result[0].cache) == 4
+        for expected, actual in zip(states, result[0].cache):
             assert mx.array_equal(expected, actual).item()
 
 

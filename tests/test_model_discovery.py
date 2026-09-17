@@ -12,6 +12,7 @@ from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
     _is_helper_checkpoint,
+    _is_hf_cache_mlx_compatible,
     _is_unsupported_model,
     _read_model_context_length,
     _register_model,
@@ -1895,6 +1896,24 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 0
 
+    @pytest.mark.parametrize("raw", [b"{", b"\xff", b"null", b"[]"])
+    def test_k2_detection_preserves_legacy_hf_cache_heuristics(self, tmp_path, raw):
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Model")
+        (snapshot / "config.json").write_bytes(raw)
+        (snapshot / "model.safetensors").write_bytes(b"fixture")
+        assert _is_hf_cache_mlx_compatible(snapshot, "mlx-community/Model")
+        if raw == b"{":
+            assert "mlx-community--Model" in discover_models(tmp_path)
+
+    def test_incomplete_k2_checkpoint_cannot_use_mlx_name_heuristic(self, tmp_path):
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "K2")
+        (snapshot / "config.json").write_text('{"model_type": "k2_horizon"}')
+        (snapshot / "model.safetensors").write_bytes(b"fixture")
+        (snapshot / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"weight": "missing.safetensors"}}'
+        )
+        assert not _is_hf_cache_mlx_compatible(snapshot, "mlx-community/K2")
+
     def test_hf_cache_bad_helper_schema_is_skipped(self, tmp_path):
         """A malformed helper-looking schema must not abort HF cache discovery."""
         _, snapshot = self._make_hf_cache_entry(tmp_path, "acme", "BadSchema")
@@ -1905,6 +1924,69 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert models == {}
+
+    @pytest.mark.parametrize(
+        "config, discovered",
+        [
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "omlx_deepseek_v41": {"version": 1, "preserve_mtp": True},
+                },
+                True,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "expert_dtype": "fp4",
+                    },
+                },
+                True,
+            ),
+            # The bf16 source layout (the repo's own test fixture) loads too.
+            ({"model_type": "deepseek_v41"}, True),
+            # Unknown conversion version, or an affine conversion without the
+            # oMLX spec: the V4.1 loader has no path for these.
+            (
+                {"model_type": "deepseek_v41", "omlx_deepseek_v41": {"version": 2}},
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 2, "group_size": 64, "mode": "affine"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization_config": {"quant_method": "fp8"},
+                    "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
+                },
+                False,
+            ),
+            (
+                {"model_type": "deepseek_v4", "omlx_deepseek_v41": {"version": 1}},
+                False,
+            ),
+        ],
+    )
+    def test_hf_cache_deepseek_v41_loadable_layouts(self, tmp_path, config, discovered):
+        """oMLX-converted and original V4.1 checkpoints need no MLX metadata."""
+        repo = "Jundot/DeepSeek-V4.1-oQ3e-mtp"
+        _, snapshot = self._make_hf_cache_entry(
+            tmp_path, "Jundot", "DeepSeek-V4.1-oQ3e-mtp"
+        )
+        (snapshot / "config.json").write_text(json.dumps(config))
+        (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"0" * 64)
+        (snapshot / "model-00002-of-00002.safetensors").write_bytes(b"0" * 64)
+        assert _is_hf_cache_mlx_compatible(snapshot, repo) is discovered
+        assert ("Jundot--DeepSeek-V4.1-oQ3e-mtp" in discover_models(tmp_path)) is (
+            discovered
+        )
 
     def test_hf_cache_mlx_metadata_is_discovered(self, tmp_path):
         """HF cache entries with safetensors format=mlx metadata are discovered."""

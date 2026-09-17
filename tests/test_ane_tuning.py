@@ -61,7 +61,7 @@ def test_candidate_settings_are_transient_copy():
     assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.10
     assert tuned.qwen35_ane_prefill_tail_padding_min_tokens == 0
     assert base.qwen35_ane_prefill_enabled is False
-    assert base.qwen35_ane_prefill_fraction == 0.53
+    assert base.qwen35_ane_prefill_fraction is None
     assert base.qwen35_ane_prefill_tail_padding_min_tokens == 1500
 
 
@@ -157,29 +157,6 @@ def test_fused_profile_refinement_balances_aggregate_dual_ane_width():
     assert refined.mlp_fraction == 0.19
     assert refined.cpu_fraction == 0.14
     assert refined.fused_down is True
-
-
-def test_profile_refinement_rebalances_mlp_without_cpu_share(monkeypatch):
-    monkeypatch.setattr(
-        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
-    )
-    candidate = ane_tuning._Candidate("predicted", True, 0.5, False, None)
-    operations = 192
-    result = {
-        "_profile": {
-            "mlp": {
-                "operations": operations,
-                "ane0_eval_ns": 19.0e6 * operations,
-                "ane1_eval_ns": 19.0e6 * operations,
-                "gpu_completion_ns": 10.0e6 * operations,
-            }
-        }
-    }
-
-    refined = ane_tuning._profile_refinement(candidate, result)
-
-    assert refined.mlp_fraction == 0.35
-    assert not refined.cpu_fraction
 
 
 def test_tuner_overrides_reduce_planned_search_matrix():

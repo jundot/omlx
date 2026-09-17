@@ -837,7 +837,7 @@ def test_vlm_target_verify_attention_handles_tq_proxies():
 
     # Non-TurboQuant caches keep the original helper behavior (declines
     # plain KVCache with no left padding -> caller uses its own path).
-    plain_ks, plain_vs = fp_cache.state
+    plain_ks, plain_vs = fp_cache.keys_and_values()
     assert (
         q35_lang._target_verify_left_padded_attention(
             queries, plain_ks, plain_vs, cache=fp_cache, scale=scale, mask=None

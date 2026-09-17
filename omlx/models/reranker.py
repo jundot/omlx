@@ -26,8 +26,8 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
+from ..patches.modernbert_attention import patch_modernbert_attention
 from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
-from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
@@ -832,6 +832,11 @@ class MLXRerankerModel:
                     self.model_name,
                     tokenizer_config={"trust_remote_code": self.trust_remote_code},
                 )
+                # Stock mlx-embeddings masks with -1e9 overflow to -inf in fp16,
+                # so a fully padded (short) query produces NaN. The embedding
+                # path already applies this finite-mask patch; the reranker's
+                # mlx-embeddings branch must do the same (issue #3507).
+                patch_modernbert_attention(self.model)
 
                 # Get num_labels from model config
                 if hasattr(self.model, "config"):
@@ -943,7 +948,6 @@ class MLXRerankerModel:
         gc.collect()
         mx.synchronize()
         mx.clear_cache()
-        clear_thread_compile_cache()
         gc.collect()
 
     # Default max_length per model type
