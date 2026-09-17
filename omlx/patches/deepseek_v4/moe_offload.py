@@ -420,6 +420,21 @@ def apply_deepseek_v4_moe_expert_offload(
             parent[key] = new
         wrapped += 1
         _sync_and_clear_cache()
+
+    # glm5_next decoder layers compile their FFN block at decode shapes
+    # (mlx_vlm glm5_next language.py ``compile_ffn``). The offloaded block
+    # manages slots host-side — LRU map, pread fetches — and cannot be
+    # traced into a compiled graph: ``tolist()`` inside a trace dies with
+    # "eval during function transformations". Keep those layers eager; the
+    # native gather kernels still run, only the graph fusion is lost, and
+    # offload trades speed for memory anyway.
+    for module in model.modules():
+        if not getattr(module, "compile_ffn", False):
+            continue
+        if any(isinstance(c, OffloadedSwitchGLU) for c in module.modules()):
+            module.compile_ffn = False
+            module._ffn_c = None
+
     if wrapped:
         logger.info(
             "deepseek_v4 moe expert offload: wrapped %d layers at %.1f%% residency "
