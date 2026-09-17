@@ -77,9 +77,9 @@ contiguous-layer and physical-memory checks may adjust or refuse.
 ## Current platform reality
 
 This design no longer depends on treating CUDA support as an unofficial MLX
-experiment. [MLX 0.32.0 officially supports CUDA 12 and CUDA 13](https://ml-explore.github.io/mlx/build/html/install.html),
+experiment. [MLX 0.32.2 officially supports CUDA 12 and CUDA 13](https://ml-explore.github.io/mlx/build/html/install.html),
 including Linux ARM wheels relevant to DGX Spark. oMLX already pins
-`mlx==0.32.0` in this branch.
+`mlx==0.32.2` in this branch.
 
 MLX provides several distributed transports:
 
@@ -276,10 +276,12 @@ registry is written atomically with mode `0600`. Replayed, expired, revoked,
 identity-mutated, source-mismatched, or host-fingerprint-mismatched requests
 fail closed.
 
-The coordinator web port must be reachable from the CUDA LAN. If the dashboard
-is open as `localhost`, set the oMLX **Server host** to `0.0.0.0` in Settings,
-restart, and enter the Studio's LAN address in the enrollment card. Plain HTTP
-is appropriate only on a trusted private LAN; use the dashboard's HTTPS origin
+The coordinator web port must be reachable from the CUDA LAN. Configure the
+main API key first, or save it together with the oMLX **Server host** set to
+`0.0.0.0` in Settings. Then restart and enter the Studio's LAN address in the
+enrollment card. oMLX refuses a non-loopback bind until an API key is
+configured. Plain HTTP is appropriate only on a trusted private LAN; use the
+dashboard's HTTPS origin
 when the network is not trusted. The one-time secret is present in the pasted
 shell command and may therefore remain in that worker user's shell history
 until the short expiry passes.
@@ -337,7 +339,7 @@ The Mac application remains a Metal distribution. The GUI bootstrap creates a
 headless Linux ARM64 environment using the official CUDA wheel set:
 
 ```text
-mlx[cuda13]==0.32.0
+mlx[cuda13]==0.32.2
 same pinned MLX-LM revision
 same oMLX cluster/runtime code
 no macOS app, Metal-only extension, or Mac authorization dependency

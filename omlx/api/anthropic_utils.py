@@ -64,7 +64,7 @@ def request_has_cache_control(request: MessagesRequest) -> bool:
 def _decode_document_block(block_dict: dict[str, Any]) -> str:
     """Decode an Anthropic document content block to text.
 
-    For text/plain documents, decodes base64 data and returns the text.
+    For text/plain documents, returns plain text or decodes base64 data.
     For other media types (e.g. PDF), returns a placeholder message since
     oMLX does not provide document parsing.
     """
@@ -75,7 +75,10 @@ def _decode_document_block(block_dict: dict[str, Any]) -> str:
 
     if media_type == "text/plain" and data:
         try:
-            decoded = base64.b64decode(data).decode("utf-8")
+            if source.get("type") == "text":
+                decoded = data
+            else:
+                decoded = base64.b64decode(data).decode("utf-8")
             label = f"[Document: {title}]\n" if title else ""
             return f"{label}{decoded}"
         except Exception:

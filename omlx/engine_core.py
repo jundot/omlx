@@ -17,6 +17,7 @@ import concurrent.futures
 import gc
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -44,14 +45,122 @@ from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
-from .utils.compile_cache import (
-    clear_thread_compile_cache,
-    compile_cache_clear_available,
+from .utils.fatal import (
+    FATAL_TEARDOWN_TIMEOUT_S,
+    exit_if_gpu_submissions_ignored,
+    fatal_exit,
 )
-from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.hardware import format_bytes
+from .utils.metal_sync import clear_thread_streams
 
 logger = logging.getLogger(__name__)
+
+
+class _EngineTeardown:
+    """Allow one extra minute only for recently successful SSD persistence."""
+
+    def __init__(self, engine_id: str, timeout: float = 60.0):
+        self.engine_id = engine_id
+        self.started = time.monotonic()
+        self.timeout = timeout
+        self.deadline = self.started + 2 * timeout
+        self.extended = False
+        self._phase = "shutdown"
+        self._progress: Callable[[], float | None] | None = None
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch, name=f"engine-close-{engine_id[:8]}", daemon=True
+        )
+
+    def set_phase(
+        self, phase: str, progress: Callable[[], float | None] | None = None
+    ) -> None:
+        with self._lock:
+            self._phase = phase
+            self._progress = progress
+
+    def remaining(self, *, mlx: bool = False) -> float:
+        remaining = max(0.0, self.deadline - time.monotonic())
+        return min(self.timeout, remaining) if mlx else remaining
+
+    def check(self, now: float) -> str | None:
+        """Return a fatal reason, or grant the single persistence extension."""
+        with self._lock:
+            phase, progress = self._phase, self._progress
+            if now < self.started + self.timeout:
+                return None
+            if now >= self.deadline:
+                return f"Engine {self.engine_id}: teardown exceeded {2 * self.timeout:g}s ({phase})"
+            if self.extended:
+                return None
+            last_success = progress() if progress is not None else None
+            # A write can finish between the time sample and this snapshot.
+            if (
+                last_success is not None
+                and last_success >= self.started
+                and now - last_success <= self.timeout / 2
+            ):
+                self.extended = True
+                logger.warning(
+                    "Engine %s: extending teardown to %gs for progressing SSD "
+                    "persistence (%s, last completed write %.1fs ago)",
+                    self.engine_id,
+                    2 * self.timeout,
+                    phase,
+                    now - last_success,
+                )
+                return None
+            return f"Engine {self.engine_id}: teardown timed out after {self.timeout:g}s ({phase}); no recent SSD persistence progress"
+
+    def _watch(self) -> None:
+        if self._done.wait(max(0.0, self.started + self.timeout - time.monotonic())):
+            return
+        try:
+            reason = self.check(time.monotonic())
+        except Exception:
+            logger.exception("Failed to inspect engine teardown progress")
+            reason = f"Engine {self.engine_id}: teardown progress check failed"
+        if reason is not None:
+            fatal_exit(reason)
+        while not self._done.wait(min(10.0, self.remaining())):
+            now = time.monotonic()
+            if now >= self.deadline:
+                fatal_exit(
+                    f"Engine {self.engine_id}: teardown exceeded {2 * self.timeout:g}s"
+                )
+                return
+            with self._lock:
+                phase, progress = self._phase, self._progress
+                try:
+                    last_success = progress() if progress is not None else None
+                except Exception:
+                    logger.exception("Failed to inspect engine teardown progress")
+                    last_success = None
+            detail = ""
+            if progress is not None:
+                detail = (
+                    f", last completed write {max(0.0, now - last_success):.1f}s ago"
+                    if last_success is not None
+                    else ", no recent successful SSD write confirmed"
+                )
+            logger.info(
+                "Engine %s: waiting for teardown (elapsed %.0fs/%gs, phase=%s%s)",
+                self.engine_id,
+                now - self.started,
+                2 * self.timeout,
+                phase,
+                detail,
+            )
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._done.set()
+        self._thread.join()
+        self.set_phase("closed")
 
 
 def _raise_request_output_error(output: RequestOutput) -> None:
@@ -81,22 +190,21 @@ def _raise_request_output_error(output: RequestOutput) -> None:
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
-# Fallback only: used when the MLX compile-cache clear symbol is unavailable
-# (see omlx/utils/compile_cache.py). In that case a per-engine MLX worker
-# thread cannot exit safely (its thread_local ~CompilerCache would free
-# @mx.compile graphs' Python objects without the GIL -> crash), so close()
-# keeps the executor + stream alive here for the process lifetime instead of
-# shutting the thread down. With the clear symbol present (the normal path)
-# these stay empty and the worker threads shut down normally.
-_immortal_mlx_executors: list = []
-_immortal_mlx_streams: list = []
-
 
 def _final_engine_thread_reclaim(stream: Any) -> None:
     """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
     gc.collect()
     _sync_and_clear_cache(stream)
     gc.collect()
+    clear_thread_streams()
+
+
+def _final_global_mlx_thread_reclaim() -> None:
+    """Reclaim MLX state before the process-wide worker thread exits."""
+    gc.collect()
+    _sync_and_clear_cache()
+    gc.collect()
+    clear_thread_streams()
 
 
 def _init_mlx_thread() -> None:
@@ -145,6 +253,34 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
             initializer=_init_mlx_thread,
         )
     return _global_mlx_executor
+
+
+def shutdown_mlx_executor() -> None:
+    """Shut down the global MLX worker after clearing its thread-local streams."""
+    global _global_mlx_executor
+    executor = _global_mlx_executor
+    if executor is None:
+        return
+
+    try:
+        future = executor.submit(_final_global_mlx_thread_reclaim)
+    except RuntimeError:
+        # An embedding application may have shut the executor down directly.
+        future = None
+
+    if future is not None:
+        try:
+            future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            fatal_exit(
+                "Global MLX executor teardown timed out after "
+                f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s"
+            )
+        except Exception as exc:
+            fatal_exit(f"Global MLX executor teardown failed: {exc!r}")
+
+    executor.shutdown(wait=False)
+    _global_mlx_executor = None
 
 
 @dataclass
@@ -222,6 +358,8 @@ class EngineCore:
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._closing = False
 
         # Acquire model ownership
         registry = get_registry()
@@ -504,6 +642,7 @@ class EngineCore:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                exit_if_gpu_submissions_ignored(e)
                 import traceback
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
@@ -545,6 +684,7 @@ class EngineCore:
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
         skip_cache_store: bool = False,
+        preserve_reasoning: bool = False,
         benchmark_trace: bool = False,
         benchmark_ane_sequence_length: int = 0,
         tools: list[dict[str, Any]] | None = None,
@@ -587,6 +727,7 @@ class EngineCore:
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=skip_cache_store,
+            preserve_reasoning=preserve_reasoning,
             benchmark_trace=benchmark_trace,
             benchmark_ane_sequence_length=benchmark_ane_sequence_length,
         )
@@ -1107,6 +1248,20 @@ class EngineCore:
             logger.debug(f"Engine {self._engine_id} released model ownership")
 
     def close(self) -> None:
+        """Close once, preserving SSD stores within a progress-gated budget."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            try:
+                with _EngineTeardown(
+                    self._engine_id, FATAL_TEARDOWN_TIMEOUT_S
+                ) as teardown:
+                    self._close(teardown)
+            finally:
+                self._closing = False
+
+    def _close(self, teardown) -> None:
         """
         Explicitly close the engine and release resources.
 
@@ -1116,43 +1271,28 @@ class EngineCore:
         if self._closed:
             return
 
-        # Release model ownership BEFORE setting _closed
-        # (_release_model checks not self._closed)
-        if self._owns_model:
-            registry = get_registry()
-            registry.release(self.model, self._engine_id)
-            self._owns_model = False
-            logger.debug(f"Engine {self._engine_id} released model ownership")
-
-        self._closed = True
+        self.scheduler._engine_teardown = teardown
 
         # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
         # stream is bound to the engine's executor thread, so dispatch both
-        # through the executor; fall back to a direct call if the executor
-        # is already shut down.
+        # through the executor. Rejection cannot safely move MLX cleanup
+        # onto the close caller's thread.
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
             fn_name = getattr(fn, "__name__", repr(fn))
             try:
-                self._mlx_executor.submit(fn).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+                teardown.set_phase(fn_name)
+                self._mlx_executor.submit(fn).result(
+                    timeout=teardown.remaining(mlx=fn_name == "deep_reset")
+                )
             except concurrent.futures.TimeoutError:
                 fatal_exit(
                     f"Engine teardown timed out after "
-                    f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while running "
+                    f"{time.monotonic() - teardown.started:.1f}s while running "
                     f"{fn_name} for engine {self._engine_id}"
                 )
             except RuntimeError:
-                try:
-                    fn()
-                except RuntimeError:
-                    pass
-                except Exception:
-                    logger.warning(
-                        "Engine %s: %s raised during close() fallback",
-                        self._engine_id,
-                        getattr(fn, "__name__", fn),
-                        exc_info=True,
-                    )
+                fatal_exit(f"Engine {self._engine_id}: MLX teardown failed ({fn_name})")
             except Exception:
                 # A failing shutdown/deep_reset must not abort close(), or the
                 # SSD cache manager below stays open and its writer thread keeps
@@ -1174,16 +1314,22 @@ class EngineCore:
         manager = getattr(self.scheduler, "paged_ssd_cache_manager", None)
         if manager is not None:
             try:
-                manager.close()
+                teardown.set_phase("fallback_ssd", manager.persistence_progress)
+                manager.close(teardown=teardown)
+                teardown.set_phase("engine_cleanup")
             except Exception:
                 logger.warning(
                     "Engine %s: SSD cache manager close() failed during teardown",
                     self._engine_id,
                     exc_info=True,
                 )
+            writer = getattr(manager, "_writer_thread", None)
+            if writer is not None and writer.is_alive() is True:
+                fatal_exit("SSD cache writer survived engine teardown")
             self.scheduler.paged_ssd_cache_manager = None
         manager = None
 
+        teardown.set_phase("engine_cleanup")
         # Clear output collectors before dropping model/scheduler references so
         # any request-side caches they retain are eligible for the final reclaim.
         for collector in self._output_collectors.values():
@@ -1209,61 +1355,44 @@ class EngineCore:
         # MLX reclaim. The reclaim must run on this engine's worker thread and
         # stream; clearing on the global executor cannot reliably return this
         # thread/stream-local Metal memory to MLX.
+        if self._owns_model:
+            get_registry().release(self.model, self._engine_id)
+            self._owns_model = False
         self.model = None
         self.tokenizer = None
         self.scheduler = None
 
         if self._mlx_executor is not None:
             try:
-                self._mlx_executor.submit(
+                reclaim_future = self._mlx_executor.submit(
                     _final_engine_thread_reclaim, self._mlx_stream
-                ).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
-            except concurrent.futures.TimeoutError:
-                fatal_exit(
-                    f"Engine teardown timed out after "
-                    f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while reclaiming "
-                    f"MLX memory for engine {self._engine_id}"
                 )
             except RuntimeError:
-                pass
-            except Exception:
-                logger.warning(
-                    "Engine %s: final MLX reclaim raised during close()",
-                    self._engine_id,
-                    exc_info=True,
-                )
+                reclaim_future = None
 
-            # MLX's @mx.compile cache is a C++ thread_local CompilerCache. If
-            # this worker thread exits with a non-empty cache, ~CompilerCache
-            # frees the cached graphs' Python objects from a thread-exit handler
-            # WITHOUT the GIL -> "PyThreadState_Get: GIL is released" crash for
-            # models with module-scope @mx.compile graphs (DeepSeek V4 unload,
-            # ml-explore/mlx #3280). Clear the cache ON this worker thread (GIL
-            # held) before the thread is torn down so the destructor runs on an
-            # empty cache, then request shutdown without waiting indefinitely.
-            # See utils/compile_cache.py.
-            if compile_cache_clear_available():
+            if reclaim_future is not None:
                 try:
-                    self._mlx_executor.submit(clear_thread_compile_cache).result(
-                        timeout=FATAL_TEARDOWN_TIMEOUT_S
-                    )
+                    teardown.set_phase("mlx_reclaim")
+                    reclaim_future.result(timeout=teardown.remaining(mlx=True))
                 except concurrent.futures.TimeoutError:
                     fatal_exit(
                         f"Engine teardown timed out after "
-                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while clearing "
-                        f"MLX compile cache for engine {self._engine_id}"
+                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while reclaiming "
+                        f"MLX memory for engine {self._engine_id}"
                     )
-                except RuntimeError:
-                    pass
-                self._mlx_executor.shutdown(wait=False)
-            else:
-                # Fallback: the clear symbol is unavailable, so do NOT exit the
-                # worker thread (that would run the unsafe destructor). Keep it
-                # alive for the process lifetime via the module-global registry.
-                _immortal_mlx_executors.append(self._mlx_executor)
-                _immortal_mlx_streams.append(self._mlx_stream)
+                except Exception as exc:
+                    fatal_exit(
+                        f"Engine {self._engine_id}: final MLX reclaim failed: "
+                        f"{exc!r}"
+                    )
+
+            # MLX 0.32.2 makes compiled AttachedData destruction GIL-safe, and
+            # _final_engine_thread_reclaim clears the worker's per-thread stream
+            # registry before ThreadPoolExecutor lets that worker exit.
+            self._mlx_executor.shutdown(wait=False)
             self._mlx_executor = None
 
+        self._closed = True
         logger.debug(f"Engine {self._engine_id} closed")
 
     def __del__(self):

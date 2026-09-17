@@ -46,6 +46,7 @@ from omlx.api.utils import (
     _drop_void_assistant_messages,
     _extract_multimodal_content_list,
     _merge_consecutive_roles,
+    cache_reasoning_output,
     chat_template_preserves_mid_system,
     clean_output_text,
     detect_and_strip_partial,
@@ -57,6 +58,7 @@ from omlx.api.utils import (
     uses_native_reasoning_content,
 )
 from omlx.exceptions import InvalidRequestError
+from omlx.model_settings import ModelSettings
 
 
 class TestReasoningEffortChatTemplateKwargs:
@@ -1028,11 +1030,21 @@ class TestConvertAnthropicToInternal:
         assert len(image_parts) == 1
         assert "iVBOR" in image_parts[0]["image_url"]["url"]
 
-    def test_document_block_text_plain(self):
-        """Test converting text/plain document block decodes content."""
+    @pytest.mark.parametrize(
+        "source_type,text",
+        [
+            ("base64", "Hello from document"),
+            ("text", "Hello from document\n你好"),
+            ("text", "SGVsbG8="),
+        ],
+    )
+    def test_document_block_text_plain(self, source_type, text):
+        """Document text is decoded only when the source declares base64."""
         import base64
 
-        text_data = base64.b64encode(b"Hello from document").decode()
+        text_data = (
+            base64.b64encode(text.encode()).decode() if source_type == "base64" else text
+        )
         request = MessagesRequest(
             model="claude-3",
             max_tokens=1024,
@@ -1042,7 +1054,7 @@ class TestConvertAnthropicToInternal:
                     content=[
                         ContentBlockDocument(
                             source={
-                                "type": "base64",
+                                "type": source_type,
                                 "media_type": "text/plain",
                                 "data": text_data,
                             },
@@ -1057,8 +1069,7 @@ class TestConvertAnthropicToInternal:
 
         assert len(result) == 1
         assert result[0]["role"] == "user"
-        assert "Hello from document" in result[0]["content"]
-        assert "[Document: notes.txt]" in result[0]["content"]
+        assert result[0]["content"] == f"[Document: notes.txt]\n{text}"
 
     def test_document_block_pdf_placeholder(self):
         """Test converting PDF document block returns placeholder."""
@@ -3596,3 +3607,47 @@ class TestToolResultWithToolAwareTokenizer:
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         # Arguments are parsed into dict for the chat template.
         assert result[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Seoul"}
+
+
+class TestCacheReasoningOutput:
+    """Whether a reasoning request's output tokens are cacheable for the next turn."""
+
+    @pytest.mark.parametrize(
+        "forced, expected", [(None, False), (True, True), (False, False)]
+    )
+    def test_explicit_retention_off_with_native_reasoning(self, forced, expected):
+        assert (
+            cache_reasoning_output(
+                ModelSettings(cache_reasoning_output=forced),
+                native_reasoning=True,
+                chat_template_kwargs={"preserve_thinking": False},
+            )
+            is expected
+        )
+
+    def test_follows_history_retention_by_default(self):
+        from omlx.api.utils import cache_reasoning_output
+
+        assert cache_reasoning_output(None, native_reasoning=False, chat_template_kwargs={}) is False
+        assert cache_reasoning_output(None, native_reasoning=True, chat_template_kwargs={}) is True
+        assert (
+            cache_reasoning_output(
+                None, native_reasoning=False, chat_template_kwargs={"preserve_thinking": True}
+            )
+            is True
+        )
+
+    def test_model_setting_overrides_detection(self):
+        from types import SimpleNamespace
+
+        from omlx.api.utils import cache_reasoning_output
+
+        forced_on = SimpleNamespace(cache_reasoning_output=True)
+        forced_off = SimpleNamespace(cache_reasoning_output=False)
+        assert cache_reasoning_output(forced_on, native_reasoning=False, chat_template_kwargs={}) is True
+        assert (
+            cache_reasoning_output(
+                forced_off, native_reasoning=True, chat_template_kwargs={"preserve_thinking": True}
+            )
+            is False
+        )

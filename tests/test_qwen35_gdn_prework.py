@@ -8,13 +8,17 @@ next conv-state slice) at every verify width it claims (S in 3..9).
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.models.cache import ArraysCache, BatchKVCache
+from mlx_vlm.models.qwen3_5 import language
 
 from omlx.patches import qwen35_gdn_prework as prework_mod
+from omlx.patches.mlx_vlm_mtp import qwen35_batch_rollback
 from omlx.patches.qwen35_gdn_prework import (
     gdn_prework_fused,
     qwen4_decode_norm_gate_fused,
@@ -42,14 +46,15 @@ def _composed(qkv, conv_state, conv1d):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("seq", [3, 4, 5, 7, 9])
-def test_fused_prework_bit_exact(seq):
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_fused_prework_bit_exact(seq, batch):
     mx.random.seed(11)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
     conv1d = nn.Conv1d(C, C, kernel_size=4, groups=C, bias=False)
     conv1d.weight = conv_w
-    qkv = (mx.random.normal((1, seq, C)) * 0.5).astype(mx.bfloat16)
-    state = (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16)
+    qkv = (mx.random.normal((batch, seq, C)) * 0.5).astype(mx.bfloat16)
+    state = (mx.random.normal((batch, 3, C)) * 0.5).astype(mx.bfloat16)
     inv = DK**-0.5
     q_scale = mx.array(inv * inv, dtype=mx.bfloat16)
     k_scale = mx.array(inv, dtype=mx.bfloat16)
@@ -542,3 +547,135 @@ def test_patched_call_restores_state_and_discards_sink_on_late_failure(monkeypat
     assert bool(
         (stock_recurrent_states[0] == original_recurrent_state).all().item()
     ), "stock fallback must see the pre-call recurrent state"
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("seq", [2, 3])
+def test_batched_verify_preserves_output_and_all_rollback_states(
+    monkeypatch, batch, seq
+):
+    import copy
+
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    mx.random.seed(193)
+    module = q35.Qwen3_5GatedDeltaNet(args)
+    module.set_dtype(mx.bfloat16)
+    module.eval()
+    inputs = mx.random.normal((batch, seq, 64)).astype(mx.bfloat16)
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((batch, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache[1] = mx.random.normal((batch, 4, 128, 128)) * 0.01
+    reference_cache = copy.deepcopy(cache)
+    reference_sink = []
+    reference = module(
+        inputs, cache=reference_cache, gdn_sink=reference_sink, target_verify=True
+    )
+    mx.eval(reference, reference_cache.state, reference_sink)
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    monkeypatch.setattr(
+        q35.Qwen3_5GatedDeltaNet, "_omlx_gdn_prework_patched", False, raising=False
+    )
+    # Register the original call with monkeypatch so teardown restores it.
+    monkeypatch.setattr(
+        q35.Qwen3_5GatedDeltaNet, "__call__", q35.Qwen3_5GatedDeltaNet.__call__
+    )
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    calls = []
+    kernel = prework_mod.gdn_prework_fused
+
+    def record(*args):
+        calls.append(args[0].shape)
+        return kernel(*args)
+
+    monkeypatch.setattr(prework_mod, "gdn_prework_fused", record)
+    sink = []
+    actual = module(inputs, cache=cache, gdn_sink=sink, target_verify=True)
+    mx.eval(actual, cache.state, sink)
+    assert calls == [(batch, seq, module.conv_dim)]
+    expected = tree_flatten((reference, reference_cache.state, reference_sink))
+    observed = tree_flatten((actual, cache.state, sink))
+    assert [key for key, _ in expected] == [key for key, _ in observed]
+    for (key, a), (_, b) in zip(expected, observed):
+        if isinstance(a, mx.array):
+            assert mx.array_equal(a, b).item(), key
+
+
+@pytest.mark.parametrize("rows", [2, 4])
+@pytest.mark.parametrize("depth", [1, 2, 4])
+@pytest.mark.parametrize("accept_kind", ["none", "all", "ragged"])
+def test_matches_upstream_without_layer_concatenation(rows, depth, accept_kind):
+    original = language.LanguageModel.rollback_speculative_cache
+    while getattr(original, "_omlx_layer_rollback", False):
+        original = original.__wrapped__
+    calls = []
+
+    def select(intermediate, *args, **kwargs):
+        calls.append(intermediate.shape[0])
+        return language.gated_delta_accept_states(intermediate, *args, **kwargs)
+
+    module = SimpleNamespace(
+        LanguageModel=SimpleNamespace(rollback_speculative_cache=original),
+        mx=mx,
+        gated_delta_accept_states=select,
+    )
+    qwen35_batch_rollback.apply(module)
+    patched = module.LanguageModel.rollback_speculative_cache
+    qwen35_batch_rollback.apply(module)
+    assert module.LanguageModel.rollback_speculative_cache is patched
+    mx.random.seed(49)
+    steps = depth + 1
+    gdn = []
+    caches = []
+    for _ in range(3):
+        cache = ArraysCache(2)
+        intermediate = mx.random.normal((rows, steps, 2, 4, 4))
+        conv = mx.random.normal((rows, steps + 3, 8)).astype(mx.bfloat16)
+        cache[0], cache[1] = conv[:, -3:], intermediate[:, -1]
+        caches.append(cache)
+        gdn.append((None,) * 9 + (conv, 4, intermediate))
+    kv = BatchKVCache(list(range(rows)))
+    keys = mx.random.normal((rows, 2, 9 + steps, 4))
+    kv.update_and_fetch(keys, keys * 0.5)
+    caches.insert(1, kv)
+    expected = copy.deepcopy(caches)
+    accepted = {
+        "none": [0] * rows,
+        "all": [depth] * rows,
+        "ragged": [i % steps for i in range(rows)],
+    }[accept_kind]
+    assert patched(None, caches, gdn, accepted, steps) == original(
+        None, expected, gdn, accepted, steps
+    )
+    assert calls == [rows] * 3
+    for actual, reference in zip(caches, expected):
+        mx.eval(actual.state, reference.state)
+        actual_values = (
+            actual.keys_and_values()
+            if isinstance(actual, BatchKVCache)
+            else actual.cache
+        )
+        reference_values = (
+            reference.keys_and_values()
+            if isinstance(reference, BatchKVCache)
+            else reference.cache
+        )
+        assert all(
+            bool(mx.array_equal(a, b)) for a, b in zip(actual_values, reference_values)
+        )
+        if isinstance(actual, BatchKVCache):
+            assert actual._idx == reference._idx
+            assert bool(mx.array_equal(actual.offset, reference.offset))
+            assert bool(mx.array_equal(actual.left_padding, reference.left_padding))

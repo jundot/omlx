@@ -164,7 +164,7 @@ def _assert_restored(result, expected_seq_len):
     assert len(sub_caches) == 2
 
     kv = sub_caches[0]
-    kv_state = kv.state
+    kv_state = kv.keys_and_values()
     keys = kv_state[0]
     assert keys.shape[2] == expected_seq_len, (
         f"restored KV holds {keys.shape[2]} tokens, "
@@ -175,7 +175,7 @@ def _assert_restored(result, expected_seq_len):
     assert mx.max(mx.abs(kv_state[1] - expected_values)).item() == 0.0
 
     arrays = sub_caches[1]
-    slots = list(arrays.state)
+    slots = list(arrays.cache)
     assert len(slots) == 4
     for i, (slot, channels) in enumerate(zip(slots, CONV_CHANNELS)):
         assert slot is not None
@@ -312,6 +312,7 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         block_aware_cache=object(),
         config=SimpleNamespace(paged_cache_block_size=BLOCK_SIZE),
         model=SimpleNamespace(),
+        _model_has_unreconstructible_cache=lambda: False,
         _cache_list_needs_boundary_snapshot=lambda cache: True,
         _boundary_cache_snapshots={},
         _boundary_snapshot_store=None,
@@ -455,9 +456,9 @@ def test_none_conv_slots_roundtrip(tmp_path):
     assert result is not None
     restored = result[0]
     assert type(restored).__name__ == "CacheList"
-    slots = list(restored.caches[1].state)
+    slots = list(restored.caches[1].cache)
     assert slots[1] is None
     assert slots[3] is None
     assert slots[0] is not None and slots[2] is not None
-    kv_state = restored.caches[0].state
+    kv_state = restored.caches[0].keys_and_values()
     assert kv_state[0].shape[2] == BLOCK_SIZE

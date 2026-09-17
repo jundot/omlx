@@ -303,7 +303,7 @@ async def _continue_queue(engine_pool: Any, chain_id: int) -> None:
     _current_run_id = run.bench_id
     # Queue-continued runs execute inside this chain's own task; record it
     # so cancel_queue can hard-cancel them instead of waiting for the next
-    # on_progress checkpoint (up to a full generation batch away).
+    # on_progress checkpoint (up to one answered question away).
     run.task = asyncio.current_task()
 
     logger.info(

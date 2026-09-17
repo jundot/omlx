@@ -423,10 +423,8 @@ final class WelcomeViewModel: ObservableObject {
 
 struct WelcomeView: View {
     @ObservedObject var vm: WelcomeViewModel
-    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
         ZStack {
             WelcomeBackdrop()
                 .ignoresSafeArea()
@@ -446,7 +444,7 @@ struct WelcomeView: View {
                 WelcomeFooter(vm: vm)
             }
         }
-        .environment(\.omlxTheme, theme)
+        .omlxThemed()
         .frame(width: 680, height: 620)
     }
 }
@@ -566,7 +564,7 @@ private struct WelcomeSetupBody: View {
                                          defaultValue: "Default 8000. Change this only if the port is already in use.",
                                          comment: "Sublabel for the port field with the recommended default")
                     ) {
-                        TextInput(text: $vm.portText, mono: true, width: 96)
+                        TextInput(text: $vm.portText, mono: true, width: .controlNarrow)
                     }
 
                     WelcomeDivider()
@@ -615,7 +613,7 @@ private struct WelcomeSetupBody: View {
                                          comment: "Sublabel explaining API key usage")
                     ) {
                         HStack(spacing: 0) {
-                            TextInput("welcome.api_key.placeholder", text: $vm.apiKey, placeholder: "sk-omlx-…", isSecure: !keyVisible, mono: true, width: 210)
+                            TextInput("welcome.api_key.placeholder", text: $vm.apiKey, placeholder: "sk-omlx-…", isSecure: !keyVisible, mono: true, width: .controlMedium)
                             Button {
                                 keyVisible.toggle()
                             } label: {
@@ -845,7 +843,9 @@ private struct WelcomeIcon: View {
             .frame(width: size, height: size)
             .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
             .shadow(color: Color.black.opacity(0.10), radius: 12, y: 6)
-            .accessibilityLabel("oMLX")
+            .accessibilityLabel(String(localized: "common.app_name",
+                                       defaultValue: "oMLX",
+                                       comment: "Product name used as the app logo accessibility label"))
     }
 }
 

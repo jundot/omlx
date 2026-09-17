@@ -26,6 +26,28 @@ final class AppConfigTests: XCTestCase {
         }
     }
 
+    func testEndpointSaveCreatesMissingSettings() throws {
+        try AppConfig.saveServerEndpoint(basePath: tempBase, port: 9000)
+        XCTAssertEqual(try AppConfig.readSettingsForTests(basePath: tempBase).port, 9000)
+    }
+
+    func testEndpointSavePreservesOtherFieldsAndRejectsCorruptStorage() throws {
+        let url = AppConfig.settingsURL(basePath: tempBase)
+        let original = Data(#"{"server":{"port":8000,"host":"127.0.0.1","auto_start_on_launch":false},"auth":{"api_key":"keep"},"model":{"model_dirs":["/keep"]},"unknown":{"x":1}}"#.utf8)
+        try original.write(to: url)
+        try AppConfig.saveServerEndpoint(basePath: tempBase, port: 9000)
+        var expected = try JSONSerialization.jsonObject(with: original) as! [String: Any]
+        var server = expected["server"] as! [String: Any]
+        server["port"] = 9000
+        expected["server"] = server
+        let actual = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! NSDictionary
+        XCTAssertEqual(actual, expected as NSDictionary)
+        let corrupt = Data("{broken".utf8)
+        try corrupt.write(to: url)
+        XCTAssertThrowsError(try AppConfig.saveServerEndpoint(basePath: tempBase, port: 9001))
+        XCTAssertEqual(try Data(contentsOf: url), corrupt)
+    }
+
     // MARK: defaultModelDir
 
     func testDefaultModelDirIsBasePathSlashModels() {

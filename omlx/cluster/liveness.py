@@ -26,6 +26,7 @@ absent.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -36,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from .ssh_policy import cluster_ssh_options
+
+logger = logging.getLogger(__name__)
 
 # A rank refreshes its marker on every phase change, while serving, and on a
 # fixed heartbeat interval even when idle (``RuntimeTelemetry``). Three missed
@@ -76,7 +79,9 @@ class PeerHealth:
             return False
         if not self.heartbeat_required:
             return True
-        return self.seconds_since_heartbeat is not None and self.process_live is not False
+        return (
+            self.seconds_since_heartbeat is not None and self.process_live is not False
+        )
 
     @property
     def stale(self) -> bool:
@@ -286,7 +291,9 @@ def marker_owner_is_live(marker: dict[str, Any]) -> bool:
     return _pid_is_live(pid)
 
 
-def marker_age_seconds(marker: dict[str, Any], *, now: float | None = None) -> float | None:
+def marker_age_seconds(
+    marker: dict[str, Any], *, now: float | None = None
+) -> float | None:
     """Seconds since a rank last refreshed its marker."""
 
     from datetime import UTC, datetime
@@ -456,6 +463,8 @@ class PeerWatchdog:
         interval: float = 15.0,
         serving_interval: float | None = None,
         on_lost: Callable[[str], None] | None = None,
+        on_abort: Callable[[str], None] | None = None,
+        abort_grace: float = 5.0,
         failure_tolerance: int = _DEFAULT_FAILURE_TOLERANCE,
     ) -> None:
         self._hosts = hosts_by_rank
@@ -473,10 +482,16 @@ class PeerWatchdog:
             else max(0.0, float(serving_interval))
         )
         self._on_lost = on_lost
+        # Graduated response: once a peer is confirmed lost, fire on_abort
+        # (request cancellation at a step boundary) and re-probe for up to
+        # abort_grace seconds before the final on_lost exit, so a recoverable
+        # flap no longer suicides the healthy rank and in-flight work gets a
+        # chance to unwind. With on_abort unset or abort_grace=0 the timing
+        # is exactly the old fire-on-tolerance behavior.
+        self._on_abort = on_abort
+        self._abort_grace = max(0.0, float(abort_grace))
         self._failure_tolerance = max(1, int(failure_tolerance))
-        self._consecutive_failures: dict[int, int] = {
-            rank: 0 for rank in hosts_by_rank
-        }
+        self._consecutive_failures: dict[int, int] = {rank: 0 for rank in hosts_by_rank}
         self._stop = False
 
     def stop(self) -> None:
@@ -527,6 +542,43 @@ class PeerWatchdog:
             if not failed_ranks:
                 continue
             failed = tuple(item for item in health if item.rank in failed_ranks)
+            reason = describe_failure(failed)
+            # Graduated response: request cancellation first, exit last.
+            if self._on_abort is not None and self._abort_grace > 0:
+                logger.warning(
+                    "Peer watchdog: %s — aborting in-flight requests and "
+                    "allowing %.1fs of recovery before teardown",
+                    reason,
+                    self._abort_grace,
+                )
+                try:
+                    self._on_abort(reason)
+                except Exception:
+                    logger.warning("Peer watchdog abort stage failed", exc_info=True)
+                if self._wait_for_recovery(sleep):
+                    for rank in failed_ranks:
+                        self._consecutive_failures[rank] = 0
+                    continue
             if self._on_lost is not None:
-                self._on_lost(describe_failure(failed))
+                self._on_lost(reason)
             return
+
+    def _wait_for_recovery(self, sleep: Callable[[float], None]) -> bool:
+        """Re-probe during the abort grace; True if every peer recovered."""
+
+        deadline = time.monotonic() + self._abort_grace
+        while not self._stop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            sleep(min(0.5, remaining))
+            if self._stop:
+                return False
+            try:
+                health = self.run_once()
+            except Exception:
+                continue
+            if health and all(item.healthy for item in health):
+                logger.warning("Peer watchdog: peer contact recovered")
+                return True
+        return False

@@ -821,15 +821,16 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
 
-    x = mx.random.normal((1, 32, 128), dtype=mx.bfloat16)
+    # Reach the 1024-route affine block threshold.
+    x = mx.random.normal((1, 512, 128), dtype=mx.bfloat16)
     indices = mx.array(
-        [[[(i + j) % 8 for j in range(2)] for i in range(32)]],
+        [[[(i + j) % 8 for j in range(2)] for i in range(512)]],
         dtype=mx.int32,
     )
     y = model(x, indices)
     mx.eval(y)
 
-    assert y.shape == (1, 32, 2, 128)
+    assert y.shape == (1, 512, 2, 128)
     assert calls == {"pair": 1, "single": 1}
 
 
@@ -882,16 +883,17 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
 
-    x = mx.random.normal((1, 32, 128), dtype=mx.bfloat16)
+    # Reach the 1024-route affine block threshold.
+    x = mx.random.normal((1, 512, 128), dtype=mx.bfloat16)
     indices = mx.array(
-        [[[(i + j) % 8 for j in range(2)] for i in range(32)]],
+        [[[(i + j) % 8 for j in range(2)] for i in range(512)]],
         dtype=mx.int32,
     )
     y = model(x, indices)
     mx.eval(y)
 
     assert y.dtype == mx.bfloat16
-    assert y.shape == (1, 32, 2, 128)
+    assert y.shape == (1, 512, 2, 128)
     assert calls == {
         "pair": 1,
         "single": 1,
@@ -1032,8 +1034,8 @@ def test_glm_patch_forward_sparse_path_and_cache_state():
     assert mx.all(mx.isfinite(logits)).item()
 
     mx.eval([c.state for c in cache])
-    full_state = cache[0].state
-    shared_state = cache[1].state
+    full_state = [c.keys_and_values() for c in cache[0].caches]
+    shared_state = [c.keys_and_values() for c in cache[1].caches]
     assert len(full_state) == 2
     assert len(shared_state) == 1
     assert full_state[1][1].shape[-1] == 0
@@ -1253,6 +1255,7 @@ def _decode_only_batch_generator(stream) -> SimpleNamespace:
         def next(self):
             return ["generation"]
 
+    from mlx_lm.generate import BatchCounters
     from omlx.patches.glm_moe_dsa.generate_patch import _AdaptivePrefillConfig
 
     return SimpleNamespace(
@@ -1260,8 +1263,7 @@ def _decode_only_batch_generator(stream) -> SimpleNamespace:
             step_size=8192, after=0, min_remaining=0
         ),
         _generation_batch=_GenerationBatch(),
-        _gen_tokens_counter=0,
-        _steps_counter=511,
+        _counters=BatchCounters(generation_steps=511),
         completion_batch_size=1,
         _stream=stream,
     )
@@ -1298,7 +1300,7 @@ def test_glm_adaptive_decode_periodic_clear_drains_generator_stream():
 
     assert generation_responses == ["generation"]
     assert prompt_responses == []
-    assert bg._steps_counter == 512
+    assert bg._counters.generation_steps == 512
     assert streams, "periodic decode clear did not drain any stream"
     assert streams == [engine_stream], (
         "periodic decode clear released Metal buffers without draining the "
@@ -1313,7 +1315,7 @@ def test_glm_adaptive_decode_clears_only_on_the_512_step_cadence():
     from omlx.patches.glm_moe_dsa import generate_patch as patch_mod
 
     bg = _decode_only_batch_generator(mx.new_thread_local_stream(mx.default_device()))
-    bg._steps_counter = 0
+    bg._counters.generation_steps = 0
 
     streams: list = []
     with (
@@ -1326,5 +1328,47 @@ def test_glm_adaptive_decode_clears_only_on_the_512_step_cadence():
     ):
         gen.BatchGenerator._next(bg)
 
-    assert bg._steps_counter == 1
+    assert bg._counters.generation_steps == 1
     assert streams == []
+
+
+def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatch):
+    """Small affine windows use stock gather_qmm after sorting."""
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx.nn")
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.deepseek_v4 import switch_layers as sl
+    from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+    if not fast.is_native_available() or not fast.has_symbol(
+        "deepseek_affine_gather_qmm_blocks"
+    ):
+        pytest.skip("native affine block kernels unavailable")
+
+    mx.random.seed(23)
+    model = SwitchGLU(128, 64, 8)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        layer = getattr(model, name).to_quantized(group_size=64, bits=2, mode="affine")
+        layer.scales = layer.scales.astype(mx.float16)
+        layer.biases = layer.biases.astype(mx.float16)
+        setattr(model, name, layer)
+
+    calls = {"single": 0}
+    orig_single = fast.deepseek_affine_gather_qmm_blocks
+
+    def single_spy(*args, **kwargs):
+        calls["single"] += 1
+        return orig_single(*args, **kwargs)
+
+    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
+
+    x = mx.random.normal((1, 8, 128), dtype=mx.float16)  # 8 tokens x 8 = 64 routes
+    indices = mx.array(
+        [[[(i + j) % 8 for j in range(8)] for i in range(8)]], dtype=mx.int32
+    )
+    assert indices.size >= sl._SORT_MIN_ROUTES
+    assert indices.size < sl._AFFINE_NATIVE_MIN_ROUTES
+    y = model(x, indices)
+    mx.eval(y)
+    assert y.shape == (1, 8, 8, 128)
+    assert calls == {"single": 0}

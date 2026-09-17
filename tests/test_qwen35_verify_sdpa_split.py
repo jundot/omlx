@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import BatchKVCache, KVCache
 
+from omlx.patches.mlx_vlm_mtp.qwen35_verify_attention import verify_attention
 from omlx.patches.qwen35_verify_sdpa_split import (
     _chunked_causal_sdpa,
     _eligible,
@@ -97,3 +99,216 @@ def test_eligibility_gates_turboquant_proxy():
     k = mx.random.normal((1, HKV, 256, HD)).astype(mx.bfloat16)
     assert _eligible(_TurboQuantProxy((1, HQ, 4, HD)), k, None) == 0
     assert _eligible(q, _TurboQuantProxy((1, HKV, 256, HD)), None) == 0
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "batch,length,size,masked,cache_kind",
+    [
+        (1, 2, 32, False, "ordinary"),
+        (2, 3, 193, True, "ordinary"),
+        (4, 4, 513, False, "qsa"),
+        (4, 4, 513, True, "qsa"),
+    ],
+)
+@pytest.mark.parametrize("dim", [64, 96, 128, 256])
+def test_matches_single_query_reductions(
+    dtype, batch, length, size, dim, masked, cache_kind
+):
+    mx.random.seed(14)
+    heads, kv_heads = 8, 2
+    # Transposing also tests non-contiguous inputs.
+    queries = (
+        mx.random.normal((batch, length, heads, dim))
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    keys = (
+        mx.random.normal((batch, size, kv_heads, dim))
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    values = (
+        mx.random.normal((batch, size, kv_heads, dim))
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    pads = [0, 3, 7, 11][:batch]
+    if cache_kind == "qsa":
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+        cache = BatchQSAKVCache(pads)
+    else:
+        cache = BatchKVCache(pads)
+    mask = None
+    if masked:
+        mask = mx.arange(size)[None, None, None, :] % 5 != 0
+        # Canonical causal masking plus holes in past context.
+        mask = mask & (
+            mx.arange(size)[None, None, None, :]
+            < size - length + mx.arange(length)[None, None, :, None] + 1
+        )
+        mask = mx.broadcast_to(mask, (batch, 1, length, size))
+    actual = verify_attention(
+        queries, keys, values, cache=cache, scale=dim**-0.5, mask=mask
+    )
+    assert actual is not None
+    rows = []
+    for b, pad in enumerate(pads):
+        tokens = []
+        for t in range(length):
+            end = size - length + t + 1
+            tokens.append(
+                mx.fast.scaled_dot_product_attention(
+                    queries[b : b + 1, :, t : t + 1],
+                    keys[b : b + 1, :, pad:end],
+                    values[b : b + 1, :, pad:end],
+                    scale=dim**-0.5,
+                    mask=mask[b : b + 1, :, t : t + 1, pad:end] if masked else None,
+                )
+            )
+        rows.append(mx.concatenate(tokens, axis=2))
+    expected = mx.concatenate(rows, axis=0)
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_future_and_left_padding_are_invisible():
+    mx.random.seed(33)
+    q = mx.random.normal((2, 8, 3, 128)).astype(mx.float16)
+    k = mx.random.normal((2, 2, 64, 128)).astype(mx.float16)
+    v = mx.random.normal((2, 2, 64, 128)).astype(mx.float16)
+    cache = BatchKVCache([3, 7])
+    expected = verify_attention(q, k, v, cache=cache, scale=128**-0.5, mask=None)
+    k2, v2 = mx.array(k), mx.array(v)
+    for row, pad in enumerate([3, 7]):
+        k2[row, :, :pad] = 100
+        v2[row, :, :pad] = 100
+    k2[:, :, -2:] = 100
+    v2[:, :, -2:] = 100
+    actual = verify_attention(q, k2, v2, cache=cache, scale=128**-0.5, mask=None)
+    assert mx.array_equal(actual[:, :, :1], expected[:, :, :1]).item()
+
+
+@pytest.mark.parametrize(
+    "case", ["single", "single_long", "long", "float32", "additive_mask", "cache"]
+)
+def test_unsupported_contract_returns_none(case):
+    length = 1 if case == "single" else 3
+    size = 8193 if case == "long" else 1024 if case == "single_long" else 64
+    dtype = mx.float32 if case == "float32" else mx.float16
+    batch = 1 if case == "single_long" else 2
+    q = mx.zeros((batch, 8, length, 128), dtype)
+    k = mx.zeros((batch, 2, size, 128), dtype)
+    cache = object() if case == "cache" else BatchKVCache([0, 3][:batch])
+    mask = mx.zeros((length, size)) if case == "additive_mask" else None
+    assert verify_attention(q, k, k, cache=cache, scale=1.0, mask=mask) is None
+
+
+def test_singleton_cache_causal_mask():
+    q = mx.ones((1, 2, 3, 64), mx.float16)
+    k = mx.ones((1, 1, 16, 64), mx.float16)
+    result = verify_attention(q, k, k, cache=KVCache(), scale=0.125, mask="causal")
+    assert mx.array_equal(result, q).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "batch,length,size,masked,cache_kind",
+    [
+        (2, 2, 1024, False, "ordinary"),
+        (3, 3, 2048, True, "qsa"),
+        (4, 4, 4096, True, "ordinary"),
+        (4, 2, 8192, False, "qsa"),
+    ],
+)
+@pytest.mark.parametrize("dim", [64, 96, 128, 256])
+def test_causal_padding_and_high_precision_reference(
+    dtype, batch, length, size, masked, cache_kind, dim
+):
+    mx.random.seed(812)
+    heads, kv_heads = 6, 2
+    q = (
+        mx.random.normal((batch, length, heads, dim))
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    k = (
+        mx.random.normal((batch, size, kv_heads, dim))
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    v = (
+        mx.random.normal((batch, size, kv_heads, dim))
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    pads = [0, 17, size // 3, size - length - 1][:batch]
+    if cache_kind == "qsa":
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+        cache = BatchQSAKVCache(pads)
+    else:
+        cache = BatchKVCache(pads)
+    mask = None
+    if masked:
+        mask = mx.broadcast_to(
+            (mx.arange(size) % 7 != 0)[None, None, None, :], (batch, 1, length, size)
+        )
+    actual = verify_attention(q, k, v, cache=cache, scale=dim**-0.5, mask=mask)
+    assert actual is not None
+    reference = []
+    for row, pad in enumerate(pads):
+        steps = []
+        for t in range(length):
+            end = size - length + t + 1
+            steps.append(
+                mx.fast.scaled_dot_product_attention(
+                    q[row : row + 1, :, t : t + 1].astype(mx.float32),
+                    k[row : row + 1, :, pad:end].astype(mx.float32),
+                    v[row : row + 1, :, pad:end].astype(mx.float32),
+                    scale=dim**-0.5,
+                    mask=mask[row : row + 1, :, t : t + 1, pad:end] if masked else None,
+                )
+            )
+        reference.append(mx.concatenate(steps, axis=2))
+    reference = mx.concatenate(reference, axis=0)
+    # A one-ULP envelope at each element, plus FP32 reduction error near zero.
+    eps = 2 ** (-7 if dtype == mx.bfloat16 else -10)
+    tolerance = eps * mx.abs(reference) + 2e-6
+    assert mx.all(mx.abs(actual.astype(mx.float32) - reference) <= tolerance).item()
+    # Change inaccessible padding and future positions; first query is invariant.
+    k2, v2 = mx.array(k), mx.array(v)
+    for row, pad in enumerate(pads):
+        k2[row, :, :pad] = 100
+        v2[row, :, :pad] = -100
+    k2[:, :, -(length - 1) :] = -100
+    v2[:, :, -(length - 1) :] = 100
+    changed = verify_attention(q, k2, v2, cache=cache, scale=dim**-0.5, mask=mask)
+    assert mx.array_equal(changed[:, :, :1], actual[:, :, :1]).item()
+
+
+def test_fully_masked_rows_are_zero_and_bound_is_explicit():
+    q = mx.ones((2, 6, 2, 256), mx.bfloat16)
+    k = mx.ones((2, 2, 2048, 256), mx.bfloat16)
+    mask = mx.zeros((2, 1, 2, 2048), mx.bool_)
+    result = verify_attention(
+        q, k, k, cache=BatchKVCache([0, 100]), scale=0.0625, mask=mask
+    )
+    assert mx.all(result == 0).item()
+    long_k = mx.ones((2, 2, 8193, 256), mx.bfloat16)
+    assert (
+        verify_attention(
+            q, long_k, long_k, cache=BatchKVCache([0, 0]), scale=0.0625, mask=None
+        )
+        is None
+    )

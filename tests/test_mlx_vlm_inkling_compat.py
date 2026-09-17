@@ -351,9 +351,9 @@ def test_tiny_model_single_forward(applied):
     assert out.logits.shape == (1, 5, 128)
     step = model(mx.array([[21]]), cache=cache)
     assert step.logits.shape == (1, 1, 128)
-    kv_state = cache[0][0].state
+    kv_state = cache[0][0].keys_and_values()
     assert kv_state[0].shape[2] == 6
-    conv_slots = list(cache[0][1].state)
+    conv_slots = list(cache[0][1].cache)
     assert len(conv_slots) == 4
     assert all(s is not None for s in conv_slots)
 

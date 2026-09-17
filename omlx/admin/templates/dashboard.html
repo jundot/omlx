@@ -3,6 +3,7 @@
 {% block title %}{{ t('dashboard.title') }}{% endblock %}
 
 {% block head %}
+<link rel="stylesheet" href="{{ static('css/gridstack.min.css') }}">
 <link rel="stylesheet" href="{{ static('css/dashboard.css') }}">
 {% endblock %}
 
@@ -17,12 +18,12 @@
         <div class="absolute inset-0 bg-grain pointer-events-none z-0"></div>
         <div class="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-gradient-to-b from-neutral-50 to-transparent rounded-full blur-3xl -z-10 opacity-50"></div>
 
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-10 relative z-10">
+        <div class="mx-auto px-4 sm:px-6 py-6 sm:py-10 relative z-10" :class="mainTab === 'status' ? dashboardWidthClass : 'max-w-7xl'">
             <!-- Status Main Tab -->
             {% include "dashboard/_status.html" %}
 
-            <!-- Cluster Main Tab -->
-            {% include "dashboard/_cluster.html" %}
+            <!-- Cluster Main Tab: the v2 wizard is the sole dashboard flow. -->
+            {% include "dashboard/_cluster_v2.html" %}
 
             <!-- Settings Main Tab -->
             {% include "dashboard/_settings.html" %}
@@ -41,6 +42,9 @@
 
     <!-- Model Settings Modal -->
     {% include "dashboard/_modal_model_settings.html" %}
+
+    <!-- Model settings snapshot apply (optimal / recipe) -->
+    {% include "dashboard/_modal_settings_apply.html" %}
 
     <!-- HF Mirror Settings Modal -->
     <div x-show="showHfMirrorModal" x-cloak
@@ -95,5 +99,9 @@
 {% block scripts %}
 <script src="{{ static('js/purify.min.js') }}"></script>
 <script src="{{ static('js/marked.umd.js') }}"></script>
+<script src="{{ static('js/usage.js') }}"></script>
+<script src="{{ static('js/cluster_v2.js') }}"></script>
+<script src="{{ static('js/gridstack-all.js') }}"></script>
+<script src="{{ static('js/dashboard_layout.js') }}"></script>
 <script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}
