@@ -225,12 +225,15 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
         spec = source_quantization_spec(config, prefix) if dtype == "U32" else None
         scale, scale_dtype = fields.get("scales") or fields.get("scale") or (None, None)
         bias, bias_dtype = fields.get("biases") or (None, None)
+        # mlx_lm quantizes a biased linear's weight and leaves its bias dense.
+        # A QuantizedProjection has nowhere to keep that bias, so the module
+        # has to materialize densely or the bias would be an unexpected tensor.
         return repack_weight(
             raw,
             dtype,
             scale,
             scale_dtype,
-            force_dense,
+            force_dense or prefix + ".bias" in mapping,
             bias=bias,
             bias_dtype=bias_dtype,
             spec=spec,

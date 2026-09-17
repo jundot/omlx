@@ -317,7 +317,7 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
 
     from omlx.patches.deepseek_v41.model import Model
 
-    c = tiny(
+    vision_defaults = dict(
         vision_n_layers=1 if vision else 0,
         vision_dim=32,
         vision_n_heads=4,
@@ -326,8 +326,9 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
         vision_min_pixels=64,
         vision_max_n_token=32,
         image_token_id=63,
-        **config_overrides,
     )
+    vision_defaults.update(config_overrides)
+    c = tiny(**vision_defaults)
     model = Model(c)
     source = tmp_path / "source"
     source.mkdir()
@@ -350,13 +351,13 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
     }
     if vision:
         config["vision_config"] = {
-            "num_hidden_layers": 1,
-            "hidden_size": 32,
-            "num_attention_heads": 4,
-            "intermediate_size": 32,
-            "patch_size": 2,
-            "max_image_tokens": 32,
-            "min_pixels": 64,
+            "num_hidden_layers": vision_defaults["vision_n_layers"],
+            "hidden_size": vision_defaults["vision_dim"],
+            "num_attention_heads": vision_defaults["vision_n_heads"],
+            "intermediate_size": vision_defaults["vision_inter_dim"],
+            "patch_size": vision_defaults["vision_patch_size"],
+            "max_image_tokens": vision_defaults["vision_max_n_token"],
+            "min_pixels": vision_defaults["vision_min_pixels"],
         }
     (source / "config.json").write_text(json.dumps(config))
     (source / "model.safetensors.index.json").write_text(
@@ -412,19 +413,21 @@ def write_affine_checkpoint(
         vision=vision,
         dim=64,
         moe_inter_dim=64,
+        vision_dim=64,
+        vision_inter_dim=64,
         **config_overrides,
     )
     originals = dict(mx.load(str(source / "model.safetensors")))
     tensors, quantized = {}, {}
     for name, value in originals.items():
         base = name.removesuffix(".weight") if name.endswith(".weight") else ""
-        # A dense linear bias marks a module mlx_lm leaves unpacked — the
-        # router and the attention output projections keep their own bias,
-        # and a QuantizedProjection has no place for it.
+        # The router stays dense, as every mlx_lm quantization predicate
+        # leaves it. Biased projections *are* packed, with their bias left
+        # dense beside the metadata, which is the real checkpoint's layout.
         if (
             base
+            and not base.endswith("ffn.gate")
             and value.ndim == 2
-            and base + ".bias" not in originals
             and value.shape[-1] % group_size == 0
             and value.shape[-1] >= group_size
         ):

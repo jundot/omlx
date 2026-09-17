@@ -41,6 +41,39 @@ def test_source_affine_checkpoint_loads_packed_and_declared_dense(tmp_path):
         model.close()
 
 
+def test_source_affine_biased_projection_stays_dense_with_its_bias(tmp_path):
+    """A packed projection that carries a dense bias has to materialize."""
+    from omlx.patches.deepseek_v41.loading import load
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+
+    source, _ = write_affine_checkpoint(tmp_path, vision=True)
+    tensors = dict(mx.load(str(source / "model.safetensors")))
+    model, _ = load(source)
+    try:
+        attn = model.vision.blocks[0].attn
+        # The checkpoint packs wqkv and keeps wqkv.bias dense beside it.
+        assert not isinstance(attn.wqkv, QuantizedProjection)
+        # The bias survives the module materializing densely.
+        np.testing.assert_array_equal(
+            np.asarray(attn.wqkv.bias.astype(mx.float32)),
+            np.asarray(tensors["vision.blocks.0.attn.wqkv.bias"].astype(mx.float32)),
+        )
+        expected = mx.dequantize(
+            tensors["vision.blocks.0.attn.wqkv.weight"],
+            tensors["vision.blocks.0.attn.wqkv.scales"],
+            tensors["vision.blocks.0.attn.wqkv.biases"],
+            group_size=64,
+            bits=2,
+            mode="affine",
+        ).astype(mx.bfloat16)
+        np.testing.assert_array_equal(
+            np.asarray(attn.wqkv.weight.astype(mx.float32)),
+            np.asarray(expected.astype(mx.float32)),
+        )
+    finally:
+        model.close()
+
+
 def test_source_affine_forced_dense_projection_dequantizes_exactly(tmp_path):
     """head/embed have to stay dense, so they must dequantize exactly."""
     from omlx.patches.deepseek_v41.loading import load
