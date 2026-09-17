@@ -279,6 +279,76 @@ def test_original_quantized_expert_reads_repack_only_selected_experts(tmp_path, 
         plan.close()
 
 
+def test_original_affine_expert_reads_repack_only_selected_experts(tmp_path):
+    """Affine source experts offload with the packed arithmetic intact."""
+    from test_deepseek_v41 import raw_safetensors
+
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.language import Expert
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+
+    def bf16_bytes(array):
+        # bfloat16 travels as its raw bits, the way safetensors stores it.
+        return np.asarray(array.view(mx.uint16))
+
+    mx.random.seed(517)
+    config = ModelConfig(
+        dim=64, moe_inter_dim=64, n_layers=1, n_routed_experts=8, n_activated_experts=2
+    )
+    reference = Expert(config, True)
+    tensors = {}
+    for proj in ("w1", "w3", "w2"):
+        weight, scales, biases = mx.quantize(
+            mx.random.normal((8, 64, 64)).astype(mx.bfloat16),
+            bits=2,
+            group_size=64,
+            mode="affine",
+        )
+        setattr(
+            reference,
+            proj,
+            QuantizedProjection(
+                weight,
+                scales,
+                2,
+                "affine",
+                biases=biases,
+                group_size=64,
+                quantize_input=False,
+            ),
+        )
+        for expert in range(8):
+            name = f"layers.0.ffn.experts.{expert}.{proj}"
+            tensors[name + ".weight"] = (np.asarray(weight[expert]), "U32")
+            tensors[name + ".scales"] = (bf16_bytes(scales[expert]), "BF16")
+            tensors[name + ".biases"] = (bf16_bytes(biases[expert]), "BF16")
+    raw_safetensors(tmp_path / "model.safetensors", tensors)
+    plan = ExpertOffloadPlan(
+        tmp_path,
+        {"quantization": {"bits": 2, "group_size": 64, "mode": "affine"}},
+        {key: "model.safetensors" for key in tensors},
+        config,
+        0.25,
+    )
+    disk = OffloadedExpert(
+        Expert(config, True), plan, "language_model.layers.0.ffn.experts"
+    )
+    try:
+        for ids in ([[0, 1]], [[2, 3]], [[0, 7]], [[6, 5]]):
+            x = mx.random.normal((1, 1, 1, 64)).astype(mx.bfloat16)
+            idx = mx.array(ids)
+            scores = mx.ones(idx.shape) / 2
+            a, b = reference(x, idx, scores), disk(x, idx, scores)
+            mx.eval(a, b)
+            np.testing.assert_array_equal(a.astype(mx.float32), b.astype(mx.float32))
+        assert disk.slots.misses > 2
+        # Metadata is part of the expert, so it must be part of its byte size.
+        assert plan.full_bytes == plan.expert_bytes * plan.count
+    finally:
+        plan.close()
+
+
 def test_engram_and_expert_estimates_compose(tmp_path, monkeypatch):
     from test_engine_pool import _make_pool
 

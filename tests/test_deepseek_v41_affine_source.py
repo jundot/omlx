@@ -67,6 +67,37 @@ def test_source_affine_forced_dense_projection_dequantizes_exactly(tmp_path):
         model.close()
 
 
+def test_source_affine_experts_are_offload_eligible(tmp_path):
+    """The offload plan accepts affine source experts and their metadata."""
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.moe_offload import (
+        ExpertOffloadPlan,
+        estimate_expert_savings,
+    )
+    from omlx.patches.moe_offload_compat import moe_offload_compatibility
+
+    source, _ = write_affine_checkpoint(tmp_path, vision=False)
+    assert moe_offload_compatibility(source) == (True, "")
+    assert estimate_expert_savings(source, 0.5) > 0
+
+    raw = json.loads((source / "config.json").read_text())
+    mapping = json.loads((source / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    plan = ExpertOffloadPlan(source, raw, mapping, ModelConfig.from_dict(raw), 0.5)
+    try:
+        # Every expert projection contributes weight, scales and biases.
+        assert plan.full_bytes == plan.expert_bytes * plan.count * len(plan.layers)
+        assert plan.layers["language_model.layers.0.ffn.experts"]["w1"] == {
+            "bits": 2,
+            "group_size": 64,
+            "mode": "affine",
+            "quantize_input": False,
+        }
+    finally:
+        plan.close()
+
+
 def test_source_affine_convert_round_trip_matches_direct_load(tmp_path):
     """convert() publishes the same affine spec the loader reads directly."""
     from omlx.patches.deepseek_v41.convert import convert
