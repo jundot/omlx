@@ -173,6 +173,10 @@ class ServerSettings:
     server_aliases: list[str] = field(default_factory=list)
     sse_keepalive_mode: str = "chunk"
     auto_start_on_launch: bool = True
+    # Spawn the macOS menubar sidecar (live prefill/decode icon) from
+    # `omlx serve`. Skipped when the native oMLX.app supervises the
+    # server (OMLX_SUPERVISED) or PyObjC is unavailable.
+    menubar: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
     distributed_inference_enabled: bool = False
@@ -213,6 +217,7 @@ class ServerSettings:
             server_aliases=data.get("server_aliases", []),
             sse_keepalive_mode=data.get("sse_keepalive_mode", "chunk"),
             auto_start_on_launch=data.get("auto_start_on_launch", True),
+            menubar=data.get("menubar", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
             distributed_inference_enabled=data.get(
@@ -1299,6 +1304,8 @@ class GlobalSettings:
             self.server.log_level = args.log_level
         if hasattr(args, "sse_keepalive_mode") and args.sse_keepalive_mode is not None:
             self.server.sse_keepalive_mode = args.sse_keepalive_mode
+        if hasattr(args, "menubar") and args.menubar is not None:
+            self.server.menubar = args.menubar
         if (
             hasattr(args, "max_audio_upload_size")
             and args.max_audio_upload_size is not None

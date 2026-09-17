@@ -85,6 +85,7 @@ class TestServerSettings:
             "server_aliases": [],
             "sse_keepalive_mode": "chunk",
             "auto_start_on_launch": True,
+            "menubar": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
             "distributed_inference_enabled": False,
