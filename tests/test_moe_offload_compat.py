@@ -102,11 +102,12 @@ def test_matching_layout_is_admitted_whatever_the_model_type(tmp_path, kind):
     assert moe_offload_compatibility(tmp_path) == (True, "")
 
 
-def test_dense_gemma_is_hidden(tmp_path):
+@pytest.mark.parametrize("enable_moe_block", [False, 0])
+def test_dense_gemma_is_hidden(tmp_path, enable_moe_block):
     _checkpoint(tmp_path, "gemma4")
     path = tmp_path / "config.json"
     raw = json.loads(path.read_text())
-    raw["text_config"]["enable_moe_block"] = False
+    raw["text_config"]["enable_moe_block"] = enable_moe_block
     path.write_text(json.dumps(raw))
     assert moe_offload_compatibility(tmp_path)[0] is False
 

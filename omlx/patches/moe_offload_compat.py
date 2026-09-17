@@ -55,7 +55,8 @@ def _inspect(path, signature):
     count = int(text.get("num_experts") or 0)
     layers = int(text.get("num_hidden_layers") or 0)
     hidden = int(text.get("hidden_size") or 0)
-    if min(count, layers, hidden) <= 0 or text.get("enable_moe_block") is False:
+    # Declared-off is falsy (False, 0, null); absent means the tensors decide.
+    if min(count, layers, hidden) <= 0 or not text.get("enable_moe_block", True):
         return False, "The model does not have the supported MoE geometry."
     quant = raw.get("quantization", text.get("quantization"))
     if not isinstance(quant, dict):
