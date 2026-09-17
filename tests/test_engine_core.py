@@ -14,7 +14,8 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
-from unittest.mock import MagicMock, patch
+import threading
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -366,6 +367,30 @@ class TestEngineCoreAddRequest:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_add_request_preserves_mid_thinking_continuation_flag(self):
+        engine = EngineCore.__new__(EngineCore)
+        engine.scheduler = MagicMock()
+        engine.scheduler._specprefill_draft_model = None
+        engine.config = MagicMock(stream_interval=1)
+        engine._output_collectors = {}
+        engine._stream_states = {}
+        engine._finished_events = {}
+        engine._mlx_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        engine._wake_engine_loop = MagicMock()
+
+        try:
+            await engine.add_request(
+                prompt=[1, 2, 3],
+                request_id="continued-thought",
+                continuation_in_thinking=True,
+            )
+        finally:
+            engine._mlx_executor.shutdown(wait=True)
+
+        request = engine.scheduler.add_request.call_args.args[0]
+        assert request.continuation_in_thinking is True
+
+    @pytest.mark.asyncio
     async def test_add_request_cleans_up_if_scheduler_insert_fails(
         self, mock_model, mock_tokenizer
     ):
@@ -435,6 +460,117 @@ class TestEngineCoreAbortRequest:
         result = await engine.abort_request("request-after-close")
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_force_output_proxies_to_engine(self):
+        async_engine = AsyncEngineCore.__new__(AsyncEngineCore)
+        inner = MagicMock()
+        inner.request_force_output = AsyncMock(return_value="accepted")
+        async_engine.engine = inner
+
+        result = await async_engine.request_force_output("chatcmpl-exact")
+
+        assert result == "accepted"
+        inner.request_force_output.assert_awaited_once_with("chatcmpl-exact")
+
+    @pytest.mark.asyncio
+    async def test_force_output_after_close_returns_not_found(self):
+        async_engine = AsyncEngineCore.__new__(AsyncEngineCore)
+        async_engine.engine = None
+
+        assert (
+            await async_engine.request_force_output("chatcmpl-finished")
+            == "not_found"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pause_request_runs_snapshot_on_executor_and_wakes_consumer(self):
+        event_loop_thread = threading.get_ident()
+        worker_threads = []
+        scheduler = MagicMock()
+
+        def pause_on_worker(request_id):
+            worker_threads.append(threading.get_ident())
+            return {
+                "status": "accepted",
+                "request_id": request_id,
+                "output_token_ids": [7, 8],
+                "output_text": "prefix",
+                "completion_tokens": 2,
+                "continuation_in_thinking": True,
+                "reasoning_end_token_index": None,
+            }
+
+        scheduler.pause_request.side_effect = pause_on_worker
+        collector = MagicMock()
+        engine = EngineCore.__new__(EngineCore)
+        engine._closed = False
+        engine.scheduler = scheduler
+        engine._mlx_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        engine._output_collectors = {"chatcmpl-pause": collector}
+        engine._mark_request_finished = MagicMock()
+        engine._wake_engine_loop = MagicMock()
+
+        try:
+            result = await engine.pause_request("chatcmpl-pause")
+        finally:
+            engine._mlx_executor.shutdown(wait=True)
+
+        assert result["output_token_ids"] == [7, 8]
+        assert worker_threads and worker_threads[0] != event_loop_thread
+        scheduler.pause_request.assert_called_once_with("chatcmpl-pause")
+        terminal = collector.put.call_args.args[0]
+        assert terminal.finished is True
+        assert terminal.finish_reason == "abort"
+        assert terminal.error_code == "request_paused"
+        engine._mark_request_finished.assert_called_once_with("chatcmpl-pause")
+        engine._wake_engine_loop.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_pause_request_not_found_does_not_signal_consumer(self):
+        scheduler = MagicMock()
+        scheduler.pause_request.return_value = {
+            "status": "not_found",
+            "request_id": "missing",
+        }
+        collector = MagicMock()
+        engine = EngineCore.__new__(EngineCore)
+        engine._closed = False
+        engine.scheduler = scheduler
+        engine._mlx_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        engine._output_collectors = {"missing": collector}
+        engine._mark_request_finished = MagicMock()
+        engine._wake_engine_loop = MagicMock()
+
+        try:
+            result = await engine.pause_request("missing")
+        finally:
+            engine._mlx_executor.shutdown(wait=True)
+
+        assert result == {"status": "not_found", "request_id": "missing"}
+        collector.put.assert_not_called()
+        engine._mark_request_finished.assert_not_called()
+        engine._wake_engine_loop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_engine_pause_request_proxies_and_handles_close(self):
+        async_engine = AsyncEngineCore.__new__(AsyncEngineCore)
+        inner = MagicMock()
+        inner.pause_request = AsyncMock(
+            return_value={"status": "accepted", "request_id": "exact"}
+        )
+        async_engine.engine = inner
+
+        result = await async_engine.pause_request("exact")
+
+        assert result == {"status": "accepted", "request_id": "exact"}
+        inner.pause_request.assert_awaited_once_with("exact")
+
+        async_engine.engine = None
+        assert await async_engine.pause_request("closed") == {
+            "status": "not_found",
+            "request_id": "closed",
+        }
 
     @pytest.mark.asyncio
     async def test_abort_request(self, mock_model, mock_tokenizer):

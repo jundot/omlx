@@ -822,9 +822,7 @@ def _load_optiq_vision_sidecar_on_load(model_dir: Path):
         duplicates = model_keys.intersection(sidecar_weights)
         if duplicates:
             sample = ", ".join(sorted(duplicates)[:3])
-            raise ValueError(
-                f"OptiQ vision sidecar duplicates model weights: {sample}"
-            )
+            raise ValueError(f"OptiQ vision sidecar duplicates model weights: {sample}")
 
         injected = True
         result = original_load_weights(
@@ -1119,8 +1117,7 @@ def _transpose_qwen35_mlx_vision_patch_embed_on_load(model_dir: Path):
         _vu._load_safetensors = original_load_safetensors
         if transposed:
             logger.info(
-                "Transposed Qwen3.5 vision patch embedding to MLX Conv3d "
-                "layout for %s",
+                "Transposed Qwen3.5 vision patch embedding to MLX Conv3d layout for %s",
                 model_dir.name,
             )
 
@@ -1546,8 +1543,12 @@ def _count_image_tokens(
 
 
 def _smart_resize_tokens(
-    h: int, w: int, patch_size: int, merge_size: int,
-    min_pixels: int, max_pixels: int,
+    h: int,
+    w: int,
+    patch_size: int,
+    merge_size: int,
+    min_pixels: int,
+    max_pixels: int,
 ) -> int:
     """Real merged-token count for one image of pixel size (h, w), mirroring
     the Qwen image processor's ``smart_resize`` -> grid_thw ->
@@ -1569,7 +1570,7 @@ def _smart_resize_tokens(
         beta = math.sqrt(min_pixels / (h * w))
         h_bar = math.ceil(h * beta / factor) * factor
         w_bar = math.ceil(w * beta / factor) * factor
-    return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size ** 2)
+    return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size**2)
 
 
 def _read_image_dims(part: dict) -> Optional[tuple]:
@@ -1998,9 +1999,7 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
-                with _load_optiq_vision_sidecar_on_load(
-                    Path(self._model_name)
-                ):
+                with _load_optiq_vision_sidecar_on_load(Path(self._model_name)):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
@@ -2107,9 +2106,7 @@ class VLMBatchedEngine(BaseEngine):
                 get_mlx_executor(), free_t5_biases, self._vlm_model
             )
             if freed > 0:
-                logger.info(
-                    "t5 bias tensors freed: %.0f MB recovered", freed / 1e6
-                )
+                logger.info("t5 bias tensors freed: %.0f MB recovered", freed / 1e6)
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
 
@@ -2305,9 +2302,7 @@ class VLMBatchedEngine(BaseEngine):
 
             apply_qwen35_verify_sdpa_split_patch()
         except Exception:
-            logger.debug(
-                "Qwen verify-split attention patch not applied", exc_info=True
-            )
+            logger.debug("Qwen verify-split attention patch not applied", exc_info=True)
 
         # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
         # Decode and masked paths keep the original mlx-vlm kernel.
@@ -2535,9 +2530,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_qwen35_moe_weighted_sum_patch()
             except Exception:
-                logger.debug(
-                    "Qwen MoE weighted-sum patch not applied", exc_info=True
-                )
+                logger.debug("Qwen MoE weighted-sum patch not applied", exc_info=True)
 
         if (
             getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
@@ -3025,8 +3018,7 @@ class VLMBatchedEngine(BaseEngine):
                         )
                     except TypeError:
                         logger.debug(
-                            "encode_image rejected image metadata; "
-                            "retrying without it",
+                            "encode_image rejected image metadata; retrying without it",
                             exc_info=True,
                         )
                 else:
@@ -3058,7 +3050,10 @@ class VLMBatchedEngine(BaseEngine):
                             inspect.Parameter.POSITIONAL_OR_KEYWORD,
                         )
                     ]
-                    if image_position_ids is not None and len(positional_parameters) >= 2:
+                    if (
+                        image_position_ids is not None
+                        and len(positional_parameters) >= 2
+                    ):
                         return model.encode_image(pixel_values, image_position_ids)
 
             return model.encode_image(pixel_values)
@@ -3333,9 +3328,7 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
-        if model_type == COHERE2_MOE_MODEL_TYPE and (
-            num_images > 0 or num_audios > 0
-        ):
+        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
             raise InvalidRequestError(
                 "Cohere2 MoE is a text-only model and does not support "
                 "image or audio input.",
@@ -3597,7 +3590,8 @@ class VLMBatchedEngine(BaseEngine):
         extra_model_inputs = {
             k: v
             for k, v in inputs.items()
-            if k not in (
+            if k
+            not in (
                 "input_ids",
                 "attention_mask",
                 "pixel_values",
@@ -3995,6 +3989,10 @@ class VLMBatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        continuation_in_thinking = bool(
+            kwargs.pop("continuation_in_thinking", False)
+        )
+        durable_prefix_token_ids = kwargs.pop("_durable_prefix_token_ids", None)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -4006,6 +4004,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
+            continuation_token_ids=durable_prefix_token_ids,
+            continuation_in_thinking=continuation_in_thinking,
             **specprefill_kwargs,
         )
 
@@ -4019,6 +4019,20 @@ class VLMBatchedEngine(BaseEngine):
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
+            generation_tps_recent=getattr(output, "generation_tps_recent", None),
+            speculative_efficiency=getattr(output, "speculative_efficiency", None),
+            speculative_efficiency_recent=getattr(
+                output, "speculative_efficiency_recent", None
+            ),
+            speculative_accepted_tokens=getattr(
+                output, "speculative_accepted_tokens", None
+            ),
+            speculative_proposed_tokens=getattr(
+                output, "speculative_proposed_tokens", None
+            ),
+            speculative_efficiency_kind=getattr(
+                output, "speculative_efficiency_kind", None
+            ),
         )
 
     async def stream_generate(
@@ -4108,11 +4122,16 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        continuation_in_thinking = bool(
+            kwargs.pop("continuation_in_thinking", False)
+        )
+        durable_prefix_token_ids = kwargs.pop("_durable_prefix_token_ids", None)
 
         engine = self._engine
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.get("request_id"),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -4125,6 +4144,8 @@ class VLMBatchedEngine(BaseEngine):
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
             ),
             tools=tools,
+            continuation_token_ids=durable_prefix_token_ids,
+            continuation_in_thinking=continuation_in_thinking,
             **specprefill_kwargs,
         )
 
@@ -4139,6 +4160,7 @@ class VLMBatchedEngine(BaseEngine):
                 yield GenerationOutput(
                     text=text,
                     new_text=output.new_text,
+                    tokens=list(getattr(output, "new_token_ids", []) or []),
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
                     finished=output.finished,
@@ -4148,6 +4170,24 @@ class VLMBatchedEngine(BaseEngine):
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
                     first_token_at=getattr(output, "first_token_at", None),
+                    generation_tps_recent=getattr(
+                        output, "generation_tps_recent", None
+                    ),
+                    speculative_efficiency=getattr(
+                        output, "speculative_efficiency", None
+                    ),
+                    speculative_efficiency_recent=(
+                        getattr(output, "speculative_efficiency_recent", None)
+                    ),
+                    speculative_accepted_tokens=getattr(
+                        output, "speculative_accepted_tokens", None
+                    ),
+                    speculative_proposed_tokens=getattr(
+                        output, "speculative_proposed_tokens", None
+                    ),
+                    speculative_efficiency_kind=getattr(
+                        output, "speculative_efficiency_kind", None
+                    ),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))
@@ -4331,7 +4371,9 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = len(self._tokenizer.encode(prompt)) + len(
+                kwargs.get("continuation_token_ids") or []
+            )
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
@@ -4397,6 +4439,24 @@ class VLMBatchedEngine(BaseEngine):
             request_id=request_id,
             text_only=True,
         )
+
+    async def request_force_output(self, request_id: str) -> str:
+        """Force one active text-generation request out of thinking."""
+        if self.is_diffusion_model:
+            # Diffusion requests are not registered in the text scheduler and
+            # therefore cannot own a chat-completion request ID. Returning
+            # unsupported here would make the server stop scanning loaded
+            # engines before it reaches the actual owner.
+            return "not_found"
+        if not self._loaded or self._engine is None:
+            return "not_found"
+        return await self._engine.request_force_output(request_id)
+
+    async def pause_request(self, request_id: str) -> dict[str, Any]:
+        """Atomically snapshot and stop one active text-generation request."""
+        if self.is_diffusion_model or not self._loaded or self._engine is None:
+            return {"status": "not_found", "request_id": request_id}
+        return await self._engine.pause_request(request_id)
 
     async def stream_chat(
         self,
@@ -4556,6 +4616,7 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        continuation_token_ids = kwargs.pop("continuation_token_ids", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -4577,6 +4638,9 @@ class VLMBatchedEngine(BaseEngine):
             tools=template_tools,
             is_partial=partial,
         )
+        if continuation_token_ids:
+            token_ids = list(token_ids) + list(continuation_token_ids)
+            kwargs["_durable_prefix_token_ids"] = list(continuation_token_ids)
 
         if images:
             # Free Metal intermediates from vision encoding.
@@ -5004,6 +5068,7 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        continuation_token_ids: list[int] | None = None,
     ) -> int:
         """Count prompt tokens for chat messages (text-only approximation).
 
@@ -5022,7 +5087,7 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer.encode(prompt))
+        return len(self._tokenizer.encode(prompt)) + len(continuation_token_ids or [])
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""

@@ -133,7 +133,10 @@ def _patch_qwen35_mtp_config_for_moe() -> None:
 
         @classmethod
         def from_dict(cls, params: dict):
-            if isinstance(params, dict) and params.get("model_type") == "qwen3_5_moe_text":
+            if (
+                isinstance(params, dict)
+                and params.get("model_type") == "qwen3_5_moe_text"
+            ):
                 try:
                     from mlx_vlm.models.qwen3_5_moe.config import (
                         TextConfig as MoETextConfig,
@@ -234,18 +237,44 @@ class _VLMAdapterMTPProxy:
         self._allow_language_model_fast_paths = not bool(
             getattr(adapter, "_uses_mrope", False)
         )
+        self._adapter_verify_hidden: Any = None
+        self._adapter_verify_logits: Any = None
+
+    def _has_positioned_projection(self) -> bool:
+        return callable(
+            getattr(self._adapter, "speculative_logits_from_hidden", None)
+        ) or callable(
+            getattr(self._language_model, "speculative_logits_from_hidden", None)
+        )
 
     def __getattr__(self, name: str) -> Any:
         if name == "language_model":
             if self._expose_language_model:
                 return self._language_model
             raise AttributeError(name)
+        if (
+            not self._allow_language_model_fast_paths
+            and self._has_positioned_projection()
+        ):
+            if name == "speculative_verify_hidden":
+                return self._speculative_verify_hidden_via_adapter
+            if name == "speculative_logits_from_hidden":
+                return self._speculative_logits_from_adapter_verify
         try:
             return getattr(self._adapter, name)
         except AttributeError:
-            if (
-                not self._allow_language_model_fast_paths
-                and (name == "model" or name.startswith("speculative_"))
+            # mRoPE targets must run the verify forward through the adapter so
+            # it can construct the multi-dimensional position ids.  The
+            # logits projection itself is position-independent, though, and
+            # mlx-vlm's positioned-sampling path needs both of these hooks.
+            # Supply a safe adapter-forward implementation for the former and
+            # expose only the inner LM's projection hook for the latter.
+            if not self._allow_language_model_fast_paths and (
+                name == "model"
+                or (
+                    name.startswith("speculative_")
+                    and name != "speculative_logits_from_hidden"
+                )
             ):
                 raise
             return getattr(self._language_model, name)
@@ -273,6 +302,55 @@ class _VLMAdapterMTPProxy:
             setter(self._adapter, delta)
         else:
             self._adapter.set_batch_rope_deltas(mx.array([delta]))
+
+    def _speculative_verify_hidden_via_adapter(
+        self,
+        inputs: mx.array,
+        cache: List[Any],
+    ) -> tuple[mx.array, dict, Any]:
+        """Run an mRoPE-safe verify forward without bypassing the adapter."""
+        out = self._adapter(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        hidden = getattr(out, "hidden_states", None)
+        if isinstance(hidden, (list, tuple)):
+            hidden = hidden[-1] if hidden else None
+        if hidden is None:
+            raise RuntimeError(
+                "VLM adapter speculative verify did not return hidden states"
+            )
+        logits = getattr(out, "logits", None)
+        if logits is None:
+            raise RuntimeError(
+                "VLM adapter speculative verify did not return target logits"
+            )
+        # Qwen's drafter consumes the captured pre-final-norm hidden while
+        # target logits are projected from the model's final-normalized
+        # output. Keep both products from the same adapter forward: applying
+        # the inner LM projection directly to ``hidden`` would omit that norm
+        # and change the target samples.
+        self._adapter_verify_hidden = hidden
+        self._adapter_verify_logits = logits
+        return (
+            hidden,
+            getattr(out, "shared_kv_states", None) or {},
+            getattr(out, "gdn_states", None),
+        )
+
+    def _speculative_logits_from_adapter_verify(self, hidden: mx.array) -> mx.array:
+        """Return the exact logits paired with the latest adapter verify."""
+        if (
+            hidden is not self._adapter_verify_hidden
+            or self._adapter_verify_logits is None
+        ):
+            raise RuntimeError(
+                "Positioned VLM MTP logits requested without a matching "
+                "adapter verify forward"
+            )
+        return self._adapter_verify_logits
 
 
 class _MTPResetBindingProxy:
@@ -303,12 +381,11 @@ def vlm_mtp_positioned_sampling_available(target_language_model: Any) -> bool:
     when the object mlx-vlm resolves as ``lm`` exposes
     ``speculative_logits_from_hidden``. That object is not the inner
     language model: ``run_vlm_mtp_decode`` wraps adapters in
-    ``_VLMAdapterMTPProxy``, which for mRoPE adapters (Qwen VLMs)
-    intentionally hides the inner model's ``speculative_*`` fast paths so
-    verify keeps mRoPE position handling. Checking the inner model
-    directly would report the hook as available while the round loop
-    falls back to plain vectorized sampling — silently dropping the
-    processors (#2399).
+    ``_VLMAdapterMTPProxy``. For mRoPE adapters (Qwen VLMs), the proxy keeps
+    the verify forward on the adapter so position ids remain correct while
+    exposing the inner model's position-independent logits projection. This
+    lets the positioned sampler enforce thinking controls without disabling
+    VLM MTP (#2399).
 
     This helper mirrors the proxy's visibility rules exactly; the
     equivalence is pinned by tests against the real proxy resolution.
@@ -322,13 +399,14 @@ def vlm_mtp_positioned_sampling_available(target_language_model: Any) -> bool:
         return hasattr(lm, "speculative_logits_from_hidden")
     # Adapter case: rounds receive _VLMAdapterMTPProxy, which hides
     # ``language_model`` outside drafter reset, so mlx-vlm uses the proxy
-    # itself as ``lm``. Attribute lookup tries the adapter first, then
-    # falls through to the inner model — unless the adapter uses mRoPE,
-    # in which case ``speculative_*`` names are blocked at the proxy.
+    # itself as ``lm``. Attribute lookup tries the adapter first, then the
+    # inner model. For mRoPE the proxy pairs the inner logits hook with a
+    # safe adapter-forward verify hook rather than exposing the inner
+    # model's position-sensitive verify fast paths.
     if hasattr(target_language_model, "speculative_logits_from_hidden"):
         return True
     if bool(getattr(target_language_model, "_uses_mrope", False)):
-        return False
+        return callable(getattr(adapter_lm, "speculative_logits_from_hidden", None))
     return hasattr(adapter_lm, "speculative_logits_from_hidden")
 
 

@@ -135,13 +135,104 @@ class TestVLMAdapterMTPProxy:
         proxy.rollback_speculative_cache([], [], 0, 4)
         assert adapter._language_model.rollback_called
 
-    def test_mrope_proxy_hides_fast_path_attrs_but_keeps_rollback(self):
+    def test_mrope_proxy_exposes_safe_positioned_hooks_and_keeps_rollback(self):
         adapter = FakeVLMAdapter(expose_rollback=False, uses_mrope=True)
         proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
 
         assert hasattr(proxy, "rollback_speculative_cache")
         assert not hasattr(proxy, "model")
-        assert not hasattr(proxy, "speculative_logits_from_hidden")
+        assert hasattr(proxy, "speculative_logits_from_hidden")
+        assert hasattr(proxy, "speculative_verify_hidden")
+        assert not hasattr(proxy, "speculative_argmax_from_hidden")
+
+        hidden, shared_kv, gdn_states = proxy.speculative_verify_hidden(
+            mx.array([[1, 2]]), []
+        )
+        assert adapter.forward_called
+        assert hidden.shape == (1, 1, 8)
+        assert shared_kv == {}
+        assert gdn_states == []
+
+    def test_mrope_positioned_projection_reuses_exact_adapter_logits(self):
+        adapter = FakeVLMAdapter(expose_rollback=False, uses_mrope=True)
+        expected_logits = mx.array([[[0.0, 1.0, 9.0, 2.0]]])
+        expected_hidden = mx.array([[[3.0, 4.0, 5.0, 6.0]]])
+
+        def adapter_forward(*args, **kwargs):
+            adapter.forward_called = True
+            from mlx_vlm.models.base import LanguageModelOutput
+
+            return LanguageModelOutput(
+                logits=expected_logits,
+                hidden_states=[expected_hidden],
+                gdn_states=[],
+                shared_kv_states={},
+            )
+
+        adapter.__call__ = adapter_forward
+
+        class CallableAdapter:
+            def __call__(self, *args, **kwargs):
+                return adapter_forward(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(adapter, name)
+
+        callable_adapter = CallableAdapter()
+        proxy = _VLMAdapterMTPProxy(
+            callable_adapter,
+            callable_adapter._language_model,
+        )
+        hidden, _, _ = proxy.speculative_verify_hidden(mx.array([[1]]), [])
+
+        # The fake inner projection returns ``hidden``. Reusing the forward's
+        # deliberately different logits proves the bridge does not project
+        # Qwen's pre-final-norm drafter hidden directly.
+        actual_logits = proxy.speculative_logits_from_hidden(hidden)
+        assert actual_logits is expected_logits
+        assert int(mx.argmax(actual_logits, axis=-1).item()) == 2
+
+    def test_mrope_adapter_only_logits_hook_gets_safe_verify_bridge(self):
+        class InnerWithoutProjection:
+            def rollback_speculative_cache(self, *args, **kwargs):
+                return None
+
+        class AdapterWithProjection:
+            _uses_mrope = True
+
+            def __init__(self):
+                self._language_model = InnerWithoutProjection()
+                self.forward_kwargs = None
+
+            def speculative_logits_from_hidden(self, hidden):
+                return hidden
+
+            def __call__(self, inputs, **kwargs):
+                self.forward_kwargs = kwargs
+                from mlx_vlm.models.base import LanguageModelOutput
+
+                return LanguageModelOutput(
+                    logits=mx.zeros((1, 2, 4)),
+                    hidden_states=[mx.zeros((1, 2, 8))],
+                    gdn_states=["state"],
+                    shared_kv_states={"full": "kv"},
+                )
+
+        adapter = AdapterWithProjection()
+        proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
+
+        hidden, shared_kv, gdn_states = proxy.speculative_verify_hidden(
+            mx.array([[1, 2]]), ["cache"]
+        )
+
+        assert hidden.shape == (1, 2, 8)
+        assert shared_kv == {"full": "kv"}
+        assert gdn_states == ["state"]
+        assert adapter.forward_kwargs == {
+            "cache": ["cache"],
+            "return_hidden": True,
+            "return_shared_kv": True,
+        }
 
     def test_mtp_rounds_sees_no_language_model(self):
         """Simulates the hasattr check in _mtp_rounds / _mtp_rounds_batch."""

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for ThinkingBudgetProcessor logits processor."""
 
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -49,12 +50,19 @@ class TestThinkingBudgetProcessor:
 
     NEWLINE_ID = 99  # Dummy \n token ID
 
-    def _make_processor(self, budget: int = 5, end_ids=None, trailing_ids=None):
+    def _make_processor(
+        self,
+        budget: int | None = 5,
+        end_ids=None,
+        trailing_ids=None,
+        force_event: threading.Event | None = None,
+    ):
         return ThinkingBudgetProcessor(
             think_end_token_ids=end_ids or [self.THINK_END_ID],
             budget=budget,
             think_start_token_id=self.THINK_START_ID,
             trailing_token_ids=trailing_ids,
+            force_event=force_event,
         )
 
     # --- Budget enforcement ---
@@ -236,6 +244,142 @@ class TestThinkingBudgetProcessor:
         assert not proc._forcing
         assert not proc._done
         assert proc._in_thinking
+
+    # --- Interactive force-output ---
+
+    def test_unlimited_budget_never_forces_automatically(self):
+        """None disables automatic enforcement while retaining token tracking."""
+        proc = self._make_processor(budget=None)
+
+        for i in range(50):
+            proc(_make_tokens(*range(100, 100 + i + 1)), _make_logits())
+
+        assert proc._thinking_tokens == 50
+        assert not proc._forcing
+        assert not proc._done
+        assert proc._in_thinking
+
+    def test_manual_force_with_unlimited_budget(self):
+        """Interactive forcing works without a configured static budget."""
+        proc = self._make_processor(budget=None)
+        proc(_make_tokens(10), _make_logits())
+
+        assert proc.request_force() is True
+        assert proc.request_force() is False
+        assert proc.force_requested
+
+        logits = proc(_make_tokens(10), _make_logits())
+        assert proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+
+    def test_external_force_event_can_be_set_before_first_call(self):
+        """A request can be signalled before its processor begins decoding."""
+        force_event = threading.Event()
+        proc = self._make_processor(budget=None, force_event=force_event)
+
+        force_event.set()
+        logits = proc(_make_tokens(10), _make_logits())
+
+        assert proc.force_requested
+        assert proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+
+    def test_manual_force_waits_for_utf8_completion(self):
+        """Interactive forcing uses the same UTF-8-safe close path as budgets."""
+        pieces = {
+            20: b"\xe2",
+            21: b"\x82",
+            22: b"\xac",
+        }
+        proc = ThinkingBudgetProcessor(
+            think_end_token_ids=[self.THINK_END_ID],
+            budget=None,
+            think_start_token_id=self.THINK_START_ID,
+            token_to_piece=lambda token_id: pieces.get(token_id, "x"),
+        )
+
+        proc(_make_tokens(10), _make_logits())
+        proc(_make_tokens(10, 20), _make_logits())
+        assert not proc._last_token_utf8_complete
+
+        proc.request_force()
+        logits = proc(_make_tokens(10, 20), _make_logits())
+        assert proc._waiting_utf8
+        assert not proc._forcing
+        assert mx.array_equal(logits, _make_logits())
+
+        logits = proc(_make_tokens(10, 20, 21), _make_logits())
+        assert proc._waiting_utf8
+        assert not proc._forcing
+        assert mx.array_equal(logits, _make_logits())
+
+        logits = proc(_make_tokens(10, 20, 21, 22), _make_logits())
+        assert proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+
+    def test_repeated_manual_force_does_not_restart_sequence(self):
+        """Repeated requests do not rewind a close sequence already in flight."""
+        proc = self._make_processor(
+            budget=None,
+            trailing_ids=[self.NEWLINE_ID],
+        )
+        proc(_make_tokens(10), _make_logits())
+        assert proc.request_force() is True
+
+        logits0 = proc(_make_tokens(10), _make_logits())
+        assert logits0[0, self.THINK_END_ID].item() == 0.0
+        assert proc.request_force() is False
+
+        logits1 = proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._force_idx == 1
+        assert logits1[0, self.NEWLINE_ID].item() == 0.0
+
+    def test_manual_force_after_natural_end_is_noop(self):
+        """A late request cannot reopen a thinking block that already ended."""
+        proc = self._make_processor(budget=None)
+        proc(_make_tokens(10), _make_logits())
+        proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._done
+
+        assert proc.request_force() is True
+        original = _make_logits()
+        result = proc(_make_tokens(10, self.THINK_END_ID, 50), original)
+
+        assert proc._done
+        assert not proc._forcing
+        assert mx.array_equal(result, original)
+
+    def test_manual_force_survives_speculative_snapshot_restore(self):
+        """A rejected speculative branch cannot consume the force request."""
+        proc = self._make_processor(budget=None)
+        proc(_make_tokens(10), _make_logits())
+        before_request = proc.snapshot_state()
+
+        proc.request_force()
+        forced = proc(_make_tokens(10), _make_logits())
+        assert forced[0, self.THINK_END_ID].item() == 0.0
+        proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._done
+
+        proc.restore_state(before_request)
+
+        assert proc.force_requested
+        assert not proc._done
+        forced_again = proc(_make_tokens(10), _make_logits())
+        assert forced_again[0, self.THINK_END_ID].item() == 0.0
+        assert proc._forcing
+
+    def test_force_signal_is_not_part_of_snapshot_state(self):
+        """Restoring decode state must not overwrite the external request latch."""
+        force_event = threading.Event()
+        proc = self._make_processor(budget=None, force_event=force_event)
+        snapshot = proc.snapshot_state()
+
+        assert "_force_event" not in snapshot
+        force_event.set()
+        proc.restore_state(snapshot)
+
+        assert proc.force_requested
 
 
 # ---------------------------------------------------------------------------

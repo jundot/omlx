@@ -6540,6 +6540,36 @@ def _build_active_models_data() -> dict:
                     "elapsed_seconds": elapsed,
                     "generated_tokens": generated_tokens,
                     "tokens_per_second": tokens_per_second,
+                    "generation_tokens_per_second_recent": getattr(
+                        req, "generation_tps_recent", None
+                    )
+                    if req
+                    else None,
+                    "speculative_decoding_efficiency": getattr(
+                        req, "speculative_efficiency", None
+                    )
+                    if req
+                    else None,
+                    "speculative_decoding_efficiency_recent": getattr(
+                        req, "speculative_efficiency_recent", None
+                    )
+                    if req
+                    else None,
+                    "speculative_accepted_tokens": getattr(
+                        req, "speculative_accepted_tokens", None
+                    )
+                    if req and getattr(req, "speculative_active", False)
+                    else None,
+                    "speculative_proposed_tokens": getattr(
+                        req, "speculative_proposed_tokens", None
+                    )
+                    if req and getattr(req, "speculative_active", False)
+                    else None,
+                    "speculative_efficiency_kind": getattr(
+                        req, "speculative_efficiency_kind", None
+                    )
+                    if req
+                    else None,
                     "last_activity_age_seconds": last_activity_age,
                     "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
@@ -6579,6 +6609,60 @@ def _build_active_models_data() -> dict:
                             "max_tokens": None,
                         }
                     )
+
+        # Scheduler-less engines (notably DFlash primary mode) expose live
+        # generation through ActivityTrackingMixin. Normalize those records
+        # into the same shape so chat can claim stats by the public SSE id.
+        for activity in activities:
+            if (
+                activity.get("kind") != "generate"
+                or activity.get("detail") != "generating"
+            ):
+                continue
+            public_request_id = activity.get("public_request_id")
+            if not public_request_id:
+                continue
+            generated_tokens = int(
+                activity.get("generated_tokens", activity.get("token_count", 0))
+                or 0
+            )
+            elapsed = activity.get("elapsed_seconds")
+            tokens_per_second = (
+                generated_tokens / elapsed
+                if elapsed is not None and elapsed > 0
+                else 0.0
+            )
+            generating.append(
+                {
+                    "request_id": public_request_id,
+                    "elapsed_seconds": elapsed,
+                    "generated_tokens": generated_tokens,
+                    "tokens_per_second": tokens_per_second,
+                    "generation_tokens_per_second_recent": activity.get(
+                        "generation_tokens_per_second_recent"
+                    ),
+                    "speculative_decoding_efficiency": activity.get(
+                        "speculative_decoding_efficiency"
+                    ),
+                    "speculative_decoding_efficiency_recent": activity.get(
+                        "speculative_decoding_efficiency_recent"
+                    ),
+                    "speculative_accepted_tokens": activity.get(
+                        "speculative_accepted_tokens"
+                    ),
+                    "speculative_proposed_tokens": activity.get(
+                        "speculative_proposed_tokens"
+                    ),
+                    "speculative_efficiency_kind": activity.get(
+                        "speculative_efficiency_kind"
+                    ),
+                    "last_activity_age_seconds": activity.get(
+                        "last_activity_age_seconds"
+                    ),
+                    "prompt_tokens": int(activity.get("prompt_tokens", 0) or 0),
+                    "max_tokens": activity.get("max_tokens"),
+                }
+            )
 
         loading_started_at = model_info.get("loading_started_at")
         loading_elapsed_seconds = (

@@ -1359,11 +1359,15 @@ class TestDFlashOutputParserWiring:
         ]
 
         create_with_tools.assert_called_once_with(engine._executor_tokenizer, tools)
-        assert len(outputs) == 1
-        assert outputs[0].finished
-        assert outputs[0].tool_calls == tool_calls
-        assert outputs[0].finish_reason == "tool_calls"
-        assert outputs[0].completion_tokens == 1
+        # Protocol markers may render no text but their raw token IDs must
+        # still be streamed so durable checkpoints remain lossless.
+        assert len(outputs) == 2
+        assert outputs[0].tokens == [7]
+        assert outputs[0].new_text == ""
+        assert outputs[-1].finished
+        assert outputs[-1].tool_calls == tool_calls
+        assert outputs[-1].finish_reason == "tool_calls"
+        assert outputs[-1].completion_tokens == 1
 
 
 class TestDFlashCachedTokens:
@@ -1403,6 +1407,151 @@ class TestDFlashCachedTokens:
         assert (
             DFlashEngine._cached_tokens_from_flow(SimpleNamespace(hit_tokens=-5)) == 0
         )
+
+
+class TestDFlashForceOutput:
+    @pytest.mark.asyncio
+    async def test_only_exact_active_public_request_is_unsupported(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        activity_id = engine._begin_activity(
+            "generate",
+            metadata={"public_request_id": "chatcmpl-exact"},
+        )
+        try:
+            assert (
+                await engine.request_force_output("chatcmpl-exact")
+                == "unsupported"
+            )
+            assert await engine.request_force_output("chatcmpl-other") == "not_found"
+        finally:
+            engine._end_activity(activity_id)
+
+
+class TestDFlashPrimaryPause:
+    @staticmethod
+    def _engine():
+        from omlx.engine.dflash import DFlashEngine
+
+        pieces = {
+            10: "old",
+            11: " thought",
+            12: " more",
+            13: "answer",
+            90: "</think>",
+        }
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._tokenizer_obj = SimpleNamespace(
+            think_end_id=90,
+            think_end="</think>",
+            encode=lambda text, **kwargs: [90] if text == "</think>" else [1],
+            decode=lambda tokens, **kwargs: "".join(
+                pieces.get(int(token), "") for token in tokens
+            ),
+        )
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_snapshot_is_cumulative_and_closes_at_atomic_boundary(self):
+        engine = self._engine()
+        stop_event = threading.Event()
+        state = engine._register_primary_request(
+            "chatcmpl-exact",
+            stop_event,
+            continuation_token_ids=[10, 11],
+            starts_in_thinking=True,
+        )
+        assert engine._record_primary_token(state, 12, " more", stop_event)
+        assert engine._record_primary_token(state, 90, "</think>", stop_event)
+        assert engine._record_primary_token(state, 13, "answer", stop_event)
+
+        pause_task = asyncio.create_task(engine.pause_request("chatcmpl-exact"))
+        await asyncio.sleep(0)
+
+        assert stop_event.is_set()
+        assert not pause_task.done()
+        assert not engine._record_primary_token(state, 14, "late", stop_event)
+
+        engine._finish_primary_request(state)
+        snapshot = await pause_task
+        assert snapshot == {
+            "status": "accepted",
+            "request_id": "chatcmpl-exact",
+            "output_token_ids": [10, 11, 12, 90, 13],
+            "output_text": "old thought more</think>answer",
+            "completion_tokens": 5,
+            "continuation_in_thinking": False,
+            "reasoning_end_token_index": 3,
+        }
+
+    @pytest.mark.asyncio
+    async def test_mid_thought_snapshot_and_exact_request_matching(self):
+        engine = self._engine()
+        stop_event = threading.Event()
+        state = engine._register_primary_request(
+            "chatcmpl-thinking",
+            stop_event,
+            continuation_token_ids=[20, 21],
+            starts_in_thinking=True,
+        )
+
+        assert await engine.pause_request("some-other-request") == {
+            "status": "not_found",
+            "request_id": "some-other-request",
+        }
+        pause_task = asyncio.create_task(engine.pause_request("chatcmpl-thinking"))
+        await asyncio.sleep(0)
+        engine._finish_primary_request(state)
+        snapshot = await pause_task
+        assert snapshot["continuation_in_thinking"] is True
+        assert snapshot["reasoning_end_token_index"] is None
+
+    @pytest.mark.asyncio
+    async def test_empty_prefill_prefix_is_snapshotted_and_stopped(self):
+        engine = self._engine()
+        stop_event = threading.Event()
+        state = engine._register_primary_request(
+            "chatcmpl-prefill",
+            stop_event,
+            continuation_token_ids=None,
+            starts_in_thinking=True,
+        )
+
+        pause_task = asyncio.create_task(engine.pause_request("chatcmpl-prefill"))
+        await asyncio.sleep(0)
+        assert stop_event.is_set()
+        assert not pause_task.done()
+        engine._finish_primary_request(state)
+
+        assert await pause_task == {
+            "status": "accepted",
+            "request_id": "chatcmpl-prefill",
+            "output_token_ids": [],
+            "output_text": "",
+            "completion_tokens": 0,
+            "continuation_in_thinking": True,
+            "reasoning_end_token_index": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_fallback_pause_delegation_is_preserved(self):
+        engine = self._engine()
+        expected = {"status": "accepted", "request_id": "fallback"}
+        engine._in_fallback_mode = True
+        engine._fallback_engine = SimpleNamespace(
+            pause_request=AsyncMock(return_value=expected)
+        )
+
+        assert await engine.pause_request("fallback") == expected
+        engine._fallback_engine.pause_request.assert_awaited_once_with("fallback")
 
 
 class TestDFlashCachedTokensWiring:

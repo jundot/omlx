@@ -230,6 +230,12 @@ class _VLMMTPDecodeState:
     stop_token_ids: set[int] = field(default_factory=set)
     emitted: int = 0
     finished: bool = False
+    accept_rounds_start: int = 0
+    accept_rounds_seen: int = 0
+    accept_rounds_source_id: int | None = None
+    draft_rounds_start: int = 0
+    draft_rounds_seen: int = 0
+    draft_rounds_source_id: int | None = None
 
 
 @dataclass
@@ -248,6 +254,9 @@ class _VLMMTPResponse:
     logprobs: Any = None
     prompt_cache: Any = None
     error: str | None = None
+    speculative_active: bool = True
+    speculative_accepted_delta: int = 0
+    speculative_proposed_delta: int = 0
 
 
 @dataclass
@@ -428,7 +437,7 @@ class _PrefillAbortedError(Exception):
         self.aborted_uids = aborted_uids
         self.processed_tokens = processed_tokens
         super().__init__(
-            f"Prefill aborted for UIDs {aborted_uids} " f"at {processed_tokens} tokens"
+            f"Prefill aborted for UIDs {aborted_uids} at {processed_tokens} tokens"
         )
 
 
@@ -1152,7 +1161,7 @@ try:
         # Surface which ones so a regression in Llama-4 batching is visible
         # to operators without diffing the patch against installed mlx_lm.
         logger.info(
-            "ChunkedKVCache patch: methods already present upstream, " "skipped: %s",
+            "ChunkedKVCache patch: methods already present upstream, skipped: %s",
             ", ".join(_ckvcache_methods_skipped),
         )
 except ImportError:
@@ -1494,12 +1503,8 @@ _DECODE_FAIR_SHARE = float(os.environ.get("OMLX_DECODE_FAIR_SHARE", "0.5"))
 # is a machine constant. The cap in tokens is derived per engine from the
 # measured prefill throughput; the fixed token value below is only the
 # cold-start fallback before the first chunk has been timed.
-_DECODE_STALL_TARGET_MS = float(
-    os.environ.get("OMLX_DECODE_STALL_TARGET_MS", "500")
-)
-_CONTENDED_PREFILL_CHUNK = int(
-    os.environ.get("OMLX_CONTENDED_PREFILL_CHUNK", "512")
-)
+_DECODE_STALL_TARGET_MS = float(os.environ.get("OMLX_DECODE_STALL_TARGET_MS", "500"))
+_CONTENDED_PREFILL_CHUNK = int(os.environ.get("OMLX_CONTENDED_PREFILL_CHUNK", "512"))
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
 # Contended chunks stay on the 64-token grid: the DSv4 native indexer only
 # engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
@@ -2223,9 +2228,9 @@ class Scheduler:
 
         # Streaming detokenizers for proper UTF-8 handling (one per active request)
         # NOTE: No pooling - each request gets a fresh instance to prevent state contamination
-        self._request_detokenizers: dict[str, Any] = (
-            {}
-        )  # request_id → active detokenizer
+        self._request_detokenizers: dict[
+            str, Any
+        ] = {}  # request_id → active detokenizer
 
         # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
         self._output_parser_factory: OutputParserFactory | None = None
@@ -3022,6 +3027,15 @@ class Scheduler:
                 # Fallback: return None, we'll use decode([token])
                 return None
             detok.reset()
+            # A durable continuation is already part of the model prompt, but
+            # the streaming detokenizer has not seen it. Replay the accepted
+            # prefix solely to restore byte/subword buffering; historical
+            # segments are deliberately discarded so the resumed stream emits
+            # only newly generated text.
+            request = self.requests.get(request_id)
+            if request is not None:
+                for token_id in getattr(request, "continuation_token_ids", ()):
+                    detok.add_token(int(token_id))
             self._request_detokenizers[request_id] = detok
         return self._request_detokenizers[request_id]
 
@@ -3053,10 +3067,22 @@ class Scheduler:
                 parser_session = self._output_parser_factory.create_session(
                     self.tokenizer
                 )
-            if request is not None and getattr(request, "needs_think_prefix", False):
+            if request is not None and (
+                getattr(request, "needs_think_prefix", False)
+                or getattr(request, "continuation_in_thinking", False)
+            ):
                 notify = getattr(parser_session, "notify_prefilled_thought", None)
                 if callable(notify):
                     notify()
+            if request is not None:
+                # Protocol parsers own substantially more state than the
+                # public in/out-of-thinking bit: channel headers, recipients,
+                # tool envelopes, and their own streaming detokenizers. Replay
+                # the exact accepted prefix to reconstruct that state after an
+                # unload/reload. Parser results are intentionally ignored so no
+                # historical text is emitted a second time.
+                for token_id in getattr(request, "continuation_token_ids", ()):
+                    parser_session.process_token(int(token_id))
             self._output_parser_sessions[request_id] = parser_session
         return self._output_parser_sessions[request_id]
 
@@ -3576,6 +3602,22 @@ class Scheduler:
         extra_kwargs: dict[str, Any] | None = None
         if vlm_embeds is not None:
             embeds_array, extra_kwargs, start_offset = vlm_embeds
+            # A durable continuation can extend beyond the image prompt's
+            # precomputed embeddings inside this call. Seed its mRoPE delta
+            # before the suffix switches to ordinary token-ID forwards; the
+            # normal post-prefill capture is too late for those calls.
+            captured_rope_delta = (extra_kwargs or {}).get(
+                "_captured_rope_deltas"
+            )
+            if captured_rope_delta is not None:
+                if isinstance(captured_rope_delta, mx.array):
+                    request.rope_deltas = float(
+                        captured_rope_delta.reshape(-1)[0].item()
+                    )
+                elif hasattr(captured_rope_delta, "item"):
+                    request.rope_deltas = float(captured_rope_delta.item())
+                else:
+                    request.rope_deltas = float(captured_rope_delta)
             # Build the restored-prefix views on the engine stream. A
             # worker-default-stream slice here sits at the head of the chunk
             # graph, so MLX bridges it with a cross-stream fence whose
@@ -3637,6 +3679,19 @@ class Scheduler:
                 processed_tokens, remaining
             )
             n_to_process = min(prefill_step_size, remaining)
+
+            # A durable VLM continuation extends the token row beyond the
+            # full-sequence embeddings produced for the original image/chat
+            # prompt. Never submit a mixed chunk: finish the embedding-backed
+            # prefix first, then prefill the saved continuation as ordinary
+            # token IDs against the same KV cache.
+            if embeds_array is not None:
+                embedded_remaining = int(embeds_array.shape[1])
+                if embedded_remaining > 0:
+                    n_to_process = min(n_to_process, embedded_remaining)
+                else:
+                    embeds_array = None
+                    extra_kwargs = None
 
             if processed_tokens == 0:
                 Scheduler._clear_cache(self)
@@ -3741,6 +3796,9 @@ class Scheduler:
                     embeds_array = embeds_array[:, n_to_process:]
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
+                    if embeds_array.shape[1] == 0:
+                        embeds_array = None
+                        extra_kwargs = None
             _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
             _throttle_post = get_phys_footprint()
             if Scheduler._qwen4_prefill_accounting_enabled(self):
@@ -3851,9 +3909,7 @@ class Scheduler:
                     # band by design — the per-chunk notice is DEBUG there,
                     # not a warning about an unexpected state.
                     _log = (
-                        logger.debug
-                        if self._prefill_speed_priority
-                        else logger.warning
+                        logger.debug if self._prefill_speed_priority else logger.warning
                     )
                     _log(
                         f"Prefill above max_bytes at "
@@ -3894,9 +3950,7 @@ class Scheduler:
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
             if getattr(request, "benchmark_trace", False):
-                _trace_total_ms = (
-                    time.perf_counter() - _trace_chunk_start
-                ) * 1000.0
+                _trace_total_ms = (time.perf_counter() - _trace_chunk_start) * 1000.0
                 _ane_sequence = int(
                     getattr(request, "benchmark_ane_sequence_length", 0) or 0
                 )
@@ -4246,9 +4300,13 @@ class Scheduler:
         else:
             min_chunk = max(1, self._prefill_min_chunk_tokens)
         current = self._current_usage_bytes()
-        if current + self._admission_transient_bound(
-            n_tokens, kv_len, gathered_core=gathered_core
-        ) <= cap:
+        if (
+            current
+            + self._admission_transient_bound(
+                n_tokens, kv_len, gathered_core=gathered_core
+            )
+            <= cap
+        ):
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
@@ -4488,9 +4546,12 @@ class Scheduler:
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
         # measurement so it tracks growth with kv_len instead of lagging behind
         # a long-run average.
-        per_token = self._predicted_chunk_transient(
-            requested, kv_len, gathered_core=gathered_core
-        ) / requested
+        per_token = (
+            self._predicted_chunk_transient(
+                requested, kv_len, gathered_core=gathered_core
+            )
+            / requested
+        )
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
@@ -5023,8 +5084,7 @@ class Scheduler:
             kv_len,
             delta / 1024**2,
             (delta / max(n_tokens, 1)) / 1024,
-            self._prefill_transient_tracker.bytes_per_token_for(gathered_core)
-            / 1024,
+            self._prefill_transient_tracker.bytes_per_token_for(gathered_core) / 1024,
             self._prefill_transient_tracker.observed_max_bytes_for(gathered_core)
             / 1024**2,
             self._prefill_transient_tracker.samples_for(gathered_core),
@@ -5580,11 +5640,7 @@ class Scheduler:
             state.request.request_id,
             state.tokens_processed,
             state.total_length - 1,
-            (
-                self.config.model_name
-                if self.config.model_name
-                else ""
-            ),
+            (self.config.model_name if self.config.model_name else ""),
         )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
@@ -5637,9 +5693,7 @@ class Scheduler:
                 # Speed priority runs full chunks through this caution band
                 # by design — the per-chunk notice is DEBUG there, not a
                 # warning about an unexpected state.
-                _log = (
-                    logger.debug if self._prefill_speed_priority else logger.warning
-                )
+                _log = logger.debug if self._prefill_speed_priority else logger.warning
                 _log(
                     f"Chunked prefill above max_bytes at "
                     f"{state.tokens_processed} tokens: "
@@ -5872,7 +5926,7 @@ class Scheduler:
                 still_prefilling.append(request)
                 still_prefilling.extend(pending_prefills[index + 1 :])
                 logger.info(
-                    "Paused chunked prefill request %s for LRU eviction " "(reason=%s)",
+                    "Paused chunked prefill request %s for LRU eviction (reason=%s)",
                     rid,
                     e.request.reason,
                 )
@@ -6054,7 +6108,7 @@ class Scheduler:
                 suppressed_stream_text
             ):
                 terminal_output.output_text = terminal_output.output_text[
-                    :-len(suppressed_stream_text)
+                    : -len(suppressed_stream_text)
                 ]
             else:
                 matched_prefix_tokens = matched_sequence[:-1]
@@ -6067,7 +6121,7 @@ class Scheduler:
                     and request.request_id not in self._output_parser_sessions
                 ):
                     terminal_output.output_text = self.tokenizer.decode(
-                        output_token_ids[:-len(matched_prefix_tokens)]
+                        output_token_ids[: -len(matched_prefix_tokens)]
                     )
             request.output_text = terminal_output.output_text
 
@@ -6194,14 +6248,12 @@ class Scheduler:
         if suppress_processor is not None:
             logits_processors.append(suppress_processor)
 
-        # Add thinking budget processor for reasoning models
-        if (
-            sampling_params.thinking_budget is not None
-            and request is not None
-            and (
-                getattr(request, "needs_think_prefix", False)
-                or self._get_output_parser_thinking_end_text() is not None
-            )
+        # Add thinking budget/interactive-force processor for reasoning models.
+        parser_thinking_end = self._get_output_parser_thinking_end_text()
+        if request is not None and (
+            getattr(request, "needs_think_prefix", False)
+            or getattr(request, "continuation_in_thinking", False)
+            or (isinstance(parser_thinking_end, str) and parser_thinking_end)
         ):
             request_think_end_id = getattr(request, "think_end_token_id", None)
             if request_think_end_id is not None:
@@ -6213,7 +6265,7 @@ class Scheduler:
 
                 think_start_id = self._get_think_token_id("think_start_id")
                 leading_ids, trailing_ids = self._resolve_think_close_pattern(
-                    self._get_output_parser_thinking_end_text()
+                    parser_thinking_end
                 )
                 parser_trailing_ids = (
                     self._resolve_output_parser_thinking_trailing_ids()
@@ -6227,6 +6279,7 @@ class Scheduler:
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
                     token_to_piece=self._thinking_budget_token_to_piece,
+                    force_event=request.force_output_event,
                 )
                 logits_processors.append(processor)
 
@@ -6648,9 +6701,7 @@ class Scheduler:
             "_expected_layer_cache_types",
             None,
         )
-        supported = getattr(
-            self.block_aware_cache, "_gdn_split_layout_supported", None
-        )
+        supported = getattr(self.block_aware_cache, "_gdn_split_layout_supported", None)
         return bool(callable(supported) and supported(layer_types))
 
     def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
@@ -6909,6 +6960,7 @@ class Scheduler:
         pre-extracted marker alongside raw decode-path snapshots (those
         are already decoupled copies from ``extract_cache``).
         """
+
         def _copy_containers(value: Any) -> Any:
             # ArraysCache.state returns its live slot LIST (not a copy);
             # the model rebinds slots in place, so container structure
@@ -7417,9 +7469,7 @@ class Scheduler:
                 isinstance(state, list)
                 and isinstance(full_state, list)
                 and len(state) == len(full_state)
-                and any(
-                    isinstance(s, (list, tuple)) and len(s) == 0 for s in state
-                )
+                and any(isinstance(s, (list, tuple)) and len(s) == 0 for s in state)
             ):
                 refilled = dict(bc)
                 refilled["state"] = [
@@ -7456,9 +7506,7 @@ class Scheduler:
         state = layer_state.get("state")
         if not isinstance(state, list):
             return False
-        return any(
-            isinstance(sub, (list, tuple)) and len(sub) == 0 for sub in state
-        )
+        return any(isinstance(sub, (list, tuple)) and len(sub) == 0 for sub in state)
 
     @staticmethod
     def _refill_blanked_cachelist_members(
@@ -7492,11 +7540,7 @@ class Scheduler:
                 return None
             refilled = dict(boundary_layer)
             refilled["state"] = [
-                (
-                    live_sub
-                    if isinstance(sub, (list, tuple)) and len(sub) == 0
-                    else sub
-                )
+                (live_sub if isinstance(sub, (list, tuple)) and len(sub) == 0 else sub)
                 for sub, live_sub in zip(state, live_state)
             ]
             if Scheduler._has_blanked_cachelist_members(refilled):
@@ -7822,9 +7866,9 @@ class Scheduler:
                 expected_cache = make_prompt_cache(self.model)
             except Exception:
                 expected_cache = None
-            if isinstance(expected_cache, (list, tuple)) and len(
-                expected_cache
-            ) == len(cache):
+            if isinstance(expected_cache, (list, tuple)) and len(expected_cache) == len(
+                cache
+            ):
                 arrays_names = {"ArraysCache", "SizedArraysCache"}
                 for layer_cache, expected_layer in zip(cache, expected_cache):
                     if (
@@ -8863,6 +8907,12 @@ class Scheduler:
             # Arm MTP boundary alignment now: a prompt shorter than a block meets
             # its first boundary mid-decode, before any capture would arm it.
             self._detect_boundary_snapshot_need()
+
+        # Establish reasoning identity before publishing the Request in
+        # self.requests. The public force-output endpoint may arrive while the
+        # request is still waiting, before admission constructs its processor.
+        if self._detect_needs_think_prefix(request):
+            request.needs_think_prefix = True
         # Prefix-cache lookup is intentionally delayed until admission. That
         # lets a same-prefix request wait for a relevant in-flight store_cache
         # without blocking the scheduler lane that continues decode/prefill.
@@ -8929,7 +8979,9 @@ class Scheduler:
                             draft_cache_list,
                             model_name=name,
                         )
-                        draft_layer_cache_types = draft_model_cache_config.get_type_names()
+                        draft_layer_cache_types = (
+                            draft_model_cache_config.get_type_names()
+                        )
                     except Exception as e:
                         logger.debug(
                             "Could not infer SpecPrefill draft cache layout: %s", e
@@ -9077,9 +9129,7 @@ class Scheduler:
                 "logits processors without vlm_mtp support (%s); falling "
                 "back to BatchGenerator",
                 request.request_id,
-                ", ".join(
-                    type(proc).__name__ for proc in unsupported_processors
-                ),
+                ", ".join(type(proc).__name__ for proc in unsupported_processors),
             )
             return None
 
@@ -9136,16 +9186,14 @@ class Scheduler:
             # logits in one vectorized call and never consults the
             # positioned ``sample_target`` hook — processors would be
             # silently dropped again (#2399). The check must look at what
-            # the round loop will actually see: for mRoPE adapters (Qwen
-            # VLMs) _VLMAdapterMTPProxy hides the inner model's
-            # speculative_* fast paths, so probing the inner model
-            # directly would pass the gate and then silently skip the
-            # budget. Decline instead.
+            # the round loop will actually see. mRoPE adapters bridge a safe
+            # adapter verify forward to their logits projection; other
+            # adapters without that paired capability still decline here.
             logger.info(
                 "vlm_mtp routing skipped for %s: request carries logits "
                 "processors but positioned verify sampling is unavailable "
                 "on %s (speculative_logits_from_hidden hidden or missing "
-                "on the round-loop view, e.g. mRoPE adapters); falling "
+                "on the round-loop view); falling "
                 "back to BatchGenerator",
                 request.request_id,
                 type(self.model).__name__,
@@ -9257,6 +9305,10 @@ class Scheduler:
 
         uid = self._vlm_mtp_next_uid
         self._vlm_mtp_next_uid -= 1
+        accept_lens_source = getattr(drafter.model, "accept_lens", None)
+        draft_lens_source = getattr(drafter.model, "draft_lens", None)
+        existing_accept_rounds = len(accept_lens_source or ())
+        existing_draft_rounds = len(draft_lens_source or ())
         self._vlm_mtp_active[uid] = _VLMMTPDecodeState(
             generator=generator,
             request=request,
@@ -9265,6 +9317,19 @@ class Scheduler:
             state_machine=state_machine,
             max_tokens=request.sampling_params.max_tokens,
             stop_token_ids=set(eos_ids),
+            # Some mlx-vlm drafters retain acceptance history across reset().
+            # Baseline both the incremental cursor and final request summary
+            # so telemetry never inherits rounds from an earlier request.
+            accept_rounds_start=existing_accept_rounds,
+            accept_rounds_seen=existing_accept_rounds,
+            accept_rounds_source_id=(
+                id(accept_lens_source) if accept_lens_source is not None else None
+            ),
+            draft_rounds_start=existing_draft_rounds,
+            draft_rounds_seen=existing_draft_rounds,
+            draft_rounds_source_id=(
+                id(draft_lens_source) if draft_lens_source is not None else None
+            ),
         )
         logger.info(
             "vlm_mtp decode started: request=%s uid=%d block_size=%s",
@@ -9274,6 +9339,88 @@ class Scheduler:
         )
         return uid
 
+    def _consume_vlm_mtp_telemetry(
+        self, state: "_VLMMTPDecodeState"
+    ) -> tuple[int, int]:
+        """Return acceptance deltas added by mlx-vlm since the prior yield."""
+        lens, draft_lens = self._read_vlm_mtp_round_telemetry(state)
+        if not lens:
+            return 0, 0
+        accept_cursor = state.accept_rounds_seen
+        draft_cursor = state.draft_rounds_seen
+        new_lens = lens[accept_cursor:]
+        state.accept_rounds_seen = len(lens)
+        new_draft_lens = draft_lens[draft_cursor:] if draft_lens is not None else None
+        if draft_lens is not None:
+            state.draft_rounds_seen = len(draft_lens)
+        if not new_lens:
+            return 0, 0
+        if new_draft_lens is not None and len(new_draft_lens) == len(new_lens):
+            proposed = sum(new_draft_lens)
+        else:
+            drafter = self._vlm_mtp_drafter
+            if drafter is None:
+                return 0, 0
+            block_size = self._vlm_mtp_draft_block_size or int(
+                getattr(drafter.model.config, "block_size", 4)
+            )
+            proposed = len(new_lens) * max(1, block_size - 1)
+        return sum(new_lens), proposed
+
+    def _read_vlm_mtp_round_telemetry(
+        self, state: "_VLMMTPDecodeState"
+    ) -> tuple[list[int], list[int] | None]:
+        """Read and synchronize per-request drafter telemetry lists.
+
+        mlx-vlm drafters replace ``accept_lens`` and ``draft_lens`` during
+        their lazy ``reset()``. Identity tracking is required in addition to
+        length tracking: an old one-round list can be replaced by a new
+        one-round list before the scheduler observes either transition.
+        """
+        drafter = self._vlm_mtp_drafter
+        if drafter is None:
+            return [], None
+        accept_lens = getattr(drafter.model, "accept_lens", None)
+        if accept_lens is None:
+            return [], None
+        accept_source_id = id(accept_lens)
+        if state.accept_rounds_source_id is None:
+            state.accept_rounds_source_id = accept_source_id
+        elif accept_source_id != state.accept_rounds_source_id:
+            state.accept_rounds_source_id = accept_source_id
+            state.accept_rounds_start = 0
+            state.accept_rounds_seen = 0
+
+        draft_lens = getattr(drafter.model, "draft_lens", None)
+        if draft_lens is not None:
+            draft_source_id = id(draft_lens)
+            if state.draft_rounds_source_id is None:
+                state.draft_rounds_source_id = draft_source_id
+            elif draft_source_id != state.draft_rounds_source_id:
+                state.draft_rounds_source_id = draft_source_id
+                state.draft_rounds_start = 0
+                state.draft_rounds_seen = 0
+        try:
+            lens = [int(value) for value in accept_lens]
+        except (TypeError, ValueError):
+            return [], None
+        if len(lens) < state.accept_rounds_seen:
+            state.accept_rounds_start = 0
+            state.accept_rounds_seen = 0
+        parsed_draft_lens: list[int] | None = None
+        if draft_lens is not None:
+            try:
+                parsed_draft_lens = [int(value) for value in draft_lens]
+            except (TypeError, ValueError):
+                parsed_draft_lens = None
+            if (
+                parsed_draft_lens is not None
+                and len(parsed_draft_lens) < state.draft_rounds_seen
+            ):
+                state.draft_rounds_start = 0
+                state.draft_rounds_seen = 0
+        return lens, parsed_draft_lens
+
     def _log_vlm_mtp_stats(
         self, state: "_VLMMTPDecodeState", finish_reason: str
     ) -> None:
@@ -9282,31 +9429,34 @@ class Scheduler:
 
         Reads ``Gemma4AssistantDraftModel.accept_lens`` — a list of accepted
         draft counts per round, populated inside mlx-vlm's ``_mtp_rounds``.
-        The drafter mutates this in place and ``reset()`` (called at the
-        start of every new round-loop entry) clears it, so we have to read
-        before the next eligible request lands. The serialized routing in
-        ``_route_to_vlm_mtp`` guarantees one in-flight vlm_mtp generator
-        at a time, so the value we read here belongs to ``state.request``.
+        Drafter implementations differ on whether ``reset()`` clears this
+        list, so the state records the list length at routing time and this
+        summary slices from that per-request baseline. The serialized routing
+        in ``_route_to_vlm_mtp`` guarantees one in-flight vlm_mtp generator
+        at a time.
         """
         drafter = self._vlm_mtp_drafter
         if drafter is None:
             return
-        accept_lens = getattr(drafter.model, "accept_lens", None)
-        if not accept_lens:
-            return
-        try:
-            lens = [int(x) for x in accept_lens]
-        except Exception:
-            return
+        all_lens, all_draft_lens = self._read_vlm_mtp_round_telemetry(state)
+        lens = all_lens[state.accept_rounds_start :]
         rounds = len(lens)
         if rounds == 0:
             return
         total_accepted = sum(lens)
+        request_draft_lens = (
+            all_draft_lens[state.draft_rounds_start :]
+            if all_draft_lens is not None
+            else None
+        )
         block_size = self._vlm_mtp_draft_block_size or int(
             getattr(drafter.model.config, "block_size", 4)
         )
-        max_per_round = max(1, block_size - 1)
-        acceptance_rate = total_accepted / (rounds * max_per_round)
+        if request_draft_lens is not None and len(request_draft_lens) == rounds:
+            total_proposed = sum(request_draft_lens)
+        else:
+            total_proposed = rounds * max(1, block_size - 1)
+        acceptance_rate = total_accepted / total_proposed if total_proposed else 0.0
         avg_tokens_per_round = (total_accepted + rounds) / rounds
         logger.info(
             "vlm_mtp stats: request=%s finish=%s rounds=%d "
@@ -9316,7 +9466,7 @@ class Scheduler:
             finish_reason,
             rounds,
             total_accepted,
-            rounds * max_per_round,
+            total_proposed,
             acceptance_rate * 100,
             avg_tokens_per_round,
             state.emitted,
@@ -9351,12 +9501,15 @@ class Scheduler:
                 # Round loop exited naturally — terminate with prompt cache
                 # so the prefix-cache layer can keep using it.
                 self._log_vlm_mtp_stats(state, "length")
+                accepted, proposed = self._consume_vlm_mtp_telemetry(state)
                 responses.append(
                     _VLMMTPResponse(
                         uid=uid,
                         token=0,
                         finish_reason="length",
                         prompt_cache=state.prompt_cache,
+                        speculative_accepted_delta=accepted,
+                        speculative_proposed_delta=proposed,
                     )
                 )
                 state.finished = True
@@ -9383,6 +9536,7 @@ class Scheduler:
             else:
                 token = int(token_val)
 
+            accepted, proposed = self._consume_vlm_mtp_telemetry(state)
             state.emitted += 1
             finish_reason: str | None = None
             if state.stop_token_ids and token in state.stop_token_ids:
@@ -9401,6 +9555,8 @@ class Scheduler:
                     prompt_cache=(
                         state.prompt_cache if finish_reason is not None else None
                     ),
+                    speculative_accepted_delta=accepted,
+                    speculative_proposed_delta=proposed,
                 )
             )
             if finish_reason is not None:
@@ -9650,6 +9806,104 @@ class Scheduler:
                 aborted.append(uid)
         return aborted
 
+    def request_force_output(self, request_id: str) -> str:
+        """Set the request-local stop-thinking latch without touching MLX state.
+
+        The Event is safe to set from the asyncio thread and is consumed by
+        ThinkingBudgetProcessor on the inference thread.  Returning a small
+        status string lets the public API distinguish absent, unsupported and
+        duplicate requests without exposing scheduler internals.
+        """
+        request = self.requests.get(request_id)
+        if request is None or request.is_finished():
+            return "not_found"
+        if not (
+            getattr(request, "needs_think_prefix", False)
+            or getattr(request, "continuation_in_thinking", False)
+            or self._get_output_parser_thinking_end_text() is not None
+        ):
+            return "unsupported"
+        if not self._resolve_think_end_token_ids():
+            return "unsupported"
+        if request.force_output_event.is_set():
+            return "already_requested"
+        request.force_output_event.set()
+        return "accepted"
+
+    @staticmethod
+    def _find_token_sequence(tokens: list[int], sequence: list[int]) -> int | None:
+        """Return the first complete sequence boundary in ``tokens``."""
+        if not sequence or len(sequence) > len(tokens):
+            return None
+        stop = len(tokens) - len(sequence) + 1
+        for index in range(stop):
+            if tokens[index : index + len(sequence)] == sequence:
+                return index
+        return None
+
+    def pause_request(self, request_id: str) -> dict[str, Any]:
+        """Snapshot one live request's accepted prefix, then enqueue its abort.
+
+        EngineCore schedules this method on the MLX executor.  Snapshotting and
+        adding the deferred abort therefore occur between scheduler steps, so
+        the returned token prefix cannot race another decode mutation.
+        """
+        request = self.requests.get(request_id)
+        if (
+            request is None
+            or request.is_finished()
+            or request_id in self._pending_abort_ids
+        ):
+            return {"status": "not_found", "request_id": request_id}
+
+        output_token_ids = [
+            int(token_id)
+            for token_id in (
+                list(getattr(request, "continuation_token_ids", []) or [])
+                + list(request.output_token_ids)
+            )
+        ]
+        think_end_ids = [
+            int(token_id) for token_id in (self._resolve_think_end_token_ids() or [])
+        ]
+        reasoning_end = self._find_token_sequence(output_token_ids, think_end_ids)
+        starts_in_thinking = bool(
+            getattr(request, "needs_think_prefix", False)
+            or getattr(request, "continuation_in_thinking", False)
+            or self._get_output_parser_thinking_end_text() is not None
+        )
+
+        output_text = ""
+        if output_token_ids:
+            try:
+                output_text = str(
+                    self.tokenizer.decode(
+                        output_token_ids, skip_special_tokens=False
+                    )
+                )
+            except TypeError:
+                output_text = str(self.tokenizer.decode(output_token_ids))
+            except Exception:
+                # Token IDs remain authoritative even for unusual tokenizers.
+                # The browser can retain its rendered preview as a fallback.
+                output_text = ""
+
+        snapshot = {
+            "status": "accepted",
+            "request_id": request_id,
+            "output_token_ids": output_token_ids,
+            "output_text": output_text,
+            "completion_tokens": len(output_token_ids),
+            "continuation_in_thinking": starts_in_thinking
+            and reasoning_end is None,
+            # Start index of the complete close marker. Tokens before this
+            # boundary are the reusable reasoning prefix for "Think more".
+            "reasoning_end_token_index": reasoning_end,
+        }
+        self._pending_abort_ids.add(request_id)
+        logger.debug("Snapshotted and enqueued pause for request %s", request_id)
+        return snapshot
+
     def abort_request(self, request_id: str) -> bool:
         """
         Enqueue a request for deferred abort.
@@ -9767,8 +10021,7 @@ class Scheduler:
             logger.warning(f"Idle reclaim failed: {e}")
             return
         logger.info(
-            "Idle reclaim: trimmed Metal transients between turns "
-            "(%.1fGB -> %.1fGB)",
+            "Idle reclaim: trimmed Metal transients between turns (%.1fGB -> %.1fGB)",
             before / 1024**3,
             after / 1024**3,
         )
@@ -9945,9 +10198,7 @@ class Scheduler:
         Active requests are intentionally not included: their memory is live
         and must remain charged to a concurrent admission.
         """
-        return bool(
-            self._pending_async_removes or self._deferred_clear_at is not None
-        )
+        return bool(self._pending_async_removes or self._deferred_clear_at is not None)
 
     def refresh_route_preflight_usage(self) -> int:
         """Publish a fresh MLX memory sample for route-level retry.
@@ -10400,8 +10651,7 @@ class Scheduler:
             return
 
         logger.warning(
-            "Preflight safety-cap rejected (%d tokens, cached=%d, "
-            "request_id=%s): %s",
+            "Preflight safety-cap rejected (%d tokens, cached=%d, request_id=%s): %s",
             num_prompt_tokens,
             cached_tokens,
             request_id,
@@ -11024,9 +11274,7 @@ class Scheduler:
                     and (self._decode_contention() or bool(self.prefilling))
                 )
                 chunk_threshold = (
-                    self._prefill_step_size_for_progress(
-                        0, len(tokens_to_process)
-                    )
+                    self._prefill_step_size_for_progress(0, len(tokens_to_process))
                     if force_chunk
                     else self.config.prefill_step_size
                 )
@@ -11211,9 +11459,7 @@ class Scheduler:
                 captured = extra.get("_captured_rope_deltas")
                 if captured is not None:
                     if isinstance(captured, mx.array):
-                        request.rope_deltas = float(
-                            captured.reshape(-1)[0].item()
-                        )
+                        request.rope_deltas = float(captured.reshape(-1)[0].item())
                     elif hasattr(captured, "item"):
                         request.rope_deltas = float(captured.item())
                     else:
@@ -11487,6 +11733,22 @@ class Scheduler:
                 if request.num_output_tokens > completion_tokens_before
                 else None
             )
+            if output_generated_at is not None:
+                request.record_generation_timestamp(step_now)
+
+            if bool(getattr(response, "speculative_active", False)):
+                request.record_speculative_cycle(
+                    accepted=int(
+                        getattr(response, "speculative_accepted_delta", 0) or 0
+                    ),
+                    proposed=int(
+                        getattr(response, "speculative_proposed_delta", 0) or 0
+                    ),
+                )
+            elif request.speculative_active:
+                # Advance the output-position window even during an adaptive
+                # MTP handoff to ordinary autoregressive decoding.
+                request.record_speculative_cycle(accepted=0, proposed=0)
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
@@ -11496,6 +11758,20 @@ class Scheduler:
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
+                generation_tps_recent=request.generation_tps_recent,
+                speculative_efficiency=request.speculative_efficiency,
+                speculative_efficiency_recent=(request.speculative_efficiency_recent),
+                speculative_accepted_tokens=(
+                    request.speculative_accepted_tokens
+                    if request.speculative_active
+                    else None
+                ),
+                speculative_proposed_tokens=(
+                    request.speculative_proposed_tokens
+                    if request.speculative_active
+                    else None
+                ),
+                speculative_efficiency_kind=request.speculative_efficiency_kind,
                 cached_tokens=request.cached_tokens,
                 benchmark_prefill_chunks=(
                     list(getattr(request, "benchmark_prefill_chunks", []))
@@ -11860,11 +12136,7 @@ class Scheduler:
                                         )
                                     )
                                     if intermediate_snapshots is not None:
-                                        for (
-                                            snapshot_cache
-                                        ) in (
-                                            intermediate_snapshots.iter_in_memory_extracted()
-                                        ):
+                                        for snapshot_cache in intermediate_snapshots.iter_in_memory_extracted():
                                             pre_eval_arrays.extend(
                                                 self._collect_arrays_from_extracted_cache(
                                                     snapshot_cache
@@ -12581,9 +12853,7 @@ class Scheduler:
         # count of 0 removes the entry, so idle engines never throttle a
         # prefilling one).
         with suppress(Exception):
-            get_decode_activity().publish(
-                self._decode_activity_key, len(self.running)
-            )
+            get_decode_activity().publish(self._decode_activity_key, len(self.running))
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
@@ -12613,9 +12883,7 @@ class Scheduler:
             if self.prefilling:
                 prefill_gate_open = self._prefill_gate_open()
                 if prefill_gate_open:
-                    self._advance_chunked_prefills(
-                        chunked_scheduled, chunked_rejected
-                    )
+                    self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
 
             # Schedule waiting requests
             scheduled, rejected = self._schedule_waiting()
@@ -12629,9 +12897,7 @@ class Scheduler:
             # step_interval between chunks. A step that merely HELD a
             # prefill for another engine's decode is deliberately not work
             # — the engine-loop sleep is the hold.
-            if scheduled or (
-                self.prefilling and (prefill_gate_open or self.running)
-            ):
+            if scheduled or (self.prefilling and (prefill_gate_open or self.running)):
                 output.has_work = True
             if chunked_rejected:
                 output.outputs.extend(chunked_rejected)
@@ -12762,8 +13028,7 @@ class Scheduler:
                             finished=True,
                             finish_reason="error",
                             error=(
-                                f"Cache corruption not recoverable "
-                                f"after retries: {e}"
+                                f"Cache corruption not recoverable after retries: {e}"
                             ),
                         )
                     )
@@ -12806,7 +13071,7 @@ class Scheduler:
             import traceback
 
             logger.error(
-                f"Error in batch generation step: {e}\n" f"{traceback.format_exc()}"
+                f"Error in batch generation step: {e}\n{traceback.format_exc()}"
             )
             raise
 
@@ -13105,8 +13370,7 @@ class Scheduler:
                     )
                 except Exception as exc:
                     fatal_exit(
-                        "Scheduler store-cache worker stream cleanup failed: "
-                        f"{exc!r}"
+                        f"Scheduler store-cache worker stream cleanup failed: {exc!r}"
                     )
                 self._store_cache_executor.shutdown(wait=False)
                 # Final drain after the bounded wait. If all workers finished
@@ -13964,18 +14228,12 @@ class Scheduler:
                     self._boundary_snapshot_store.pending_peak_bytes
                 ),
                 "backpressure_ms": self._boundary_snapshot_store.backpressure_ms,
-                "state_dtype": (
-                    self._boundary_snapshot_store.gdn_sidecar_state_dtype
-                ),
+                "state_dtype": (self._boundary_snapshot_store.gdn_sidecar_state_dtype),
                 "state_dequantizations": (
                     self._boundary_snapshot_store.gdn_state_dequantizations
                 ),
-                "encode_failures": (
-                    self._boundary_snapshot_store.gdn_encode_failures
-                ),
-                "decode_failures": (
-                    self._boundary_snapshot_store.gdn_decode_failures
-                ),
+                "encode_failures": (self._boundary_snapshot_store.gdn_encode_failures),
+                "decode_failures": (self._boundary_snapshot_store.gdn_decode_failures),
                 "capability_fallbacks": (
                     self._boundary_snapshot_store.gdn_capability_fallbacks
                 ),
@@ -13999,13 +14257,9 @@ class Scheduler:
         if self.block_aware_cache is not None:
             prefix_stats = self.block_aware_cache.get_stats_dict()
             stats["prefix_cache"] = prefix_stats
-            stats["boundary_snapshots"] = (
-                self._boundary_snapshot_diagnostics.snapshot()
-            )
+            stats["boundary_snapshots"] = self._boundary_snapshot_diagnostics.snapshot()
             if self._last_prefix_cache_lookup is not None:
-                stats["last_prefix_lookup"] = dict(
-                    self._last_prefix_cache_lookup
-                )
+                stats["last_prefix_lookup"] = dict(self._last_prefix_cache_lookup)
             specprefill_cache_stats = {
                 "target_static_hits": prefix_stats["exact_prefix_hits"],
                 "target_static_misses": prefix_stats["exact_prefix_misses"],

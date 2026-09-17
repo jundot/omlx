@@ -47,6 +47,13 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
         num_output_tokens=20,
         num_prompt_tokens=12,
         max_tokens=64,
+        generation_tps_recent=3.5,
+        speculative_active=True,
+        speculative_efficiency=0.75,
+        speculative_efficiency_recent=0.5,
+        speculative_accepted_tokens=9,
+        speculative_proposed_tokens=12,
+        speculative_efficiency_kind="accepted_over_proposed",
     )
     waiting_request = SimpleNamespace(
         request_id="wait-1",
@@ -91,6 +98,12 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
             "elapsed_seconds": 10.0,
             "generated_tokens": 20,
             "tokens_per_second": 2.0,
+            "generation_tokens_per_second_recent": 3.5,
+            "speculative_decoding_efficiency": 0.75,
+            "speculative_decoding_efficiency_recent": 0.5,
+            "speculative_accepted_tokens": 9,
+            "speculative_proposed_tokens": 12,
+            "speculative_efficiency_kind": "accepted_over_proposed",
             "last_activity_age_seconds": 0.5,
             "prompt_tokens": 12,
             "max_tokens": 64,
@@ -494,11 +507,22 @@ def test_active_models_dflash_primary_counts_activity():
                 "active_requests": 1,
                 "activities": [
                     {
-                        "request_id": "req-1",
+                        "request_id": "activity-1",
+                        "public_request_id": "chatcmpl-dflash",
                         "kind": "generate",
                         "detail": "generating",
                         "elapsed_seconds": 3.0,
+                        "last_activity_age_seconds": 0.1,
                         "token_count": 42,
+                        "generated_tokens": 42,
+                        "prompt_tokens": 12,
+                        "max_tokens": 256,
+                        "generation_tokens_per_second_recent": 13.5,
+                        "speculative_decoding_efficiency": 0.5,
+                        "speculative_decoding_efficiency_recent": 0.4,
+                        "speculative_accepted_tokens": 21,
+                        "speculative_proposed_tokens": None,
+                        "speculative_efficiency_kind": "accepted_output_share",
                     }
                 ],
             }
@@ -509,6 +533,23 @@ def test_active_models_dflash_primary_counts_activity():
     assert data["total_active_requests"] == 1
     assert model["active_requests"] == 1
     assert model["activities"][0]["detail"] == "generating"
+    assert model["generating"] == [
+        {
+            "request_id": "chatcmpl-dflash",
+            "elapsed_seconds": 3.0,
+            "generated_tokens": 42,
+            "tokens_per_second": 14.0,
+            "generation_tokens_per_second_recent": 13.5,
+            "speculative_decoding_efficiency": 0.5,
+            "speculative_decoding_efficiency_recent": 0.4,
+            "speculative_accepted_tokens": 21,
+            "speculative_proposed_tokens": None,
+            "speculative_efficiency_kind": "accepted_output_share",
+            "last_activity_age_seconds": 0.1,
+            "prompt_tokens": 12,
+            "max_tokens": 256,
+        }
+    ]
 
 
 def test_active_models_resolves_scheduler_property_without_async_core():

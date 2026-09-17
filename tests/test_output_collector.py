@@ -443,6 +443,31 @@ class TestRequestOutputCollectorMergeOutputs:
         assert result.generated_at == 10.0
         assert result.generated_until == 11.0
 
+    def test_merge_uses_latest_empty_speculative_window(self):
+        """Adaptive AR fallback may age every proposal out of the window."""
+        collector = RequestOutputCollector()
+        existing = RequestOutput(
+            request_id="test-001",
+            speculative_efficiency=0.75,
+            speculative_efficiency_recent=0.5,
+            speculative_accepted_tokens=75,
+            speculative_proposed_tokens=100,
+        )
+        new = RequestOutput(
+            request_id="test-001",
+            speculative_efficiency=0.75,
+            speculative_efficiency_recent=None,
+            speculative_accepted_tokens=75,
+            speculative_proposed_tokens=100,
+        )
+
+        result = collector._merge_outputs(existing, new)
+
+        assert result.speculative_efficiency == 0.75
+        assert result.speculative_efficiency_recent is None
+        assert result.speculative_accepted_tokens == 75
+        assert result.speculative_proposed_tokens == 100
+
 
 class TestRequestOutputCollectorHasWaitingConsumers:
     """Tests for RequestOutputCollector.has_waiting_consumers()."""

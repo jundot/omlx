@@ -921,3 +921,118 @@ class TestCallBackbone:
         assert result[0] is logits
         assert result[1] is hidden
         assert result[2] is gdn
+
+
+def test_scheduler_consumes_vlm_mtp_acceptance_rounds_incrementally():
+    from types import SimpleNamespace
+
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, _VLMMTPDecodeState
+
+    scheduler = Scheduler.__new__(Scheduler)
+    model = SimpleNamespace(accept_lens=[2, 1], config=SimpleNamespace(block_size=4))
+    scheduler._vlm_mtp_drafter = SimpleNamespace(model=model)
+    scheduler._vlm_mtp_draft_block_size = 4
+    state = _VLMMTPDecodeState(
+        generator=iter(()),
+        request=Request("request", [1], SamplingParams()),
+        prompt_cache=[],
+        sampler=lambda value: value,
+        state_machine=None,
+        max_tokens=10,
+    )
+
+    assert scheduler._consume_vlm_mtp_telemetry(state) == (3, 6)
+    assert scheduler._consume_vlm_mtp_telemetry(state) == (0, 0)
+    model.accept_lens.append(3)
+    assert scheduler._consume_vlm_mtp_telemetry(state) == (3, 3)
+
+
+def test_scheduler_vlm_mtp_telemetry_ignores_prior_request_rounds():
+    from types import SimpleNamespace
+
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, _VLMMTPDecodeState
+
+    scheduler = Scheduler.__new__(Scheduler)
+    model = SimpleNamespace(accept_lens=[2, 1], config=SimpleNamespace(block_size=4))
+    scheduler._vlm_mtp_drafter = SimpleNamespace(model=model)
+    scheduler._vlm_mtp_draft_block_size = 4
+    state = _VLMMTPDecodeState(
+        generator=iter(()),
+        request=Request("request", [1], SamplingParams()),
+        prompt_cache=[],
+        sampler=lambda value: value,
+        state_machine=None,
+        max_tokens=10,
+        accept_rounds_start=2,
+        accept_rounds_seen=2,
+    )
+
+    assert scheduler._consume_vlm_mtp_telemetry(state) == (0, 0)
+    model.accept_lens.append(3)
+    assert scheduler._consume_vlm_mtp_telemetry(state) == (3, 3)
+
+
+def test_scheduler_vlm_mtp_telemetry_detects_equal_length_reset():
+    from types import SimpleNamespace
+
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, _VLMMTPDecodeState
+
+    scheduler = Scheduler.__new__(Scheduler)
+    old_accept_lens = [2]
+    old_draft_lens = [2]
+    model = SimpleNamespace(
+        accept_lens=old_accept_lens,
+        draft_lens=old_draft_lens,
+        config=SimpleNamespace(block_size=3),
+    )
+    scheduler._vlm_mtp_drafter = SimpleNamespace(model=model)
+    scheduler._vlm_mtp_draft_block_size = 3
+    state = _VLMMTPDecodeState(
+        generator=iter(()),
+        request=Request("request", [1], SamplingParams()),
+        prompt_cache=[],
+        sampler=lambda value: value,
+        state_machine=None,
+        max_tokens=10,
+        accept_rounds_start=1,
+        accept_rounds_seen=1,
+        accept_rounds_source_id=id(old_accept_lens),
+        draft_rounds_start=1,
+        draft_rounds_seen=1,
+        draft_rounds_source_id=id(old_draft_lens),
+    )
+
+    # mlx-vlm reset() replaces both lists. The new list can already be the
+    # same length as the old one when the scheduler next observes it.
+    model.accept_lens = [1]
+    model.draft_lens = [1]
+    assert scheduler._consume_vlm_mtp_telemetry(state) == (1, 1)
+
+
+def test_scheduler_vlm_mtp_telemetry_uses_exact_dynamic_draft_lengths():
+    from types import SimpleNamespace
+
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, _VLMMTPDecodeState
+
+    scheduler = Scheduler.__new__(Scheduler)
+    model = SimpleNamespace(
+        accept_lens=[1, 0],
+        draft_lens=[2, 1],
+        config=SimpleNamespace(block_size=3),
+    )
+    scheduler._vlm_mtp_drafter = SimpleNamespace(model=model)
+    scheduler._vlm_mtp_draft_block_size = 3
+    state = _VLMMTPDecodeState(
+        generator=iter(()),
+        request=Request("request", [1], SamplingParams()),
+        prompt_cache=[],
+        sampler=lambda value: value,
+        state_machine=None,
+        max_tokens=10,
+    )
+
+    assert scheduler._consume_vlm_mtp_telemetry(state) == (1, 3)

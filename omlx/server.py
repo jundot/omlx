@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -183,8 +183,8 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, VLMBatchedEngine
-from .engine.distributed import DistributedInferenceError
+from .engine import BaseEngine, BatchedEngine, DFlashEngine, VLMBatchedEngine
+from .engine.distributed import DistributedBatchedEngine, DistributedInferenceError
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -1968,6 +1968,36 @@ def _resolve_metric_durations(
     return prefill_duration, generation_duration
 
 
+def _generation_telemetry_usage(output) -> dict:
+    """Map engine telemetry to optional oMLX Usage extension fields."""
+    recent_tps = getattr(output, "generation_tps_recent", None)
+    efficiency = getattr(output, "speculative_efficiency", None)
+    recent_efficiency = getattr(output, "speculative_efficiency_recent", None)
+    accepted = getattr(output, "speculative_accepted_tokens", None)
+    proposed = getattr(output, "speculative_proposed_tokens", None)
+    kind = getattr(output, "speculative_efficiency_kind", None)
+    return {
+        "generation_tokens_per_second_recent": (
+            round(float(recent_tps), 2) if recent_tps is not None else None
+        ),
+        "speculative_decoding_efficiency": (
+            round(float(efficiency), 6) if efficiency is not None else None
+        ),
+        "speculative_decoding_efficiency_recent": (
+            round(float(recent_efficiency), 6)
+            if recent_efficiency is not None
+            else None
+        ),
+        "speculative_accepted_tokens": (
+            int(accepted) if accepted is not None else None
+        ),
+        "speculative_proposed_tokens": (
+            int(proposed) if proposed is not None else None
+        ),
+        "speculative_efficiency_kind": kind,
+    }
+
+
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
     """Get OCR generation defaults for a model, or None if not an OCR model."""
     if model_id is None:
@@ -3685,6 +3715,60 @@ async def create_rerank(
 # =============================================================================
 
 
+@app.post("/v1/requests/{request_id}/force-output")
+async def force_request_output(
+    request_id: str,
+    _: bool = Depends(verify_api_key),
+):
+    """Ask one exact in-flight request to close thinking and answer now."""
+    pool = get_engine_pool()
+    for model_id in pool.get_loaded_model_ids():
+        entry = pool.get_entry(model_id)
+        engine = entry.engine if entry is not None else None
+        request_force = getattr(engine, "request_force_output", None)
+        if not callable(request_force):
+            continue
+        result = await request_force(request_id)
+        if result == "accepted":
+            return JSONResponse(
+                status_code=202,
+                content={"request_id": request_id, "status": "accepted"},
+            )
+        if result == "already_requested":
+            raise HTTPException(
+                status_code=409,
+                detail="Force output was already requested for this request",
+            )
+        if result == "unsupported":
+            raise HTTPException(
+                status_code=422,
+                detail="Force output is not supported for this request",
+            )
+    raise HTTPException(status_code=404, detail="Active request not found")
+
+
+@app.post("/v1/requests/{request_id}/pause")
+async def pause_request_output(
+    request_id: str,
+    _: bool = Depends(verify_api_key),
+):
+    """Atomically snapshot an exact generated-token prefix and stop its request."""
+    pool = get_engine_pool()
+    for model_id in pool.get_loaded_model_ids():
+        entry = pool.get_entry(model_id)
+        engine = entry.engine if entry is not None else None
+        pause = getattr(engine, "pause_request", None)
+        if not callable(pause):
+            continue
+        snapshot = await pause(request_id)
+        if snapshot.get("status") == "accepted":
+            preview = _build_protocol_pause_preview(engine, snapshot)
+            if preview is not None:
+                snapshot["preview"] = preview
+            return JSONResponse(status_code=200, content=snapshot)
+    raise HTTPException(status_code=404, detail="Active request not found")
+
+
 @app.post("/v1/completions")
 async def create_completion(
     request: CompletionRequest,
@@ -3919,6 +4003,16 @@ async def create_chat_completion(
     }
     ```
     """
+    continuation_token_ids = request.continuation_token_ids
+    if continuation_token_ids and request.messages and request.messages[-1].partial:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "continuation_token_ids cannot be combined with a partial "
+                "assistant message"
+            ),
+        )
+
     # Log incoming request summary at debug, message content at trace
     logger.debug(
         f"Chat completion request received: model={request.model}, "
@@ -3931,6 +4025,15 @@ async def create_chat_completion(
             logger.log(
                 5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview
             )
+
+    if continuation_token_ids and is_markitdown_model(request.model):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Durable token continuation is supported only by local "
+                "text and vision chat engines"
+            ),
+        )
 
     if is_markitdown_model(request.model):
         return await _create_markitdown_chat_completion(request, http_request)
@@ -3949,6 +4052,19 @@ async def create_chat_completion(
         load_start = time.perf_counter()
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
+
+        if continuation_token_ids and (
+            isinstance(engine, DistributedBatchedEngine)
+            or not isinstance(engine, (BatchedEngine, VLMBatchedEngine, DFlashEngine))
+            or getattr(engine, "is_diffusion_model", False)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Durable token continuation is supported only by local "
+                    "text and vision chat engines"
+                ),
+            )
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
@@ -4127,6 +4243,7 @@ async def create_chat_completion(
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 is_partial=is_partial,
+                continuation_token_ids=continuation_token_ids,
             )
         except Exception as e:
             # Catch chat template rendering failures: Jinja2 TemplateError,
@@ -4247,6 +4364,12 @@ async def create_chat_completion(
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
         )
+
+        if continuation_token_ids:
+            chat_kwargs["continuation_token_ids"] = continuation_token_ids
+            chat_kwargs["continuation_in_thinking"] = (
+                request.continuation_in_thinking
+            )
 
         # SpecPrefill: per-request overrides (fall back to model_settings)
         if request.specprefill is not None:
@@ -4935,6 +5058,7 @@ async def stream_completion(
             xtc_threshold=xtc_threshold,
             stop=request.stop,
             seed=request.seed,
+            request_id=response_id,
             **gen_kwargs,
         ):
             if first_token_time is None and output.new_text:
@@ -5049,6 +5173,7 @@ async def stream_completion(
                         if metric_gen_duration > 0
                         else None
                     ),
+                    **_generation_telemetry_usage(last_output),
                 ).model_dump(exclude_none=True),
             }
             yield f"data: {json.dumps(usage_data)}\n\n"
@@ -5234,6 +5359,173 @@ def _merge_streamed_tool_call_prefix(streamed: list, terminal: list | None) -> l
     return merged
 
 
+def _encode_continuation_marker(tokenizer: Any, text: str) -> list[int]:
+    if tokenizer is None:
+        return []
+    try:
+        return [int(token_id) for token_id in tokenizer.encode(
+            text, add_special_tokens=False
+        )]
+    except TypeError:
+        try:
+            return [int(token_id) for token_id in tokenizer.encode(text)]
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def _resolve_engine_think_end_token_ids(engine: Any) -> list[int] | None:
+    """Resolve the engine's configured native reasoning-close sequence.
+
+    Batched text/VLM engines keep the output-parser factory on their nested
+    scheduler, while DFlash owns the same resolver directly. Walking this
+    small wrapper chain keeps SSE reasoning accounting aligned with the exact
+    marker used by the generation-time thinking processor.
+    """
+    candidates: list[Any] = [engine]
+    current = engine
+    for attr in ("_engine", "engine", "scheduler"):
+        current = getattr(current, attr, None)
+        if current is None:
+            break
+        candidates.append(current)
+
+    for candidate in candidates:
+        resolver = getattr(candidate, "_resolve_think_end_token_ids", None)
+        if not callable(resolver):
+            continue
+        try:
+            token_ids = resolver()
+        except Exception as exc:
+            logger.debug("Could not resolve engine thinking boundary: %s", exc)
+            continue
+        if token_ids:
+            try:
+                return [int(token_id) for token_id in token_ids]
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _resolve_engine_output_parser_factory(engine: Any) -> Any | None:
+    """Find a protocol parser factory through the local engine wrappers."""
+    candidates: list[Any] = [engine]
+    current = engine
+    for attr in ("_engine", "engine", "scheduler"):
+        current = getattr(current, attr, None)
+        if current is None:
+            break
+        candidates.append(current)
+    for candidate in candidates:
+        factory = getattr(candidate, "_output_parser_factory", None)
+        if factory is not None:
+            return factory
+    return None
+
+
+def _build_protocol_pause_preview(
+    engine: Any, snapshot: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Render exact raw checkpoint IDs through the model's protocol parser.
+
+    Native protocols such as Harmony, Gemma 4, and Inkling do not decode to
+    literal ``<think>`` tags. Replaying a fresh parser gives the browser an
+    authoritative normalized preview without changing the raw token checkpoint.
+    """
+    factory = _resolve_engine_output_parser_factory(engine)
+    tokenizer = getattr(engine, "tokenizer", None)
+    token_ids = snapshot.get("output_token_ids") or []
+    if factory is None or tokenizer is None or not token_ids:
+        return None
+    try:
+        session = factory.create_session(tokenizer)
+        starts_in_thinking = bool(
+            snapshot.get("continuation_in_thinking")
+            or snapshot.get("reasoning_end_token_index") is not None
+        )
+        if starts_in_thinking:
+            notify = getattr(session, "notify_prefilled_thought", None)
+            if callable(notify):
+                notify()
+
+        normalized_parts: list[str] = []
+        synthetic_start = getattr(factory, "thinking_start_output_text", None)
+        if starts_in_thinking and synthetic_start:
+            normalized_parts.append(str(synthetic_start))
+        for token_id in token_ids:
+            result = session.process_token(int(token_id))
+            if result.stream_text:
+                normalized_parts.append(result.stream_text)
+        if not snapshot.get("continuation_in_thinking"):
+            final = session.finalize()
+            if final.stream_text:
+                normalized_parts.append(final.stream_text)
+
+        normalized = "".join(normalized_parts)
+        if snapshot.get("continuation_in_thinking"):
+            parser = ThinkingParser(start_in_thinking=False)
+            reasoning, content = parser.feed(normalized)
+        else:
+            reasoning, content = extract_thinking(normalized)
+        return {
+            "reasoning_content": reasoning or None,
+            "content": content or "",
+        }
+    except Exception as exc:
+        logger.debug("Could not render protocol pause preview: %s", exc)
+        return None
+
+
+def _count_reasoning_token_ids(
+    token_ids: list[int],
+    tokenizer: Any,
+    *,
+    starts_in_thinking: bool,
+    still_in_thinking: bool,
+    native_close_token_ids: list[int] | None = None,
+) -> int:
+    """Count raw reasoning tokens in a durable completion prefix.
+
+    The continuation phase bit makes an open reasoning prefix unambiguous.
+    Once reasoning has closed, scan token IDs for the first native close marker
+    so the count remains cumulative while answer tokens are appended.
+    """
+    if not token_ids or not starts_in_thinking:
+        return 0
+
+    close_sequences: list[list[int]] = []
+    if native_close_token_ids:
+        close_sequences.append(
+            [int(token_id) for token_id in native_close_token_ids]
+        )
+    try:
+        think_end_id = getattr(tokenizer, "think_end_id", None)
+    except (AttributeError, TypeError, ValueError):
+        think_end_id = None
+    if think_end_id is not None:
+        try:
+            close_sequences.append([int(think_end_id)])
+        except (TypeError, ValueError):
+            pass
+    for marker in ("</think>", "</mm:think>", "</think:opensource>"):
+        encoded = _encode_continuation_marker(tokenizer, marker)
+        if encoded and encoded not in close_sequences:
+            close_sequences.append(encoded)
+
+    first_close: int | None = None
+    for sequence in close_sequences:
+        width = len(sequence)
+        for index in range(len(token_ids) - width + 1):
+            if token_ids[index : index + width] == sequence:
+                if first_close is None or index < first_close:
+                    first_close = index
+                break
+    if first_close is not None:
+        return first_close
+    return len(token_ids) if still_in_thinking else 0
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -5253,11 +5545,12 @@ async def stream_chat_completion(
     first_token_time = None
     first_visible_time = None
     last_output = None
+    continuation_token_ids = list(request.continuation_token_ids or [])
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
+    tokenizer = getattr(engine, "tokenizer", None)
     try:
-        tokenizer = getattr(engine, "tokenizer", None)
         if tokenizer is not None:
             prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
                 engine, messages, kwargs
@@ -5268,6 +5561,34 @@ async def stream_chat_completion(
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    if continuation_token_ids and tokenizer is not None:
+        try:
+            try:
+                accumulated_text = tokenizer.decode(
+                    continuation_token_ids, skip_special_tokens=False
+                )
+            except TypeError:
+                accumulated_text = tokenizer.decode(continuation_token_ids)
+            # Restore split-tag/parser state without re-emitting the durable
+            # prefix. The explicit phase bit is authoritative for templates
+            # whose reasoning boundary is not one of ThinkingParser's tags.
+            thinking_parser.feed(accumulated_text)
+        except Exception as exc:
+            logger.debug("Could not replay continuation parser state: %s", exc)
+        thinking_parser._in_thinking = request.continuation_in_thinking
+
+    emitted_token_ids = list(continuation_token_ids)
+    native_close_token_ids = _resolve_engine_think_end_token_ids(engine)
+    reasoning_token_count = _count_reasoning_token_ids(
+        emitted_token_ids,
+        tokenizer,
+        starts_in_thinking=(start_in_thinking or request.continuation_in_thinking),
+        still_in_thinking=request.continuation_in_thinking,
+        native_close_token_ids=native_close_token_ids,
+    )
+    include_token_ids = bool(
+        request.stream_options and request.stream_options.include_token_ids
+    )
 
     def mark_visible_delta() -> None:
         nonlocal first_visible_time
@@ -5325,7 +5646,9 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
-    engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    engine_stream = engine.stream_chat(
+        messages=messages, request_id=response_id, **kwargs
+    )
     try:
         async for output in engine_stream:
             if first_token_time is None:
@@ -5348,9 +5671,43 @@ async def stream_chat_completion(
             if output.new_text:
                 accumulated_text += output.new_text
 
+            thinking_delta = ""
+            content_delta = ""
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
+            raw_token_ids = [int(token_id) for token_id in (output.tokens or [])]
+            if raw_token_ids:
+                emitted_token_ids.extend(raw_token_ids)
+                reasoning_token_count = _count_reasoning_token_ids(
+                    emitted_token_ids,
+                    tokenizer,
+                    starts_in_thinking=(
+                        start_in_thinking or request.continuation_in_thinking
+                    ),
+                    still_in_thinking=thinking_parser._in_thinking,
+                    native_close_token_ids=native_close_token_ids,
+                )
+                if include_token_ids:
+                    token_chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=request.model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    token_ids=raw_token_ids,
+                                    reasoning_token_count=reasoning_token_count,
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                    yield (
+                        "data: "
+                        f"{token_chunk.model_dump_json(exclude_none=True)}\n\n"
+                    )
+
+            if stream_content and output.new_text:
                 # Emit reasoning_content delta
                 if thinking_delta:
                     if thinking_filter:
@@ -5884,6 +6241,7 @@ async def stream_chat_completion(
                         if metric_gen_duration > 0
                         else None
                     ),
+                    **_generation_telemetry_usage(last_output),
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"

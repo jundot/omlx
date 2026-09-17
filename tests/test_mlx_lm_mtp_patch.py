@@ -50,6 +50,26 @@ class TestApplyOrchestrator:
         import omlx.patches.mlx_lm_mtp as mtp  # noqa: F401
 
 
+def test_response_telemetry_consumes_each_verify_cycle_once():
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _MtpState,
+        _annotate_speculative_response,
+    )
+
+    state = _MtpState(pending_spec_accepted=2, pending_spec_proposed=3)
+    first = SimpleNamespace()
+    second = SimpleNamespace()
+
+    _annotate_speculative_response(first, state)
+    _annotate_speculative_response(second, state)
+
+    assert first.speculative_active is True
+    assert first.speculative_accepted_delta == 2
+    assert first.speculative_proposed_delta == 3
+    assert second.speculative_accepted_delta == 0
+    assert second.speculative_proposed_delta == 0
+
+
 class TestCacheRollback:
     def test_arrays_cache_gains_rollback_slot(self):
         from omlx.patches.mlx_lm_mtp import cache_rollback

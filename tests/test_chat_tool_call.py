@@ -317,11 +317,15 @@ class TestChatToolRoundSourceContract:
 
         assert "context._requestStartedAt = Date.now();" in stream
         assert "Date.now() - context._requestStartedAt" in stream
-        assert stream.count("this.resetStreamSession(stream") == 2
+        assert stream.count("this.resetStreamSession(stream") == 4
         finally_body = stream[stream.rindex("} finally {") :]
-        assert finally_body.index("if (depth === 0) {") < finally_body.index(
+        assert finally_body.index(
+            "if (depth === 0 && !thinkMoreRestart && !pauseFinalized)"
+        ) < finally_body.index(
             "this.resetStreamSession(stream, { preserveFinalContent: true });"
         )
+        assert "if (depth === 0 && thinkMoreRestart)" in finally_body
+        assert "if (depth === 0 && pauseFinalized)" in finally_body
 
     def test_chat_setting_exposes_a_bounded_tool_round_limit(self):
         source = CHAT_TEMPLATE.read_text(encoding="utf-8")

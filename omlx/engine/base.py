@@ -206,6 +206,13 @@ class GenerationOutput:
     generated_at: Optional[float] = None
     generated_until: Optional[float] = None
     first_token_at: Optional[float] = None
+    # Request-local trailing-window and speculative decode telemetry.
+    generation_tps_recent: Optional[float] = None
+    speculative_efficiency: Optional[float] = None
+    speculative_efficiency_recent: Optional[float] = None
+    speculative_accepted_tokens: Optional[int] = None
+    speculative_proposed_tokens: Optional[int] = None
+    speculative_efficiency_kind: Optional[str] = None
     # Internal scheduler trace populated only by local benchmark requests.
     benchmark_prefill_chunks: List[int] = field(default_factory=list)
     benchmark_requested_steps: List[int] = field(default_factory=list)
