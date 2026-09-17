@@ -179,6 +179,13 @@ def quantize_engram(
     """Write three safetensors arrays in bounded row chunks, never a full table."""
     if bits not in (2, 3, 4, 6, 8):
         raise ValueError("Unsupported Engram affine bit width")
+    if table.get("bias_key"):
+        # A table that already carries affine metadata is quantized. The reads
+        # below assume published FP8 bytes, so requantizing would produce
+        # garbage instead of a smaller table.
+        raise ValueError(
+            "Engram table is already quantized: requantization is unsupported"
+        )
     if rows_per_chunk <= 0:
         raise ValueError("Engram chunk size must be positive")
     reader = TensorFile(source / table["weight_file"])

@@ -91,6 +91,9 @@ The settings API and model loader use the same eligibility check.
 
 The common adapter supports stacked `[num_experts, ...]` quantized
 `SwitchGLU` projections and the per-expert layout used by OLMoE conversions.
+Both are read from either an MXFP checkpoint or a community `mlx_lm` affine
+conversion, whose projections carry a U32 weight with float scales and biases
+and declare their format in the checkpoint's own `quantization` dict.
 All backbone layers must have the expected tensor names, shapes, storage
 dtypes, and quantization metadata. Fused or renamed projections, missing
 experts, unquantized weights, and per-expert linear bias are rejected.
