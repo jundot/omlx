@@ -94,11 +94,12 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
 
 
 @pytest.mark.parametrize(
-    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4", "qwen3_5_moe"]
+    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4", "qwen3_5_moe", "mixtral"]
 )
-def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
+def test_matching_layout_is_admitted_whatever_the_model_type(tmp_path, kind):
+    """The checkpoint's own tensors decide, not a list of known model types."""
     _checkpoint(tmp_path, kind)
-    assert moe_offload_compatibility(tmp_path)[0] is False
+    assert moe_offload_compatibility(tmp_path) == (True, "")
 
 
 def test_dense_gemma_is_hidden(tmp_path):
@@ -122,8 +123,10 @@ def test_unsupported_saved_setting_rejected_before_load(tmp_path):
     from omlx.model_settings import ModelSettings
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
+    # A checkpoint no layout matches: the load path must refuse it by name.
     _checkpoint(tmp_path, "glm5_next")
-    with pytest.raises(ValueError, match="not supported for this model type"):
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {})
+    with pytest.raises(ValueError, match="missing expert tensor"):
         maybe_apply_pre_load_patches(
             str(tmp_path), ModelSettings(moe_expert_offload_enabled=True)
         )
