@@ -416,6 +416,27 @@ class SwiGLU(nn.Module):
         return swiglu(gate, x)
 
 
+
+def _switch_proj(proj, x, indices, sorted_indices=False, block_plan=None):
+    """mlx_lm SwitchLinear has no block_plan; omlx QuantizedSwitchLinear does."""
+    accept = getattr(type(proj).__call__, "_omlx_accepts_block_plan", None)
+    if accept is None:
+        import inspect
+
+        try:
+            accept = "block_plan" in inspect.signature(type(proj).__call__).parameters
+        except (TypeError, ValueError):
+            accept = False
+        try:
+            type(proj).__call__._omlx_accepts_block_plan = accept
+        except (AttributeError, TypeError):
+            pass
+    if accept:
+        return proj(
+            x, indices, sorted_indices=sorted_indices, block_plan=block_plan
+        )
+    return proj(x, indices, sorted_indices=sorted_indices)
+
 class SwitchGLU(nn.Module):
     def __init__(
         self,
@@ -556,10 +577,8 @@ class SwitchGLU(nn.Module):
             x_up = x_pair[..., :hidden_dims]
             x_gate = x_pair[..., hidden_dims:]
         else:
-            x_up = self.up_proj(x, idx, sorted_indices=do_sort, block_plan=block_plan)
-            x_gate = self.gate_proj(
-                x, idx, sorted_indices=do_sort, block_plan=block_plan
-            )
+            x_up = _switch_proj(self.up_proj, x, idx, do_sort, block_plan)
+            x_gate = _switch_proj(self.gate_proj, x, idx, do_sort, block_plan)
         x = self.activation(x_up, x_gate)
         if (
             block_plan is not None
@@ -570,12 +589,7 @@ class SwitchGLU(nn.Module):
             and self.down_proj["scales"].dtype in (mx.float16, mx.bfloat16)
         ):
             x = x.astype(self.down_proj["scales"].dtype)
-        x = self.down_proj(
-            x,
-            idx,
-            sorted_indices=do_sort,
-            block_plan=block_plan,
-        )
+        x = _switch_proj(self.down_proj, x, idx, do_sort, block_plan)
 
         if (
             weighted_sum

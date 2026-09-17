@@ -63,6 +63,10 @@ class CacheTypeRegistry:
         "BatchKVCache": CacheType.BATCH_KVCACHE,
         "BatchRotatingKVCache": CacheType.BATCH_ROTATING_KVCACHE,
         "ArraysCache": CacheType.ARRAYS_CACHE,
+        # DeepSeek V4.1 packed CSA2 cache. Handler lives in
+        # patches/deepseek_v41/cache.py; registered below and again on
+        # apply_fast_path so prefix reuse is not refused as unreconstructible.
+        "DeepseekV41Cache": CacheType.DEEPSEEK_V41,
         "QuantizedKVCache": CacheType.QUANTIZED_KVCACHE,
         "CacheList": CacheType.CACHE_LIST,
         # TurboQuant: handled specially in prefix_cache/paged_ssd_cache,
@@ -153,7 +157,12 @@ class CacheTypeRegistry:
 
     @classmethod
     def is_arrays_family(cls, class_name: str) -> bool:
-        """Check whether a class name belongs to the ArraysCache family."""
+        """Check whether a class name belongs to the ArraysCache family.
+
+        DeepseekV41Cache maps to DEEPSEEK_V41 on purpose. The GDN split
+        path treats arrays-family layers as structural placeholders;
+        V4.1 must keep packed deltas instead.
+        """
         if class_name == "SizedArraysCache":
             return True
         return cls._class_name_map.get(class_name) == CacheType.ARRAYS_CACHE
@@ -272,6 +281,12 @@ def _initialize_default_handlers() -> None:
     CacheTypeRegistry.register(Qwen4QSAKVCacheHandler())
     CacheTypeRegistry.register(Qwen4QSAQuantizedKVCacheHandler())
     CacheTypeRegistry.register(Qwen4BatchQSAKVCacheHandler())
+    try:
+        from omlx.patches.deepseek_v41.cache import DeepseekV41CacheHandler
+
+        CacheTypeRegistry.register(DeepseekV41CacheHandler())
+    except ImportError:
+        logger.debug("DeepseekV41CacheHandler skipped (mlx-lm not importable)")
 
 
 # Initialize handlers when module is imported

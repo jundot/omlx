@@ -54,12 +54,23 @@ def _register_module(qualname: str, file_path: Path, package: str) -> None:
     logger.info("Registered fast %s from %s", qualname, file_path.name)
 
 
+def _register_v41_cache_handler() -> None:
+    """Enable prefix-cache store/reuse for DeepseekV41Cache layers."""
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    from .cache import DeepseekV41CacheHandler
+
+    CacheTypeRegistry.register(DeepseekV41CacheHandler())
+    logger.info("DeepseekV41CacheHandler registered for prefix cache reuse")
+
+
 def apply_fast_path() -> bool:
     global _APPLIED
     if _APPLIED:
         return True
     os.environ.setdefault("OMLX_DSV41_ENGRAM", "mmap")
     _inject_pooling_cache()
+    _register_v41_cache_handler()
     v4 = Path(__file__).resolve().parent.parent / "deepseek_v4"
     _register_module(
         "mlx_lm.models.hyper_connection",

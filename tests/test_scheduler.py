@@ -685,6 +685,7 @@ class TestSchedulerAddRequest:
             "RotatingKVCache",
             "ArraysCache",
             "MiniMaxM3KVCache",
+            "DeepseekV41Cache",
             # Plainly sliceable, round-trips by block slicing.
             "ChunkedKVCache",
             "TurboQuantKVCache",

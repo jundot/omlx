@@ -41,3 +41,22 @@ def test_fast_path_is_default():
     from omlx.patches.deepseek_v41 import fast_path as fp
 
     assert fp.fast_path_enabled() is True
+
+
+def test_quantization_config_skips_engram_embed_affine_metadata():
+    from omlx.patches.deepseek_v41.fast_path import apply_fast_path
+
+    apply_fast_path()
+    from mlx_lm.models.deepseek_v41 import make_quantization_config
+    import mlx.nn as nn
+
+    class _E(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.engram = nn.Module()
+            self.engram.embed = nn.Embedding(8, 4)
+            self.engram.wkv = nn.Linear(4, 4, bias=False)
+
+    cfg = make_quantization_config(_E())
+    assert cfg.get("engram.embed") is False
+    assert cfg.get("engram.wkv", {}).get("mode") == "mxfp8"

@@ -261,7 +261,12 @@ def make_quantization_config(model):
         if k.startswith("mtp.")
         and (k.endswith(".e_proj") or k.endswith(".h_proj") or k.endswith(".main_proj"))
     }
-    engram_wkv = {k: mxfp8 for k, _ in flat_modules if k.endswith(".engram.wkv")}
+    engram_wkv = {k: mxfp8 for k, _ in flat_modules if k.endswith("engram.wkv")}
+    # Engram embedding tables live on SSD (mmap). Affine scales+biases for
+    # ~1e8 rows * (256/32) * 4 B * 2 tensors is ~12 GiB of unused metadata.
+    engram_embed = {
+        k: False for k, _ in flat_modules if k.endswith("engram.embed")
+    }
     return {
         "group_size": 32,
         "bits": 8,
@@ -271,6 +276,7 @@ def make_quantization_config(model):
         **attn,
         **mtp_projs,
         **engram_wkv,
+        **engram_embed,
     }
 
 
@@ -1313,6 +1319,7 @@ class DeepseekV41Model(PipelineMixin, nn.Module):
         cache: Optional[Any] = None,
         images=None,
         image_mask: Optional[mx.array] = None,
+        inputs_embeds: Optional[mx.array] = None,
     ) -> mx.array:
         if images is not None:
             raise NotImplementedError(
@@ -1320,7 +1327,10 @@ class DeepseekV41Model(PipelineMixin, nn.Module):
                 "Do not pass images until ViT/aligner is implemented."
             )
 
-        h = self.embed_tokens(inputs)
+        if inputs_embeds is not None:
+            h = inputs_embeds
+        else:
+            h = self.embed_tokens(inputs)
         h = mx.contiguous(
             mx.broadcast_to(
                 h[:, :, None, :],
@@ -1423,8 +1433,13 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
         images=None,
         skip_lm_head: bool = False,
+        inputs_embeds: Optional[mx.array] = None,
+        **kwargs,
     ):
-        out = self.model(inputs, cache, images=images)
+        del kwargs  # omlx adapter may pass return_hidden / pixel kwargs
+        out = self.model(
+            inputs, cache, images=images, inputs_embeds=inputs_embeds
+        )
         if skip_lm_head:
             # Chunked prefill discards per-chunk logits; first decode scores
             # the prompt's last token. Skip the full-vocab lm_head GEMM.

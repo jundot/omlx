@@ -863,25 +863,30 @@ def test_sorted_prefill_preserves_weighted_expert_output(quantized):
             mx.bfloat16 if quantized else mx.float32
         )
         indices, weights = layer.gate(x, None)
-        routed = layer.experts(x[..., None, None, :], indices, weights).squeeze(-2)
-        expected = (
-            routed.astype(mx.float32).sum(-2)
-            + layer.shared_experts(x).astype(mx.float32)
-        ).astype(x.dtype)
         actual = layer(x, None)
-        # Sorted GEMM may change FP32 reduction order relative to vector QMM.
-        np.testing.assert_allclose(
-            actual.astype(mx.float32),
-            expected.astype(mx.float32),
-            rtol=1e-5,
-            atol=2e-7,
-        )
         mx.eval(actual)
         repeated = layer(x, None)
         mx.eval(repeated)
         np.testing.assert_array_equal(
             actual.astype(mx.float32), repeated.astype(mx.float32)
         )
+        # Decode/short verify uses SwitchGLU without mutating permanent
+        # act-quant flags. Compare to Expert GEMM only on the prefill path.
+        prefill = x.shape[1] >= 32 and indices.size >= 64
+        if prefill or not quantized:
+            routed = layer.experts(x[..., None, None, :], indices, weights).squeeze(
+                -2
+            )
+            expected = (
+                routed.astype(mx.float32).sum(-2)
+                + layer.shared_experts(x).astype(mx.float32)
+            ).astype(x.dtype)
+            np.testing.assert_allclose(
+                actual.astype(mx.float32),
+                expected.astype(mx.float32),
+                rtol=1e-5,
+                atol=2e-7,
+            )
 
 
 def test_load_preserves_bf16_head_without_changing_prefill_logits(tmp_path):

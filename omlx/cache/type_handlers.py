@@ -852,7 +852,7 @@ class ArraysCacheHandler(CacheTypeHandler):
             return None
 
         states = state.get("states", [])
-        if meta_state and tuple(meta_state) == ("deepseek_v41", "2"):
+        if meta_state and len(meta_state) >= 2 and meta_state[0] == "deepseek_v41":
             from ..patches.deepseek_v41.cache import DeepseekV41Cache
 
             return DeepseekV41Cache.from_state(states, meta_state)
