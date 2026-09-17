@@ -439,11 +439,14 @@ def _is_stock_switch_glu(obj) -> bool:
     # (the default for Gemma 4 checkpoints) is covered. OffloadSwitchGLU
     # has a different name, so re-wrapping is naturally excluded.
     # The GLM DSA package's SwitchGLU (fused gate/up, native weighted sum)
-    # has its own adapter; see omlx.patches.glm_moe_dsa.moe_offload.
+    # has its own adapter; see omlx.patches.glm_moe_dsa.moe_offload. The
+    # DeepSeek V4 package's SwitchGLU (native block/pair kernels), shared by
+    # glm5_next, has its own too; see omlx.patches.deepseek_v4.moe_offload.
     return (
         type(obj).__name__ == "SwitchGLU"
         and hasattr(obj, "activation")
         and type(obj).__module__ != "omlx.patches.glm_moe_dsa.switch_layers"
+        and type(obj).__module__ != "omlx.patches.deepseek_v4.switch_layers"
     )
 
 
@@ -566,10 +569,17 @@ def apply_moe_expert_offload(
 
     # GLM DSA blocks have their own adapter (fused gate/up, native weighted
     # sum); it shares this store format and the same wrap-before-materialize
-    # contract, so the engine sees one count.
+    # contract, so the engine sees one count. DeepSeek V4 / glm5_next blocks
+    # (native block kernels, split projections) follow the same pattern; see
+    # omlx.patches.deepseek_v4.moe_offload.
     from .glm_moe_dsa.moe_offload import apply_glm_moe_expert_offload
 
     wrapped = apply_glm_moe_expert_offload(model, model_dir, resident_fraction)
+    from .deepseek_v4.moe_offload import apply_deepseek_v4_moe_expert_offload
+
+    wrapped += apply_deepseek_v4_moe_expert_offload(
+        model, model_dir, resident_fraction
+    )
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
         view, reason = _resolve_store_view(glu, store, path)
@@ -636,11 +646,6 @@ def estimate_offload_admission_bytes(
         if model_dir is None:
             return full_size
         minimum = _minimum_experts(model_dir)
-        config_path = Path(model_dir) / "config.json"
-        if config_path.exists():
-            kind = json.loads(config_path.read_text()).get("model_type", "")
-            if kind.startswith("deepseek_v4") or kind == "glm5_next":
-                return full_size
         # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
         # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
         # Field completeness is tracked PER EXPERT, not container-wide: the
