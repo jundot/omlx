@@ -369,7 +369,10 @@ def serve_command(args):
         for h in bind_hosts:
             print(f"Starting server at http://{h}:{settings.server.port}")
         menubar_ok, menubar_hint = menubar_sidecar.should_autostart(
-            cli_flag=args.menubar, settings_enabled=settings.server.menubar
+            # getattr: tests and embedders may hand serve_command a bare
+            # Namespace / fake settings without the serve-parser defaults.
+            cli_flag=getattr(args, "menubar", None),
+            settings_enabled=getattr(settings.server, "menubar", True),
         )
         if menubar_ok:
             menubar_proc = menubar_sidecar.spawn(
