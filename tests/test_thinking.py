@@ -112,6 +112,53 @@ class TestExtractThinking:
         assert thinking == "thought process"
         assert content == "visible answer"
 
+    def test_orphan_close_tag_stripped_from_content_with_open(self):
+        """Regression for #1864: after a thinking_budget force-close, the model
+        keeps reasoning and emits its OWN ``</think>`` later. With a leading
+        ``<think>``, the first pair is extracted but the second close was
+        leaking into the answer as a literal tag. It must be stripped."""
+        thinking, content = extract_thinking(
+            "<think>reasoning</think>spilled text\n</think>\n\nfinal answer"
+        )
+        assert thinking == "reasoning"
+        assert "</think>" not in content
+        assert content == "spilled text\n\nfinal answer"
+
+    def test_orphan_close_tag_stripped_from_content_tail_branch(self):
+        """Regression for #1864 on the partial-tail branch (prompt pre-opened
+        ``<think>``, no open tag in output): the model's second, self-emitted
+        ``</think>`` must not survive in the answer body."""
+        thinking, content = extract_thinking(
+            "reasoning</think>answer body\n</think>\n\nanswer body dup"
+        )
+        assert thinking == "reasoning"
+        assert "</think>" not in content
+        assert content == "answer body\n\nanswer body dup"
+
+    def test_orphan_close_tag_inline_stripped_without_stray_newline(self):
+        """A bare inline orphan ``</think>`` (no surrounding newlines) is
+        removed outright — it must not inject a stray newline mid-text."""
+        thinking, content = extract_thinking(
+            "<think>reasoning</think>foo</think>bar"
+        )
+        assert thinking == "reasoning"
+        assert content == "foobar"
+
+    def test_orphan_close_strip_is_linear_on_whitespace_runs(self):
+        """ReDoS guard: orphan-tag cleanup must stay linear on untrusted model
+        output. A leading ``[ \\t]*`` quantifier made this O(n^2) on long
+        whitespace runs (a degenerate-repetition / injection DoS). A 200k-char
+        run plus a ``</think>`` must finish near-instantly."""
+        import time
+
+        payload = "<think>x</think>" + (" " * 200_000) + "y</think>"
+        start = time.perf_counter()
+        _, content = extract_thinking(payload)
+        elapsed = time.perf_counter() - start
+        assert "</think>" not in content
+        # Linear scan is well under 100ms; the quadratic version took ~120s.
+        assert elapsed < 1.0, f"orphan strip too slow ({elapsed:.2f}s) — ReDoS?"
+
 
 class TestThinkingParser:
     """Tests for streaming ThinkingParser."""
