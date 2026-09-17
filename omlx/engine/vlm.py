@@ -1861,6 +1861,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 model_type = _read_config_model_type(self._model_name)
                 if model_type == "deepseek_v41":
+                    from ..patches.deepseek_v41.engram_fast import engram_is_mmap
                     from ..patches.deepseek_v41.loading import load
 
                     return load(
@@ -1881,7 +1882,8 @@ class VLMBatchedEngine(BaseEngine):
                                 "deepseek_v41_engram_ssd_offload",
                                 False,
                             )
-                        ),
+                        )
+                        or engram_is_mmap(),
                         ced_prefill=bool(
                             getattr(
                                 self._model_settings,

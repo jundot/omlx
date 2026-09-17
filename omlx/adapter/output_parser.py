@@ -1411,7 +1411,15 @@ def detect_output_parser(
                 session_tokenizer, model_path=session_model_path
             ),
             stop_token_ids=set(),
-            protocol_marker_texts=("<｜DSML｜ calls>", "</｜DSML｜ calls>"),
+            thinking_start_text="<think>",
+            thinking_start_output_text="<think>\n",
+            thinking_end_text="</think>",
+            protocol_marker_texts=(
+                "<｜DSML｜ calls>",
+                "</｜DSML｜ calls>",
+                "<think>",
+                "</think>",
+            ),
         )
 
     if _is_deepseek_v4_model(model_name, tokenizer, model_config):

@@ -252,3 +252,122 @@ def fused_hc_projection(x, fn, eps):
         output_shapes=[(*x.shape[:-2], 24)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+def _make_hc_sinkhorn_only_kernel():
+    """Fused sigmoid/softmax + sinkhorn for deferred mHC decode (from our V4.1 fork)."""
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint tid  = thread_position_in_threadgroup.x;
+        uint row  = threadgroup_position_in_grid.x;
+        uint lane = tid % 32;
+        uint sg   = tid / 32;
+
+        constexpr int MIX      = (2 + HC) * HC;
+        constexpr int BASE_OFF = 2 * HC;
+        constexpr float EPS = EPS_INT * 1e-9;
+
+        const device float* mix      = (const device float*)mixes + row * MIX;
+        device float*       pre_out  = (device float*)pre + row * HC;
+        device float*       post_out = (device float*)post + row * HC;
+        device float*       comb_out = (device float*)comb + row * HC * HC;
+
+        if (sg == 0) {
+            const float pre_scale  = scale[0];
+            const float post_scale = scale[1];
+            const float comb_scale = scale[2];
+
+            const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+            const uint  llane  = metal::min(lane, (uint)(HC - 1));
+
+            float pre_z  = mix[llane]      * pre_scale  + base[llane];
+            float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+            float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
+            float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+            if (lane < (uint)HC) {
+                pre_out[lane]  = pre_v;
+                post_out[lane] = post_v;
+            }
+
+            float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC)
+                            * comb_scale
+                      + *(const device float4*)(base + BASE_OFF + llane * HC))
+                     * active;
+
+            float row_max = metal::max(metal::max(v.x, v.y),
+                                       metal::max(v.z, v.w));
+            float4 e = metal::fast::exp(v - row_max) * active;
+            float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS))
+                     + EPS * active;
+
+            float4 col_inv = 1.0f / (float4(
+                simd_sum(r.x), simd_sum(r.y),
+                simd_sum(r.z), simd_sum(r.w)
+            ) + EPS);
+            r *= col_inv;
+
+            for (int iter = 1; iter < ITERS; ++iter) {
+                r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
+                col_inv = 1.0f / (float4(
+                    simd_sum(r.x), simd_sum(r.y),
+                    simd_sum(r.z), simd_sum(r.w)
+                ) + EPS);
+                r *= col_inv;
+            }
+
+            if (lane < (uint)HC) {
+                *(device float4*)(comb_out + lane * HC) = r;
+            }
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="hc_sinkhorn_only",
+        input_names=["mixes", "scale", "base"],
+        output_names=["pre", "post", "comb"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_sinkhorn_only_kernel = _make_hc_sinkhorn_only_kernel()
+
+
+def hc_sinkhorn_only(mixes, scale, base, hc_mult, sinkhorn_iters, eps, batch_shape):
+    """Metal fused mix→(pre,post,comb); falls back to None if unavailable."""
+    if (
+        _hc_sinkhorn_only_kernel is None
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or hc_mult != 4
+        or mixes.dtype not in (mx.float32, mx.bfloat16, mx.float16)
+    ):
+        return None
+
+    mixes_f = mixes.astype(mx.float32)
+    mix_flat = mixes_f.reshape(-1, mixes_f.shape[-1])
+    rows = mix_flat.shape[0]
+    pre, post, comb = _hc_sinkhorn_only_kernel(
+        inputs=[mix_flat, scale.astype(mx.float32), base.astype(mx.float32)],
+        template=[
+            ("HC", hc_mult),
+            ("ITERS", sinkhorn_iters),
+            ("EPS_INT", round(eps / 1e-9)),
+        ],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (rows, hc_mult),
+            (rows, hc_mult),
+            (rows, hc_mult, hc_mult),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    pre = pre.reshape(*batch_shape, hc_mult)
+    post = post.reshape(*batch_shape, hc_mult)
+    comb = comb.reshape(*batch_shape, hc_mult, hc_mult)
+    return pre, post, comb
+

@@ -8,6 +8,7 @@ from contextlib import ExitStack, closing
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 from mlx_lm.generate import wired_limit
 from transformers import PreTrainedTokenizerFast
@@ -18,6 +19,12 @@ from .model import Model
 from .processing import Processor
 from .quantization import QuantizedProjection
 from .storage import DiskEngramEmbedding, EngramPrefetch, TensorFile, decode_array
+from .engram_cache import (
+    QuantHotRowCache,
+    engram_cache_gb,
+    engram_cache_policy,
+    _quant_cache_rows_per_layer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,173 @@ def set_module(model, path, module):
         setattr(parent, parts[-1], module)
 
 
+def _should_use_fast_server_load(raw, preserve_mtp, moe_offload) -> bool:
+    """Use the mlx-lm CSA2/SwitchGLU model on the omlx server loader.
+
+    Tiny unit-test checkpoints (n_layers < 16), DSpark MTP, and MoE expert
+    offload stay on the original omlx Model + DiskEngramEmbedding path.
+    """
+    if moe_offload is not None:
+        return False
+    if preserve_mtp:
+        return False
+    text_cfg = raw.get("text_config") if isinstance(raw.get("text_config"), dict) else raw
+    n = int(text_cfg.get("num_hidden_layers") or text_cfg.get("n_layers") or 0)
+    return n >= 16
+
+
+def _load_fast_mlx_lm(path: Path, raw: dict):
+    """Load via apply_fast_path + mlx_lm so omlx serve matches ~27 tok/s decode."""
+    from mlx_lm import load as mlx_load
+    from mlx_vlm.models.base import InputEmbeddingsFeatures
+    from transformers import PreTrainedTokenizerFast
+
+    from .config import ModelConfig
+    from .processing import Processor
+    from .tool_parser import parse_tool_call, tool_call_end, tool_call_start
+
+    inner, tokenizer = mlx_load(str(path))
+    hf_tok = getattr(tokenizer, "_tokenizer", tokenizer)
+    if not isinstance(hf_tok, PreTrainedTokenizerFast):
+        hf_tok = PreTrainedTokenizerFast.from_pretrained(path)
+    hf_tok.has_tool_calling = True
+    hf_tok.tool_call_start = tool_call_start
+    hf_tok.tool_call_end = tool_call_end
+    hf_tok.tool_parser = parse_tool_call
+    tokenizer = hf_tok
+
+    config = ModelConfig.from_dict(raw)
+    ensure = getattr(inner, "ensure_engram", None)
+    if callable(ensure):
+        ensure()
+
+    class FastServerModel(nn.Module):
+        """VLM-shaped wrapper: adapter sees .language_model + .config + .close()."""
+
+        def __init__(self, lm, cfg):
+            super().__init__()
+
+            class _LM:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def embed(self, ids):
+                    return self._inner.model.embed_tokens(ids)
+
+                def make_cache(self):
+                    return self._inner.make_cache()
+
+                def __call__(self, *args, **kwargs):
+                    return self._inner(*args, **kwargs)
+
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+
+            self.language_model = _LM(lm)
+            self.config = cfg
+            self.model_type = cfg.model_type
+            if cfg.vision_enabled:
+                from .vision import Aligner, ViT
+
+                self.vision = ViT(cfg)
+                self.aligner = Aligner(cfg)
+                self.image_start = mx.zeros((cfg.dim,))
+                self.image_newline = mx.zeros((cfg.dim,))
+                self.image_end = mx.zeros((cfg.dim,))
+
+        def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+            from .model import Model as OmlxVlmModel
+
+            return OmlxVlmModel.get_input_embeddings(
+                self, input_ids, pixel_values, **kwargs
+            )
+
+        def __call__(self, input_ids, pixel_values=None, cache=None, **kwargs):
+            skip = bool(kwargs.get("skip_lm_head", False))
+            embeds = kwargs.get("inputs_embeds")
+            return self.language_model(
+                input_ids,
+                cache=cache,
+                skip_lm_head=skip,
+                inputs_embeds=embeds,
+            )
+
+        def close(self):
+            lm = self.language_model
+            model = getattr(lm, "model", lm)
+            for layer in getattr(model, "layers", ()):
+                eng = getattr(layer, "engram", None)
+                table = getattr(eng, "_mmap_table", None) if eng is not None else None
+                close = getattr(table, "close", None)
+                if close is not None:
+                    close()
+
+    wrapper = FastServerModel(inner, config)
+    if config.vision_enabled:
+        from mlx.utils import tree_flatten
+
+        mapping = json.loads((path / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        wanted = {
+            name
+            for name, _ in tree_flatten(wrapper.parameters())
+            if name.startswith(("vision.", "aligner.", "image_"))
+        }
+        by_file = {}
+        for key, filename in mapping.items():
+            target = key if key.startswith(("vision.", "aligner.", "image_")) else None
+            if target is None:
+                continue
+            # official checkpoint stores vision.* without language_model prefix
+            if target in wanted:
+                by_file.setdefault(filename, []).append((key, target))
+        for filename, pairs in by_file.items():
+            values = mx.load(str(path / filename))
+            wrapper.load_weights(
+                [(target, values[key]) for key, target in pairs if key in values],
+                strict=False,
+            )
+    processor = Processor(tokenizer, config)
+    logger.info(
+        "DeepSeek V4.1 omlx server using mlx-lm fast model (%s)",
+        type(inner).__module__,
+    )
+    inner.eval()
+    # Materialize every mx.array on this thread, including buffers that are
+    # not registered parameters (Engram q_weight/k_weight, HC tables). Lazy
+    # arrays keep the load-thread Stream(gpu, N) and abort the scheduler
+    # worker ("There is no Stream(gpu, N) in current thread").
+    def _eval_mx(obj, seen=None):
+        seen = set() if seen is None else seen
+        oid = id(obj)
+        if oid in seen:
+            return
+        seen.add(oid)
+        if isinstance(obj, mx.array):
+            mx.eval(obj)
+            return
+        if isinstance(obj, nn.Module):
+            for _, child in obj.items():
+                _eval_mx(child, seen)
+        if isinstance(obj, dict):
+            for v in obj.values():
+                _eval_mx(v, seen)
+            return
+        if isinstance(obj, (list, tuple)):
+            for v in obj:
+                _eval_mx(v, seen)
+            return
+        d = getattr(obj, "__dict__", None)
+        if d:
+            for v in d.values():
+                _eval_mx(v, seen)
+
+    _eval_mx(inner)
+    mx.synchronize()
+    return wrapper, processor
+
+
 def load(
     path,
     *,
@@ -64,6 +238,21 @@ def load(
     ced_prefill=False,
 ):
     path = Path(path)
+    raw_early = json.loads((path / "config.json").read_text())
+    preserve_for_fast = preserve_mtp
+    if preserve_for_fast is None:
+        from ..mlx_lm_mtp import is_mtp_active
+
+        preserve_for_fast = is_mtp_active()
+    if _should_use_fast_server_load(
+        raw_early, preserve_for_fast, moe_expert_offload_resident_fraction
+    ):
+        try:
+            return _load_fast_mlx_lm(path, raw_early)
+        except Exception as e:
+            logger.warning(
+                "Fast mlx-lm server load failed (%s); using omlx loader", e
+            )
     if (path / "conversion.inprogress.json").exists():
         raise ValueError("DeepSeek V4.1 checkpoint conversion is still in progress")
     raw = json.loads((path / "config.json").read_text())
@@ -149,6 +338,38 @@ def load(
             # Keep the GPU submission boundaries in both modes. Resident tables
             # are excluded by submit(), so RAM mode schedules no disk reads.
             model.language_model._engram_prefetch = EngramPrefetch()
+            if engram_ssd_offload and engram_cache_gb() > 0:
+                n_tables = len(format_spec["engram_tables"])
+                # Head dim from first table header once modules are bound.
+                capacity = None
+                for layer in model.language_model.layers:
+                    if "engram" not in layer:
+                        continue
+                    embed = layer.engram.embed
+                    if not isinstance(embed, DiskEngramEmbedding):
+                        continue
+                    embed._row_meta()
+                    if capacity is None:
+                        capacity = _quant_cache_rows_per_layer(
+                            n_tables, embed._head_dim, block_size=32
+                        )
+                    if capacity > 0:
+                        embed.bind_hot_cache(
+                            QuantHotRowCache(
+                                capacity,
+                                embed._head_dim,
+                                block_size=32,
+                                policy=engram_cache_policy(),
+                            )
+                        )
+                if capacity:
+                    logger.info(
+                        "DeepSeek V4.1 Engram hot-row cache: %.1f GiB budget, "
+                        "%d rows/table, policy=%s",
+                        engram_cache_gb(),
+                        capacity,
+                        engram_cache_policy(),
+                    )
         expected_shapes = {
             name: value.shape for name, value in tree_flatten(model.parameters())
         }

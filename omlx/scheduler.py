@@ -2849,7 +2849,7 @@ class Scheduler:
     # materialization differences. Larger blocks coarsen cache-hit granularity:
     # e.g. a 4096-token block cannot serve a 3k-token prefix. A geometry change
     # also leaves old SSD blocks cold until normal eviction removes them.
-    _ARRAYS_CACHE_BLOCK_SIZE = 2048
+    _ARRAYS_CACHE_BLOCK_SIZE = 32768
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
         """Enlarge block size for ArraysCache-only hybrid models.
@@ -2903,6 +2903,22 @@ class Scheduler:
             target,
         )
         self.config.paged_cache_block_size = target
+        # Keep prefill chunks on the same geometry. A 2048-token step against
+        # an 8192-token block still mx.evals every 2048 tokens and parks GPU.
+        if int(self.config.prefill_step_size or 0) < target:
+            logger.info(
+                "Raising prefill_step_size=%s to %s to match ArraysCache block",
+                self.config.prefill_step_size,
+                target,
+            )
+            self.config.prefill_step_size = target
+        if int(self.config.max_num_batched_tokens or 0) < target:
+            logger.info(
+                "Raising max_num_batched_tokens=%s to %s to match ArraysCache block",
+                self.config.max_num_batched_tokens,
+                target,
+            )
+            self.config.max_num_batched_tokens = target
 
     def _model_has_arrays_cache(self) -> bool:
         """Whether the model's cache layout contains ArraysCache layers."""
@@ -3934,8 +3950,10 @@ class Scheduler:
                 Scheduler._clear_cache(self)
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
-            # Reclaim Metal intermediates between prefill chunks.
-            Scheduler._clear_cache(self)
+            # Reclaim Metal intermediates between prefill chunks only when
+            # the pool is actually tight. Unconditional clear parks the GPU.
+            if self._should_clear_after_chunk():
+                Scheduler._clear_cache(self)
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
             if getattr(request, "benchmark_trace", False):
@@ -5310,21 +5328,16 @@ class Scheduler:
     def _should_clear_after_chunk(self) -> bool:
         """Whether the end-of-chunk Metal pool flush should run.
 
-        The flush is process-global (``mx.clear_cache``), so under decode
-        contention it dumps the other engine's warm buffer pool on every
-        chunk. Skip it while contended and comfortably below the soft
-        watermark; the pool legitimately retains reusable chunk transients
-        there (set_cache_limit spans total memory). Crossing soft resumes
-        today's per-chunk clearing, so guard behavior in the caution zone
-        is unchanged.
+        ``mx.synchronize`` + ``mx.clear_cache`` parks the GPU after every
+        prefill chunk (macmon triangle ~every 2048 tokens). Skip the flush
+        while comfortably below the memory limit so the Metal pool reuses
+        chunk transients. Resume clearing at 80% of the limit.
         """
-        if not self._decode_fairness:
-            return True
-        if not self._decode_contention():
-            return True
         if self._memory_limit_bytes <= 0:
             return True
-        return self._current_usage_bytes() >= self._memory_limit_bytes
+        # 95% of the process ceiling. 80% of 450GB was 360GB and prefill
+        # transients re-armed the per-chunk Metal flush (5s GPU triangle).
+        return self._current_usage_bytes() >= int(self._memory_limit_bytes * 0.95)
 
     def _prefill_step_size_for_progress(
         self, processed_tokens: int, remaining_tokens: int
@@ -11074,10 +11087,14 @@ class Scheduler:
                 # (own or another engine's) or an in-flight chunked prefill;
                 # the entry threshold then uses the contended cap so shorter
                 # prompts still interleave.
+                # Only yield-chunk against a live decode. Two fat prefills
+                # used to force the chunked path against each other, which
+                # bounced through the event loop and parked the GPU every
+                # block. Dual-prefill stays on the external loop instead.
                 force_chunk = (
                     self._decode_fairness
                     and vlm_embeds is None
-                    and (self._decode_contention() or bool(self.prefilling))
+                    and self._decode_contention()
                 )
                 chunk_threshold = (
                     self._prefill_step_size_for_progress(

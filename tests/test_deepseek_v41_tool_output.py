@@ -179,3 +179,31 @@ def test_invalid_json_cannot_end_tool_turn():
     assert visible == wire
     assert not any(stops)
     assert not final.tool_calls
+
+
+def replay_visible(text, split=None, prefilled=False):
+    split = len(text) if split is None else split
+    chunks = [text[:split], text[split:]] if split < len(text) else [text]
+    tokenizer = Tokenizer(dict(enumerate(chunks)))
+    factory = detect_output_parser("v41", tokenizer, {"model_type": "deepseek_v41"})
+    session = factory.create_session(tokenizer)
+    if prefilled:
+        session.notify_prefilled_thought()
+    visible = []
+    for i in range(len(chunks)):
+        visible.append(session.process_token(i).visible_text)
+    visible.append(session.finalize().visible_text)
+    return "".join(visible)
+
+
+def test_visible_text_never_leaks_think_or_dsml():
+    # Telegram/Discord read assistant content from visible_text.
+    reasoning = "<think>Example: " + CALL + "</think>"
+    out = replay_visible(reasoning + "Answer")
+    assert "DSML" not in out
+    assert "<think>" not in out
+    assert out == "Answer"
+    assert "DSML" not in replay_visible(CALL)
+    leaked = replay_visible("Hello " + CALL + " world")
+    assert "DSML" not in leaked
+    assert leaked.startswith("Hello")
