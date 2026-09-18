@@ -7,7 +7,9 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-_SUPPORTED_TYPES = frozenset({"deepseek_v41", "qwen4_exp", "gemma4", "olmoe"})
+_SUPPORTED_TYPES = frozenset(
+    {"deepseek_v41", "qwen4_exp", "gemma4", "olmoe", "glm_moe_dsa"}
+)
 
 
 def moe_offload_compatibility(model_path):
@@ -44,7 +46,13 @@ def _inspect(path, signature):
     from .moe_expert_offload import CheckpointExpertStore
 
     text = raw.get("text_config", raw)
-    count = int(text.get("num_experts") or 0)
+    if kind == "glm_moe_dsa":
+        count = int(text.get("n_routed_experts") or 0)
+        first_moe = int(text.get("first_k_dense_replace") or 0)
+        moe_freq = int(text.get("moe_layer_freq") or 1)
+    else:
+        count = int(text.get("num_experts") or 0)
+        first_moe, moe_freq = 0, 1
     layers = int(text.get("num_hidden_layers") or 0)
     hidden = int(text.get("hidden_size") or 0)
     intermediate = int(
@@ -59,8 +67,12 @@ def _inspect(path, signature):
     if not isinstance(quant, dict):
         return False, "Expert offload requires an MLX quantized checkpoint."
     store = CheckpointExpertStore(path)
+    if min(layers - first_moe, moe_freq) <= 0:
+        return False, "The model does not have the supported MoE geometry."
     for layer in range(layers):
-        if kind == "olmoe":
+        if layer < first_moe or layer % moe_freq:
+            continue  # dense layer (GLM's first_k_dense_replace)
+        if kind in ("olmoe", "glm_moe_dsa"):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind == "qwen4_exp":
