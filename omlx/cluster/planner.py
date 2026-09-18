@@ -113,6 +113,10 @@ class ModelLayout:
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
     supports_pipeline: bool = False
+    # Attention head dimension, for the admission-equivalent SDPA prefill
+    # transient (#3423). 0 means unknown: no transient is budgeted, matching
+    # the pre-fix planner exactly.
+    head_dim: int = 0
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
@@ -179,6 +183,7 @@ class ModelLayout:
             "supports_pipeline": self.supports_pipeline,
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
+            "head_dim": self.head_dim,
         }
 
     @classmethod
@@ -223,6 +228,7 @@ class ModelLayout:
                     payload.get("supports_tensor_parallel", False)
                 ),
                 supports_pipeline=bool(payload.get("supports_pipeline", False)),
+                head_dim=int(payload.get("head_dim", 0)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -698,6 +704,13 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _head_dim(config: dict[str, Any]) -> int:
+    return _config_int(config, "head_dim", 0) or (
+        _config_int(config, "hidden_size", 0, maximum=1_000_000)
+        // max(_config_int(config, "num_attention_heads", 1), 1)
+    )
+
+
 def _model_source(model_type: str) -> str:
     """Source of the mlx-lm module for this model type, or "".
 
@@ -1086,6 +1099,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         supports_pipeline=_supports_pipeline(_model_config(root)),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(_model_config(root)),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(_model_config(root)),
+        head_dim=_head_dim(_model_config(root)),
     )
 
 
@@ -1629,6 +1643,9 @@ def _finish_pipeline_plan(
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
         kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
+        # The admission guard charges the SDPA transient on top of KV — the
+        # reservation must cover it or the plan signs what the rank refuses.
+        kv_bytes += _sdpa_transient_for_stage(model, context_tokens)
         planned = model.fixed_weight_bytes + layer_weight_bytes + kv_bytes
         if planned > node.usable_bytes:
             raise PlanningError(
@@ -1843,6 +1860,44 @@ def _kv_bytes_per_token_for_stage(
     return per_token // max(1, tensor_parallel_size)
 
 
+def _sdpa_transient_for_stage(
+    model: ModelLayout,
+    tokens: int,
+    tensor_parallel_size: int = 1,
+    *,
+    step: int = 2048,
+) -> int:
+    """The prefill attention transient admission will charge for ``tokens``.
+
+    The rank admission guard prices KV AND the last chunk's SDPA transient
+    (#3423): for a head_dim outside the fused set that is the unfused fp32
+    score matrix, which at long context rivals the KV itself (the reported
+    2×64 GB / head_dim-256 plan admitted ~25% less than it signed). Priced
+    with the SAME MemoryMonitor formula the guard uses, at the planner's
+    default step — the tuner's later, smaller step only ever lowers the
+    charge, so the plan never over-promises. Heads are sharded under tensor
+    parallelism exactly as the guard's rank monitor shards them. 0 when the
+    model's head_dim is unknown: the pre-fix behavior, never a fabricated
+    number.
+    """
+
+    if model.head_dim <= 0 or model.tensor_parallel_heads <= 0 or tokens <= 0:
+        return 0
+    from omlx.memory_monitor import MemoryMonitor
+
+    tp = max(1, int(tensor_parallel_size))
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=1,
+        num_kv_heads=max(1, model.tensor_parallel_kv_heads // tp),
+        head_dim=model.head_dim,
+        num_attention_heads=max(1, model.tensor_parallel_heads // tp),
+    )
+    return monitor.estimate_chunk_transient_bytes(
+        min(int(step), int(tokens)), int(tokens)
+    )
+
+
 def _max_context_for_stage(
     model: ModelLayout,
     node: NodeBudget,
@@ -1865,7 +1920,34 @@ def _max_context_for_stage(
     if per_token <= 0:
         return 0
     spare = node.usable_bytes - weight_bytes
-    return max(0, spare // per_token)
+    if spare <= 0 or model.head_dim <= 0:
+        return max(0, spare // per_token)
+    # #3423: the admission guard also charges the SDPA prefill transient, so
+    # the answer is the longest context whose KV + transient fits — not the
+    # transient-free quotient, which oversold by ~25% on head_dim-256 models.
+    naive = spare // per_token
+    if (
+        _sdpa_transient_for_stage(model, naive, tensor_parallel_size)
+        + naive * per_token
+        <= spare
+    ):
+        return naive
+
+    def fits(tokens: int) -> bool:
+        return (
+            tokens * per_token
+            + _sdpa_transient_for_stage(model, tokens, tensor_parallel_size)
+            <= spare
+        )
+
+    lo, hi = 0, naive  # fits(0) holds; fits(naive) does not
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _tp_stage_budget(
@@ -2077,6 +2159,11 @@ def plan_hybrid(
         remainder = stage_layer_bytes % tensor_parallel_size
         kv_bytes = _kv_bytes_for_stage(
             model, end - start, context_tokens, tensor_parallel_size
+        )
+        # Same admission-equivalent transient, with the heads sharded across
+        # the TP group exactly as the rank guard shards them.
+        kv_bytes += _sdpa_transient_for_stage(
+            model, context_tokens, tensor_parallel_size
         )
         for tp_rank, node in enumerate(group):
             held_layer_bytes = per_member + (1 if tp_rank < remainder else 0)

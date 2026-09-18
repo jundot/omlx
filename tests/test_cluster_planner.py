@@ -666,3 +666,102 @@ def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
     )
     config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
     assert planner._supports_pipeline(config) is True
+
+
+# --- #3423: the plan must budget the same SDPA transient admission charges ------
+
+
+def _transient_model(head_dim, *, layers=24, kv=8_192, heads=8):
+    # kv=8192 B/token/layer == 2 (K+V) × 8 heads × 256 dim × 2 B — so the
+    # planner's KV arithmetic and the admission monitor's agree exactly.
+    return ModelLayout(
+        source="transient-test",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(1 * GIB,) * layers,
+        tensor_parallel_heads=heads,
+        tensor_parallel_kv_heads=heads,
+        kv_bytes_per_token_per_layer=kv,
+        head_dim=head_dim,
+    )
+
+
+def _node(gib=64, reserve_gib=8):
+    return NodeBudget(
+        node_id="n",
+        capacity_bytes=gib * GIB,
+        reserve_bytes=reserve_gib * GIB,
+        rank=0,
+    )
+
+
+def test_max_context_budgets_the_unfused_sdpa_transient():
+    from omlx.cluster.planner import _max_context_for_stage
+    from omlx.memory_monitor import MemoryMonitor
+
+    model = _transient_model(256)  # head_dim 256 → unfused fp32 score matrix
+    node = _node()
+    weights = 24 * GIB
+    spare = node.usable_bytes - weights
+
+    ctx = _max_context_for_stage(model, node, layer_count=24, weight_bytes=weights)
+    naive = spare // (24 * 8_192)
+    assert 0 < ctx < naive
+
+    # The admission formula agrees the signed context fits...
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    monitor.set_model_info(num_layers=24, num_kv_heads=8, head_dim=256)
+    peak = monitor.estimate_prefill_peak_bytes(ctx, 2048)
+    assert peak <= spare
+    # ...and the naive (transient-free) answer does NOT fit.
+    assert monitor.estimate_prefill_peak_bytes(naive, 2048) > spare
+
+
+def test_max_context_fused_head_dim_is_barely_below_the_naive_answer():
+    from omlx.cluster.planner import _max_context_for_stage
+
+    model = _transient_model(128)  # fused path: output buffer only
+    node = _node()
+    weights = 24 * GIB
+    naive = (node.usable_bytes - weights) // (24 * 8_192)
+
+    ctx = _max_context_for_stage(model, node, layer_count=24, weight_bytes=weights)
+    assert 0 < ctx < naive
+    # Fused transient is tiny next to the unfused one.
+    assert naive - ctx < 2000
+
+
+def test_max_context_unknown_head_dim_keeps_legacy_behavior():
+    from omlx.cluster.planner import _max_context_for_stage
+
+    model = _transient_model(0)
+    node = _node()
+    weights = 24 * GIB
+    expected = (node.usable_bytes - weights) // (24 * 8_192)
+    assert (
+        _max_context_for_stage(model, node, layer_count=24, weight_bytes=weights)
+        == expected
+    )
+
+
+def test_assignment_kv_reservation_covers_the_admission_peak():
+    from omlx.memory_monitor import MemoryMonitor
+
+    model = _transient_model(256)
+    tokens = 30_000
+    plan = plan_unequal_pipeline(model, [_node()], context_tokens=tokens)
+    reserved = plan.assignments[0].kv_cache_bytes
+
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    monitor.set_model_info(num_layers=24, num_kv_heads=8, head_dim=256)
+    admission_peak = monitor.estimate_prefill_peak_bytes(tokens, 2048)
+    assert reserved >= admission_peak
+    # And it is strictly more than the transient-free KV budget.
+    assert reserved > 24 * 8_192 * tokens
+
+
+def test_assignment_kv_reservation_unchanged_when_head_dim_unknown():
+    from omlx.cluster.planner import _kv_bytes_for_stage
+
+    model = _transient_model(0)
+    tokens = 300_000
+    assert _kv_bytes_for_stage(model, 24, tokens) == 24 * 8_192 * tokens
