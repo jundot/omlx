@@ -4395,7 +4395,7 @@ async def create_chat_completion(
                     cleaned_text or regular_content, response_format
                 )
                 if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
+                    cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -5601,7 +5601,7 @@ async def stream_chat_completion(
                 cleaned_text, request.response_format
             )
             if parsed_json is not None:
-                cleaned_text = json.dumps(parsed_json)
+                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
             if not is_valid:
                 logger.warning(f"JSON validation failed: {error}")
 
@@ -7280,7 +7280,7 @@ async def create_response(
                     cleaned_text or regular_content, response_format
                 )
                 if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
+                    cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -7859,7 +7859,7 @@ async def stream_responses_api(
     if response_format and not tool_calls:
         _, parsed_json, is_valid, error = parse_json_output(final_text, response_format)
         if parsed_json is not None:
-            final_text = json.dumps(parsed_json)
+            final_text = json.dumps(parsed_json, ensure_ascii=False)
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
