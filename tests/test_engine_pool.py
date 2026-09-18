@@ -981,6 +981,38 @@ class TestVLMFallback:
         assert entry.engine is mock_batched_engine
 
     @pytest.mark.asyncio
+    async def test_vlm_fallback_records_why_vision_is_gone(self, small_mock_model_dir):
+        """The downgrade has to leave a trace the API layer can act on.
+
+        Without it the text extractor strips image parts and the caller gets
+        an ordinary 200 describing an image the model never saw (#3688).
+        """
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        assert entry.vision_downgrade_reason is None
+
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock(
+            side_effect=ValueError("Received 785 parameters not in model: mtp.")
+        )
+        mock_vlm_engine.stop = AsyncMock()
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
+        ):
+            await pool._load_engine("model-a")
+
+        assert entry.engine is mock_batched_engine
+        assert "785 parameters not in model" in (entry.vision_downgrade_reason or "")
+
+    @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
         """Test that non-VLM engine failures propagate normally."""
         pool = _make_pool(ceiling=10 * 1024**3)

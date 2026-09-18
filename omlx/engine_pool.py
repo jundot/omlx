@@ -248,6 +248,10 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # Why a VLM entry is being served by a text-only engine. Set when the VLM
+    # load raises and the pool falls back to BatchedEngine; the API layer
+    # refuses image input instead of dropping it silently (#3688).
+    vision_downgrade_reason: str | None = None
 
 
 class EnginePool:
@@ -3238,8 +3242,12 @@ class EnginePool:
 
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
-                    logger.info(
-                        f"Successfully loaded {model_id} as LLM (fallback from VLM)"
+                    entry.vision_downgrade_reason = str(start_error)
+                    logger.warning(
+                        f"Loaded {model_id} as LLM (fallback from VLM): the "
+                        f"model answers text but can no longer see images, "
+                        f"and image input will be refused until the VLM load "
+                        f"error above is resolved"
                     )
                 else:
                     raise
@@ -3268,6 +3276,13 @@ class EnginePool:
             self._current_model_memory += resident_size
             load_completed = True
             self._clear_load_failure(entry)
+            if isinstance(VLMBatchedEngine, type) and isinstance(
+                engine, VLMBatchedEngine
+            ):
+                # A load that does produce a vision engine retires the
+                # downgrade note. An entry that keeps coming back text-only
+                # keeps it, so image input stays refused rather than dropped.
+                entry.vision_downgrade_reason = None
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.

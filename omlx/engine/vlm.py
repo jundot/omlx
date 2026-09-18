@@ -108,6 +108,7 @@ COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
+QWEN35_MOE_MODEL_TYPE = "qwen3_5_moe"
 
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
@@ -1134,6 +1135,35 @@ def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
     )
 
 
+class _SafeOpenMetadataWrapper:
+    """``safe_open`` handle that hides ``format=mlx`` from its metadata.
+
+    mlx-vlm runs ``Model.sanitize`` only for checkpoints that do not declare
+    the MLX format, so a load that needs a sanitize pass over MLX-format
+    shards has to make them look unconverted for the duration of that load.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __enter__(self):
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._inner.__exit__(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def metadata(self):
+        metadata = self._inner.metadata()
+        if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+            metadata = dict(metadata)
+            metadata.pop("format", None)
+        return metadata
+
+
 def _model_shard_matcher(model_dir: Path):
     """Return a predicate for safetensors shards directly under *model_dir*."""
     target_dir = model_dir.resolve()
@@ -1175,27 +1205,6 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     original_safe_open = safetensors.safe_open
     original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
     is_target_shard = _model_shard_matcher(model_dir)
-
-    class _SafeOpenMetadataWrapper:
-        def __init__(self, inner):
-            self._inner = inner
-
-        def __enter__(self):
-            self._inner.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._inner.__exit__(*args)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-        def metadata(self):
-            metadata = self._inner.metadata()
-            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
-                metadata = dict(metadata)
-                metadata.pop("format", None)
-            return metadata
 
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
@@ -1331,6 +1340,87 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
         )
         with ple_load_resources():
             yield
+    finally:
+        safetensors.safe_open = original_safe_open
+
+
+def _is_unsanitized_mtp_expert_key(key: str) -> bool:
+    """True for an MTP MoE weight still keyed one-tensor-per-routed-expert.
+
+    ``mtp.layers.<n>.mlp.experts.*`` is the checkpoint spelling; the runtime
+    binds the stacked ``mtp.layers.<n>.mlp.switch_mlp.*`` form instead, so a
+    key of this shape has no place to land until ``sanitize`` stacks it.
+    """
+    head, separator, _ = key.partition(".mlp.experts.")
+    return bool(separator) and "mtp.layers." in head
+
+
+def _checkpoint_has_unsanitized_mtp_experts(model_dir: Path) -> bool:
+    """Scan safetensors headers for an MTP head in the per-expert layout.
+
+    Header-only: reads each shard's tensor names, never weight data.
+    """
+    import safetensors
+
+    for shard in sorted(model_dir.glob("*.safetensors")):
+        try:
+            with safetensors.safe_open(str(shard), framework="np") as f:
+                keys = tuple(f.keys())
+            if any(_is_unsanitized_mtp_expert_key(key) for key in keys):
+                return True
+        except Exception as e:
+            logger.debug("Could not scan %s for MTP expert weights: %s", shard, e)
+    return False
+
+
+@contextlib.contextmanager
+def _force_qwen35_moe_mtp_sanitize_on_load(model_dir: Path):
+    """Run the Qwen3.5-MoE sanitize pass over an MLX-format MTP head.
+
+    mlx-vlm skips ``Model.sanitize`` when the safetensors metadata declares
+    ``format=mlx``. That is fine for a converted backbone, which is written
+    in the runtime's own layout — but an MTP head merged in from a separate
+    export can still carry its routed experts one tensor per expert, and
+    stacking those into ``switch_mlp.*`` is something only sanitize does.
+    Without it the head's ``experts.<i>.*`` tensors reach strict
+    ``load_weights`` with nothing to bind to, the VLM load raises
+    "Received N parameters not in model", and the pool falls back to a
+    text-only engine — the model keeps answering and stops seeing images
+    (#3688).
+
+    Hide only the ``format=mlx`` metadata, and only for the checkpoints that
+    carry such a head, so every other MLX-format checkpoint keeps skipping
+    sanitize exactly as it does today.
+    """
+    if _read_config_model_type(model_dir) != QWEN35_MOE_MODEL_TYPE:
+        yield
+        return
+    if not _is_mlx_format_safetensors_dir(model_dir):
+        yield
+        return
+    if not _checkpoint_has_unsanitized_mtp_experts(model_dir):
+        yield
+        return
+
+    import safetensors
+
+    original_safe_open = safetensors.safe_open
+    is_target_shard = _model_shard_matcher(model_dir)
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        if is_target_shard(filename):
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    safetensors.safe_open = _patched_safe_open
+    try:
+        logger.info(
+            "Qwen3.5 MoE MTP head ships per-expert weights; running the "
+            "mlx-vlm sanitize pass over the MLX-format checkpoint %s",
+            model_dir.name,
+        )
+        yield
     finally:
         safetensors.safe_open = original_safe_open
 
@@ -1936,6 +2026,7 @@ class VLMBatchedEngine(BaseEngine):
                 _transpose_qwen35_mlx_vision_patch_embed_on_load(
                     Path(self._model_name)
                 ),
+                _force_qwen35_moe_mtp_sanitize_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
