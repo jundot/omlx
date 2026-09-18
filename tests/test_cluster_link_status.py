@@ -601,13 +601,20 @@ def test_an_address_on_a_down_interface_is_not_offered():
     assert ("en6", "10.0.1.9") not in addresses
 
 
-def test_loopback_and_self_assigned_addresses_are_never_a_shared_subnet():
-    """Every Mac has 127.0.0.1, and 169.254 means DHCP failed on both ends."""
+def test_loopback_is_never_a_shared_subnet_but_a_self_assigned_address_is_kept():
+    """Every Mac has 127.0.0.1 — that proves nothing about reaching a peer.
+
+    A 169.254 address is not excluded here: a direct Thunderbolt Bridge cable
+    with no DHCP relay legitimately self-assigns one (Apple's own recommended
+    setup with no server on the link), and shared_link_addresses' downstream
+    route+ping/TCP verification is what proves or refutes it — not a blanket
+    address-range guess made before that check gets a chance to run.
+    """
 
     addresses = {a.address for a in parse_interface_addresses(_LAPTOP_IFCONFIG)}
 
     assert "127.0.0.1" not in addresses
-    assert not any(address.startswith("169.254.") for address in addresses)
+    assert "169.254.138.14" in addresses
 
 
 def test_a_hex_flag_word_does_not_push_an_address_onto_the_interface_above_it():
@@ -645,6 +652,31 @@ def test_a_renumbered_port_resolves_to_the_name_and_address_the_host_has_now():
     link = shared_link_addresses(_laptop(), _studio())
 
     assert (link.source.interface, link.source.address) == ("en4", "10.0.1.1")
+
+
+def test_a_self_assigned_thunderbolt_bridge_wins_over_the_routable_lan():
+    """A direct cable with no DHCP relay self-assigns a 169.254 address — it
+    is not routable to the internet, but it is still the faster, preferred
+    link, and its rank does not depend on macOS's network service order."""
+
+    laptop = _host(
+        "a",
+        [("en0", "192.168.211.40", 24), ("en7", "169.254.220.76", 16)],
+        thunderbolt={"en7"},
+    )
+    studio = _host(
+        "b",
+        [("en0", "192.168.211.41", 24), ("en7", "169.254.148.177", 16)],
+        thunderbolt={"en7"},
+    )
+
+    link = shared_link_addresses(laptop, studio)
+
+    assert link.kind == "thunderbolt"
+    assert (link.source.address, link.peer.address) == (
+        "169.254.220.76",
+        "169.254.148.177",
+    )
 
 
 def test_without_a_fast_link_any_common_subnet_is_still_used():
