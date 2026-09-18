@@ -15,6 +15,38 @@ def mgr(tmp_path):
 
 
 class TestProfilesCRUD:
+    @pytest.mark.parametrize(
+        "scheme,bits", [("affine4", 4), ("affine8", 8)]
+    )
+    def test_affine_profile_save_load_and_apply(self, tmp_path, scheme, bits):
+        manager = ModelSettingsManager(tmp_path)
+        settings = {"turboquant_kv_scheme": scheme, "turboquant_kv_bits": bits}
+        manager.save_profile("m", "affine", scheme.title(), None, settings)
+        manager = ModelSettingsManager(tmp_path)
+        assert manager.get_profile("m", "affine")["settings"] == settings
+        applied = manager.apply_profile("m", "affine")
+        assert applied.turboquant_kv_scheme == scheme
+        assert applied.turboquant_kv_bits == bits
+
+    def test_invalid_profile_update_preserves_saved_profile(self, mgr):
+        mgr.save_profile("m", "kv", "KV", None, {"turboquant_kv_scheme": "affine4"})
+        original = mgr.get_profile("m", "kv")
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.update_profile("m", "kv", settings={
+                "turboquant_kv_scheme": "affine4", "turboquant_kv_bits": 3,
+            })
+        assert mgr.get_profile("m", "kv") == original
+
+    def test_partial_profile_validates_against_base_settings(self, mgr):
+        mgr.save_profile("m", "bits", "Bits", None, {"turboquant_kv_bits": 3})
+        mgr.set_settings("m", ModelSettings(turboquant_kv_scheme="affine4"))
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.apply_profile("m", "bits")
+        assert mgr.get_settings("m").turboquant_kv_scheme == "affine4"
+        assert mgr.get_settings("m").turboquant_kv_bits == 4
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.save_profile("m", "bad", "Bad", None, {"turboquant_kv_bits": 3})
+
     def test_list_profiles_empty_by_default(self, mgr):
         assert mgr.list_profiles("model-a") == []
 
@@ -159,6 +191,73 @@ class TestProfilesCRUD:
         api_names = [p["api_name"] for p in manager.list_profiles("m")]
 
         assert api_names == ["fast-chat", "fast-chat-2"]
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    def test_legacy_turboquant_profiles_gain_explicit_scheme(self, tmp_path, bits):
+        profiles_file = tmp_path / "model_profiles.json"
+        profiles_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profiles": {
+                        "m": {
+                            "legacy": {
+                                "name": "legacy",
+                                "display_name": "Legacy TurboQuant",
+                                "created_at": "2026-06-01T00:00:00+00:00",
+                                "updated_at": "2026-06-01T00:00:00+00:00",
+                                "settings": {
+                                    "turboquant_kv_enabled": True,
+                                    "turboquant_kv_bits": bits,
+                                },
+                            }
+                        }
+                    },
+                }
+            )
+        )
+
+        manager = ModelSettingsManager(tmp_path)
+
+        assert manager.get_profile("m", "legacy")["settings"] == {
+            "turboquant_kv_enabled": True,
+            "turboquant_kv_bits": bits,
+            "turboquant_kv_scheme": "turboquant",
+        }
+        persisted = json.loads(profiles_file.read_text())
+        assert (
+            persisted["profiles"]["m"]["legacy"]["settings"][
+                "turboquant_kv_scheme"
+            ]
+            == "turboquant"
+        )
+
+    def test_sampling_only_profile_does_not_gain_kv_scheme(self, tmp_path):
+        profiles_file = tmp_path / "model_profiles.json"
+        profiles_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profiles": {
+                        "m": {
+                            "sampling": {
+                                "name": "sampling",
+                                "display_name": "Sampling",
+                                "created_at": "2026-06-01T00:00:00+00:00",
+                                "updated_at": "2026-06-01T00:00:00+00:00",
+                                "settings": {"temperature": 0.2},
+                            }
+                        }
+                    },
+                }
+            )
+        )
+
+        manager = ModelSettingsManager(tmp_path)
+
+        assert manager.get_profile("m", "sampling")["settings"] == {
+            "temperature": 0.2
+        }
 
     def test_profile_api_name_migration_avoids_random_internal_name_fallback(
         self, tmp_path
@@ -323,6 +422,64 @@ class TestApplyProfile:
         assert persisted.presence_penalty == 1.5
         assert persisted.vlm_mtp_enabled is False
         assert persisted.active_profile_name == "penalty"
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    def test_apply_legacy_turboquant_profile_overrides_affine_base(
+        self, tmp_path, bits
+    ):
+        profiles_file = tmp_path / "model_profiles.json"
+        profiles_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profiles": {
+                        "m": {
+                            "legacy": {
+                                "name": "legacy",
+                                "display_name": "Legacy TurboQuant",
+                                "created_at": "2026-06-01T00:00:00+00:00",
+                                "updated_at": "2026-06-01T00:00:00+00:00",
+                                "settings": {
+                                    "turboquant_kv_enabled": True,
+                                    "turboquant_kv_bits": bits,
+                                },
+                            }
+                        }
+                    },
+                }
+            )
+        )
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings(
+            "m",
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme="affine4",
+                turboquant_kv_bits=4,
+            ),
+        )
+
+        applied = manager.apply_profile("m", "legacy")
+
+        assert applied.turboquant_kv_scheme == "turboquant"
+        assert applied.turboquant_kv_bits == bits
+
+    def test_sampling_only_profile_inherits_affine_engine_settings(self, mgr):
+        mgr.set_settings(
+            "m",
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme="affine8",
+                turboquant_kv_bits=8,
+            ),
+        )
+        mgr.save_profile("m", "sampling", "Sampling", None, {"temperature": 0.2})
+
+        applied = mgr.apply_profile("m", "sampling")
+
+        assert applied.turboquant_kv_enabled is True
+        assert applied.turboquant_kv_scheme == "affine8"
+        assert applied.turboquant_kv_bits == 8
 
     def test_apply_tolerates_legacy_empty_string_values(self, tmp_path):
         profiles_file = tmp_path / "model_profiles.json"
@@ -737,6 +894,53 @@ class TestExposedProfileRequestSettings:
         assert settings.mtp_enabled is True
         assert mgr.get_settings("qwen-base").temperature == 0.2
         assert mgr.get_settings("qwen-base").mtp_enabled is False
+
+    def test_legacy_turboquant_exposed_profile_overrides_affine_base(self, tmp_path):
+        profiles_file = tmp_path / "model_profiles.json"
+        profiles_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profiles": {
+                        "qwen-base": {
+                            "legacy": {
+                                "name": "legacy",
+                                "display_name": "Legacy TurboQuant",
+                                "api_name": "legacy",
+                                "created_at": "2026-06-01T00:00:00+00:00",
+                                "updated_at": "2026-06-01T00:00:00+00:00",
+                                "settings": {
+                                    "turboquant_kv_enabled": True,
+                                    "turboquant_kv_bits": 8,
+                                },
+                                "expose_as_model": True,
+                            }
+                        }
+                    },
+                }
+            )
+        )
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme="affine4",
+                turboquant_kv_bits=4,
+            ),
+        )
+
+        runtime = manager.get_exposed_profile_runtime_settings_for_request(
+            "qwen-base:legacy"
+        )
+        listed = manager.list_exposed_profile_models()[0]
+
+        assert runtime is not None
+        _, settings = runtime
+        assert settings.turboquant_kv_scheme == "turboquant"
+        assert settings.turboquant_kv_bits == 8
+        assert listed["settings"]["turboquant_kv_scheme"] == "affine4"
+        assert manager.list_profiles("qwen-base")[0]["has_engine_fields"] is True
 
     def test_request_settings_fall_back_to_resolved_physical_model(self, mgr):
         mgr.set_settings(

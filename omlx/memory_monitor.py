@@ -245,6 +245,8 @@ class MemoryMonitor:
         self._head_dim: Optional[int] = None
         # KV storage width; may be fractional with TurboQuant.
         self._dtype_size: float = 2
+        self._prefill_kv_dtype_size: float = 2
+        self._affine_prefill: bool = False
         self._kv_bytes_per_token_override: float | None = None
         # SDPA score-matrix width = model compute/activation dtype, distinct from
         # _dtype_size (which the scheduler may override to a fractional TurboQuant
@@ -458,6 +460,8 @@ class MemoryMonitor:
         rotating_layer_specs: Sequence[tuple[int, int]] | None = None,
         prefill_memory_profile: PrefillMemoryProfile | None = None,
         ane_prefill_transient_bytes: int = 0,
+        prefill_kv_dtype_size: float | None = None,
+        affine_prefill: bool = False,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -489,11 +493,19 @@ class MemoryMonitor:
             prefill_memory_profile: Optional model-specific strategy for cache
                 and prefill transient shapes that the uniform estimator cannot
                 represent.
+            prefill_kv_dtype_size: KV width while prefill runs, before any
+                conversion for decode. Defaults to the stored KV width.
+            affine_prefill: Reserve one unpacked FP32 layer and bounded
+                attention scores for incremental signed-affine prefill.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._dtype_size = dtype_size
+        self._prefill_kv_dtype_size = (
+            dtype_size if prefill_kv_dtype_size is None else prefill_kv_dtype_size
+        )
+        self._affine_prefill = affine_prefill
         self._score_dtype_size = (
             compute_dtype_size
             if compute_dtype_size and compute_dtype_size > 0
@@ -669,7 +681,7 @@ class MemoryMonitor:
             layers = self._num_layers or 0
         kv_heads = self._num_kv_heads or 0
         dim = self._head_dim or 0
-        dtype = self._dtype_size
+        dtype = self._prefill_kv_dtype_size
 
         if not (layers and kv_heads and dim):
             return 0
@@ -849,7 +861,7 @@ class MemoryMonitor:
         # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
-        attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
+        attn = self.estimate_chunk_transient_bytes(eff_chunk, full_kv_len)
 
         # KV growth attributable to this request: only the new tokens.
         # The cached portion is already counted in the caller's current-usage
@@ -898,7 +910,19 @@ class MemoryMonitor:
                     gathered_core=gathered_core,
                 )
             return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
-        return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
+        transient = self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
+        if self._affine_prefill and n_tokens > 0 and kv_len > 0:
+            from .affine4 import _MAX_SCORE_ELEMENTS
+
+            heads = self._num_attention_heads or self._num_kv_heads or 0
+            kv_heads = self._num_kv_heads or 0
+            dim = self._head_dim or 0
+            rows = max(1, _MAX_SCORE_ELEMENTS // max(1, heads * kv_len))
+            scores = heads * min(n_tokens, rows) * kv_len * 4
+            unpacked_kv = 2 * kv_heads * kv_len * dim * 4
+            query_and_output = 2 * heads * n_tokens * dim * 4
+            transient = max(transient, unpacked_kv + scores + query_and_output)
+        return transient
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
