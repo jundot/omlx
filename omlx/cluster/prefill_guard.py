@@ -107,16 +107,42 @@ class RankPrefillGuard:
         node_id: str = "",
         ceiling_bytes: int = 0,
         prefill_step_size: int = _DEFAULT_PREFILL_STEP,
+        memory_guard_tier: str = "",
     ) -> None:
         self._monitor = monitor
         self._rank = int(rank)
         self._node_id = node_id
         self._ceiling = max(0, int(ceiling_bytes))
         self._step = max(1, int(prefill_step_size))
+        self._tier = str(memory_guard_tier or "")
 
     @property
     def active(self) -> bool:
         return self._monitor is not None and self._ceiling > 0
+
+    def _live_ceiling(self) -> int:
+        """Re-read the admission ceiling for this check (#3527).
+
+        The build-time ceiling is sampled seconds after the weights land —
+        free memory's transient minimum — and freezing it rejected slices
+        the settled host holds fine (49.7 GiB frozen vs 112.1 GiB honest).
+        Single-node admission reads the dynamic component per request so
+        other applications' pressure shows up immediately; a cluster rank
+        now does the same. The build-time value remains the fallback when
+        the live read is unavailable, and a guard built without a tier
+        keeps its fixed ceiling exactly as before.
+        """
+
+        if not self._tier:
+            return self._ceiling
+        try:
+            from .memory_guard import ceiling_breakdown
+
+            live = int(ceiling_breakdown(self._tier).get("hard_limit", 0))
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("live ceiling read failed; using build-time value")
+            return self._ceiling
+        return live or self._ceiling
 
     def check(
         self,
@@ -144,7 +170,7 @@ class RankPrefillGuard:
             raise_if_prefill_exceeds(
                 self._monitor,
                 prefill_memory_guard=True,
-                hard_limit_bytes=self._ceiling,
+                hard_limit_bytes=self._live_ceiling(),
                 current_usage_bytes=usage,
                 prefill_step_size=self._step,
                 num_prompt_tokens=int(num_prompt_tokens),
@@ -261,4 +287,5 @@ def build_guard(
         node_id=node_id,
         ceiling_bytes=ceiling,
         prefill_step_size=prefill_step_size,
+        memory_guard_tier=memory_guard_tier,
     )
