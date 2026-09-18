@@ -231,6 +231,10 @@ def load(model_path, *, is_vlm):
         weights.update(chunk)
     _install_packed(language_model, config["modules"], weights, prefix=prefix)
     model.load_weights(list(weights.items()), strict=True)
+    if is_vlm:
+        from .decode import CapacityPreservingModel
+
+        language_model.model.__class__ = CapacityPreservingModel
     if os.environ.get("OMLX_PRISM_FP16_ACTIVATIONS", "0") == "1":
         _enable_fp16_activations(language_model)
         model._omlx_prism_activation_signature = "prism_fp16_v1"

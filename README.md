@@ -325,7 +325,8 @@ adapter for their affine 2-bit/group-128 weights. Keep the original `config.json
 module manifest, tokenizer and weights together; do not change `model_type` to
 `qwen3_5`. The adapter applies the required activation and inverse embedding
 transforms for both text-only and vision packs. It does not execute Python files
-from the downloaded model's `runtime/` directory.
+from the downloaded model's `runtime/` directory. Single-row decoding preserves
+allocated attention-cache capacity instead of copying the full prefix per token.
 
 For these packs, `OMLX_PRISM_FP16_ACTIVATIONS=1` opts into FP16 activations and
 attention caches. FP32 normalization/convolution weights otherwise promote the

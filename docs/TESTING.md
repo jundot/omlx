@@ -133,7 +133,8 @@ Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed 
 
 # Prism Hadamard model loading
 
-Run `python -m pytest tests/test_prism_hadamard.py tests/test_model_loading.py`.
+Run `python -m pytest tests/test_prism_hadamard.py tests/test_prism_decode.py
+tests/test_model_loading.py tests/test_active_models_visibility.py`.
 The tests compare packed projection and embedding results against an independent
 dense Hadamard matrix, load tiny text and vision checkpoints through the production
 dispatch, and check malformed packs, strict weight loading and image-message format.
@@ -181,3 +182,69 @@ Run `python -m pytest tests/test_sdpa256_attention.py` for the FP32 bounded
 attention regression. On M1, forcing MLX's fused FP32 head-dim-256 kernel fails
 at evaluation with a threadgroup-memory error; the fallback must remain bounded
 and preserve FP32 rather than silently narrowing attention inputs.
+
+
+## Prism singleton decode capacity
+
+Generate at least 192 tokens after a long prompt; two-token smoke tests do not
+expose cache-buffer growth. Verify stable memory, visible prefill progress,
+prefix reuse, and the transition from two concurrent replies to one. The tiny
+model tests compare logits and cache contents with upstream decoding, including
+padded batches, multi-row batches, prefill and hidden-state capture.
+
+For a cheap, isolated cache-copy reproduction, set `MODEL_DIR` and run the
+following with `BASELINE=1` and `BASELINE=0` in separate processes. Use identical
+`OMLX_PRISM_FP16_ACTIVATIONS` and an idle GPU. This constructs **synthetic zero
+KV states** at 66,500 tokens: it measures decoder throughput and allocation,
+not semantic quality or full-server latency. The baseline restores mlx-vlm's
+original singleton decoder, retaining this PR's loader and precision settings.
+A 40 GiB allocation guard limits the baseline's buffer growth. Compare equal
+32-token runs first; then extend the fixed run with `STEPS=192`.
+
+```python
+import gc, os, time
+import mlx.core as mx
+from mlx_lm.generate import BatchGenerator
+from mlx_vlm.models.qwen3_5.language import Qwen3_5Model
+from omlx.models.vlm import VLMModelAdapter
+from omlx.utils.model_loading import maybe_load_custom_quantization
+
+model, _ = maybe_load_custom_quantization(os.environ["MODEL_DIR"], is_vlm=True)
+lm = model.language_model
+if os.environ.get("BASELINE") == "1":
+    lm.model.__class__ = Qwen3_5Model
+cache = lm.make_cache()
+logits = lm(mx.array([[100]]), cache=cache).logits
+mx.eval(logits, [c.state for c in cache])
+length = 66500
+for c in cache:
+    if getattr(c, "keys", None) is not None:
+        shape = list(c.keys.shape)
+        shape[2] = ((length + 255) // 256) * 256
+        c.keys = mx.zeros(shape, dtype=c.keys.dtype)
+        c.values = mx.zeros(shape, dtype=c.values.dtype)
+        c.offset = length
+mx.eval([c.state for c in cache])
+del logits
+gc.collect()
+mx.clear_cache()
+steps = int(os.environ.get("STEPS", "32"))
+bg = BatchGenerator(VLMModelAdapter(model), max_tokens=steps + 5,
+                    stop_tokens=[], prefill_batch_size=1, completion_batch_size=1)
+bg.insert([[100]], caches=[cache])
+cache = None
+start = time.monotonic()
+try:
+    for i in range(steps):
+        list(bg.next_generated())
+        active, pool = mx.get_active_memory(), mx.get_cache_memory()
+        if active + pool > 40 * 1024**3:
+            break
+    print({"tokens": i + 1, "tok/s": (i + 1) / (time.monotonic() - start),
+           "active_GiB": active / 1024**3, "pool_GiB": pool / 1024**3})
+finally:
+    bg.close()
+```
+
+Separately compare real-prompt outputs before and after the decoder change;
+synthetic KV benchmarks cannot validate language or image behavior.

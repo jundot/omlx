@@ -39,6 +39,30 @@ class FakePrefillTracker:
         return [{"request_id": "prefill-1", "processed": 10, "total": 20}]
 
 
+def test_prefill_visibility_uses_scheduler_cache_namespace():
+    from omlx.prefill_progress import PrefillProgressTracker
+
+    namespace = "/models/model-a:precision-v1"
+    tracker = PrefillProgressTracker()
+    tracker.update("prefill-1", 2048, 8192, namespace)
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(model_name=namespace),
+        snapshot_for_admin=lambda: {"running_by_id": {}, "waiting": []},
+    )
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=FakePool(scheduler)),
+        patch.object(admin_routes, "_get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=tracker),
+    ):
+        data = admin_routes._build_active_models_data()
+    assert data["total_active_requests"] == 1
+    assert data["models"][0]["id"] == "model-a"
+    assert data["models"][0]["prefilling"][0]["processed"] == 2048
+    assert scheduler.config.model_name == namespace
+
+
 def test_active_models_generation_includes_activity_and_waiting_rows():
     running_request = SimpleNamespace(
         request_id="gen-1",
