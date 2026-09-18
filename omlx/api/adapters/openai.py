@@ -110,7 +110,7 @@ class OpenAIAdapter(BaseAdapter):
         # Separate thinking from content
         raw_text = clean_special_tokens(response.text) if response.text else ""
         thinking_content, regular_content = extract_thinking(raw_text)
-        content = regular_content.strip() if regular_content else None
+        content = regular_content.strip() if regular_content else ""
 
         # Determine finish reason
         finish_reason = (
@@ -158,7 +158,7 @@ class OpenAIAdapter(BaseAdapter):
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
         delta = ChatCompletionChunkDelta(
-            content=chunk.text if chunk.text else None,
+            content=chunk.text if chunk.text else "",
             reasoning_content=chunk.reasoning_content if chunk.reasoning_content else None,
             tool_calls=chunk.tool_call_delta,
         )
