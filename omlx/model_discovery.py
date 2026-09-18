@@ -581,6 +581,30 @@ def _has_vision_subconfig(config: dict) -> bool:
     )
 
 
+def _index_has_language_model_root(model_path: Path) -> bool:
+    """True when the weight index declares a ``language_model.`` weight root.
+
+    Checkpoints exported by OptiQ / oQ-style pipelines (e.g. the Qwen3.8-27B
+    family) place all language weights under a ``language_model.`` prefix and
+    the vision tower under ``vision_tower.*`` / ``model.visual.*``.  The
+    mlx-lm text loader strips the ``language_model.`` prefix and drops the
+    vision prefixes in ``sanitize()``.  The presence of
+    ``language_model.``-rooted language weights therefore signals a checkpoint
+    that is intentionally loadable by the text-only (mlx-lm) path, even when
+    ``vision_config`` is non-empty.
+
+    Returns ``False`` when there is no index or it cannot be read.
+    """
+    index = model_path / "model.safetensors.index.json"
+    try:
+        weight_map = json.loads(index.read_text(encoding="utf-8")).get(
+            "weight_map", {}
+        )
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return any(k.startswith("language_model.") for k in weight_map)
+
+
 def _architecture_indicates_causal_lm(architectures: list[str]) -> bool:
     """True when ``architectures`` describe a text causal LM (not mlx-audio STS).
 
@@ -738,7 +762,20 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for VLM: presence of a vision sub-config (fallback heuristic).
     # Catch-all for VLMs that aren't yet listed in VLM_MODEL_TYPES.
     if _has_vision_subconfig(config):
-        return "vlm"
+        # A vision sub-config is not always decisive: some families (e.g.
+        # qwen3_5) ship text-capable quants that keep a non-empty
+        # vision_config while the tower is dropped by mlx-lm's sanitize().
+        # The checkpoint's weight structure reveals this: weights rooted
+        # under ``language_model.`` are built for the text-only load path.
+        if _index_has_language_model_root(model_path):
+            logger.info(
+                "Model carries a vision sub-config but its weight index "
+                "declares a language_model root — treating as LLM "
+                "(text-capable quant where mlx-lm drops the vision tower "
+                "via sanitize())"
+            )
+        else:
+            return "vlm"
 
     # Check for audio models — architectures take priority over model_type.
     # Only top-level architectures/model_type are inspected; nested audio_config
