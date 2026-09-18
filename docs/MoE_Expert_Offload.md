@@ -91,6 +91,9 @@ The settings API and model loader use the same eligibility check.
 
 The common adapter supports stacked `[num_experts, ...]` quantized
 `SwitchGLU` projections and the per-expert layout used by OLMoE conversions.
+Both are read from either an MXFP checkpoint or a community `mlx_lm` affine
+conversion, whose projections carry a U32 weight with float scales and biases
+and declare their format in the checkpoint's own `quantization` dict.
 All backbone layers must have the expected tensor names, shapes, storage
 dtypes, and quantization metadata. Fused or renamed projections, missing
 experts, unquantized weights, and per-expert linear bias are rejected.
@@ -131,12 +134,14 @@ where the kernel path is identical, rounding-bounded where it is not.
 
 ## DeepSeek V4.1
 
-DeepSeek V4.1 uses its own expert adapter and loader. Both the original
-checkpoint and oMLX converted MXFP/oQ checkpoints are supported. Expert
-weights stay in the existing safetensors files. The resident fraction applies
-to the routed experts in each backbone layer, with capacity floored at the
-number selected by one token. Shared experts, attention, and other backbone
-weights remain resident.
+DeepSeek V4.1 uses its own expert adapter and loader. The original checkpoint,
+oMLX converted MXFP/oQ checkpoints, and community `mlx_lm` affine conversions
+are supported. Expert weights stay in the existing safetensors files; an
+affine source reports its format in the checkpoint's `quantization` dict and
+counts its packed weight plus BF16 scales and biases toward the resident set.
+The resident fraction applies to the routed experts in each backbone layer,
+with capacity floored at the number selected by one token. Shared experts,
+attention, and other backbone weights remain resident.
 
 Non-resident experts are read with positional `pread` calls on a small
 reader pool of their own, not through the Engram row-gather mapping: an

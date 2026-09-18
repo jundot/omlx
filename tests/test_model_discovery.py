@@ -1947,18 +1947,19 @@ class TestHfCacheDiscovery:
             ),
             # The bf16 source layout (the repo's own test fixture) loads too.
             ({"model_type": "deepseek_v41"}, True),
-            # Unknown conversion version, or an affine conversion without the
-            # oMLX spec: the V4.1 loader has no path for these.
+            # An unknown conversion version stays hidden.
             (
                 {"model_type": "deepseek_v41", "omlx_deepseek_v41": {"version": 2}},
                 False,
             ),
+            # Community mlx_lm affine conversions declare their format in a
+            # top-level quantization dict instead of the oMLX spec.
             (
                 {
                     "model_type": "deepseek_v41",
                     "quantization": {"bits": 2, "group_size": 64, "mode": "affine"},
                 },
-                False,
+                True,
             ),
             (
                 {
@@ -1966,8 +1967,43 @@ class TestHfCacheDiscovery:
                     "quantization_config": {"quant_method": "fp8"},
                     "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
                 },
+                True,
+            ),
+            # A quantization declaration the V4.1 loader cannot read stays
+            # hidden rather than failing at load time.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"quant_method": "fp8"},
+                },
                 False,
             ),
+            # The loader reads the affine mode only, so a declared mxfp4/mxfp8
+            # source — and a width that is not an integer — stays hidden too
+            # instead of being admitted and then raising "Unsupported source
+            # quantization mode" at load time.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 4, "group_size": 64, "mode": "mxfp4"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": True, "group_size": 64, "mode": "affine"},
+                },
+                False,
+            ),
+            ({"model_type": "deepseek_v41", "quantization": "mlx"}, False),
             (
                 {"model_type": "deepseek_v4", "omlx_deepseek_v41": {"version": 1}},
                 False,

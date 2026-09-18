@@ -79,7 +79,11 @@ expert reads from shared shards and any expert slab read through the Engram
 mapping. Further cases check that consumed read buffers are released within the
 in-flight byte window and pin the serial LRU order under concurrent reads,
 expert-boundary chunking of sorted routes, and the fit-to-budget residency
-helper against the admission arithmetic. Run alongside `test_deepseek_v41_offload.py`,
+helper against the admission arithmetic. `tests/test_deepseek_v41_affine_source.py`
+covers community `mlx_lm` affine source checkpoints: packed and declared-dense
+projections, exact force-dense dequantization, the affine Engram table spec, a
+convert round-trip against a direct load, the declared-format resolver, and
+offload eligibility. Run alongside `test_deepseek_v41_offload.py`,
 `test_moe_expert_offload.py`, and the engine-pool/model-settings suites.
 `node tests/moe_expert_offload_ui.test.cjs` checks the actual dashboard
 save/reopen payload and speculative-decoding toggle exclusion.
