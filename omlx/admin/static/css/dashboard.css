@@ -1160,6 +1160,16 @@
         }
     }
 
+    /* Keep usage columns readable inside narrow screens and dashboard blocks.
+       The existing scroll container owns overflow, not the page. */
+    .usage-model-table { min-width: 48rem; }
+    .usage-model-table th:first-child {
+        min-width: 14rem;
+        max-width: 20rem;
+        overflow-wrap: anywhere;
+    }
+    .usage-model-table td { white-space: nowrap; }
+
     /* === Dashboard layout grid (GridStack) === */
     .dash-grid > .dash-block-parked { display: none; }
     /* Item content is absolutely positioned by GridStack; let shadows, tooltips

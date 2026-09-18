@@ -1,7 +1,7 @@
 <section x-data="usageHistory()" aria-labelledby="usage-heading">
     <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
         <h3 id="usage-heading" class="text-xl font-bold">{{ t('usage.heading') }}</h3>
-        <div class="flex gap-2">
+        <div class="flex flex-wrap gap-2 min-w-0 max-w-full">
             <select x-model="range" @change="model = ''; load()" aria-label="{{ t('usage.range') }}" class="border rounded-lg px-3 py-2 text-sm">
                 <option value="today">{{ t('usage.today') }}</option>
                 <option value="yesterday">{{ t('usage.yesterday') }}</option>
@@ -10,7 +10,7 @@
                 <option value="90d">{{ t('usage.90d') }}</option>
                 <option value="month">{{ t('usage.month') }}</option>
             </select>
-            <select x-model="model" @change="load()" aria-label="{{ t('usage.model') }}" class="border rounded-lg px-3 py-2 text-sm max-w-48">
+            <select x-model="model" @change="load()" aria-label="{{ t('usage.model') }}" class="border rounded-lg px-3 py-2 text-sm min-w-0 max-w-48">
                 <option value="">{{ t('usage.all_models') }}</option>
                 <template x-for="id in models" :key="id"><option :value="id" x-text="id"></option></template>
             </select>
@@ -35,8 +35,8 @@
             </div>
             <p class="text-sm text-neutral-500 mb-3" x-show="data.totals.requests === 0">{{ t('usage.empty') }}</p>
             <div class="border border-neutral-200 rounded-xl overflow-hidden mb-5">
-                <div class="overflow-x-auto">
-                    <table class="w-full text-sm text-right">
+                <div class="overflow-x-auto" tabindex="0" role="region" aria-label="{{ t('usage.heading') }}">
+                    <table class="usage-model-table w-full text-sm text-right">
                         <thead class="bg-neutral-50 text-xs text-neutral-500">
                             <tr>
                                 <th class="p-3 text-left">{{ t('usage.model') }}</th>
@@ -51,7 +51,7 @@
                         <tbody>
                             <template x-for="row in data.models" :key="row.model_id">
                                 <tr class="border-t border-neutral-200">
-                                    <th class="p-3 text-left font-medium break-all" x-text="row.model_id"></th>
+                                    <th scope="row" class="p-3 text-left font-medium" x-text="row.model_id"></th>
                                     <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key">
                                         <td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td>
                                     </template>
