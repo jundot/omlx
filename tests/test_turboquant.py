@@ -1369,3 +1369,15 @@ def test_batch_tq_state_restore_resets_phys_end():
         f"stale batch-mode _phys_end leaked through restore "
         f"({batch._phys_end} != 20)"
     )
+
+
+def test_turboquant_safe_kernel_patch():
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+    import mlx_vlm.turboquant as _tq
+
+    apply_turboquant_attention_patch()
+    # At dim > 256, the kernel hook must return None to protect against 1024 > 640 threadgroup overflow
+    assert _tq._fused_mse_decode_kernel(4, 4, 512) is None
+    # At dim <= 256, the kernel hook passes through
+    assert _tq._fused_mse_decode_kernel(4, 4, 256) is not None
+

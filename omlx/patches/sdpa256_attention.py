@@ -42,7 +42,7 @@ _PATCHED = False
 HEAD_DIM = 256
 # Force the bounded kernel only once the context is long enough that the
 # default unfused route's O(L^2) score matrix becomes a memory problem.
-_SDPA256_MIN_KV_LEN = 8192
+_SDPA256_MIN_KV_LEN = int(os.environ.get("OMLX_SDPA256_MIN_KV_LEN", "8192"))
 # Decode-shaped multi-row calls (MTP verify: q_len = 1 + draft depth <= 9)
 # do not need the forced full-attention route. Below this floor the stock path's
 # score matrix is at most n_q * 15 * kv_len and is not a memory problem.
@@ -155,7 +155,7 @@ def _tiled_route_required(queries, keys) -> bool:
             batch * n_q,
             q_len,
             keys.shape[-2],
-            HEAD_DIM,
+            queries.shape[-1],
             # The unfused fallback materializes fp32 scores even for bf16
             # inputs (issue #2204 follow-up): pricing it at the query dtype
             # halves the predicted matrix and admits OOM spikes at long
@@ -327,7 +327,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
     try:
         if queries.shape[-2] < _SDPA256_MIN_Q_LEN:  # decode / MTP verify
             return False
-        if queries.shape[-1] != HEAD_DIM:
+        if queries.shape[-1] not in (256, 512):
             return False
         if keys.shape[-2] < _SDPA256_MIN_KV_LEN:
             return False
