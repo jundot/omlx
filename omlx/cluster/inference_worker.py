@@ -807,7 +807,13 @@ def _start_peer_watchdog(
             plan_hash=marker.payload.get("plan_hash"),
         )
 
-    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0)
+    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "30.0") or 0.0)
+    failure_tolerance = int(
+        os.environ.get("OMLX_CLUSTER_PEER_FAILURE_TOLERANCE", "10") or 10
+    )
+    serving_interval = float(
+        os.environ.get("OMLX_CLUSTER_PEER_SERVING_INTERVAL", "3.0") or 3.0
+    )
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,
@@ -815,6 +821,8 @@ def _start_peer_watchdog(
         on_lost=on_lost,
         on_abort=on_abort,
         abort_grace=abort_grace,
+        serving_interval=serving_interval,
+        failure_tolerance=failure_tolerance,
     )
     thread = threading.Thread(
         target=watchdog.run, name="omlx-cluster-peer-watchdog", daemon=True
