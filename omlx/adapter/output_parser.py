@@ -371,7 +371,7 @@ def install_minimax_m3_tokenizer_protocol(
     )
 
     apply_mlx_vlm_minimax_m3_compat_patch()
-    from mlx_vlm.tool_parsers.minimax_m3 import (
+    from mlx_vlm.tools.parsers.minimax_m3 import (
         parse_tool_call as parse_native_tool_call,
     )
 
@@ -726,7 +726,7 @@ class MiniMaxM3OutputParserSession:
 
                 apply_mlx_vlm_minimax_m3_compat_patch()
 
-                from mlx_vlm.tool_parsers.minimax_m3 import parse_tool_call
+                from mlx_vlm.tools.parsers.minimax_m3 import parse_tool_call
 
                 parsed = parse_tool_call(self._raw_text)
                 parsed_calls = parsed if isinstance(parsed, list) else [parsed]

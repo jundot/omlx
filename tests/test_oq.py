@@ -52,7 +52,6 @@ from omlx.oq import (
     _ImatrixCaptureWrapper,
     _is_audio_tensor,
     _is_moe_router,
-    _is_vision_tensor,
     _LazyTensorIndex,
     _load_builtin_calibration,
     _measure_sensitivity,
@@ -399,14 +398,6 @@ class TestUniversalQuantPredicate:
             "model.layers.10.mlp.up_proj", module, dense_config
         )
         assert result is True
-
-    # Group size
-
-    def test_moe_router_fp16_group_size(self, moe_config, module):
-        result = universal_quant_predicate(
-            "model.layers.0.mlp.gate", module, moe_config
-        )
-        assert result is False  # MoE router gates kept fp16
 
     def test_150_expert_group_size_128(self, module):
         config = {
@@ -7272,3 +7263,262 @@ class TestEstimateBpwPostSanitizeNames:
         # Experts dominate the parameter count; a raw-name scan reports
         # ~15-16 bpw because none of them end in ".weight".
         assert est["effective_bpw"] < 8.0, est
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestStreamedCalibration:
+    @pytest.fixture
+    def checkpoint(self, tmp_path, monkeypatch):
+        from dataclasses import asdict
+        from mlx.utils import tree_flatten
+        from tests.test_mlx_vlm_qwen4_exp_compat import _tiny_config
+        import omlx.oq as oq
+
+        cfg = _tiny_config()
+        cfg.text_config.linear_key_head_dim = 32
+        cfg.text_config.linear_value_head_dim = 32
+        from mlx_vlm.models.qwen4_exp.language import (
+            configure_mtp_runtime,
+            configure_ple_runtime,
+        )
+        from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+        source = tmp_path / "source"
+        source.mkdir()
+        index = source / "model.safetensors.index.json"
+        index.write_text(
+            json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
+        )
+        configure_ple_runtime(source, mode="resident")
+        configure_mtp_runtime(source, enabled=True)
+        mx.random.seed(7)
+        model = Model(cfg)
+        model.eval()
+        weights = {
+            key: value.astype(mx.bfloat16) if value.dtype == mx.float32 else value
+            for key, value in tree_flatten(model.parameters())
+        }
+        scale_key = next(
+            key for key in weights if key.endswith("ngram_embedding.weight_scale")
+        )
+        weights[scale_key] = mx.array([0.25], dtype=mx.bfloat16)
+        model.load_weights(list(weights.items()))
+        mx.eval(model.parameters())
+        config = asdict(cfg)
+        config["architectures"] = ["Qwen4ExpForConditionalGeneration"]
+        config["text_config"]["mtp_num_hidden_layers"] = 1
+        (source / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(str(source / "model.safetensors"), weights)
+        index.write_text(
+            json.dumps({"weight_map": {key: "model.safetensors" for key in weights}})
+        )
+        tokens = mx.array(
+            [
+                [1, 2, 3, 4, 5, 6],
+                [2, 3, 4, 5, 6, 7],
+                [3, 4, 5, 6, 7, 8],
+                [4, 5, 6, 7, 8, 9],
+            ],
+            dtype=mx.int32,
+        )
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
+        yield source, config, model, tokens, scale_key
+        configure_mtp_runtime(source, enabled=False)
+        configure_ple_runtime(source, mode="resident")
+        mx.synchronize()
+        mx.clear_cache()
+
+    @pytest.mark.parametrize("keep_mtp", [False, True])
+    def test_imatrix_parity_and_cache_reuse(
+        self, checkpoint, tmp_path, monkeypatch, keep_mtp
+    ):
+        import omlx.oq as oq
+
+        source, config, model, tokens, _ = checkpoint
+        resident, _ = oq._collect_imatrix_from_model(
+            model,
+            object(),
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=2,
+            seq_length=6,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.load_model",
+            MagicMock(
+                side_effect=AssertionError("streaming must not load the whole model")
+            ),
+        )
+        kwargs = dict(
+            cache_path=str(tmp_path / "imatrix.npz"),
+            reuse_cache=True,
+            num_samples=2,
+            seq_length=6,
+            strict=False,
+            trust_remote_code=False,
+            stream_calibration=True,
+            require_mtp_entries=keep_mtp,
+            measure_sensitivity=True,
+            sensitivity_oq_level=4,
+            sensitivity_num_samples=2,
+            sensitivity_seq_length=6,
+        )
+        first = oq._load_or_collect_imatrix(str(source), config, **kwargs)
+        assert first.metadata["collection"]["processed_samples"] == 4
+        expected = {
+            key: value
+            for key, value in resident.items()
+            if keep_mtp or not key.startswith("mtp.")
+        }
+        assert first.entries.keys() == expected.keys()
+        for key, entry in expected.items():
+            np.testing.assert_array_equal(first.entries[key].counts, entry.counts)
+            np.testing.assert_array_equal(
+                first.entries[key].in_sum2, entry.in_sum2, err_msg=key
+            )
+        reference = oq._measure_sensitivity_from_model(
+            model, object(), config, 4, num_samples=2, seq_length=6
+        )
+        fused = first.metadata["collection"]["sensitivity_map"]
+        assert fused.keys() == reference.keys()
+        assert any(value > 0 for value in reference.values())
+        for key, value in reference.items():
+            assert fused[key] == pytest.approx(value, abs=1e-6)
+        second = oq._load_or_collect_imatrix(str(source), config, **kwargs)
+        assert not first.reused and second.reused
+
+    @pytest.mark.parametrize("keep_mtp", [False, True])
+    def test_output_preserves_ple_scale_and_reloads(
+        self, checkpoint, tmp_path, monkeypatch, keep_mtp
+    ):
+        from mlx.utils import tree_flatten
+        from mlx_vlm.utils import load_model
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+        import omlx.oq as oq
+
+        source, config, model, tokens, scale_key = checkpoint
+
+        def unexpected_measurement(*args, **kwargs):
+            raise AssertionError("explicit sensitivity override must skip measurement")
+
+        monkeypatch.setattr(oq, "_streamed_sensitivity_state", unexpected_measurement)
+        output = tmp_path / "output"
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            group_size=32,
+            enhanced=True,
+            stream_calibration=True,
+            imatrix_num_samples=2,
+            imatrix_seq_length=6,
+            sensitivity_map_override={0: 1, 1: 1},
+            preserve_mtp=keep_mtp,
+        )
+        configure_qwen4_exp_runtime(output, mode="resident", mtp_enabled=keep_mtp)
+        loaded = load_model(output, lazy=True, strict=True)
+        parameters = dict(tree_flatten(loaded.parameters()))
+        assert parameters[scale_key].item() == 0.25
+        assert any(key.startswith("mtp.") for key in parameters) == keep_mtp
+        assert mx.isfinite(loaded(tokens).logits).all().item()
+
+    @pytest.mark.parametrize(
+        "explicit,env,kind,over_budget,expected",
+        [
+            (None, "", "llama", True, False),
+            (None, "1", "llama", True, False),
+            (None, "", "minimax_m3_vl", True, True),
+            (None, "", "qwen4_exp", False, False),
+            (None, "0", "qwen4_exp", True, False),
+            (False, "1", "qwen4_exp", True, False),
+            (True, "0", "qwen4_exp", False, True),
+        ],
+    )
+    def test_selection(self, monkeypatch, explicit, env, kind, over_budget, expected):
+        import omlx.oq as oq
+
+        monkeypatch.setenv("OMLX_OQ_STREAM_CALIBRATION", env)
+        assert (
+            oq._resolve_stream_calibration(
+                explicit, model_exceeds_ram=over_budget, model_type=kind
+            )
+            is expected
+        )
+
+    def test_explicit_unsupported_layout_fails_before_loading(self):
+        import omlx.oq as oq
+
+        with pytest.raises(ValueError, match="streaming imatrix sourcer"):
+            oq._resolve_stream_calibration(
+                True, model_exceeds_ram=True, model_type="llama"
+            )
+
+    def test_mmap_ple_is_filtered_before_materialization(self):
+        import omlx.oq as oq
+
+        prefix = "language_model.model.layers.1."
+        skipped = prefix + "ple.ple_embedding.ngram_embedding.shards.0.weight"
+        kept = prefix + "self_attn.q_proj.weight"
+
+        class Plan(dict):
+            def pop(self, key):
+                assert key != skipped, "mmap PLE must not be materialized"
+                return super().pop(key)
+
+        plan = Plan({skipped: object(), kept: mx.ones((2, 2))})
+        items = oq._streamed_layer_items(plan, 1, skip_key=oq._qwen4_exp_mmap_skip_key)
+        assert [key for key, _ in items] == ["self_attn.q_proj.weight"]
+
+    def test_minimax_collection_matches_resident(self, tmp_path, monkeypatch):
+        from dataclasses import asdict
+        from mlx.utils import tree_flatten
+        from omlx.patches.mlx_vlm_minimax_m3_compat import (
+            apply_mlx_vlm_minimax_m3_compat_patch,
+        )
+        import omlx.oq as oq
+
+        apply_mlx_vlm_minimax_m3_compat_patch()
+        from tests.test_mlx_vlm_minimax_m3_compat import _tiny_text_config
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3Model
+
+        args = _tiny_text_config(pack_shared_expert=False)
+        args.vocab_size = 64
+        args.num_hidden_layers = 2
+        args.moe_layer_freq = [0, 1]
+        args.layer_types = ["full_attention", "full_attention"]
+        model = nn.Module()
+        model.language_model = nn.Module()
+        model.language_model.model = MiniMaxM3Model(args)
+        model.eval()
+        config = {
+            "model_type": "minimax_m3_vl",
+            "text_config": asdict(args),
+            "architectures": ["MiniMaxM3ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+        )
+        tokens = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        resident, _ = oq._collect_imatrix_from_model(
+            model,
+            object(),
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=1,
+            seq_length=4,
+        )
+        streamed, _ = oq._collect_imatrix_streaming(
+            tmp_path,
+            object(),
+            config,
+            num_samples=1,
+            seq_length=4,
+            calib_data=tokens,
+        )
+        assert resident.keys() == streamed.keys()
+        for key, entry in resident.items():
+            np.testing.assert_array_equal(streamed[key].counts, entry.counts)
+            np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2)

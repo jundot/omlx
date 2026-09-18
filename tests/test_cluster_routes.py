@@ -179,6 +179,7 @@ class _ReadyClusterPool:
         assert model_id == self.model_id
         self.reloads += 1
         self.entry.engine = None
+        self.entry.pending_unload_reason = None
 
     async def get_engine(self, model_id):
         assert model_id == self.model_id
@@ -904,6 +905,14 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     assert loaded.json()["canary_completion_tokens"] == 1
     assert len(loaded.json()["ranks"]) == 2
     assert pool.entry.engine is not None
+
+    # Verify reload succeeds even if entry has a stuck pending_unload_reason
+    pool.entry.pending_unload_reason = "drain timeout"
+    pool.reloads = 0
+    loaded_again = _client().post("/admin/api/cluster/deployments/nemotron-pool/load")
+    assert loaded_again.status_code == 200, loaded_again.json()
+    assert pool.reloads == 1
+    assert pool.entry.pending_unload_reason is None
 
     removed = _client().delete("/admin/api/cluster/deployments/nemotron-pool")
     assert removed.status_code == 200

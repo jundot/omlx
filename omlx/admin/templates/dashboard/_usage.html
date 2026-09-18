@@ -1,4 +1,4 @@
-<section x-data="usageHistory()" class="mb-8 mt-8" aria-labelledby="usage-heading">
+<section x-data="usageHistory()" aria-labelledby="usage-heading">
     <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
         <h3 id="usage-heading" class="text-xl font-bold">{{ t('usage.heading') }}</h3>
         <div class="flex gap-2">
@@ -34,7 +34,7 @@
                 </template>
             </div>
             <p class="text-sm text-neutral-500 mb-3" x-show="data.totals.requests === 0">{{ t('usage.empty') }}</p>
-            <div class="border rounded-xl overflow-hidden mb-5">
+            <div class="border border-neutral-200 rounded-xl overflow-hidden mb-5">
                 <div class="overflow-x-auto">
                     <table class="w-full text-sm text-right">
                         <thead class="bg-neutral-50 text-xs text-neutral-500">
@@ -50,7 +50,7 @@
                         </thead>
                         <tbody>
                             <template x-for="row in data.models" :key="row.model_id">
-                                <tr class="border-t">
+                                <tr class="border-t border-neutral-200">
                                     <th class="p-3 text-left font-medium break-all" x-text="row.model_id"></th>
                                     <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key">
                                         <td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td>
@@ -62,7 +62,7 @@
                     </table>
                 </div>
             </div>
-            <div class="border rounded-xl p-4">
+            <div class="border border-neutral-200 rounded-xl p-4">
                 <h4 class="text-sm font-semibold mb-2">{{ t('usage.heatmap') }}</h4>
                 <p class="text-xs text-neutral-500 mb-3">{{ t('usage.heatmap_note') }}</p>
                 <div class="overflow-auto" style="max-height: 300px">

@@ -13,6 +13,13 @@ class DeepseekV41Cache(ArraysCache):
         super().__init__(7)
         self.compress_ratio = compress_ratio
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls()
+        obj.cache = list(state)
+        obj.meta_state = meta_state
+        return obj
+
     @property
     def offset(self):
         return self.cache[0] if self.cache[0] is not None else 0

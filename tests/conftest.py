@@ -1,4 +1,5 @@
 import os
+import subprocess
 
 # MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
@@ -134,6 +135,19 @@ class MockModel:
 def mock_tokenizer() -> MockTokenizer:
     """Provide a mock tokenizer for tests."""
     return MockTokenizer()
+
+
+@pytest.fixture
+def mock_cluster_ssh(monkeypatch):
+    from omlx.cluster import launch
+
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            [], 0, stdout='{"action": "no-marker"}', stderr=""
+        )
+    )
+    monkeypatch.setattr(launch, "_run_cluster_ssh", runner)
+    return runner
 
 
 @pytest.fixture

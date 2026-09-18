@@ -276,10 +276,12 @@ registry is written atomically with mode `0600`. Replayed, expired, revoked,
 identity-mutated, source-mismatched, or host-fingerprint-mismatched requests
 fail closed.
 
-The coordinator web port must be reachable from the CUDA LAN. If the dashboard
-is open as `localhost`, set the oMLX **Server host** to `0.0.0.0` in Settings,
-restart, and enter the Studio's LAN address in the enrollment card. Plain HTTP
-is appropriate only on a trusted private LAN; use the dashboard's HTTPS origin
+The coordinator web port must be reachable from the CUDA LAN. Configure the
+main API key first, or save it together with the oMLX **Server host** set to
+`0.0.0.0` in Settings. Then restart and enter the Studio's LAN address in the
+enrollment card. oMLX refuses a non-loopback bind until an API key is
+configured. Plain HTTP is appropriate only on a trusted private LAN; use the
+dashboard's HTTPS origin
 when the network is not trusted. The one-time secret is present in the pasted
 shell command and may therefore remain in that worker user's shell history
 until the short expiry passes.

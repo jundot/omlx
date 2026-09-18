@@ -1514,16 +1514,34 @@ def collect_kv_layer_specs(
     except ImportError:
         return 0, [], 0
 
+    kv_types = (KVCache,)
+    list_types = (CacheList,)
+    try:
+        from mlx_vlm.models.cache import (
+            CacheList as VLMCacheList,
+        )
+        from mlx_vlm.models.cache import (
+            KVCache as VLMKVCache,
+        )
+    except ImportError:
+        pass  # Text-only distributed ranks do not require mlx-vlm.
+    else:
+        kv_types += (VLMKVCache,)
+        list_types += (VLMCacheList,)
+
     full = 0
     arrays = 0
     windows: Counter[int] = Counter()
 
     def _walk(c: Any) -> None:
         nonlocal full, arrays
-        if type(c) is KVCache or type(c).__name__ in _FULL_KV_CACHE_CLASS_NAMES:
+        if (
+            type(c) in kv_types
+            or type(c).__name__ in _FULL_KV_CACHE_CLASS_NAMES
+        ):
             full += 1
             return
-        if isinstance(c, CacheList):
+        if isinstance(c, list_types):
             for inner in c.caches:
                 _walk(inner)
             return

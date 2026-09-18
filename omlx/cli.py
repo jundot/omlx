@@ -55,6 +55,8 @@ def _has_cli_overrides(args) -> bool:
         "log_level",
         "sse_keepalive_mode",
         "max_audio_upload_size",
+        "max_image_upload_size",
+        "max_image_side_length",
         "max_concurrent_requests",
         "embedding_batch_size",
         "memory_guard",
@@ -1089,6 +1091,21 @@ Example directory structure:
         "in settings.json (built-in default: 100MB). Uploads are buffered "
         "in memory, so this is also a per-request RAM cap",
     )
+    serve_parser.add_argument(
+        "--max-image-upload-size",
+        type=str,
+        default=None,
+        help="Maximum image payload size for VLM inputs (e.g. '50MB', '100MB'). "
+        "Overrides the value in settings.json (built-in default: 50MB).",
+    )
+    serve_parser.add_argument(
+        "--max-image-side-length",
+        type=int,
+        default=None,
+        help="Maximum side length in pixels for VLM input images. Images exceeding "
+        "this limit are downscaled preserving aspect ratio (built-in default: 2048, "
+        "0 to disable).",
+    )
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
@@ -1226,7 +1243,7 @@ Example directory structure:
         "--api-key",
         type=str,
         default=None,
-        help="API key for authentication (optional)",
+        help="API key for authentication (required for non-loopback binds)",
     )
 
     # Launch command

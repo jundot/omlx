@@ -283,6 +283,19 @@ class TestVLMToolForwarding:
 class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""
 
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.parametrize("default_mode, expected", [(None, "block"), ("ar", None)])
+    def test_detects_model_owned_diffusion_generator(self, default_mode, expected):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._vlm_model = SimpleNamespace(
+            config=SimpleNamespace(
+                canvas_length=256, default_generation_mode=default_mode
+            ),
+            language_model=SimpleNamespace(generate=lambda *args, **kwargs: None),
+        )
+
+        assert engine._detect_diffusion_family() == expected
+
     @pytest.mark.asyncio
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
@@ -756,7 +769,7 @@ class TestInjectToolCalling:
         with patch.dict(
             "sys.modules",
             {
-                "mlx_vlm.tool_parsers": None,
+                "mlx_vlm.tools.registry": None,
                 "mlx_lm": None,
                 "mlx_lm.tokenizer_utils": None,
             },
@@ -1467,6 +1480,102 @@ class TestPrepareVisionInputs:
 
         call_kwargs = mock_prepare.call_args[1]
         assert call_kwargs.get("audio") is None
+
+
+    # --- per-image vision feature cache -------------------------------
+
+    def _vision_cache_engine(self, images, entries_by_index):
+        """Engine whose vision cache already holds the given per-image
+        features, keyed by each image's real per-image hash."""
+        from omlx.utils.image import compute_per_image_hashes
+
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+        hashes = compute_per_image_hashes(images)
+        entries = {hashes[i]: f for i, f in entries_by_index.items()}
+
+        cache = MagicMock()
+        cache.get.side_effect = lambda h, _model: entries.get(h)
+        engine._vision_cache = cache
+        engine._vision_cache_enabled = True
+
+        # Keep the embedding step inert but mx.eval-able.
+        embed = MagicMock()
+        embed.inputs_embeds = mx.zeros((1, 3, 8))
+        embed.to_dict.return_value = {"inputs_embeds": embed.inputs_embeds}
+        engine._vlm_model.get_input_embeddings.return_value = embed
+
+        # The token-count cross-check is a separate guard; neutralise it so
+        # these tests isolate the shape agreement.
+        engine._image_token_count = MagicMock(return_value=None)
+        return engine, cache
+
+    @staticmethod
+    def _two_images():
+        from PIL import Image
+
+        return [Image.new("RGB", (8, 8), "red"), Image.new("RGB", (12, 5), "blue")]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_per_image_cache_used_when_shapes_agree(self, mock_act, mock_prepare):
+        """Two entries of equal shape still combine and serve from cache."""
+        images = self._two_images()
+        engine, _ = self._vision_cache_engine(
+            images, {0: mx.zeros((1, 4, 8)), 1: mx.ones((1, 4, 8))}
+        )
+        mock_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": mx.zeros((2, 3, 8, 8)),
+        }
+        engine._compute_vision_features = MagicMock(return_value=None)
+
+        engine._prepare_vision_inputs([{"role": "user", "content": "Describe"}], images)
+
+        used = engine._vlm_model.get_input_embeddings.call_args[1][
+            "cached_image_features"
+        ]
+        assert used.shape == (2, 4, 8)
+        engine._compute_vision_features.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_mismatched_per_image_shapes_fall_through(self, mock_act, mock_prepare):
+        """Entries cached under different resize regimes must not be
+        concatenated. Gemma 4 encodes an image to a token count that depends
+        on the other images in the request, so two entries cached from
+        separate single-image requests can disagree; mx.concatenate raised a
+        500 before this fell through."""
+        images = self._two_images()
+        recomputed = mx.zeros((2, 6, 8))
+        engine, cache = self._vision_cache_engine(
+            images, {0: mx.zeros((1, 4, 8)), 1: mx.ones((1, 6, 8))}
+        )
+        mock_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": mx.zeros((2, 3, 8, 8)),
+        }
+        engine._compute_vision_features = MagicMock(return_value=recomputed)
+
+        engine._prepare_vision_inputs([{"role": "user", "content": "Describe"}], images)
+
+        # Fell through to a recompute rather than raising...
+        engine._compute_vision_features.assert_called_once()
+        used = engine._vlm_model.get_input_embeddings.call_args[1][
+            "cached_image_features"
+        ]
+        assert used is recomputed
+        # ...and consulted the whole-request entry on the way, which is only
+        # fetched when the per-image path is unusable.
+        from omlx.utils.image import compute_image_hash
+
+        assert any(
+            call.args and call.args[0] == compute_image_hash(images)
+            for call in cache.get.call_args_list
+        )
 
 
 class TestFormatMessagesForVLMTemplate:
@@ -2647,6 +2756,21 @@ class TestCaptureVLMPositionState:
     """
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_returned_position_state_overrides_previous_request(self):
+        pid = mx.arange(6).reshape(1, 6)
+        rd = mx.array([[-12]])
+        lm = SimpleNamespace(
+            _position_ids=mx.zeros((1, 3)), _rope_deltas=mx.zeros((1, 1))
+        )
+        extra = {"position_ids": pid, "rope_deltas": rd}
+
+        with patch.object(vlm_module.mx, "eval", wraps=mx.eval) as eval_mock:
+            vlm_module._capture_vlm_position_state(lm, extra)
+
+        assert extra["_captured_rope_deltas"] is rd
+        assert [id(a) for a in eval_mock.call_args.args] == [id(pid), id(rd)]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_captures_and_materializes_lazy_mrope_state(self):
         pid = mx.arange(6).reshape(1, 6) + 1
         rd = mx.zeros((1, 1)) - 3
@@ -2678,3 +2802,51 @@ class TestCaptureVLMPositionState:
         vlm_module._capture_vlm_position_state(None, extra)
 
         assert extra == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+@pytest.mark.parametrize("side_limit, expected_tokens", [(2048, 3072), (0, 11750)])
+async def test_preflight_uses_processed_image_dimensions(
+    monkeypatch, side_limit, expected_tokens
+):
+    from omlx.utils import image as image_module
+
+    monkeypatch.setattr(image_module, "get_max_image_side_length", lambda: side_limit)
+    image_module.clear_image_decode_cache()
+    try:
+        engine = _make_loaded_engine()
+        engine._processor = _QWEN_PROC
+        engine._apply_chat_template = MagicMock(return_value="test")
+        engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+        messages = [{"role": "user", "content": [_image_part(4000, 3000)]}]
+        # Repeat to exercise the decoded-image cache as well.
+        for _ in range(2):
+            await engine.preflight_chat(messages)
+            assert engine._preflight_or_raise_with_eviction.call_args.kwargs[
+                "num_prompt_tokens"
+            ] == expected_tokens + 1
+    finally:
+        image_module.clear_image_decode_cache()
+
+
+def test_deepseek_v4_packed_vision_features_round_trip():
+    engine = _make_loaded_engine(model_type="deepseek_v4")
+    engine._vlm_model.config.vision_downsample_ratio = 2
+    first = mx.arange(16).reshape(2, 8)
+    second = mx.arange(24).reshape(3, 8) + 100
+    engine._vlm_model.encode_images.return_value = [first, second]
+    metadata = {
+        "image_grid_hw": mx.array([[2, 4], [2, 6]]),
+        "image_permutations": mx.array([1, 0, 2, 0, 1]),
+    }
+    pixels = mx.zeros((20, 12))
+    packed = engine._compute_vision_features(pixels, metadata)
+    restored = engine._split_vision_features(packed, 2, metadata)
+    engine._vlm_model.encode_images.assert_called_once_with(pixels, **metadata)
+    assert mx.array_equal(restored[0], first)
+    assert mx.array_equal(restored[1], second)
+    with pytest.raises(ValueError, match="image grids"):
+        engine._split_vision_features(packed[:4], 2, metadata)

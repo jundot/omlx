@@ -1,0 +1,51 @@
+<!-- API Endpoints -->
+<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+    <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+        <div class="flex items-center gap-3">
+            <i data-lucide="link" class="w-4 h-4 text-neutral-500"></i>
+            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
+        </div>
+        <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
+            <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.api.host') }}</label>
+            <select id="server-alias-select"
+                    x-model="selectedAlias"
+                    class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">
+                <template x-for="alias in serverAliases" :key="alias">
+                    <option :value="alias" x-text="alias"></option>
+                </template>
+            </select>
+        </div>
+    </div>
+    <div class="divide-y divide-neutral-100">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+            <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.openai') }}</label>
+            <div class="flex items-center gap-2">
+                <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                      x-text="'http://' + displayHost + ':' + stats.port + '/v1'"></code>
+                <button x-data="{ copied: false }"
+                        @click="copyToClipboard('http://' + displayHost + ':' + stats.port + '/v1'); copied = true; setTimeout(() => copied = false, 2000)"
+                        class="p-1.5 rounded-lg transition-all"
+                        :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
+                        :title="window.t('status.api.copy_tooltip')">
+                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                </button>
+            </div>
+        </div>
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+            <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.claude') }}</label>
+            <div class="flex items-center gap-2">
+                <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                      x-text="'http://' + displayHost + ':' + stats.port"></code>
+                <button x-data="{ copied: false }"
+                        @click="copyToClipboard('http://' + displayHost + ':' + stats.port); copied = true; setTimeout(() => copied = false, 2000)"
+                        class="p-1.5 rounded-lg transition-all"
+                        :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
+                        :title="window.t('status.api.copy_tooltip')">
+                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>

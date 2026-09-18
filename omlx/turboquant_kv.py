@@ -44,6 +44,24 @@ from mlx_vlm.turboquant import (
 
 logger = logging.getLogger(__name__)
 
+
+@classmethod
+def _from_cache(cls, cache, bits, seed=0):
+    result = cls(bits=bits, seed=seed)
+    if callable(getattr(cache, "keys_and_values", None)):
+        keys, values = (
+            cache.keys_and_values() if cache.keys is not None else (None, None)
+        )
+    else:
+        keys, values = cache.state
+    if keys is not None:
+        result.update_and_fetch(keys, values)
+    return result
+
+
+TurboQuantKVCache.from_cache = _from_cache
+
+
 __all__ = [
     "TurboQuantKVCache",
     "BatchTurboQuantKVCache",

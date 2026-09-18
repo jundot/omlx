@@ -68,8 +68,36 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
     )
 
     def gated_delta_update_metal(
-        q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state=None,
+        mask=None,
+        use_kernel=True,
+        state_steps=None,
+        cache=None,
+        cache_index=1,
     ):
+        if cache is not None or state_steps is not None:
+            return original(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                state,
+                mask,
+                use_kernel=use_kernel,
+                state_steps=state_steps,
+                cache=cache,
+                cache_index=cache_index,
+            )
         # Debug-only: skip the GDN op entirely to measure its E2E share.
         # Output is garbage; never enable outside profiling.
         if stub and q.shape[1] > 1:

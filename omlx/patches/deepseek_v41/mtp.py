@@ -30,6 +30,12 @@ class AcceptanceDepthController:
 
 
 class DSparkMixin:
+    _omlx_mtp_multi_request = True
+
+    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+        """Scheduler cache-only entry; normal forward retains full logits."""
+        return self(input_ids, cache=cache, _ced_prefill=True, **kwargs)
+
     @property
     def args(self):
         return self._config
@@ -42,6 +48,7 @@ class DSparkMixin:
         self._omlx_mtp_chain = True
         self._omlx_mtp_head_clone = False
         self._omlx_mtp_rowwise_unsupported = True
+        self._omlx_mtp_independent_verify = True
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
 
     def make_mtp_depth_controller(self, depth):
@@ -139,6 +146,11 @@ class DSparkMixin:
         active = getattr(self, "_omlx_dspark_decode_enabled", False)
         capture_dspark = kwargs.pop("return_dspark_hidden", False)
         capture = return_hidden or bool(capture_dspark)
+        if kwargs.get("_ced_prefill", False) and self._config.ced_prefill:
+            if input_ids.shape[0] != 1:
+                raise ValueError("CED scheduler prefill requires one request row")
+            if capture or verify:
+                raise ValueError("CED prefill cannot supply full hidden/verify states")
         prime = active and not capture and not verify and input_ids.shape[0] == 1
         verify_states = None
         if verify:
@@ -160,6 +172,8 @@ class DSparkMixin:
             cache[0]._mtp_draft_stash = (input_ids, snapshots, before, verify_states)
         if prime:
             logits, hidden = result
-            capture_prompt(self, input_ids, hidden, cache)
+            # The draft ring retains one window; reset across omitted spans
+            # using the existing absolute-position prompt-capture contract.
+            capture_prompt(self, input_ids[:, -hidden.shape[1] :], hidden, cache)
             return logits
         return result

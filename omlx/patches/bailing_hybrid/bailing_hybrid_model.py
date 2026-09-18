@@ -463,7 +463,7 @@ class LinearAttention(nn.Module):
         # legacy layout in place before external prefill reuses it.
         state = None
         if cache is not None:
-            slots = list(cache.state)
+            slots = list(cache.cache)
             if len(slots) == 1:
                 legacy_state = slots[0]
                 if legacy_state is None:
@@ -475,7 +475,7 @@ class LinearAttention(nn.Module):
                         "Invalid bailing_hybrid recurrent cache: expected a "
                         "four-tensor legacy state"
                     )
-                cache.state = slots
+                cache.cache = slots
             if len(slots) != 4:
                 raise ValueError(
                     "Invalid bailing_hybrid recurrent cache: expected 4 slots, "

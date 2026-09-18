@@ -55,22 +55,32 @@ fill):
 | 25% | 4.57 GB | 40.1 | 9.6 s | 0.67 |
 | 12.5% | 2.96 GB | 29.3 | 18.1 s | 0.45 |
 
-Decode throughput degrades gracefully; TTFT is the pain point at low
-residency, because a long prefill routes to most experts per layer and pays
-the fetch churn up front. A call's misses are therefore read *in parallel*:
-`ensure()` first classifies every expert the call needs without touching the
-cache, starts the missing experts' reads on a shared pool (`os.pread`, so a
-read needs nothing but a descriptor and an offset), and only then runs the
-serial install loop, which takes bytes from the pipeline instead of reading
-them itself. The slot writes, the LRU order, the eviction victims and the
-hit/miss counters all stay on the calling thread in the serial order, so the
-pipeline changes nothing but *when* the bytes arrive.
+Decode throughput degrades gracefully. TTFT was the pain point at low
+residency in the first version: a long prefill routes to most experts per
+layer, and chunking the prefill by tokens re-fetched an expert in every
+chunk that touched it, evicting on the way. Over-capacity prefill is now
+chunked on expert boundaries instead — the routes are sorted by expert and
+each chunk holds every route of up to `capacity` distinct experts, the same
+shape as the DeepSeek V4.1 adapter's sorted prefill — so each expert is read
+at most once per layer per model call. Measured with
+`benchmarks/moe_offload_prefill_bench.py` on the same model (585-token
+prompt, 32 decode tokens, single runs; warm = second identical request, cold
+= first request after load; filesystem page-cache state is not controlled).
+Fetch counts are sampled at the first yielded token and include the decode
+step mlx-lm runs ahead of that yield, rather than measuring pure prefill:
 
-The remaining headroom is scheduling, not IO width: prefill's full
-expert-access schedule is computable *before* any fetch (run the router over
-the whole prompt — no prediction needed), and decode prefetch (layer L+1's
-fetches during layer L's compute) has measured LRU→optimal headroom of
-+17pp hit rate at low residency.
+| residency | expert fetches through first token, before → after | TTFT warm, before → after | TTFT cold, after | decode tok/s |
+|---|---|---|---|---|
+| 50% | 6,073 → 1,719 | 2.38 s → 0.69 s | 1.64 s | 60.6 |
+| 25% | 30,302 → 2,675 | 8.87 s → 0.85 s | 1.51 s | 43.5 |
+| 12.5% | 64,369 → 2,913 | 16.60 s → 0.97 s | 11.92 s | 31.7 |
+
+Decode is untouched by the change (it takes the no-sync fast path). The
+remaining follow-up is decode prefetch (layer L+1's fetches during layer
+L's compute), which has measured LRU→optimal headroom of +17pp hit rate at
+low residency.
+
+A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` schedules missing experts before the serial install loop. Slot writes, LRU updates, and hit/miss counters stay on the calling thread.
 
 ## Supported models
 
@@ -127,6 +137,81 @@ weights stay in the existing safetensors files. The resident fraction applies
 to the routed experts in each backbone layer, with capacity floored at the
 number selected by one token. Shared experts, attention, and other backbone
 weights remain resident.
+
+Non-resident experts are read with positional `pread` calls on a small
+reader pool of their own, not through the Engram row-gather mapping: an
+expert is megabytes of contiguous bytes, and a faulting `MADV_RANDOM` gather
+reads it one page at a time. A residency update starts the misses' reads
+ahead of the installs, at most 512 MiB of payload in flight, and installs
+them serially in the order the misses were seen, so eviction victims, hit
+and miss counts, and resident bytes are identical to a serial fetch. Sorted
+prefill routes are chunked on expert boundaries (every route of up to
+`capacity` distinct experts per chunk), so a prefill reads each expert once
+per layer and runs one kernel per chunk.
+
+Measured on a synthetic checkpoint with the oQ3e expert geometry (384
+experts, 3-bit affine, 14.8 MiB per expert, 4 layers, random weights),
+cold reads from the internal SSD of an M5 Max, 12.5% residency:
+
+| | mmap gather (before) | positional reads |
+|---|---:|---:|
+| decode, one token, per MoE layer | 362 ms | 9.1 ms |
+| expert fetch throughput | 0.23 GB/s | 9.3 GB/s |
+| sorted prefill, 256 tokens | 33 token-layers/s | 568 token-layers/s |
+
+These are single runs of adapter-level calls on synthetic weights; they
+exclude attention, Engram, and the rest of the forward.
+
+### Measured on a 128 GB Mac
+
+`Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp` on an M5 Max with 128 GB and the
+internal SSD (`iogpu.wired_limit_mb` unset), Engram on SSD, native kernels
+built, run with `benchmarks/deepseek_v41_offload_bench.py` on a 433-token
+prose prompt in one prefill chunk followed by 64 greedy tokens. Single runs:
+
+| residency | experts per layer | load | Metal active | peak footprint | prefill | decode | decode hit rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 12.5% | 48 | 3.9 s | 38.0 GiB | 49.6 GiB | 28 tok/s | 5.6 tok/s | 0.69 |
+| 25% | 96 | 4.5 s | 65.7 GiB | 77.4 GiB | 25 tok/s | 4.2 tok/s | 0.78 |
+
+Both settings produce coherent, on-topic continuations. Served through
+`omlx serve` with the same settings (discovered from the HF cache, Engram
+forced to SSD by admission, 12.5% residency, engine load 4.4 s), two
+64-token chat completions ran at 2.7 tok/s on cold expert slots and
+4.1 tok/s after. Prefill reads every
+expert the prompt routes to once per layer (about 226 of 384 per layer for
+this prompt, 130 GiB in total) at 8 to 9 GB/s. Decode is bound by miss
+latency at one to two misses per layer per token. The lower residency
+decodes faster: the RAM the resident slots do not take is used by the page
+cache, which serves repeated misses far faster than the SSD (6.5 GB/s
+effective at 12.5% against 3.4 GB/s at 25%). On a 128 GB machine 12.5% is
+the better default. Expect the page cache to take all remaining RAM during
+a run; it is reclaimable and is not part of the Metal working-set limit.
+Higher residencies fit the limit on paper (`fit_resident_fraction` reports
+41% at 107.5 GiB) but leave no headroom for the KV cache and prefill
+transients, and were not measured.
+
+### Sizing on a 128 GB Mac
+
+For `Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp`, the shard headers give 221.5 GiB
+of routed experts, 91.9 GiB of Engram tables, 7.5 GiB of DSpark draft
+weights (not loaded under offload), and 10.1 GiB of everything else. With
+Engram on SSD the resident set is:
+
+| resident fraction | experts per layer | resident weights |
+|---:|---:|---:|
+| 12.5% | 48 | 38 GiB |
+| 25% | 96 | 65 GiB |
+| 33.3% | 128 | 84 GiB |
+| 37.5% | 144 | 93 GiB |
+
+The Metal working-set limit on a 128 GB machine with `iogpu.wired_limit_mb`
+unset is about 107 GiB, and KV cache, prefill transients, and the Engram
+page cache share it. `admission_bytes(path, fraction)` and
+`fit_resident_fraction(path, budget_bytes)` in
+`omlx.patches.deepseek_v41.moe_offload` give the engine pool's admission
+estimate for a fraction and the largest fraction whose estimate fits a byte
+budget.
 
 For a 384-expert checkpoint, 12.5% keeps 48 experts per layer. The adapter
 preserves V4.1's activation quantization, clamped SwiGLU, and application of

@@ -146,6 +146,7 @@ from .api.responses_utils import (
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
+    apply_namespace_tool_aliases,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
@@ -155,17 +156,19 @@ from .api.responses_utils import (
     convert_responses_tools,
     format_sse_event,
     normalize_response_output_to_messages,
+    split_namespace_tool_name,
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
+    ToolCallExtraction,
     ToolCallStreamSegment,
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
-    parse_tool_calls,
     parse_json_output,
+    parse_qwen_tool_calls,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
@@ -262,6 +265,9 @@ class ServerState:
     mcp_executor: Optional[object] = None
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
+    # Bind address snapshot for security checks. Unlike GlobalSettings.server.host,
+    # this remains unchanged until the process restarts on the new address.
+    bind_host: str | None = None
     settings_manager: Optional[object] = None  # ModelSettingsManager
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
@@ -318,21 +324,35 @@ async def verify_api_key(
     request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
-    """Verify API key if configured.
+    """Verify API key unless an explicitly loopback-only server allows no auth.
 
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
     from .admin.auth import fingerprint_key, verify_any_api_key
+    from .utils.network import is_loopback_bind
 
-    # No auth required if no API key is configured
+    global_settings = _server_state.global_settings
+    configured_host = getattr(
+        getattr(global_settings, "server", None), "host", None
+    )
+    if not isinstance(configured_host, str):
+        configured_host = None
+    bind_host = getattr(_server_state, "bind_host", None)
+    active_host = bind_host if isinstance(bind_host, str) else configured_host
+    loopback_only = active_host is None or is_loopback_bind(active_host)
+
+    # A missing key is accepted only when the configured bind is loopback-only.
     if _server_state.api_key is None:
-        return True
+        if loopback_only:
+            return True
+        raise HTTPException(status_code=401, detail="API key required")
 
     # Skip verification if enabled
     if (
-        _server_state.global_settings is not None
-        and _server_state.global_settings.auth.skip_api_key_verification
+        global_settings is not None
+        and global_settings.auth.skip_api_key_verification
+        and loopback_only
     ):
         return True
 
@@ -347,8 +367,8 @@ async def verify_api_key(
 
     # Check main key and sub keys
     sub_keys = (
-        _server_state.global_settings.auth.sub_keys
-        if _server_state.global_settings is not None
+        global_settings.auth.sub_keys
+        if global_settings is not None
         else []
     )
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
@@ -832,6 +852,7 @@ def _is_api_route(request: FastAPIRequest) -> bool:
     classified as non-API. Switch to ``request.scope.get("route")``
     matching at that point.
     """
+
     return request.url.path.startswith("/v1/")
 
 
@@ -866,7 +887,9 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.detail,
         )
     if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+        content = _openai_error_body(
+            exc.detail, exc.status_code, code=getattr(exc, "code", None)
+        )
     else:
         content = {"detail": exc.detail}
     return JSONResponse(status_code=exc.status_code, content=content)
@@ -2074,15 +2097,29 @@ def init_server(
         - Sampling parameters (max_tokens, temperature, etc.) are per-model settings
 
     Raises:
-        ValueError: If model directory doesn't exist or no models found
+        ValueError: If network authentication is unsafe, the model directory
+            doesn't exist, or no models are found.
     """
     from pathlib import Path
 
     from .model_settings import ModelSettingsManager
+    from .utils.network import network_auth_error
+
+    if global_settings is not None:
+        auth_error = network_auth_error(
+            global_settings.server.host,
+            api_key,
+            global_settings.auth.skip_api_key_verification,
+        )
+        if auth_error:
+            raise ValueError(auth_error)
 
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    _server_state.bind_host = (
+        global_settings.server.host if global_settings is not None else None
+    )
     from .cluster.exposure import distributed_inference_enabled as is_enabled
 
     _server_state.distributed_inference_enabled = is_enabled(global_settings)
@@ -2691,7 +2728,11 @@ async def _with_json_keepalive(
             logger.warning(
                 "JSON keepalive request failed (%d): %s", e.status_code, e.detail
             )
-            yield json.dumps(_openai_error_body(e.detail, e.status_code))
+            yield json.dumps(
+                _openai_error_body(
+                    e.detail, e.status_code, code=getattr(e, "code", None)
+                )
+            )
             return
         if result is not None:
             yield result
@@ -4340,9 +4381,12 @@ async def create_chat_completion(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Process response_format if specified
@@ -5077,6 +5121,29 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+class _ToolCallGenerationError(HTTPException):
+    """Keep generation failure codes through JSON keepalive responses."""
+
+    def __init__(self, error: dict):
+        super().__init__(status_code=500, detail=error["message"])
+        self.code = error["code"]
+
+
+def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
+    failed = extraction.parse_errors
+    if not failed:
+        return None
+    code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
+    message = (
+        "Model output contains an unrecoverable tool call. "
+        "Previously delivered tool calls must not be executed again on retry."
+    )
+    logger.warning(
+        "Tool call generation failed: code=%s, failed_calls=%d", code, len(failed)
+    )
+    return _openai_error_body(message, 500, code=code)
+
+
 def _registered_tool_names(tools: object) -> set[str]:
     """Return nonempty function names explicitly registered by the request."""
 
@@ -5100,8 +5167,8 @@ def _registered_tool_names(tools: object) -> set[str]:
 def _tool_call_semantic_key(tool_call: object) -> tuple[str, str] | None:
     """Canonical name/JSON-object identity, or ``None`` when malformed.
 
-    This is syntactic validation plus the separate registered-name check at the
-    call site; it is deliberately not full JSON Schema argument validation.
+    Unknown names remain callable output for client-side error feedback.
+    This is syntactic validation, not full JSON Schema argument validation.
     """
 
     function = getattr(tool_call, "function", None)
@@ -5242,13 +5309,16 @@ async def stream_chat_completion(
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
+            tools=kwargs.get("tools"),
             capture_ordered_segments=stream_completed_qwen_tools,
         )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -5366,10 +5436,11 @@ async def stream_chat_completion(
                         if segment.kind != "envelope":
                             stream_tool_sequence_safe = False
                             continue
-                        _cleaned, completed_calls = parse_tool_calls(
+                        _, completed_calls, _ = parse_qwen_tool_calls(
                             segment.text,
                             engine.tokenizer,
                             kwargs.get("tools"),
+                            finish_reason="stop",
                         )
                         completed_calls = completed_calls or []
                         completed_keys = [
@@ -5378,11 +5449,6 @@ async def stream_chat_completion(
                         if (
                             not completed_calls
                             or any(key is None for key in completed_keys)
-                            or any(
-                                key[0] not in registered_tool_names
-                                for key in completed_keys
-                                if key is not None
-                            )
                         ):
                             stream_tool_sequence_safe = False
                             continue
@@ -5426,6 +5492,9 @@ async def stream_chat_completion(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
+
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
@@ -5504,6 +5573,7 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
@@ -5519,25 +5589,12 @@ async def stream_chat_completion(
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         cleaned_thinking = extraction.cleaned_thinking
-        if tool_calls and qwen_tool_envelope_streaming_capable:
-            # Raw-text parsing is never allowed to promote malformed or
-            # unregistered functions on the explicitly capability-gated qwen
-            # early-stream path. Other parser families retain their existing
-            # terminal semantics; engine-native structured calls above are
-            # authoritative and intentionally bypass this API-layer filter.
-            tool_calls = [
-                tool_call
-                for tool_call in tool_calls
-                if (
-                    (key := _tool_call_semantic_key(tool_call)) is not None
-                    and key[0] in registered_tool_names
-                )
-            ]
-
         # Process response_format if specified
         if request.response_format and not tool_calls:
             cleaned_text, parsed_json, is_valid, error = parse_json_output(
@@ -5588,7 +5645,7 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5691,6 +5748,11 @@ async def stream_chat_completion(
             event = f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
             mark_visible_delta()
             yield event
+
+    if tool_failure:
+        yield f"data: {json.dumps(tool_failure)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # Final chunk with finish_reason
     finish_reason = (
@@ -5892,12 +5954,17 @@ async def stream_anthropic_messages(
     tool_filter = None
     thinking_filter = None
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -5936,8 +6003,9 @@ async def stream_anthropic_messages(
     )
 
     # 3. Stream content with thinking/content separation
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             last_output = output  # Keep reference for tool_calls and token counts
 
             if first_token_time is None and output.new_text:
@@ -6025,6 +6093,9 @@ async def stream_anthropic_messages(
         yield create_message_stop_event()
         return
 
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
     if thinking_delta:
@@ -6100,6 +6171,7 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    tool_failure = None
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -6112,14 +6184,16 @@ async def stream_anthropic_messages(
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
 
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
                 yield create_content_block_stop_event(index=block_index)
@@ -6196,6 +6270,22 @@ async def stream_anthropic_messages(
             )
             # Close tool block
             yield create_content_block_stop_event(index=i)
+
+    if tool_failure:
+        error = tool_failure["error"]
+        yield format_sse_event(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": error["message"],
+                    "code": error["code"],
+                },
+            },
+        )
+        yield create_message_stop_event()
+        return
 
     # 6. Send message_delta with stop_reason and actual token counts
     stop_reason = map_finish_reason_to_stop_reason(
@@ -6611,9 +6701,12 @@ async def create_anthropic_message(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=internal_tools,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -6830,8 +6923,11 @@ async def create_response(
             preserve_images=preserve_tool_images,
         )
 
-        # Convert tools: flat → nested
-        openai_tools = convert_responses_tools(request.tools)
+        # Convert tools: flat → nested. namespace_aliases maps each expanded
+        # namespace member's wire name back for the return path.
+        namespace_aliases: dict = {}
+        openai_tools = convert_responses_tools(request.tools, namespace_aliases)
+        apply_namespace_tool_aliases(messages, namespace_aliases)
         if (
             getattr(engine, "is_diffusion_model", False)
             and not getattr(engine, "supports_tool_calling", False)
@@ -6911,18 +7007,19 @@ async def create_response(
             else:
                 compiled_grammar = None
 
-        # Merge MCP tools
-        effective_tools = (
-            None
-            if (
-                getattr(engine, "is_diffusion_model", False)
-                and not getattr(engine, "supports_tool_calling", False)
-            )
-            else openai_tools
+        # Merge MCP tools, matching create_chat_completion's tools_disabled
+        # semantics: tool_choice="none" suppresses tool exposure to the chat
+        # template, and the MCP merge itself must run even when the client
+        # sent no tools of its own, since MCP servers can offer tools the
+        # client never listed.
+        tools_disabled = request.tool_choice == "none" or (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
         )
+        effective_tools = None if tools_disabled else openai_tools
         if (
             _server_state.mcp_manager
-            and effective_tools
+            and not tools_disabled
             and mcp_tools_exposed()
         ):
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
@@ -7093,6 +7190,7 @@ async def create_response(
                                 resolved_model=resolved_model,
                                 response_format=response_format,
                                 native_reasoning=native_reasoning,
+                                namespace_aliases=namespace_aliases,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -7156,9 +7254,12 @@ async def create_response(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -7206,11 +7307,13 @@ async def create_response(
                         arguments = tc.get("arguments", "{}")
                     else:
                         continue
+                    namespace, name = split_namespace_tool_name(name, namespace_aliases)
                     output_items.append(
                         build_function_call_output_item(
                             name=name,
                             arguments=arguments,
                             call_id=call_id,
+                            namespace=namespace,
                         )
                     )
 
@@ -7273,6 +7376,7 @@ async def stream_responses_api(
     resolved_model: Optional[str] = None,
     response_format=None,
     native_reasoning: bool = False,
+    namespace_aliases: Optional[dict] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -7522,12 +7626,17 @@ async def stream_responses_api(
     thinking_filter = None
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -7535,8 +7644,9 @@ async def stream_responses_api(
         else:
             stream_content = False
 
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -7602,6 +7712,9 @@ async def stream_responses_api(
         )
         return
 
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
     # Flush remaining content from parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
@@ -7658,6 +7771,7 @@ async def stream_responses_api(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -7669,9 +7783,11 @@ async def stream_responses_api(
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
             for ev in _emit_reasoning_delta(cleaned_thinking):
@@ -7703,7 +7819,7 @@ async def stream_responses_api(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
@@ -7842,6 +7958,7 @@ async def stream_responses_api(
             else:
                 continue
 
+            namespace, name = split_namespace_tool_name(name, namespace_aliases)
             fc_id = generate_id(IDPrefix.FUNCTION_CALL)
             fc_item = {
                 "type": "function_call",
@@ -7851,6 +7968,8 @@ async def stream_responses_api(
                 "arguments": "",
                 "status": "in_progress",
             }
+            if namespace:
+                fc_item["namespace"] = namespace
 
             # output_item.added
             seq += 1
@@ -7899,6 +8018,8 @@ async def stream_responses_api(
                 "arguments": arguments,
                 "status": "completed",
             }
+            if namespace:
+                completed_fc["namespace"] = namespace
             seq += 1
             yield format_sse_event(
                 "response.output_item.done",
@@ -7913,6 +8034,23 @@ async def stream_responses_api(
             output_items.append(completed_fc)
             output_index += 1
             next_output_index = output_index
+
+    if tool_failure:
+        seq += 1
+        yield format_sse_event(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    **initial_data,
+                    "status": "failed",
+                    "output": output_items,
+                    "error": tool_failure["error"],
+                },
+                "sequence_number": seq,
+            },
+        )
+        return
 
     # Record metrics
     usage_data = None
@@ -8082,8 +8220,8 @@ model and sampling defaults are managed via the admin page.
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
+        default=None,
+        help="Host to bind to (default: settings or 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
@@ -8096,6 +8234,12 @@ model and sampling defaults are managed via the admin page.
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for authentication (required for non-loopback binds)",
     )
 
     args = parser.parse_args()
@@ -8114,6 +8258,15 @@ model and sampling defaults are managed via the admin page.
     from .settings import init_settings
 
     settings = init_settings()
+    if args.host is not None:
+        settings.server.host = args.host
+    if args.api_key is not None:
+        settings.auth.api_key = args.api_key
+    errors = settings.validate()
+    if errors:
+        for error in errors:
+            print(f"Configuration error: {error}")
+        raise SystemExit(1)
     settings.ensure_directories()
 
     # Match the cli.py launcher: keep freed GPU buffers in the pool so
@@ -8136,7 +8289,7 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=settings.server.host, port=args.port)
 
 
 if __name__ == "__main__":

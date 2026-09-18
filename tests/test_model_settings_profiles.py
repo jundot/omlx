@@ -765,3 +765,258 @@ class TestExposedProfileRequestSettings:
 
         assert settings.temperature == 0.6
         assert settings.enable_thinking is True
+
+
+class TestTemplateApplication:
+    def test_latest_template_reuses_copy_and_preserves_engine_settings(self, mgr):
+        mgr.set_settings("m", ModelSettings(mtp_enabled=True))
+        mgr.save_template("coding", "Coding", None, {"temperature": 0.2, "top_p": 0.8})
+        first = mgr.apply_template("m", "coding")
+        mgr.update_template("coding", settings={"temperature": 0.9})
+        second = mgr.apply_template("m", "coding")
+        assert first.active_profile_name == second.active_profile_name
+        assert second.temperature == 0.9
+        assert second.top_p is None
+        assert second.mtp_enabled is True
+        assert len(mgr.list_profiles("m")) == 1
+
+    def test_renamed_copy_keeps_identity_and_exposure(self, mgr, tmp_path):
+        mgr.save_template("coding", "Coding", None, {"temperature": 0.2})
+        mgr.apply_template("m", "coding")
+        mgr.update_profile("m", "coding", new_name="copy", expose_as_model=True)
+        before = mgr.get_profile("m", "copy")
+        mgr.update_template("coding", new_name="renamed", settings={"temperature": 0.9})
+        applied = mgr.apply_template("m", "renamed")
+        assert applied.active_profile_name == "copy"
+        assert applied.temperature == 0.9
+        copy = mgr.get_profile("m", "copy")
+        assert copy["source_template"] == "renamed"
+        assert copy["api_name"] == before["api_name"]
+        assert copy["expose_as_model"] is True
+        restored = ModelSettingsManager(tmp_path)
+        assert restored.get_profile("m", "copy") == copy
+        assert restored.get_settings("m").temperature == 0.9
+
+    def test_delete_detaches_copies_without_changing_runtime(self, mgr, tmp_path):
+        mgr.save_template("coding", "Coding", None, {"temperature": 0.2})
+        mgr.apply_template("m", "coding")
+        mgr.apply_template("other", "coding")
+        mgr.delete_template("coding")
+        restored = ModelSettingsManager(tmp_path)
+        for model in ("m", "other"):
+            assert restored.get_profile(model, "coding")["source_template"] is None
+            assert restored.get_settings(model).temperature == 0.2
+            assert restored.get_settings(model).active_profile_name == "coding"
+        assert restored.apply_template("m", "coding") is None
+
+    def test_rejected_settings_do_not_create_or_update_copy(self, mgr):
+        mgr.save_template("coding", "Coding", None, {"temperature": 0.2})
+
+        def reject(settings):
+            raise ValueError("Rejected")
+
+        with pytest.raises(ValueError, match="Rejected"):
+            mgr.apply_template("m", "coding", settings_sanitizer=reject)
+        assert mgr.list_profiles("m") == []
+        mgr.apply_template("m", "coding")
+        original = mgr.get_profile("m", "coding")
+        mgr.update_template("coding", settings={"temperature": 0.9})
+        with pytest.raises(ValueError, match="Rejected"):
+            mgr.apply_template("m", "coding", settings_sanitizer=reject)
+        assert mgr.get_profile("m", "coding") == original
+        assert mgr.get_settings("m").temperature == 0.2
+
+    @pytest.mark.parametrize("operation", ["apply", "rename", "delete"])
+    def test_second_file_write_failure_rolls_back(
+        self, mgr, tmp_path, monkeypatch, operation
+    ):
+        mgr.save_template("coding", "Coding", None, {"temperature": 0.2})
+        mgr.apply_template("m", "coding")
+        mgr.update_template("coding", settings={"temperature": 0.9})
+        before = mgr.get_profile("m", "coding")
+
+        def fail():
+            raise OSError("Disk full")
+
+        monkeypatch.setattr(
+            mgr, "_save" if operation == "apply" else "_save_templates", fail
+        )
+        with pytest.raises(OSError, match="Disk full"):
+            if operation == "apply":
+                mgr.apply_template("m", "coding")
+            elif operation == "rename":
+                mgr.update_template("coding", new_name="new")
+            else:
+                mgr.delete_template("coding")
+        restored = ModelSettingsManager(tmp_path)
+        for instance in (mgr, restored):
+            assert instance.get_profile("m", "coding") == before
+            assert instance.get_template("coding") is not None
+            assert instance.get_template("new") is None
+            assert instance.get_settings("m").temperature == 0.2
+
+
+def _write_legacy_profile_storage(tmp_path):
+    mgr = ModelSettingsManager(tmp_path)
+    mgr.save_template("coding", "Coding", None, {"temperature": 0.9})
+    mgr.save_profile("m", "coding", "Coding", None, {"temperature": 0.1})
+    mgr.save_profile(
+        "m",
+        "orphan",
+        "Orphan",
+        None,
+        {"temperature": 0.3},
+        source_template="deleted",
+        expose_as_model=True,
+    )
+    mgr.save_profile(
+        "other", "copy", "Copy", None, {"temperature": 0.2}, source_template="coding"
+    )
+    mgr.set_settings("m", ModelSettings(active_profile_name="missing", temperature=0.4))
+    mgr.set_settings(
+        "other", ModelSettings(active_profile_name="copy", temperature=0.2)
+    )
+    documents = {
+        path.name: json.loads(path.read_bytes())
+        for path in (mgr.settings_file, mgr.profiles_file, mgr.templates_file)
+    }
+    documents["model_settings.json"]["models"]["m"]["unknown"] = 7
+    documents["model_profiles.json"]["profiles"]["m"]["orphan"]["unknown"] = 8
+    for name, document in documents.items():
+        (tmp_path / name).write_text(json.dumps(document))
+    return documents
+
+
+def test_startup_repairs_only_missing_references_with_exact_backups(tmp_path):
+    expected = _write_legacy_profile_storage(tmp_path)
+    originals = {name: (tmp_path / name).read_bytes() for name in expected}
+    mgr = ModelSettingsManager(tmp_path)
+    expected["model_profiles.json"]["profiles"]["m"]["orphan"]["source_template"] = None
+    expected["model_settings.json"]["models"]["m"]["active_profile_name"] = None
+    for name, document in expected.items():
+        assert json.loads((tmp_path / name).read_bytes()) == document
+    assert mgr.get_settings("m").temperature == 0.4
+    assert mgr.get_settings("other").active_profile_name == "copy"
+    assert mgr.get_profile("other", "copy")["settings"]["temperature"] == 0.2
+    backups = list(tmp_path.glob("profile-reference-backup-*"))
+    assert len(backups) == 1
+    for name, content in originals.items():
+        assert (backups[0] / name).read_bytes() == content
+
+    snapshots = {
+        name: ((tmp_path / name).read_bytes(), (tmp_path / name).stat().st_mtime_ns)
+        for name in expected
+    }
+    ModelSettingsManager(tmp_path)
+    assert list(tmp_path.glob("profile-reference-backup-*")) == backups
+    for name, snapshot in snapshots.items():
+        assert (
+            (tmp_path / name).read_bytes(),
+            (tmp_path / name).stat().st_mtime_ns,
+        ) == snapshot
+
+
+def test_fresh_storage_does_not_create_repair_files(tmp_path):
+    ModelSettingsManager(tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "filename", ["model_settings.json", "model_profiles.json", "global_templates.json"]
+)
+@pytest.mark.parametrize("damage", ["invalid_json", "unknown_version"])
+def test_unreadable_storage_does_not_trigger_reference_repair(
+    tmp_path, filename, damage, caplog
+):
+    documents = _write_legacy_profile_storage(tmp_path)
+    path = tmp_path / filename
+    if damage == "invalid_json":
+        path.write_text("{")
+    else:
+        document = documents[filename]
+        document["version"] = 999
+        path.write_text(json.dumps(document))
+    originals = {name: (tmp_path / name).read_bytes() for name in documents}
+    ModelSettingsManager(tmp_path)
+    assert "Skipped profile reference repair" in caplog.text
+    assert not list(tmp_path.glob("profile-reference-backup-*"))
+    for name, content in originals.items():
+        assert (tmp_path / name).read_bytes() == content
+
+
+@pytest.mark.parametrize("failure", ["backup", "second_write", "corrupt_backup"])
+def test_reference_repair_failure_retains_original_documents(
+    tmp_path, monkeypatch, failure, caplog
+):
+    documents = _write_legacy_profile_storage(tmp_path)
+    originals = {name: (tmp_path / name).read_bytes() for name in documents}
+    write = ModelSettingsManager._write_profile_repair
+
+    def fail_write(path, content):
+        in_backup = path.parent != tmp_path
+        if path.name == "model_profiles.json" and in_backup and failure == "backup":
+            raise OSError("Backup unavailable")
+        if (
+            path.name == "model_settings.json"
+            and not in_backup
+            and failure == "second_write"
+        ):
+            raise OSError("Settings write unavailable")
+        if in_backup and failure == "corrupt_backup":
+            content = b"corrupt backup"
+        write(path, content)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ModelSettingsManager, "_write_profile_repair", staticmethod(fail_write)
+        )
+        ModelSettingsManager(tmp_path)
+        backup = next(tmp_path.glob("profile-reference-backup-*"))
+        first_backup = backup / "model_settings.json"
+        modified_at = first_backup.stat().st_mtime_ns
+        ModelSettingsManager(tmp_path)
+        assert list(tmp_path.glob("profile-reference-backup-*")) == [backup]
+        assert first_backup.stat().st_mtime_ns == modified_at
+        assert "Profile reference repair failed" in caplog.text
+        for name, content in originals.items():
+            assert (tmp_path / name).read_bytes() == content
+
+    if failure == "corrupt_backup":
+        ModelSettingsManager(tmp_path)
+        assert first_backup.read_bytes() == b"corrupt backup"
+        assert list(tmp_path.glob("profile-reference-backup-*")) == [backup]
+        for name, content in originals.items():
+            assert (tmp_path / name).read_bytes() == content
+        return
+
+    ModelSettingsManager(tmp_path)
+    assert list(tmp_path.glob("profile-reference-backup-*")) == [backup]
+    assert first_backup.stat().st_mtime_ns == modified_at
+    for name, content in originals.items():
+        assert (backup / name).read_bytes() == content
+    repaired = json.loads((tmp_path / "model_settings.json").read_bytes())
+    assert repaired["models"]["m"]["active_profile_name"] is None
+
+
+def test_reference_repair_rollback_failure_reports_backup(tmp_path, monkeypatch, caplog):
+    documents = _write_legacy_profile_storage(tmp_path)
+    originals = {name: (tmp_path / name).read_bytes() for name in documents}
+    write = ModelSettingsManager._write_profile_repair
+
+    def fail_write(path, content):
+        if path.parent == tmp_path:
+            if path.name == "model_settings.json":
+                raise OSError("Settings write unavailable")
+            if content == originals[path.name]:
+                raise OSError("Rollback unavailable")
+        write(path, content)
+
+    monkeypatch.setattr(
+        ModelSettingsManager, "_write_profile_repair", staticmethod(fail_write)
+    )
+    with pytest.raises(OSError, match="Rollback unavailable"):
+        ModelSettingsManager(tmp_path)
+    backup = next(tmp_path.glob("profile-reference-backup-*"))
+    assert str(backup) in caplog.text
+    for name, content in originals.items():
+        assert (backup / name).read_bytes() == content

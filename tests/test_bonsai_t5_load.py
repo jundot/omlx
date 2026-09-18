@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import json
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -528,3 +530,96 @@ class TestFreeT5Biases:
         assert freed == 0
         assert model.t5.biases.shape == (4, 1)
         np.testing.assert_array_equal(np.array(model.t5.biases), biases_before)
+
+
+@pytest.mark.parametrize("mode", ["affine", "mxfp4"])
+@pytest.mark.parametrize("positional", [False, True])
+def test_installed_matmul_preserves_mlx_call_contract(mode, positional):
+    x = mx.ones((2, 64), dtype=mx.float16)
+    packed = mx.quantize(
+        mx.ones((8, 64), dtype=mx.float16),
+        bits=4,
+        group_size=32 if mode == "mxfp4" else 64,
+        mode=mode,
+    )
+
+    def run():
+        if positional:
+            w, scales, *biases = packed
+            return mx.quantized_matmul(
+                x,
+                w,
+                scales,
+                biases[0] if biases else None,
+                True,
+                None,
+                None,
+                mode,
+            )
+        return mx.quantized_matmul(x, *packed, mode=mode)
+
+    expected = run()
+    mx.eval(expected)
+    apply_bonsai_t5_load_patch()
+    actual = run()
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("packing", ["affine", "t5", "invalid_u8"])
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_preload_dispatch_uses_weight_format(tmp_path, monkeypatch, packing, group_size):
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    monkeypatch.setattr(bonsai_qmv, "apply_bonsai_qmv_patch", lambda: False)
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "quantization": {"bits": 2, "group_size": group_size},
+            }
+        )
+    )
+    model = _TinyModel()
+    model.proj = nn.QuantizedLinear(128, 4, bias=False, group_size=group_size, bits=2)
+    weights = dict(tree_flatten(model.parameters()))
+    x = mx.ones((1, 128), dtype=mx.float16)
+    expected = model.proj(x)
+    mx.eval(expected)
+    if packing == "t5":
+        quants = np.ones((4, 128), dtype=np.uint8)
+        weights["proj.weight"] = mx.array(pack_t5(quants, group_size))
+    elif packing == "invalid_u8":
+        weights["proj.weight"] = mx.zeros((4, 14), dtype=mx.uint8)
+    # Weight and scales can live in different shards.
+    mx.save_safetensors(
+        str(tmp_path / "model-00001.safetensors"),
+        {"proj.weight": weights.pop("proj.weight")},
+    )
+    mx.save_safetensors(str(tmp_path / "model-00002.safetensors"), weights)
+    original = mx.quantized_matmul
+    maybe_apply_pre_load_patches(str(tmp_path))
+    assert (mx.quantized_matmul is not original) == (packing == "t5")
+    if packing == "invalid_u8":
+        return
+    loaded = {}
+    for shard in sorted(tmp_path.glob("*.safetensors")):
+        loaded.update(mx.load(str(shard)))
+    model.load_weights(list(loaded.items()))
+    if packing == "affine":
+        assert mx.array_equal(model.proj(x), expected).item()
+    else:
+        assert model.proj.weight.dtype == mx.uint8
+        mx.eval(model.proj(x))
+
+
+def test_one_bit_preload_still_installs_load_patch(tmp_path, monkeypatch):
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    monkeypatch.setattr(bonsai_qmv, "apply_bonsai_qmv_patch", lambda: False)
+    monkeypatch.setattr(bonsai_qmv, "apply_bonsai_construct_patch", lambda: False)
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "qwen3", "quantization": {"bits": 1, "group_size": 128}}'
+    )
+    original = mx.quantized_matmul
+    maybe_apply_pre_load_patches(str(tmp_path))
+    assert mx.quantized_matmul is not original

@@ -308,6 +308,7 @@ class EnginePool:
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._unloading_models: set[str] = set()
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -808,6 +809,10 @@ class EnginePool:
                 entry, settings
             )
             add("deepseek_v41_engram_ssd_offload", v41_offload)
+            add(
+                "deepseek_v41_ced_prefill_enabled",
+                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+            )
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -1280,10 +1285,19 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if entry is None:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            if entry.engine is not None:
+                failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
+                if not (isinstance(failed_reason, str) and failed_reason.strip()):
+                    self._raise_if_reload_busy(entry, "activate distributed cluster")
+            pending_task = self._pending_unload_tasks.pop(model_id, None)
+            if pending_task is not None and not pending_task.done():
+                pending_task.cancel()
+            entry.pending_unload_reason = None
+            entry.pending_unload_allow_pinned = False
+            entry.abort_requested = False
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            self._raise_if_reload_busy(entry, "activate distributed cluster")
             await self._unload_engine(model_id)
             self._clear_load_failure(entry)
 
@@ -1421,6 +1435,9 @@ class EnginePool:
         engine = entry.engine
         if engine is None:
             return False
+        failed_reason = getattr(engine, "runtime_failed_reason", None)
+        if isinstance(failed_reason, str) and failed_reason.strip():
+            return False
         has_active_requests = getattr(engine, "has_active_requests", None)
         if not callable(has_active_requests):
             return False
@@ -1464,6 +1481,9 @@ class EnginePool:
 
     def _entry_is_quiescent(self, entry: EngineEntry) -> bool:
         """Return True only after leases, collectors, and scheduler work drain."""
+        failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
+        if isinstance(failed_reason, str) and failed_reason.strip():
+            return True
         return not (
             entry.in_use > 0
             or self._entry_has_active_requests(entry)
@@ -1688,6 +1708,39 @@ class EnginePool:
             return None
         return entry.pending_unload_reason or "request abort"
 
+    def _acquire_loaded_engine(self, model_id, force_lm, lease, runtime_settings):
+        """Lease a ready engine without waiting for another model's disk drain.
+
+        This path has no await: the unload marker and lease update are atomic
+        on the pool's event loop. Loads and settings changes still take the lock.
+        """
+        entry = self._entries.get(model_id)
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or entry.pending_unload_reason
+            or model_id in self._unloading_models
+            or (force_lm and isinstance(entry.engine, VLMBatchedEngine))
+        ):
+            return None
+        expected = self._engine_runtime_signature(model_id, runtime_settings)
+        if (
+            expected is not None
+            and entry.runtime_settings_signature is not None
+            and expected != entry.runtime_settings_signature
+        ) or (
+            runtime_settings is not None and entry.runtime_settings_signature is None
+        ):
+            return None
+        self._validate_llm_engine_ready(model_id, entry.engine)
+        if entry.runtime_settings_signature is None:
+            entry.runtime_settings_signature = expected
+        entry.last_access = time.time()
+        if lease:
+            entry.in_use += 1
+        return entry.engine
+
     async def get_engine(
         self,
         model_id: str,
@@ -1730,6 +1783,11 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        ready = self._acquire_loaded_engine(
+            model_id, force_lm, _lease, runtime_settings
+        )
+        if ready is not None:
+            return ready
         async with self._lock:
             entry = self._entries.get(model_id)
             if not entry:
@@ -2011,6 +2069,12 @@ class EnginePool:
             return loaded.engine
 
     async def _release_engine_lease(self, model_id: str) -> None:
+        # A normal completed request need not wait behind unrelated teardown.
+        entry = self._entries.get(model_id)
+        if entry is not None and not entry.pending_unload_reason:
+            if entry.in_use > 0:
+                entry.in_use -= 1
+            return
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
@@ -2070,7 +2134,7 @@ class EnginePool:
     async def acquire(self, model_id: str, force_lm: bool = False):
         """Acquire an engine with an atomic in-use lease.
 
-        The lease is taken under the pool lock at acquire time and always
+        The lease is taken atomically on the pool event loop and always
         released in finally, so the engine cannot be evicted mid-request even
         on exception.
         """
@@ -2529,6 +2593,24 @@ class EnginePool:
         return False
 
     async def _unload_engine(self, model_id: str) -> None:
+        if model_id in self._unloading_models:
+            raise ModelBusyError(model_id, "unload while teardown is in progress")
+        self._unloading_models.add(model_id)
+        task = asyncio.create_task(self._stop_and_unload_engine(model_id))
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+        finally:
+            self._unloading_models.discard(model_id)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _stop_and_unload_engine(self, model_id: str) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
 
@@ -2552,6 +2634,7 @@ class EnginePool:
             else resident_size
         )
         pre_unload_active = 0 if distributed else mx.get_active_memory()
+        pre_unload_footprint = 0 if distributed else get_phys_footprint()
 
         try:
             await entry.engine.stop()
@@ -2582,28 +2665,10 @@ class EnginePool:
             except Exception as e:
                 logger.warning(f"Error resetting activity counter for {model_id}: {e}")
 
-        # Yield to the event loop before dropping the engine reference.
-        #
-        # When abort_all_requests() fires before _unload_engine(), it sets
-        # asyncio Events for each active request.  Server-side streaming
-        # generators are then scheduled in the asyncio ready queue, but they
-        # cannot run until the event loop gets control.  EngineCore.close()
-        # (called inside stop()) blocks the event loop with synchronous
-        # .result() calls on the MLX executor -- scheduler.shutdown() and
-        # scheduler.deep_reset() -- so those generators are still suspended
-        # when stop() returns.
-        #
-        # If we set entry.engine = None and call gc.collect() immediately,
-        # the generators are still alive with a local 'engine' variable
-        # referencing the BatchedEngine, keeping its refcount above zero.
-        # The model's ~20 GB of MLX weight tensors therefore remain "active"
-        # in Metal memory, the settle barrier times out, and subsequent load
-        # attempts fail with 507 because the ceiling is still exceeded.
-        #
-        # A few asyncio.sleep(0) calls drain the ready queue -- generator
-        # tear-down is at most a few frames deep -- so that by the time we
-        # clear entry.engine and run gc.collect(), no coroutine frame holds
-        # a stale engine reference.
+        # Let cancelled streaming generators release their engine references
+        # before gc.collect() and the Metal memory settle barrier. stop() can
+        # yield while closing the core, but request cleanup may still have
+        # callbacks queued when it returns.
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -2665,7 +2730,15 @@ class EnginePool:
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
-            if actual_freed >= min_expected_freed:
+            # Metal can release arrays before macOS updates its footprint
+            # ledger. Admission reads both, so wait for that drop too when
+            # measurable; otherwise an immediate settings reload can fail 507.
+            footprint_pending = (
+                0 < min_expected_freed <= pre_unload_footprint
+                and get_phys_footprint()
+                > pre_unload_footprint - min_expected_freed
+            )
+            if actual_freed >= min_expected_freed and not footprint_pending:
                 settled = True
                 logger.debug(
                     f"Settle round {_settle_round + 1} for '{model_id}': "
@@ -2693,7 +2766,8 @@ class EnginePool:
             logger.debug(
                 f"Settle round {_settle_round + 1} for '{model_id}': "
                 f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)}) - retry"
+                f"(need>={format_size(min_expected_freed)}), "
+                f"footprint_pending={footprint_pending} - retry"
             )
             await asyncio.sleep(0.5)
             gc.collect()

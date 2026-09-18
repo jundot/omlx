@@ -41,26 +41,15 @@ from typing import Any, Callable, Generator, List, Optional, Set, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-
-from ..patches.mlx_vlm_mlx0322_compat import (
-    apply_mlx_vlm_mlx0322_compat_patch,
-)
-
-# Install the MLX 0.32.2 source hook before importing mlx-vlm.speculative.
-# Importing that package eagerly loads common, mtp, and utils; applying the
-# hook afterwards can leave their copied generation_stream globals pointing
-# at the stream from the pre-reload common module.
-apply_mlx_vlm_mlx0322_compat_patch()
-
 from mlx_vlm.speculative import common as _vlm_common  # noqa: E402, I001
 from mlx_vlm.speculative import load_drafter as _vlm_load_drafter  # noqa: E402
+from mlx_vlm.speculative.mtp import _buffer_mtp_target_cache
 
 # The round loops dispatch their target-verify and cache-rollback forwards
 # inside ``with mx.stream(generation_stream)``, using mlx-vlm's own
 # thread-local stream — a different object from mlx-lm's generation_stream
 # and from the per-engine stream. Draining the MTP work means draining this
 # one, resolved on the thread that advances the round loop.
-
 # PR #1169 (f96138e) moved the MTP round loop helpers from ``mlx_vlm.generate``
 # into ``mlx_vlm.speculative.utils``. Import directly from the new location —
 # the symbols are still ``_``-prefixed but this is now their canonical home.
@@ -69,137 +58,12 @@ from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
     _mtp_rounds_batch,
 )
 
-try:
-    from mlx_vlm.speculative.mtp import (  # noqa: E402, SLF001
-        _buffer_mtp_target_cache,
-    )
-except Exception:  # pragma: no cover - compatibility with older mlx-vlm
-
-    def _buffer_mtp_target_cache(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
-
 from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
 from ..utils.model_loading import materialize_lazy_state  # noqa: E402
 
 _vlm_generation_stream = _vlm_common.generation_stream
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# mlx-vlm compat patch: Qwen3.5 MoE MTP drafter support
-# ---------------------------------------------------------------------------
-# mlx-vlm's ``qwen3_5_mtp`` module hard-codes the *dense* ``TextConfig``
-# from ``mlx_vlm.models.qwen3_5.config``.  When the MTP drafter is trained
-# from a MoE base model (e.g. Qwen3.6-35B-A3B), its ``text_config`` has
-# ``model_type="qwen3_5_moe_text"`` and uses ``moe_intermediate_size``
-# instead of ``intermediate_size``.  The dense ``TextConfig`` rejects this,
-# causing ``TextConfig.__init__() missing 1 required positional argument:
-# 'intermediate_size'``.
-#
-# The error occurs in ``mlx_vlm.utils.update_module_configs`` which calls
-# ``model_class.TextConfig.from_dict(text_config_dict)`` — bypassing
-# ``Qwen3_5MTPConfig.__post_init__`` entirely.  We fix this by replacing
-# the ``TextConfig`` re-export on the ``qwen3_5_mtp`` package with a
-# dispatcher that picks the correct config class based on ``model_type``.
-# This is safe to call multiple times (idempotent).
-
-
-def _patch_qwen35_mtp_config_for_moe() -> None:
-    """Make ``qwen3_5_mtp`` module accept MoE ``text_config`` dicts.
-
-    Two code paths need patching:
-    1. ``update_module_configs`` reads ``model_class.TextConfig`` (package attr).
-    2. ``Qwen3_5MTPConfig.__post_init__`` imports ``TextConfig`` directly
-       from ``mlx_vlm.models.qwen3_5.config``.
-
-    We patch both: replace the package-level re-export *and* monkey-patch
-    ``__post_init__`` to use the correct config class.
-    """
-    try:
-        import mlx_vlm.speculative.drafters.qwen3_5_mtp as mtp_pkg
-        from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import (
-            Qwen3_5MTPConfig,
-        )
-        from mlx_vlm.models.qwen3_5.config import (
-            TextConfig as DenseTextConfig,
-        )
-    except ImportError:
-        return  # drafter module not available; nothing to patch
-
-    # -- Patch 1: replace package-level TextConfig for update_module_configs --
-    class _DispatchingTextConfig(DenseTextConfig):
-        """TextConfig subclass that dispatches to MoE config when needed."""
-
-        @classmethod
-        def from_dict(cls, params: dict):
-            if isinstance(params, dict) and params.get("model_type") == "qwen3_5_moe_text":
-                try:
-                    from mlx_vlm.models.qwen3_5_moe.config import (
-                        TextConfig as MoETextConfig,
-                    )
-
-                    return MoETextConfig.from_dict(params)
-                except Exception:
-                    pass  # fall through to dense
-            return DenseTextConfig.from_dict(params)
-
-    mtp_pkg.TextConfig = _DispatchingTextConfig
-
-    # -- Patch 2: fix Qwen3_5MTPConfig.__post_init__ direct import --
-    _original_post_init = Qwen3_5MTPConfig.__post_init__
-
-    def _patched_post_init(self):
-        raw = getattr(self, "text_config", None)
-        if isinstance(raw, dict) and raw.get("model_type") == "qwen3_5_moe_text":
-            try:
-                from mlx_vlm.models.qwen3_5_moe.config import (
-                    TextConfig as MoETextConfig,
-                )
-
-                self.text_config = MoETextConfig.from_dict(raw)
-                for key in ("mtp_num_hidden_layers", "mtp_use_dedicated_embeddings"):
-                    if key in raw:
-                        setattr(self.text_config, key, raw[key])
-                if self.text_config is not None:
-                    self.tie_word_embeddings = bool(
-                        self.text_config.tie_word_embeddings
-                    )
-                return  # skip the original __post_init__
-            except Exception:
-                pass  # fall through to original
-        _original_post_init(self)
-
-    Qwen3_5MTPConfig.__post_init__ = _patched_post_init
-
-    # -- Patch 3: use MoE decoder layer for MoE MTP drafters --
-    # ``Qwen3_5MTPDraftModel.__init__`` creates ``Qwen3_5DecoderLayer``
-    # (dense MLP) but MoE MTP weights use ``Qwen3_5MoeSparseMoeBlock``.
-    # We monkey-patch the module-level ``Qwen3_5DecoderLayer`` reference so
-    # the existing ``__init__`` picks up MoE layers when the text_config
-    # indicates a MoE architecture.
-    import mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp as _mtp_mod
-
-    _orig_dense_layer = _mtp_mod.Qwen3_5DecoderLayer
-
-    def _moe_aware_decoder_layer(args, layer_idx):
-        """Dispatch to MoE decoder layer when args indicate a MoE model."""
-        if getattr(args, "model_type", "") == "qwen3_5_moe_text":
-            try:
-                from mlx_vlm.models.qwen3_5_moe.language import (
-                    Qwen3_5MoeDecoderLayer,
-                )
-
-                return Qwen3_5MoeDecoderLayer(args=args, layer_idx=layer_idx)
-            except Exception:
-                pass  # fall through to dense
-        return _orig_dense_layer(args=args, layer_idx=layer_idx)
-
-    _mtp_mod.Qwen3_5DecoderLayer = _moe_aware_decoder_layer
-    logger.debug("Patched qwen3_5_mtp for MoE text_config support")
-
-
-_patch_qwen35_mtp_config_for_moe()
 
 
 class VLMMTPDrafter:

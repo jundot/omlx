@@ -773,7 +773,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         pre_active = mx.get_active_memory()
 
         # Release dflash model and cache references
-        shutdown_runtime_cache_manager()
+        await loop.run_in_executor(get_mlx_executor(), shutdown_runtime_cache_manager)
         self._dflash_prefix_cache = None
         self._runtime_context = None
         self._target_model = None
@@ -853,8 +853,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
+        from ..engine_core import get_mlx_executor
+
         try:
-            shutdown_runtime_cache_manager()
+            await asyncio.get_running_loop().run_in_executor(
+                get_mlx_executor(), shutdown_runtime_cache_manager
+            )
         except Exception as exc:
             logger.debug(f"shutdown_runtime_cache_manager: {exc}")
         self._dflash_prefix_cache = None

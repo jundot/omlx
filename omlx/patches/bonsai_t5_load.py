@@ -136,13 +136,15 @@ def _patched_load_weights(
 def _t5_quantized_matmul(
     x: mx.array,
     w: mx.array,
+    /,
     scales: mx.array,
-    biases: mx.array,
-    *,
+    biases: mx.array | None = None,
     transpose: bool = True,
-    bits: int = 4,
-    group_size: int = 64,
-    **kwargs,
+    group_size: int | None = None,
+    bits: int | None = None,
+    mode: str = "affine",
+    *,
+    stream=None,
 ):
     """mx.quantized_matmul replacement that handles t5 uint8 and 1-bit weights.
 
@@ -159,7 +161,7 @@ def _t5_quantized_matmul(
     For all other weight dtypes the original C function is called unchanged.
     """
     # 1-bit affine: route around the missing stock kernels.
-    if bits == 1 and w.dtype == mx.uint32 and transpose:
+    if bits == 1 and mode == "affine" and w.dtype == mx.uint32 and transpose:
         M = x.shape[-2] if x.ndim >= 2 else 1
         if has_native() and M == 1:
             return bonsai_q1_affine_qmv(
@@ -168,14 +170,23 @@ def _t5_quantized_matmul(
         if has_native() and 2 <= M <= 5:
             return bonsai_qmv_wide(x, w, scales, biases, bits=1)
         # Prefill / no native ext: dequantize to x.dtype and matmul.
-        w_fp = _dequant_1bit(w, scales, biases, x.dtype, group_size)
+        w_fp = _dequant_1bit(
+            w, scales, biases, x.dtype, 64 if group_size is None else group_size
+        )
         return x @ w_fp.T
 
     # Normal path: uint32 weights → native MLX kernel (the common case).
     if w.dtype != mx.uint8:
         return _original_quantized_matmul(
-            x, w, scales, biases, transpose=transpose, bits=bits, group_size=group_size,
-            **kwargs
+            x,
+            w,
+            scales,
+            biases,
+            transpose=transpose,
+            bits=bits,
+            group_size=group_size,
+            mode=mode,
+            stream=stream,
         )
 
     # t5 uint8 weight routing:

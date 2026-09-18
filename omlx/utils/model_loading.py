@@ -380,6 +380,36 @@ def _patch_mlx_lm_load_config() -> None:
     _MLX_LM_LOAD_CONFIG_PATCHED = True
 
 
+def _checkpoint_has_t5_weights(model_path: str | Path) -> bool:
+    """Detect t5 packing from tensor headers without materializing weights."""
+    import safetensors
+
+    weights = {}
+    scales = {}
+    for shard in sorted(Path(model_path).glob("*.safetensors")):
+        with safetensors.safe_open(str(shard), framework="numpy") as f:
+            for key in f.keys():
+                if key.endswith(".weight"):
+                    tensor = f.get_slice(key)
+                    if tensor.get_dtype() == "U8":
+                        weights[key[:-7]] = tensor.get_shape()
+                elif key.endswith(".scales"):
+                    scales[key[:-7]] = f.get_slice(key).get_shape()
+
+    for prefix, shape in weights.items():
+        scale_shape = scales.get(prefix)
+        if (
+            len(shape) == 2
+            and scale_shape is not None
+            and len(scale_shape) == 2
+            and shape[0] == scale_shape[0]
+            and scale_shape[1] > 0
+            and shape[1] in (13 * scale_shape[1], 26 * scale_shape[1])
+        ):
+            return True
+    return False
+
+
 def maybe_apply_pre_load_patches(
     model_name: str,
     model_settings: Any | None = None,
@@ -421,15 +451,6 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    - mlx-vlm MLX 0.32.2 compatibility backport when ``for_vlm`` is True.
-      This installs before model-module imports and carries only upstream PRs
-      #1949, #1982, and #2006, without moving the deliberately stable mlx-vlm
-      pin.
-    Some model patches inject modules into ``sys.modules`` or replace mlx-lm
-    internals; the mlx-vlm compatibility hook instead transforms only the
-    affected pinned sources as they load. Gating keeps non-affected models at
-    zero cost.
-
     Safe to call repeatedly; the patches are idempotent.
     """
     from ..model_settings import validate_moe_expert_offload
@@ -471,13 +492,6 @@ def maybe_apply_pre_load_patches(
 
     _patch_mlx_lm_load_config()
 
-    if for_vlm:
-        from ..patches.mlx_vlm_mlx0322_compat import (
-            apply_mlx_vlm_mlx0322_compat_patch,
-        )
-
-        apply_mlx_vlm_mlx0322_compat_patch()
-
     # Machine-conditioned, model-independent: reroute sorted gather_qmm
     # around the defective M5 NAX kernels (issue #2267). Install is cheap
     # and self-gating — a canary at the first matching call decides
@@ -512,7 +526,8 @@ def maybe_apply_pre_load_patches(
     # wrapper chain bypasses us entirely.
     quant_cfg = config.get("quantization") or {}
     quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    if quant_bits in (1, 2):
+    # Ordinary 2-bit affine checkpoints do not need the t5 loading shim.
+    if quant_bits == 1 or (quant_bits == 2 and _checkpoint_has_t5_weights(model_name)):
         try:
             from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
         except Exception as e:
@@ -611,7 +626,6 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
-
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if not for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
@@ -976,17 +990,17 @@ def maybe_apply_pre_load_patches(
         try:
             from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
         except Exception as e:
-            logger.debug("bonsai qmv patch import failed: %s", e)
+            logger.debug("1/2-bit affine decode optimization import failed: %s", e)
         else:
             if apply_bonsai_qmv_patch():
                 logger.info(
-                    "Bonsai %d-bit qmv decode patch applied for %s",
+                    "%d-bit affine decode optimization enabled for %s",
                     quant_bits,
                     model_name,
                 )
             else:
                 logger.debug(
-                    "Bonsai qmv patch skipped for %s "
+                    "1/2-bit affine decode optimization skipped for %s "
                     "(native extension not available; stock mlx fallback active)",
                     model_name,
                 )

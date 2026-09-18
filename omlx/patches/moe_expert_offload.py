@@ -496,13 +496,65 @@ class OffloadSwitchGLU(nn.Module):
             out = _scatter_unsort(out, inv, indices.shape)
         return out.squeeze(-2)
 
+    def _forward_expert_major(
+        self, flat_x: mx.array, ids: list[int], k: int, do_sort: bool
+    ) -> mx.array:
+        """Over-capacity prefill: chunk the routes on expert boundaries.
+
+        ``ids[t * k + j]`` is the expert of token ``t``'s ``j``-th route. The
+        routes are sorted by expert and cut into chunks holding every route
+        of up to ``capacity`` distinct experts, the same shape as the
+        DeepSeek V4.1 adapter's sorted prefill: an expert's routes all land
+        in one chunk, so each expert is installed at most once per call
+        (the token-chunked path re-fetched an expert in every chunk that
+        touched it, evicting on the way). Routes within a chunk are
+        independent — the cross-expert weighted sum happens in the caller —
+        so the chunk runs with one expert index per route, under the kernel
+        the resident model would choose for the whole call (sorted at or
+        above the stock threshold, else unsorted), and the outputs are put
+        back in route order once at the end. Each chunk is evaluated before
+        the next is built, which bounds the prefill transient.
+        """
+        c = self.cache
+        d_model = flat_x.shape[-1]
+        ids_np = np.asarray(ids, dtype=np.int64)
+        order = np.argsort(ids_np, kind="stable")  # routes grouped by expert
+        sorted_ids = ids_np[order]
+        # every position where a new expert's run begins, chunked by capacity
+        run_starts = np.flatnonzero(np.diff(sorted_ids)) + 1
+        run_starts = np.concatenate(([0], run_starts))
+        cuts = run_starts[:: c.capacity].tolist() + [len(ids)]
+        outs = []
+        for start, end in zip(cuts[:-1], cuts[1:]):
+            chunk_ids = sorted_ids[start:end]
+            c.ensure(mx.array(np.unique(chunk_ids), dtype=mx.int32))
+            slots = mx.take(c.map, mx.array(chunk_ids, dtype=mx.int32))
+            slots = slots.reshape(-1, 1)
+            t_idx = mx.array(order[start:end] // k, dtype=mx.int32)
+            xe = mx.expand_dims(mx.take(flat_x, t_idx, axis=0), (-2, -3))
+            inv = None
+            if do_sort:
+                xe, slots, inv = _gather_sort(xe, slots)
+            up = c.qmm("up_proj", xe, slots, do_sort)
+            gate = c.qmm("gate_proj", xe, slots, do_sort)
+            o = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
+            if do_sort:
+                o = _scatter_unsort(o, inv, (end - start, 1))
+            o = o.squeeze(-2)[:, 0, :]
+            mx.eval(o)
+            outs.append(o)
+        out = mx.concatenate(outs, axis=0)
+        inverse = mx.array(np.argsort(order, kind="stable"), dtype=mx.int32)
+        return mx.take(out, inverse, axis=0).reshape(-1, k, d_model)
+
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        # A single call must have every expert it routes to resident AT ONCE:
-        # a long prefill can route to more distinct experts than the cache
-        # holds, in which case earlier installs would be evicted before the
-        # gather runs and their slots would read garbage. Chunk the token axis
-        # until each chunk's working set fits. Decode (working set =
-        # batch x top_k) takes the no-sync fast path.
+        # A single _forward must have every expert it routes to resident AT
+        # ONCE: a long prefill can route to more distinct experts than the
+        # cache holds, in which case earlier installs would be evicted before
+        # the gather runs and their slots would read garbage. Decode (working
+        # set = batch x top_k) takes the no-sync fast path; larger calls pay
+        # one readback to decide, and go expert-major only when the distinct
+        # working set genuinely exceeds capacity.
         c = self.cache
         flat_i = indices.reshape(-1, indices.shape[-1])
         n_tok, k = flat_i.shape
@@ -510,34 +562,13 @@ class OffloadSwitchGLU(nn.Module):
             raise ValueError("Expert cache capacity is smaller than routing top-k")
         if n_tok * k <= c.capacity or n_tok == 1:
             return self._forward(x, indices)
-        distinct = len(set(int(e) for e in flat_i.reshape(-1).tolist()))
-        if distinct <= c.capacity:
+        ids = flat_i.reshape(-1).tolist()
+        if len(set(ids)) <= c.capacity:
             return self._forward(x, indices)
-
         flat_x = x.reshape(-1, x.shape[-1])
-        # halve until each chunk fits; capacity >= top_k guarantees termination
-        size = n_tok
-        while size > 1:
-            size = max(1, size // 2)
-            ok = True
-            for s in range(0, n_tok, size):
-                if (
-                    len(set(int(e) for e in flat_i[s : s + size].reshape(-1).tolist()))
-                    > c.capacity
-                ):
-                    ok = False
-                    break
-            if ok:
-                break
-        # Evaluate each chunk before building the next: left lazy, every
-        # chunk's intermediates coexist and the prefill transient exceeds the
-        # memory the offload exists to save.
-        outs = []
-        for s in range(0, n_tok, size):
-            o = self._forward(flat_x[s : s + size], flat_i[s : s + size])
-            mx.eval(o)
-            outs.append(o)
-        out = mx.concatenate(outs, axis=0)
+        # Mirror the stock SwitchGLU's sort rule for the call as a whole, so
+        # every chunk runs the kernel the resident model would have used.
+        out = self._forward_expert_major(flat_x, ids, k, indices.size >= 64)
         return out.reshape(indices.shape + (x.shape[-1],))
 
 

@@ -1784,6 +1784,38 @@ class TestAsyncWriteAndTimeoutLoad:
         # Block should be removed from index (corrupted entry cleanup)
         assert not ssd_cache.has_block(block_hash)
 
+    @pytest.mark.parametrize(
+        "method, expected",
+        [("load_block", None), ("load_block_with_metadata", (None, None))],
+    )
+    @pytest.mark.parametrize("unlink_fails", [False, True])
+    def test_corrupt_block_cleanup_logging(
+        self, ssd_cache, mx, caplog, method, expected, unlink_fails
+    ):
+        block_hash = b"corrupt_cleanup"
+        file_path = ssd_cache._cache_dir / "corrupted.safetensors"
+        file_path.write_bytes(b"corrupted")
+        ssd_cache._index.add(
+            PagedSSDBlockMetadata(block_hash, file_path, 9, 1, 0, 0, 1)
+        )
+        original_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if unlink_fails and path == file_path:
+                raise OSError("unlink denied")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", unlink):
+            assert getattr(ssd_cache, method)(block_hash) == expected
+
+        assert not ssd_cache.has_block(block_hash)
+        assert file_path.exists() == unlink_fails
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == int(unlink_fails)
+        if unlink_fails:
+            assert str(file_path) in warnings[0].getMessage()
+            assert "unlink denied" in warnings[0].getMessage()
+
     def test_load_no_executor_deadlock(self, ssd_cache, mx):
         """Regression test: _load_executor must not exist (prevents deadlock)."""
         # The old implementation used ThreadPoolExecutor(max_workers=1) which

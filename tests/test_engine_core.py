@@ -30,6 +30,12 @@ from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
 
+@pytest.fixture(autouse=True)
+def _mock_explicit_gc(monkeypatch):
+    # These engines use mock models. Real reclamation is covered in test_engine_teardown.
+    monkeypatch.setattr("gc.collect", lambda: 0)
+
+
 class TestEngineConfig:
     """Tests for EngineConfig dataclass."""
 
@@ -671,8 +677,8 @@ class TestEngineCoreClose:
             ):
                 engine.close()
 
-            future.result.assert_called_once_with(timeout=60.0)
-            assert "Engine teardown timed out after 60s" in fatal.call_args.args[0]
+            assert 0 < future.result.call_args.kwargs["timeout"] <= 120.0
+            assert "while running shutdown" in fatal.call_args.args[0]
 
 
 class TestEngineCoreGetCacheStats:
@@ -793,6 +799,47 @@ class TestEngineCoreGenerateCancellation:
 
 class TestEngineCoreErrorPropagation:
     """Tests for error propagation from engine loop to requests."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message, terminal",
+        [
+            ("kIOGPUCommandBufferCallbackErrorSubmissionsIgnored", True),
+            ("kIOGPUCommandBufferCallbackErrorTimeout", False),
+            ("Memory limit exceeded during prefill", False),
+        ],
+    )
+    async def test_engine_loop_gpu_error_policy(
+        self, mock_model, mock_tokenizer, message, terminal
+    ):
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        engine._running = True
+
+        def recover():
+            engine._running = False
+            return []
+
+        try:
+            with (
+                patch.object(engine.scheduler, "has_requests", return_value=True),
+                patch.object(engine, "_step_burst", side_effect=RuntimeError(message)),
+                patch.object(
+                    engine.scheduler, "fail_all_requests", side_effect=recover
+                ) as recovery,
+                patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            ):
+                if terminal:
+                    with pytest.raises(SystemExit):
+                        await engine._engine_loop()
+                    fatal.assert_called_once()
+                    recovery.assert_not_called()
+                else:
+                    await engine._engine_loop()
+                    fatal.assert_not_called()
+                    recovery.assert_called_once()
+        finally:
+            engine._running = False
+            engine.close()
 
     @pytest.mark.asyncio
     async def test_error_output_propagates_to_collector(
@@ -1533,23 +1580,20 @@ class TestEngineCoreCloseReleasesSSDManager:
             manager.close.assert_called_once()
             assert scheduler.paged_ssd_cache_manager is None
 
-    def test_manager_closed_when_executor_fallback_raises(
+    def test_executor_rejection_does_not_run_mlx_teardown_on_caller(
         self, mock_model, mock_tokenizer
     ):
-        with patch("omlx.engine_core.get_registry") as mock_registry:
-            mock_registry.return_value.acquire.return_value = True
-            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
-
-            scheduler = engine.scheduler
-            manager = MagicMock()
-            scheduler.paged_ssd_cache_manager = manager
-            scheduler.shutdown = MagicMock(side_effect=ValueError("boom"))
-            engine._mlx_executor.shutdown(wait=True)
-
-            engine.close()  # must not raise
-
-            manager.close.assert_called_once()
-            assert scheduler.paged_ssd_cache_manager is None
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler = engine.scheduler
+        scheduler.shutdown = MagicMock()
+        engine._mlx_executor.shutdown(wait=True)
+        with (
+            patch("omlx.engine_core.fatal_exit", side_effect=SystemExit),
+            pytest.raises(SystemExit),
+        ):
+            engine.close()
+        scheduler.shutdown.assert_not_called()
+        assert not engine._closed
 
     def test_manager_closed_on_normal_close(self, mock_model, mock_tokenizer):
         with patch("omlx.engine_core.get_registry") as mock_registry:

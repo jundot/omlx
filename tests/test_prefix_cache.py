@@ -295,7 +295,7 @@ class TestBlockAwarePrefixCache:
                 promote_to_hot_cache=False,
             )
             assert restored_cache is not None
-            restored_keys, restored_values = restored_cache[0].state
+            restored_keys, restored_values = restored_cache[0].keys_and_values()
             assert restored_table.num_tokens == len(tokens)
             assert mx.array_equal(restored_keys, keys).item()
             assert mx.array_equal(restored_values, values).item()
@@ -942,7 +942,10 @@ class TestBlockAwarePrefixCacheWithSSD:
 
         assert restored is not None
         restored_cache = restored[0]
-        restored_keys, restored_values = restored_cache.kv_cache.state
+        restored_keys, restored_values = (
+            restored_cache.kv_cache.keys,
+            restored_cache.kv_cache.values,
+        )
         assert restored_keys.tolist() == keys.tolist()
         assert restored_values.tolist() == values.tolist()
         assert restored_cache.index_keys.tolist() == index_keys.tolist()
@@ -2520,7 +2523,7 @@ class TestArraysCacheLastBlockOnly:
         assert len(reconstructed) == 1
         layer_cache = reconstructed[0]
         if hasattr(layer_cache, "state"):
-            reconstructed_keys, reconstructed_values = layer_cache.state
+            reconstructed_keys, reconstructed_values = layer_cache.keys_and_values()
         elif isinstance(layer_cache, (list, tuple)) and len(layer_cache) == 2:
             reconstructed_keys, reconstructed_values = layer_cache
         else:
@@ -3582,8 +3585,8 @@ class TestTurboQuantFormatMismatchRecovery:
         assert result is not None
         assert isinstance(result[0], SizedArraysCache)
         assert result[0].size() == 4
-        assert len(result[0].state) == 4
-        for expected, actual in zip(states, result[0].state):
+        assert len(result[0].cache) == 4
+        for expected, actual in zip(states, result[0].cache):
             assert mx.array_equal(expected, actual).item()
 
 
@@ -4641,3 +4644,55 @@ class TestReconstructionSilentFallbackHardening:
 
         assert rebuilt is not None
         assert rebuilt.offset == self.BLOCK
+
+
+@pytest.mark.parametrize("complete_base", [True, False])
+def test_pooling_snapshot_base_after_atomic_image_prefix(tmp_path, complete_base):
+    import mlx.core as mx
+    from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+    from omlx.cache.pooling_delta import compact_pooling_cache_snapshot
+    from omlx.cache.type_handlers import CacheListHandler
+    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+    apply_deepseek_v4_patch()
+    prefix, _, ssd = TestBlockAwarePrefixCache._make_ssd_prefix_cache(tmp_path)
+    handler = CacheListHandler()
+
+    def snapshot(count):
+        rotating = RotatingKVCache(max_size=4)
+        keys = mx.ones((1, 1, count, 8))
+        rotating.update_and_fetch(keys, keys)
+        pool = PoolingCache(4)
+        pool.state = (None, None, mx.arange(count // 4 * 8).reshape(1, count // 4, 8))
+        cache = CacheList(rotating, pool)
+        return [
+            {
+                "layer_idx": 0,
+                "class_name": "CacheList",
+                "cache_type": "CacheList",
+                "state": list(handler.serialize_state(cache)),
+                "meta_state": handler.serialize_meta_state(cache),
+            }
+        ]
+
+    initial = snapshot(12)
+    compact_pooling_cache_snapshot(initial, 12, 12 if complete_base else 4)
+    final = snapshot(16)
+    delta = snapshot(16)
+    compact_pooling_cache_snapshot(delta, 16, 4)
+    try:
+        table = prefix.store_cache(
+            "image", list(range(16)), final, boundary_snapshots={12: initial, 16: delta}
+        )
+        if not complete_base:
+            assert table is None or table.num_tokens == 0
+            return
+        assert table.num_tokens == 16
+        hit, _ = prefix.fetch_cache("reuse", list(range(16)))
+        restored = prefix.reconstruct_cache(hit)
+        assert restored is not None
+        assert mx.array_equal(restored[0][1].pooled, final[0]["state"][1][2])
+        assert restored[0][0].offset == 16
+    finally:
+        ssd.close()

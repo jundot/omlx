@@ -3,7 +3,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from .activations import swiglu
+from ..activations import swiglu
 
 
 def _gather_sort(x, indices):

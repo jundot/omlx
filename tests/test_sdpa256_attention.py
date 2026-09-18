@@ -74,12 +74,14 @@ def test_flash_sdpa256_memory_is_sub_quadratic():
 
     peaks = []
     for seq_len in (8192, 32768):
-        q, k, v = _qkv(seq_len, seq_len)
+        baseline = mx.get_active_memory()
+        q, k, v = _qkv(seq_len, seq_len, n_q=6, n_kv=1)
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
         mx.reset_peak_memory()
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
-        peaks.append(mx.get_peak_memory())
-    assert peaks[1] < 6 * peaks[0]
+        peaks.append(mx.get_peak_memory() - baseline)
+        del q, k, v
+    assert peaks[0] > 0 and peaks[1] < 6 * peaks[0], peaks
 
 
 def test_metal_bounded_path_forces_mlx0322_fused_kernel(monkeypatch):

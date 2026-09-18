@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -275,13 +276,16 @@ def test_no_unreachable_functions_in_the_cluster_package():
         ("pairing_routes.py", "set_pairing_manager_getter"),
     }
 
-    sources = {path: path.read_text() for path in (_REPO / "omlx").rglob("*.py")}
+    name_counts = Counter(
+        name
+        for path in (_REPO / "omlx").rglob("*.py")
+        for name in re.findall(r"\w+", path.read_text())
+    )
 
     uncalled = []
     for path in sorted(_CLUSTER.glob("*.py")):
         for name in _public_functions(path):
-            pattern = re.compile(rf"\b{re.escape(name)}\b")
-            hits = sum(len(pattern.findall(text)) for text in sources.values())
+            hits = name_counts[name]
             if hits <= 1 and (path.name, name) not in allowed_uncalled:
                 uncalled.append(f"{path.name}:{name}")
 
