@@ -152,6 +152,31 @@ cannot restore the original FP32 states. Compare next-token distributions and
 task outputs against the default path: activation rounding changes, although
 checkpoint weights and recurrent state retain their original precision.
 
+For a matched prefill timing, set `MODEL_DIR` to the checkpoint directory and
+run the snippet below twice, with `OMLX_PRISM_FP16_ACTIVATIONS=0` and `=1`.
+Use the same idle GPU and checkpoint. It warms the exact shape once, then times
+three fresh-cache passes, including the final-token output projection.
+
+```python
+import os, statistics, time
+import mlx.core as mx
+from omlx.utils.model_loading import maybe_load_custom_quantization
+
+model, processor = maybe_load_custom_quantization(os.environ["MODEL_DIR"], is_vlm=True)
+lm = model.language_model
+text = "The community garden has apple trees, a wooden bench, and a small pond. Birds visit each morning. "
+ids = mx.array([processor.tokenizer.encode(text * 100)[:1024]])
+times = []
+for trial in range(4):
+    cache = lm.make_cache()
+    start = time.perf_counter()
+    hidden = lm.model(ids, cache=cache)
+    mx.eval(lm.lm_head(hidden[:, -1:]))
+    if trial:
+        times.append(time.perf_counter() - start)
+print(times, "seconds;", ids.shape[-1] / statistics.median(times), "tokens/sec")
+```
+
 Run `python -m pytest tests/test_sdpa256_attention.py` for the FP32 bounded
 attention regression. On M1, forcing MLX's fused FP32 head-dim-256 kernel fails
 at evaluation with a threadgroup-memory error; the fallback must remain bounded
