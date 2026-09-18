@@ -5784,7 +5784,9 @@ class TestMeasureSensitivityQuantizedVlm:
         assert vlm_load.call_args.kwargs["lazy"] is True
         assert vlm_load.call_args.kwargs["trust_remote_code"] is True
         assert vlm_load.call_args.kwargs["strict"] is False
-        tokenizer_load.assert_called_once_with(Path("/fake/minimax-proxy"))
+        tokenizer_load.assert_called_once_with(
+            Path("/fake/minimax-proxy"), {"trust_remote_code": True}
+        )
         lm_load.assert_not_called()
 
 
