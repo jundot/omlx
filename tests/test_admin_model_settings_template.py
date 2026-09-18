@@ -442,10 +442,32 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     html = _model_settings_template()
     section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
     assert "modelSettings.moe_expert_offload_enabled" in section
-    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert "modelSettings.moe_expert_offload_resident_percent" in section
     assert ":disabled" in section
     for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
         assert f"modelSettings.{key}" in section
+
+
+def test_moe_expert_offload_resident_fraction_is_a_bounded_percentage():
+    """The resident fraction is typed as a whole percentage, not picked."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "<select" not in section
+    assert '<input type="number" min="20" max="80" step="1"' in section
+    assert "modelSettings.moe_expert_offload_resident_percent" in section
+    assert ">%</span>" in section
+    assert '@blur="onMoeExpertOffloadResidentBlur()"' in section
+    assert (
+        'x-show="moeExpertOffloadResidentInvalid() '
+        '&& modelSettings.moe_expert_offload_resident_touched"' in section
+    )
+    assert (
+        "{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}"
+        in section
+    )
+    assert (
+        "{{ t('modal.model_settings.moe_expert_offload_resident_range') }}" in section
+    )
 
 
 def test_profile_editor_behavior():

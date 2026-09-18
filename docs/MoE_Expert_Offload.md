@@ -26,7 +26,8 @@ larger than physical memory load at all.
 ## Enabling it
 
 Per model, in the admin dashboard: **Model Settings → MoE Expert Offload**,
-with a resident-fraction selector (12.5% – 75%). Or via the settings API:
+with a resident-fraction field (a whole percentage from 20 to 80). Or via the
+settings API:
 
 ```json
 {"moe_expert_offload_enabled": true, "moe_expert_offload_resident_fraction": 0.25}
