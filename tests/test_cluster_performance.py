@@ -421,6 +421,87 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
     assert batch._next_logprobs[0].shape == (32,)
 
 
+def test_full_logits_worker_materializes_its_forward_before_the_token_all_sum(
+    monkeypatch,
+):
+    """#3521: the stage send must complete before the token collective.
+
+    On the full-logits worker branch (no rank-zero-logits contract) the send
+    rides the lazy forward result, and nothing downstream evaluates it —
+    the rank contributes zeros to the sample. The token all-sum can then be
+    scheduled first: this rank blocks in the collective, rank zero blocks in
+    the recv, and the pipeline never produces a token.
+    """
+
+    class Cache:
+        state = mx.array([0])
+
+    class FullLogitsModel:
+        # No _omlx_supports_rank_zero_logits: the full-logits worker branch.
+        def __init__(self):
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = 1
+
+        def __call__(self, value, cache=None, skip_logits=False):
+            return mx.zeros((*value.shape, 32))
+
+    class Batch:
+        def __init__(self, model):
+            self.model = model
+            self.uids = [1]
+            self.prompt_cache = [Cache()]
+            self.tokens = [[]]
+            self.samplers = [None]
+            self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
+            self.logits_processors = [[]]
+            self.state_machines = []
+            self.max_tokens = [2]
+            self._current_tokens = None
+            self._current_logprobs = []
+            self._next_tokens = mx.array([3], dtype=mx.uint32)
+            self._next_logprobs = []
+            self._token_context = []
+            self._num_tokens = [0]
+            self._matcher_states = []
+
+    model = FullLogitsModel()
+    batch = Batch(model)
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+    )
+    events = []
+    real_eval = mx.eval
+
+    def recording_eval(*values):
+        events.append("eval")
+        return real_eval(*values)
+
+    monkeypatch.setattr(mx, "eval", recording_eval)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda value, group=None: events.append("all_sum") or value,
+    )
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    with install_runtime_optimizations(
+        model,
+        _WorkerGroup(),
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert capabilities["rank_zero_logits"]["active"] is False
+        mlx_generate.GenerationBatch._step(batch)
+
+    # The forward must be materialized before the token collective is issued.
+    assert "all_sum" in events
+    assert "eval" in events
+    assert events.index("eval") < events.index("all_sum")
+
+
 def test_pipeline_prefill_schedule_has_equal_fill_and_drain_timeline():
     schedules = [
         pipeline_prefill_schedule(10, 4, rank=rank, world_size=3)
