@@ -1442,12 +1442,33 @@ LinkCommandRunner = Callable[
     [str, Sequence[str]], subprocess.CompletedProcess[str]
 ]
 
+# ``ServerSettings.port``/``ServerConfig.port``'s own default (settings.py,
+# config.py). Deliberately not imported from there: this module stays
+# usable without pulling in settings-loading machinery, and the port only
+# needs to be *something* oMLX itself listens on by default, not the
+# caller's actual configured port -- see the probe's own comment below for
+# why 22 (SSH) was wrong and what the honest limitation of this port is.
+_BOUND_CONNECT_PROBE_PORT = 8000
+
 
 def _run_link_command(
     ssh_hostname: str,
     command: Sequence[str],
 ) -> subprocess.CompletedProcess[str]:
-    """Run one bounded link check locally or through the paired SSH identity."""
+    """Run one bounded link check locally or through the paired SSH identity.
+
+    ``ssh`` joins every trailing argument with a bare space before handing
+    the result to the remote shell -- it does not preserve the local argv's
+    element boundaries the way ``subprocess.run`` does. An unquoted
+    multi-line command (the Linux bound-connect probe below is the reason
+    this exists) arrives split across separate shell statements instead of
+    the one atomic argument the caller passed, and fails with a syntax
+    error on every remote invocation -- invisible to any test that mocks
+    this function, since the bug is in what SSH does to the argv, not in
+    anything this function's own callers do wrong. ``shlex.join`` folds the
+    whole command into the single argument SSH actually preserves verbatim,
+    mirroring ``_remote_gui_authorize``'s already-correct pattern above.
+    """
 
     argv = list(command)
     if ssh_hostname not in _LOCAL_HOSTS:
@@ -1455,7 +1476,7 @@ def _run_link_command(
             "ssh",
             *cluster_ssh_options(connect_timeout=5),
             ssh_hostname,
-            *argv,
+            shlex.join(argv),
         ]
     try:
         return subprocess.run(
@@ -1504,18 +1525,38 @@ def verify_link_reachability(
         if selected != local.interface:
             # Linux does not implement macOS's ``route -n get`` form. Binding
             # a TCP connection to the candidate source address proves both the
-            # route and that the peer's SSH service answers on that exact path,
-            # without needing a platform-specific interface command.
-            script = (
+            # route and that the peer's oMLX server answers on that exact
+            # path, without needing a platform-specific interface command.
+            #
+            # Probes _BOUND_CONNECT_PROBE_PORT (oMLX's own default server
+            # port), not SSH's 22: connecting to 22 would silently make
+            # inbound SSH scoped to the fabric interface a *new*
+            # requirement for clustering to pass this check, unrelated to
+            # whether the fabric itself works. This is oMLX's own default
+            # port, not a discovered one -- an admin Mac running on a
+            # different port fails this probe even though its fabric path
+            # is fine. Advertising and probing the peer's actual
+            # configured port is tracked separately (§C5/#2885); this is
+            # the immediate, self-contained fix for the shell-mangling bug
+            # that made every remote invocation of this probe fail
+            # regardless of port.
+            bound_connect_script = (
                 "import socket,sys\n"
-                "s=socket.create_connection((sys.argv[2],22),timeout=3,"
+                "s=socket.create_connection((sys.argv[2],"
+                f"{_BOUND_CONNECT_PROBE_PORT}),timeout=3,"
                 "source_address=(sys.argv[1],0))\n"
                 "s.close()"
             )
             if route.returncode != 0:
                 bound = run(
                     local.host,
-                    ("python3", "-c", script, local.address, remote.address),
+                    (
+                        "/usr/bin/python3",
+                        "-c",
+                        bound_connect_script,
+                        local.address,
+                        remote.address,
+                    ),
                 )
                 if bound.returncode == 0:
                     continue

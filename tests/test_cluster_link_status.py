@@ -7,6 +7,7 @@ be told to click. These tests pin the distinctions.
 """
 
 import ipaddress
+import shlex
 import subprocess
 
 import pytest
@@ -16,6 +17,7 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkStatus,
     TransportInfo,
+    _run_link_command,
     assess_link,
     classify_link,
     configure_link,
@@ -795,6 +797,110 @@ def test_link_verification_rejects_a_route_on_the_wrong_interface():
     assert verified is False
     assert "uses en0" in reason
     assert "en4" in reason
+
+
+# --- #2849: the Linux/bound-connect fallback, and the remote-argv bug that
+# made every real invocation of it fail regardless of what it probed. -----
+
+
+def test_link_verification_falls_back_to_a_bound_connect_when_route_lacks_the_form():
+    """Linux has no ``route -n get``; the bound-connect probe is the only
+    signal available there. Previously untested at any level -- the gap
+    that let #2849's shell-mangling bug (below) ship unnoticed."""
+
+    link = shared_link_addresses(_laptop(), _studio())
+    calls = []
+
+    def runner(host, command):
+        calls.append((host, tuple(command)))
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 1, "", "no such command")
+        if command[0] == "/usr/bin/python3":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    verified, _reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is True
+    bound_calls = [c for _h, c in calls if c[0] == "/usr/bin/python3"]
+    assert len(bound_calls) == 2, "one bound-connect probe per direction"
+    for command in bound_calls:
+        assert command[0] == "/usr/bin/python3", "not bare python3 -- may not be on PATH"
+        script = command[2]
+        assert ",22)" not in script, "must not require inbound SSH on the fabric interface"
+        assert ",8000)" in script, "oMLX's own default server port"
+
+
+def test_link_verification_rejects_when_the_bound_connect_also_fails():
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(_host, command):
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 1, "", "no such command")
+        return subprocess.CompletedProcess(command, 1, "", "connection refused")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is False
+    assert "no usable route" in reason
+
+
+def test_run_link_command_shell_quotes_a_multiword_remote_command(monkeypatch):
+    """The actual #2849 bug, exercised without a mocked runner: ssh joins
+    every trailing argument with a bare space before handing the result to
+    the remote shell, so an unquoted multi-line command (exactly the
+    bound-connect probe's ``python -c`` script above) arrives split across
+    separate shell statements and fails with a syntax error on every real
+    remote invocation. Every test above fakes ``runner`` directly, which is
+    exactly why this shipped unnoticed -- this test is the one that
+    exercises ``_run_link_command`` itself."""
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    multiline_command = (
+        "/usr/bin/python3",
+        "-c",
+        "import socket,sys\ns=socket.create_connection((sys.argv[2],8000))\ns.close()",
+        "10.0.1.1",
+        "10.0.1.2",
+    )
+
+    _run_link_command("Studio.local", multiline_command)
+
+    argv = captured["argv"]
+    assert argv[0] == "ssh"
+    host_index = argv.index("Studio.local")
+    # Exactly one trailing argument after the hostname -- ssh has nothing
+    # left of its own to (mis)join.
+    assert len(argv) == host_index + 2
+    remote_command = argv[host_index + 1]
+    assert shlex.split(remote_command) == list(multiline_command), (
+        "must survive a shlex round trip back to the exact original argv"
+    )
+
+
+def test_run_link_command_does_not_shell_quote_a_local_command(monkeypatch):
+    """A local command runs as a plain argv, no shell involved at all --
+    quoting it would leave literal quote characters in what subprocess.run
+    execs, which is a distinct and equally real bug in the other direction."""
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _run_link_command("127.0.0.1", ("/sbin/ping", "-n", "-c", "1", "10.0.1.2"))
+
+    assert captured["argv"] == ["/sbin/ping", "-n", "-c", "1", "10.0.1.2"]
 
 
 def test_the_detected_link_speed_is_carried_into_the_explanation():
