@@ -35,6 +35,13 @@ in ``maybe_apply_pre_load_patches`` which satisfies that requirement.
 
 from __future__ import annotations
 
+from ..mtp_head_norm_convention import fc_norm_is_raw_hf as _fc_norm_is_raw_hf
+from ..mtp_head_norm_convention import (
+    head_layer_norms_are_raw_hf as _head_layer_norms_are_raw_hf,
+)
+from ..mtp_head_norm_convention import is_fc_norm as _is_fc_norm
+from ..mtp_head_norm_convention import is_oq_tracked_tensor as _tracked
+
 import logging
 import weakref
 from typing import Any
@@ -525,6 +532,16 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
             except Exception:
                 return _fallback
 
+        # A converted pre_fc gamma can sit below the 0.5 cutoff, so the
+        # per-key magnitude test alone would shift it twice. See
+        # omlx/patches/mtp_head_norm_convention.py.
+        _verdict_cache: list = []
+
+        def _fc_norm_is_raw(_value):
+            if not _verdict_cache:
+                _verdict_cache.append(_head_layer_norms_are_raw_hf(weights))
+            return _fc_norm_is_raw_hf(_value, _verdict_cache[0])
+
         sanitized = {}
         for key, value in weights.items():
             if "model.language_model" in key:
@@ -551,7 +568,10 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
                 if "mtp." in key:
                     # Per-key: a head norm may still be raw-HF even when a
                     # sibling head norm (e.g. mtp.norm) is already shifted.
-                    if _is_oq_tracked_tensor(value):
+                    if _is_fc_norm(key) and not _tracked(value):
+                        if _fc_norm_is_raw(value):
+                            value = value + 1.0
+                    elif _is_oq_tracked_tensor(value):
                         value = _mark_mtp_norm_conditional_add(value)
                     elif _mtp_norm_is_raw_hf(value, has_unsanitized_conv1d):
                         value = value + 1.0
