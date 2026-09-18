@@ -73,10 +73,12 @@ from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
     compare_keys,
+    create_auto_login_token,
     create_session_token,
     require_admin,
     validate_api_key,
     verify_api_key,
+    verify_auto_login_token,
     verify_session,
 )
 from .benchmark import (
@@ -246,6 +248,12 @@ class LoginRequest(BaseModel):
 
     api_key: str
     remember: bool = False
+
+
+class AutoLoginTokenRequest(BaseModel):
+    """Request model for the auto-login token exchange."""
+
+    key: str
 
 
 class SetupApiKeyRequest(BaseModel):
@@ -2032,16 +2040,52 @@ async def logout(response: Response):
     return {"success": True}
 
 
-@router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
+@router.post("/api/auto-login-token")
+async def create_auto_login_token_route(request: AutoLoginTokenRequest):
     """
-    Auto-login using API key and redirect to the target admin page.
+    Exchange the main API key for a short-lived browser auto-login token.
 
-    Used by the macOS menubar app to open admin pages with automatic
-    authentication, bypassing the manual login form.
+    The macOS menubar app POSTs the main API key here — in the request
+    body, never in a URL — and opens the returned token in the browser.
+    The permanent key therefore never reaches browser history, the server
+    access log, or the process list.
+
+    Only the main key is accepted: sub keys must not grant admin login.
 
     Args:
-        key: The API key for authentication.
+        request: AutoLoginTokenRequest containing the main API key.
+
+    Returns:
+        JSON response with a short-lived signed token.
+
+    Raises:
+        HTTPException: 401 if no API key is configured or it does not match.
+    """
+    global_settings = _get_global_settings()
+    server_api_key = global_settings.auth.api_key if global_settings else None
+
+    if (
+        not request.key
+        or not server_api_key
+        or not verify_api_key(request.key, server_api_key)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return {"token": create_auto_login_token()}
+
+
+@router.get("/auto-login")
+async def auto_login(auth_token: str = "", redirect: str = "/admin/dashboard"):
+    """
+    Auto-login using a short-lived token and redirect to the target admin page.
+
+    Used by the macOS menubar app to open admin pages with automatic
+    authentication, bypassing the manual login form. The app first POSTs
+    the main API key to /admin/api/auto-login-token and passes the token
+    it gets back here, so the permanent key never appears in this URL.
+
+    Args:
+        auth_token: Short-lived signed auto-login token.
         redirect: The path to redirect to after login. Must start with /admin.
 
     Returns:
@@ -2050,11 +2094,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     if not redirect.startswith("/admin"):
         raise HTTPException(status_code=400, detail="Invalid redirect path")
 
-    global_settings = _get_global_settings()
-    server_api_key = global_settings.auth.api_key if global_settings else None
-
-    # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
+    if not auth_token or not verify_auto_login_token(auth_token):
         return RedirectResponse(url="/admin", status_code=302)
 
     token = create_session_token()

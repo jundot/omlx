@@ -18,6 +18,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 SESSION_COOKIE_NAME = "omlx_admin_session"
 SESSION_MAX_AGE = 86400  # 24 hours in seconds
 REMEMBER_ME_MAX_AGE = 2592000  # 30 days in seconds
+AUTO_LOGIN_MAX_AGE = 30  # seconds — window for the /admin/auto-login exchange
 
 # Secret key for signing session tokens
 # Use environment variable if set, otherwise generate a random key
@@ -235,6 +236,39 @@ def validate_api_key(api_key: str) -> tuple[bool, str]:
     if not api_key.isascii():
         return False, "API key must contain only ASCII characters"
     return True, ""
+
+
+def create_auto_login_token() -> str:
+    """Create a short-lived token for the /admin/auto-login browser exchange.
+
+    The macOS menubar app trades the main API key for one of these (POST
+    body, never a URL) and then opens the dashboard with the token, so the
+    permanent key stays out of browser history, access logs, and the
+    process list. Its own salt keeps it distinct from a session token, and
+    the short expiry caps the replay value if it leaks.
+
+    Returns:
+        A signed token valid for AUTO_LOGIN_MAX_AGE seconds.
+    """
+    return _serializer.dumps({"auto_login": True}, salt="auto-login")
+
+
+def verify_auto_login_token(token: str) -> bool:
+    """Verify a token minted by create_auto_login_token.
+
+    Args:
+        token: The token from the /admin/auto-login request.
+
+    Returns:
+        True if the token is a fresh, correctly signed auto-login token.
+    """
+    if not token:
+        return False
+    try:
+        data = _serializer.loads(token, salt="auto-login", max_age=AUTO_LOGIN_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return False
+    return data.get("auto_login", False) is True
 
 
 def verify_session(request: Request) -> bool:

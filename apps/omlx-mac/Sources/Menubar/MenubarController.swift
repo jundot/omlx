@@ -1007,8 +1007,50 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
-        guard let url = MenubarController.webAdminURL(host: host, port: port, apiKey: config.apiKey) else { return }
-        NSWorkspace.shared.open(url)
+        let apiKey = config.apiKey
+
+        // Trade the main API key for a short-lived token so the permanent
+        // key never lands in the browser URL. If the exchange fails, open
+        // without a token — the server redirects to the login page instead.
+        guard let apiKey, !apiKey.isEmpty else {
+            guard let url = MenubarController.webAdminURL(host: host, port: port, authToken: nil) else { return }
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        Task {
+            let token = await fetchAutoLoginToken(host: host, port: port, apiKey: apiKey)
+            guard let url = MenubarController.webAdminURL(host: host, port: port, authToken: token) else { return }
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// POSTs the main API key to `/admin/api/auto-login-token` and returns
+    /// the short-lived token, or nil if the exchange fails. The key travels
+    /// in the request body only — never in a URL.
+    private func fetchAutoLoginToken(host: String, port: Int, apiKey: String) async -> String? {
+        guard let baseURL = AppConfig.httpURL(host: AppConfig.connectableHost(for: host), port: port),
+              var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        else {
+            return nil
+        }
+        comps.path = "/admin/api/auto-login-token"
+        guard let url = comps.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["key": apiKey])
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode,
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = payload["token"] as? String, !token.isEmpty
+        else {
+            return nil
+        }
+        return token
     }
 
     @objc private func openChat() {
@@ -1398,20 +1440,24 @@ extension MenubarController {
 
     /// Builds the browser URL for the web admin dashboard. Uses the
     /// `/admin/auto-login` endpoint so the dashboard opens without the
-    /// manual login form: the server validates the main API key, sets the
-    /// session cookie, then redirects to `redirect`. A missing/stale key
+    /// manual login form: the caller first exchanges the main API key for
+    /// a short-lived token (`fetchAutoLoginToken`), passes it here, and the
+    /// server sets the session cookie before redirecting to `redirect`.
+    /// The permanent key never appears in this URL. A missing/stale token
     /// makes the endpoint redirect to the login page instead — a graceful
     /// fallback, so we still emit the URL.
     ///
-    /// `URLComponents.queryItems` percent-encodes the key, so a key
+    /// `URLComponents.queryItems` percent-encodes the token, so a token
     /// containing `&`, `=`, `/`, spaces etc. is transmitted intact. The one
     /// exception is `+`: URLComponents leaves it unescaped and servers
-    /// decode `+` as a space (form-urlencoded semantics), which would
-    /// corrupt a key containing `+`. We escape it explicitly below.
+    /// decode a bare `+` as a space (form-urlencoded semantics). A
+    /// `URLSafeTimedSerializer` token is URL-safe base64 — `-` and `_`, never
+    /// `+` — so today's tokens cannot hit this, but we escape it explicitly
+    /// below so the URL stays correct for any token source.
     ///
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
-    static func webAdminURL(host: String, port: Int, apiKey: String?) -> URL? {
+    static func webAdminURL(host: String, port: Int, authToken: String?) -> URL? {
         guard let baseURL = AppConfig.httpURL(
             host: AppConfig.connectableHost(for: host),
             port: port
@@ -1422,8 +1468,8 @@ extension MenubarController {
         }
         comps.path = "/admin/auto-login"
         var items = [URLQueryItem(name: "redirect", value: "/admin/dashboard")]
-        if let key = apiKey, !key.isEmpty {
-            items.append(URLQueryItem(name: "key", value: key))
+        if let token = authToken, !token.isEmpty {
+            items.append(URLQueryItem(name: "auth_token", value: token))
         }
         comps.queryItems = items
         comps.percentEncodedQuery = comps.percentEncodedQuery?
