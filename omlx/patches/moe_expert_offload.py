@@ -38,6 +38,7 @@ import struct
 import threading
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, wait
+from functools import lru_cache
 from pathlib import Path
 
 import mlx.core as mx
@@ -794,101 +795,204 @@ def apply_moe_expert_offload(
     return wrapped
 
 
+def _checkpoint_signature(model_dir: Path) -> tuple:
+    """Stat identity of the config and shards, so cached scans follow edits."""
+    files = [model_dir / "config.json", *model_dir.glob("*.safetensors")]
+    out = []
+    for path in sorted(files):
+        if path.exists():
+            st = path.stat()
+            out.append((path.name, st.st_size, st.st_mtime_ns))
+    return tuple(out)
+
+
+@lru_cache(maxsize=64)
+def _offload_layout(model_dir: str, signature: tuple) -> tuple[tuple[int, int], ...]:
+    """``(expert count, expert bytes)`` per container the wrapper would wrap.
+
+    Derived from the same structural rules ``apply_moe_expert_offload``
+    enforces, so an estimate built on it cannot promise savings the wrapper
+    will not deliver: a container counts only when all three
+    ``{gate,up,down}_proj`` projections are present *with quantization
+    scales* (unquantized checkpoints wrap nothing) in a supported layout —
+    stacked 3-D tensors or per-expert ``.experts.<n>.<proj>.<field>`` names.
+    Renamed layouts (Mixtral-style ``w1/w2/w3``) match neither and are not
+    listed. Families served by their own adapters are not listed either.
+    Header-only: the shard bodies are never read. ``signature`` is the
+    cache key's edit guard (see ``_checkpoint_signature``).
+    """
+    config_path = Path(model_dir) / "config.json"
+    if config_path.exists():
+        kind = json.loads(config_path.read_text()).get("model_type", "")
+        if kind.startswith("deepseek_v4") or kind in ("glm5_next", "glm_moe_dsa"):
+            return ()
+    # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
+    # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
+    # Field completeness is tracked PER EXPERT, not container-wide: the
+    # wrapper verifies every expert's tensors, so one complete expert
+    # must not vouch for 31 incomplete ones (reported: 1 complete + 31
+    # gate-only experts estimated 972,736 from 1,000,000 while zero
+    # modules wrapped).
+    stacked: dict[str, dict] = {}
+    per_expert: dict[str, dict] = {}
+
+    for shard in sorted(Path(model_dir).glob("*.safetensors")):
+        with open(shard, "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+        for name, spec in header.items():
+            if name == "__metadata__":
+                continue
+            b0, b1 = spec["data_offsets"]
+            m = _PER_EXPERT_PROJ_RE.match(name)
+            if m:
+                b = per_expert.setdefault(m.group("parent"), {"bytes": 0, "per_e": {}})
+                b["bytes"] += b1 - b0
+                b["per_e"].setdefault(int(m.group("idx")), set()).add(
+                    (m.group("proj"), m.group("field"))
+                )
+                continue
+            shape = spec.get("shape", ())
+            if len(shape) == 3:
+                parts = name.rsplit(".", 2)
+                if (
+                    len(parts) == 3
+                    and parts[1] in _PROJS
+                    and parts[2] in ("weight", "scales", "biases")
+                ):
+                    b = stacked.setdefault(
+                        parts[0], {"bytes": 0, "fields": set(), "e": set()}
+                    )
+                    b["bytes"] += b1 - b0
+                    b["fields"].add((parts[1], parts[2]))
+                    b["e"].add(int(shape[0]))
+
+    required = {(p, f) for p in _PROJS for f in ("weight", "scales")}
+    layout: list[tuple[int, int]] = []
+    for b in stacked.values():
+        if not required <= b["fields"]:
+            continue  # unquantized or partial: wraps nothing
+        if len(b["e"]) != 1:  # projections disagree on E
+            continue
+        n = next(iter(b["e"]))
+        if n > 0:
+            layout.append((n, b["bytes"]))
+    for b in per_expert.values():
+        per_e = b["per_e"]
+        if not per_e or any(not required <= s for s in per_e.values()):
+            continue  # any incomplete expert: the wrapper rejects the layer
+        layout.append((len(per_e), b["bytes"]))
+    return tuple(layout)
+
+
+def _layout_for(model_path: str | Path):
+    """``(model_dir, layout)`` for a resolvable checkpoint, else ``None``."""
+    model_dir = _resolve_model_dir(model_path)
+    if model_dir is None:
+        return None
+    model_dir = Path(model_dir)
+    return model_dir, _offload_layout(str(model_dir), _checkpoint_signature(model_dir))
+
+
+def _admission_from_layout(
+    layout: tuple[tuple[int, int], ...],
+    full_size: int,
+    resident_fraction: float,
+    minimum: int,
+) -> int:
+    """``full_size`` less the bytes the runtime would leave on disk.
+
+    Each container's savings honor the runtime's routing-aware capacity
+    floor: ``capacity = min(E, max(minimum, round(E * fraction)))``, so tiny
+    fractions do not under-report the resident share.
+    """
+    saved = 0.0
+    for n, nbytes in layout:
+        capacity = min(n, max(minimum, round(n * resident_fraction)))
+        saved += nbytes * (1.0 - capacity / n)
+    if saved <= 0:
+        return full_size
+    return full_size - int(saved)
+
+
 def estimate_offload_admission_bytes(
     model_path: str | Path, full_size: int, resident_fraction: float = 0.25
 ) -> int:
     """Admission-time size estimate with offload active.
 
-    Derived from the same structural rules ``apply_moe_expert_offload``
-    enforces, so the estimate cannot promise savings the wrapper will not
-    deliver: a container counts only when all three ``{gate,up,down}_proj``
-    projections are present *with quantization scales* (unquantized
-    checkpoints wrap nothing) in a supported layout — stacked 3-D tensors
-    or per-expert ``.experts.<n>.<proj>.<field>`` names. Renamed layouts
-    (Mixtral-style ``w1/w2/w3``) match neither and discount nothing. Each
-    layer's savings honor the runtime's routing-aware capacity floor:
-    ``capacity = min(E, max(8, top_k, round(E * fraction)))``, so tiny fractions
-    do not under-report the resident share. Falls back to ``full_size`` on
-    any failure — admission must never get more permissive by accident.
+    See ``_offload_layout`` for what counts as offloadable and
+    ``_admission_from_layout`` for the capacity floor. Falls back to
+    ``full_size`` on any failure — admission must never get more permissive
+    by accident.
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return full_size
     try:
-        model_dir = _resolve_model_dir(model_path)
-        if model_dir is None:
+        found = _layout_for(model_path)
+        if found is None:
             return full_size
-        minimum = _minimum_experts(model_dir)
-        config_path = Path(model_dir) / "config.json"
-        if config_path.exists():
-            kind = json.loads(config_path.read_text()).get("model_type", "")
-            if kind.startswith("deepseek_v4") or kind in ("glm5_next", "glm_moe_dsa"):
-                return full_size
-        # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
-        # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
-        # Field completeness is tracked PER EXPERT, not container-wide: the
-        # wrapper verifies every expert's tensors, so one complete expert
-        # must not vouch for 31 incomplete ones (reported: 1 complete + 31
-        # gate-only experts estimated 972,736 from 1,000,000 while zero
-        # modules wrapped).
-        stacked: dict[str, dict] = {}
-        per_expert: dict[str, dict] = {}
-
-        for shard in sorted(Path(model_dir).glob("*.safetensors")):
-            with open(shard, "rb") as f:
-                header_len = struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(header_len))
-            for name, spec in header.items():
-                if name == "__metadata__":
-                    continue
-                b0, b1 = spec["data_offsets"]
-                m = _PER_EXPERT_PROJ_RE.match(name)
-                if m:
-                    b = per_expert.setdefault(
-                        m.group("parent"), {"bytes": 0, "per_e": {}}
-                    )
-                    b["bytes"] += b1 - b0
-                    b["per_e"].setdefault(int(m.group("idx")), set()).add(
-                        (m.group("proj"), m.group("field"))
-                    )
-                    continue
-                shape = spec.get("shape", ())
-                if len(shape) == 3:
-                    parts = name.rsplit(".", 2)
-                    if len(parts) == 3 and parts[1] in _PROJS and parts[2] in (
-                        "weight", "scales", "biases"
-                    ):
-                        b = stacked.setdefault(
-                            parts[0], {"bytes": 0, "fields": set(), "e": set()}
-                        )
-                        b["bytes"] += b1 - b0
-                        b["fields"].add((parts[1], parts[2]))
-                        b["e"].add(int(shape[0]))
-
-        required = {(p, f) for p in _PROJS for f in ("weight", "scales")}
-        saved = 0.0
-        for b in stacked.values():
-            if not required <= b["fields"]:
-                continue  # unquantized or partial: wraps nothing
-            if len(b["e"]) != 1:  # projections disagree on E
-                continue
-            n = next(iter(b["e"]))
-            if n <= 0:
-                continue
-            capacity = min(n, max(minimum, round(n * resident_fraction)))
-            saved += b["bytes"] * (1.0 - capacity / n)
-        for b in per_expert.values():
-            per_e = b["per_e"]
-            if not per_e or any(not required <= s for s in per_e.values()):
-                continue  # any incomplete expert: the wrapper rejects the layer
-            n = len(per_e)
-            capacity = min(n, max(minimum, round(n * resident_fraction)))
-            saved += b["bytes"] * (1.0 - capacity / n)
-        if saved <= 0:
-            return full_size
-        return full_size - int(saved)
+        model_dir, layout = found
+        return _admission_from_layout(
+            layout, full_size, resident_fraction, _minimum_experts(model_dir)
+        )
     except Exception:
         logger.debug("offload admission estimate failed", exc_info=True)
         return full_size
+
+
+def offload_capacity_fractions(model_path: str | Path) -> tuple[float, ...]:
+    """Every resident fraction that maps to a distinct whole-expert capacity.
+
+    The runtime keeps ``min(E, max(floor, round(E * fraction)))`` experts per
+    container, so only ``capacity / E`` values change what is resident, and a
+    setting chosen from this list round-trips through the runtime exactly.
+    Ascending. Empty when nothing would be wrapped (dense or unquantized
+    checkpoints, families with their own adapters, the kill switch).
+    """
+    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
+        return ()
+    try:
+        found = _layout_for(model_path)
+    except Exception:
+        logger.debug("offload layout scan failed", exc_info=True)
+        return ()
+    if found is None:
+        return ()
+    model_dir, layout = found
+    minimum = _minimum_experts(model_dir)
+    fractions: set[float] = set()
+    for n, _ in layout:
+        for capacity in range(min(n, minimum), n + 1):
+            fractions.add(capacity / n)
+    return tuple(sorted(fractions))
+
+
+def fit_resident_fraction(
+    model_path: str | Path, full_size: int, budget_bytes: int
+) -> float | None:
+    """Largest resident fraction whose admission estimate fits ``budget_bytes``.
+
+    Built on :func:`estimate_offload_admission_bytes` (same layout, same
+    floor), so the returned fraction's estimate fits and the next larger
+    capacity's does not. ``1.0`` when the fully resident model fits, ``None``
+    when even the routing floor does not. The result is a whole number of
+    experts per container expressed as a fraction, so passing it back as the
+    setting reproduces the same capacity.
+    """
+    candidates = offload_capacity_fractions(model_path)
+    if not candidates:
+        return 1.0 if full_size <= budget_bytes else None
+    # The estimate is non-decreasing in the fraction (every capacity is),
+    # so the fitting candidates form a prefix; bisect for its end.
+    lo, hi = 0, len(candidates)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        size = estimate_offload_admission_bytes(model_path, full_size, candidates[mid])
+        if size <= budget_bytes:
+            lo = mid + 1
+        else:
+            hi = mid
+    return candidates[lo - 1] if lo else None
 
 
 def materialize_offload_state(model) -> int:

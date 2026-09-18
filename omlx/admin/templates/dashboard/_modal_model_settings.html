@@ -1186,11 +1186,15 @@
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.moe_expert_offload_fraction_label') }}</label>
                                             <select x-model.number="modelSettings.moe_expert_offload_resident_fraction"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="0.125">{{ t('modal.model_settings.moe_expert_offload_resident_12_5') }}</option>
-                                                <option value="0.25">{{ t('modal.model_settings.moe_expert_offload_resident_25') }}</option>
-                                                <option value="0.5">{{ t('modal.model_settings.moe_expert_offload_resident_50') }}</option>
-                                                <option value="0.75">{{ t('modal.model_settings.moe_expert_offload_resident_75') }}</option>
+                                                <template x-if="moeOffloadFitOption()">
+                                                    <option :value="selectedModel.moe_expert_offload_fit_fraction" x-text="moeOffloadFitLabel()"></option>
+                                                </template>
+                                                <option value="0.125" x-text="moeOffloadPresetLabel(0.125, 'modal.model_settings.moe_expert_offload_resident_12_5')">{{ t('modal.model_settings.moe_expert_offload_resident_12_5') }}</option>
+                                                <option value="0.25" x-text="moeOffloadPresetLabel(0.25, 'modal.model_settings.moe_expert_offload_resident_25')">{{ t('modal.model_settings.moe_expert_offload_resident_25') }}</option>
+                                                <option value="0.5" x-text="moeOffloadPresetLabel(0.5, 'modal.model_settings.moe_expert_offload_resident_50')">{{ t('modal.model_settings.moe_expert_offload_resident_50') }}</option>
+                                                <option value="0.75" x-text="moeOffloadPresetLabel(0.75, 'modal.model_settings.moe_expert_offload_resident_75')">{{ t('modal.model_settings.moe_expert_offload_resident_75') }}</option>
                                             </select>
+                                            <p class="text-xs text-neutral-500 mt-1" x-show="moeOffloadNoFit()">{{ t('modal.model_settings.moe_expert_offload_no_fit') }}</p>
                                         </div>
                                     </div>
                                 </template>

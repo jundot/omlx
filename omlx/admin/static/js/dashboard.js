@@ -4052,6 +4052,50 @@
                 return Math.max(0, Math.round(bytes)) + ' B';
             },
 
+            // MoE expert offload: admission sizes per residency option and the
+            // largest whole-expert residency that fits the memory ceiling, as
+            // reported by /api/models (see EnginePool.fit_moe_offload_fraction).
+            MOE_OFFLOAD_PRESET_FRACTIONS: [0.125, 0.25, 0.5, 0.75],
+
+            moeOffloadPreset(fraction) {
+                const presets = this.selectedModel?.moe_expert_offload_presets;
+                if (!Array.isArray(presets)) return null;
+                return presets.find(p => Math.abs(p.fraction - fraction) < 1e-9) || null;
+            },
+
+            moeOffloadPresetLabel(fraction, labelKey) {
+                const label = window.t(labelKey);
+                const preset = this.moeOffloadPreset(fraction);
+                if (!preset || !Number.isFinite(preset.bytes) || preset.bytes <= 0) return label;
+                const sized = `${label} \u00b7 ~${this.formatByteCount(preset.bytes)}`;
+                if (preset.fits !== false) return sized;
+                return `${sized} \u00b7 ${window.t('modal.model_settings.moe_expert_offload_exceeds')}`;
+            },
+
+            moeOffloadFitOption() {
+                const fit = this.selectedModel?.moe_expert_offload_fit_fraction;
+                if (!Number.isFinite(fit) || fit <= 0 || fit > 1) return false;
+                return !this.MOE_OFFLOAD_PRESET_FRACTIONS.some(p => Math.abs(p - fit) < 1e-9);
+            },
+
+            moeOffloadFitLabel() {
+                const fit = this.selectedModel?.moe_expert_offload_fit_fraction;
+                if (!Number.isFinite(fit)) return '';
+                const pct = fit * 100;
+                const pctText = Number.isInteger(pct) ? String(pct) : pct.toFixed(1);
+                const bytes = this.selectedModel?.moe_expert_offload_fit_bytes;
+                const sized = Number.isFinite(bytes) && bytes > 0 ? ` \u00b7 ~${this.formatByteCount(bytes)}` : '';
+                return `${window.t('modal.model_settings.moe_expert_offload_fit_label')}: ${pctText}% resident${sized}`;
+            },
+
+            moeOffloadNoFit() {
+                const model = this.selectedModel;
+                const presets = model?.moe_expert_offload_presets;
+                if (!Array.isArray(presets) || !presets.length) return false;
+                if (Number.isFinite(model?.moe_expert_offload_fit_fraction)) return false;
+                return presets.some(p => p.fits === false);
+            },
+
             formatTokenCount(n) {
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
