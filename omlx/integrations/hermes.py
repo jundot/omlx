@@ -130,6 +130,23 @@ class HermesIntegration(Integration):
             model_config.pop("max_tokens", None)
         config["model"] = model_config
 
+        # Hermes' only reasoning knob is agent.reasoning_effort ("none".."xhigh",
+        # default "medium"). Write it only on an explicit signal so the default
+        # stands otherwise.
+        agent_config = config.get("agent", {})
+        if not isinstance(agent_config, dict):
+            agent_config = {}
+        if ctx.reasoning is True:
+            agent_config["reasoning_effort"] = "high"
+        elif ctx.reasoning is False:
+            agent_config["reasoning_effort"] = "none"
+        else:
+            agent_config.pop("reasoning_effort", None)
+        if agent_config:
+            config["agent"] = agent_config
+        else:
+            config.pop("agent", None)
+
         config_path.parent.mkdir(parents=True, exist_ok=True)
         yaml_content = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
         config_path.write_text(

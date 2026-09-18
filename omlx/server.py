@@ -183,6 +183,7 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
+from .configured_model import ConfiguredModel, new_configured_model
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.embedding import EmbeddingEngine
@@ -287,6 +288,26 @@ class ServerState:
 
 # Global server state instance
 _server_state: ServerState = ServerState()
+
+
+def model_config(model_id: str | None) -> ConfiguredModel:
+    """Resolved configuration for an API model name.
+
+    ``model_id`` may be an alias or an exposed-profile ID; profile overrides
+    apply and the entry is the physical model's. An unknown model gets only
+    the sampling defaults.
+    """
+    resolved_model_id = resolve_model_id(model_id)
+    settings = get_model_settings_for_request(model_id, resolved_model_id)
+    entry = None
+    pool = _server_state.engine_pool
+    if resolved_model_id and pool is not None:
+        entry = pool.get_entry(resolved_model_id)
+    return new_configured_model(
+        settings=settings,
+        model_entry=entry,
+        sampling=_server_state.sampling,
+    )
 
 
 def get_server_state() -> ServerState:
@@ -1869,13 +1890,20 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
     return None
 
 
-def get_model_settings_for_request(model_id: str | None):
-    """Return settings for the requested API model name via ModelSettingsManager."""
+def get_model_settings_for_request(
+    model_id: str | None,
+    resolved_model_id: str | None = None,
+):
+    """Return settings for the requested API model name via ModelSettingsManager.
+
+    Pass ``resolved_model_id`` if already known to skip resolving it again.
+    """
     sm = _server_state.settings_manager
     if not model_id or sm is None:
         return None
 
-    resolved_model_id = resolve_model_id(model_id)
+    if resolved_model_id is None:
+        resolved_model_id = resolve_model_id(model_id)
     if not hasattr(sm, "get_settings_for_request"):
         return sm.get_settings(resolved_model_id or model_id)
 
@@ -1987,57 +2015,9 @@ def _get_ocr_defaults(model_id: str | None) -> dict | None:
 
 
 def get_max_context_window(model_id: str | None = None) -> int | None:
-    """
-    Get effective max context window limit.
-
-    Resolution:
-        1. **Per-model override** (admin UI / settings.json) — always
-           wins. An operator who has set a per-model number knows what
-           they want; ``max_context_window_policy`` does not clamp it.
-        2. **Model-config-discovered native context length** (#1308),
-           optionally clamped by the operator policy: if
-           ``sampling.max_context_window_policy`` is set, return
-           ``min(native, policy)``; otherwise return ``native`` as-is.
-        3. **Fallback default** from ``SamplingSettings.max_context_window``
-           — only used when neither tier 1 nor tier 2 yields a value.
-           Treated as a default, NOT capped by the policy; existing
-           ``settings.json`` files carrying the historical ``32768``
-           default keep working unchanged after upgrade.
-
-    The policy field is intentionally nullable and unset by default so
-    no existing install behavior shifts. Setting it engages
-    ``min(native, policy)`` across every model whose native context is
-    discoverable; per-model overrides remain the operator's escape
-    hatch for individual models that should exceed the policy.
-
-    Returns:
-        Max context window token count, or ``None`` if no tier resolves
-        (only possible when neither the model nor the global default
-        provides a value, which shouldn't happen in practice).
-    """
-    # Resolve alias for physical model metadata, but keep requested alias settings.
-    requested_model_id = model_id
-    model_settings = get_model_settings_for_request(requested_model_id)
-    model_id = resolve_model_id(model_id)
-
-    # Priority 1: explicit per-model override (not capped by policy)
-    if model_settings and model_settings.max_context_window is not None:
-        return model_settings.max_context_window
-
-    # Priority 2: model-native context, optionally clamped by policy
-    pool = _server_state.engine_pool
-    if model_id and pool is not None:
-        entry = pool.get_entry(model_id)
-        if entry is not None and entry.model_context_length is not None:
-            native = entry.model_context_length
-            policy = getattr(_server_state.sampling, "max_context_window_policy", None)
-            if policy is not None and policy > 0:
-                return min(native, policy)
-            return native
-
-    # Priority 3: fallback default (not capped — preserves legacy
-    # settings.json behavior).
-    return _server_state.sampling.max_context_window
+    """Context limit in tokens for an API model name; see
+    :attr:`ConfiguredModel.max_context_window` for how it is chosen."""
+    return model_config(model_id).max_context_window
 
 
 def get_embedding_max_length(
@@ -3345,31 +3325,22 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
             continue
 
-        m["max_context_window"] = get_max_context_window(model_id)
-        source_model_id = m.get("source_model_id") or model_id
+        config = model_config(model_id)
+        m["max_context_window"] = config.max_context_window
+        m["max_tokens"] = config.max_tokens
+        m["enable_thinking"] = config.enable_thinking
+        m["preserve_thinking"] = config.preserve_thinking
 
-        # Resolve effective max_tokens: model setting > global default
-        max_tokens = _server_state.sampling.max_tokens
+        source_model_id = m.get("source_model_id") or model_id
         if _server_state.settings_manager:
-            sm = _server_state.settings_manager
-            if hasattr(sm, "get_settings_for_request"):
-                ms = sm.get_settings_for_request(
-                    model_id,
-                    resolved_model_id=source_model_id,
-                )
-            else:
-                ms = sm.get_settings(source_model_id)
-            base_ms = sm.get_settings(source_model_id)
+            base_ms = _server_state.settings_manager.get_settings(source_model_id)
             if base_ms and base_ms.model_alias and source_model_id == model_id:
                 m["model_alias"] = base_ms.model_alias
             m["is_favorite"] = base_ms is not None and base_ms.is_favorite
             m["is_hidden"] = base_ms is not None and base_ms.is_hidden
-            if ms and ms.max_tokens is not None:
-                max_tokens = ms.max_tokens
         else:
             m["is_favorite"] = False
             m["is_hidden"] = False
-        m["max_tokens"] = max_tokens
     return status
 
 
