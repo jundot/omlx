@@ -144,3 +144,15 @@ isolated base path and port. Check text, streamed text, two concurrent requests,
 and an image question after a text-only system turn. Repeat a prompt longer than
 one cache block and confirm nonzero cached tokens with the same answer. The model
 must retain its original `prism_hadamard_qwen35` config throughout.
+
+Repeat with `OMLX_PRISM_FP16_ACTIVATIONS=1` to check the opt-in mixed-precision
+path. Check a fresh 66K-token prompt and its cached repeat, not just short
+generation. The FP16 path uses a separate prefix-cache model signature so it
+cannot restore the original FP32 states. Compare next-token distributions and
+task outputs against the default path: activation rounding changes, although
+checkpoint weights and recurrent state retain their original precision.
+
+Run `python -m pytest tests/test_sdpa256_attention.py` for the FP32 bounded
+attention regression. On M1, forcing MLX's fused FP32 head-dim-256 kernel fails
+at evaluation with a threadgroup-memory error; the fallback must remain bounded
+and preserve FP32 rather than silently narrowing attention inputs.

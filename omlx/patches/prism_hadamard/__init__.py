@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 import mlx.core as mx
@@ -44,6 +45,7 @@ class Packed(nn.Module):
         super().__init__()
         self.weight, self.scales, self.biases = arrays
         self.block, self.signs, self.embedding = block, signs, embedding
+        self.activation_dtype = None
 
     def __call__(self, x):
         if self.embedding:
@@ -66,9 +68,11 @@ class Packed(nn.Module):
         return self.as_linear(x)
 
     def as_linear(self, x):
+        if self.activation_dtype is not None:
+            x = x.astype(self.activation_dtype)
         if self.block:
             x = hadamard(x, self.block, self.signs)
-        return mx.quantized_matmul(
+        out = mx.quantized_matmul(
             x,
             self.weight,
             self.scales,
@@ -77,6 +81,33 @@ class Packed(nn.Module):
             group_size=128,
             bits=2,
         )
+        return out.astype(self.activation_dtype) if self.activation_dtype else out
+
+
+class _ActivationRMSNorm(nn.RMSNorm):
+    def __call__(self, x):
+        return super().__call__(x).astype(x.dtype)
+
+
+class _ActivationConv1d(nn.Conv1d):
+    def __call__(self, x):
+        return super().__call__(x).astype(x.dtype)
+
+
+def _enable_fp16_activations(model):
+    """Keep checkpoint weights and recurrent state intact; narrow activations.
+
+    FP32 norm/conv weights otherwise promote the entire residual stream and
+    attention cache. Keep their arithmetic in FP32, then return to FP16 at
+    module boundaries. This is opt-in because it changes rounding.
+    """
+    for _, module in model.named_modules():
+        if isinstance(module, Packed):
+            module.activation_dtype = mx.float16
+        elif type(module) is nn.RMSNorm:
+            module.__class__ = _ActivationRMSNorm
+        elif type(module) is nn.Conv1d:
+            module.__class__ = _ActivationConv1d
 
 
 def _validate_config(config, *, is_vlm):
@@ -200,6 +231,9 @@ def load(model_path, *, is_vlm):
         weights.update(chunk)
     _install_packed(language_model, config["modules"], weights, prefix=prefix)
     model.load_weights(list(weights.items()), strict=True)
+    if os.environ.get("OMLX_PRISM_FP16_ACTIVATIONS", "0") == "1":
+        _enable_fp16_activations(language_model)
+        model._omlx_prism_activation_signature = "prism_fp16_v1"
     model.eval()
     mx.eval(model.parameters())
     if is_vlm:

@@ -2205,6 +2205,10 @@ class VLMBatchedEngine(BaseEngine):
                 Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
             )
 
+        signature = getattr(self._vlm_model, "_omlx_prism_activation_signature", None)
+        if isinstance(signature, str) and signature:
+            scheduler_config.model_name = self._model_name + ":" + signature
+
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

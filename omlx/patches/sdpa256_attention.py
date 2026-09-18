@@ -287,7 +287,11 @@ def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
     additive masks, so route them there directly."""
     global _NATIVE_FORCE_FUSED
 
-    if isinstance(mask, mx.array):
+    # Metal's head-dim-256 fp32 fused kernel requests 53 KiB of threadgroup
+    # memory, exceeding the 32 KiB limit on M1. The failure happens at eval,
+    # so catching the lazy SDPA call cannot recover. Keep fp32 exact and
+    # bounded using the portable path instead of silently narrowing it.
+    if isinstance(mask, mx.array) or getattr(queries, "dtype", mx.float16) == mx.float32:
         return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
     native_shape = values.shape[-1] == HEAD_DIM and not (
         isinstance(mask, str)

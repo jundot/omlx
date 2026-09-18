@@ -40,6 +40,24 @@ def _max_abs(a, b):
 # --- kernel correctness --------------------------------------------------
 
 
+@pytest.mark.parametrize("mask", [None, "causal"])
+def test_fp32_bounded_attention_avoids_oversized_metal_kernel(mask, monkeypatch):
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    q, k, v = _qkv(32, 96, n_q=4, n_kv=2, dtype=mx.float32)
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask=mask)
+    mx.eval(ref)
+
+    def no_native(*args, **kwargs):
+        raise AssertionError("FP32 must not dispatch the oversized fused kernel")
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", no_native)
+    out = sdpa256._flash_sdpa256(q, k, v, SCALE_256, mask)
+    mx.eval(out)
+    assert out.dtype == mx.float32
+    assert _max_abs(out, ref) < 2e-6
+
+
 @pytest.mark.parametrize("seq_len", [256, 1024, 4096])
 def test_flash_sdpa256_square_causal_matches_reference(seq_len):
     from omlx.patches.sdpa256_attention import _flash_sdpa256

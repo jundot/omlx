@@ -327,6 +327,12 @@ module manifest, tokenizer and weights together; do not change `model_type` to
 transforms for both text-only and vision packs. It does not execute Python files
 from the downloaded model's `runtime/` directory.
 
+For these packs, `OMLX_PRISM_FP16_ACTIVATIONS=1` opts into FP16 activations and
+attention caches. FP32 normalization/convolution weights otherwise promote the
+residual stream to FP32. The option preserves checkpoint weights, FP32 recurrent
+state and FP32 Hadamard accumulation, but changes activation rounding; validate
+it on your workload before enabling it. Other model formats are unaffected.
+
 ## CLI Configuration
 
 ```bash

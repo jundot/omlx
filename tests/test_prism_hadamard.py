@@ -11,7 +11,12 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
 
-from omlx.patches.prism_hadamard import MODEL_TYPE, Packed, _install_packed
+from omlx.patches.prism_hadamard import (
+    MODEL_TYPE,
+    Packed,
+    _enable_fp16_activations,
+    _install_packed,
+)
 from omlx.utils.model_loading import maybe_load_custom_quantization
 
 
@@ -82,12 +87,12 @@ def text_pack(tmp_path):
         model_type="qwen3_5_text",
         hidden_size=512,
         intermediate_size=512,
-        num_hidden_layers=1,
+        num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=1,
         head_dim=128,
         vocab_size=16,
-        full_attention_interval=1,
+        full_attention_interval=2,
         tie_word_embeddings=False,
         linear_num_value_heads=4,
         linear_num_key_heads=1,
@@ -152,6 +157,53 @@ def test_text_pack_loads_through_dispatch_without_checkpoint_code(
     logits = model(mx.array([[1, 2, 3]]))
     assert logits.shape == (1, 3, 16)
     assert mx.all(mx.isfinite(logits)).item()
+
+
+def test_opt_in_fp16_keeps_weights_and_recurrent_state_in_original_precision(
+    text_pack, monkeypatch
+):
+    path, _, weights = text_pack
+    monkeypatch.setenv("OMLX_PRISM_FP16_ACTIVATIONS", "1")
+    monkeypatch.setattr(
+        "mlx_lm.utils.load_tokenizer", lambda *a, **kw: sentinel.tokenizer
+    )
+    model, _ = maybe_load_custom_quantization(str(path), is_vlm=False)
+    assert model._omlx_prism_activation_signature == "prism_fp16_v1"
+    loaded = dict(tree_flatten(model.parameters()))
+    for key, expected in weights.items():
+        assert loaded[key].dtype == expected.dtype
+        np.testing.assert_array_equal(np.asarray(loaded[key]), np.asarray(expected))
+    cache = model.make_cache()
+    hidden = model.model(mx.array([[1, 2, 3]]), cache=cache)
+    assert hidden.dtype == mx.float16
+    assert cache[0][1].dtype == mx.float32
+    assert mx.all(mx.isfinite(model.lm_head(hidden))).item()
+
+
+def test_fp16_module_boundaries_preserve_fp32_weights():
+    model = nn.Sequential(nn.RMSNorm(128), nn.Conv1d(128, 128, 3, groups=128))
+    before = dict(tree_flatten(model.parameters()))
+    _enable_fp16_activations(model)
+    x = mx.random.normal((1, 5, 128)).astype(mx.float16)
+    norm = model.layers[0]
+    conv = model.layers[1]
+    expected = mx.fast.rms_norm(x, before["layers.0.weight"], norm.eps).astype(
+        mx.float16
+    )
+    np.testing.assert_array_equal(np.asarray(norm(x)), np.asarray(expected))
+    assert conv(expected).dtype == mx.float16
+    for key, weight in tree_flatten(model.parameters()):
+        assert weight is before[key]
+
+
+def test_fp16_projection_with_fp32_affine_parameters():
+    arrays = mx.quantize(mx.ones((4, 128), dtype=mx.float32), group_size=128, bits=2)
+    module = Packed(arrays)
+    _enable_fp16_activations(module)
+    out = module(mx.ones((1, 128), dtype=mx.float32))
+    assert out.dtype == mx.float16
+    np.testing.assert_allclose(np.asarray(out), 128, atol=0.1)
+    assert module.scales.dtype == mx.float32
 
 
 @pytest.mark.parametrize(
