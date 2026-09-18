@@ -54,6 +54,7 @@ def _has_cli_overrides(args) -> bool:
         "host",
         "log_level",
         "sse_keepalive_mode",
+        "menubar",
         "max_audio_upload_size",
         "max_image_upload_size",
         "max_image_side_length",
@@ -92,6 +93,9 @@ def serve_command(args):
     from . import process_title
     from .settings import burst_decode_env, init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
+    from . import menubar_sidecar
+
+    menubar_proc = None
 
     process_title.set_process_title()
 
@@ -364,11 +368,24 @@ def serve_command(args):
 
         for h in bind_hosts:
             print(f"Starting server at http://{h}:{settings.server.port}")
+        menubar_ok, menubar_hint = menubar_sidecar.should_autostart(
+            # getattr: tests and embedders may hand serve_command a bare
+            # Namespace / fake settings without the serve-parser defaults.
+            cli_flag=getattr(args, "menubar", None),
+            settings_enabled=getattr(settings.server, "menubar", True),
+        )
+        if menubar_ok:
+            menubar_proc = menubar_sidecar.spawn(
+                bind_hosts[0], settings.server.port, parent_pid=os.getpid()
+            )
+        elif menubar_hint:
+            print(menubar_hint)
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
             pass
     finally:
+        menubar_sidecar.terminate(menubar_proc)
         # Uvicorn closes sockets during normal shutdown; this covers failures
         # after bind succeeds but before the server takes ownership.
         for sock in serve_sockets:
@@ -1064,6 +1081,14 @@ Example directory structure:
     )
     serve_parser.add_argument(
         "--port", type=int, default=None, help="Port to bind (default: 8000)"
+    )
+    serve_parser.add_argument(
+        "--menubar",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show a macOS menubar sidecar with live prefill/decode status "
+        "(default: on when PyObjC is available; --no-menubar or native "
+        "oMLX.app supervision disables it)",
     )
     serve_parser.add_argument(
         "--log-level",
