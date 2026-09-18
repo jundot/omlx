@@ -116,7 +116,17 @@ def generate_ssh_key_pair(
         key_path = _SSH_KEY_PATH
 
     if key_path.exists() and not overwrite:
-        # Load existing key
+        # Load existing key — tighten permissions if we can, since ssh refuses
+        # group/world-readable private keys and we never want to silently use
+        # a laxly-permissioned identity.
+        try:
+            os.chmod(key_path, 0o600)
+        except OSError:
+            if (key_path.stat().st_mode & 0o077):
+                raise RuntimeError(
+                    f"managed private key {key_path} is group/world-readable; "
+                    f"refusing to use it: chmod 600 {key_path}"
+                ) from None
         pubkey_path = Path(str(key_path) + ".pub")
         if not pubkey_path.exists():
             raise RuntimeError(f"private key exists but public key missing: {key_path}")
