@@ -122,6 +122,12 @@ class TestIsHomebrew:
             mock_sys.prefix = "/usr/local/homebrew/opt/omlx/libexec"
             assert is_homebrew()
 
+    def test_homebrew_cask_conda_prefix(self):
+        """Conda environments installed by a Homebrew cask are pip installs."""
+        with patch("omlx.utils.install.sys") as mock_sys:
+            mock_sys.prefix = "/opt/homebrew/Caskroom/miniconda/base/envs/omlx"
+            assert not is_homebrew()
+
     def test_non_homebrew_prefix(self):
         """Regular venv should not detect as Homebrew."""
         with patch("omlx.utils.install.sys") as mock_sys:
