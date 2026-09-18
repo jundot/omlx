@@ -1329,6 +1329,11 @@ def maybe_load_custom_quantization(
         )
         return None
 
+    if config.get("model_type") == "prism_hadamard_qwen35":
+        from ..patches.prism_hadamard import load
+
+        return load(model_name, is_vlm=is_vlm)
+
     quant_config = config.get("quantization_config")
     quant_method = quant_config.get("quant_method") if quant_config else None
 

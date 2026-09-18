@@ -320,6 +320,13 @@ Models are auto-detected by type. You can also download models directly from the
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
 
+Prism Hadamard Qwen3.5 packs, including Bonsai 2, are loaded through a dedicated
+adapter for their affine 2-bit/group-128 weights. Keep the original `config.json`,
+module manifest, tokenizer and weights together; do not change `model_type` to
+`qwen3_5`. The adapter applies the required activation and inverse embedding
+transforms for both text-only and vision packs. It does not execute Python files
+from the downloaded model's `runtime/` directory.
+
 ## CLI Configuration
 
 ```bash

@@ -130,3 +130,17 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+# Prism Hadamard model loading
+
+Run `python -m pytest tests/test_prism_hadamard.py tests/test_model_loading.py`.
+The tests compare packed projection and embedding results against an independent
+dense Hadamard matrix, load tiny text and vision checkpoints through the production
+dispatch, and check malformed packs, strict weight loading and image-message format.
+No downloaded model or checkpoint Python is needed.
+
+For hardware validation, serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` with an
+isolated base path and port. Check text, streamed text, two concurrent requests,
+and an image question after a text-only system turn. Repeat a prompt longer than
+one cache block and confirm nonzero cached tokens with the same answer. The model
+must retain its original `prism_hadamard_qwen35` config throughout.
