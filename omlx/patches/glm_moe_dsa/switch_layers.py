@@ -7,34 +7,10 @@ import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
 from .kernels import fast as glm_fast
-
-
-def _inverse_permutation(order, inverse_scatter=False):
-    if inverse_scatter:
-        return mx.put_along_axis(
-            mx.zeros_like(order),
-            order,
-            mx.arange(order.size, dtype=order.dtype),
-            axis=0,
-        )
-    return mx.argsort(order)
-
-
-def _gather_sort(x, indices, inverse_scatter=False):
-    *_, M = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = _inverse_permutation(order, inverse_scatter)
-    lhs_indices = order // M
-    x = x.flatten(0, -3)
-    return x[lhs_indices], indices[order], inv_order
-
-
-def _scatter_unsort(x, inv_order, shape=None):
-    x = x[inv_order]
-    if shape is not None:
-        x = mx.unflatten(x, 0, shape)
-    return x
+from .._switch_sort import (
+    gather_sort as _gather_sort,
+    scatter_unsort as _scatter_unsort,
+)
 
 
 class QuantizedSwitchLinear(nn.Module):

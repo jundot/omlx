@@ -1177,6 +1177,142 @@ private struct AdvancedTab: View {
                         .disabled(vm.qwen4PleSsdOffloadForced)
                     }
                 }
+                if vm.isDeepseekV41 && vm.engramSsdOffloadSupported {
+                    Row(label: String(localized: "settings.advanced.engram_ssd_offload.label",
+                                      defaultValue: "SSD Engram Offload (DeepSeek V4.1)",
+                                      comment: "Row label for the DeepSeek V4.1 Engram SSD mmap toggle"),
+                        sublabel: vm.engramSsdOffloadForced
+                            ? String(localized: "settings.advanced.engram_ssd_offload.forced",
+                                     defaultValue: "Required because resident loading exceeds the configured model-memory limit.",
+                                     comment: "Sublabel when Engram SSD offload is forced by memory limits")
+                            : String(localized: "settings.advanced.engram_ssd_offload.sub",
+                                     defaultValue: "Keep the Engram table on SSD to save memory. Prefill can be slower after context changes.",
+                                     comment: "Sublabel for the Engram SSD offload toggle")) {
+                        RowSwitch(isOn: vm.bind(
+                            $vm.engramSsdOffload,
+                            save: {
+                                Task {
+                                    await vm.save(.engramSsdOffload, client: client)
+                                }
+                            }
+                        ))
+                        .disabled(vm.engramSsdOffloadForced)
+                    }
+                }
+                if vm.expertStreamingSupported || vm.moeExpertOffloadSupported {
+                    Row(label: vm.expertStreamingSupported
+                            ? String(localized: "settings.advanced.expert_streaming.label",
+                                     defaultValue: "Expert Streaming",
+                                     comment: "Row label for the unified MoE expert streaming toggle")
+                            : String(localized: "settings.advanced.moe_expert_offload.label",
+                                     defaultValue: "MoE Expert Offload",
+                                     comment: "Row label for the legacy MoE expert offload toggle"),
+                        sublabel: vm.expertStreamingConflictReason
+                            ?? (vm.expertStreamingSupported
+                                ? String(localized: "settings.advanced.expert_streaming.sub",
+                                         defaultValue: "Serve MoE experts from SSD under a memory budget with a live governor. Applies after the model reloads.",
+                                         comment: "Sublabel for the unified expert streaming toggle")
+                                : String(localized: "settings.advanced.moe_expert_offload.sub",
+                                         defaultValue: "Stream MoE expert weights from the checkpoint on demand, keeping only a fraction resident. Applies after the model reloads.",
+                                         comment: "Sublabel for the legacy expert offload toggle"))) {
+                        // Profile-eligible: the edit lands in the working
+                        // profile and reaches the server on Apply — never a
+                        // per-toggle PUT (a flipped engine-construction
+                        // setting reloads the model).
+                        RowSwitch(isOn: vm.bindProfile($vm.expertStreamingEnabled))
+                        .disabled(vm.expertStreamingConflictReason != nil)
+                        .help(vm.expertStreamingConflictReason ?? "")
+                    }
+                }
+                if vm.expertStreamingEnabled {
+                    if vm.moeExpertOffloadSupported && !vm.expertStreamingSupported {
+                        // Legacy-adapter knob (deepseek_v41 / gemma4 /
+                        // olmoe): the unified backend sizes residency
+                        // from the GiB budget instead.
+                        Row(label: String(localized: "settings.advanced.moe_resident_fraction.label",
+                                          defaultValue: "Resident Experts",
+                                          comment: "Row label for the legacy offload resident-fraction picker"),
+                            sublabel: String(localized: "settings.advanced.moe_resident_fraction.sub",
+                                             defaultValue: "Share of each layer's experts kept in memory; the rest stream on demand.",
+                                             comment: "Sublabel for the resident-fraction picker")) {
+                            Popup(selection: vm.bindProfile(
+                                $vm.moeExpertResidentFraction
+                            ), width: .controlCompact,
+                                  // Mirrors the WebUI select: 0.125 / 0.25 /
+                                  // 0.5 / 0.75, plus the loaded value when
+                                  // it isn't one of the presets.
+                                  options: ModelSettingsScreenVM.aneFractionOptions(
+                                      current: vm.moeExpertResidentFraction,
+                                      presets: [0.125, 0.25, 0.5, 0.75]))
+                        }
+                    }
+                }
+                if vm.expertStreamingSupported && vm.expertStreamingEnabled {
+                    Row(label: String(localized: "settings.advanced.expert_budget_auto.label",
+                                      defaultValue: "Automatic Expert Budget",
+                                      comment: "Row label for the automatic expert budget toggle"),
+                        sublabel: String(localized: "settings.advanced.expert_budget_auto.sub",
+                                         defaultValue: "RAM-scaled starting budget with a governor that grows on decode stalls and shrinks under memory pressure. Off pins the Budget field below.",
+                                         comment: "Sublabel for the automatic expert budget toggle")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.expertBudgetAuto))
+                    }
+                    if !vm.expertBudgetAuto {
+                        expertGibRow(
+                            label: String(localized: "settings.advanced.expert_budget_gib.label",
+                                          defaultValue: "Pinned Budget",
+                                          comment: "Row label for the pinned expert budget field"),
+                            sublabel: String(localized: "settings.advanced.expert_budget_gib.sub",
+                                             defaultValue: "Fixed LRU budget. Empty clears the pin back to automatic.",
+                                             comment: "Sublabel for the pinned expert budget field"),
+                            text: $vm.expertBudgetGib, suffix: "GiB")
+                    }
+                    Row(label: String(localized: "settings.advanced.expert_dynamic.label",
+                                      defaultValue: "Dynamic Governor",
+                                      comment: "Row label for the dynamic governor mode picker"),
+                        sublabel: String(localized: "settings.advanced.expert_dynamic.sub",
+                                         defaultValue: "Auto follows the budget mode (on for automatic, off for pinned). On forces it over a pinned budget.",
+                                         comment: "Sublabel for the dynamic governor mode picker")) {
+                        Picker("", selection: vm.bindProfile($vm.expertDynamicMode)) {
+                            Text("Auto").tag(0)
+                            Text("On").tag(1)
+                            Text("Off").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 220)
+                    }
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_dynamic_max.label",
+                                      defaultValue: "Governor Ceiling",
+                                      comment: "Row label for the governor max budget field"),
+                        sublabel: String(localized: "settings.advanced.expert_dynamic_max.sub",
+                                         defaultValue: "GiB cap for governor growth. Empty = 6 GiB.",
+                                         comment: "Sublabel for the governor max budget field"),
+                        text: $vm.expertDynamicMaxGib, suffix: "GiB")
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_dynamic_min.label",
+                                      defaultValue: "Governor Floor",
+                                      comment: "Row label for the governor min budget field"),
+                        sublabel: String(localized: "settings.advanced.expert_dynamic_min.sub",
+                                         defaultValue: "GiB floor the governor will not shrink below. Empty = auto.",
+                                         comment: "Sublabel for the governor min budget field"),
+                        text: $vm.expertDynamicMinGib, suffix: "GiB")
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_dynamic_stall.label",
+                                      defaultValue: "Stall Target",
+                                      comment: "Row label for the governor stall target field"),
+                        sublabel: String(localized: "settings.advanced.expert_dynamic_stall.sub",
+                                         defaultValue: "Decode-layer stall rate above this grows the cache (0–0.9, default 0.05).",
+                                         comment: "Sublabel for the governor stall target field"),
+                        text: $vm.expertDynamicStall)
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_prefill.label",
+                                      defaultValue: "Prefill Budget",
+                                      comment: "Row label for the prefill budget field"),
+                        sublabel: String(localized: "settings.advanced.expert_prefill.sub",
+                                         defaultValue: "GiB cap so prefill streams through without displacing the decode hot set. Empty = auto.",
+                                         comment: "Sublabel for the prefill budget field"),
+                        text: $vm.expertPrefillGib, suffix: "GiB")
+                }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
@@ -1292,6 +1428,22 @@ private struct AdvancedTab: View {
                                  comment: "Subtitle for the Experimental settings section")
             )
             ExperimentalSection(vm: vm, client: client)
+        }
+    }
+
+    /// Shared layout for the expert-streaming numeric rows: label +
+    /// sublabel on the left, a mono TextInput bound through
+    /// `bindProfile` (a working-profile edit — no PUT until Apply) on
+    /// the right. Empty field = auto/cleared server-side.
+    private func expertGibRow(
+        label: String,
+        sublabel: String,
+        text: Binding<String>,
+        suffix: String? = nil
+    ) -> some View {
+        Row(label: label, sublabel: sublabel) {
+            TextInput(text: vm.bindProfile(text),
+                      mono: true, suffix: suffix, width: .controlCompact)
         }
     }
 }
@@ -2190,8 +2342,25 @@ private struct ExperimentalSection: View {
                       comment: "Sublabel describing SpecPrefill")
     }
 
+    private var expertStreamingOwnsSpeculativePathReason: String {
+        String(localized: "settings.speculative.conflict.expert_streaming",
+               defaultValue: "Disable expert streaming before enabling this feature.",
+               comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because expert streaming is on")
+    }
+
+    private var mtpOwnsSpeculativePathReason: String {
+        String(localized: "settings.speculative.conflict.mtp",
+               defaultValue: "Disable Lightning MTP before enabling this feature.",
+               comment: "Tooltip / sublabel shown when DFlash can't be enabled because Lightning MTP is on")
+    }
+
+    // DFlash conflicts with every other speculative path — the backend
+    // rejects dflash+mtp, dflash+vlm_mtp, and dflash+offload (either
+    // spelling) with no deepseek_v41 exemption
+    // (validate_moe_expert_offload), so all three lock the toggle.
     private var dflashToggleDisabled: Bool {
         !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+            || vm.mtpEnabled || vm.expertStreamingEnabled
     }
 
     private var dflashHelp: String {
@@ -2199,6 +2368,10 @@ private struct ExperimentalSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
+        if vm.expertStreamingEnabled {
+            return expertStreamingOwnsSpeculativePathReason
+        }
+        if vm.mtpEnabled { return mtpOwnsSpeculativePathReason }
         return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
     }
 
@@ -2207,6 +2380,10 @@ private struct ExperimentalSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
+        if vm.expertStreamingEnabled {
+            return expertStreamingOwnsSpeculativePathReason
+        }
+        if vm.mtpEnabled { return mtpOwnsSpeculativePathReason }
         if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.dflash.sub",
                       defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",

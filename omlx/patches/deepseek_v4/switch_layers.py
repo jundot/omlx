@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-import os
 from functools import lru_cache
 
 import mlx.core as mx
@@ -16,6 +15,10 @@ from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 from omlx.custom_kernels.nax import is_nax_available
 
+from .._switch_sort import gather_sort as _gather_sort
+from .._switch_sort import scatter_unsort as _scatter_unsort
+from ..expert_streaming._env import env_int, env_str
+
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
@@ -23,14 +26,14 @@ _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
 # Affine 2/3-bit g64 crossovers measured on M1 Ultra. Other formats keep
 # their existing 64-route sorting threshold.
-_SORT_MIN_ROUTES = int(os.environ.get("OMLX_DEEPSEEK_SORT_MIN_ROUTES", "32"))
-_AFFINE_NATIVE_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_AFFINE_BLOCK_MIN_ROUTES", "1024")
+_SORT_MIN_ROUTES = env_int("OMLX_DEEPSEEK_SORT_MIN_ROUTES", 32)
+_AFFINE_NATIVE_MIN_ROUTES = env_int(
+    "OMLX_DEEPSEEK_AFFINE_BLOCK_MIN_ROUTES", 1024
 )
 # Tuned on M3 Ultra. Set this to 8192 to restore the previous crossover on
 # other pre-NAX chips; M5 prefill uses the NAX fallback below.
-_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES", "16384")
+_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = env_int(
+    "OMLX_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES", 16384
 )
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
@@ -39,9 +42,9 @@ _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
 # 4k pp 828 -> 400 tok/s on M5 Max). Decode-sized calls stay on the block
 # kernels pending M5 measurements. OMLX_DEEPSEEK_MOE_NAX=0 keeps the block
 # kernels everywhere, =1 routes every call to stock on NAX GPUs.
-_NAX_STOCK_MODE = os.environ.get("OMLX_DEEPSEEK_MOE_NAX", "").strip().lower()
-_NAX_STOCK_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_MOE_NAX_MIN_ROUTES", "1024")
+_NAX_STOCK_MODE = (env_str("OMLX_DEEPSEEK_MOE_NAX", "") or "").lower()
+_NAX_STOCK_MIN_ROUTES = env_int(
+    "OMLX_DEEPSEEK_MOE_NAX_MIN_ROUTES", 1024
 )
 
 
@@ -65,21 +68,6 @@ def _sort_threshold(*projections) -> int:
     ):
         return _SORT_MIN_ROUTES
     return 64
-
-
-def _gather_sort(x, indices):
-    *_, M = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
-
-
-def _scatter_unsort(x, inv_order, shape=None):
-    x = x[inv_order]
-    if shape is not None:
-        x = mx.unflatten(x, 0, shape)
-    return x
 
 
 @lru_cache(maxsize=None)

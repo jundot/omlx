@@ -7,11 +7,9 @@ Resident tables retain their packed bytes; prefetch workers only copy CPU rows.
 """
 
 import fcntl
-import json
 import math
 import mmap
 import os
-import struct
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -22,20 +20,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from omlx.utils.safetensors import (
+    SAFETENSORS_NUMPY_DTYPES,
+    read_safetensors_header,
+)
+
 RESIDENT_READ_BYTES = 8 * 1024 * 1024
-# safetensors dtype tag -> numpy transport dtype (bf16 travels as raw uint16).
-SAFETENSORS_NUMPY_DTYPES = {
-    "BF16": "<u2",
-    "F16": "<f2",
-    "F32": "<f4",
-    "U32": "<u4",
-    "U8": "u1",
-    "I8": "i1",
-    "F8_E4M3": "u1",
-    "F8_E8M0": "u1",
-    "F8_E4M3FN": "u1",
-    "F8_E8M0FNU": "u1",
-}
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 PAGE_PREFETCH_MIN_ROWS = 128
 PAGE_IO_WORKERS = 48
@@ -65,14 +55,26 @@ def _resident_buffer(shape, dtype):
     return np.asarray(value)
 
 
+# Shared safetensors dtype table plus the fp8 tags it does not carry:
+# E8M0 scales and the FN/FNU variants travel as raw bytes and
+# decode_array expands them on the MLX side.
+_NP_DTYPES = {
+    **SAFETENSORS_NUMPY_DTYPES,
+    "F8_E8M0": np.dtype("u1"),
+    "F8_E4M3FN": np.dtype("u1"),
+    "F8_E8M0FNU": np.dtype("u1"),
+}
+
+
 class TensorFile:
     def __init__(self, path):
         self._lock = RLock()
-        self._file = Path(path).open("rb")  # noqa: SIM115 -- owned until close()
+        self._path = Path(path)
+        self._file = self._path.open("rb")  # noqa: SIM115 -- owned until close()
         try:
-            length = struct.unpack("<Q", self._file.read(8))[0]
-            self.header = json.loads(self._file.read(length))
-            self._start = length + 8
+            # Shared parser leaves the file positioned at data start.
+            self.header = read_safetensors_header(self._file)
+            self._start = self._file.tell()
             self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
             self._file_size = os.fstat(self._file.fileno()).st_size
             self._seen_pages = None
@@ -94,9 +96,9 @@ class TensorFile:
                 raise RuntimeError("Engram tensor file is closed")
             entry = self.header[key]
             dtype = entry["dtype"]
-            if dtype not in SAFETENSORS_NUMPY_DTYPES:
+            if dtype not in _NP_DTYPES:
                 raise ValueError(f"Unsupported source tensor dtype: {dtype}")
-            dt = np.dtype(SAFETENSORS_NUMPY_DTYPES[dtype])
+            dt = np.dtype(_NP_DTYPES[dtype])
             start, end = entry["data_offsets"]
             if end - start != math.prod(entry["shape"]) * dt.itemsize:
                 raise ValueError(f"Invalid tensor byte length: {key}")
@@ -262,26 +264,46 @@ class DiskEngramEmbedding(nn.Module):
         self._resident = None
         self._prefetched = None
 
+    def _reopen_files(self):
+        """Reopen any TensorFile closed by a failed make_resident()."""
+        if self._closed:
+            return
+        shared = self._scales is self._weights
+        if self._weights._mapping is None:
+            self._weights = TensorFile(self._weights._path)
+            if shared:
+                self._scales = self._weights
+        if not shared and self._scales._mapping is None:
+            self._scales = TensorFile(self._scales._path)
+
     def make_resident(self):
         """Keep packed tensors in Metal-managed RAM with shared CPU views."""
         with self._lock:
-            resident = {
-                self._weight_key: self._weights.read(
-                    self._weight_key, metal_backed=True
-                ),
-            }
-            if self._scale_key is not None:
-                resident[self._scale_key] = self._scales.read(
-                    self._scale_key, metal_backed=True
-                )
-            if self._bias_key is not None:
-                resident[self._bias_key] = self._scales.read(
-                    self._bias_key, metal_backed=True
-                )
-            self._resident = resident
-            self._weights.close()
-            if self._scales is not self._weights:
-                self._scales.close()
+            try:
+                resident = {
+                    self._weight_key: self._weights.read(
+                        self._weight_key, metal_backed=True
+                    ),
+                }
+                if self._scale_key is not None:
+                    resident[self._scale_key] = self._scales.read(
+                        self._scale_key, metal_backed=True
+                    )
+                if self._bias_key is not None:
+                    resident[self._bias_key] = self._scales.read(
+                        self._bias_key, metal_backed=True
+                    )
+                self._resident = resident
+                self._weights.close()
+                if self._scales is not self._weights:
+                    self._scales.close()
+            except Exception:
+                # A partially built table must not stay installed and the
+                # mmap readers must stay usable — the caller may keep the
+                # table SSD-backed instead of failing the load.
+                self._resident = None
+                self._reopen_files()
+                raise
 
     def selected_bytes(self, rows):
         total = 0
@@ -320,11 +342,17 @@ class DiskEngramEmbedding(nn.Module):
 
     def __call__(self, indices):
         host = np.asarray(indices).astype(np.int64)
-        pending, self._prefetched = self._prefetched, None
+        with self._lock:
+            pending, self._prefetched = self._prefetched, None
         if pending is not None:
             requested, future = pending
-            data = future.result()
-            if not np.array_equal(requested, host):
+            try:
+                data = future.result()
+            except Exception:
+                # A failed prefetch must not kill the request — take the
+                # synchronous read path for these rows.
+                data = None
+            if data is None or not np.array_equal(requested, host):
                 data = self._read_rows(host)
         else:
             data = self._read_rows(host)
@@ -377,16 +405,23 @@ class EngramPrefetch:
         if embed.selected_bytes(host.size) + host.nbytes > PREFETCH_BYTES:
             return
         future = self._executor.submit(embed._read_rows, host)
-        embed._prefetched = (host, future)
+        with embed._lock:
+            embed._prefetched = (host, future)
         self._pending = (embed, future)
 
     def drain(self):
         pending, self._pending = self._pending, None
         if pending is not None:
             embed, future = pending
-            embed._prefetched = None
+            with embed._lock:
+                embed._prefetched = None
             if not future.cancel():
-                future.result()
+                try:
+                    future.result()
+                except Exception:
+                    # Prefetch failure surfaces on the demand path, which
+                    # already falls back to a synchronous read.
+                    pass
 
     @contextmanager
     def forward(self):

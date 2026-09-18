@@ -29865,6 +29865,174 @@
         }
       }
     },
+    "settings.expert_streaming.conflict.dflash" : {
+      "extractionState" : "manual",
+      "comment" : "Sublabel/tooltip when expert streaming can't be enabled because DFlash is on",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable DFlash before enabling expert streaming."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите DFlash перед включением потоковой выгрузки экспертов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用专家流式卸载前禁用 DFlash。"
+          }
+        }
+      }
+    },
+    "settings.expert_streaming.conflict.mtp" : {
+      "extractionState" : "manual",
+      "comment" : "Sublabel/tooltip when expert streaming can't be enabled because Lightning MTP is on for a legacy-only model",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable Lightning MTP before enabling expert streaming on this model."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите Lightning MTP перед включением потоковой выгрузки экспертов для этой модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在此模型上启用专家流式卸载前禁用 Lightning MTP。"
+          }
+        }
+      }
+    },
+    "settings.expert_streaming.conflict.vlm_mtp" : {
+      "extractionState" : "manual",
+      "comment" : "Sublabel/tooltip when expert streaming can't be enabled because VLM MTP is on",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling expert streaming."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите VLM MTP перед включением потоковой выгрузки экспертов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用专家流式卸载前禁用 VLM MTP。"
+          }
+        }
+      }
+    },
+    "settings.mtp.conflict.expert_streaming" : {
+      "extractionState" : "manual",
+      "comment" : "Tooltip / sublabel shown when Lightning MTP can't be enabled because expert streaming is on",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable expert streaming before enabling Lightning MTP."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите потоковую выгрузку экспертов перед включением Lightning MTP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 Lightning MTP 前禁用专家流式卸载。"
+          }
+        }
+      }
+    },
+    "settings.speculative.conflict.expert_streaming" : {
+      "extractionState" : "manual",
+      "comment" : "Tooltip / sublabel shown when another speculative feature can't be enabled because expert streaming is on",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable expert streaming before enabling this feature."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите потоковую выгрузку экспертов перед включением этой функции."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用此功能前禁用专家流式卸载。"
+          }
+        }
+      }
+    },
+    "settings.speculative.conflict.mtp" : {
+      "extractionState" : "manual",
+      "comment" : "Tooltip / sublabel shown when DFlash can't be enabled because Lightning MTP is on",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable Lightning MTP before enabling this feature."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите Lightning MTP перед включением этой функции."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用此功能前禁用 Lightning MTP。"
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.expert_streaming" : {
+      "extractionState" : "manual",
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because expert streaming is on",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable expert streaming before enabling VLM MTP."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите потоковую выгрузку экспертов перед включением VLM MTP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 VLM MTP 前禁用专家流式卸载。"
+          }
+        }
+      }
+    },
     "common.close" : {
       "comment" : "Generic close button",
       "extractionState" : "manual",

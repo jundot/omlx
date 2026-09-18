@@ -84,6 +84,15 @@ def pack_activation(x, bits=8, group_size=32, e4m3_scale=False):
     """Pack each row as value bytes followed by one scale byte per group."""
     if bits not in (4, 8) or x.shape[-1] % group_size:
         raise ValueError("Invalid packed activation geometry")
+    if x.size == 0:
+        # Zero-token cache slots (prefill init): no groups to reduce, and
+        # mx.max over an empty axis raises. Emit the empty packed frame
+        # directly (value bytes + one scale byte per group, all zero-width
+        # on the token axes). Mirrors the `if x.size else x` guard in
+        # quantize_activation above.
+        ngroups = x.shape[-1] // group_size
+        vbytes = x.shape[-1] * bits // 8
+        return mx.zeros((*x.shape[:-1], vbytes + ngroups), mx.uint8)
     grouped = x.astype(mx.float32).reshape(
         *x.shape[:-1], x.shape[-1] // group_size, group_size
     )

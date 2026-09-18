@@ -17,12 +17,14 @@ from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
     group_expert_select,
+    split_kv_b_proj_heads,
 )
 from omlx.patches.glm_moe_dsa.sparse_mla import (
     exact_block_token_attention,
     q8_vup_flat,
     sparse_mla_attention,
 )
+from omlx.utils.metal_sync import cache_clear_threshold_bytes
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
@@ -792,6 +794,42 @@ class Glm5NextMoE(nn.Module):
 
     def __call__(self, x):
         indices, scores = self.gate(x)
+        # Opt-in adaptive top-k truncation (cumulative mass) and
+        # cache-prior rerank. Exact mode (None/1.0, bonus 0.0) leaves the
+        # routing untouched — zero overhead.
+        from omlx.patches.expert_streaming.adaptive_topk import (
+            apply_cache_prior_to_logits as _prior_boost,
+            instance_prior as _instance_prior,
+            instance_threshold as _instance_threshold,
+            resident_experts as _resident_experts,
+            truncate_topk_mass as _topk_truncate,
+        )
+
+        # Per-instance isolation (PR #3468): per-model settings stamped at
+        # conversion; globals only for never-stamped blocks.
+        _bonus = _instance_prior(self)
+        if _bonus > 0:
+            # Group router consumes raw logits (sigmoid is inside
+            # group_expert_select): recompute them, boost the resident
+            # set, reselect. Any failure keeps the stock routing above.
+            try:
+                _res = _resident_experts(self.switch_mlp)
+                if _res:
+                    _logits = x.astype(mx.float32) @ self.gate.weight.astype(mx.float32).T
+                    indices, scores = group_expert_select(
+                        _prior_boost(_logits, _res, _bonus),
+                        self.gate.e_score_correction_bias,
+                        self.gate.top_k,
+                        self.gate.n_group,
+                        self.gate.topk_group,
+                        self.gate.routed_scaling_factor,
+                        self.gate.norm_topk_prob,
+                    )
+            except Exception:
+                pass
+        _thr = _instance_threshold(self)
+        if _thr is not None and _thr < 1.0:
+            indices, scores = _topk_truncate(indices, scores, _thr)
         y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
         if y.ndim == x.ndim + 1:
             y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
@@ -801,6 +839,12 @@ class Glm5NextMoE(nn.Module):
 
 
 class Glm5NextDecoderLayer(nn.Module):
+    # Declares that this decoder honors the streaming ``_stream_eval`` flag
+    # inline in ``__call__`` (per-layer eval + pool trim). The streaming
+    # converter reads it to publish a per-model ``boundary_active`` for the
+    # scheduler's prefill guard — no wrapper class needed for this family.
+    _omlx_honors_inline_stream_eval = True
+
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
         layer_type = config.layer_types[layer_idx]
@@ -843,8 +887,26 @@ class Glm5NextDecoderLayer(nn.Module):
         if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
-            return self._ffn_c(x)
-        return self._ffn_block(x)
+            out = self._ffn_c(x)
+        else:
+            out = self._ffn_block(x)
+        # Expert streaming: evaluate per layer so the lazy graph does not pin
+        # every layer's mini-bank (42 layers x ~13 MB/expert x uniq) at once.
+        # Without this, decode/prefill accumulates multi-GB of temp experts
+        # and the process swaps. Also release the allocator cache — GLM mini-
+        # banks are ~3.4 GB/layer and the pool would otherwise retain tens of
+        # GB across layers.
+        if getattr(self, "_stream_eval", False):
+            mx.eval(out)
+            # Keep eval load-bearing, but avoid flushing MLX's allocator cache
+            # on every layer when the free pool is small.
+            get_cache_memory = getattr(mx, "get_cache_memory", None)
+            if (
+                get_cache_memory is None
+                or get_cache_memory() >= cache_clear_threshold_bytes()
+            ):
+                mx.clear_cache()
+        return out
 
     def _ffn_block(self, x: mx.array) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
@@ -931,8 +993,34 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # Lightning MTP (JANG-MTP layout): when the model carries an
+        # attached draft head (``self.mtp``, set by the glm5_next_model
+        # patch when num_nextn_predict_layers>0 and MTP is active) the
+        # checkpoint's extra decoder layer survives as ``mtp.<i>.*``;
+        # every key still flows through the stock per-layer transforms
+        # below. Head-less loads (mtp_enabled=False, or checkpoints
+        # without draft weights) keep dropping the keys so the strict
+        # load never sees unused parameters.
+        has_mtp = bool(getattr(self, "mtp", None))
+        if not has_mtp:
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
         weights = DSV32Model.sanitize(self, weights)
+
+        # JANG draft head (``mtp.<i>.block.*``): the parent sanitize fuses
+        # ``kv_b_proj`` into the ``embed_q``/``unembed_out`` MultiLinears
+        # only for ``model.layers.{0..n-1}``. Mirror the same fusion for
+        # the draft's sparse attention via the shared split_kv_b_proj_heads
+        # helper (deepseek_v32.py) so the strict load sees exactly the
+        # modules ``Glm5NextDecoderLayer`` constructs. No-ops on head-less
+        # loads (no ``mtp.`` keys survive above).
+        for _key in list(weights.keys()):
+            if not _key.startswith("mtp.") or not _key.endswith(
+                ".self_attn.kv_b_proj.weight"
+            ):
+                continue
+            split_kv_b_proj_heads(
+                self.args, _key[: -len(".kv_b_proj.weight")], weights
+            )
 
         remapped = {}
         conv_parts = {}
@@ -948,6 +1036,24 @@ class LanguageModel(nn.Module):
         )
         for k, v in weights.items():
             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
+            # Raw-transformers export names HyperConnection params hc_base/
+            # hc_fn/hc_scale; the vendored module expects base/fn/scale.
+            nk = nk.replace(".hc_base", ".base").replace(".hc_fn", ".fn").replace(".hc_scale", ".scale")
+            # Raw-transformers export carries o_norm bare (the module is a
+            # custom RMSNormGated holding .weight).
+            if nk.endswith(".self_attn.o_norm"):
+                nk = nk + ".weight"
+            # Raw-transformers export carries the per-stream convs bare
+            # (self_attn.q_conv1d, no .weight suffix).
+            for stream in ("q", "k", "v"):
+                bare = ".self_attn." + stream + "_conv1d"
+                if nk.endswith(bare):
+                    nk = nk + ".weight"
+                    break
+            # Raw-transformers export carries the router bias at the MoE
+            # level; the vendored gate is a submodule holding it.
+            if nk.endswith(".mlp.e_score_correction_bias"):
+                nk = nk.replace(".mlp.e_score_correction_bias", ".mlp.gate.e_score_correction_bias")
 
             fused = False
             for part in ("q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"):
@@ -970,9 +1076,14 @@ class LanguageModel(nn.Module):
 
         for prefix, parts in conv_parts.items():
             if all(c in parts for c in ("q", "k", "v")):
-                remapped[prefix + "conv1d.weight"] = mx.concatenate(
+                fused = mx.concatenate(
                     [parts["q"], parts["k"], parts["v"]], axis=0
                 )
+                # Raw-transformers export carries convs 2D (out, k); MLX
+                # Conv1d expects (out, k, 1).
+                if fused.ndim == 2:
+                    fused = fused.reshape(fused.shape[0], fused.shape[1], 1)
+                remapped[prefix + "conv1d.weight"] = fused
             else:
                 for c, w in parts.items():
                     remapped[prefix + c + "_conv1d.weight"] = w

@@ -140,6 +140,18 @@ enum ProfileSettingsKey {
     // Model-specific
     static let modelTypeOverride = "model_type_override"
     static let trustRemoteCode = "trust_remote_code"
+    // Unified MoE expert streaming (all engine-construction settings —
+    // a changed value reloads the engine on profile apply).
+    static let expertStreamingEnabled = "expert_streaming_enabled"
+    static let moeExpertOffloadEnabled = "moe_expert_offload_enabled"
+    static let moeExpertOffloadResidentFraction = "moe_expert_offload_resident_fraction"
+    static let expertStreamingBudgetGib = "expert_streaming_budget_gib"
+    static let expertStreamingBudgetAuto = "expert_streaming_budget_auto"
+    static let expertStreamingDynamic = "expert_streaming_dynamic"
+    static let expertStreamingDynamicMaxGib = "expert_streaming_dynamic_max_gib"
+    static let expertStreamingDynamicMinGib = "expert_streaming_dynamic_min_gib"
+    static let expertStreamingDynamicStallTarget = "expert_streaming_dynamic_stall_target"
+    static let expertStreamingPrefillBudgetGib = "expert_streaming_prefill_budget_gib"
     static let turboquantKvEnabled = "turboquant_kv_enabled"
     static let turboquantKvBits = "turboquant_kv_bits"
     static let qwen35AnePrefillSharedFraction = "qwen35_ane_prefill_shared_fraction"

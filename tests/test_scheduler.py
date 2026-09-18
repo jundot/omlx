@@ -1765,7 +1765,13 @@ class TestPrefillAbortInterrupt:
         scheduler.uid_to_request_id[uid] = request.request_id
         scheduler._pending_abort_ids.add(request.request_id)
 
-        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache:
+        # The first-chunk pool clear is gated on should_clear_cache() (Etapa
+        # D): force it on so the chunk-boundary reclaim runs deterministically
+        # regardless of the ambient MLX pool size.
+        with (
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache,
+            patch.object(scheduler_module, "should_clear_cache", return_value=True),
+        ):
             with pytest.raises(_PrefillAbortedError):
                 scheduler._do_external_prefill(
                     request,

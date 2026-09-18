@@ -158,6 +158,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         config=SimpleNamespace(paged_cache_block_size=64),
         block_aware_cache=object() if snapshots_enabled else None,
         _stream=mx.default_stream(mx.gpu),
+        _clear_cache_if_pool_large=lambda: None,
     )
     state = Scheduler._begin_prefill(
         ns,

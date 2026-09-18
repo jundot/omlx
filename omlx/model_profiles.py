@@ -41,6 +41,120 @@ UNIVERSAL_PROFILE_FIELDS = (
     "forced_ct_kwargs",
 )
 
+# Machine-readable schema for the expert_streaming_* ModelSettings fields
+# (model_settings.py) — one ordered bounds table so the admin write
+# validation, the load-time io-overrides coercion
+# (patches/expert_streaming/__init__.py) and tests share the ranges
+# instead of drifting copies.
+#
+# spec keys:
+#   "type"    : "bool" | "int" | "float" | "choice"
+#   "default" : the ModelSettings field default (None = unset marker)
+#   "bounds"  : (lo, hi, lo_open) for int/float — hi=None is unbounded,
+#               lo_open excludes the low end
+#   "choices" : allowed normalized strings for "choice"
+#   "tunable" : False marks the routing switch itself — excluded from
+#               EXPERT_STREAMING_TUNABLE_KEYS below
+#
+# Bounds mirror the runtime's own coercion points: the GiB ceilings match
+# MAX_EXPERT_STREAMING_BUDGET_BYTES (64 GiB); topk_threshold's floor is
+# adaptive_topk._MIN_THRESHOLD (below it the runtime drops to exact
+# routing, so persisting it would store a knob that never engages);
+# cold_tier accepts any "2".."8" digit label plus "" = off
+# (conversion._resolve_cold_tier_root). Explicit 0 on budget_gib is legal
+# (page-cache only); the other GiB fields are lo-open — 0 is rejected.
+STREAMING_SETTING_SCHEMA: dict[str, dict[str, Any]] = {
+    "expert_streaming_enabled": {
+        "type": "bool",
+        "default": False,
+        "tunable": False,
+    },
+    "expert_streaming_budget_gib": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, 64.0, False),
+    },
+    "expert_streaming_budget_auto": {"type": "bool", "default": True},
+    "expert_streaming_dynamic": {"type": "bool", "default": None},
+    "expert_streaming_dynamic_max_gib": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, 64.0, True),
+    },
+    "expert_streaming_dynamic_min_gib": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, 64.0, False),
+    },
+    "expert_streaming_dynamic_stall_target": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, 0.9, False),
+    },
+    "expert_streaming_prefill_budget_gib": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, 64.0, True),
+    },
+    "expert_streaming_io_depth": {
+        "type": "int",
+        "default": None,
+        "bounds": (1, 64, False),
+    },
+    "expert_streaming_coalesce": {"type": "bool", "default": None},
+    "expert_streaming_readahead": {"type": "bool", "default": None},
+    "expert_streaming_seed": {"type": "bool", "default": None},
+    "expert_streaming_per_layer_eval": {"type": "bool", "default": None},
+    "expert_streaming_pins": {"type": "bool", "default": None},
+    "expert_streaming_pin_gib": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, 64.0, True),
+    },
+    "expert_streaming_pin_sync": {"type": "bool", "default": None},
+    "expert_streaming_pin_regime": {
+        "type": "choice",
+        "default": None,
+        "choices": ("decode", "prefill"),
+    },
+    "expert_streaming_cold_tier": {
+        "type": "choice",
+        "default": None,
+        "choices": ("", "2", "3", "4", "5", "6", "7", "8"),
+    },
+    "expert_streaming_hot_fraction": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, 1.0, False),
+    },
+    "expert_streaming_cache_policy": {
+        "type": "choice",
+        "default": None,
+        "choices": ("lru", "s3fifo"),
+    },
+    "expert_streaming_topk_threshold": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.05, 1.0, False),
+    },
+    "expert_streaming_cache_prior": {
+        "type": "float",
+        "default": None,
+        "bounds": (0.0, None, False),
+    },
+}
+
+# The expert_streaming_* tunable family consumed at engine construction
+# (everything except the `enabled` switch). Derived from the schema so a
+# new knob cannot drift out of the profile allowlist: spliced into
+# MODEL_SPECIFIC_PROFILE_FIELDS below and re-exported through
+# model_settings for EnginePool's reload signature (a changed value must
+# force a reload) and the admin sanitizers (these keys must not survive
+# on a diffusion model).
+EXPERT_STREAMING_TUNABLE_KEYS = tuple(
+    key for key, spec in STREAMING_SETTING_SCHEMA.items() if spec.get("tunable", True)
+)
+
 # Model-specific fields — eligible for per-model profiles only (never templates).
 MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
@@ -67,6 +181,19 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_oq_a8_min_tokens",
     "moe_expert_offload_enabled",
     "moe_expert_offload_resident_fraction",
+    # Validation scope for model-dependent rules (e.g. the DSpark offload
+    # exception). Per-model only — never templates. Always re-derived
+    # from the checkpoint at validation time, so a copied profile cannot
+    # carry a stale scope.
+    "model_type",
+    # Unified expert-streaming backend (canonical keys; the moe_* pair above
+    # stays as load-time aliases served by the same backend). `enabled` is
+    # the routing switch and stays spelled out; the IO/pinning/policy
+    # tunables splice in from EXPERT_STREAMING_TUNABLE_KEYS. Per-model by
+    # construction: several are checkpoint- or hardware-bound (pins, seed)
+    # and must never propagate across models via templates.
+    "expert_streaming_enabled",
+    *EXPERT_STREAMING_TUNABLE_KEYS,
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",
@@ -111,8 +238,6 @@ EXCLUDED_FROM_PROFILES = frozenset(
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
         "deepseek_v41_engram_ssd_offload",
-        # Architecture-level prefill strategy; explicit per model.
-        "deepseek_v41_ced_prefill_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

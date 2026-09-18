@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,16 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
 
         _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+        # mlx-vlm now ships a native qwen4_exp without the MTP surface; an
+        # earlier import satisfies import_module from sys.modules and hides
+        # the vendored implementation, so drop it before resolving.
+        for name in [
+            n
+            for n in sys.modules
+            if n == "mlx_vlm.models.qwen4_exp"
+            or n.startswith("mlx_vlm.models.qwen4_exp.")
+        ]:
+            del sys.modules[name]
         importlib.import_module("mlx_vlm.models.qwen4_exp")
         from mlx_vlm.models.qwen3_5 import language as qwen35_language
 

@@ -1,0 +1,410 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Adaptive top-k truncation for MoE routing (opt-in quality/speed knob).
+
+Ports the cumulative-mass idea from macqwen-releases (FlashNext,
+MIT licensed): after the router's top-k selection, keep the smallest
+score-descending prefix whose cumulative relative mass reaches
+``threshold``. Dropped slots are padded with the top expert at score 0
+(the duplicate collapses in the streaming plan, so no extra expert I/O)
+and the kept scores are renormalized to the ORIGINAL total top-k mass
+(blend 1.0), preserving activation magnitude.
+
+Bit-exactness contract: ``threshold`` None or >= 1.0 bypasses everything
+— the stock routing body runs untouched. Only 0 < threshold < 1.0
+engages the approximation, and it changes outputs by design.
+
+Applies to:
+  * qwen4_exp (inherited ``Qwen3_5MoeSparseMoeBlock`` from installed
+    mlx_vlm.models.qwen3_5_moe) — monkey-patched, mirroring the
+    qwen35_moe_router.py convention;
+  * glm5_next — a direct hook in the vendored ``Glm5NextMoE.__call__``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+import mlx.core as mx
+
+from ._env import env_float
+
+logger = logging.getLogger(__name__)
+
+_THRESHOLD: float | None = None
+
+_MIN_THRESHOLD = 0.05
+_MAX_THRESHOLD = 1.0
+
+# Model types with a truncation hook live in the family registry
+# (``model_hooks.ModelHooks.topk_supported``): the qwen hook wraps
+# Qwen3_5MoeSparseMoeBlock (shared by the vendored qwen4_exp decoder); the
+# glm hook lives in the vendored Glm5NextMoE.__call__. Any other supported
+# streaming type silently ignores the threshold without this gate — the
+# converter must warn instead of logging it active (see is_topk_applicable).
+# Derived from the registry so the two lists cannot drift; the literal
+# fallback keeps is_topk_applicable usable when model_hooks itself is
+# unimportable (the failure mode the except below guards).
+try:
+    from .model_hooks import topk_supported_types
+
+    TOPK_APPLICABLE_TYPES = topk_supported_types()
+except Exception:  # pragma: no cover - model_hooks is a leaf import
+    TOPK_APPLICABLE_TYPES = frozenset(
+        {
+            "qwen4_exp",
+            "qwen4_exp_text",
+            "glm5_next",
+            "glm5_next_text",
+        }
+    )
+
+
+def is_topk_applicable(model_type: object) -> bool:
+    """True when an adaptive top-k hook exists for this model type."""
+    try:
+        from .model_hooks import hooks_for
+
+        return hooks_for(model_type).topk_supported
+    except Exception:
+        from .residency import normalize_model_type
+
+        return normalize_model_type(model_type) in TOPK_APPLICABLE_TYPES
+
+
+def _coerce_threshold(threshold: Any) -> float | None:
+    """Parse a threshold; return None for anything unusable (never raises).
+
+    Fail-closed to exact routing: callers wrap the whole streaming
+    conversion in ``except Exception`` that just logs "Expert streaming
+    conversion failed", so raising here on a bad knob value (e.g.
+    OMLX_MOE_TOPK_THRESHOLD=2, or 0.0 in a hand-edited settings file)
+    would leave the model unconverted and resident — the
+    multi-hundred-GB path streaming exists to avoid. A bad knob must
+    cost quality-neutral exact routing, never the conversion itself.
+    """
+    if threshold is None:
+        return None
+    try:
+        t = float(threshold)
+    except (TypeError, ValueError):
+        logger.error(
+            "Adaptive top-k threshold %r is not a number; exact routing kept",
+            threshold,
+        )
+        return None
+    if not (_MIN_THRESHOLD <= t <= _MAX_THRESHOLD):
+        # One bounds check catches NaN (all comparisons False), values
+        # below _MIN (would keep almost no experts), and > 1.0 — which
+        # is over-full mass, not "exact" (only None or exactly 1.0 are;
+        # the API layer rejects > 1.0 with a 400).
+        logger.error(
+            "Adaptive top-k threshold %.4g outside [%.2f, %.2f]; exact routing kept",
+            t,
+            _MIN_THRESHOLD,
+            _MAX_THRESHOLD,
+        )
+        return None
+    return t
+
+
+def configure(threshold: float | None) -> None:
+    """Set the active routing threshold (None or exactly 1.0 = exact).
+
+    Out-of-range or unparseable values fall back to exact routing with an
+    ERROR log; this function never raises (see ``_coerce_threshold``).
+    """
+    global _THRESHOLD
+    t = _coerce_threshold(threshold)
+    _THRESHOLD = None if t is None or t >= 1.0 else t
+    if _THRESHOLD is not None:
+        logger.info("Adaptive top-k truncation active: threshold=%.2f", _THRESHOLD)
+
+
+def _coerce_prior(value: Any) -> float:
+    """float(value) clamped >= 0; unparseable fails closed to exact (0.0).
+
+    Never bare-cast: a malformed value must disable the knob, not brick
+    the module."""
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# Cache-conditional routing (Qualcomm 2412.00099): logit bonus for
+# LRU-resident experts before top-k. 0.0 = exact routing (default).
+# Approximate by design — opt-in only.
+_CACHE_PRIOR = _coerce_prior(env_float("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
+
+
+def cache_prior_bonus() -> float:
+    """Active cache-prior logit bonus (0.0 = exact routing)."""
+    return _CACHE_PRIOR
+
+
+def configure_cache_prior(value: Any) -> float:
+    """Set the active bonus (None = env fallback, <=0 = exact).
+
+    Mirrors configure(): explicit values win, env fills the gap, garbage
+    fails closed to exact. Returns the effective bonus."""
+    global _CACHE_PRIOR
+    _CACHE_PRIOR = _coerce_prior(
+        env_float("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0) if value is None else value
+    )
+    return _CACHE_PRIOR
+
+
+def resident_experts(switch_mlp: Any) -> set[int]:
+    """Experts resident in the app-level cache for this layer.
+
+    Intersection over the GLU's projection linears (an expert needs every
+    projection to avoid I/O). Residency reads through the cache's locked
+    ``resident_keys()`` snapshot — S3-FIFO keeps probationary residents in
+    a second queue an unlocked ``_store`` read both races and misses;
+    foreign caches without the method fall back to the raw ``_store``
+    mapping. Duck-typed and fail-closed: anything unexpected yields the
+    empty set (no rerank)."""
+    try:
+        cache = getattr(switch_mlp, "_cache", None)
+        rk = getattr(cache, "resident_keys", None)
+        if callable(rk):
+            resident = rk()
+        else:
+            resident = getattr(cache, "_store", None)
+            if resident is None:
+                return set()
+        n = int(getattr(switch_mlp, "_num_experts", 0) or 0)
+        if n <= 0:
+            return set()
+        lins = [
+            getattr(switch_mlp, a, None)
+            for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+        ]
+        lins = [l for l in lins if l is not None and hasattr(l, "bundle_key")]
+        if not lins:
+            return set()
+        res: set[int] | None = None
+        for lin in lins:
+            try:
+                present = {e for e in range(n) if lin.bundle_key(e) in resident}
+            except Exception:
+                return set()
+            res = present if res is None else (res & present)
+            if not res:
+                return set()
+        return res or set()
+    except Exception:
+        return set()
+
+
+def _resident_mask(resident: set[int], width: int):
+    """Boolean [width] mask marking cache-resident expert slots.
+
+    None when no in-range expert is resident — the callers then return
+    their input untouched (exact routing).
+    """
+    res = sorted({int(e) for e in resident if 0 <= int(e) < width})
+    if not res:
+        return None
+    anchors = mx.array(res, dtype=mx.int32)
+    return (mx.arange(width)[None, :] == anchors[:, None]).any(axis=0)
+
+
+def rerank_cache_prior(gates: Any, resident: set[int] | None, bonus: float) -> Any:
+    """Boost resident experts by *bonus* in logit space before top-k.
+
+    Identity when the bonus is off or the set is empty (exact routing
+    untouched). Implemented as two lazy ops (broadcast compare + add),
+    no per-expert graph bloat.
+    """
+    if bonus <= 0 or not resident:
+        return gates
+    try:
+        is_res = _resident_mask(resident, int(gates.shape[-1]))
+        if is_res is None:
+            return gates
+        LOG = mx.log(mx.maximum(gates, 1e-30))
+        return mx.softmax(LOG + is_res.astype(LOG.dtype) * float(bonus), axis=-1)
+    except Exception:
+        return gates
+
+
+def apply_cache_prior_to_logits(logits: Any, resident: set[int] | None, bonus: float) -> Any:
+    """Boost resident experts by *bonus* on raw (pre-sigmoid) logits.
+
+    The GLM/DeepSeek-style group router consumes raw logits (sigmoid is
+    inside group_expert_select), so unlike rerank_cache_prior there is no
+    log/softmax roundtrip — a plain masked add. Identity when off/empty;
+    fail closed to the input on any error.
+    """
+    if bonus <= 0 or not resident:
+        return logits
+    try:
+        is_res = _resident_mask(resident, int(logits.shape[-1]))
+        if is_res is None:
+            return logits
+        return logits.astype(mx.float32) + is_res.astype(mx.float32) * float(bonus)
+    except Exception:
+        return logits
+
+
+# Per-instance routing isolation: per-model top-k / cache-prior
+# settings must not leak through the module globals onto the shared Qwen /
+# GLM MoE classes. Converted models carry explicit per-block attributes;
+# the patched __call__s prefer them and only fall back to the globals for
+# blocks that were never configured (backward compat: direct configure() in
+# unit tests). Production conversion resolves via resolve_* (no global write)
+# and stamps every MoE block with set_instance_routing, so a later model's
+# settings cannot change a resident model's outputs.
+_INSTANCE_THRESHOLD_ATTR = "_omlx_topk_threshold"
+_INSTANCE_PRIOR_ATTR = "_omlx_cache_prior"
+
+
+def set_instance_routing(block: Any, threshold: float | None, prior: float) -> None:
+    """Stamp per-model routing onto one MoE block (None/0.0 = exact)."""
+    try:
+        setattr(block, _INSTANCE_THRESHOLD_ATTR, threshold)
+        setattr(block, _INSTANCE_PRIOR_ATTR, float(prior or 0.0))
+    except Exception:
+        pass
+
+
+def instance_threshold(block: Any) -> float | None:
+    """Effective threshold for *block*: per-instance when stamped, else global."""
+    try:
+        return getattr(block, _INSTANCE_THRESHOLD_ATTR, _THRESHOLD)
+    except Exception:
+        return _THRESHOLD
+
+
+def instance_prior(block: Any) -> float:
+    """Effective cache-prior bonus for *block*: per-instance when stamped."""
+    try:
+        return float(getattr(block, _INSTANCE_PRIOR_ATTR, _CACHE_PRIOR) or 0.0)
+    except Exception:
+        return _CACHE_PRIOR
+
+
+def resolve_threshold_from_settings(
+    settings: Any | None, model_type: object = None
+) -> float | None:
+    """Resolve the threshold WITHOUT touching the module global.
+
+    Same coercion + env fallback + inapplicable-type soft-noop as
+    configure_from_settings, but pure: production conversion uses this so
+    per-model settings never leak onto the shared class."""
+    t = getattr(settings, "expert_streaming_topk_threshold", None) if settings else None
+    if t is None:
+        env = os.environ.get("OMLX_MOE_TOPK_THRESHOLD", "")
+        if env.strip():
+            try:
+                t = float(env)
+            except ValueError:
+                logger.warning("Invalid OMLX_MOE_TOPK_THRESHOLD=%r; ignoring", env)
+    t = _coerce_threshold(t)
+    eff = None if t is None or t >= 1.0 else t
+    if eff is not None and model_type is not None and not is_topk_applicable(model_type):
+        logger.warning(
+            "Adaptive top-k threshold %.2f ignored: no truncation hook for model type %r "
+            "(exact routing stays on)",
+            eff,
+            model_type,
+        )
+        return None
+    return eff
+
+
+def resolve_prior_from_settings(settings: Any | None) -> float:
+    """Resolve the cache-prior bonus WITHOUT touching the module global."""
+    v = getattr(settings, "expert_streaming_cache_prior", None) if settings else None
+    if v is None:
+        v = env_float("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0)
+    return _coerce_prior(v)
+
+
+def current_threshold() -> float | None:
+    return _THRESHOLD
+
+
+def truncate_topk_mass(inds, scores, threshold: float, return_keeps: bool = False):
+    """Truncate a top-k routing by cumulative relative mass.
+
+    ``inds``: [..., k] expert ids; ``scores``: [..., k] routing scores
+    (any positive scaling — relative mass is used). Returns
+    (inds, scores) with the same shapes: kept experts in score-descending
+    order, dropped slots holding the top expert at score 0, kept scores
+    renormalized to the original total top-k mass.
+    """
+    total = mx.sum(scores, axis=-1, keepdims=True)
+    rel = scores / mx.maximum(total, 1e-30)
+    order = mx.argsort(-rel, axis=-1)
+    s_sorted = mx.take_along_axis(rel, order, axis=-1)
+    i_sorted = mx.take_along_axis(inds, order, axis=-1)
+    # mass accumulated BEFORE the current expert — keep while it is still
+    # below the threshold (the first expert always keeps)
+    cum_before = mx.cumsum(s_sorted, axis=-1) - s_sorted
+    keep = (cum_before < threshold).astype(scores.dtype)
+    first = i_sorted[..., :1]
+    i_pad = mx.where(keep > 0, i_sorted, first)
+    s_pad = s_sorted * keep
+    denom = mx.maximum(mx.sum(s_pad, axis=-1, keepdims=True), 1e-30)
+    s_final = (s_pad / denom) * total
+    if return_keeps:
+        keeps = mx.sum(keep, axis=-1).mean().item()
+        return i_pad.astype(inds.dtype), s_final.astype(scores.dtype), keeps
+    return i_pad.astype(inds.dtype), s_final.astype(scores.dtype)
+
+
+def apply_qwen35_moe_topk_patch() -> bool:
+    """Engage truncation for Qwen3.5/3.6/qwen4_exp sparse MoE blocks.
+
+    Wraps ``Qwen3_5MoeSparseMoeBlock.__call__`` in the installed mlx_vlm
+    (qwen3_5_moe.language, shared by the vendored qwen4_exp). When the
+    active threshold is exact (None/1.0) the wrapped call — stock or the
+    fused-router patch — runs untouched.
+    """
+    try:
+        from mlx_vlm.models.qwen3_5_moe import language as q35
+    except ImportError:
+        return False
+    cls = getattr(q35, "Qwen3_5MoeSparseMoeBlock", None)
+    if cls is None or getattr(cls, "_omlx_topk_truncate", False):
+        return cls is not None
+
+    orig_call = cls.__call__
+
+    def patched_call(self, x):
+        # Per-instance isolation: a resident block keeps its own model's
+        # threshold/prior; globals are only the fallback for blocks never
+        # stamped (backward compat with direct configure() in tests).
+        thr = instance_threshold(self)
+        bonus = instance_prior(self)
+        if (thr is None or thr >= 1.0) and bonus <= 0:
+            return orig_call(self, x)
+        try:
+            gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+            if bonus > 0:
+                gates = rerank_cache_prior(
+                    gates, resident_experts(self.switch_mlp), bonus
+                )
+            k = self.top_k
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+            if thr is not None and thr < 1.0:
+                inds, scores = truncate_topk_mass(inds, scores, thr)
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2)
+            shared_y = self.shared_expert(x)
+            shared_y = self._shared_expert_scale(x) * shared_y
+            return y + shared_y
+        except Exception:
+            logger.warning("adaptive top-k routing failed; stock fallback", exc_info=True)
+            return orig_call(self, x)
+
+    cls.__call__ = patched_call
+    cls._omlx_topk_truncate = True
+    logger.info("Qwen3.5/qwen4_exp adaptive top-k patch applied")
+    return True

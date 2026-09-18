@@ -34,7 +34,7 @@ class DSparkMixin:
 
     def _omlx_prefill(self, input_ids, cache=None, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
-        return self(input_ids, cache=cache, _ced_prefill=True, **kwargs)
+        return self(input_ids, cache=cache, **kwargs)
 
     @property
     def args(self):
@@ -146,11 +146,6 @@ class DSparkMixin:
         active = getattr(self, "_omlx_dspark_decode_enabled", False)
         capture_dspark = kwargs.pop("return_dspark_hidden", False)
         capture = return_hidden or bool(capture_dspark)
-        if kwargs.get("_ced_prefill", False) and self._config.ced_prefill:
-            if input_ids.shape[0] != 1:
-                raise ValueError("CED scheduler prefill requires one request row")
-            if capture or verify:
-                raise ValueError("CED prefill cannot supply full hidden/verify states")
         prime = active and not capture and not verify and input_ids.shape[0] == 1
         verify_states = None
         if verify:
@@ -159,21 +154,38 @@ class DSparkMixin:
             before = cache[0].size()
             snapshots = [(list(c.cache), c.left_padding, c.lengths) for c in cache]
             verify_states = [{} for _ in cache]
-        result = self._forward(
-            input_ids,
-            cache=cache,
-            inputs_embeds=inputs_embeds,
-            token_types=token_types,
-            return_dspark_hidden=capture or prime,
-            mtp_verify_states=verify_states,
-            **kwargs,
-        )
+        def _run_forward():
+            return self._forward(
+                input_ids,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                token_types=token_types,
+                return_dspark_hidden=capture or prime,
+                mtp_verify_states=verify_states,
+                **kwargs,
+            )
+
+        if verify:
+            # Layer-3 seam: freeze expert-slot recency for the draft
+            # block so verify traffic cannot evict decode-hot experts.
+            # Kernels and plan builders are untouched (see verify_scope).
+            # The family registry resolves it lazily (the target module
+            # imports expert_streaming at load time — a direct top-level
+            # import here would cycle).
+            from ..expert_streaming.model_hooks import resolve_verify_scope
+
+            _verify_scope = resolve_verify_scope("deepseek_v41")
+            if _verify_scope is None:
+                from .moe_offload import verify_scope as _verify_scope
+
+            with _verify_scope():
+                result = _run_forward()
+        else:
+            result = _run_forward()
         if verify:
             cache[0]._mtp_draft_stash = (input_ids, snapshots, before, verify_states)
         if prime:
             logits, hidden = result
-            # The draft ring retains one window; reset across omitted spans
-            # using the existing absolute-position prompt-capture contract.
-            capture_prompt(self, input_ids[:, -hidden.shape[1] :], hidden, cache)
+            capture_prompt(self, input_ids, hidden, cache)
             return logits
         return result

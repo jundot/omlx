@@ -61,7 +61,6 @@ def load(
     engram_ssd_offload=False,
     preserve_mtp=None,
     moe_expert_offload_resident_fraction=None,
-    ced_prefill=False,
 ):
     path = Path(path)
     if (path / "conversion.inprogress.json").exists():
@@ -88,20 +87,17 @@ def load(
             raise ValueError("Converted checkpoint MTP layout cannot be overridden")
         config.preserve_mtp = bool(preserve_mtp)
     if moe_expert_offload_resident_fraction is not None:
-        if preserve_mtp is True:
-            raise ValueError("MoE expert offload cannot enable DSpark MTP")
-        # Retained draft weights need not consume RAM when speculation is forbidden.
-        config.preserve_mtp = False
-    if ced_prefill:
-        if config.ced_layout_supported():
-            config.ced_prefill = True
-            logger.info("DeepSeek V4.1 CED prefill enabled: decoder tail %d", config.window_size)
-        else:
-            config.ced_prefill = False
-            logger.warning(
-                "DeepSeek V4.1 CED prefill requested but layer layout is "
-                "unsupported; falling back to full decoder prefill"
-            )
+        if preserve_mtp is None:
+            # Retained draft weights need not consume RAM when speculation
+            # is off; with DSpark requested they stay resident and verify
+            # under frozen slot recency (see moe_offload.verify_scope).
+            if config.preserve_mtp:
+                logger.info(
+                    "DeepSeek V4.1 MoE offload: preserve_mtp unset — "
+                    "dropping the resident DSpark draft head "
+                    "(pass preserve_mtp=True to keep it)"
+                )
+            config.preserve_mtp = False
     model = Model(config)
     if config.engram_layer_ids:
         logger.info(
@@ -154,15 +150,44 @@ def load(
         }
 
         if moe_expert_offload_resident_fraction is not None:
-            from .moe_offload import ExpertOffloadPlan, OffloadedExpert
+            from .moe_offload import (
+                ExpertOffloadPlan,
+                OffloadedExpert,
+                _draft_offload,
+            )
 
             offload = ExpertOffloadPlan(
-                path, raw, mapping, config, moe_expert_offload_resident_fraction
+                path,
+                raw,
+                mapping,
+                config,
+                moe_expert_offload_resident_fraction,
+                draft_rows=_draft_offload() if config.preserve_mtp else 0,
             )
             model._moe_offload_plan = offload
             for layer_id, layer in enumerate(model.language_model.layers):
                 prefix = f"language_model.layers.{layer_id}.ffn.experts"
                 layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
+            # F5 opt-in: draft stages wrap in the same bounded-residency
+            # machinery but stay outside the trunk backing — the governor
+            # budget keeps covering only the backbone layers.
+            for stage_id, stage in enumerate(
+                getattr(model.language_model, "mtp", None) or ()
+            ):
+                prefix = f"language_model.mtp.{stage_id}.ffn.experts"
+                if prefix in offload.layers:
+                    stage.ffn.experts = OffloadedExpert(
+                        stage.ffn.experts, offload, prefix
+                    )
+            if offload.draft_rows:
+                logger.info(
+                    "DeepSeek V4.1 DSpark offload: %d/%d experts resident "
+                    "per draft stage (%.2f GiB -> %.2f GiB)",
+                    offload.draft_rows,
+                    offload.count_of("language_model.mtp.0.ffn.experts"),
+                    offload.draft_full_bytes / 1024**3,
+                    offload.draft_resident_bytes / 1024**3,
+                )
             logger.info(
                 "DeepSeek V4.1 MoE offload: %d/%d experts resident per layer "
                 "(%.2f GiB -> %.2f GiB expert weights)",
@@ -172,7 +197,14 @@ def load(
                 offload.resident_bytes / 1024**3,
             )
         offload_keys = set(offload.excluded_keys) if offload is not None else set()
-        if offload is not None and not source_checkpoint:
+        if (
+            offload is not None
+            and not source_checkpoint
+            and not config.preserve_mtp
+        ):
+            # A preserved draft head must load like any other tensor;
+            # excluding it here used to break preserve_mtp + offload on
+            # converted checkpoints at the completeness check below.
             offload_keys.update(
                 k for k in mapping if k.startswith("language_model.mtp.")
             )
@@ -314,12 +346,28 @@ def load(
                 if "engram" in layer and isinstance(
                     layer.engram.embed, DiskEngramEmbedding
                 ):
-                    layer.engram.embed.make_resident()
+                    try:
+                        layer.engram.embed.make_resident()
+                    except Exception:
+                        # One table is a single Metal allocation that can
+                        # exceed the wired/single-buffer limit — keep the
+                        # table mmap-backed (engram_ssd_offload semantics)
+                        # instead of failing the whole load.
+                        logger.warning(
+                            "DeepSeek V4.1 Engram residency failed; "
+                            "keeping the table mmap-backed",
+                            exc_info=True,
+                        )
         mx.eval(model.parameters())
         model.eval()
         return model, processor
-    except BaseException:
-        model.close()
+    except BaseException as err:
+        try:
+            model.close()
+        except Exception as close_err:
+            # The load failure stays the raised error; a cleanup failure
+            # chains underneath instead of masking it.
+            raise err from close_err
         raise
     finally:
         memory_scope.close()

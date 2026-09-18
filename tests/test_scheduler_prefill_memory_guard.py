@@ -44,6 +44,17 @@ def _make_scheduler() -> Scheduler:
     # Strip make_cache so the KVCache-counting branch in
     # _set_model_info_for_monitor doesn't try to iterate a MagicMock.
     del model.make_cache
+    # A MagicMock fabricates a truthy value for any attribute — including
+    # _expert_streaming_backing and the wrapper-chain hops
+    # (_streaming_backing_of walks language_model/model/_vlm_model/
+    # _language_model). Left in place, the scheduler detects this fixture
+    # as streaming and the memory-guard accounting under test takes the
+    # streaming branch. Delete them so the walk terminates with no backing.
+    del model._expert_streaming_backing
+    del model.language_model
+    del model.model
+    del model._vlm_model
+    del model._language_model
 
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2

@@ -39,6 +39,15 @@ def make_scheduler(**settings) -> Scheduler:
     model = MagicMock()
     del model._omlx_prefill
     model.layers = []
+    # MagicMock fabricates truthy attrs for any name; delete the
+    # streaming-backing marker and wrapper-chain hops so
+    # _streaming_backing_of finds nothing and admission keeps the
+    # non-serialized multi-slot cap the fairness budget assumes.
+    del model._expert_streaming_backing
+    del model.language_model
+    del model.model
+    del model._vlm_model
+    del model._language_model
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
     config = SchedulerConfig(

@@ -100,6 +100,66 @@ def _dequant_mla_proj_mode(args) -> str:
     return "0"
 
 
+def split_kv_b_proj_heads(args, prefix: str, weights: dict) -> bool:
+    """Split ``{prefix}.kv_b_proj`` into per-head embed_q/unembed_out.
+
+    Shared by ``Model.sanitize`` (the per-layer fuse under
+    ``model.layers.<i>.self_attn``) and the vendored GLM-5 Next MTP draft
+    head (``mtp.<i>.block.self_attn`` prefix) so the two stay verbatim
+    instead of drifting. The dequantize → per-head reshape → requantize
+    resolves the ``_dequant_mla_proj_mode`` sets here on every call, so a
+    future non-"0" mode reaches both callers identically. Returns True
+    when the key was present and split.
+    """
+    if f"{prefix}.kv_b_proj.weight" not in weights:
+        return False
+    dequant_mla_proj = _dequant_mla_proj_mode(args)
+    dequant_embed_q = dequant_mla_proj in {
+        "1",
+        "true",
+        "all",
+        "both",
+        "embed",
+        "embed_q",
+    }
+    dequant_unembed_out = dequant_mla_proj in {
+        "1",
+        "true",
+        "all",
+        "both",
+        "unembed",
+        "unembed_out",
+        "out",
+    }
+    quantized = f"{prefix}.kv_b_proj.scales" in weights
+    v = weights.pop(f"{prefix}.kv_b_proj.weight")
+    head_dim = args.qk_nope_head_dim + args.v_head_dim
+    if quantized:
+        dims = args.kv_lora_rank
+        scales = weights.pop(f"{prefix}.kv_b_proj.scales")
+        biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+        # Try to infer bits and group size
+        bits = (v.shape[-1] * 32) // dims
+        group_size = dims // scales.shape[-1]
+        v = mx.dequantize(v, scales, biases, bits=bits, group_size=group_size)
+    num_heads = args.num_attention_heads
+    v = v.reshape(num_heads, head_dim, -1)
+    wk = mx.contiguous(v[:, : args.qk_nope_head_dim, :].swapaxes(-1, -2))
+    wv = mx.contiguous(v[:, args.qk_nope_head_dim :, :])
+    if quantized:
+        if not dequant_embed_q:
+            wk, wk_scales, wk_biases = mx.quantize(wk, bits=bits, group_size=group_size)
+            weights[f"{prefix}.embed_q.scales"] = wk_scales
+            weights[f"{prefix}.embed_q.biases"] = wk_biases
+        if not dequant_unembed_out:
+            wv, wv_scales, wv_biases = mx.quantize(wv, bits=bits, group_size=group_size)
+            weights[f"{prefix}.unembed_out.scales"] = wv_scales
+            weights[f"{prefix}.unembed_out.biases"] = wv_biases
+    weights[f"{prefix}.embed_q.weight"] = wk
+    weights[f"{prefix}.unembed_out.weight"] = wv
+    return True
+
+
 def _use_glm_moe_fused_gate_up(args) -> bool:
     return getattr(args, "model_type", None) == "glm_moe_dsa"
 
@@ -1006,43 +1066,7 @@ class Model(nn.Module):
                             [weights.pop(gate_key), weights.pop(up_key)],
                             axis=0,
                         )
-            prefix = f"model.layers.{l}.self_attn"
-            if f"{prefix}.kv_b_proj.weight" in weights:
-                quantized = f"{prefix}.kv_b_proj.scales" in weights
-                v = weights.pop(f"{prefix}.kv_b_proj.weight")
-                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
-
-                if quantized:
-                    dims = self.args.kv_lora_rank
-                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
-                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
-                    # Try to infer bits and group size
-                    bits = (v.shape[-1] * 32) // dims
-                    group_size = dims // scales.shape[-1]
-                    v = mx.dequantize(
-                        v, scales, biases, bits=bits, group_size=group_size
-                    )
-                num_heads = self.args.num_attention_heads
-                v = v.reshape(num_heads, head_dim, -1)
-                wk = mx.contiguous(
-                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
-                )
-                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
-                if quantized:
-                    if not dequant_embed_q:
-                        wk, wk_scales, wk_biases = mx.quantize(
-                            wk, bits=bits, group_size=group_size
-                        )
-                        weights[f"{prefix}.embed_q.scales"] = wk_scales
-                        weights[f"{prefix}.embed_q.biases"] = wk_biases
-                    if not dequant_unembed_out:
-                        wv, wv_scales, wv_biases = mx.quantize(
-                            wv, bits=bits, group_size=group_size
-                        )
-                        weights[f"{prefix}.unembed_out.scales"] = wv_scales
-                        weights[f"{prefix}.unembed_out.biases"] = wv_biases
-                weights[f"{prefix}.embed_q.weight"] = wk
-                weights[f"{prefix}.unembed_out.weight"] = wv
+            split_kv_b_proj_heads(self.args, f"model.layers.{l}.self_attn", weights)
 
         return weights
 

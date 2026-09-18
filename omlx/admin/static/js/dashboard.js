@@ -8,6 +8,103 @@
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
+    // The whole expert_streaming_* settings family, in two roles: the
+    // eight keys the modal editor owns as dedicated controls, and the
+    // remaining runtime tunables (autotuned / hand-edited) that the
+    // modal only surfaces read-only on its advanced summary line.
+    const EXPERT_STREAMING_EDITOR_KEYS = [
+        'expert_streaming_enabled',
+        'expert_streaming_budget_gib',
+        'expert_streaming_budget_auto',
+        'expert_streaming_dynamic',
+        'expert_streaming_dynamic_max_gib',
+        'expert_streaming_dynamic_min_gib',
+        'expert_streaming_dynamic_stall_target',
+        'expert_streaming_prefill_budget_gib',
+    ];
+    // Fallback copy of the advanced-keys list (= the served settings
+    // schema minus the editor keys, in schema order — which matches the
+    // summary line's historical display order). loadExpertStreamingSchema
+    // refreshes the derived list from GET /api/expert-streaming/
+    // settings-schema; this literal keeps working when the fetch fails.
+    const EXPERT_STREAMING_ADVANCED_KEYS = [
+        'expert_streaming_io_depth',
+        'expert_streaming_coalesce',
+        'expert_streaming_readahead',
+        'expert_streaming_seed',
+        'expert_streaming_per_layer_eval',
+        'expert_streaming_pins',
+        'expert_streaming_pin_gib',
+        'expert_streaming_pin_sync',
+        'expert_streaming_pin_regime',
+        'expert_streaming_cold_tier',
+        'expert_streaming_hot_fraction',
+        'expert_streaming_cache_policy',
+        'expert_streaming_topk_threshold',
+        'expert_streaming_cache_prior',
+    ];
+    const EXPERT_STREAMING_PROFILE_KEYS = [
+        ...EXPERT_STREAMING_EDITOR_KEYS,
+        ...EXPERT_STREAMING_ADVANCED_KEYS,
+    ];
+    // Static bounds for the numeric editor inputs — mirrors
+    // STREAMING_SETTING_SCHEMA (model_profiles) so the form stays
+    // correct when the settings-schema endpoint is unreachable; once
+    // served, expertStreamingNumInput prefers the schema's bounds.
+    const EXPERT_STREAMING_NUM_INPUT_BOUNDS = {
+        expert_streaming_budget_gib: {min: 0, max: 64, step: 0.5},
+        expert_streaming_dynamic_max_gib: {min: 0.5, max: 64, step: 0.5},
+        expert_streaming_dynamic_min_gib: {min: 0, max: 64, step: 0.5},
+        expert_streaming_dynamic_stall_target: {min: 0, max: 0.9, step: 0.01},
+        expert_streaming_prefill_budget_gib: {min: 0.5, max: 64, step: 0.5},
+    };
+    // Profile-form encoders for keys whose control state doesn't map 1:1
+    // onto the wire value. Each handler writes (or deliberately omits)
+    // its key on `out`; not writing keeps the key absent from the
+    // profile payload.
+    const PROFILE_FIELD_ENCODERS = {
+        thinking_budget_enabled(ms, out) {
+            if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
+        },
+        thinking_budget_tokens(ms, out) {
+            if (ms.enableThinkingBudget && ms.thinking_budget_tokens) {
+                out.thinking_budget_tokens = Number(ms.thinking_budget_tokens);
+            }
+        },
+        index_cache_freq(ms, out) {
+            if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
+        },
+        max_tool_result_tokens(ms, out) {
+            if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
+                out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
+            }
+        },
+        guided_grammar_enabled(ms, out) {
+            out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
+        },
+        guided_grammar(ms, out) {
+            const g = ms.guided_grammar_enabled ? (ms.guided_grammar || '').trim() : '';
+            if (g) out.guided_grammar = g;
+        },
+        // The modal stores the governor as a 3-state mode string; the
+        // profile key is the tri-state bool (auto = omit).
+        expert_streaming_dynamic(ms, out) {
+            if (ms.expert_streaming_dynamic_mode === 'on') out.expert_streaming_dynamic = true;
+            else if (ms.expert_streaming_dynamic_mode === 'off') out.expert_streaming_dynamic = false;
+        },
+        // 3-state budget: pinned writes the GiB value, page-cache writes
+        // budget_auto=false, auto writes budget_auto=true.
+        expert_streaming_budget_gib(ms, out) {
+            if (ms.expert_streaming_budget_mode === 'pinned'
+                && Number.isFinite(Number(ms.expert_streaming_budget_gib))) {
+                out.expert_streaming_budget_gib = Number(ms.expert_streaming_budget_gib);
+            }
+        },
+        expert_streaming_budget_auto(ms, out) {
+            if (ms.expert_streaming_budget_mode === 'pagecache') out.expert_streaming_budget_auto = false;
+            else if (ms.expert_streaming_budget_mode === 'auto') out.expert_streaming_budget_auto = true;
+        },
+    };
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -45,6 +142,9 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
+        ...EXPERT_STREAMING_PROFILE_KEYS,
+        'deepseek_v41_engram_ssd_offload',
+        'qwen4_ple_ssd_offload',
         'qwen35_oq_a8_enabled',
         'qwen35_oq_a8_min_tokens',
         'specprefill_enabled',
@@ -251,6 +351,16 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
+                expert_streaming_enabled: false,
+                // 3-state budget: 'auto' | 'pagecache' (budget_gib 0 / auto off)
+                // | 'pinned' (explicit GiB).
+                expert_streaming_budget_mode: 'auto',
+                expert_streaming_budget_gib: null,
+                expert_streaming_dynamic_mode: 'auto',
+                expert_streaming_dynamic_max_gib: null,
+                expert_streaming_dynamic_min_gib: null,
+                expert_streaming_dynamic_stall_target: null,
+                expert_streaming_prefill_budget_gib: null,
                 qwen35_oq_a8_enabled: false,
                 qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
@@ -286,6 +396,7 @@
             templates: [],               // global templates
             presets: [],                 // curated presets (bundled + remote refresh)
             profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
+            expertStreamingSchemaFields: [],  // /api/expert-streaming/settings-schema; [] = fallback literals
             profileScope: 'model',       // 'preset' | 'global' | 'model'
             refreshingPresets: false,
             activeProfileName: null,     // currently-active profile for the form
@@ -682,6 +793,7 @@
                     this.loadModels(),
                     this.loadServerInfo(),
                     this.loadProfileFields(),
+                    this.loadExpertStreamingSchema(),
                     this.loadPresets(),
                     this.checkForUpdate()
                 ]);
@@ -1433,33 +1545,9 @@
                     if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
-                    if (k === 'thinking_budget_enabled') {
-                        if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
-                        continue;
-                    }
-                    if (k === 'thinking_budget_tokens') {
-                        if (ms.enableThinkingBudget && ms.thinking_budget_tokens) {
-                            out.thinking_budget_tokens = Number(ms.thinking_budget_tokens);
-                        }
-                        continue;
-                    }
-                    if (k === 'index_cache_freq') {
-                        if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
-                        continue;
-                    }
-                    if (k === 'max_tool_result_tokens') {
-                        if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
-                            out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
-                        }
-                        continue;
-                    }
-                    if (k === 'guided_grammar_enabled') {
-                        out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
-                        continue;
-                    }
-                    if (k === 'guided_grammar') {
-                        const g = ms.guided_grammar_enabled ? (ms.guided_grammar || '').trim() : '';
-                        if (g) out.guided_grammar = g;
+                    const encodeProfileField = PROFILE_FIELD_ENCODERS[k];
+                    if (encodeProfileField) {
+                        encodeProfileField(ms, out);
                         continue;
                     }
                     // Standard field: omit unset values entirely — the server
@@ -1513,7 +1601,38 @@
                 const active = this.profiles.find(p => p.name === this.activeProfileName);
                 if (!active) { this.profilesDrift = false; return; }
                 const form = this.formValuesForProfile();
+                // Only compare keys the form can actually serialize: a
+                // profile may carry engine-scope or autotuned keys the
+                // editor never emits (model_type stamped at validation,
+                // expert_streaming_io_depth, cache_reasoning_output, ...);
+                // diffing those against an absent form value would flag
+                // drift forever.
+                const handled = new Set([
+                    'enable_thinking',
+                    'chat_template_kwargs',
+                    'forced_ct_kwargs',
+                    'thinking_budget_enabled',
+                    'thinking_budget_tokens',
+                    'index_cache_freq',
+                    'max_tool_result_tokens',
+                    'guided_grammar_enabled',
+                    'guided_grammar',
+                    'expert_streaming_dynamic',
+                    'expert_streaming_budget_gib',
+                    'expert_streaming_budget_auto',
+                ]);
+                const ms = this.modelSettings || {};
+                const isDiffusion = !!ms.is_diffusion_model;
+                const serializable = new Set(
+                    (this.profileFields.universal || [])
+                        .concat(this.profileFields.model_specific || [])
+                        .filter(k =>
+                            (handled.has(k) || k in ms)
+                            && !(k === 'enable_thinking' && this.selectedModel?.thinking_forced)
+                            && !(isDiffusion && this.isDiffusionUnsupportedProfileField(k)))
+                );
                 for (const [k, v] of Object.entries(active.settings || {})) {
+                    if (!serializable.has(k)) continue;
                     if (JSON.stringify(form[k]) !== JSON.stringify(v)) {
                         this.profilesDrift = true;
                         return;
@@ -1578,6 +1697,44 @@
                 const profile = this.profiles.find(p => p.name === this.activeProfileName);
                 return this.matchingProfileTemplate(profile)?.name || null;
             },
+            // Expert-streaming telemetry pill on the models table: compact
+            // hit-rate chip + a full counter breakdown on hover. `es` is the
+            // per-model `expert_streaming` block from /admin/api/models
+            // (null unless loaded with a streaming backing attached).
+            expertStreamingChip(es) {
+                if (!es) return '';
+                const pct = Math.round((es.hit_rate || 0) * 100);
+                return `stream: ${pct}% hit`;
+            },
+            expertStreamingTooltip(es) {
+                if (!es) return '';
+                const parts = [
+                    `hit rate ${Math.round((es.hit_rate || 0) * 100)}%`,
+                    `${es.hits ?? 0} hits / ${es.misses ?? 0} misses`,
+                    `${es.evictions ?? 0} evictions`,
+                    `resident ${es.resident ?? 0}/${es.capacity ?? 0} slots`,
+                ];
+                if (es.staged_hits) parts.push(`${es.staged_hits} staged hits`);
+                if (es.cache_policy) parts.push(`policy ${es.cache_policy}`);
+                if (es.governor?.last_action) {
+                    parts.push(`governor: ${es.governor.last_action}`);
+                }
+                if (es.governor?.capacity != null) {
+                    parts.push(`gov cap ${es.governor.capacity}`);
+                }
+                if (es.guard && Object.keys(es.guard).length) {
+                    const g = es.guard;
+                    const guardBits = [];
+                    if (g.num_moe_layers != null) {
+                        guardBits.push(`${g.num_moe_layers} MoE layers`);
+                    }
+                    if (g.boundary_active != null) {
+                        guardBits.push(`layer boundary ${g.boundary_active ? 'on' : 'off'}`);
+                    }
+                    if (guardBits.length) parts.push(`guard: ${guardBits.join(', ')}`);
+                }
+                return parts.join(' · ');
+            },
             async loadProfilesForModel(modelId) {
                 const seq = this._applySeq;
                 this.profiles = [];
@@ -1621,6 +1778,76 @@
                 } catch (e) {
                     console.error('Failed to load profile field definitions:', e);
                 }
+            },
+            async loadExpertStreamingSchema() {
+                // Progressive enhancement: the served bounds table
+                // (STREAMING_SETTING_SCHEMA) refreshes the streaming key
+                // lists so a new tunable surfaces without a JS release;
+                // the module literals stay the fallback.
+                try {
+                    const r = await fetch('/admin/api/expert-streaming/settings-schema');
+                    if (r.ok) {
+                        const data = await r.json();
+                        const fields = Array.isArray(data.fields) ? data.fields : [];
+                        this.expertStreamingSchemaFields =
+                            fields.filter(f => f && typeof f.key === 'string');
+                        // The whole family is unsupported on the diffusion
+                        // lane — fold in any tunable the JS literals predate.
+                        for (const f of this.expertStreamingSchemaFields) {
+                            DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.add(f.key);
+                        }
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load expert streaming schema:', e);
+                }
+            },
+            expertStreamingAdvancedKeys() {
+                // Schema keys minus the editor's dedicated controls —
+                // same order the schema declares (the historical display
+                // order). Falls back to the literal when unfetched.
+                const fields = this.expertStreamingSchemaFields;
+                if (!fields || !fields.length) return EXPERT_STREAMING_ADVANCED_KEYS;
+                const editor = new Set(EXPERT_STREAMING_EDITOR_KEYS);
+                return fields.map(f => f.key).filter(k => !editor.has(k));
+            },
+            expertStreamingEditorNumericKeys() {
+                // The governor/prefill numeric inputs — schema-typed
+                // numbers among the editor keys, minus budget_gib (the
+                // 3-state budget mode serializes it separately above).
+                const fields = this.expertStreamingSchemaFields;
+                if (!fields || !fields.length) {
+                    return ['expert_streaming_dynamic_max_gib',
+                            'expert_streaming_dynamic_min_gib',
+                            'expert_streaming_dynamic_stall_target',
+                            'expert_streaming_prefill_budget_gib'];
+                }
+                const editor = new Set(EXPERT_STREAMING_EDITOR_KEYS);
+                return fields
+                    .filter(f => editor.has(f.key)
+                        && (f.type === 'float' || f.type === 'int')
+                        && f.key !== 'expert_streaming_budget_gib')
+                    .map(f => f.key);
+            },
+            expertStreamingNumInput(key) {
+                // {min, max, step} for a numeric editor input. Schema
+                // bounds win when served (they ARE the PUT validator's
+                // bounds); the literal table is the offline fallback.
+                // HTML min is inclusive, so a lo_open schema bound maps
+                // to the first grid point above lo (lo + step).
+                const fallback = EXPERT_STREAMING_NUM_INPUT_BOUNDS[key]
+                    || {min: 0, step: 1};
+                const f = (this.expertStreamingSchemaFields || [])
+                    .find(f => f && f.key === key);
+                const b = f && f.bounds;
+                if (!b) return {...fallback};
+                const attrs = {
+                    min: b.lo_open ? b.lo + fallback.step : b.lo,
+                    step: fallback.step,
+                };
+                if (b.hi !== null && b.hi !== undefined) attrs.max = b.hi;
+                return attrs;
             },
 
             async loadPresets() {
@@ -1793,6 +2020,30 @@
                     || !!ms.guided_grammar_enabled;
             },
 
+            // Effective expert-offload state for the speculative gates:
+            // the live canonical toggle OR a stored legacy alias the
+            // legacy adapter still serves (moe_expert_offload_enabled is
+            // already gated on moe_expert_offload_supported at build).
+            // The raw stored flag alone misses canonical-key saves; the
+            // backend enforces the combination either way
+            // (validate_moe_expert_offload).
+            expertOffloadEffective() {
+                const ms = this.modelSettings;
+                if (!ms) return false;
+                return !!ms.expert_streaming_enabled
+                    || !!ms.moe_expert_offload_enabled;
+            },
+
+            // deepseek_v41* config types: DSpark verify runs under frozen
+            // residency, so the backend permits Lightning MTP under MoE
+            // offload there (model_settings.validate_moe_expert_offload).
+            isDeepseekV41Model(model) {
+                const type = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return type.startsWith('deepseek_v41');
+            },
+
             // Coerce a raw kwarg string from the panel into its JSON type:
             // 'true'/'false' -> boolean, finite numeric strings -> number.
             coerceKwargValue(v) {
@@ -1866,14 +2117,19 @@
                     thinking_default: model?.thinking_default ?? null,
                     qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
                         || s.qwen4_ple_ssd_offload === true,
+                    // The user's stored choice tracked separately: the
+                    // display flag above ORs in the load-time forced
+                    // state, and persisting THAT on an unrelated save
+                    // would pin the model to SSD forever (the
+                    // deepseek_v41 twin already tracks _requested).
+                    qwen4_ple_ssd_offload_requested:
+                        s.qwen4_ple_ssd_offload === true,
                     qwen4_ple_ssd_offload_supported:
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
-                    deepseek_v41_ced_prefill_enabled:
-                        s.deepseek_v41_ced_prefill_enabled === true,
-                    deepseek_v41_ced_prefill_supported:
-                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
+                    expert_streaming_supported:
+                        model?.expert_streaming_supported === true,
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
                         || s.deepseek_v41_engram_ssd_offload === true,
                     deepseek_v41_engram_ssd_offload_requested:
@@ -1896,6 +2152,30 @@
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    // Unified expert streaming: effective enable ORs the
+                    // legacy alias (served by the same backend on save).
+                    expert_streaming_enabled: !isDiffusion && (!!s.expert_streaming_enabled || !!s.moe_expert_offload_enabled),
+                    // 3-state budget: explicit budget_gib (incl. 0) pins the
+                    // mode; otherwise budget_auto=false means page-cache only.
+                    expert_streaming_budget_mode:
+                        Number.isFinite(s.expert_streaming_budget_gib)
+                            ? (s.expert_streaming_budget_gib > 0 ? 'pinned' : 'pagecache')
+                            : (s.expert_streaming_budget_auto === false ? 'pagecache' : 'auto'),
+                    expert_streaming_budget_gib: s.expert_streaming_budget_gib ?? null,
+                    // Read-only surface for the runtime-consumed advanced
+                    // keys (autotune/hand-edited settings) that have no
+                    // editor controls.
+                    expert_streaming_advanced_summary:
+                        this.expertStreamingAdvancedKeys()
+                            .map(k => [k.slice('expert_streaming_'.length), s[k]])
+                            .filter(([, v]) => v !== undefined && v !== null && v !== '')
+                            .map(([k, v]) => `${k}=${v}`)
+                            .join(' · '),
+                    expert_streaming_dynamic_mode: s.expert_streaming_dynamic === true ? 'on' : (s.expert_streaming_dynamic === false ? 'off' : 'auto'),
+                    expert_streaming_dynamic_max_gib: s.expert_streaming_dynamic_max_gib ?? null,
+                    expert_streaming_dynamic_min_gib: s.expert_streaming_dynamic_min_gib ?? null,
+                    expert_streaming_dynamic_stall_target: s.expert_streaming_dynamic_stall_target ?? null,
+                    expert_streaming_prefill_budget_gib: s.expert_streaming_prefill_budget_gib ?? null,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -2123,6 +2403,17 @@
                         // Update the models list so the profile badge reflects the change
                         const m = this.models.find(m => m.id === modelId);
                         if (m) m.settings = { ...settings };
+                        // Profile apply persists + may force an engine
+                        // reload/unload — surface that like save does.
+                        if (data.requires_reload) {
+                            if (data.auto_reloaded) {
+                                alert(window.t('js.info.model_settings_auto_reloaded'));
+                            } else if (data.auto_unloaded) {
+                                alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else {
+                                alert(window.t('js.info.model_type_reload_required'));
+                            }
+                        }
                         await this.loadProfilesForModel(modelId);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
@@ -2850,9 +3141,9 @@
                                     : 0,
                                 enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
-                                    !!this.modelSettings.qwen4_ple_ssd_offload,
-                                deepseek_v41_ced_prefill_enabled:
-                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
+                                    this.modelSettings.qwen4_ple_ssd_offload_forced
+                                        ? !!this.modelSettings.qwen4_ple_ssd_offload_requested
+                                        : !!this.modelSettings.qwen4_ple_ssd_offload,
                                 deepseek_v41_engram_ssd_offload:
                                     this.modelSettings.deepseek_v41_engram_ssd_offload_forced
                                         ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
@@ -2876,8 +3167,43 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
-                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
-                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
+                                // Saving migrates legacy offload keys to the
+                                // canonical streaming keys (served by one backend).
+                                moe_expert_offload_enabled: false,
+                                // Fraction is only meaningful on the legacy
+                                // adapter (v41/gemma4/olmoe); the server
+                                // defaults a null back to 0.25.
+                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction,
+                                expert_streaming_enabled: !isDiffusion && !!this.modelSettings.expert_streaming_enabled,
+                                // 3-state budget: 'pagecache' writes
+                                // budget_auto=false (budget_gib unset);
+                                // 'auto' writes true; 'pinned' clears the
+                                // auto flag and sends the explicit GiB (which
+                                // always wins server-side).
+                                expert_streaming_budget_auto: !this.modelSettings.expert_streaming_enabled
+                                    ? null
+                                    : (this.modelSettings.expert_streaming_budget_mode === 'pagecache'
+                                        ? false
+                                        : (this.modelSettings.expert_streaming_budget_mode === 'auto' ? true : null)),
+                                // 'pagecache' writes an explicit 0 (not null):
+                                // it preserves the pinned-0 distinction in the
+                                // stored record, and the signature canonicalizes
+                                // 0/unset to the same value so this round-trip
+                                // never forces a reload.
+                                expert_streaming_budget_gib: !this.modelSettings.expert_streaming_enabled
+                                    ? null
+                                    : (this.modelSettings.expert_streaming_budget_mode === 'pinned'
+                                        ? (Number.isFinite(Number(this.modelSettings.expert_streaming_budget_gib)) ? Number(this.modelSettings.expert_streaming_budget_gib) : null)
+                                        : (this.modelSettings.expert_streaming_budget_mode === 'pagecache' ? 0 : null)),
+                                expert_streaming_dynamic: this.modelSettings.expert_streaming_enabled ? (this.modelSettings.expert_streaming_dynamic_mode === 'on' ? true : (this.modelSettings.expert_streaming_dynamic_mode === 'off' ? false : null)) : null,
+                                // Governor/prefill numerics: send the parsed
+                                // value only while streaming is on and the
+                                // input parses; otherwise explicit null.
+                                ...Object.fromEntries(
+                                    this.expertStreamingEditorNumericKeys()
+                                        .map(k => [k, this.modelSettings.expert_streaming_enabled
+                                            && Number.isFinite(Number(this.modelSettings[k]))
+                                            ? Number(this.modelSettings[k]) : null])),
                                 qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
                                 qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
@@ -3010,6 +3336,17 @@
                                     qwen35_ane_prefill_cpu_gdn_fraction: 0,
                                     qwen35_ane_prefill_cpu_threads: 8,
                                     qwen35_ane_prefill_cpu_shared_resource: true,
+                                    // Whole expert-streaming family is
+                                    // unsupported on the diffusion lane:
+                                    // enabled off, every other editor key null.
+                                    expert_streaming_enabled: false,
+                                    ...Object.fromEntries(
+                                        EXPERT_STREAMING_EDITOR_KEYS
+                                            .filter(k => k !== 'expert_streaming_enabled')
+                                            .map(k => [k, null])),
+                                    moe_expert_offload_enabled: false,
+                                    moe_expert_offload_resident_fraction: 0.25,
+                                    deepseek_v41_engram_ssd_offload: false,
                                     specprefill_enabled: false,
                                     specprefill_draft_model: null,
                                     specprefill_keep_pct: null,

@@ -247,7 +247,10 @@ class TestApplyProfile:
         assert s.ttl_seconds == 300
         assert s.is_pinned is True
 
-    def test_apply_round_trip_clears_removed_universal_fields(self, mgr):
+    def test_update_profile_merges_settings(self, mgr):
+        # update_profile's settings argument is a partial patch over the
+        # stored record: keys absent from the patch must survive, so clients
+        # that serialize only a subset cannot silently drop the rest.
         mgr.save_profile(
             "m",
             "p",
@@ -260,12 +263,36 @@ class TestApplyProfile:
         assert s.max_context_window == 8192
         assert s.max_tokens == 512
 
-        mgr.update_profile("m", "p", settings={"temperature": 0.7})
+        mgr.update_profile("m", "p", settings={"temperature": 0.5})
+        stored = mgr.get_profile("m", "p")["settings"]
+        assert stored["max_context_window"] == 8192
+        assert stored["max_tokens"] == 512
+        assert stored["temperature"] == 0.5
         mgr.apply_profile("m", "p")
         s = mgr.get_settings("m")
-        assert s.max_context_window is None
-        assert s.max_tokens is None
-        assert s.temperature == 0.7
+        assert s.max_context_window == 8192
+        assert s.max_tokens == 512
+        assert s.temperature == 0.5
+
+    def test_update_profile_preserves_non_form_fields(self, mgr):
+        # Regression: engine-scope/autotuned keys the settings form never
+        # serializes used to be wiped by any settings update.
+        mgr.save_profile(
+            "m",
+            "p",
+            "P",
+            None,
+            {
+                "expert_streaming_io_depth": 8,
+                "cache_reasoning_output": True,
+                "temperature": 0.7,
+            },
+        )
+        mgr.update_profile("m", "p", settings={"temperature": 0.5})
+        stored = mgr.get_profile("m", "p")["settings"]
+        assert stored["expert_streaming_io_depth"] == 8
+        assert stored["cache_reasoning_output"] is True
+        assert stored["temperature"] == 0.5
 
     def test_apply_round_trip_clears_removed_kwargs(self, mgr):
         mgr.save_profile(
@@ -283,8 +310,16 @@ class TestApplyProfile:
         assert s.chat_template_kwargs == {"enable_thinking": True}
         assert s.forced_ct_kwargs == ["enable_thinking"]
 
-        mgr.update_profile("m", "p", settings={"temperature": 0.5})
-        mgr.apply_profile("m", "p")
+        # A freshly saved profile is still a full snapshot: apply resets
+        # fields the replacement profile does not carry.
+        mgr.save_profile(
+            "m",
+            "p2",
+            "P2",
+            None,
+            {"temperature": 0.5},
+        )
+        mgr.apply_profile("m", "p2")
         s = mgr.get_settings("m")
         assert s.chat_template_kwargs is None
         assert s.forced_ct_kwargs is None
@@ -387,12 +422,17 @@ class TestProfileFieldFiltering:
         )
         assert mgr.get_profile("m", "p")["settings"] == {"temperature": 0.5}
 
+        # Update is a merge: None/"" are dropped from the incoming patch, and
+        # previously stored keys survive (update never clears stored fields).
         mgr.update_profile(
             "m",
             "p",
             settings={"top_p": 0.9, "max_tokens": None, "reasoning_parser": ""},
         )
-        assert mgr.get_profile("m", "p")["settings"] == {"top_p": 0.9}
+        assert mgr.get_profile("m", "p")["settings"] == {
+            "temperature": 0.5,
+            "top_p": 0.9,
+        }
 
     def test_qwen_ane_prefill_fields_round_trip_as_model_specific(self, mgr):
         settings = {

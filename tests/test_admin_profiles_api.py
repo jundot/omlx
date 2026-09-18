@@ -169,6 +169,38 @@ class TestProfileRoutes:
         assert r.json()["profile"]["api_name"] == "coding"
         assert r.json()["profile"]["settings"]["temperature"] == 0.2
 
+    def test_update_profile_preserves_stored_fields(self, client):
+        """A settings patch must not drop stored keys it does not carry.
+
+        Regression: update used to replace the settings record wholesale, so
+        a partial update wiped engine-scope fields the client never sent.
+        """
+        c, mgr = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "p",
+                "display_name": "P",
+                "settings": {
+                    "expert_streaming_io_depth": 8,
+                    "cache_reasoning_output": True,
+                    "temperature": 0.0,
+                },
+            },
+        )
+        r = c.put(
+            "/admin/api/models/model-a/profiles/p",
+            json={"settings": {"temperature": 0.2}},
+        )
+        assert r.status_code == 200
+        settings = r.json()["profile"]["settings"]
+        assert settings["expert_streaming_io_depth"] == 8
+        assert settings["cache_reasoning_output"] is True
+        assert settings["temperature"] == 0.2
+        stored = mgr.get_profile("model-a", "p")["settings"]
+        assert stored["expert_streaming_io_depth"] == 8
+        assert stored["cache_reasoning_output"] is True
+
     def test_update_profile_api_name(self, client):
         c, _ = client
         c.post(
@@ -378,7 +410,9 @@ class TestProfileRoutes:
 
 class TestApplySnapshotSemantics:
     """Applying a profile is authoritative over universal fields: absent
-    keys reset to defaults so clearing a value in the editor round-trips.
+    keys reset to defaults. Profile updates merge into the stored record
+    (a settings patch never drops stored keys), so the snapshot that apply
+    sees is the union of everything ever saved into the profile.
     Model-specific and excluded fields are not reset."""
 
     def test_apply_resets_universal_fields_removed_from_profile(self, client):
@@ -398,6 +432,8 @@ class TestApplySnapshotSemantics:
         r = c.post("/admin/api/models/model-a/profiles/p/apply")
         assert r.json()["settings"]["max_tokens"] == 512
 
+        # Update merges into the stored record: keys absent from the patch
+        # survive, and apply then snapshots the full merged set.
         r = c.put(
             "/admin/api/models/model-a/profiles/p",
             json={"settings": {"temperature": 0.7}},
@@ -406,10 +442,10 @@ class TestApplySnapshotSemantics:
         r = c.post("/admin/api/models/model-a/profiles/p/apply")
         settings = r.json()["settings"]
         assert settings["temperature"] == 0.7
-        assert "max_context_window" not in settings
-        assert "max_tokens" not in settings
+        assert settings["max_context_window"] == 8192
+        assert settings["max_tokens"] == 512
 
-    def test_apply_clears_kwargs_removed_from_profile(self, client):
+    def test_apply_clears_kwargs_absent_from_applied_profile(self, client):
         c, _ = client
         c.post(
             "/admin/api/models/model-a/profiles",
@@ -425,11 +461,17 @@ class TestApplySnapshotSemantics:
         r = c.post("/admin/api/models/model-a/profiles/p/apply")
         assert r.json()["settings"]["chat_template_kwargs"] == {"enable_thinking": True}
 
-        c.put(
-            "/admin/api/models/model-a/profiles/p",
-            json={"settings": {"temperature": 0.5}},
+        # Applying a different profile without the kwargs still snapshots:
+        # fields the applied profile does not carry reset to defaults.
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "p2",
+                "display_name": "P2",
+                "settings": {"temperature": 0.5},
+            },
         )
-        r = c.post("/admin/api/models/model-a/profiles/p/apply")
+        r = c.post("/admin/api/models/model-a/profiles/p2/apply")
         settings = r.json()["settings"]
         assert "chat_template_kwargs" not in settings
         assert "forced_ct_kwargs" not in settings
@@ -450,7 +492,12 @@ class TestApplySnapshotSemantics:
             "/admin/api/models/model-a/profiles/p",
             json={"settings": {"top_p": 0.9, "max_context_window": ""}},
         )
-        assert mgr.get_profile("model-a", "p")["settings"] == {"top_p": 0.9}
+        # Update merges: the patch's None/"" values are dropped and the
+        # previously stored temperature survives.
+        assert mgr.get_profile("model-a", "p")["settings"] == {
+            "temperature": 0.5,
+            "top_p": 0.9,
+        }
 
     def test_apply_preserves_excluded_and_model_specific_settings(self, client):
         c, mgr = client

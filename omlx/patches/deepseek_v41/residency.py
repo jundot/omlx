@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from omlx.utils.safetensors import file_signature, read_safetensors_header
+
 
 @dataclass(frozen=True)
 class EngramResidencyEstimate:
@@ -24,38 +26,39 @@ class EngramResidencyEstimate:
 
 
 @lru_cache(maxsize=128)
-def header_with_offset(filename, size, mtime_ns):
-    """A shard's safetensors header and the file offset of its tensor data."""
+def _header(filename, size, mtime_ns):
+    # Keep the corrupt-header sanity check the shared parser omits, then
+    # delegate the 8-byte length + JSON body to it.
     with open(filename, "rb") as file:
         raw = file.read(8)
         if len(raw) != 8:
             raise ValueError("Truncated safetensors header")
-        length = struct.unpack("<Q", raw)[0]
-        if length > size - 8:
+        if struct.unpack("<Q", raw)[0] > size - 8:
             raise ValueError("Invalid safetensors header length")
-        return json.loads(file.read(length)), 8 + length
+        file.seek(0)
+        return read_safetensors_header(file)
 
 
-def _header(filename, size, mtime_ns):
-    return header_with_offset(filename, size, mtime_ns)[0]
+def _files_signature(files):
+    """``(path, size, mtime_ns)`` tuples — the cache key for header scans.
 
-
-def checkpoint_signature(model_path):
-    """Sizes and mtimes of every file a residency estimate depends on."""
-    path = Path(model_path).expanduser().resolve()
-    files = [path / "config.json", path / "model.safetensors.index.json"]
-    files.extend(path.glob("*.safetensors"))
-    files.extend((path / "engram").glob("*.safetensors"))
+    Shared by every lru-cached per-checkpoint reader (the residency
+    estimate here, ``moe_offload.estimate_expert_savings`` and the
+    ``moe_offload_compat`` layout check): a replaced file changes size
+    or mtime and re-runs the scan, an untouched one stays cached.
+    """
     return tuple(
-        (str(f), st.st_size, st.st_mtime_ns)
+        (str(f), *file_signature(f))
         for f in sorted(files)
-        for st in (f.stat(),)
     )
 
 
 def deepseek_v41_residency_estimate(model_path):
     path = Path(model_path).expanduser().resolve()
-    return _estimate(str(path), checkpoint_signature(path))
+    files = [path / "config.json", path / "model.safetensors.index.json"]
+    files.extend(path.glob("*.safetensors"))
+    files.extend((path / "engram").glob("*.safetensors"))
+    return _estimate(str(path), _files_signature(files))
 
 
 @lru_cache(maxsize=128)

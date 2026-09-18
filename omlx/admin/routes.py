@@ -42,10 +42,12 @@ from ..model_profiles import (
     filter_universal_fields,
 )
 from ..model_settings import (
+    EXPERT_STREAMING_TUNABLE_KEYS,
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
+    moe_offload_requested,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
@@ -292,6 +294,10 @@ class ModelSettingsRequest(BaseModel):
 
     model_alias: str | None = None
     model_type_override: str | None = None
+    # Checkpoint-derived model_type scope (auto-managed — stamped into the
+    # settings record by _validate_model_settings; accepted here so stored
+    # profiles round-trip through extra="forbid").
+    model_type: str | None = None
     max_context_window: int | None = None
     max_tokens: int | None = None
     temperature: float | None = None
@@ -312,8 +318,41 @@ class ModelSettingsRequest(BaseModel):
     preserve_thinking: bool | None = None
     cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    # Canonical streaming switch (moe_expert_offload_enabled remains the
+    # accepted alias — both feed moe_offload_requested).
+    expert_streaming_enabled: bool | None = None
+    # Dynamic expert budget (auto default — the Swift/HTML editors expose
+    # these; None everywhere = automatic: RAM-scaled initial budget +
+    # hunger/pressure governor). An explicit budget_gib pins manual mode.
+    expert_streaming_budget_gib: float | None = None
+    expert_streaming_budget_auto: bool | None = None
+    expert_streaming_dynamic: bool | None = None
+    expert_streaming_dynamic_max_gib: float | None = None
+    expert_streaming_dynamic_min_gib: float | None = None
+    expert_streaming_dynamic_stall_target: float | None = None
+    expert_streaming_prefill_budget_gib: float | None = None
+    # Per-model routing/IO tunables (see ModelSettings and
+    # patches/expert_streaming/_IO_OVERRIDE_KEYS). None keeps the env /
+    # built-in default. The settings form never sends these — they are
+    # profile-preserved keys that must round-trip through extra="forbid".
+    # Bounds are enforced by _validate_expert_streaming_bounds.
+    expert_streaming_topk_threshold: float | None = None
+    expert_streaming_cache_prior: float | None = None
+    expert_streaming_io_depth: int | None = None
+    expert_streaming_coalesce: bool | None = None
+    expert_streaming_readahead: bool | None = None
+    expert_streaming_seed: bool | None = None
+    expert_streaming_per_layer_eval: bool | None = None
+    expert_streaming_pins: bool | None = None
+    expert_streaming_pin_gib: float | None = None
+    expert_streaming_pin_sync: bool | None = None
+    expert_streaming_pin_regime: str | None = None
+    # "2".."8" select a cold precision tier (""/None = off); int values are
+    # accepted and coerce the same way the bounds check does (str()).
+    expert_streaming_cold_tier: str | int | None = None
+    expert_streaming_hot_fraction: float | None = None
+    expert_streaming_cache_policy: str | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
-    deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -907,7 +946,10 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
     )
-    for key in unsupported_none_fields:
+    # Whole expert-streaming tunable family: the diffusion lane never
+    # builds the streaming backend, so stored values must not survive
+    # a save/profile-apply on this lane.
+    for key in (*unsupported_none_fields, *EXPERT_STREAMING_TUNABLE_KEYS):
         settings[key] = None
 
     settings["force_sampling"] = False
@@ -918,6 +960,9 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_skip_last"] = True
     settings["moe_expert_offload_enabled"] = False
     settings["moe_expert_offload_resident_fraction"] = 0.25
+    settings["expert_streaming_enabled"] = False
+    settings["qwen4_ple_ssd_offload"] = False
+    settings["deepseek_v41_engram_ssd_offload"] = False
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -995,6 +1040,14 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_skip_last = True
     settings.moe_expert_offload_enabled = False
     settings.moe_expert_offload_resident_fraction = 0.25
+    # Whole expert-streaming family — the diffusion lane never builds the
+    # streaming backend (mirrors _sanitize_diffusion_settings_dict and the
+    # WebUI's DIFFUSION_UNSUPPORTED_PROFILE_FIELDS).
+    settings.expert_streaming_enabled = False
+    for key in EXPERT_STREAMING_TUNABLE_KEYS:
+        setattr(settings, key, None)
+    settings.qwen4_ple_ssd_offload = False
+    settings.deepseek_v41_engram_ssd_offload = False
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -2367,6 +2420,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
         qwen4_mmap_bytes = 0
+        expert_streaming_supported = False
         if (model_info.get("config_model_type") or "").replace(
             "-", "_"
         ).lower() == "qwen4_exp":
@@ -2378,7 +2432,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 estimate = qwen4_exp_residency_estimate(
                     model_info.get("model_path", "")
                 )
-                if getattr(settings, "moe_expert_offload_enabled", False):
+                if moe_offload_requested(settings):
                     entry = engine_pool.get_entry(model_id)
                     if entry is not None:
                         _, _, adjusted = engine_pool._qwen4_ple_offload_status(
@@ -2398,6 +2452,22 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                     model_id,
                     exc_info=True,
                 )
+        # Expert streaming capability: MoE allowlist only.
+        try:
+            from ..patches.expert_streaming.residency import (
+                expert_streaming_estimate,
+            )
+
+            _est = expert_streaming_estimate(
+                model_info.get("model_path", "")
+            )
+            expert_streaming_supported = bool(_est.supported)
+        except (OSError, TypeError, ValueError):
+            logger.debug(
+                "Could not inspect expert-streaming support for %s",
+                model_id,
+                exc_info=True,
+            )
 
         deepseek_v41_engram_ssd_offload_supported = False
         deepseek_v41_engram_ssd_offload_forced = False
@@ -2414,7 +2484,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 estimate = deepseek_v41_residency_estimate(
                     model_info.get("model_path", "")
                 )
-                if getattr(settings, "moe_expert_offload_enabled", False):
+                if moe_offload_requested(settings):
                     entry = engine_pool.get_entry(model_id)
                     if entry is not None:
                         _, _, adjusted = engine_pool._deepseek_v41_engram_offload_status(
@@ -2491,10 +2561,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "expert_streaming_supported": expert_streaming_supported,
             "deepseek_v41_engram_ssd_offload_supported": deepseek_v41_engram_ssd_offload_supported,
             "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
             "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
             "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
+            # Live expert-streaming telemetry for the loaded engine (None
+            # when unloaded or no streaming backing is attached).
+            "expert_streaming": model_info.get("expert_streaming"),
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2824,11 +2898,6 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
-    if "deepseek_v41_ced_prefill_enabled" in sent:
-        is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
-        current_settings.deepseek_v41_ced_prefill_enabled = bool(
-            request.deepseek_v41_ced_prefill_enabled and is_v41
-        )
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
@@ -2836,6 +2905,18 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
+    # Canonical streaming switch (None leaves the stored value untouched).
+    if "expert_streaming_enabled" in sent:
+        current_settings.expert_streaming_enabled = bool(
+            request.expert_streaming_enabled
+        )
+    # Dynamic budget + routing/IO tunables: direct assignment (None clears
+    # back to auto — never bool()/float() here, which would collapse the
+    # auto sentinel). extra="forbid" keeps `sent` inside the declared
+    # ModelSettingsRequest fields, and every tunable key is a ModelSettings
+    # attribute (the diffusion sanitizer setattr()s the same tuple).
+    for key in sent & set(EXPERT_STREAMING_TUNABLE_KEYS):
+        setattr(current_settings, key, getattr(request, key))
     if "deepseek_v41_engram_ssd_offload" in sent:
         is_deepseek_v41 = (entry.config_model_type or "").replace(
             "-", "_"
@@ -3404,6 +3485,11 @@ async def update_model_settings(
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent
+        # Expert-streaming / bank keys attach at engine construction and
+        # are all covered by the runtime signature above — presence in the
+        # request alone must not unload the engine (the WebUI sends the
+        # full family on every save); only an old-vs-new signature change
+        # triggers the reload.
     )
     auto_unloaded = False
     auto_reloaded = False
@@ -3534,12 +3620,95 @@ def _raise_if_alias_conflicts_exposed_profiles(
             )
 
 
+def _fmt_bound(bound) -> object:
+    """Display a schema bound without a trailing .0 (64.0 -> 64)."""
+    return int(bound) if isinstance(bound, float) and bound.is_integer() else bound
+
+
+def _validate_expert_streaming_bounds(settings: dict) -> None:
+    """Reject expert-streaming values outside the runtime-supported ranges.
+
+    Types, bounds and choices come from the single bounds table
+    (model_profiles.STREAMING_SETTING_SCHEMA) via the runtime's own
+    ``validate_streaming_setting`` coercion, so the write boundary cannot
+    drift from the load path. The admin contract stays stricter on
+    numerics: out-of-range values are rejected rather than
+    clamped/dropped the way the loader coerces them, and int fields
+    demand an integral value. Raises ValueError -> HTTP 400.
+    """
+    from ..model_profiles import STREAMING_SETTING_SCHEMA
+    from ..patches.expert_streaming import validate_streaming_setting
+
+    for name, spec in STREAMING_SETTING_SCHEMA.items():
+        value = settings.get(name)
+        if value is None:
+            continue
+        kind = spec["type"]
+        if kind == "bool" or kind == "choice":
+            # Strict booleans: the runtime treats any truthy/falsy value
+            # as a flag, so silently accepting "true"/1/[] would persist
+            # a value the load path interprets differently from what the
+            # admin contract reported back (e.g. dynamic "auto" -> bool()
+            # -> forced on, budget_auto 0 -> `is False` misses -> auto
+            # stays on). Choices normalize case/whitespace; cold_tier's
+            # "" stays legal (off). None out = unusable.
+            if validate_streaming_setting(name, value) is not None:
+                continue
+            if kind == "bool":
+                raise ValueError(f"{name} must be a boolean.")
+            shown = " or ".join(f'"{c}"' for c in spec["choices"] if c)
+            raise ValueError(f"{name} must be {shown}.")
+        # Numeric: bools are not numbers for these knobs — True must not
+        # silently become 1 GiB of pinned budget.
+        lo, hi, lo_open = spec["bounds"]
+        integral = kind == "int"
+        lo_d = _fmt_bound(lo)
+        hi_d = _fmt_bound(hi) if hi is not None else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"{name} must be an integer in [{lo_d}, {hi_d}]."
+                if integral
+                else f"{name} must be a number."
+            )
+        if integral and int(value) != value:
+            raise ValueError(f"{name} must be an integer in [{lo_d}, {hi_d}].")
+        if hi is None:
+            if value < lo:
+                raise ValueError(f"{name} must be >= {lo_d}.")
+            continue
+        ok = (lo < value <= hi) if lo_open else (lo <= value <= hi)
+        if not ok:
+            bound = f"({lo_d}, {hi_d}]" if lo_open else f"[{lo_d}, {hi_d}]"
+            unit = " GiB" if name.endswith("_gib") else ""
+            raise ValueError(f"{name} must be in {bound}{unit}.")
+
+
 def _validate_model_settings(entry, settings):
     from ..model_settings import validate_moe_expert_offload
 
     try:
-        validate_moe_expert_offload(settings)
-        if settings.get("moe_expert_offload_enabled"):
+        # Scoped DSpark exception needs the model type; fall back to
+        # strict validation when the checkpoint config is unreadable.
+        # (config.json re-read is deliberate: text_config.model_type is a
+        # valid fallback scope for composite checkpoints.)
+        entry_type = None
+        try:
+            _cfg = json.loads((Path(entry.model_path) / "config.json").read_text())
+            _text = _cfg.get("text_config") or {}
+            entry_type = _cfg.get("model_type") or _text.get("model_type")
+        except Exception:
+            pass
+        validate_moe_expert_offload(settings, model_type=entry_type)
+        _validate_expert_streaming_bounds(settings)
+        if entry_type is not None:
+            # Carry the validation scope so ModelSettings construction
+            # (from_dict) enforces the same per-type rule downstream.
+            # Overwrite: the checkpoint is authoritative, so a copied
+            # profile can never carry a stale scope.
+            settings["model_type"] = entry_type
+        # Unified predicate: canonical expert_streaming_enabled must not
+        # bypass the MoE compatibility gate the legacy alias goes through.
+        if moe_offload_requested(settings):
             from ..patches.moe_offload_compat import moe_offload_compatibility
 
             supported, reason = moe_offload_compatibility(entry.model_path)
@@ -3723,7 +3892,13 @@ async def apply_model_profile(
 ):
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    engine_pool = _get_engine_pool()
     is_diffusion_model = _entry_is_diffusion_model(entry)
+    prev_load_signature = None
+    if engine_pool is not None:
+        prev_load_signature = engine_pool._engine_runtime_signature(
+            model_id, mgr.get_settings(model_id)
+        )
     def sanitizer(settings):
         if is_diffusion_model:
             _sanitize_diffusion_settings_dict(settings)
@@ -3738,7 +3913,52 @@ async def apply_model_profile(
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(applied)
         mgr.set_settings(model_id, applied)
-    return {"model_id": model_id, "settings": applied.to_dict()}
+
+    # Engine-construction settings (expert streaming, bank, MTP, ...) only
+    # take effect on a fresh engine: mirror the PUT auto-unload so applying
+    # a profile to a loaded model cannot leave the old build serving.
+    requires_reload = False
+    auto_unloaded = False
+    auto_reloaded = False
+    if engine_pool is not None and entry.engine is not None:
+        current_load_signature = engine_pool._engine_runtime_signature(
+            model_id, applied
+        )
+        requires_reload = prev_load_signature != current_load_signature
+        if requires_reload:
+            was_pinned = entry.is_pinned
+            try:
+                logger.info(
+                    "Profile %s changed load-time settings for loaded model "
+                    "%s, auto-unloading.",
+                    name,
+                    model_id,
+                )
+                await engine_pool._unload_engine(model_id)
+                auto_unloaded = True
+            except Exception as e:
+                logger.warning("Auto-unload failed for %s: %s", model_id, e)
+            if auto_unloaded and was_pinned:
+                try:
+                    await engine_pool._load_engine(model_id)
+                    auto_reloaded = True
+                    logger.info(
+                        "Auto-reloaded pinned model %s after profile apply.",
+                        model_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Auto-reload failed for pinned model %s: %s",
+                        model_id,
+                        e,
+                    )
+    return {
+        "model_id": model_id,
+        "settings": applied.to_dict(),
+        "requires_reload": requires_reload,
+        "auto_unloaded": auto_unloaded,
+        "auto_reloaded": auto_reloaded,
+    }
 
 
 @router.post("/api/models/{model_id}/profile-templates/{name}/apply")
@@ -4169,6 +4389,39 @@ async def apply_optimal_settings(
         f"https://omlx.ai/benchmarks/performance/{request.benchmark_id}"
     )
     return {**summary, **applied}
+
+
+@router.get("/api/expert-streaming/settings-schema")
+async def expert_streaming_settings_schema(
+    is_admin: bool = Depends(require_admin),
+):
+    """Serve STREAMING_SETTING_SCHEMA as JSON-safe field descriptors.
+
+    The settings form derives its expert-streaming key lists and input
+    bounds from this so a tunable added to the shared table
+    (model_profiles.STREAMING_SETTING_SCHEMA — the same source the PUT
+    validator and the runtime coercion read) surfaces without a JS
+    release. Per field: key, type, default, bounds {lo, hi, lo_open}
+    (numeric only; hi null = unbounded), choices (choice only).
+    """
+    from ..model_profiles import STREAMING_SETTING_SCHEMA
+
+    fields = []
+    for key, spec in STREAMING_SETTING_SCHEMA.items():
+        field = {
+            "key": key,
+            "type": spec["type"],
+            "default": spec.get("default"),
+        }
+        bounds = spec.get("bounds")
+        if bounds is not None:
+            lo, hi, lo_open = bounds
+            field["bounds"] = {"lo": lo, "hi": hi, "lo_open": bool(lo_open)}
+        choices = spec.get("choices")
+        if choices is not None:
+            field["choices"] = list(choices)
+        fields.append(field)
+    return {"fields": fields}
 
 
 @router.get("/api/profile-fields")
@@ -6308,12 +6561,11 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                for subdir in "0123456789abcdef":
-                    subdir_path = root / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
+            for subdir in "0123456789abcdef":
+                subdir_path = cache_dir / subdir
+                if not subdir_path.exists():
+                    continue
+                for f in subdir_path.glob("*.safetensors"):
                         num_files += 1
                         total_bytes += f.stat().st_size
             payload["total_num_files"] = num_files
@@ -6699,6 +6951,10 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
+                # Same shape list_models emits via get_status() (engine_pool
+                # ._expert_streaming_status) — None when the engine has no
+                # streaming state.
+                "expert_streaming": model_info.get("expert_streaming"),
                 "cluster": (
                     {**model_info["cluster"], "live": cluster_live}
                     if model_info.get("cluster")
@@ -6880,17 +7136,16 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                    for subdir in "0123456789abcdef":
-                        subdir_path = root / subdir
-                        if not subdir_path.exists():
-                            continue
-                        for f in subdir_path.glob("*.safetensors"):
-                            try:
-                                f.unlink()
-                                total_deleted += 1
-                            except OSError:
-                                pass
+                for subdir in "0123456789abcdef":
+                    subdir_path = cache_dir / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        try:
+                            f.unlink()
+                            total_deleted += 1
+                        except OSError:
+                            pass
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 

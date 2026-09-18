@@ -18,7 +18,6 @@ import copy
 import gc
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -53,8 +52,10 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .model_settings import (
+    EXPERT_STREAMING_TUNABLE_KEYS,
     ane_prefill_backend,
     ane_prefill_fraction,
+    moe_offload_requested,
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
@@ -415,15 +416,12 @@ class EnginePool:
                 shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
                 width=runtime_settings.qwen35_ane_prefill_sequence_length,
             )
-        if getattr(runtime_settings, "moe_expert_offload_enabled", False):
+        if moe_offload_requested(runtime_settings):
             from .patches.moe_expert_offload import estimate_offload_admission_bytes
 
             fraction = runtime_settings.moe_expert_offload_resident_fraction
             if entry.config_model_type == "deepseek_v41":
-                if (
-                    v41_estimate is None
-                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-                ):
+                if v41_estimate is None:
                     from .patches.deepseek_v41.moe_offload import (
                         estimate_expert_savings,
                     )
@@ -432,10 +430,68 @@ class EnginePool:
                         0, base - estimate_expert_savings(entry.model_path, fraction)
                     )
             elif qwen4_estimate is None:
-                base = estimate_offload_admission_bytes(
-                    entry.model_path, base, fraction
-                )
+                # Unified-streaming types: the real commitment is
+                # non-expert weights + the resolved LRU budget (the
+                # fraction mirror only describes the legacy adapter's
+                # fixed resident share — charging it under-counts the
+                # heap the governor can grow).
+                try:
+                    from .patches.expert_streaming.residency import (
+                        expert_streaming_estimate,
+                    )
+
+                    _est = expert_streaming_estimate(entry.model_path)
+                except Exception:
+                    _est = None
+                if _est is not None and getattr(_est, "supported", False):
+                    from .patches.expert_streaming import (
+                        resolve_budget_bytes,
+                    )
+
+                    base = max(
+                        0,
+                        base
+                        - int(getattr(_est, "expert_bytes", 0) or 0)
+                        + resolve_budget_bytes(runtime_settings),
+                    )
+                else:
+                    base = estimate_offload_admission_bytes(
+                        entry.model_path, base, fraction
+                    )
         return base + extra
+
+    def _forced_ssd_offload(
+        self,
+        entry: EngineEntry,
+        estimate: object,
+        label: str,
+        ceiling: int | None,
+    ) -> bool:
+        """Ceiling-resolved force decision + the user-facing warning.
+
+        Normal residency calls use the stable ceiling so a post-unload
+        vm_stat dip cannot pin the new engine to SSD. Pre-load admission
+        may pass its earlier live ceiling explicitly when only mmap fits.
+        """
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "%s forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
+                "roughly 2.5x slower than a resident load.",
+                label,
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
+        return forced
 
     def _qwen4_ple_offload_status(
         self,
@@ -455,7 +511,7 @@ class EnginePool:
             )
 
             estimate = qwen4_exp_residency_estimate(entry.model_path)
-            if getattr(settings, "moe_expert_offload_enabled", False):
+            if moe_offload_requested(settings):
                 from .patches.moe_expert_offload import estimate_offload_admission_bytes
 
                 fraction = settings.moe_expert_offload_resident_fraction
@@ -479,26 +535,7 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        # Normal residency calls use the stable ceiling so a post-unload
-        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
-        # pass its earlier live ceiling explicitly when only mmap fits.
-        if ceiling is None:
-            ceiling = self._residency_ceiling()
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-            if ceiling <= 0:
-                ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
-        if forced:
-            logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
-                "roughly 2.5x slower than a resident load.",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        forced = self._forced_ssd_offload(entry, estimate, "Qwen4-Exp PLE", ceiling)
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -544,10 +581,10 @@ class EnginePool:
             estimate = deepseek_v41_residency_estimate(entry.model_path)
             if not estimate.supported:
                 return False, False, None
-            if (
-                getattr(settings, "moe_expert_offload_enabled", False)
-                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-            ):
+            # Unified predicate: canonical expert_streaming_enabled and the
+            # legacy alias both request offload; the env kill switch is
+            # honored inside moe_offload_requested.
+            if moe_offload_requested(settings):
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(
@@ -565,25 +602,9 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        # Normal residency calls use the stable ceiling so a post-unload
-        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
-        # pass its earlier live ceiling explicitly when only mmap fits.
-        if ceiling is None:
-            ceiling = self._residency_ceiling()
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-            if ceiling <= 0:
-                ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
-        if forced:
-            logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB).",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        forced = self._forced_ssd_offload(
+            entry, estimate, "DeepSeek V4.1 Engram", ceiling
+        )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
@@ -803,15 +824,25 @@ class EnginePool:
         if mtp_active:
             add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
         if entry is not None:
-            qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
-            add("qwen4_ple_ssd_offload", qwen4_offload)
-            v41_offload, _, _ = self._deepseek_v41_engram_offload_status(
-                entry, settings
-            )
-            add("deepseek_v41_engram_ssd_offload", v41_offload)
+            # Requested values only. The *_offload_status helpers fold in the
+            # load-time "forced to SSD" decision, which depends on free memory
+            # at that instant — using it here would make the reuse signature
+            # oscillate with vm_stat and reload engines spuriously. Forced
+            # resolution stays a load-time concern (_load_engine applies
+            # _effective_*_model_settings). Non-matching model types keep the
+            # inert False the old resolution returned.
+            sig_model_type = (entry.config_model_type or "").replace(
+                "-", "_"
+            ).lower()
             add(
-                "deepseek_v41_ced_prefill_enabled",
-                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+                "qwen4_ple_ssd_offload",
+                sig_model_type == "qwen4_exp"
+                and bool(data.get("qwen4_ple_ssd_offload", False)),
+            )
+            add(
+                "deepseek_v41_engram_ssd_offload",
+                sig_model_type == "deepseek_v41"
+                and bool(data.get("deepseek_v41_engram_ssd_offload", False)),
             )
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
@@ -896,13 +927,34 @@ class EnginePool:
                     data.get("qwen35_ane_prefill_cpu_shared_resource", True),
                 )
 
-        moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
+        # Both spellings feed the same predicate — a toggle on either
+        # must rebuild the engine (the canonical key used to be invisible
+        # to the signature).
+        moe_offload_active = bool(
+            data.get("moe_expert_offload_enabled", False)
+            or data.get("expert_streaming_enabled", False)
+        )
         add("moe_expert_offload_enabled", moe_offload_active)
         if moe_offload_active:
             add(
                 "moe_expert_offload_resident_fraction",
                 data.get("moe_expert_offload_resident_fraction", 0.25),
             )
+            # Every expert-streaming knob consumed at engine construction
+            # belongs here so changing one reloads while a stale value never
+            # forces a reload once the feature is off.
+            for key in EXPERT_STREAMING_TUNABLE_KEYS:
+                # budget_gib is canonicalized: the WebUI writes an explicit 0
+                # for page-cache mode, and 0 must hash the same as unset so
+                # flipping auto/page-cache never forces a reload.
+                add(
+                    key,
+                    (
+                        (data.get(key) or 0)
+                        if key == "expert_streaming_budget_gib"
+                        else data.get(key)
+                    ),
+                )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
@@ -2059,9 +2111,12 @@ class EnginePool:
 
             loaded = self._entries[model_id]
             if ngram_admission_override and expected_signature is not None:
-                # Automatic mmap is local to this admission attempt. Keep the
-                # user's requested variant as the reuse key so the next request
-                # does not reload the model merely because pressure recovered.
+                # Forced mmap is local to this admission attempt: _load_engine
+                # stamped the signature of the effective settings it built
+                # with, which can carry the forced SSD-offload flag. Keep the
+                # user's requested variant as the reuse key so the next
+                # request does not reload the model merely because pressure
+                # recovered.
                 loaded.runtime_settings_signature = expected_signature
             self._validate_llm_engine_ready(model_id, loaded.engine)
             if _lease:
@@ -2928,6 +2983,7 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            requested_settings = model_settings
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
@@ -3311,8 +3367,14 @@ class EnginePool:
             # place. Recording that effective engine as a different variant
             # makes the next identical concurrent request attempt a reload and
             # fail with ModelBusyError before it reaches the scheduler (#2406).
+            # Stamp the REQUESTED settings, not the effective ones: the
+            # _effective_* helpers fold in memory-pressure "forced to SSD"
+            # decisions that vary between calls — signing with them makes
+            # direct _load_engine callers (settings PUT, profile apply)
+            # record a signature the next get_engine reads as a mismatch and
+            # pays a full unload+reload for.
             entry.runtime_settings_signature = self._engine_runtime_signature(
-                model_id, model_settings
+                model_id, requested_settings
             )
 
             # Propagate memory limit to new engine's scheduler
@@ -3470,6 +3532,81 @@ class EnginePool:
         shutdown_mlx_executor()
         logger.info("Engine pool shutdown complete")
 
+    def _expert_streaming_status(self, entry: EngineEntry) -> dict | None:
+        """Runtime expert-streaming telemetry for a loaded model.
+
+        Consumes the counters the engines already keep (the same
+        ``expert_streaming_summary`` used by the per-request health log),
+        so the admin dashboard can show hit rate / evictions / governor
+        state without reaching into patch internals. Returns None when the
+        model is not loaded or no streaming backing is attached.
+        """
+        engine = entry.engine
+        if engine is None:
+            return None
+        try:
+            # Same holder walk the engines use per request: the converter
+            # stamps the backing on the engine and/or model, and the legacy
+            # adapter exposes its governor-facing state.
+            from .patches.expert_streaming import (
+                streaming_cache_of,
+                streaming_summary_backing,
+            )
+
+            backing = streaming_summary_backing(engine)
+            cache = streaming_cache_of(backing)
+
+            sched = self._resolve_scheduler_from_engine(engine)
+            guard_info = None
+            if sched is not None:
+                # The scheduler's accessor lazy-resolves and returns the
+                # (guard_info, backing, lru_cache) snapshot — no private
+                # getattr mining here.
+                state = getattr(sched, "streaming_state", None)
+                if callable(state):
+                    guard_info, sched_backing, sched_cache = state()
+                    if backing is None:
+                        backing = sched_backing
+                    if cache is None:
+                        cache = sched_cache
+            if backing is None and cache is None:
+                return None
+
+            from .patches.expert_streaming import expert_streaming_summary
+
+            summary = expert_streaming_summary(cache, backing)
+            if not summary:
+                return None
+            governor = summary.get("governor") or {}
+            backing_summary = summary.get("backing") or {}
+            return {
+                "hit_rate": summary.get("lru_hit_rate", 0.0),
+                "hits": summary.get("lru_hits", 0),
+                "misses": summary.get("lru_misses", 0),
+                "evictions": summary.get("lru_evictions", 0),
+                "resident": summary.get("lru_size", 0),
+                "capacity": summary.get("lru_capacity", 0),
+                "advised": summary.get("advised", 0),
+                "staged_hits": backing_summary.get("staged_hits", 0),
+                "cache_policy": summary.get("cache_policy"),
+                "governor": {
+                    "actions": governor.get("actions"),
+                    "last_action": governor.get("last_action"),
+                    "capacity": governor.get("capacity"),
+                    "stall_target": governor.get("stall_target"),
+                }
+                if governor
+                else None,
+                "guard": dict(guard_info) if guard_info else None,
+            }
+        except Exception:
+            logger.debug(
+                "expert-streaming status unavailable for %s",
+                entry.model_id,
+                exc_info=True,
+            )
+            return None
+
     def get_status(self) -> dict:
         """
         Get pool status for monitoring endpoints.
@@ -3510,6 +3647,7 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    "expert_streaming": self._expert_streaming_status(e),
                 }
             )
         return {

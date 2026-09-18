@@ -7,6 +7,23 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+from ..utils.safetensors import file_signature
+
+
+def _files_signature(files):
+    """``(path, size, mtime_ns)`` tuples — the cache key for header scans.
+
+    A replaced file changes size or mtime and re-runs the scan; an
+    untouched one stays cached. Composed on the shared per-file
+    ``file_signature`` (omlx/utils/safetensors.py).
+    """
+    return tuple((str(f), *file_signature(f)) for f in sorted(files))
+
+
+# Deliberately NOT expert_streaming.residency.SUPPORTED_TYPES: that list
+# gates the unified SSD-streaming converter, this one gates the legacy
+# fetch-on-miss adapter. qwen4_exp is dual-listed; keep the two scopes
+# in sync only where a family genuinely supports both paths.
 _SUPPORTED_TYPES = frozenset({"deepseek_v41", "qwen4_exp", "gemma4", "olmoe"})
 
 
@@ -16,16 +33,44 @@ def moe_offload_compatibility(model_path):
         path = Path(model_path).expanduser().resolve()
         config = path / "config.json"
         raw = json.loads(config.read_text())
-        if raw.get("model_type") not in _SUPPORTED_TYPES:
+        mtype = raw.get("model_type")
+        # Unified backend first: streaming-owned model types are eligible
+        # when the converter's own structural estimate says so.
+        try:
+            from .expert_streaming.residency import (
+                SUPPORTED_TYPES as _STREAMING_TYPES,
+            )
+            from .expert_streaming.residency import (
+                _config_model_type,
+                expert_streaming_estimate,
+                normalize_model_type,
+            )
+
+            # Effective model_type: top level wins, VLM wrappers fall
+            # back to text_config — the same reading the streaming stack
+            # and the legacy adapter apply (normalized).
+            mtype = _config_model_type(raw)
+            if mtype and normalize_model_type(mtype) in _STREAMING_TYPES:
+                est = expert_streaming_estimate(str(path))
+                if est.supported:
+                    return True, ""
+                # Dual-listed types (qwen4_exp) may still be servable by the
+                # legacy fetch-on-miss adapter — fall through to its
+                # per-tensor inspection rather than rejecting here.
+                if mtype not in _SUPPORTED_TYPES:
+                    return False, (
+                        getattr(est, "reason", None)
+                        or "MoE expert offload is not supported for this checkpoint."
+                    )
+        except Exception:
+            pass
+        if mtype not in _SUPPORTED_TYPES:
             return False, "MoE expert offload is not supported for this model type."
         files = [config, *path.glob("*.safetensors")]
         index = path / "model.safetensors.index.json"
         if index.exists():
             files.append(index)
-        signature = tuple(
-            (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(files)
-        )
-        return _inspect(str(path), signature)
+        return _inspect(str(path), _files_signature(files))
     except (OSError, TypeError, ValueError, KeyError):
         return False, "Could not verify the expert checkpoint layout."
 
@@ -33,7 +78,12 @@ def moe_offload_compatibility(model_path):
 @lru_cache(maxsize=128)
 def _inspect(path, signature):
     raw = json.loads((Path(path) / "config.json").read_text())
-    kind = raw["model_type"]
+    try:
+        from .expert_streaming.residency import _config_model_type
+
+        kind = _config_model_type(raw)
+    except Exception:
+        kind = raw.get("model_type")
     if kind == "deepseek_v41":
         from .deepseek_v41.moe_offload import estimate_expert_savings
 
@@ -41,7 +91,15 @@ def _inspect(path, signature):
             return True, ""
         return False, "The checkpoint has no offloadable routed experts."
 
+    from .expert_streaming.model_hooks import legacy_checkpoint_layout
     from .moe_expert_offload import CheckpointExpertStore
+
+    layout = legacy_checkpoint_layout(kind)
+    if layout is None:
+        # _SUPPORTED_TYPES gates entry; deepseek_v41 returned above, so an
+        # unknown kind here means the registry and the gate drifted apart.
+        return False, "MoE expert offload is not supported for this model type."
+    parents, leaf = layout
 
     text = raw.get("text_config", raw)
     count = int(text.get("num_experts") or 0)
@@ -60,15 +118,17 @@ def _inspect(path, signature):
         return False, "Expert offload requires an MLX quantized checkpoint."
     store = CheckpointExpertStore(path)
     for layer in range(layers):
-        if kind == "olmoe":
-            parent = f"model.layers.{layer}.mlp"
-            prefix = parent + ".switch_mlp"
-        elif kind == "qwen4_exp":
-            parent = f"language_model.model.layers.{layer}.mlp"
-            prefix = parent + ".switch_mlp"
-        else:
-            parent = f"language_model.model.layers.{layer}.experts"
-            prefix = parent + ".switch_glu"
+        # First parent whose stacked spelling exists wins; otherwise the
+        # last candidate's parent drives the per-expert probe (e.g. the
+        # de-nested qwen4_exp spelling — the checkpoint omits the
+        # runtime's `.model` segment, and the per-key spec lookup below
+        # must use the same spelling or it falls back to the global
+        # 8-bit quant spec and the shape math is wrong).
+        for cand in parents:
+            parent = cand.format(layer=layer)
+            prefix = parent + "." + leaf
+            if store.has(prefix + ".gate_proj.weight"):
+                break
         per_expert = not store.has(prefix + ".gate_proj.weight")
         for proj in ("gate_proj", "up_proj", "down_proj"):
             key = prefix + "." + proj

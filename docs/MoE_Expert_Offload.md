@@ -187,8 +187,8 @@ cache, which serves repeated misses far faster than the SSD (6.5 GB/s
 effective at 12.5% against 3.4 GB/s at 25%). On a 128 GB machine 12.5% is
 the better default. Expect the page cache to take all remaining RAM during
 a run; it is reclaimable and is not part of the Metal working-set limit.
-Higher residencies fit the limit on paper (`fit_resident_fraction` reports
-41% at 107.5 GiB) but leave no headroom for the KV cache and prefill
+Higher residencies fit the limit on paper (the admission estimate puts 41%
+at 107.5 GiB) but leave no headroom for the KV cache and prefill
 transients, and were not measured.
 
 ### Sizing on a 128 GB Mac
@@ -207,11 +207,11 @@ Engram on SSD the resident set is:
 
 The Metal working-set limit on a 128 GB machine with `iogpu.wired_limit_mb`
 unset is about 107 GiB, and KV cache, prefill transients, and the Engram
-page cache share it. `admission_bytes(path, fraction)` and
-`fit_resident_fraction(path, budget_bytes)` in
-`omlx.patches.deepseek_v41.moe_offload` give the engine pool's admission
-estimate for a fraction and the largest fraction whose estimate fits a byte
-budget.
+page cache share it. `expert_streaming_estimate(path)` in
+`omlx.patches.expert_streaming.residency` gives the engine pool's
+header-derived admission estimate (checkpoint, expert, resident and
+streaming bytes); `slots_for_budget(budget_bytes)` on the estimate reports
+the experts-per-layer residency a byte budget affords.
 
 For a 384-expert checkpoint, 12.5% keeps 48 experts per layer. The adapter
 preserves V4.1's activation quantization, clamped SwiGLU, and application of

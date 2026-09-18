@@ -70,8 +70,14 @@ def test_shared_ane_web_state_preserves_backend_default_and_saved_fraction(
         "qwen35_ane_prefill_fraction": saved_fraction,
         "qwen35_ane_prefill_shared_fraction": 0,
     }
+    advanced_keys = re.search(
+        r"const EXPERT_STREAMING_ADVANCED_KEYS = \[.*?\];", source, re.S
+    ).group()
     script = (
-        "const OCR_CONFIG_MODEL_TYPES = new Set(); const app = {isDiffusionModel: () => false, buildCtKwargEntries: () => [],"
+        "const OCR_CONFIG_MODEL_TYPES = new Set(); "
+        + advanced_keys
+        + " const app = {isDiffusionModel: () => false, buildCtKwargEntries: () => [],"
+        + " expertStreamingAdvancedKeys: () => EXPERT_STREAMING_ADVANCED_KEYS,"
         + method
         + "};"
     )

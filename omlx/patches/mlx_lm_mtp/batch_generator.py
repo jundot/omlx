@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -641,6 +642,8 @@ class _MtpStats:
     mtp_head_ms: float = 0.0  # cumulative time inside MTP-head forwards
     sample_ms: float = 0.0  # cumulative time in sampling + acceptance check
     cache_ops_ms: float = 0.0  # cumulative time in trim / rollback restore
+    # P6 streaming-gate decision recorded at entry: {"mode", "decode_hit_rate"}.
+    mtp_gate: Optional[dict] = None
 
 
 @dataclass
@@ -736,6 +739,194 @@ class _MtpBatchState:
 # controller's acceptance and cycle-cost model.
 _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS = 128
 _MTP_REENTRY_MAX_COOLDOWN_TOKENS = 4096
+
+# P6 (megaplan): expert-streaming-aware MTP gate. Under SSD-backed expert
+# streaming the verify forward pays for its extra positions in expert
+# reads, so the entry cost matters: the full depth warmup sweep plus the
+# 16-cycle exit streak burned ~50-100 s of reads on JANG models before
+# parking (measured on the mtp_ab campaign). Modes:
+#   auto (default): streaming-active -> cheap entry (depth-1 warmup +
+#   short exit streak); no streaming -> untouched.
+#   on:  never constrain (previous behavior).
+#   off: never enter MTP while a bounded streaming cache is live.
+_MTP_STREAM_GATE = os.environ.get(
+    "OMLX_MTP_EXPERT_STREAMING_GATE", "auto"
+).strip().lower()
+_MTP_STREAM_EXIT_STREAK = 4
+
+# P8.1 (megaplan): evict the materialized MTP head when parking is
+# permanent (max cooldown — the conclusive-loss and escalated cases) or
+# the streaming gate is off. The head is ~1.4 GiB of dead weight while
+# parked on qwen4_exp (its single-module MoE head is never converted to
+# streaming); the re-entry probe re-materializes the same tensors from
+# the checkpoint shards via lazy mx.load, so outputs stay bit-exact.
+# OMLX_MTP_HEAD_EVICT: auto (default) | off.
+_MTP_HEAD_EVICT = os.environ.get("OMLX_MTP_HEAD_EVICT", "auto").strip().lower()
+
+
+def _mtp_head_evict_enabled() -> bool:
+    return _MTP_HEAD_EVICT not in ("0", "off", "false")
+
+
+def _mtp_head_module(model: Any) -> Tuple[Any, Any]:
+    """(mtp module, mtp runtime) — whichever attachment spelling applies."""
+    runtime = None
+    try:
+        from mlx_vlm.models.qwen4_exp.language import get_mtp_runtime
+
+        runtime = get_mtp_runtime()
+    except Exception:
+        pass
+    getter = getattr(model, "get_mtp_module", None)
+    module = getter() if callable(getter) else getattr(model, "mtp", None)
+    return module, runtime
+
+
+def _mtp_head_source(module: Any, runtime: Any) -> Optional[dict]:
+    """param_path -> (shard_path, checkpoint_key) for every leaf, or None.
+
+    Any unresolved leaf fails the whole map — eviction without a complete
+    reload path would corrupt the head, so it stays resident instead.
+    """
+    import json
+    from pathlib import Path
+
+    from mlx.utils import tree_flatten
+
+    prefix = getattr(runtime, "checkpoint_prefix", None)
+    model_dir = getattr(runtime, "model_path", None)
+    if not prefix or not model_dir:
+        return None
+    model_dir = Path(model_dir)
+    params = dict(tree_flatten(module.parameters()))
+    if not params:
+        return None
+    stem = prefix.rstrip(".")
+    ckpt_key_of = {p: f"{stem}.{p}" for p in params}
+    files: Dict[str, str] = {}
+    index = model_dir / "model.safetensors.index.json"
+    if index.exists():
+        try:
+            files = json.loads(index.read_text()).get("weight_map", {})
+        except Exception:
+            files = {}
+    else:
+        try:
+            import safetensors
+
+            for shard in sorted(model_dir.glob("*.safetensors")):
+                with safetensors.safe_open(str(shard), framework="np") as f:
+                    for key in f.keys():
+                        files[key] = shard.name
+        except Exception:
+            return None
+    src = {}
+    for path, key in ckpt_key_of.items():
+        fname = files.get(key)
+        if fname is None:
+            return None
+        src[path] = (model_dir / fname, key)
+    return src
+
+
+def _mtp_head_source_cached(module: Any, runtime: Any) -> dict | None:
+    """The head's reloadable weight source, resolved once and stashed on it."""
+    src = getattr(module, "_omlx_mtp_source", None)
+    if src is None:
+        src = _mtp_head_source(module, runtime)
+        if src is not None:
+            module._omlx_mtp_source = src
+    return src
+
+
+def _evict_mtp_head(model: Any, reason: str) -> int:
+    """Drop the head's materialized arrays; reload path is stashed on it."""
+    if not _mtp_head_evict_enabled():
+        return 0
+    try:
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
+
+        module, runtime = _mtp_head_module(model)
+        if module is None or getattr(module, "_omlx_mtp_evicted", False):
+            return 0
+        params = dict(tree_flatten(module.parameters()))
+        if not params:
+            return 0
+        src = _mtp_head_source_cached(module, runtime)
+        if src is None:
+            logger.debug("MTP head evict skipped: no reloadable source")
+            return 0
+        freed = sum(int(a.nbytes) for a in params.values())
+        module.load_weights(
+            [(p, mx.zeros(0, dtype=a.dtype)) for p, a in params.items()],
+            strict=False,
+        )
+        module._omlx_mtp_evicted = True
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
+        logger.info(
+            "MTP head evicted (%s): released ~%.1f MiB of resident weights",
+            reason,
+            freed / 2**20,
+        )
+        return freed
+    except Exception as exc:
+        logger.debug("MTP head evict failed: %s", exc)
+        return 0
+
+
+def _reload_mtp_head(model: Any) -> bool:
+    """Re-materialize an evicted head from the same checkpoint shards.
+
+    mx.load returns lazy arrays — the bytes are paid at the next
+    mtp_forward's eval, amortized over the cooldown's 4096 tokens.
+    """
+    try:
+        import mlx.core as mx
+
+        module, runtime = _mtp_head_module(model)
+        if module is None or not getattr(module, "_omlx_mtp_evicted", False):
+            return True
+        src = _mtp_head_source_cached(module, runtime)
+        if src is None:
+            return False
+        by_file: Dict[Any, list] = {}
+        for path, (shard, key) in src.items():
+            by_file.setdefault(shard, []).append((path, key))
+        weights = []
+        for shard, items in by_file.items():
+            loaded = mx.load(str(shard))
+            for path, key in items:
+                if key not in loaded:
+                    return False
+                weights.append((path, loaded[key]))
+        module.load_weights(weights, strict=False)
+        module._omlx_mtp_evicted = False
+        logger.info("MTP head reloaded from checkpoint (%d params)", len(weights))
+        return True
+    except Exception as exc:
+        logger.debug("MTP head reload failed: %s", exc)
+        return False
+
+
+def _mtp_streaming_gate() -> Tuple[str, Optional[dict]]:
+    """(mode, signal): the streaming regime for the MTP entry decision."""
+    if _MTP_STREAM_GATE not in ("auto", "on", "off"):
+        return "on", None
+    try:
+        from omlx.patches.expert_streaming.expert_cache import (
+            streaming_gate_state,
+        )
+
+        sig = streaming_gate_state()
+    except Exception:
+        sig = None
+    if sig is None:
+        return "on", None
+    return ("off" if _MTP_STREAM_GATE == "off" else _MTP_STREAM_GATE), sig
 
 
 @dataclass
@@ -1145,6 +1336,9 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     if _mtp_batch_state_valid_for_batch(gen_batch, batch_state):
         return batch_state
 
+    if _mtp_streaming_gate()[0] == "off":
+        return None
+
     replacements: Dict[int, List[Any]] = {}
     token_context_updates: Dict[int, Any] = {}
     states = dict(batch_state.states) if batch_state is not None else {}
@@ -1265,6 +1459,34 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
 
     park_state = _mtp_park_state_for_batch(gen_batch)
     _set_singleton_mrope_delta(gen_batch)
+    # P6 gate: under expert streaming, "off" never enters MTP (the verify
+    # positions' expert demand is paid in SSD reads); "auto" enters cheap
+    # (depth-1 warmup + short exit streak, applied in _post_init_mtp).
+    _gate, _gate_sig = _mtp_streaming_gate()
+    if _gate == "off":
+        uid = gen_batch.uids[0] if gen_batch.uids else None
+        if park_state is None:
+            park_state = _MtpParkState(
+                uid=uid,
+                cooldown_tokens=_MTP_REENTRY_MAX_COOLDOWN_TOKENS,
+                tokens_remaining=_MTP_REENTRY_MAX_COOLDOWN_TOKENS,
+            )
+            gen_batch._omlx_mtp_park_state = park_state
+        else:
+            park_state.cooldown_tokens = _MTP_REENTRY_MAX_COOLDOWN_TOKENS
+            park_state.tokens_remaining = park_state.cooldown_tokens
+        logger.info(
+            "MTP[%s] gate=off: expert streaming active (decode hit %.2f) — "
+            "staying on the standard step",
+            uid,
+            (_gate_sig or {}).get("decode_hit_rate", 0.0),
+        )
+        # P8.1: MTP never runs on this request — the head is dead weight.
+        _evict_mtp_head(gen_batch.model, "gate-off")
+        return None
+    # P8.1: a re-entry probe after a permanent park needs the head back;
+    # no-op while it is resident.
+    _reload_mtp_head(gen_batch.model)
     _post_init_mtp(gen_batch)
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if not _mtp_state_valid_for_batch(gen_batch, state):
@@ -2587,6 +2809,23 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
                     marginal_ms=getattr(gen_batch.model, "_omlx_mtp_marginal_ms", None),
                     exit_margin=_effective_loop_tax(gen_batch.model),
                 )
+            _gate, _gate_sig = _mtp_streaming_gate()
+            if _gate == "auto" and isinstance(
+                state.controller, _DepthController
+            ):
+                # Cheap entry under SSD streaming: measure depth-1 once and
+                # the plain-step baseline, then let the exit gate decide —
+                # the full deep sweep + 16-cycle streak is wasted expert
+                # reads when verify is not RAM-served.
+                state.controller.cur = 1
+                state.controller._warmup = [0, 0, 0]
+                state.controller.EXIT_STREAK = _MTP_STREAM_EXIT_STREAK
+                state.stats.mtp_gate = {
+                    "mode": "auto",
+                    "decode_hit_rate": (_gate_sig or {}).get(
+                        "decode_hit_rate"
+                    ),
+                }
         primed = _prompt_priming.take_primed(
             gen_batch.model,
             gen_batch.prompt_cache,
@@ -2933,6 +3172,18 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     else:
         park_state = _MtpParkState(uid=state.uid)
         gen_batch._omlx_mtp_park_state = park_state
+    # P6: a stint that drafted at least a few positions and accepted
+    # literally nothing is conclusive (JANG-4M: 0/9 — every cycle pure
+    # verify cost). n<4 is too thin: a cold-cache patch can read 0/2 on a
+    # healthy head (measured on qwen oQ4e, where the same probe later ran
+    # at 70%). Skip the exponential warm-up only on solid evidence.
+    if state.stats.accepts == 0 and sum(state.stats.depth_drafted) >= 4:
+        park_state.cooldown_tokens = _MTP_REENTRY_MAX_COOLDOWN_TOKENS
+        park_state.tokens_remaining = park_state.cooldown_tokens
+    # P8.1: a max-cooldown park is effectively permanent for this request —
+    # drop the resident head; the next probe re-materializes it.
+    if park_state.cooldown_tokens >= _MTP_REENTRY_MAX_COOLDOWN_TOKENS:
+        _evict_mtp_head(gen_batch.model, "permanent-park")
     if state.controller is not None:
         _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
     logger.info(
@@ -3042,8 +3293,10 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     if stats.zero_cycles:
         depth_str += f" d0={stats.zero_cycles}"
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
+    gate = getattr(stats, "mtp_gate", None)
+    gate_str = f" gate={gate.get('mode')}" if isinstance(gate, dict) else ""
     logger.info(
-        "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
+        "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s%s "
         "emits[init=%d,draft=%d,bonus=%d,verify=%d] "
         "timing[backbone=%.1fms mtp=%.1fms sample=%.1fms cache=%.1fms]",
         uid,
@@ -3055,6 +3308,7 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         total_drafted,
         rate_str,
         depth_str,
+        gate_str,
         stats.init_emits,
         stats.draft_emits,
         stats.bonus_emits,
@@ -3064,6 +3318,55 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         stats.sample_ms,
         stats.cache_ops_ms,
     )
+    _mtp_stats_accumulate(stats)
+
+
+# ---------------------------------------------------------------------------
+# Cross-request aggregate (bench harness reads this via mtp_stats_snapshot).
+# ---------------------------------------------------------------------------
+
+_MTP_AGG: Dict[str, Any] = {}
+
+
+def mtp_stats_reset() -> None:
+    """Clear the cross-request MTP counters (bench arms call this at start)."""
+    _MTP_AGG.clear()
+
+
+def _mtp_stats_accumulate(stats: "_MtpStats") -> None:
+    g = _MTP_AGG
+    for k in (
+        "cycles",
+        "accepts",
+        "rejects",
+        "init_emits",
+        "draft_emits",
+        "bonus_emits",
+        "verify_emits",
+        "zero_cycles",
+    ):
+        g[k] = g.get(k, 0) + int(getattr(stats, k, 0))
+    for k in ("backbone_ms", "mtp_head_ms", "sample_ms", "cache_ops_ms"):
+        g[k] = g.get(k, 0.0) + float(getattr(stats, k, 0.0))
+    for name in ("depth_drafted", "depth_accepted"):
+        for j, n in enumerate(getattr(stats, name)):
+            acc = g.setdefault(name, [])
+            while len(acc) <= j:
+                acc.append(0)
+            acc[j] += int(n)
+    g["sequences"] = g.get("sequences", 0) + 1
+    if stats.mtp_gate is not None:
+        g["mtp_gate"] = dict(stats.mtp_gate)
+
+
+def mtp_stats_snapshot() -> Dict[str, Any]:
+    """Summed MTP counters across finished sequences since the last reset."""
+    snap = dict(_MTP_AGG)
+    drafted = sum(snap.get("depth_drafted") or [])
+    accepted = sum(snap.get("depth_accepted") or [])
+    if drafted:
+        snap["accept_rate"] = accepted / drafted
+    return snap
 
 
 def _bump_emit_stat(state: _MtpState, source: str) -> None:

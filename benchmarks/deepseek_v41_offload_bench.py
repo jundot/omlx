@@ -5,12 +5,9 @@ Loads a V4.1 checkpoint through the oMLX loader with Engram on SSD and MoE
 expert offload at each requested resident fraction, then runs a chunked
 prefill and a greedy decode directly on the model (no scheduler), reporting
 load time, Metal and process memory, time to first token, decode speed, and
-the expert cache's hit rate and fetch throughput per phase. Prints the
-resident set per fraction from the shard headers and the largest fraction
-that fits the Metal working-set limit first, so a run that cannot fit is
-visible before any weights load::
+the expert cache's hit rate and evictions per phase::
 
-    python benchmarks/deepseek_v41_offload_bench.py --model /path/to/oQ3e \\
+    python benchmarks/deepseek_v41_offload_bench.py --model /path/to/oQ3e \
         --fractions 0.125 0.25 --prompt-tokens 512 --decode-tokens 32
 """
 
@@ -28,70 +25,26 @@ from omlx.utils.proc_memory import get_lifetime_max_phys_footprint, get_phys_foo
 
 
 def _offload_stats(model) -> dict:
-    hits = misses = fetched = 0
+    hits = misses = evictions = 0
     for layer in model.language_model.layers:
         slots = getattr(layer.ffn.experts, "slots", None)
         if slots is None:
             continue
         hits += slots.hits
         misses += slots.misses
-        fetched += slots.fetched_bytes
-    return {"hits": hits, "misses": misses, "fetched_bytes": fetched}
+        evictions += slots.evictions
+    return {"hits": hits, "misses": misses, "evictions": evictions}
 
 
-def _delta(after: dict, before: dict, seconds: float) -> dict:
-    misses = after["misses"] - before["misses"]
+def _delta(after: dict, before: dict) -> dict:
     hits = after["hits"] - before["hits"]
-    fetched = after["fetched_bytes"] - before["fetched_bytes"]
+    misses = after["misses"] - before["misses"]
     return {
         "hits": hits,
         "misses": misses,
+        "evictions": after["evictions"] - before["evictions"],
         "hit_rate": hits / max(1, hits + misses),
-        "fetched_gib": fetched / 2**30,
-        "fetch_gbps": fetched / max(seconds, 1e-9) / 1e9,
     }
-
-
-def sizing(path: Path, budget: int, engram_ssd: bool) -> dict:
-    from omlx.patches.deepseek_v41.moe_offload import (
-        _plan,
-        admission_bytes,
-        fit_resident_fraction,
-    )
-
-    plan = _plan(path, 1.0)
-    rows = []
-    for fraction in (0.125, 0.25, 1 / 3, 0.375, 0.5, 1.0):
-        capacity = min(plan.count, max(plan.floor, round(plan.count * fraction)))
-        rows.append(
-            {
-                "fraction": fraction,
-                "experts_per_layer": capacity,
-                "admission_gib": admission_bytes(
-                    path, fraction, engram_ssd_offload=engram_ssd
-                )
-                / 2**30,
-            }
-        )
-    fit = fit_resident_fraction(path, budget, engram_ssd_offload=engram_ssd)
-    print(
-        f"experts {plan.full_bytes / 2**30:.1f} GiB, draft {plan.draft_bytes / 2**30:.1f} GiB, "
-        f"budget {budget / 2**30:.1f} GiB"
-    )
-    for row in rows:
-        print(
-            f"  {row['fraction'] * 100:5.1f}%  {row['experts_per_layer']:4d} experts/layer  "
-            f"admission {row['admission_gib']:6.1f} GiB"
-        )
-    print(
-        "largest fraction within budget: "
-        + (
-            "none"
-            if fit is None
-            else f"{fit:.4f} ({round(fit * plan.count)} experts/layer)"
-        )
-    )
-    return {"rows": rows, "fit": fit, "budget": budget}
 
 
 def run(path: Path, fraction: float, args) -> dict:
@@ -139,13 +92,13 @@ def run(path: Path, fraction: float, args) -> dict:
             "tokens": len(ids),
             "seconds": ttft,
             "tok_s": len(ids) / ttft,
-            **_delta(_offload_stats(model), before, ttft),
+            **_delta(_offload_stats(model), before),
         }
         p = result["prefill"]
         print(
             f"[{fraction:.4f}] prefill {p['tokens']} tokens: {ttft:.1f} s "
             f"({p['tok_s']:.1f} tok/s), hit rate {p['hit_rate']:.2f}, "
-            f"fetched {p['fetched_gib']:.1f} GiB at {p['fetch_gbps']:.2f} GB/s"
+            f"{p['misses']} misses, {p['evictions']} evictions"
         )
         token = int(mx.argmax(logits[0, -1]).item())
         generated = [token]
@@ -160,14 +113,14 @@ def run(path: Path, fraction: float, args) -> dict:
             "tokens": len(generated) - 1,
             "seconds": decode_s,
             "tok_s": (len(generated) - 1) / decode_s,
-            **_delta(_offload_stats(model), before, decode_s),
+            **_delta(_offload_stats(model), before),
         }
         result["generated"] = tokenizer.decode(generated)
         d = result["decode"]
         print(
             f"[{fraction:.4f}] decode {d['tokens']} tokens: {d['tok_s']:.2f} tok/s, "
-            f"hit rate {d['hit_rate']:.2f}, fetched {d['fetched_gib']:.1f} GiB at "
-            f"{d['fetch_gbps']:.2f} GB/s"
+            f"hit rate {d['hit_rate']:.2f}, {d['misses']} misses, "
+            f"{d['evictions']} evictions"
         )
         print(f"[{fraction:.4f}] text: {result['generated'][:200]!r}")
         result["after_run"] = {
@@ -202,8 +155,6 @@ def main():
         "--prompt",
         default="The expert offload path streams routed experts from the checkpoint on demand.",
     )
-    ap.add_argument("--budget-gib", type=float, default=None)
-    ap.add_argument("--sizing-only", action="store_true")
     ap.add_argument("--json", type=Path, default=None)
     args = ap.parse_args()
     if args.prompt_tokens <= 0 or args.prefill_chunk <= 0 or args.decode_tokens < 1:
@@ -212,19 +163,12 @@ def main():
         )
     if any(not 0 < fraction <= 1 for fraction in args.fractions):
         ap.error("--fractions must be in (0, 1]")
-    budget = (
-        int(args.budget_gib * 2**30)
-        if args.budget_gib is not None
-        else int(mx.device_info()["max_recommended_working_set_size"])
-    )
     report = {
         "model": str(args.model),
-        "sizing": sizing(args.model, budget, args.engram == "ssd"),
-    }
-    if not args.sizing_only:
-        report["runs"] = [
+        "runs": [
             run(args.model, fraction, args) for fraction in args.fractions
-        ]
+        ],
+    }
     if args.json:
         args.json.write_text(json.dumps(report, indent=1))
 

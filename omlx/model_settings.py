@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
+    EXPERT_STREAMING_TUNABLE_KEYS as EXPERT_STREAMING_TUNABLE_KEYS,
     MODEL_SPECIFIC_PROFILE_FIELDS,
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
@@ -36,7 +37,48 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 
-def validate_moe_expert_offload(settings: dict) -> None:
+def moe_offload_requested(settings) -> bool:
+    """Offload intent: legacy key or canonical streaming key.
+
+    Unified-backend predicate shared by every call site: either key routes
+    into ``apply_moe_expert_offload``, which dispatches to expert_streaming
+    where it owns the model type and to the legacy adapter elsewhere.
+    Accepts objects and plain dicts; None-safe.
+
+    ``OMLX_MOE_EXPERT_OFFLOAD=0`` is the operator kill switch for the whole
+    stack: it wins over either key here so every gate that flows through
+    this predicate (lazy load, apply, conversion guard, admission) turns
+    off consistently instead of each call site remembering to re-check.
+    """
+    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
+        return False
+    if settings is None:
+        return False
+    get = getattr(settings, "get", None)
+    if callable(get):
+        return bool(
+            get("moe_expert_offload_enabled", False)
+            or get("expert_streaming_enabled", False)
+        )
+    return bool(
+        getattr(settings, "moe_expert_offload_enabled", False)
+        or getattr(settings, "expert_streaming_enabled", False)
+    )
+
+
+def validate_moe_expert_offload(
+    settings: dict, *, model_type: str | None = None
+) -> None:
+    # The resident fraction is consumed only while a request is actually
+    # routed to the offload backend (either spelling), and the exclusivity
+    # contract applies to the unified backend as a whole — the canonical
+    # expert_streaming_enabled key must not evade it (it used to: only the
+    # legacy alias was checked, so canonical+DFlash passed). Validating
+    # unconditionally used to reject unrelated saves/settings files that
+    # merely carried a stored (inert) fraction, so both clauses gate on the
+    # single intent check.
+    if not moe_offload_requested(settings):
+        return
     fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
     if (
         isinstance(fraction, bool)
@@ -44,13 +86,35 @@ def validate_moe_expert_offload(settings: dict) -> None:
         or not 0 < fraction <= 1
     ):
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
-    if settings.get("moe_expert_offload_enabled") and any(
-        settings.get(key)
-        for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled")
-    ):
+    mtype = (model_type or "").lower().replace("-", "_")
+    # DFlash and VLM MTP never run the streaming converter: the MoE
+    # banks would materialize fully with nothing guarding them.
+    if settings.get("dflash_enabled") or settings.get("vlm_mtp_enabled"):
         raise ValueError(
-            "MoE expert offload cannot be combined with Lightning MTP, "
-            "VLM MTP, or DFlash; disable speculative decoding first."
+            "MoE expert offload cannot be combined with DFlash or VLM "
+            "MTP; disable speculative decoding first."
+        )
+    if settings.get("mtp_enabled"):
+        if mtype.startswith("deepseek_v41"):
+            # DSpark verify runs under frozen residency: the V4.1
+            # adapter suspends LRU reordering inside verify blocks
+            # (see moe_offload.verify_scope), so native MTP is safe.
+            return
+        try:
+            from .patches.expert_streaming.residency import (
+                SUPPORTED_TYPES as _STREAMING_TYPES,
+                normalize_model_type,
+            )
+
+            if normalize_model_type(mtype) in _STREAMING_TYPES:
+                # Unified streaming converts MTP-stage MoE banks too and
+                # verify runs under SpeculationState — MTP is supported.
+                return
+        except Exception:
+            pass
+        raise ValueError(
+            "MoE expert offload cannot be combined with Lightning MTP "
+            "on this model; disable speculative decoding first."
         )
 
 
@@ -241,8 +305,22 @@ class ModelSettings:
         moe_expert_offload_enabled: Stream MoE expert weights from the
             checkpoint on demand instead of keeping them all resident (fits
             models larger than memory; costs decode speed). Requires reload.
+            Legacy alias of expert_streaming_enabled — both feed the same
+            unified backend (see moe_offload_requested).
         moe_expert_offload_resident_fraction: Fraction of each layer's experts
             kept resident (0 < f <= 1, default 0.25).
+        expert_streaming_enabled: Canonical spelling of the MoE expert
+            streaming switch (same backend as moe_expert_offload_enabled).
+        expert_streaming_budget_gib: App-level expert LRU budget in GiB —
+            an explicit value always wins over budget_auto (0 = page-cache
+            only, >0 = pinned manual budget, None = unset/auto).
+        expert_streaming_budget_auto: RAM-scaled automatic starting budget
+            (default on; False = page-cache only; ignored once budget_gib
+            pins a value).
+        expert_streaming_dynamic: Dynamic residency governor — revisits the
+            LRU capacity at request boundaries (None = auto: on for an
+            automatic budget, off for a pinned one; True forces it over a
+            pinned budget; requires budget > 0).
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -311,21 +389,131 @@ class ModelSettings:
     model_alias: Optional[str] = (
         None  # API-visible name (alternative to directory name)
     )
+    model_type: Optional[str] = (
+        None  # config.json model_type scope for model-dependent validation
+        # (e.g. the DSpark offload exception). Auto-managed from the
+        # checkpoint; never templates (MODEL_SPECIFIC only).
+    )
     index_cache_freq: Optional[int] = (
         None  # IndexCache: every Nth layer keeps indexer (DeepSeek DSA only)
     )
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
-    # Qwen4-Exp only: keep the large PLE N-gram table on SSD and gather rows
-    # through mmap. The runtime may force this on when resident loading cannot
-    # fit under the configured model-memory ceiling but mmap loading can.
+    # Qwen4-Exp only (default off): keep the large PLE N-gram table on SSD and
+    # gather rows through mmap. PLE lookups are pure row gathers with no
+    # matmuls, so SSD paging costs no throughput while freeing the ~25-30% of
+    # RAM the table would otherwise pin (same behavior llama.cpp measures with
+    # --mmap). Turn off to pin the table in memory. The runtime may force this
+    # on when resident loading cannot fit under the configured model-memory
+    # ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # MoE expert streaming (SSD): keep hot experts resident, stream the rest
+    # from SSD. Hardware-specific; may be auto-forced when resident load cannot
+    # fit under the memory ceiling but streaming fits. Requires reload.
+    expert_streaming_enabled: bool = False
+    # App-level expert LRU budget in GiB. An explicit value always wins over
+    # budget_auto: 0 = page-cache only (the OS file cache serves expert
+    # reuse; nothing is pinned by the app), >0 pins that many GiB. None =
+    # unset, so the auto stack below decides. Admin rejects values outside
+    # [0, 64] GiB.
+    expert_streaming_budget_gib: Optional[float] = None
+    # Auto budget (DEFAULT): when streaming is enabled and no explicit
+    # budget_gib is set, size the starting LRU from total RAM (~5%, clamped
+    # to [0.5, 4] GiB) and let the dynamic governor adapt it at runtime
+    # (grow on proven decode-stall hunger, shrink on memory pressure).
+    # False opts back out to page-cache only. Ignored once budget_gib pins
+    # a value — a pinned budget is manual mode (the governor then stays off
+    # unless expert_streaming_dynamic=True forces it on).
+    # Machine-specific: per-model profiles only, never templates.
+    expert_streaming_budget_auto: Optional[bool] = True
+    # Opt-in approximate MoE routing: keep the smallest score-descending
+    # prefix of the top-k experts whose cumulative mass reaches this
+    # threshold. None/1.0 = exact routing (bit-identical to the reference
+    # path); <1.0 trades output fidelity for fewer streamed expert bytes.
+    expert_streaming_topk_threshold: Optional[float] = None
+    # Opt-in cache-conditional MoE routing: logit bonus for LRU-resident
+    # experts before top-k. None/0.0 = exact routing (bit-identical);
+    # >0 trades output fidelity for fewer SSD re-reads (Fase 3: hit
+    # 9.2%->19.3%, +10.8% tok/s at 1.0 on Qwen-JANG_4M short).
+    # Machine-specific: per-model profiles only, never templates.
+    expert_streaming_cache_prior: Optional[float] = None
+    # Per-model overrides for the expert-streaming IO layer. None keeps the
+    # env-var / built-in default behavior (see patches/expert_streaming).
+    # Machine-tuned values land here so a per-model profile survives
+    # restarts like any other setting.
+    expert_streaming_io_depth: Optional[int] = (
+        None  # Expert IO thread-pool depth (default env OMLX_EXPERT_STREAMING_QD or 16)
+    )
+    expert_streaming_coalesce: Optional[bool] = (
+        None  # Coalesce consecutive expert ids into single pread runs
+    )
+    expert_streaming_readahead: Optional[bool] = (
+        None  # F_RDADVISE kernel readahead hints for expert runs (decode)
+    )
+    expert_streaming_seed: Optional[bool] = (
+        None  # Seed expert LRU / page cache from prefill routing hotness
+    )
+    expert_streaming_per_layer_eval: Optional[bool] = (
+        None  # Qwen4-exp per-layer eval+clear_cache boundary during streaming prefill
+        # (default env OMLX_EXPERT_STREAMING_PER_LAYER_EVAL or on). GLM/DeepSeek
+        # decoders honor the boundary natively and are unaffected by this knob.
+    )
+    expert_streaming_pins: Optional[bool] = (
+        None  # mlock-pin the observed/learned hot experts per layer (default env
+        # OMLX_EXPERT_STREAMING_PIN or off). Enables the learned pin profile
+        # (<model>/.omlx/expert_pin_profile.json): saved on unload, reloaded on
+        # load so the hot set is wired from token 1. Zero output change.
+    )
+    expert_streaming_pin_gib: Optional[float] = (
+        None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 0.25)
+    )
+    expert_streaming_pin_sync: Optional[bool] = (
+        None  # Fase M1: apply the learned pins synchronously at engine load
+        # (default env OMLX_EXPERT_STREAMING_PIN_SYNC or off). Bench arms set
+        # it so the mlock pass provably completes before the first request.
+    )
+    expert_streaming_pin_regime: Optional[str] = (
+        None  # Fase M1: profile regime that drives the pin selection —
+        # "decode" or "prefill" (default env OMLX_EXPERT_STREAMING_PIN_REGIME).
+    )
+    expert_streaming_cold_tier: Optional[str] = (
+        None  # Cold precision tier for streamed experts: "2".."8" reads expert
+        # banks from a pre-built <model>/expert_cold/ tier directory — fewer
+        # bytes per token on the NVMe I/O floor, at the tier's fidelity.
+        # None/"" = off.
+    )
+    # HOBBIT per-expert hot/cold split — fraction of experts per
+    # layer (top by learned pin-profile frequency) that keep the ORIGINAL
+    # packing while the rest read the cold tier. 0/unset = uniform tier.
+    expert_streaming_hot_fraction: Optional[float] = None
+    # Expert cache eviction policy: "lru" (default) or "s3fifo" (scan
+    # resistant). None keeps env OMLX_EXPERT_STREAMING_CACHE
+    # ("lru"). Machine-specific: per-model profiles only, never templates.
+    expert_streaming_cache_policy: Optional[str] = None
+    # Dynamic expert-residency governor (DEFAULT AUTO): revisits the LRU
+    # capacity at request boundaries — grow on proven decode-stall hunger
+    # (additive, per-layer targeted), halve under memory pressure, clear
+    # when desperate. None = auto (on when the budget itself is automatic,
+    # i.e. no explicit budget_gib pin; off when the user pinned a budget).
+    # True forces it on even over a pinned budget; False opts out.
+    # Requires budget > 0. Env OMLX_EXPERT_STREAMING_DYNAMIC=1 forces on.
+    expert_streaming_dynamic: Optional[bool] = None
+    # Ceiling (GiB) the governor may grow the cache to. None keeps env
+    # OMLX_EXPERT_STREAMING_DYNAMIC_MAX_GIB (6.0).
+    expert_streaming_dynamic_max_gib: Optional[float] = None
+    # Floor (GiB) the governor will not shrink below (pressure clears pool
+    # the cache outright instead). None = max(0.25, initial_budget / 4).
+    expert_streaming_dynamic_min_gib: Optional[float] = None
+    # Hunger SLO: windowed decode-layer stall rate above this grows the
+    # cache (when headroom allows). None = 0.05. Lower = more aggressive.
+    expert_streaming_dynamic_stall_target: Optional[float] = None
+    # V2 phase-aware prefill budget (GiB): prefill streams through and
+    # should not displace the decode hot set, so it gets its own smaller
+    # cap. None = auto (decode_cap / 4, min 32 slots). The decode cap is
+    # the dynamic one the governor tunes.
+    expert_streaming_prefill_budget_gib: Optional[float] = None
     deepseek_v41_engram_ssd_offload: bool = False
-    # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
-    # last window-size tokens; decoder global KV is the encoder-final
-    # projection already produced by the midpoint CSA2 layer.
-    deepseek_v41_ced_prefill_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -522,7 +710,7 @@ class ModelSettings:
                     "require per-request logits processors, which the "
                     "vlm_mtp decode path does not apply"
                 )
-        validate_moe_expert_offload(self.to_dict())
+        validate_moe_expert_offload(self.to_dict(), model_type=self.model_type)
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -554,6 +742,11 @@ class ModelSettings:
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
 
         return cls(**filtered_data)
+
+
+# EXPERT_STREAMING_TUNABLE_KEYS is defined in model_profiles (the leaf that
+# also splices it into the profile allowlist) and re-exported here for the
+# engine_pool / admin import sites.
 
 
 class ModelSettingsManager:
@@ -1374,7 +1567,14 @@ class ModelSettingsManager:
             if description is not None:
                 profile["description"] = description
             if settings is not None:
-                profile["settings"] = filter_profile_fields(settings)
+                # Merge, don't replace: a settings update carries only the
+                # fields the client serializes. Wholesale replacement used to
+                # silently drop stored keys the caller never sent (engine-scope
+                # or autotuned fields such as expert_streaming_io_depth and
+                # cache_reasoning_output).
+                merged = dict(profile.get("settings") or {})
+                merged.update(filter_profile_fields(settings))
+                profile["settings"] = merged
             if source_template is not None:
                 profile["source_template"] = source_template or None
             if expose_as_model is not None:
@@ -1698,6 +1898,10 @@ class ModelSettingsManager:
             if description is not None:
                 template["description"] = description
             if settings is not None:
+                # Replace, don't merge: unlike update_profile, templates only
+                # hold universal fields and the editor serializes every one
+                # of them (formValuesForTemplate). A key the user cleared is
+                # absent by design — merging would resurrect it.
                 template["settings"] = filter_universal_fields(settings)
             template["updated_at"] = utcnow().isoformat()
             templates_snapshot = copy.deepcopy(self._templates)

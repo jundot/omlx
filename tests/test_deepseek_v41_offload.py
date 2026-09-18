@@ -291,8 +291,10 @@ def test_model_close_unmaps_even_after_prefetch_failure(converted, monkeypatch):
     monkeypatch.setattr(embed, "_read_rows", fail)
     prefetch.submit(embed, np.array([1]))
     assert entered.wait(5)
-    with pytest.raises(OSError, match="read failed"):
-        model.close()
+    # A prefetch is a hint: its failure no longer propagates through
+    # drain/close — the demand path already fell back to a synchronous
+    # read. close() still completes and unmaps every table.
+    model.close()
     for layer in model.language_model.layers:
         if "engram" in layer:
             assert layer.engram.embed._weights._mapping is None

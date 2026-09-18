@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 from fastapi import HTTPException
+from streaming_fixtures import write_safetensors
 
 from omlx.patches.moe_offload_compat import moe_offload_compatibility
 
@@ -48,7 +49,7 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
                     mx.quantize(mx.ones(shape), group_size=32),
                 ):
                     tensors[f"{key}.{field}"] = value
-    mx.save_safetensors(str(path / "model.safetensors"), tensors)
+    write_safetensors(path / "model.safetensors", tensors)
     return tensors
 
 
@@ -83,7 +84,7 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
         tensors[key] = tensors[key].astype(mx.int32)
     else:
         tensors[key.removesuffix("weight") + "bias"] = mx.zeros((64,))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
     assert moe_offload_compatibility(tmp_path)[0] is False
     with pytest.raises(HTTPException) as error:
         _validate_model_settings(
@@ -93,11 +94,17 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
     assert error.value.status_code == 400
 
 
-@pytest.mark.parametrize(
-    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4", "qwen3_5_moe"]
-)
-def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
+@pytest.mark.parametrize("kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4"])
+def test_streaming_owned_types_follow_the_estimate(tmp_path, kind):
+    # One allowlist: the converter's structural estimate decides
+    # streaming-owned types.
     _checkpoint(tmp_path, kind)
+    assert moe_offload_compatibility(tmp_path)[0] is True
+
+
+def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path):
+    # qwen3_5_moe is in NEITHER allowlist: matching experts cannot rescue it.
+    _checkpoint(tmp_path, "qwen3_5_moe")
     assert moe_offload_compatibility(tmp_path)[0] is False
 
 
@@ -111,10 +118,14 @@ def test_dense_gemma_is_hidden(tmp_path):
 
 
 def test_checkpoint_replacement_invalidates_eligibility(tmp_path):
-    tensors = _checkpoint(tmp_path)
+    # Legacy path (olmoe): _inspect's per-tensor completeness check still
+    # runs for legacy-owned types — a swapped checkpoint must re-fail.
+    # (Streaming-owned types like qwen4_exp gate on the structural estimate;
+    # a missing bank there fails at conversion via _resolve_stacked_key.)
+    tensors = _checkpoint(tmp_path, "olmoe")
     assert moe_offload_compatibility(tmp_path)[0] is True
     tensors.pop(next(iter(tensors)))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
     assert moe_offload_compatibility(tmp_path)[0] is False
 
 
@@ -122,7 +133,9 @@ def test_unsupported_saved_setting_rejected_before_load(tmp_path):
     from omlx.model_settings import ModelSettings
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-    _checkpoint(tmp_path, "glm5_next")
+    # qwen3_5_moe is in neither the streaming allowlist nor the legacy
+    # one, so the saved setting still rejects before load.
+    _checkpoint(tmp_path, "qwen3_5_moe")
     with pytest.raises(ValueError, match="not supported for this model type"):
         maybe_apply_pre_load_patches(
             str(tmp_path), ModelSettings(moe_expert_offload_enabled=True)

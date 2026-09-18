@@ -36,6 +36,10 @@ class ShardWriter:
         if not self._values:
             return
         name = f".model-shard-{len(self._shards) + 1:05d}.safetensors"
+        # format:mlx is the convention every oMLX safetensors writer emits
+        # (omlx/oq.py, expert_streaming conversion): the V4.1 loader itself
+        # gates on the config spec, but model discovery's generic MLX
+        # heuristic and external safetensors tooling read this metadata.
         mx.save_safetensors(
             str(self.destination / name),
             self._values,

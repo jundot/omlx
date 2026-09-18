@@ -470,6 +470,21 @@ class BaseEngine(ABC):
         """
         return None
 
+    def _log_streaming_summary(self, output: Any | None = None) -> None:
+        """One-line MoE streaming health log per completed request.
+
+        No-op unless expert streaming is active. ``output`` is the terminal
+        engine output whose token counters are reported; ``None`` logs
+        zeros. Never raises — the callee swallows its own errors.
+        """
+        from ..patches.expert_streaming import log_expert_streaming_summary
+
+        log_expert_streaming_summary(
+            self,
+            prompt_tokens=int(getattr(output, "prompt_tokens", 0) or 0),
+            completion_tokens=int(getattr(output, "completion_tokens", 0) or 0),
+        )
+
 
 class ActivityTrackingMixin:
     """In-flight operation tracking for admin visibility.
