@@ -1875,6 +1875,30 @@ class TestTokenCountEndpoint:
         assert "input_tokens" in data
         assert isinstance(data["input_tokens"], int)
 
+    def test_token_count_forwards_chat_template_kwargs(
+        self, client, mock_llm_engine
+    ):
+        recorded = []
+        original = mock_llm_engine.tokenizer.apply_chat_template
+
+        def apply_chat_template(messages, tokenize=False, **kwargs):
+            recorded.append(kwargs)
+            return original(messages, tokenize=tokenize, **kwargs)
+
+        mock_llm_engine.tokenizer.apply_chat_template = apply_chat_template
+
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+        assert response.status_code == 200
+        assert recorded[-1]["enable_thinking"] is False
+
     def test_token_count_with_system(self, client):
         """Test token counting with system prompt."""
         response = client.post(

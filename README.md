@@ -270,6 +270,15 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
 
 Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), Anthropic adaptive thinking, and vision inputs (base64, URL).
 
+Chat completion output is bounded by the model's effective total context
+window. If an explicit `max_tokens` or `max_completion_tokens` would make the
+rendered prompt plus completion exceed that window, oMLX returns HTTP 400 with
+the exact remaining `available_tokens`. When the client omits an output limit,
+oMLX clamps its configured default to that exact remainder. The Anthropic
+`/v1/messages/count_tokens` compatibility route accepts
+`chat_template_kwargs` so callers can count the same rendered template they
+will generate with.
+
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | Chat completions (streaming) |
