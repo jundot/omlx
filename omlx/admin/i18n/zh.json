@@ -36,6 +36,7 @@
   "navbar.tab.logs": "日志",
   "navbar.tab.bench": "基准",
   "navbar.tab.chat": "聊天",
+  "navbar.tablist_label": "仪表盘分区",
   "navbar.dropdown.manager": "管理器",
   "navbar.dropdown.downloader": "下载器",
   "navbar.dropdown.quantizer": "oQ 量化",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "限制单次请求中转换的文档附件数量。",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF 处理引擎",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "选择 PDF 文档请求由 MarkItDown 自身还是 OCR 引擎处理。",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "所选 OCR 模型不可用。在模型恢复可用或选择其他引擎之前，PDF 将使用 MarkItDown 处理。",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "选择 MarkItDown 时，扫描件或纯图片 PDF 将失败，含表格的 PDF 可能无法正确处理。",
   "settings.integrations.websearch.section_label": "联网搜索",
   "settings.integrations.websearch.provider": "搜索服务商",
@@ -1973,5 +1975,12 @@
   "usage.delayed": "历史记录可能不完整：存储延迟或待处理缓冲区已溢出。",
   "usage.loading": "正在加载使用量…",
   "usage.disabled": "使用历史已关闭。请在设置 → 使用历史中开启。",
-  "usage.open_settings": "打开设置"
+  "usage.open_settings": "打开设置",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "取消"
 }

@@ -36,6 +36,7 @@
   "navbar.tab.logs": "Logs",
   "navbar.tab.bench": "Bench",
   "navbar.tab.chat": "Chat",
+  "navbar.tablist_label": "Dashboard sections",
   "navbar.dropdown.manager": "Manager",
   "navbar.dropdown.downloader": "Downloader",
   "navbar.dropdown.quantizer": "oQ Quantization",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "Limit document attachments converted in one request.",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF processing engine",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine.",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "The selected OCR model is unavailable. PDFs use MarkItDown until the model is available again or you select another engine.",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly.",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",
@@ -1973,5 +1975,12 @@
   "usage.delayed": "History may be incomplete: storage is delayed or the pending buffer overflowed.",
   "usage.loading": "Loading usage…",
   "usage.disabled": "Usage history is off. Turn it on in Settings → Usage History.",
-  "usage.open_settings": "Open Settings"
+  "usage.open_settings": "Open Settings",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Cancel"
 }

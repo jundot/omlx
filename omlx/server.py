@@ -146,6 +146,7 @@ from .api.responses_utils import (
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
+    apply_namespace_tool_aliases,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
@@ -155,6 +156,7 @@ from .api.responses_utils import (
     convert_responses_tools,
     format_sse_event,
     normalize_response_output_to_messages,
+    split_namespace_tool_name,
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
@@ -6932,8 +6934,11 @@ async def create_response(
             preserve_images=preserve_tool_images,
         )
 
-        # Convert tools: flat → nested
-        openai_tools = convert_responses_tools(request.tools)
+        # Convert tools: flat → nested. namespace_aliases maps each expanded
+        # namespace member's wire name back for the return path.
+        namespace_aliases: dict = {}
+        openai_tools = convert_responses_tools(request.tools, namespace_aliases)
+        apply_namespace_tool_aliases(messages, namespace_aliases)
         if (
             getattr(engine, "is_diffusion_model", False)
             and not getattr(engine, "supports_tool_calling", False)
@@ -7196,6 +7201,7 @@ async def create_response(
                                 resolved_model=resolved_model,
                                 response_format=response_format,
                                 native_reasoning=native_reasoning,
+                                namespace_aliases=namespace_aliases,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -7312,11 +7318,13 @@ async def create_response(
                         arguments = tc.get("arguments", "{}")
                     else:
                         continue
+                    namespace, name = split_namespace_tool_name(name, namespace_aliases)
                     output_items.append(
                         build_function_call_output_item(
                             name=name,
                             arguments=arguments,
                             call_id=call_id,
+                            namespace=namespace,
                         )
                     )
 
@@ -7379,6 +7387,7 @@ async def stream_responses_api(
     resolved_model: Optional[str] = None,
     response_format=None,
     native_reasoning: bool = False,
+    namespace_aliases: Optional[dict] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -7960,6 +7969,7 @@ async def stream_responses_api(
             else:
                 continue
 
+            namespace, name = split_namespace_tool_name(name, namespace_aliases)
             fc_id = generate_id(IDPrefix.FUNCTION_CALL)
             fc_item = {
                 "type": "function_call",
@@ -7969,6 +7979,8 @@ async def stream_responses_api(
                 "arguments": "",
                 "status": "in_progress",
             }
+            if namespace:
+                fc_item["namespace"] = namespace
 
             # output_item.added
             seq += 1
@@ -8017,6 +8029,8 @@ async def stream_responses_api(
                 "arguments": arguments,
                 "status": "completed",
             }
+            if namespace:
+                completed_fc["namespace"] = namespace
             seq += 1
             yield format_sse_event(
                 "response.output_item.done",

@@ -36,6 +36,7 @@
   "navbar.tab.logs": "ログ",
   "navbar.tab.bench": "ベンチマーク",
   "navbar.tab.chat": "チャット",
+  "navbar.tablist_label": "ダッシュボードのセクション",
   "navbar.dropdown.manager": "管理",
   "navbar.dropdown.downloader": "ダウンロード",
   "navbar.dropdown.quantizer": "oQ量子化",
@@ -344,7 +345,7 @@
   "settings.tab.integrations": "Integration Settings",
   "settings.global.section_label": "グローバル設定",
   "settings.global.heading": "サーバー設定",
-  "settings.global.restart_notice": "",
+  "settings.global.restart_notice": "Settings marked with",
   "settings.global.restart_badge": "再起動が必要",
   "settings.global.restart_suffix": "マークの付いた設定はサーバーの再起動が必要です。",
   "settings.integrations.section_label": "Integrations",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "Limit document attachments converted in one request.",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF processing engine",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine.",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "選択したOCRモデルは利用できません。モデルが再び利用可能になるか、別のエンジンを選択するまで、PDFはMarkItDownで処理されます。",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly.",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",
@@ -1973,5 +1975,12 @@
   "usage.delayed": "履歴が不完全な可能性があります: 保存が遅延しているか、保留バッファがあふれました。",
   "usage.loading": "使用履歴を読み込み中…",
   "usage.disabled": "使用履歴はオフです。設定 → 使用履歴でオンにしてください。",
-  "usage.open_settings": "設定を開く"
+  "usage.open_settings": "設定を開く",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "キャンセル"
 }

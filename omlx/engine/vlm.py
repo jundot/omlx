@@ -175,20 +175,14 @@ def _is_missing_chat_template_error(exc: ValueError) -> bool:
 
 
 def _capture_vlm_position_state(lm: Any, extra_kwargs: dict[str, Any]) -> None:
-    """Copy the language model's per-request mRoPE state into extra_kwargs.
+    """Capture returned position metadata before consulting model-owned state.
 
-    get_input_embeddings() leaves ``_position_ids`` and ``_rope_deltas`` lazy
-    on the executor's default stream. They are materialized here because a
-    lazy default-stream input inside the engine-stream prefill graph deadlocks
-    the Qwen ANE prefill primitive on restored-prefix requests (#3305, the
-    same class as the text-only seed in #3279).
+    Materialize it on the executor stream to prevent cross-stream ANE prefill deadlocks.
     """
-    if lm is None:
-        return
-    pid = getattr(lm, "_position_ids", None)
+    pid = extra_kwargs.get("position_ids", getattr(lm, "_position_ids", None))
     if pid is not None and "position_ids" not in extra_kwargs:
         extra_kwargs["position_ids"] = pid
-    rd = getattr(lm, "_rope_deltas", None)
+    rd = extra_kwargs.get("rope_deltas", getattr(lm, "_rope_deltas", None))
     if rd is not None:
         extra_kwargs["_captured_rope_deltas"] = rd
     lazy_state = [v for v in (pid, rd) if isinstance(v, mx.array)]
@@ -1861,25 +1855,14 @@ class VLMBatchedEngine(BaseEngine):
             return False
 
     def _detect_diffusion_family(self) -> str | None:
-        """Return the mlx-vlm diffusion generation family for loaded models."""
-        try:
-            from mlx_vlm.generate.diffusion import diffusion_generation_family
-
-            family = diffusion_generation_family(self._vlm_model)
-            if family == "block":
-                return family
-            if family is not None:
-                logger.warning(
-                    "Unsupported diffusion generation family for %s: %s",
-                    self._model_name,
-                    family,
-                )
-            return None
-        except Exception as e:
-            logger.debug("mlx-vlm diffusion family detection skipped: %s", e)
+        """Route canvas diffusion models to the serial generation lane."""
+        from mlx_vlm.generate.diffusion import is_diffusion_model
 
         config = getattr(self._vlm_model, "config", None)
-        if getattr(config, "canvas_length", None) is not None:
+        if (
+            getattr(config, "canvas_length", None) is not None
+            and is_diffusion_model(self._vlm_model)
+        ):
             return "block"
         return None
 
@@ -2024,6 +2007,12 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+
+        from ..models.vlm import restore_bonsai_quantized_modules
+
+        restored = restore_bonsai_quantized_modules(self._vlm_model)
+        if restored:
+            logger.info("Restored oMLX Bonsai kernel paths for %d modules", restored)
 
         if self.model_type == "unlimited-ocr":
             from ..utils.tokenizer import (
@@ -2340,7 +2329,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
 
                 apply_qwen35_q4_mlp_patch()
-                apply_qwen35_q4_prefill_linear_patch()
+                apply_qwen35_q4_prefill_linear_patch(self._vlm_model)
                 # Muse Glimmer rides the same native qmm tile (MLP plus the
                 # q/gate/o attention projections); no-op unless the muse
                 # compat patch installed the vendored module.
@@ -2713,10 +2702,10 @@ class VLMBatchedEngine(BaseEngine):
         """Inject tool calling attributes into VLM tokenizer.
 
         mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We prefer mlx_vlm.tool_parsers which is a superset of
+        tool_parser, etc). We prefer mlx_vlm.tools.parsers which is a superset of
         mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
         and loads the correct per-model parser.  Falls back to mlx_lm if the
-        mlx_vlm.tool_parsers package is not present.
+        mlx_vlm.tools.parsers package is not present.
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
@@ -2737,25 +2726,14 @@ class VLMBatchedEngine(BaseEngine):
             logger.info("VLM tool calling enabled: parser=minimax_m3")
             return
 
-        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
+        # Prefer mlx_vlm.tools.parsers (superset; knows about Gemma4 etc.)
         try:
-            from mlx_vlm.tool_parsers import (
-                _EXTRA_PATTERNS,
+            from mlx_vlm.tools.registry import (
+                _infer_tool_parser,
                 load_tool_module,
             )
 
-            from mlx_lm.tokenizer_utils import _infer_tool_parser
-
-            tool_parser_type = _infer_tool_parser(tokenizer)
-            if tool_parser_type is None and isinstance(chat_template, str):
-                tool_parser_type = next(
-                    (
-                        name
-                        for marker, name in _EXTRA_PATTERNS
-                        if marker in chat_template
-                    ),
-                    None,
-                )
+            tool_parser_type = _infer_tool_parser(chat_template)
             if tool_parser_type is None:
                 return
             try:
@@ -3004,6 +2982,10 @@ class VLMBatchedEngine(BaseEngine):
         model = self._vlm_model
         model_type = self.model_type or ""
 
+        if model_type == "deepseek_v4":
+            features = model.encode_images(pixel_values, **extra_model_inputs)
+            return mx.concatenate(features, axis=0)
+
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
             image_grid_thw = extra_model_inputs.get("image_grid_thw")
@@ -3120,6 +3102,18 @@ class VLMBatchedEngine(BaseEngine):
         Returns a list of per-image feature tensors, or None if the model
         architecture does not support splitting.
         """
+        if self.model_type == "deepseek_v4":
+            grid = extra_model_inputs["image_grid_hw"].tolist()
+            ratio = self._vlm_model.config.vision_downsample_ratio
+            counts = [
+                ((h + ratio - 1) // ratio) * ((w + ratio - 1) // ratio)
+                for h, w in grid
+            ]
+            if len(counts) != num_images or sum(counts) != features.shape[0]:
+                raise ValueError("DeepSeek V4 cached features do not match image grids")
+            offsets = [sum(counts[:i + 1]) for i in range(len(counts))]
+            return list(mx.split(features, offsets[:-1], axis=0))
+
         if num_images <= 1:
             return [features]
 
@@ -3716,6 +3710,14 @@ class VLMBatchedEngine(BaseEngine):
                             "Vision feature computation failed, using full pipeline",
                             exc_info=True,
                         )
+
+            if (
+                self.model_type == "deepseek_v4"
+                and "cached_image_features" in call_kwargs
+            ):
+                call_kwargs["cached_image_features"] = self._split_vision_features(
+                    call_kwargs["cached_image_features"], num_images, extra_model_inputs
+                )
 
             # Run vision encoder + embedding merge.
             # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)

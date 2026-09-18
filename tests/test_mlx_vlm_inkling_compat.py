@@ -121,40 +121,8 @@ def test_load_config_translates_nvfp4(applied, tmp_path):
     assert "quantization" not in config
 
 
-def test_raw_inkling_layout_detection_uses_weight_index(applied, tmp_path):
-    from omlx.patches.mlx_vlm_inkling_compat import _has_raw_inkling_weights
-
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "inkling_mm_model"})
-    )
-    index_path = tmp_path / "model.safetensors.index.json"
-    index_path.write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "model.llm.layers.0.attn.wq_du.weight": "model-1.safetensors"
-                }
-            }
-        )
-    )
-    assert _has_raw_inkling_weights(tmp_path)
-
-    index_path.write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "language_model.model.layers.0.self_attn.qkvr_proj.weight": (
-                        "model-1.safetensors"
-                    )
-                }
-            }
-        )
-    )
-    assert not _has_raw_inkling_weights(tmp_path)
-
-
-@pytest.mark.parametrize(("raw_layout", "sanitize_calls"), [(True, 1), (False, 0)])
-def test_load_model_forces_sanitize_only_for_raw_inkling(
+@pytest.mark.parametrize(("raw_layout", "sanitize_calls"), [(True, 1), (False, 1)])
+def test_load_model_sanitizes_raw_and_converted_inkling(
     applied, tmp_path, monkeypatch, raw_layout, sanitize_calls
 ):
     from types import SimpleNamespace
@@ -204,7 +172,9 @@ def test_load_model_forces_sanitize_only_for_raw_inkling(
 
     arch = SimpleNamespace(ModelConfig=FakeModelConfig, Model=FakeModel)
     monkeypatch.setattr(
-        vlm_utils, "get_model_and_args", lambda config: (arch, "inkling")
+        vlm_utils,
+        "get_model_and_args",
+        lambda config, model_path=None: (arch, "inkling"),
     )
     monkeypatch.setattr(
         vlm_utils,
@@ -351,7 +321,7 @@ def test_tiny_model_single_forward(applied):
     assert out.logits.shape == (1, 5, 128)
     step = model(mx.array([[21]]), cache=cache)
     assert step.logits.shape == (1, 1, 128)
-    kv_state = cache[0][0].keys_and_values()
+    kv_state = cache[0][0].state
     assert kv_state[0].shape[2] == 6
     conv_slots = list(cache[0][1].cache)
     assert len(conv_slots) == 4

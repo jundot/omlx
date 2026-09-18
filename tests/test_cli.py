@@ -1541,7 +1541,15 @@ class TestLaunchClaudeTierPrecedence:
         execute.assert_called_once()
         binary, argv, env = execute.call_args.args
         assert binary == "claude"
-        assert argv == ["claude", "--disallowedTools", "LSP", "--resume", "session-id"]
+        assert argv == [
+            "claude",
+            "--disallowedTools",
+            "LSP",
+            "--settings",
+            '{"useAutoModeDuringPlan":false}',
+            "--resume",
+            "session-id",
+        ]
         assert env["ANTHROPIC_MODEL"] == "picked-model"
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "opus-cfg"
         assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sonnet-cfg"

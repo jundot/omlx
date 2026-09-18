@@ -2181,3 +2181,17 @@ class TestTextOnlySizeEstimation:
 
         models = discover_models(tmp_path)
         assert models["plain-llm"].text_only_size == 0
+
+
+@pytest.mark.parametrize(
+    "vision_layers, expected", [(32, "vlm"), (0, "llm"), (None, "llm")]
+)
+def test_deepseek_v4_flat_vision_config(tmp_path, vision_layers, expected):
+    config = {
+        "model_type": "deepseek_v4",
+        "architectures": ["DeepseekV4ForCausalLM"],
+    }
+    if vision_layers is not None:
+        config["vision_n_layers"] = vision_layers
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert detect_model_type(tmp_path) == expected

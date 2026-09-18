@@ -5040,3 +5040,236 @@ async def test_attribute_cdata_preserves_write_call_in_stream(
         assert not any(e.get("delta", {}).get("text") for e in events)
     else:
         assert not any(e.get("type") == "response.output_text.delta" for e in events)
+
+
+def _responses_tool_call_client(monkeypatch, body: str):
+    """A /v1/responses client whose model always generates ``body``."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    from omlx.engine.batched import BatchedEngine
+    from omlx.server import _server_state, app
+
+    engine = BatchedEngine("test-model")
+    engine._loaded = True
+    engine._model = SimpleNamespace(args=SimpleNamespace(model_type="qwen3"))
+    engine._tokenizer = MockTokenizer()
+    engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+    monkeypatch.setattr(engine, "_preflight_or_raise_with_eviction", AsyncMock())
+
+    output = MockGenerationOutput(
+        text=body,
+        new_text=body,
+        completion_tokens=4,
+        finished=True,
+        finish_reason="stop",
+    )
+    monkeypatch.setattr(engine, "generate", AsyncMock(return_value=output))
+
+    async def generate_stream(*args, **kwargs):
+        yield output
+
+    monkeypatch.setattr(engine, "stream_generate", generate_stream)
+    monkeypatch.setattr(_server_state, "engine_pool", MockEnginePool(engine))
+    monkeypatch.setattr(_server_state, "default_model", "test-model")
+    return TestClient(app)
+
+
+def _response_output_items(response, stream: bool):
+    if not stream:
+        return response.json()["output"]
+    return [
+        event["item"]
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+        for event in [json.loads(line[6:])]
+        if event.get("type") == "response.output_item.done"
+    ]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_namespace_tool_round_trip(monkeypatch, stream):
+    """A Codex-shaped namespace tool reaches the model and returns split (#3371)."""
+    client = _responses_tool_call_client(
+        monkeypatch,
+        '<tool_call>{"name": "mcp__demo__get_weather", '
+        '"arguments": {"city": "Paris"}}</tool_call>',
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "What is the weather in Paris?",
+            "stream": stream,
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__demo__",
+                    "description": "Demo MCP server",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "description": "Get the current weather for a city.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    items = _response_output_items(response, stream)
+    calls = [item for item in items if item["type"] == "function_call"]
+    assert len(calls) == 1, items
+    assert calls[0]["name"] == "get_weather"
+    assert calls[0]["namespace"] == "mcp__demo__"
+    assert json.loads(calls[0]["arguments"]) == {"city": "Paris"}
+    others = [item for item in items if item["type"] != "function_call"]
+    assert others and all("namespace" not in item for item in others)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_flat_tool_call_carries_no_namespace(monkeypatch, stream):
+    """Flat function tools keep returning a bare name, on every item type."""
+    client = _responses_tool_call_client(
+        monkeypatch,
+        "<think>Checking.</think>"
+        '<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>',
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "What is the weather in Paris?",
+            "stream": stream,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    items = _response_output_items(response, stream)
+    calls = [item for item in items if item["type"] == "function_call"]
+    assert len(calls) == 1, items
+    assert calls[0]["name"] == "get_weather"
+    assert {item["type"] for item in items} >= {"message", "reasoning"}
+    assert all("namespace" not in item for item in items)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("stored_history", [False, True])
+def test_responses_namespace_tool_continuation(
+    monkeypatch, tmp_path, stream, stored_history
+):
+    import copy
+
+    from omlx.api.responses_utils import ResponseStore
+    from omlx.server import _server_state
+
+    monkeypatch.setattr(
+        _server_state, "responses_store", ResponseStore(state_dir=tmp_path)
+    )
+    captured = []
+    apply_template = MockTokenizer.apply_chat_template
+
+    def capture_template(self, messages, *args, **kwargs):
+        captured.append(copy.deepcopy(messages))
+        return apply_template(self, messages, *args, **kwargs)
+
+    monkeypatch.setattr(MockTokenizer, "apply_chat_template", capture_template)
+    client = _responses_tool_call_client(
+        monkeypatch,
+        '<tool_call>{"name":"mcp__demo__search_2","arguments":{}}</tool_call>'
+        '<tool_call>{"name":"mcp__other__search","arguments":{}}</tool_call>',
+    )
+    groups = [
+        {
+            "type": "namespace",
+            "name": namespace,
+            "tools": [{"type": "function", "name": "search"}],
+        }
+        for namespace in ("mcp__demo", "mcp__other")
+    ]
+    payload = {
+        "model": "test-model",
+        "input": "Search both sources.",
+        "stream": stream,
+        "store": stored_history,
+        "tools": [{"type": "function", "name": "mcp__demo__search"}, *groups],
+    }
+    first = client.post("/v1/responses", json=payload)
+    assert first.status_code == 200, first.text
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in first.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        public = next(
+            event["response"]
+            for event in events
+            if event.get("type") == "response.completed"
+        )
+    else:
+        public = first.json()
+    calls = [item for item in public["output"] if item["type"] == "function_call"]
+    assert [(call["namespace"], call["name"]) for call in calls] == [
+        ("mcp__demo", "search"),
+        ("mcp__other", "search"),
+    ]
+    results = [
+        {"type": "function_call_output", "call_id": call["call_id"], "output": "Found"}
+        for call in calls
+    ]
+    payload["tools"] = groups
+    if stored_history:
+        monkeypatch.setattr(
+            _server_state, "responses_store", ResponseStore(state_dir=tmp_path)
+        )
+        payload["previous_response_id"] = public["id"]
+        payload["input"] = results
+    else:
+        payload["input"] = [
+            {"role": "user", "content": "Search both sources."},
+            *public["output"],
+            *results,
+        ]
+    output = _server_state.engine_pool._engine.generate.return_value
+    output.text = output.new_text = "Both sources checked."
+    captured.clear()
+    second = client.post("/v1/responses", json=payload)
+    assert second.status_code == 200, second.text
+    history = [
+        call for message in captured[-1] for call in message.get("tool_calls", [])
+    ]
+    # Removing the flat collision changes the current wire name.
+    assert [call["function"]["name"] for call in history] == [
+        "mcp__demo__search",
+        "mcp__other__search",
+    ]
+    assert [call["id"] for call in history] == [call["call_id"] for call in calls]
+    assert all("namespace" not in call["function"] for call in history)
+    if stored_history:
+        preserved = _server_state.responses_store.resolve_chain_messages(public["id"])
+        assert [
+            call["function"]["namespace"]
+            for message in preserved
+            for call in message.get("tool_calls", [])
+        ] == ["mcp__demo", "mcp__other"]
+    client.close()

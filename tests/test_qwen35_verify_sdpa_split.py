@@ -312,3 +312,22 @@ def test_fully_masked_rows_are_zero_and_bound_is_explicit():
         )
         is None
     )
+
+
+def test_explicit_mask_is_preserved_when_verify_kernel_declines():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omlx.patches.mlx_vlm_mtp.qwen35_verify_attention import apply
+
+    original = Mock(return_value=mx.ones((2, 1, 1, 64)))
+    language = SimpleNamespace(_qwen3_5_left_padded_attention=original)
+    apply(language)
+    q = mx.ones((2, 1, 1, 64), dtype=mx.bfloat16)
+    k = mx.ones((2, 1, 4, 64), dtype=mx.bfloat16)
+    mask = mx.array([True, False, True, False])[None, None, None, :]
+    result = language._qwen3_5_left_padded_attention(
+        q, k, k, cache=BatchKVCache([0, 0]), scale=0.125, mask=mask
+    )
+    assert result is None
+    original.assert_not_called()

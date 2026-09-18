@@ -283,6 +283,19 @@ class TestVLMToolForwarding:
 class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""
 
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.parametrize("default_mode, expected", [(None, "block"), ("ar", None)])
+    def test_detects_model_owned_diffusion_generator(self, default_mode, expected):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._vlm_model = SimpleNamespace(
+            config=SimpleNamespace(
+                canvas_length=256, default_generation_mode=default_mode
+            ),
+            language_model=SimpleNamespace(generate=lambda *args, **kwargs: None),
+        )
+
+        assert engine._detect_diffusion_family() == expected
+
     @pytest.mark.asyncio
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
@@ -756,7 +769,7 @@ class TestInjectToolCalling:
         with patch.dict(
             "sys.modules",
             {
-                "mlx_vlm.tool_parsers": None,
+                "mlx_vlm.tools.registry": None,
                 "mlx_lm": None,
                 "mlx_lm.tokenizer_utils": None,
             },
@@ -2743,6 +2756,21 @@ class TestCaptureVLMPositionState:
     """
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_returned_position_state_overrides_previous_request(self):
+        pid = mx.arange(6).reshape(1, 6)
+        rd = mx.array([[-12]])
+        lm = SimpleNamespace(
+            _position_ids=mx.zeros((1, 3)), _rope_deltas=mx.zeros((1, 1))
+        )
+        extra = {"position_ids": pid, "rope_deltas": rd}
+
+        with patch.object(vlm_module.mx, "eval", wraps=mx.eval) as eval_mock:
+            vlm_module._capture_vlm_position_state(lm, extra)
+
+        assert extra["_captured_rope_deltas"] is rd
+        assert [id(a) for a in eval_mock.call_args.args] == [id(pid), id(rd)]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_captures_and_materializes_lazy_mrope_state(self):
         pid = mx.arange(6).reshape(1, 6) + 1
         rd = mx.zeros((1, 1)) - 3
@@ -2802,3 +2830,23 @@ async def test_preflight_uses_processed_image_dimensions(
             ] == expected_tokens + 1
     finally:
         image_module.clear_image_decode_cache()
+
+
+def test_deepseek_v4_packed_vision_features_round_trip():
+    engine = _make_loaded_engine(model_type="deepseek_v4")
+    engine._vlm_model.config.vision_downsample_ratio = 2
+    first = mx.arange(16).reshape(2, 8)
+    second = mx.arange(24).reshape(3, 8) + 100
+    engine._vlm_model.encode_images.return_value = [first, second]
+    metadata = {
+        "image_grid_hw": mx.array([[2, 4], [2, 6]]),
+        "image_permutations": mx.array([1, 0, 2, 0, 1]),
+    }
+    pixels = mx.zeros((20, 12))
+    packed = engine._compute_vision_features(pixels, metadata)
+    restored = engine._split_vision_features(packed, 2, metadata)
+    engine._vlm_model.encode_images.assert_called_once_with(pixels, **metadata)
+    assert mx.array_equal(restored[0], first)
+    assert mx.array_equal(restored[1], second)
+    with pytest.raises(ValueError, match="image grids"):
+        engine._split_vision_features(packed[:4], 2, metadata)

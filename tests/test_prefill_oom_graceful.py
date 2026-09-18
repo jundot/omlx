@@ -1620,3 +1620,21 @@ def test_adaptive_throttle_tail_below_floor_never_grows_chunk():
     # above the tail (152).
     n = _call(ns, 152, kv_len=122_000)
     assert n <= 152
+
+
+def test_guard_rejects_image_prefix_that_cannot_fit_whole():
+    hard = 42 * _GB
+    current = 30 * _GB
+    ns = _throttle_ctx(
+        current=current, hard=hard, samples_bpt=27 * 1024 * 1024, reclaim_to=current
+    )
+    ns._fake_current = current
+    with pytest.raises(PrefillMemoryExceededError):
+        Scheduler._guard_prefill_chunk(
+            ns,
+            2048,
+            kv_len=0,
+            progress=0,
+            loop_label="image-prefix",
+            minimum_tokens=2048,
+        )

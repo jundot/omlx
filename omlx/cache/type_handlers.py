@@ -482,8 +482,12 @@ class ChunkedKVCacheHandler(KVCacheHandler):
         )
 
     def serialize_state(self, cache_obj):
+        if cache_obj.keys is None:
+            return None, None
+        length = cache_obj.offset - cache_obj.start_position
         return (
-            cache_obj.keys_and_values() if cache_obj.keys is not None else (None, None)
+            cache_obj.keys[..., :length, :],
+            cache_obj.values[..., :length, :],
         )
 
     def serialize_meta_state(self, cache_obj):
@@ -987,6 +991,11 @@ class CacheListHandler(CacheTypeHandler):
 
     def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
         return tuple(self.extract_state(cache_obj)["sub_states"])
+
+    def deserialize_state(
+        self, elements: tuple[Any, ...], meta_state: Any | None = None
+    ) -> Any:
+        return self.reconstruct_cache({"sub_states": list(elements)}, meta_state)
 
     def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
         state = self.extract_state(cache_obj)

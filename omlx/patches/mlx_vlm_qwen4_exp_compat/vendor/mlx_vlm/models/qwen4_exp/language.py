@@ -21,15 +21,17 @@ import numpy as np
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
 
-from .cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.speculative.cache_state import start_speculative_cache
+from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
+from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_attention_mask,
     _create_qwen3_5_ssm_mask,
-    _target_verify_linear,
-    _target_verify_linears,
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
@@ -1111,6 +1113,15 @@ class Qwen4ExpRMSNormGated(nn.Module):
         return (y * gate).astype(dtype)
 
 
+class _Qwen4Verifier(Qwen3_5BatchInvariantForward):
+    @staticmethod
+    def _normalize_gated_delta_qk(layer, q, k):
+        return layer._normalize_qk(q, k)
+
+
+_VERIFIER = _Qwen4Verifier()
+
+
 class Qwen4ExpGatedDeltaNet(Qwen3_5GatedDeltaNet):
     def __init__(self, config: TextConfig):
         super().__init__(config)
@@ -1171,8 +1182,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
         position_ids: Optional[mx.array],
         target_verify: bool = False,
     ) -> Optional[mx.array]:
-        projected = _target_verify_linear(
-            self.index_qk_proj, hidden_states, target_verify
+        projected = (
+            _target_verify_linear(self.index_qk_proj, hidden_states)
+            if target_verify
+            else self.index_qk_proj(hidden_states)
         )
         return self.from_projected(projected, cache, position_ids)
 
@@ -1481,10 +1494,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Project once, append both caches, and attend only to selected K/V."""
 
         batch, length, _ = x.shape
-        q_proj_output, keys, values = _target_verify_linears(
-            (self.q_proj, self.k_proj, self.v_proj),
-            x,
-            target_verify,
+        q_proj_output, keys, values = (
+            _target_verify_linears((self.q_proj, self.k_proj, self.v_proj), x)
+            if target_verify
+            else tuple(
+                projection(x) for projection in (self.q_proj, self.k_proj, self.v_proj)
+            )
         )
         queries, gate = mx.split(
             q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
@@ -1512,8 +1527,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         keys, values = cache.update_and_fetch(keys, values)
 
-        projected = _target_verify_linear(
-            self.indexer.index_qk_proj, x, target_verify
+        projected = (
+            _target_verify_linear(self.indexer.index_qk_proj, x)
+            if target_verify
+            else self.indexer.index_qk_proj(x)
         ).reshape(
             batch,
             length,
@@ -1557,8 +1574,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             pooled_index_keys=pooled_index_keys,
         )
         output = output.reshape(batch, length, -1)
-        return _target_verify_linear(
-            self.o_proj, output * mx.sigmoid(gate), target_verify
+        return (
+            _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
+            if target_verify
+            else self.o_proj(output * mx.sigmoid(gate))
         )
 
     def _gathered_text_decode(
@@ -1570,10 +1589,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Append one token and attend only to QSA-selected cached K/V rows."""
 
         batch, length, _ = x.shape
-        q_proj_output, new_keys, new_values = _target_verify_linears(
-            (self.q_proj, self.k_proj, self.v_proj),
-            x,
-            False,
+        q_proj_output, new_keys, new_values = (
+            self.q_proj(x),
+            self.k_proj(x),
+            self.v_proj(x),
         )
         queries, gate = mx.split(
             q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
@@ -1710,16 +1729,16 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             elif isinstance(mask, str) and mask == "left_padded_decode":
                 # The indexer mask already includes each row's left padding.
                 mask = qsa_mask
+        if target_verify:
+            return _VERIFIER._attention(
+                self, x, mask, cache, position_ids, position_embeddings
+            )
         return super().__call__(
             x,
             mask=mask,
             cache=cache,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
-            # The inherited ragged verify kernel ignores arbitrary masks.
-            # QSA must use masked attention when the indexer selected keys.
-            target_verify=target_verify
-            and not (qsa_mask is not None and isinstance(cache, BatchQSAKVCache)),
         )
 
 
@@ -1791,21 +1810,25 @@ class Qwen4ExpGatedResidual(nn.Module):
                 ..., self.hc_lowrank : self.hc_lowrank + self.hc_count
             ]
         elif input_inject_weight is None:
-            mix = _target_verify_linear(
-                self.input_mix_weight_down, normed, target_verify
+            mix = (
+                _target_verify_linear(self.input_mix_weight_down, normed)
+                if target_verify
+                else self.input_mix_weight_down(normed)
             )
             block_injection = (
-                _target_verify_linear(
-                    self.block_inject_weight, normed, target_verify
+                (
+                    _target_verify_linear(self.block_inject_weight, normed)
+                    if target_verify
+                    else self.block_inject_weight(normed)
                 )
                 if "block_inject_weight" in self
                 else None
             )
         else:
-            combined = _target_verify_linear(
-                input_inject_weight,
-                normed,
-                target_verify,
+            combined = (
+                _target_verify_linear(input_inject_weight, normed)
+                if target_verify
+                else input_inject_weight(normed)
             )
             indices = _HYPER_SPLIT_INDICES.get((self.hc_lowrank, self.hc_count))
             if indices is None:
@@ -1823,10 +1846,10 @@ class Qwen4ExpGatedResidual(nn.Module):
 
         mix = nn.silu(mix / self.hc_count)
         mix = mx.sigmoid(
-            _target_verify_linear(
-                self.input_mix_weight_up,
-                mix,
-                target_verify,
+            (
+                _target_verify_linear(self.input_mix_weight_up, mix)
+                if target_verify
+                else self.input_mix_weight_up(mix)
             )
         )
         mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
@@ -2865,7 +2888,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         token_history = mx.concatenate([previous_context, input_ids], axis=-1)
         if cache is not None:
-            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
+            cache.update_window(3, token_history, self.context_len)
 
         ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
         embeddings = self.ngram_embedding(ngram_ids)
@@ -2921,7 +2944,7 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            cache[2] = mx.contiguous(conv_input[:, -self.short_conv_state_len :])
+            cache.update_window(2, conv_input, self.short_conv_state_len)
         return nn.silu(self.conv1d(conv_input)), state
 
     def __call__(
@@ -2942,9 +2965,17 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         embeddings = self.ple_embedding(input_ids, cache)
         keys = self.norm_key(
-            _target_verify_linear(self.key_proj, embeddings, target_verify)
+            (
+                _target_verify_linear(self.key_proj, embeddings)
+                if target_verify
+                else self.key_proj(embeddings)
+            )
         ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
-        values = _target_verify_linear(self.value_proj, embeddings, target_verify)
+        values = (
+            _target_verify_linear(self.value_proj, embeddings)
+            if target_verify
+            else self.value_proj(embeddings)
+        )
         queries = self.norm_query(hidden_states).reshape(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
@@ -3012,12 +3043,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             target_verify=target_verify,
         )
         if self.is_linear:
-            branch = self.linear_attn(
-                mixed,
-                mask=mask,
-                cache=cache,
-                gdn_sink=gdn_sink,
-                target_verify=target_verify,
+            branch = (
+                _VERIFIER._gated_delta(self.linear_attn, mixed, mask, cache)
+                if target_verify
+                else self.linear_attn(mixed, mask=mask, cache=cache)
             )
         else:
             branch = self.self_attn(
@@ -3034,7 +3063,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states,
             target_verify=target_verify,
         )
-        branch = self.mlp(mixed, target_verify=target_verify)
+        branch = (
+            _VERIFIER._feed_forward(self.mlp, mixed)
+            if target_verify
+            else self.mlp(mixed)
+        )
         injection = branch[..., None, :] * injection_weights[..., None]
         return hyper_input + injection.reshape(*hyper_input.shape)
 
@@ -3069,6 +3102,10 @@ class Qwen4ExpModel(nn.Module):
         **kwargs,
     ):
         del kwargs
+        if cache is not None and any(
+            getattr(c, "_speculation", None) is not None for c in cache
+        ):
+            gdn_sink = []
         hidden_states = (
             self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         )
@@ -3292,10 +3329,21 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
-        output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
-        if mtp_capture and output.hidden_states:
-            output.hidden_states = [output.hidden_states[0]]
-        return output
+        transaction = (
+            start_speculative_cache(cache or [], inputs.shape[1])
+            if mtp_capture
+            else None
+        )
+        try:
+            output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
+            if mtp_capture and output.hidden_states:
+                output.hidden_states = [output.hidden_states[0]]
+            output.gdn_states = transaction
+            return output
+        except BaseException:
+            if transaction is not None:
+                transaction.abort()
+            raise
 
     def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
         """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""

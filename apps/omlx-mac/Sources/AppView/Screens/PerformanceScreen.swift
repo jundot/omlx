@@ -28,14 +28,35 @@ struct PerformanceScreen: View {
             CacheSection(vm: vm)
 
             FooterBar(error: vm.lastError) {
+                Button(String(localized: "settings.button.reset_defaults",
+                              defaultValue: "Reset Defaults",
+                              comment: "Fill this screen with defaults before applying")) {
+                    Task { await vm.resetDefaults(client: services.client) }
+                }
+                .buttonStyle(.omlx(.normal))
+                .disabled(vm.isSaving || vm.isLoading || vm.isResetting)
+                .help(String(localized: "settings.reset_defaults.help",
+                             defaultValue: "Restore default values. Paths and API keys are kept. Click Apply to save."))
                 Button(String(localized: "performance.button.apply",
                               defaultValue: "Apply",
                               comment: "Apply button at the bottom of the Performance screen")) {
                     Task { await vm.save(client: services.client) }
                 }
                 .buttonStyle(.omlx(.primary))
-                .disabled(!vm.hasPendingChanges || vm.isSaving)
+                .disabled(!vm.hasPendingChanges || vm.isSaving || vm.isResetting)
             }
+        }
+        .alert(String(localized: "settings.reset_defaults.title",
+                      defaultValue: "Settings Reset"), isPresented: $vm.showResetNotice) {
+            Button(String(localized: "common.cancel", defaultValue: "Cancel"), role: .cancel) {
+                vm.cancelReset()
+            }
+            Button(String(localized: "common.ok", defaultValue: "OK")) {
+                vm.confirmReset()
+            }
+        } message: {
+            Text(String(localized: "settings.reset_defaults.message",
+                        defaultValue: "Settings have been reset to defaults. Click Apply to save the changes."))
         }
         .task { await vm.load(client: services.client) }
     }

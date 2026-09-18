@@ -554,14 +554,15 @@ def _has_vision_subconfig(config: dict) -> bool:
     """
     Return True if ``config`` carries evidence of a vision sub-config.
 
-    Three keys cover the conventions in the wild:
+    Vision configuration conventions:
 
+    - ``vision_n_layers`` - DeepSeek V4 uses a positive layer count.
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
       ``llava_qwen2``.
 
-    All three are non-empty checks: text-only quants of VLM families can
+    The nested configurations use non-empty checks: text-only quants of VLM families can
     leave an empty ``vision_config: {}`` stub behind after stripping the
     vision tower (#2385), and key presence alone would misclassify them
     as VLM.
@@ -570,7 +571,11 @@ def _has_vision_subconfig(config: dict) -> bool:
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        bool(config.get("vision_config"))
+        (
+            config.get("model_type") == "deepseek_v4"
+            and (config.get("vision_n_layers") or 0) > 0
+        )
+        or bool(config.get("vision_config"))
         or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )

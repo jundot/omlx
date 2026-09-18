@@ -49,6 +49,7 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
 )
 from mlx_lm.sample_utils import make_logits_processors
+from mlx_vlm.models import cache as _vlm_cache
 
 from .cache.deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
@@ -945,7 +946,20 @@ if _TQ_SINGLETON_CACHE_TYPE is not None:
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
 _original_merge_caches = _mlx_lm_generate_module._merge_caches
 _original_ppb_split = PromptProcessingBatch.split
-_REGULAR_SINGLETON_CACHE_TYPES = (_MLXKVCache, _MLXRotatingKVCache)
+
+_REGULAR_SINGLETON_CACHE_TYPES = (
+    _MLXKVCache,
+    _MLXRotatingKVCache,
+    _vlm_cache.KVCache,
+    _vlm_cache.RotatingKVCache,
+)
+for _cache_cls, _filter in (
+    (_vlm_cache.KVCache, _regular_kv_filter_singleton),
+    (_vlm_cache.RotatingKVCache, _regular_rotating_kv_filter_singleton),
+):
+    _cache_cls.filter = _filter
+    _cache_cls.extract = _regular_cache_extract_singleton
+    _cache_cls.extend = _regular_cache_extend_singleton
 
 
 def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
@@ -1147,6 +1161,11 @@ try:
     else:
         _ckvcache_methods_skipped.append("extend")
 
+    _vlm_cache.ChunkedKVCache.merge = classmethod(_CKVCache.merge.__func__)
+    _vlm_cache.ChunkedKVCache.filter = _CKVCache.filter
+    _vlm_cache.ChunkedKVCache.extract = _CKVCache.extract
+    _vlm_cache.ChunkedKVCache.extend = _CKVCache.extend
+
     if _ckvcache_methods_skipped:
         # Upstream may have landed implementations between mlx_lm upgrades.
         # Surface which ones so a regression in Llama-4 batching is visible
@@ -1228,7 +1247,9 @@ def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
 
 def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
     """Cache layer counted by TurboQuant's skip-last full-attention rule."""
-    return isinstance(cache_obj, _MLXKVCache) or _is_turboquant_kv_cache(cache_obj)
+    return isinstance(
+        cache_obj, (_MLXKVCache, _vlm_cache.KVCache)
+    ) or _is_turboquant_kv_cache(cache_obj)
 
 
 class _BoundaryStoreUnavailable(Exception):
@@ -1447,7 +1468,11 @@ def _slice_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
     """Slice VLM extra kwargs to first n tokens along seq dimension."""
     sliced: dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 2:
+        if (
+            key not in ("rope_deltas", "_captured_rope_deltas")
+            and isinstance(val, mx.array)
+            and val.ndim >= 2
+        ):
             sliced[key] = _vlm_extra_seq_slice(val, slice(None, n))
         else:
             sliced[key] = val
@@ -1458,7 +1483,11 @@ def _advance_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
     """Advance VLM extra kwargs past first n tokens along seq dimension."""
     advanced: dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 2:
+        if (
+            key not in ("rope_deltas", "_captured_rope_deltas")
+            and isinstance(val, mx.array)
+            and val.ndim >= 2
+        ):
             advanced[key] = _vlm_extra_seq_slice(val, slice(n, None))
         else:
             advanced[key] = val
@@ -1683,6 +1712,9 @@ class _BoundarySnapshotProvider:
         if self._store is not None:
             return self._store.load(self._request_id, tc)
         return None
+
+    def keys(self):
+        return self._valid_tcs
 
     def __len__(self) -> int:
         return len(self._valid_tcs)
@@ -1982,6 +2014,7 @@ class Scheduler:
         )
         self._decode_time_owed_s: float = 0.0
         self._prefill_hold_until: float = 0.0
+        self._admit_prefill_next: bool = False
         # Measured throughputs feeding the adaptive fairness constants.
         # Best-observed prefill tok/s sizes the contended chunk (stall-time
         # target): contended chunks only measure SLOWER, so a running max
@@ -3322,9 +3355,9 @@ class Scheduler:
             return False
 
         def _ok(c: Any) -> bool:
-            if isinstance(c, KVCache):
+            if isinstance(c, (KVCache, _vlm_cache.KVCache)):
                 return True
-            if isinstance(c, ArraysCache):
+            if isinstance(c, (ArraysCache, _vlm_cache.ArraysCache)):
                 return True
             class_name = type(c).__name__
             if class_name in (
@@ -3339,7 +3372,7 @@ class Scheduler:
                 return True
             if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
                 return False
-            if isinstance(c, CacheList):
+            if isinstance(c, (CacheList, _vlm_cache.CacheList)):
                 # A KVCache member inside a CacheList converts fine at
                 # runtime, but the prefix/SSD store paths dispatch on the
                 # layer class ("CacheList") and have no TurboQuant
@@ -3349,7 +3382,9 @@ class Scheduler:
                 # Until CacheList-level TQ serialization exists, exclude
                 # composite layers that contain a convertible KVCache
                 # (e.g. inkling's CacheList(KVCache, ArraysCache)).
-                if any(type(inner) is KVCache for inner in c.caches):
+                if any(
+                    type(inner) in (KVCache, _vlm_cache.KVCache) for inner in c.caches
+                ):
                     if not getattr(self, "_tq_cachelist_guard_logged", False):
                         self._tq_cachelist_guard_logged = True
                         logger.info(
@@ -3384,15 +3419,15 @@ class Scheduler:
         converted = 0
         bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
+            if isinstance(cache_obj, (KVCache, _vlm_cache.KVCache)):
                 if i == last_kv_idx:
                     continue
                 prompt_cache[i] = TurboQuantKVCache(bits=bits)
                 converted += 1
-            elif isinstance(cache_obj, CacheList):
+            elif isinstance(cache_obj, (CacheList, _vlm_cache.CacheList)):
                 new_caches = []
                 for c in cache_obj.caches:
-                    if isinstance(c, KVCache):
+                    if isinstance(c, (KVCache, _vlm_cache.KVCache)):
                         new_caches.append(TurboQuantKVCache(bits=bits))
                         converted += 1
                     else:
@@ -3426,15 +3461,15 @@ class Scheduler:
         converted = 0
         bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
+            if isinstance(cache_obj, (KVCache, _vlm_cache.KVCache)):
                 if i == last_kv_idx:
                     continue
                 prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
                 converted += 1
-            elif isinstance(cache_obj, CacheList):
+            elif isinstance(cache_obj, (CacheList, _vlm_cache.CacheList)):
                 new_caches = []
                 for c in cache_obj.caches:
-                    if isinstance(c, KVCache):
+                    if isinstance(c, (KVCache, _vlm_cache.KVCache)):
                         new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
                         converted += 1
                     else:
@@ -3606,6 +3641,21 @@ class Scheduler:
             # raises before the normal restore below runs.
             request._prefill_saved_rope_deltas = _saved_rope_deltas
 
+        prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
+        minimum_prefix = (
+            prefix_hook(tokens)
+            if vlm_embeds is not None and callable(prefix_hook)
+            else 0
+        )
+        if not isinstance(minimum_prefix, int):
+            minimum_prefix = 0
+        if minimum_prefix >= len(tokens):
+            raise ValueError("DeepSeek V4 image prompts must end with a text token")
+        if minimum_prefix and request.cached_tokens:
+            raise ValueError(
+                "DeepSeek V4 image prefill requires an uncached image prefix"
+            )
+
         # Prefill tokens[0:N-1] (leave last token for insert())
         prefill_tokens = tokens[:-1]
         last_token = tokens[-1:]
@@ -3649,14 +3699,24 @@ class Scheduler:
                     block_size=block_size,
                 )
 
+            atomic_prefix = minimum_prefix if processed_tokens == 0 else 0
+            if atomic_prefix:
+                if boundary_enabled and block_size > 0:
+                    atomic_prefix = min(
+                        remaining,
+                        ((atomic_prefix + block_size - 1) // block_size) * block_size,
+                    )
+                n_to_process = max(n_to_process, atomic_prefix)
+
             try:
-                n_to_process = self._adaptive_chunk_size(
-                    n_to_process,
-                    request_id=request.request_id,
-                    loop_label="external",
-                    kv_len=base_size + processed_tokens,
-                    gathered_core=gathered_core,
-                )
+                if not atomic_prefix:
+                    n_to_process = self._adaptive_chunk_size(
+                        n_to_process,
+                        request_id=request.request_id,
+                        loop_label="external",
+                        kv_len=base_size + processed_tokens,
+                        gathered_core=gathered_core,
+                    )
                 # Check the predicted peak before submitting work to Metal.
                 n_to_process = self._guard_prefill_chunk(
                     n_to_process,
@@ -3665,6 +3725,7 @@ class Scheduler:
                     loop_label="external",
                     request_id=request.request_id,
                     gathered_core=gathered_core,
+                    **({"minimum_tokens": atomic_prefix} if atomic_prefix else {}),
                 )
             except _PrefillEvictionNeeded:
                 # Keep token progress aligned with the advanced KV on retry.
@@ -4224,6 +4285,7 @@ class Scheduler:
         loop_label: str,
         request_id: str | None = None,
         gathered_core: bool = False,
+        minimum_tokens: int = 0,
     ) -> int:
         """Clamp/abort a prefill chunk so its predicted peak can never reach
         the physical Metal cap (the uncatchable async OOM crash).
@@ -4244,11 +4306,15 @@ class Scheduler:
         if self._prefill_speed_priority:
             min_chunk = n_tokens
         else:
-            min_chunk = max(1, self._prefill_min_chunk_tokens)
+            min_chunk = max(1, self._prefill_min_chunk_tokens, minimum_tokens)
         current = self._current_usage_bytes()
-        if current + self._admission_transient_bound(
-            n_tokens, kv_len, gathered_core=gathered_core
-        ) <= cap:
+        if (
+            current
+            + self._admission_transient_bound(
+                n_tokens, kv_len, gathered_core=gathered_core
+            )
+            <= cap
+        ):
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
@@ -4357,7 +4423,7 @@ class Scheduler:
         # Same quantization as the adaptive throttle: an off-grid size here
         # would reintroduce the near-miss buffers _snap_chunk_size exists to
         # avoid.
-        n_fit = self._snap_chunk_size(n_fit, n_tokens)
+        n_fit = max(minimum_tokens, self._snap_chunk_size(n_fit, n_tokens))
         if n_fit < n_tokens:
             logger.debug(
                 "[guard:%s] shrink %d -> %d at progress=%d kv_len=%d "
@@ -5828,10 +5894,8 @@ class Scheduler:
     ) -> None:
         """Advance in-flight prefills until decode fairness requires a yield.
 
-        Called at the start of each step() before _schedule_waiting(). Each
-        request advances by at most one chunk. Deferred requests precede
-        already-advanced requests in the next round. Completed prefills are
-        inserted into BatchGenerator and moved to self.running.
+        Each request advances by at most one chunk per call. Deferred requests precede already-advanced requests in the next round.
+        Completed prefills are inserted into BatchGenerator and moved to self.running.
 
         Args:
             scheduled: The step's running list of newly-scheduled requests;
@@ -6114,6 +6178,22 @@ class Scheduler:
             ready.append(pending_output)
         return ready
 
+    def _boundary_snapshot_block_size(self, request: "Request", token_count: int) -> int:
+        block_size = self.config.paged_cache_block_size
+        prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
+        minimum_prefix = (
+            prefix_hook(request.prompt_token_ids) if callable(prefix_hook) else 0
+        )
+        if (
+            isinstance(minimum_prefix, int)
+            and minimum_prefix > block_size > 0
+            and token_count
+            == ((minimum_prefix + block_size - 1) // block_size) * block_size
+        ):
+            # No earlier boundary exists inside the indivisible image prefix.
+            return token_count
+        return block_size
+
     def _emit_prefill_boundary_snapshot(
         self,
         request: "Request",
@@ -6140,10 +6220,16 @@ class Scheduler:
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache
         ]
+        snapshot_block_size = self._boundary_snapshot_block_size(request, total_tokens)
         self._on_prefill_boundary_snapshot(
             request.request_id,
             snapshot_cache,
             total_tokens,
+            **(
+                {"snapshot_block_size": snapshot_block_size}
+                if snapshot_block_size != self.config.paged_cache_block_size
+                else {}
+            ),
         )
 
     def _build_sampler_and_processors(
@@ -6680,6 +6766,7 @@ class Scheduler:
         token_count: int,
         *,
         source: str = "prefill",
+        snapshot_block_size: int | None = None,
     ) -> None:
         """Record a prefill boundary or a verified terminal response snapshot."""
         if self._model_has_unreconstructible_cache():
@@ -6741,6 +6828,8 @@ class Scheduler:
             )
             return
 
+        snapshot_block_size = snapshot_block_size or block_size
+
         # Offload snapshot to SSD if store is available, keeping only a
         # None marker in the dict.  Falls back to in-memory storage when
         # the SSD store is unavailable or the write fails.
@@ -6756,7 +6845,7 @@ class Scheduler:
                     token_count,
                     snapshot_cache,
                     self._extract_snapshot_cache_states,
-                    block_size=block_size,
+                    block_size=snapshot_block_size,
                 )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
@@ -6775,7 +6864,7 @@ class Scheduler:
                     _compact_boundary_snapshot_value(
                         self._prefill_snapshot_value(snapshot_cache),
                         token_count,
-                        block_size,
+                        snapshot_block_size,
                         self._stream,
                     )
                 )
@@ -6785,7 +6874,7 @@ class Scheduler:
                 _compact_boundary_snapshot_value(
                     self._prefill_snapshot_value(snapshot_cache),
                     token_count,
-                    block_size,
+                    snapshot_block_size,
                     self._stream,
                 )
             )
@@ -7158,6 +7247,8 @@ class Scheduler:
         if request.request_id not in self._boundary_cache_snapshots:
             self._boundary_cache_snapshots[request.request_id] = {}
 
+        snapshot_block_size = self._boundary_snapshot_block_size(request, total_tokens)
+
         # Offload to SSD with in-memory fallback.
         if self._boundary_snapshot_store is not None:
             with self._phase_timer("boundary_snapshot_save"):
@@ -7166,7 +7257,7 @@ class Scheduler:
                     total_tokens,
                     snapshot_cache,
                     self._extract_snapshot_cache_states,
-                    block_size=block_size,
+                    block_size=snapshot_block_size,
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
@@ -7189,14 +7280,14 @@ class Scheduler:
                 # Mirrors _on_prefill_boundary_snapshot's in-memory fallback.
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = (
                     self._decode_boundary_snapshot_value(
-                        snapshot_cache, total_tokens, block_size
+                        snapshot_cache, total_tokens, snapshot_block_size
                     )
                 )
                 storage = "memory"
         else:
             self._boundary_cache_snapshots[request.request_id][total_tokens] = (
                 self._decode_boundary_snapshot_value(
-                    snapshot_cache, total_tokens, block_size
+                    snapshot_cache, total_tokens, snapshot_block_size
                 )
             )
             storage = "memory"
@@ -7651,7 +7742,11 @@ class Scheduler:
         if not offsets or any(offset != token_count for offset in offsets):
             return
         self._on_prefill_boundary_snapshot(
-            request.request_id, cache, token_count, source="completion"
+            request.request_id,
+            cache,
+            token_count,
+            source="completion",
+            snapshot_block_size=self._boundary_snapshot_block_size(request, token_count),
         )
 
     def _prepare_prompt_boundary_cache_store(
@@ -8610,6 +8705,13 @@ class Scheduler:
         if request.request_id in self._prefix_cache_prepared:
             return
 
+        prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
+        minimum_prefix = (
+            prefix_hook(request.prompt_token_ids) if callable(prefix_hook) else 0
+        )
+        if not isinstance(minimum_prefix, int):
+            minimum_prefix = 0
+
         # Check support before lookup, including partial prefix hits.
         if (
             self.block_aware_cache is not None
@@ -8651,6 +8753,16 @@ class Scheduler:
                     0, block_table.num_tokens - last_token_count
                 )
                 self.paged_cache_manager.free_block(last_block_id)
+            if block_table and 0 < block_table.num_tokens < minimum_prefix:
+                logger.info(
+                    "Request %s: cached prefix %d precedes complete image prefix %d",
+                    request.request_id,
+                    block_table.num_tokens,
+                    minimum_prefix,
+                )
+                if self.paged_cache_manager is not None:
+                    self.paged_cache_manager.delete_block_table(request.request_id)
+                block_table = None
             if block_table and block_table.num_tokens > 0:
                 bypass_hot_cache = self._bypass_hot_cache_under_pressure()
                 if bypass_hot_cache:
@@ -8679,10 +8791,13 @@ class Scheduler:
                         reconstructed = self.block_aware_cache.reconstruct_cache(
                             block_table
                         )
-                reconstruct_ms = (
-                    time.perf_counter() - reconstruct_started
-                ) * 1000.0
+                reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
+                if block_table.num_tokens < minimum_prefix:
+                    reconstructed = None
                 if reconstructed:
+                    restore_cache = getattr(self.model, "restore_cache", None)
+                    if restore_cache is not None:
+                        reconstructed = restore_cache(reconstructed)
                     request.prompt_cache = reconstructed
                     request.block_table = block_table
                     request.cached_tokens = block_table.num_tokens
@@ -12604,21 +12719,28 @@ class Scheduler:
             self._check_memory_pressure()
 
         try:
-            # Advance in-flight chunked prefills (one chunk per request).
-            # Must run before _schedule_waiting() so that completing prefills
-            # are inserted into BatchGenerator before the decode step.
+            # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.
+            admit_first = False
+            prefill_gate_open = self._prefill_gate_open() if self.prefilling else True
+            if (
+                self._decode_fairness
+                and self.prefilling
+                and self.waiting
+                and self._decode_contention()
+                and prefill_gate_open
+            ):
+                admit_first = self._admit_prefill_next
+                self._admit_prefill_next = not admit_first
+            if admit_first:
+                scheduled, rejected = self._schedule_waiting()
+
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
-            prefill_gate_open = True
-            if self.prefilling:
-                prefill_gate_open = self._prefill_gate_open()
-                if prefill_gate_open:
-                    self._advance_chunked_prefills(
-                        chunked_scheduled, chunked_rejected
-                    )
+            if self.prefilling and prefill_gate_open:
+                self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
 
-            # Schedule waiting requests
-            scheduled, rejected = self._schedule_waiting()
+            if not admit_first:
+                scheduled, rejected = self._schedule_waiting()
             # Merge chunked-prefill completions into the scheduled list.
             if chunked_scheduled:
                 scheduled = chunked_scheduled + scheduled
@@ -12908,6 +13030,7 @@ class Scheduler:
             get_decode_activity().remove(self._decode_activity_key)
         self._decode_time_owed_s = 0.0
         self._prefill_hold_until = 0.0
+        self._admit_prefill_next = False
         # A store_cache worker may still be loading request-local boundary
         # snapshots or publishing blocks. reset() clears both namespaces, so
         # use the same bounded teardown barrier as shutdown() before aborting

@@ -2,7 +2,7 @@
 """GLM Lightning MTP rollback without splitting the target batch cache."""
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache, BatchKVCache, CacheList
+from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList
 
 from ..deepseek_v4.cache_extras import BatchPoolingCache
 
@@ -63,7 +63,10 @@ def rollback_rows(language, caches, captures, accepted, block_size):
         indices = ends[:, None, None] + mx.arange(kernel_size - 1)[None, :, None]
         cache[1] = state
         cache[0] = mx.take_along_axis(conv_input, indices, axis=1)
-        cache.advance(-rewind)
+        if cache.lengths is not None:
+            cache.lengths = cache.lengths + rewind
+        if cache.left_padding is not None:
+            cache.left_padding = cache.left_padding + rewind
     uniform_trim = block_size - max_end
     extra = [max_end - end for end in kept]
     for cache in caches:

@@ -36,6 +36,7 @@
   "navbar.tab.logs": "로그",
   "navbar.tab.bench": "벤치마크",
   "navbar.tab.chat": "채팅",
+  "navbar.tablist_label": "대시보드 섹션",
   "navbar.dropdown.manager": "관리",
   "navbar.dropdown.downloader": "다운로드",
   "navbar.dropdown.quantizer": "oQ 양자화",
@@ -344,7 +345,7 @@
   "settings.tab.integrations": "통합 설정",
   "settings.global.section_label": "기본 설정",
   "settings.global.heading": "서버 설정",
-  "settings.global.restart_notice": "",
+  "settings.global.restart_notice": "Settings marked with",
   "settings.global.restart_badge": "재시작 필요",
   "settings.global.restart_suffix": "표시가 있는 설정은 서버 재시작이 필요합니다.",
   "settings.integrations.section_label": "통합",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "한 요청에서 변환할 문서 첨부 수를 제한합니다.",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF 처리 엔진",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "PDF 문서 요청이 들어왔을 때 MarkItDown으로 자체 처리할지 OCR 엔진을 사용할지 선택합니다.",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "선택한 OCR 모델을 사용할 수 없습니다. 모델을 다시 사용할 수 있거나 다른 엔진을 선택할 때까지 PDF는 MarkItDown으로 처리됩니다.",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "MarkItDown을 선택하면 스캔 또는 이미지 전용 PDF 요청은 실패할 수 있으며, 표가 포함된 PDF 문서는 제대로 처리되지 않을 수 있습니다.",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",
@@ -1973,5 +1975,12 @@
   "usage.delayed": "기록이 불완전할 수 있습니다: 저장이 지연되었거나 대기 버퍼가 넘쳤습니다.",
   "usage.loading": "사용량 불러오는 중…",
   "usage.disabled": "사용 기록이 꺼져 있습니다. 설정 → 사용 기록에서 켜세요.",
-  "usage.open_settings": "설정 열기"
+  "usage.open_settings": "설정 열기",
+  "settings.global.reset_defaults": "기본값으로 초기화",
+  "settings.global.reset_hint": "기본값을 불러옵니다. 경로와 API 키는 유지됩니다. 저장을 눌러 적용하세요.",
+  "settings.global.reset_failed": "기본 설정을 불러오지 못했습니다.",
+  "settings.global.reset_title": "설정 초기화",
+  "settings.global.reset_message": "설정값을 초기화했습니다. Save를 눌러야 저장됩니다.",
+  "settings.global.reset_ok": "확인",
+  "settings.global.reset_cancel": "취소"
 }

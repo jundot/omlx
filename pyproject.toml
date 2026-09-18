@@ -52,11 +52,8 @@ dependencies = [
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     # The mlx-lm pin above includes the NewlineTokenizer registration fix
-    # required by transformers 5.13+. Floor 5.12.1: AutoTokenizer's
-    # fix_mistral_regex backend gate (used by get_tokenizer_config for
-    # mistral-common models) first shipped in 5.12.1 — on older 5.x the kwarg
-    # is silently swallowed and Tekken prompts stay corrupted.
-    "transformers>=5.12.1,<5.18",
+    # required by transformers 5.13+. mlx-vlm requires the 5.14 processor API.
+    "transformers>=5.14.0,<5.18",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -113,9 +110,11 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 78b96eb. MiniMax M3 support is vendored under
-    # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
+    # mlx-vlm from commit 3fb24e9. oMLX model implementations remain registered
+    # by their pre-load patches.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@3fb24e907dec2b99ea4ec7b350f52fd6db145575",
+    # mlx-vlm now requires mlx-audio in the shared runtime.
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
@@ -155,11 +154,17 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (5175326) with tts/stt/sts extras
-    # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
-    # stt extra: tiktoken, mistral-common[audio]
-    # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
+    # mlx-audio from commit (49596ac, v0.4.8) with tts/stt/sts extras
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d",
+    # Keep dependencies for existing audio models removed from upstream extras.
+    "espeakng-loader>=0.2.4",
+    "librosa==0.11.0",
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "numba>=0.60.0",
+    "phonemizer-fork>=3.3.2",
+    "pyloudnorm>=0.2.0",
+    "spacy>=3.8.4",
     # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
     # python; uvicorn's ws="auto" picks it up when installed.
     "wsproto==1.2.0",
@@ -177,12 +182,8 @@ paroquant = [
 # version-free. End-users don't `pip install omlx[bundle]`; this is for
 # the macOS .app build pipeline.
 #
-# mlx-audio[tts,stt,sts]'s 12 transitive deps appear explicitly because
-# venvstacks 0.7.0's internal `uv pip compile` runs with --no-config and
-# doesn't propagate pyproject.toml's `tool.uv.override-dependencies`,
-# so it can't resolve mlx-audio's `mlx-lm==0.31.1` pin against our
-# git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
-# separately via --no-deps post-resolution.
+# Audio runtime dependencies are explicit because build.py installs the audio wheel
+# separately with --no-deps after the shared layer resolves.
 bundle = [
     "mcp>=2.0.0,<3",
     "modelscope>=1.10.0",
@@ -272,7 +273,7 @@ include = ["omlx*"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
-# (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
+# so dependency resolution retains the selected runtime versions.
 override-dependencies = [
     "mlx==0.32.2",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@872ae88d1fac77350db23c8c04fe8dd372a9e3e8",

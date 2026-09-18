@@ -50,7 +50,7 @@
                         </thead>
                         <tbody>
                             <template x-for="row in data.models" :key="row.model_id">
-                                <tr class="border-t">
+                                <tr class="border-t border-neutral-200">
                                     <th class="p-3 text-left font-medium break-all" x-text="row.model_id"></th>
                                     <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key">
                                         <td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td>

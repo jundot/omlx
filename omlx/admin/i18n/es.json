@@ -36,6 +36,7 @@
   "navbar.tab.logs": "Registros",
   "navbar.tab.bench": "Benchmark",
   "navbar.tab.chat": "Chat",
+  "navbar.tablist_label": "Secciones del panel",
   "navbar.dropdown.manager": "Gestor",
   "navbar.dropdown.downloader": "Descargas",
   "navbar.dropdown.quantizer": "Cuantización oQ",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "Limit document attachments converted in one request.",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF processing engine",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine.",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "El modelo OCR seleccionado no está disponible. Los PDF se procesan con MarkItDown hasta que el modelo vuelva a estar disponible o selecciones otro motor.",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly.",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",
@@ -1973,5 +1975,12 @@
   "usage.delayed": "El historial puede estar incompleto: el almacenamiento está retrasado o el búfer pendiente se desbordó.",
   "usage.loading": "Cargando uso…",
   "usage.disabled": "El historial de uso está desactivado. Actívalo en Ajustes → Historial de uso.",
-  "usage.open_settings": "Abrir ajustes"
+  "usage.open_settings": "Abrir ajustes",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Cancelar"
 }

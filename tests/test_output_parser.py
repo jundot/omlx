@@ -835,14 +835,14 @@ class TestOutputParserFactory:
         assert factory.kind == "minimax_m3"
 
     def test_minimax_m3_parser_extracts_tool_calls(self, monkeypatch):
-        module = types.ModuleType("mlx_vlm.tool_parsers.minimax_m3")
+        module = types.ModuleType("mlx_vlm.tools.parsers.minimax_m3")
 
         def parse_tool_call(text):
             assert "lookup" in text
             return {"name": "lookup", "arguments": {"query": "mlx"}}
 
         module.parse_tool_call = parse_tool_call
-        monkeypatch.setitem(sys.modules, "mlx_vlm.tool_parsers.minimax_m3", module)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.tools.parsers.minimax_m3", module)
 
         start = "]<]minimax[>[<tool_call>"
         end = "]<]minimax[>[</tool_call>"

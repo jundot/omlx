@@ -167,6 +167,8 @@ class TestVLMExtraSlicing:
             "token_type_ids": mx.array([[0, 1, 1, 0]]),
             "per_layer_inputs": mx.zeros((1, 4, 2, 3)),
             "scalar": mx.array(7),
+            "rope_deltas": mx.array([[-12]]),
+            "_captured_rope_deltas": mx.array([[-12]]),
         }
 
         sliced = scheduler_module._slice_vlm_extra(extra, 3)
@@ -180,6 +182,9 @@ class TestVLMExtraSlicing:
         assert advanced["token_type_ids"].tolist() == [[1, 1, 0]]
         assert advanced["per_layer_inputs"].shape == (1, 3, 2, 3)
         assert advanced["scalar"] is extra["scalar"]
+        for key in ("rope_deltas", "_captured_rope_deltas"):
+            assert sliced[key] is extra[key]
+            assert advanced[key] is extra[key]
 
 
 class TestSchedulingPolicy:
@@ -7658,3 +7663,121 @@ def test_scheduler_ignores_remaining_responses_after_string_stop():
     assert finished == {"stop-output"}
     assert request.output_token_ids == [10]
     assert all(o.finished for o in outputs)
+
+
+def test_vlm_chunked_cache_keeps_serial_scheduler_contract():
+    from mlx_vlm.models.cache import ChunkedKVCache
+
+    cache = ChunkedKVCache(chunk_size=8)
+    keys = mx.ones((1, 1, 3, 4))
+    cache.update_and_fetch(keys, keys)
+    merged = scheduler_module._patched_merge_caches([[cache]])
+    assert merged[0] is cache
+    cache.filter([0])
+    assert cache.extract(0) is cache
+    with pytest.raises(NotImplementedError, match="batch_size > 1"):
+        cache.merge([cache, cache])
+    cache.filter([])
+    assert cache.empty() and cache.offset == 0 and cache.start_position == 0
+
+
+@pytest.mark.parametrize(
+    "cached, truncated, expected", [(2, False, 0), (8, False, 8), (8, True, 0)]
+)
+def test_image_prefix_cache_requires_complete_image_span(
+    mock_model, mock_tokenizer, cached, truncated, expected
+):
+    from omlx.cache.paged_cache import BlockTable
+
+    mock_model.minimum_prefill_prefix = lambda tokens: 6
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    scheduler.block_aware_cache = MagicMock()
+    scheduler.paged_cache_manager = MagicMock()
+    scheduler._model_has_unreconstructible_cache = lambda: False
+    table = BlockTable(request_id="image-prefix", block_ids=[1], num_tokens=cached)
+    scheduler.block_aware_cache.fetch_cache.return_value = (table, [])
+
+    def reconstruct(*args, **kwargs):
+        if truncated:
+            table.num_tokens = 2
+        return [KVCache()]
+
+    scheduler.block_aware_cache.reconstruct_cache.side_effect = reconstruct
+    request = Request(
+        request_id="image-prefix",
+        prompt=list(range(10)),
+        sampling_params=SamplingParams(),
+    )
+    scheduler.add_request(request)
+    scheduler._prepare_prefix_cache_for_request(request)
+    assert request.cached_tokens == expected
+    assert request.remaining_tokens == request.prompt_token_ids[expected:]
+    if not expected:
+        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with(
+            request.request_id
+        )
+
+
+def test_external_prefill_keeps_image_prefix_atomic(mock_model, mock_tokenizer):
+    from mlx_vlm.models.cache import RotatingKVCache
+
+    mock_model.minimum_prefill_prefix = lambda tokens: 6
+    scheduler = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(prefill_step_size=2, paged_cache_block_size=4),
+    )
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._emit_prefill_boundary_snapshot = MagicMock()
+    cache = [RotatingKVCache(max_size=16)]
+    request = Request(
+        request_id="atomic-image",
+        prompt=list(range(13)),
+        sampling_params=SamplingParams(),
+    )
+    request.prompt_token_ids = list(range(13))
+    request.num_prompt_tokens = 13
+    request.benchmark_trace = True
+    scheduler._do_external_prefill(
+        request,
+        request.prompt_token_ids,
+        cache,
+        vlm_embeds=(mx.zeros((1, 13, 8)), {}, 0),
+    )
+    assert request.benchmark_prefill_chunks == [8, 2, 2]
+    assert [
+        c.args[2] for c in scheduler._emit_prefill_boundary_snapshot.call_args_list
+    ] == [8, 12]
+
+
+@pytest.mark.parametrize("on_ssd", [True, False])
+def test_first_image_boundary_reached_during_decode(mock_model, mock_tokenizer, on_ssd):
+    from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+    apply_deepseek_v4_patch()
+    mock_model.minimum_prefill_prefix = lambda tokens: 6
+    scheduler = Scheduler(mock_model, mock_tokenizer, SchedulerConfig(paged_cache_block_size=4))
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._boundary_snapshot_required = True
+    scheduler._model_has_unreconstructible_cache = lambda: False
+    request = Request(request_id="decode-image", prompt=list(range(7)), sampling_params=SamplingParams())
+    request.prompt_token_ids = list(range(7))
+    request.num_prompt_tokens = 7
+    request.output_token_ids = [2]
+    rotating = RotatingKVCache(max_size=4)
+    rotating.update_and_fetch(mx.ones((1, 1, 8, 8)), mx.ones((1, 1, 8, 8)))
+    pool = PoolingCache(4)
+    pool.state = (None, None, mx.ones((1, 2, 8)))
+    scheduler._extract_boundary_snapshot = MagicMock(return_value=[CacheList(rotating, pool)])
+    if on_ssd:
+        scheduler._boundary_snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store.save.return_value = True
+    scheduler._maybe_capture_boundary_snapshot(request, 0)
+    if on_ssd:
+        assert scheduler._boundary_snapshot_store.save.call_args.kwargs["block_size"] == 8
+    else:
+        _, layers = scheduler._boundary_cache_snapshots[request.request_id][8]
+        assert layers[0]["pooling_delta_ranges"]["1"] == [0, 2]
+        assert layers[0]["state"][1][2].shape[1] == 2

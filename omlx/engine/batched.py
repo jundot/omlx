@@ -478,11 +478,9 @@ class BatchedEngine(BaseEngine):
                 from ..patches.qwen35_q4_mlp import (
                     apply_qwen35_q4_lm_prefill_linear_patch,
                     apply_qwen35_q4_mlp_patch,
-                    apply_qwen35_q4_prefill_linear_patch,
                 )
 
                 apply_qwen35_q4_mlp_patch()
-                apply_qwen35_q4_prefill_linear_patch()
                 apply_qwen35_q4_lm_prefill_linear_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)

@@ -35,6 +35,13 @@ with a resident-fraction selector (12.5% – 75%). Or via the settings API:
 Toggling triggers an engine reload (it is a load-time transform). The env
 kill switch `OMLX_MOE_EXPERT_OFFLOAD=0` disables it regardless of settings.
 
+Two env vars tune the reader, and neither changes what is computed:
+
+| variable | default | effect |
+|---|---|---|
+| `OMLX_MOE_OFFLOAD_IO_WORKERS` | 12 | threads reading missing experts. `1` or less (or an unparseable value) keeps the serial path and starts no threads |
+| `OMLX_MOE_OFFLOAD_IO_BATCH` | `4 x workers` | experts whose reads may be in flight at once — the bound on the host memory the pipeline holds ahead of the slot writes |
+
 ## Performance
 
 `gemma-4-26b-a4b-it-4bit`, 585-token prompt, 256 generated tokens, warm
@@ -72,6 +79,8 @@ Decode is untouched by the change (it takes the no-sync fast path). The
 remaining follow-up is decode prefetch (layer L+1's fetches during layer
 L's compute), which has measured LRU→optimal headroom of +17pp hit rate at
 low residency.
+
+A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` schedules missing experts before the serial install loop. Slot writes, LRU updates, and hit/miss counters stay on the calling thread.
 
 ## Supported models
 

@@ -36,6 +36,7 @@
   "navbar.tab.logs": "Журналы",
   "navbar.tab.bench": "Бенчмарк",
   "navbar.tab.chat": "Чат",
+  "navbar.tablist_label": "Разделы панели управления",
   "navbar.dropdown.manager": "Менеджер",
   "navbar.dropdown.downloader": "Загрузчик",
   "navbar.dropdown.quantizer": "oQ квантование",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "Ограничить число вложений документов, преобразуемых в одном запросе.",
   "settings.integrations.markitdown.pdf_processing_engine": "Движок обработки PDF",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "Выберите, чем обрабатывать PDF-документы: самим MarkItDown или OCR-движком.",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "Выбранная модель OCR недоступна. PDF обрабатываются через MarkItDown, пока модель снова не станет доступна или вы не выберете другой движок.",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "Отсканированные PDF и PDF только из изображений не будут обработаны при выборе MarkItDown; PDF с таблицами также могут обработаться некорректно.",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",
@@ -1973,5 +1975,12 @@
   "usage.delayed": "История может быть неполной: запись задерживается или буфер ожидания переполнен.",
   "usage.loading": "Загрузка данных об использовании…",
   "usage.disabled": "История использования отключена. Включите её в разделе Настройки → История использования.",
-  "usage.open_settings": "Открыть настройки"
+  "usage.open_settings": "Открыть настройки",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Отмена"
 }

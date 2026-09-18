@@ -10,7 +10,9 @@ query position. Padding remains on the GPU after vector cache rollback.
 from functools import cache
 
 import mlx.core as mx
-from mlx_lm.models.cache import BatchKVCache, KVCache
+from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
+from mlx_lm.models.cache import KVCache as LMKVCache
+from mlx_vlm.models.cache import BatchKVCache, KVCache
 
 _SOURCE = r"""
 
@@ -139,7 +141,7 @@ def verify_attention(queries, keys, values, *, cache, scale, mask):
     """Return bounded causal attention, or None for other contracts."""
     if (
         not (
-            type(cache) in (BatchKVCache, KVCache)
+            type(cache) in (BatchKVCache, KVCache, LMBatchKVCache, LMKVCache)
             or getattr(type(cache), "_omlx_mtp_verify_attention_cache", False)
         )
         or queries.ndim != 4
@@ -221,7 +223,7 @@ def verify_attention(queries, keys, values, *, cache, scale, mask):
 def apply(language):
     if getattr(language, "_omlx_verify_attention", False):
         return
-    original = language._target_verify_left_padded_attention
+    original = language._qwen3_5_left_padded_attention
 
     def attention(queries, keys, values, *, cache, scale, mask):
         result = verify_attention(
@@ -229,7 +231,10 @@ def apply(language):
         )
         if result is not None:
             return result
+        # The upstream ragged helper ignores explicit masks.
+        if isinstance(mask, mx.array):
+            return None
         return original(queries, keys, values, cache=cache, scale=scale, mask=mask)
 
-    language._target_verify_left_padded_attention = attention
+    language._qwen3_5_left_padded_attention = attention
     language._omlx_verify_attention = True

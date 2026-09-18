@@ -36,6 +36,7 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 
 from __future__ import annotations
 
+import importlib
 import logging
 import weakref
 from typing import Any
@@ -63,10 +64,9 @@ def apply() -> bool:
         logger.debug(f"mlx_vlm.qwen3_5 not importable for MTP runtime: {e}")
         return False
 
-    from . import qwen35_batch_rollback, qwen35_verify_attention, qwen35_verify_linear
+    from . import qwen35_verify_attention, qwen35_verify_linear
 
-    qwen35_batch_rollback.apply(q35_lang)
-    qwen35_verify_linear.apply(q35_lang)
+    qwen35_verify_linear.apply()
     qwen35_verify_attention.apply(q35_lang)
     _patch_text_config(q35_config)
     _register_mtp_classes_for_vlm(q35_lang)
@@ -76,10 +76,43 @@ def apply() -> bool:
     # too; the function is idempotent so calling it twice is safe.
     _patch_vlm_model_adapter()
     _patch_vlm_outer_model_load_weights()
+    _patch_batch_cache_padding_identity()
 
     _APPLIED = True
     logger.info("mlx-vlm Qwen3.5 (dense) runtime MTP patch applied")
     return True
+
+
+def _patch_batch_cache_padding_identity() -> None:
+    """Refresh Qwen's padding metadata after ragged finalization.
+
+    Qwen keys it by array identity, so in-place updates require rebinding.
+    """
+    for module_name in ("mlx_lm.models.cache", "mlx_vlm.models.cache"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:
+            logger.debug(f"{module_name} not importable: {e}")
+            continue
+        for name in ("BatchKVCache", "BatchRotatingKVCache", "BatchQuantizedKVCache"):
+            cls = getattr(module, name, None)
+            if cls is None or getattr(cls, "_omlx_padding_rebind_patched", False):
+                continue
+            original_finalize = cls.finalize
+
+            def finalize(self, _original=original_finalize):
+                padding_pending = (
+                    getattr(self, "_right_padding", None) is not None
+                    or getattr(self, "_lengths", None) is not None
+                )
+                before = getattr(self, "left_padding", None)
+                _original(self)
+                after = getattr(self, "left_padding", None)
+                if padding_pending and isinstance(after, mx.array) and after is before:
+                    self.left_padding = mx.array(after)
+
+            cls.finalize = finalize
+            cls._omlx_padding_rebind_patched = True
 
 
 def _patch_vlm_outer_model_load_weights() -> None:
@@ -121,9 +154,8 @@ def _remap_root_mtp_weights(model: Any, weights: Any) -> Any:
 
     Some third-party MLX Qwen VLM checkpoints use canonical
     ``language_model.*`` paths for the backbone but retain the MTP head at
-    root ``mtp.*``. mlx-vlm skips ``Model.sanitize`` for MLX-format shards,
-    so the normal sanitizer remap never runs and strict loading rejects the
-    head. Only rewrite when the runtime MTP module is actually attached.
+    root ``mtp.*``. Direct load_weights callers also need the canonical path.
+    Only rewrite when the runtime MTP module is attached.
     """
     language_model = getattr(model, "language_model", None)
     if language_model is None or getattr(language_model, "mtp", None) is None:
@@ -286,8 +318,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             return original_init(self, args, config)
         original_init(self, args, config)
         # Attach MTPModule when the config declares MTP heads so mlx-vlm's
-        # load_weights (which skips Model.sanitize for is_mlx_format
-        # checkpoints) can place the persisted mtp.* tensors. Whether MTP
+        # load_weights can place the persisted mtp.* tensors. Whether MTP
         # speculative decode is actually invoked at inference time is gated
         # downstream by ``mlx_lm_mtp.batch_generator._is_mtp_eligible``,
         # which checks the per-instance ``_omlx_mtp_decode_enabled`` marker.
@@ -353,6 +384,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             mask,
             cache,
             capture_layer_ids=[last_layer_idx],
+            speculative_verify=True,
             **kwargs,
         )
         from mlx_vlm.models.base import LanguageModelOutput

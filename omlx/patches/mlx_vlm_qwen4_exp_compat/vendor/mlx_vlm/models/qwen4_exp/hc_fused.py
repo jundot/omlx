@@ -6,9 +6,9 @@ projection with stream mixing. Supports at most 16 BF16 rows, four streams,
 and affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
 can round differently from the canonical BF16 operations.
 
-Each kernel specialization is evaluated once inside the failure handler to
-catch lazy compilation errors. Later calls stay lazy; errors during their
-external evaluation propagate to the caller. Disable with OMLX_QWEN4_HC_FUSED=0.
+Each kernel specialization is evaluated once to catch lazy compilation errors.
+Failures only fall back for the current call; later evaluation errors propagate.
+Disable with OMLX_QWEN4_HC_FUSED=0.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ _DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
 }
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
-_RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
 _INELIGIBLE_LOGGED = False
 
@@ -245,7 +244,7 @@ def _kernel(
 
 
 def enabled() -> bool:
-    return not _DISABLED and not _RUNTIME_FAILED
+    return not _DISABLED
 
 
 def _quantized_ok(projection) -> bool:
@@ -397,7 +396,7 @@ def _tail(hc: int, hidden: int):
 
 def prefill_forward(module, hyper_input):
     """Prefill with canonical normalization and a compiled mean; None on failure."""
-    global _RUNTIME_FAILED, _FAILURE_LOGGED
+    global _FAILURE_LOGGED
     try:
         hc, hidden = module.hc_count, module.hidden_size
         dtype = hyper_input.dtype
@@ -414,7 +413,6 @@ def prefill_forward(module, hyper_input):
             return mixed
         return mixed, hyper_input, injection
     except Exception as exc:  # noqa: BLE001 - optional native path
-        _RUNTIME_FAILED = True
         if not _FAILURE_LOGGED:
             _FAILURE_LOGGED = True
             logger.warning(
@@ -427,7 +425,7 @@ def prefill_forward(module, hyper_input):
 
 def fused_forward(module, hyper_input):
     """Return fused outputs, or None on construction or first-evaluation failure."""
-    global _RUNTIME_FAILED, _FAILURE_LOGGED
+    global _FAILURE_LOGGED
     try:
         hc, hidden, lowrank = module.hc_count, module.hidden_size, module.hc_lowrank
         width = hc * hidden
@@ -511,7 +509,6 @@ def fused_forward(module, hyper_input):
             return mixed
         return mixed, hyper_input, injection.reshape(batch, seq, hc)
     except Exception as exc:  # noqa: BLE001 - optional native path
-        _RUNTIME_FAILED = True
         if not _FAILURE_LOGGED:
             _FAILURE_LOGGED = True
             logger.warning(

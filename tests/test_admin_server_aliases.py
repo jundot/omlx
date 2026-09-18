@@ -1182,3 +1182,35 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         assert gs.cache.gdn_ssd_pending_max_size == "512MB"
         assert gs.cache.gdn_sidecar_state_dtype == "fp32"
         gs.save.assert_not_called()
+
+
+def test_global_defaults_ignore_overrides_and_do_not_write(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.server.port = 9123
+    gs.memory.prefill_memory_guard = False
+    gs.cache.ssd_cache_max_size = "321GB"
+    gs.auth.api_key = "keep-key"
+    gs.model.model_dirs = [str(tmp_path / "models")]
+    gs.save()
+    original = (tmp_path / "settings.json").read_bytes()
+    monkeypatch.setenv("OMLX_PORT", "9456")
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    app.dependency_overrides[admin_routes.require_admin] = lambda: True
+    with _patched_global_settings(gs), TestClient(app) as client:
+        response = client.get("/admin/api/global-settings/defaults")
+    assert response.status_code == 200
+    data = response.json()
+    defaults = GlobalSettings()
+    assert data["server"]["port"] == defaults.server.port
+    assert data["memory"]["prefill_memory_guard"] is True
+    assert data["cache"]["ssd_cache_max_size"] == "auto"
+    assert data["sampling"] == defaults.sampling.to_dict()
+    assert data["auth"]["api_key"] == ""
+    assert gs.server.port == 9123
+    assert gs.auth.api_key == "keep-key"
+    assert gs.model.model_dirs == [str(tmp_path / "models")]
+    assert (tmp_path / "settings.json").read_bytes() == original

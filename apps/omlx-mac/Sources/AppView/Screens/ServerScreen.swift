@@ -188,6 +188,15 @@ struct ServerScreen: View {
                              comment: "Hint footer text under the Server screen explaining which controls apply immediately vs. via the Apply button"),
                 error: vm.lastError
             ) {
+                Button(String(localized: "settings.button.reset_defaults",
+                              defaultValue: "Reset Defaults",
+                              comment: "Fill this screen with defaults before applying")) {
+                    Task { await vm.resetDefaults(client: services.client) }
+                }
+                .buttonStyle(.omlx(.normal))
+                .disabled(vm.isMovingBasePath || vm.isLoading || vm.isResetting || services.canSaveSettingsOffline)
+                .help(String(localized: "settings.reset_defaults.help",
+                             defaultValue: "Restore default values. Paths and API keys are kept. Click Apply to save."))
                 Button(String(localized: "server.button.apply",
                               defaultValue: "Apply",
                               comment: "Button to apply pending server settings: port, default profile, storage, and aliases")) {
@@ -195,8 +204,20 @@ struct ServerScreen: View {
                 }
                     .buttonStyle(.omlx(.primary))
                     .disabled(!vm.hasPendingServerChanges(services: services)
-                              || vm.isMovingBasePath)
+                              || vm.isMovingBasePath || vm.isResetting)
             }
+        }
+        .alert(String(localized: "settings.reset_defaults.title",
+                      defaultValue: "Settings Reset"), isPresented: $vm.showResetNotice) {
+            Button(String(localized: "common.cancel", defaultValue: "Cancel"), role: .cancel) {
+                vm.cancelReset()
+            }
+            Button(String(localized: "common.ok", defaultValue: "OK")) {
+                vm.confirmReset()
+            }
+        } message: {
+            Text(String(localized: "settings.reset_defaults.message",
+                        defaultValue: "Settings have been reset to defaults. Click Apply to save the changes."))
         }
         .task {
             // services.config is already populated by AppDelegate before this

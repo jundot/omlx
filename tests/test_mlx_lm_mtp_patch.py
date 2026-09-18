@@ -15,7 +15,6 @@ from omlx.cache.type_registry import CacheTypeRegistry
 from mlx_lm.generate_utils import BatchCounters
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.models.cache import KVCache
-from mlx_vlm.models.qwen3_5 import language
 
 from omlx.model_settings import ModelSettings
 from omlx.patches import mlx_lm_mtp
@@ -4599,36 +4598,39 @@ def test_singleton_only_model_decodes_multirow_without_mtp(monkeypatch, late_joi
         mlx_lm_mtp.set_mtp_active(active)
 
 
-def test_singleton_and_ordinary_dispatch_are_preserved():
+def test_singleton_and_ordinary_dispatch_are_preserved(monkeypatch):
     calls = []
 
-    def original(linear, x, verify):
-        calls.append((x.shape, verify))
-        return verify
+    from mlx_vlm.speculative.ops import linear as ops
 
-    fake = SimpleNamespace(_use_target_verify_dense=original)
-    qwen35_verify_linear.apply(fake)
-    first = fake._use_target_verify_dense
-    qwen35_verify_linear.apply(fake)
-    assert fake._use_target_verify_dense is first
-    assert first(None, mx.zeros((1, 3, 64)), True)
-    assert not first(None, mx.zeros((1, 1, 64)), False)
-    assert not first(None, mx.zeros((4, 3, 64)), True)
-    assert calls == [((1, 3, 64), True), ((1, 1, 64), False)]
+    def original(linear, x):
+        calls.append(x.shape)
+        return True
+
+    monkeypatch.setattr(ops, "_use_target_verify_dense", original)
+    qwen35_verify_linear.apply()
+    first = ops._use_target_verify_dense
+    qwen35_verify_linear.apply()
+    assert ops._use_target_verify_dense is first
+    assert first(None, mx.zeros((1, 3, 64)))
+    assert not first(None, mx.zeros((4, 3, 64)))
+    assert calls == [(1, 3, 64)]
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("bits", [None, 4, 8])
 @pytest.mark.parametrize("batch,length", [(2, 2), (4, 3)])
 def test_batch_linear_matches_standard_projection(dtype, bits, batch, length):
-    qwen35_verify_linear.apply(language)
+    qwen35_verify_linear.apply()
     mx.random.seed(79)
     layer = nn.Linear(2048, 4096, bias=False)
     if bits is not None:
         layer = nn.QuantizedLinear.from_linear(layer, bits=bits, group_size=64)
     layer.set_dtype(dtype)
     x = mx.random.normal((batch, length, 2048)).astype(dtype)
-    actual = language._target_verify_linear(layer, x, True)
+    from mlx_vlm.speculative.ops.linear import _target_verify_linear
+
+    actual = _target_verify_linear(layer, x)
     expected = layer(x)
     assert actual.dtype == dtype
     assert mx.array_equal(actual, expected)
@@ -4656,17 +4658,19 @@ def test_quantized_qwen_batch_matches_standard(bits, size, monkeypatch):
         host._omlx_mtp_decode_enabled = False
         expected, _ = generate(model, prompts, limits)
         host._omlx_mtp_decode_enabled = True
-        gate = language._use_target_verify_dense
+        from mlx_vlm.speculative.ops import linear as ops
+
+        gate = ops._use_target_verify_dense
         observed = []
 
-        def record(linear, x, verify):
-            result = gate(linear, x, verify)
-            if verify and x.ndim == 3 and x.shape[0] > 1 and x.shape[1] > 1:
+        def record(linear, x):
+            result = gate(linear, x)
+            if x.ndim == 3 and x.shape[0] > 1 and x.shape[1] > 1:
                 observed.append(tuple(x.shape))
                 assert not result
             return result
 
-        monkeypatch.setattr(language, "_use_target_verify_dense", record)
+        monkeypatch.setattr(ops, "_use_target_verify_dense", record)
         actual, _ = generate(model, prompts, limits)
         assert observed, "Actual multi-row verification must use ordinary projections"
         assert actual == expected
@@ -4730,11 +4734,13 @@ def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
                 accepted,
             ]
             for values in cases:
-                references = {count: copy.deepcopy(caches) for count in set(values)}
-                for count, reference in references.items():
-                    original(reference, gdn, count, size)
-                actual = copy.deepcopy(caches)
-                original(actual, gdn, values, size)
+                copies = {count: copy.deepcopy((caches, gdn)) for count in set(values)}
+                references = {}
+                for count, (reference, transaction) in copies.items():
+                    original(reference, transaction, [count] * len(values), size)
+                    references[count] = reference
+                actual, transaction = copy.deepcopy((caches, gdn))
+                original(actual, transaction, values, size)
                 _assert_rows_equal(actual, references, values)
                 checked.append(tuple(values))
             return original(caches, gdn, accepted, size)
@@ -4747,3 +4753,85 @@ def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
         mlx_lm_mtp.set_mtp_depth(previous_depth)
+
+
+def _cache_rows(cache):
+    for layer in cache or ():
+        offset = getattr(layer, "offset", None)
+        if isinstance(offset, mx.array) and offset.ndim == 1:
+            return int(offset.size)
+    return None
+
+
+@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
+def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family):
+    previous = mlx_lm_mtp.is_mtp_active()
+    previous_depth = mlx_lm_mtp.get_mtp_depth()
+    mlx_lm_mtp.set_mtp_active(True)
+    mlx_lm_mtp.set_mtp_depth(2)
+    monkeypatch.setattr(bg, "_DepthController", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    try:
+        mx.random.seed(173)
+        model = _model(family)
+        host = model._language_model
+        mx.eval(model.parameters())
+        prompts = [[3, 4, 5, 6, 7], [3, 6, 7, 8, 4, 5, 6], [4, 5, 6]]
+        limits = [18, 22, 17]
+        host._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, limits)
+        host._omlx_mtp_decode_enabled = True
+        # Force boundary crossings within the short generation.
+        model._omlx_mtp_commit_align = 4
+        materialized = []
+        last_verify_rows = [0]
+        original_materialize = bg._materialize_mtp_boundary_emit
+
+        def materialize(row, state):
+            materialized.append(last_verify_rows[0])
+            return original_materialize(row, state)
+
+        original_backbone = bg._call_backbone
+
+        def backbone(target, inputs, cache, n_confirmed=0):
+            rows = _cache_rows(cache)
+            assert rows is None or rows == int(inputs.shape[0])
+            if n_confirmed:
+                last_verify_rows[0] = int(inputs.shape[0])
+            return original_backbone(target, inputs, cache, n_confirmed)
+
+        monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
+        monkeypatch.setattr(bg, "_call_backbone", backbone)
+        actual, _ = generate(model, prompts, limits)
+        assert actual == expected
+        assert any(rows > 1 for rows in materialized)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+        mlx_lm_mtp.set_mtp_depth(previous_depth)
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_lightning_verify_preserves_quantized_linear_dispatch(monkeypatch, batch):
+    from mlx_vlm.models.qwen3_5 import speculative_verifier
+    from mlx_vlm.speculative.ops import linear as ops
+
+    from omlx.patches import qwen35_verify_qmm
+
+    qwen35_verify_linear.apply()
+    monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: True)
+    calls = []
+    layer = nn.QuantizedLinear(64, 64, bits=4, group_size=64)
+    x = mx.zeros((batch, 3, 64))
+
+    def projection(self, values):
+        calls.append(values.shape)
+        return values
+
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", projection)
+    assert ops._target_verify_linear(layer, x) is x
+    assert ops._target_verify_linears((layer, layer), x) == (x, x)
+    verifier = speculative_verifier.Qwen3_5BatchInvariantForward()
+    assert verifier._linear(layer, x) is x
+    assert verifier._linears((layer, layer), x) == (x, x)
+    assert verifier.quantized_linear(layer, x) is x
+    assert calls == [x.shape] * 7

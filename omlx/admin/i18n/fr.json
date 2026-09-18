@@ -36,6 +36,7 @@
   "navbar.tab.logs": "Logs",
   "navbar.tab.bench": "Benchmark",
   "navbar.tab.chat": "Chat",
+  "navbar.tablist_label": "Sections du tableau de bord",
   "navbar.dropdown.manager": "Gestionnaire",
   "navbar.dropdown.downloader": "Downloader",
   "navbar.dropdown.quantizer": "Quantification oQ",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "Limit document attachments converted in one request.",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF processing engine",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine.",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "Le modèle OCR sélectionné est indisponible. Les PDF sont traités avec MarkItDown jusqu'à ce que le modèle soit à nouveau disponible ou que vous sélectionniez un autre moteur.",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly.",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",
@@ -1973,5 +1975,12 @@
   "usage.delayed": "L'historique peut être incomplet : le stockage est retardé ou le tampon en attente a débordé.",
   "usage.loading": "Chargement de l'utilisation…",
   "usage.disabled": "L'historique d'utilisation est désactivé. Activez-le dans Paramètres → Historique d'utilisation.",
-  "usage.open_settings": "Ouvrir les paramètres"
+  "usage.open_settings": "Ouvrir les paramètres",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Annuler"
 }

@@ -40,7 +40,10 @@ class PoolingCacheHandler(CacheTypeHandler):
         return cache_obj.ratio
 
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
-        buf_kv, buf_gate, pooled, prev_win_kv, prev_win_gate = cache_obj.state
+        state = cache_obj.state
+        if len(state) == 3:
+            state = (*state, None, None)
+        buf_kv, buf_gate, pooled, prev_win_kv, prev_win_gate = state
         return {
             "buf_kv": buf_kv,
             "buf_gate": buf_gate,

@@ -551,289 +551,136 @@ def _qwen4_decode_dynamic_eligible(
 
 
 def apply_qwen35_gdn_prework_patch() -> bool:
-    """Route the batch-1 target-verify GDN prework through the fused kernel.
-
-    Wraps ``Qwen3_5GatedDeltaNet.__call__``: the fused arm re-implements the
-    verify forward using the module's own weights and the SAME module-level
-    helpers (recurrence, sink capture, cache advance); every other shape
-    falls through to the original untouched. Any failure inside the fused
-    arm falls back to the original call for that layer permanently.
-    """
+    """Install fused prework at ordinary decode and speculative entry points."""
     global _PATCHED
     if _PATCHED:
         return True
     if not mx.metal.is_available():
         return False
 
-    try:
-        from mlx_vlm.models.qwen3_5 import language as q35
-    except ImportError:
-        return False
-
-    needed = (
-        "Qwen3_5GatedDeltaNet",
-        "_target_verify_linears",
-        "_target_verify_linear",
-        "_gated_delta_update_verify_decode",
-        "_qwen3_5_advance_left_padding_info",
-        "_qwen3_5_advance_lengths_info",
-    )
-    if not all(hasattr(q35, n) for n in needed):
-        logger.debug("gdn prework: upstream seams missing; patch skipped")
-        return False
+    from mlx_vlm.models.qwen3_5 import language as q35
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.speculative.ops.linear import _target_verify_linears
 
     cls = q35.Qwen3_5GatedDeltaNet
-    if getattr(cls, "_omlx_gdn_prework_patched", False):
-        _PATCHED = True
-        return True
+    original = cls.__call__
+    original_verify = Qwen3_5BatchInvariantForward._gated_delta
 
-    orig_call = cls.__call__
-    disabled = {"flag": False}
-    qwen4_decode_disabled = {"flag": False}
+    def decode(self, inputs, mask=None, cache=None):
+        if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
+            return original(self, inputs, mask=mask, cache=cache)
+        mixed_qkv, z, b, a = _target_verify_linears(
+            (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a), inputs
+        )
+        inv = self.head_k_dim**-0.5
+        q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
+            mixed_qkv,
+            cache[0],
+            self.conv1d.weight,
+            mx.array(inv * inv, dtype=mx.bfloat16),
+            mx.array(inv, dtype=mx.bfloat16),
+            b,
+            a,
+            self.A_log,
+            self.dt_bias,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        )
+        out, state = _qwen4_decode_recurrence(q, k, v, g, beta, cache[1])
+        flat = qwen4_decode_norm_gate_fused(
+            out,
+            z,
+            self.norm.weight,
+            hv=self.num_v_heads,
+            dv=self.head_v_dim,
+            eps=self.norm.eps,
+        )
+        result = self.out_proj(flat)
+        cache[0], cache[1] = conv_state, state
+        if hasattr(cache, "advance"):
+            cache.advance(1)
+            q35._qwen3_5_advance_left_padding_info(cache, 1)
+            q35._qwen3_5_advance_lengths_info(cache, 1)
+        global _QWEN4_DECODE_ENGAGED_LOGGED
+        if not _QWEN4_DECODE_ENGAGED_LOGGED:
+            _QWEN4_DECODE_ENGAGED_LOGGED = True
+            logger.info("Qwen4 fused B1/T1 GDN decode prework and norm-gate engaged")
+        return result
 
-    def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
-        if gdn_sink is None or cache is None:
-            return False
-        if not (2 <= s_len <= 9):
-            return False
-        if mask is not None:
-            return False
-        if inputs.dtype != mx.bfloat16:
-            return False
-        if getattr(self, "conv_kernel_size", 0) != 4:
-            return False
-        if self.head_k_dim != 128 or self.head_v_dim != 128:
-            return False
-        if getattr(cache, "lengths", None) is not None:
-            return False
-        conv_state = cache[0]
-        if conv_state is None or conv_state.shape[0] != inputs.shape[0]:
-            return False
-        if conv_state.dtype != mx.bfloat16:
-            return False
-        if self.conv1d.weight.dtype != mx.bfloat16:
-            return False
-        return getattr(self.conv1d, "bias", None) is None
-
-    def patched_call(self, inputs, mask=None, cache=None, gdn_sink=None,
-                     target_verify=False):
-        S = inputs.shape[1]
-        if (
-            not qwen4_decode_disabled["flag"]
-            and _qwen4_decode_dynamic_eligible(
-                self,
-                inputs,
-                mask,
-                cache,
-                gdn_sink,
-                target_verify,
-            )
+    def verify(verifier, layer, inputs, mask, cache):
+        length = inputs.shape[1]
+        # The fused prework uses Qwen3.5 RMS scaling, not Qwen4 L2 scaling.
+        compatible_norm = (
+            type(verifier)._normalize_gated_delta_qk
+            is Qwen3_5BatchInvariantForward._normalize_gated_delta_qk
+        )
+        if not (
+            compatible_norm
+            and cache is not None
+            and cache.is_speculating
+            and 2 <= length <= 9
+            and mask is None
+            and inputs.dtype == mx.bfloat16
+            and layer.conv_kernel_size == 4
+            and layer.head_k_dim == 128
+            and layer.head_v_dim == 128
+            and cache.lengths is None
+            and cache[0] is not None
+            and cache[0].shape[0] == inputs.shape[0]
+            and cache[0].dtype == mx.bfloat16
+            and layer.conv1d.weight.dtype == mx.bfloat16
+            and getattr(layer.conv1d, "bias", None) is None
         ):
-            conv_state = cache[0]
-            recurrent_state = cache[1]
-            try:
-                mixed_qkv, z, b, a = q35._target_verify_linears(
-                    (
-                        self.in_proj_qkv,
-                        self.in_proj_z,
-                        self.in_proj_b,
-                        self.in_proj_a,
-                    ),
-                    inputs,
-                    False,
-                )
-                inv_scale = self.head_k_dim**-0.5
-                q_scale = getattr(self, "_omlx_qwen4_decode_q_scale", None)
-                k_scale = getattr(self, "_omlx_qwen4_decode_k_scale", None)
-                if q_scale is None or k_scale is None:
-                    q_scale = mx.array(
-                        inv_scale * inv_scale,
-                        dtype=mx.bfloat16,
-                    )
-                    k_scale = mx.array(inv_scale, dtype=mx.bfloat16)
-                    self._omlx_qwen4_decode_q_scale = q_scale
-                    self._omlx_qwen4_decode_k_scale = k_scale
+            return original_verify(verifier, layer, inputs, mask, cache)
+        mixed_qkv, z, b, a = verifier._linears(
+            (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a),
+            inputs,
+        )
+        inv = layer.head_k_dim**-0.5
+        q, k, v, conv_state = gdn_prework_fused(
+            mixed_qkv,
+            cache[0],
+            layer.conv1d.weight,
+            mx.array(inv * inv, dtype=mx.bfloat16),
+            mx.array(inv, dtype=mx.bfloat16),
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_k_dim,
+            layer.head_v_dim,
+        )
+        conv_input = mx.concatenate([cache[0], mixed_qkv], axis=1)
+        cache.record_speculative_window(0, conv_input, layer.conv_kernel_size - 1)
+        cache[0] = conv_state
+        out, _ = q35.gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            layer.A_log,
+            layer.dt_bias,
+            cache=cache,
+            use_kernel=not layer.training,
+        )
+        if hasattr(cache, "advance"):
+            cache.advance(length)
+            q35._qwen3_5_advance_left_padding_info(cache, length)
+            q35._qwen3_5_advance_lengths_info(cache, length)
+        out = layer.norm(out, z.reshape(inputs.shape[0], length, -1, layer.head_v_dim))
+        result = verifier._linear(
+            layer.out_proj, out.reshape(inputs.shape[0], length, -1)
+        )
+        global _ENGAGED_LOGGED
+        if not _ENGAGED_LOGGED:
+            _ENGAGED_LOGGED = True
+            logger.info("[gdn-prework] fused verify prework engaged (S=%d)", length)
+        return result
 
-                q, k, v, next_conv_state, g, beta = (
-                    qwen4_decode_prework_fused(
-                        mixed_qkv,
-                        conv_state,
-                        self.conv1d.weight,
-                        q_scale,
-                        k_scale,
-                        b,
-                        a,
-                        self.A_log,
-                        self.dt_bias,
-                        self.num_k_heads,
-                        self.num_v_heads,
-                        self.head_k_dim,
-                        self.head_v_dim,
-                    )
-                )
-                out, next_recurrent_state = _qwen4_decode_recurrence(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    recurrent_state,
-                )
-                flat = qwen4_decode_norm_gate_fused(
-                    out,
-                    z,
-                    self.norm.weight,
-                    hv=self.num_v_heads,
-                    dv=self.head_v_dim,
-                    eps=self.norm.eps,
-                )
-                result = q35._target_verify_linear(
-                    self.out_proj,
-                    flat,
-                    False,
-                )
-
-                # Commit cache ownership only after every fallible graph
-                # construction step succeeded.  This mirrors the verify
-                # route below and keeps a fallback from applying the token
-                # twice after a late error.
-                cache[0] = next_conv_state
-                cache[1] = next_recurrent_state
-                if hasattr(cache, "advance"):
-                    cache.advance(1)
-                    q35._qwen3_5_advance_left_padding_info(cache, 1)
-                    q35._qwen3_5_advance_lengths_info(cache, 1)
-
-                global _QWEN4_DECODE_ENGAGED_LOGGED
-                if not _QWEN4_DECODE_ENGAGED_LOGGED:
-                    _QWEN4_DECODE_ENGAGED_LOGGED = True
-                    logger.info(
-                        "Qwen4 fused B1/T1 GDN decode prework and norm-gate "
-                        "engaged"
-                    )
-                return result
-            except Exception:
-                cache[0] = conv_state
-                cache[1] = recurrent_state
-                qwen4_decode_disabled["flag"] = True
-                logger.warning(
-                    "Qwen4 fused GDN decode arm failed; reverting to stock "
-                    "for the rest of the process",
-                    exc_info=True,
-                )
-
-        if disabled["flag"] or not _eligible(self, inputs, mask, cache, gdn_sink, S):
-            return orig_call(self, inputs, mask=mask, cache=cache,
-                             gdn_sink=gdn_sink, target_verify=target_verify)
-        # Captured before the try block (and before any fallible op) so the
-        # except branch always has the pre-mutation state to restore, even
-        # if the failure happens before this point is normally reached.
-        conv_state = cache[0]
-        recurrent_state = cache[1]
-        sink_len = len(gdn_sink) if gdn_sink is not None else 0
-        try:
-            B = inputs.shape[0]
-            mixed_qkv, z, b, a = q35._target_verify_linears(
-                (self.in_proj_qkv, self.in_proj_z, self.in_proj_b,
-                 self.in_proj_a),
-                inputs,
-                True,
-            )
-            z = z.reshape(B, S, -1, self.head_v_dim)
-
-            if not hasattr(self, "_omlx_gdn_scales"):
-                inv = self.head_k_dim ** -0.5
-                self._omlx_gdn_scales = (
-                    mx.array(inv * inv, dtype=mx.bfloat16),
-                    mx.array(inv, dtype=mx.bfloat16),
-                )
-            q_scale, k_scale = self._omlx_gdn_scales
-
-            q, k, v, new_conv_state = gdn_prework_fused(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight,
-                q_scale,
-                k_scale,
-                self.num_k_heads,
-                self.num_v_heads,
-                self.head_k_dim,
-                self.head_v_dim,
-            )
-            cache[0] = new_conv_state
-
-            state = recurrent_state
-            if state is not None and state.shape[0] != B:
-                state = None
-            initial_state = state
-            out, state, intermediate_states = (
-                q35._gated_delta_update_verify_decode(
-                    q, k, v, a, b, self.A_log, self.dt_bias, state, None,
-                    use_kernel=not self.training,
-                )
-            )
-            # The rollback capture wants the conv INPUT window; build it
-            # lazily — it is only evaluated on a partial accept.
-            conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-            gdn_sink.append(
-                (
-                    q, k, v, a, b, self.A_log, self.dt_bias, initial_state,
-                    None, conv_input, self.conv_kernel_size,
-                    intermediate_states,
-                )
-            )
-
-            cache[1] = state
-
-            global _ENGAGED_LOGGED
-            if not _ENGAGED_LOGGED:
-                _ENGAGED_LOGGED = True
-                logger.info(
-                    "[gdn-prework] fused verify prework engaged (S=%d)", S
-                )
-
-            out = self.norm(out, z)
-            result = q35._target_verify_linear(
-                self.out_proj, out.reshape(B, S, -1), True
-            )
-            # Deferred to the very end, after every fallible step has
-            # succeeded: advancing here and then hitting an exception below
-            # would double-advance once the except branch below falls back
-            # to orig_call, which advances the cache itself.
-            if hasattr(cache, "advance"):
-                cache.advance(S)
-                q35._qwen3_5_advance_left_padding_info(cache, S)
-                q35._qwen3_5_advance_lengths_info(cache, S)
-            return result
-        except Exception:
-            disabled["flag"] = True
-            # cache[0] may already hold the fused kernel's post-update conv
-            # state (set above, before the delta update that can raise);
-            # orig_call's stock path recomputes conv from scratch and
-            # expects the pre-call state, so restore it before falling back
-            # -- otherwise it silently double-applies the conv step.
-            cache[0] = conv_state
-            # A late failure can also happen after the recurrent delta state
-            # has been committed to cache[1]. The stock fallback consumes the
-            # same tokens again, so it must start from the original recurrent
-            # state as well or silently double-apply the delta update.
-            cache[1] = recurrent_state
-            # A failure after the sink append (norm/out_proj) would leave
-            # the fused entry in place while orig_call appends the stock
-            # one -- two entries for one layer call shifts every later
-            # layer's rollback capture. Drop anything this call appended.
-            if gdn_sink is not None:
-                del gdn_sink[sink_len:]
-            logger.warning(
-                "gdn prework fused arm failed; reverting to stock for the "
-                "rest of the process",
-                exc_info=True,
-            )
-            return orig_call(self, inputs, mask=mask, cache=cache,
-                             gdn_sink=gdn_sink, target_verify=target_verify)
-
-    cls.__call__ = patched_call
+    cls.__call__ = decode
     cls._omlx_gdn_prework_patched = True
+    Qwen3_5BatchInvariantForward._gated_delta = verify
     _PATCHED = True
-    logger.info("Qwen3.5/3.6 fused GDN verify prework patch applied")
+    logger.info("Qwen fused GDN prework patch applied")
     return True

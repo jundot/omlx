@@ -775,7 +775,7 @@ def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
 @pytest.mark.parametrize("size", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_masked_replay_restores_metadata(size, dtype):
-    from mlx_lm.models.cache import ArraysCache
+    from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.glm5_next import language
 
     mx.random.seed(884)
@@ -819,7 +819,8 @@ def test_masked_replay_restores_metadata(size, dtype):
 
 
 def test_invalid_vector_does_not_mutate_any_cache():
-    from mlx_lm.models.cache import ArraysCache, CacheList, BatchKVCache
+    from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList
+
     from omlx.patches.deepseek_v4.cache_extras import BatchPoolingCache
 
     cache = ArraysCache(2)

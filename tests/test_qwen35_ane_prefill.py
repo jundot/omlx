@@ -577,47 +577,18 @@ def test_gdn_profitable_tail_is_padded_before_recurrence(monkeypatch):
     assert [part[0, -1, 0].item() for part in result] == [1, 2, 3, 4]
 
 
-def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
-    fallback = object()
-    accelerated = object()
+def test_install_dispatch_adds_gdn_projection_hook(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
 
-    def target_linears(linears, x, target_verify=False):
-        return fallback
-
-    vlm = SimpleNamespace(
-        Qwen3_5MLP=None,
-        register_qwen3_5_mlp_prefill_backend=lambda backend: None,
-        _target_verify_linears=target_linears,
-    )
-    lm = SimpleNamespace(MLP=None)
-
-    def import_module(name):
-        if name == "mlx_vlm.models.qwen3_5.language":
-            return vlm
-        if name == "mlx_lm.models.qwen3_5":
-            return lm
-        raise ImportError(name)
-
-    monkeypatch.setattr(ane_patch.importlib, "import_module", import_module)
-    monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_GDN_MODULES", weakref.WeakValueDictionary())
+    calls = []
     monkeypatch.setattr(
-        ane_patch, "_gdn_backend", lambda gdn, x, target_verify=False: accelerated
+        q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: calls.append("vlm")
     )
-
-    gdn = _GDN()
-    ane_patch._register_gdn_module(gdn)
+    monkeypatch.setattr(q4patch, "register_qwen35_lm_gdn_prefill_backend", calls.append)
+    monkeypatch.setattr(ane_patch, "_wrap_class", lambda cls: None)
 
     assert ane_patch._install_dispatch()
-    assert (
-        vlm._target_verify_linears(
-            (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
-            mx.zeros((1, 1, 128)),
-        )
-        is accelerated
-    )
-    assert vlm._target_verify_linears((object(),), mx.zeros((1, 1, 128))) is fallback
+    assert calls == [ane_patch._gdn_backend, "vlm"]
 
 
 def test_install_dispatch_registers_mlx_lm_gdn_backend(monkeypatch):
@@ -2405,6 +2376,8 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
         def __call__(self, x):
             return x
 
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
     registrations = []
     gdn_registrations = []
     vlm = SimpleNamespace(
@@ -2422,6 +2395,11 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
     monkeypatch.setattr(ane_patch, "_PATCHED_CLASSES", set())
     monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
     monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
+
+    monkeypatch.setattr(q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: None)
+    monkeypatch.setattr(
+        q4patch, "register_qwen35_lm_gdn_prefill_backend", gdn_registrations.append
+    )
 
     assert ane_patch._install_dispatch()
     assert PatchedMLP in ane_patch._PATCHED_CLASSES

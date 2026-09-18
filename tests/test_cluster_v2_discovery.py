@@ -12,6 +12,7 @@ import logging
 import socket
 import struct
 import time
+from types import SimpleNamespace
 
 from omlx.cluster.discovery import (
     _TX_FAIL_RESET_ROUNDS,
@@ -22,6 +23,7 @@ from omlx.cluster.discovery import (
     PeerCaps,
     PeerRecord,
     _classify_link,
+    _default_interface_lister,
     _http_probe_node_id,
     _system_proxy_probe_node_id,
     _tailscale_executable,
@@ -794,6 +796,67 @@ def test_mdns_handler_exception_is_contained():
 # -- interface joins ------------------------------------------------------------
 
 
+def test_default_interfaces_exclude_inactive_and_non_ipv6_links(monkeypatch):
+    output = """lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+    inet6 ::1 prefixlen 128
+en0: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet6 fe80::1%en0 prefixlen 64
+    status: active
+en11: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet6 fe80::2%en11 prefixlen 64
+    status: inactive
+en12: flags=8862<BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet6 fe80::3%en12 prefixlen 64
+    status: active
+en13: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet 192.168.1.2 netmask 0xffffff00
+    status: active
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+    inet6 fe80::4%utun0 prefixlen 64
+"""
+    monkeypatch.setattr("omlx.cluster.discovery.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output),
+    )
+    assert _default_interface_lister() == ["en0", "utun0"]
+
+    output = output.replace("status: active", "status: inactive")
+    output = output.replace("8051<UP,", "8050<")
+    assert _default_interface_lister() == []
+
+
+def test_interface_reconnect_leaves_membership_before_rejoining(monkeypatch):
+    names = ["en11"]
+    service, _ = _service(interface_lister=lambda: names)
+    sock = FakeSocket()
+    memberships = set()
+
+    def setsockopt(level, option, membership):
+        if option == socket.IPV6_JOIN_GROUP:
+            if membership in memberships:
+                raise OSError(errno.EADDRINUSE, "Already joined")
+            memberships.add(membership)
+        elif option == socket.IPV6_LEAVE_GROUP:
+            memberships.remove(membership)
+
+    sock.setsockopt = setsockopt
+    monkeypatch.setattr(socket, "if_nametoindex", lambda name: 14)
+    service._sync_interfaces(sock)
+    service._send_hello(sock)
+    names.clear()
+    service._sync_interfaces(sock)
+    service._send_hello(sock)
+    assert len(sock.sent) == 1
+    assert not memberships
+
+    names.append("en11")
+    service._sync_interfaces(sock)
+    service._send_hello(sock)
+    assert len(sock.sent) == 2
+    assert sock.sent[-1][1] == (MULTICAST_GROUP, MULTICAST_PORT, 0, 14)
+
+
 def test_interface_sync_skips_unsupported_interfaces():
     sock = FakeSocket()
     service, _ = _service(
@@ -961,13 +1024,15 @@ def test_send_hello_uses_scoped_4tuple_per_interface():
     )
 
 
-def test_send_hello_without_joins_uses_default_route_2tuple():
+def test_send_hello_without_active_interfaces_does_not_send():
     sock = FakeSocket()
     service, _ = _service(socket_factory=lambda: sock)
 
     service._send_hello(sock)
 
-    assert sock.sent[0][1] == (MULTICAST_GROUP, MULTICAST_PORT)
+    assert not sock.sent
+    assert service._consecutive_tx_fail_rounds == 0
+    assert not service._needs_socket_reset
 
 
 def test_wassup_reply_preserves_link_local_scope_id():
@@ -1027,7 +1092,7 @@ def test_send_failures_are_rate_limited(caplog):
     service, clock = _service(socket_factory=lambda: sock)
     service._joined = {"en0": 10}
 
-    with caplog.at_level(logging.DEBUG, logger="omlx.cluster.discovery"):
+    with caplog.at_level(5, logger="omlx.cluster.discovery"):
         service._send_hello(sock)
         clock.advance(5)
         service._send_hello(sock)  # inside the 60s window: silent
@@ -1035,6 +1100,17 @@ def test_send_failures_are_rate_limited(caplog):
         clock.advance(61)
         service._send_hello(sock)
         assert sum("HELLO send on if" in r.getMessage() for r in caplog.records) == 2
+        assert all(
+            r.levelno == 5
+            for r in caplog.records
+            if "HELLO send on if" in r.getMessage()
+        )
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="omlx.cluster.discovery"):
+        clock.advance(61)
+        service._send_hello(sock)
+        assert not any("HELLO send on if" in r.getMessage() for r in caplog.records)
 
 
 def test_consecutive_failed_rounds_request_socket_reset():

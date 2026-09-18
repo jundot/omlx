@@ -22,7 +22,7 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_string = str(path)
     if path_string not in package_path:
-        package_path.append(path_string)
+        package_path.insert(0, path_string)
 
 
 def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
@@ -41,14 +41,12 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
         from mlx_vlm.models.qwen3_5 import language as qwen35_language
 
         from ..mlx_vlm_mtp import (
-            qwen35_batch_rollback,
             qwen35_verify_attention,
             qwen35_verify_linear,
         )
 
         # Reuse the shared primitives without replacing Qwen4's HC trunk.
-        qwen35_verify_linear.apply(qwen35_language)
-        qwen35_batch_rollback.apply(qwen35_language)
+        qwen35_verify_linear.apply()
         qwen35_verify_attention.apply(qwen35_language)
         _patch_prompt_utils()
         _patch_prompt_loop()

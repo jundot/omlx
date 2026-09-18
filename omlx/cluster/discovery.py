@@ -832,20 +832,32 @@ def load_cluster_name(base_path: Path | str | None = None) -> str:
 
 
 def _default_interface_lister() -> list[str]:
-    """Names of multicast-capable candidate interfaces (never raises)."""
+    """Names of active IPv6 multicast interfaces (never raises)."""
 
     names: list[str] = []
     if sys.platform == "darwin":
         try:
             result = subprocess.run(  # noqa: S603 - fixed system executable
-                ["/sbin/ifconfig", "-l"],
+                ["/sbin/ifconfig", "-a"],
                 capture_output=True,
                 text=True,
                 timeout=2.0,
                 check=False,
             )
             if result.returncode == 0:
-                names = result.stdout.split()
+                for block in re.split(r"\n(?=\S)", result.stdout):
+                    header = re.match(r"^(\S+):\s+flags=[0-9a-fA-F]+<([^>]*)>", block)
+                    if header is None:
+                        continue
+                    name, flags = header.groups()
+                    if (
+                        not name.startswith("lo")
+                        and {"UP", "MULTICAST"} <= set(flags.split(","))
+                        and not re.search(r"^\s+status:\s+inactive\s*$", block, re.M)
+                        and re.search(r"^\s+inet6\s+", block, re.M) is not None
+                    ):
+                        names.append(name)
+                return names
         except (OSError, subprocess.SubprocessError):
             names = []
     if not names:
@@ -1383,7 +1395,14 @@ class DiscoveryService:
         current = set(names)
         for name, ifindex in list(self._joined.items()):
             if name not in current:
-                # Interface vanished; its group membership dies with it.
+                # An inactive interface can retain membership until explicitly left.
+                membership = socket.inet_pton(
+                    socket.AF_INET6, MULTICAST_GROUP
+                ) + struct.pack("@I", ifindex)
+                with suppress(OSError):
+                    sock.setsockopt(
+                        socket.IPPROTO_IPV6, socket.IPV6_LEAVE_GROUP, membership
+                    )
                 self._joined.pop(name, None)
                 continue
             try:
@@ -1504,12 +1523,13 @@ class DiscoveryService:
                 self._joined.clear()
 
     def _send_hello(self, sock: Any) -> None:
-        nonce = secrets.randbits(64)
         with self._lock:
+            joined = list(self._joined.values())
+            if not joined:
+                return
+            nonce = secrets.randbits(64)
             self._nonces.append(nonce)
         payload = encode_hello(nonce, self._cluster_hash)
-        with self._lock:
-            joined = list(self._joined.values()) or [0]
         any_ok = False
         last_error: str | None = None
         now = self._clock()
@@ -1519,11 +1539,7 @@ class DiscoveryService:
             # IPV6_MULTICAST_IF on the shared socket per round instead; that
             # state goes stale when macOS renumbers interfaces on
             # Thunderbolt hotplug and every send then fails EHOSTUNREACH.)
-            target = (
-                (MULTICAST_GROUP, MULTICAST_PORT, 0, ifindex)
-                if ifindex
-                else (MULTICAST_GROUP, MULTICAST_PORT)
-            )
+            target = (MULTICAST_GROUP, MULTICAST_PORT, 0, ifindex)
             try:
                 sock.sendto(payload, target)
                 any_ok = True
@@ -1534,7 +1550,7 @@ class DiscoveryService:
                     >= _TX_FAIL_LOG_INTERVAL
                 ):
                     self._tx_fail_logged_at[ifindex] = now
-                    logger.debug("HELLO send on if %d failed: %s", ifindex, exc)
+                    logger.log(5, "HELLO send on if %d failed: %s", ifindex, exc)
         if any_ok:
             self._consecutive_tx_fail_rounds = 0
             self._consecutive_socket_resets = 0

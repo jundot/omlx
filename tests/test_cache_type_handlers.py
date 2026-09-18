@@ -1332,11 +1332,14 @@ class TestCacheListHandlerWithMLX:
         assert len(cache.caches) == 2
 
 
-def test_chunked_cache_restore_preserves_absolute_position_and_next_update():
+@pytest.mark.parametrize("module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"])
+def test_chunked_cache_restore_preserves_absolute_position_and_next_update(module):
     mx = pytest.importorskip("mlx.core")
+    from importlib import import_module
+
     from mlx_lm.models.cache import ChunkedKVCache
 
-    cache = ChunkedKVCache(4)
+    cache = import_module(module).ChunkedKVCache(4)
     keys = mx.arange(12, dtype=mx.float32).reshape(1, 1, 6, 2)
     cache.update_and_fetch(keys, keys + 100)
     cache.maybe_trim_front()

@@ -294,3 +294,140 @@ def test_short_external_prefills_share_admission_debt(clock, ane_prefill):
     assert rejected == []
     assert not scheduler.waiting
     assert forwarded == [2, 2]
+
+
+@pytest.mark.parametrize("other_engine", [False, True])
+def test_waiting_and_inflight_prefills_both_progress_under_decode_load(
+    clock, other_engine
+):
+    scheduler = make_scheduler()
+    if other_engine:
+        get_decode_activity().publish("other-decoder", 1)
+    else:
+        scheduler.running["decoder"] = make_request("decoder")
+    add_prefill(scheduler, "inflight")
+    for index in range(3):
+        scheduler.add_request(make_request(f"waiting-{index}", 3))
+    events = []
+
+    def advance(state):
+        events.append("inflight")
+        clock.now += 0.5
+        scheduler._accrue_decode_debt(0.5)
+        return False
+
+    def forward(tokens, **kwargs):
+        events.append("waiting")
+        clock.now += 0.5
+
+    def decode():
+        clock.now += 0.125
+        return iter([])
+
+    scheduler.model.side_effect = forward
+    scheduler.batch_generator.next_generated.side_effect = decode
+    with (
+        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
+        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
+    ):
+        for _ in range(24):
+            scheduler.step()
+            clock.now += 0.125
+            if not scheduler.waiting:
+                break
+
+    assert not scheduler.waiting
+    assert events == ["inflight", "waiting"] * 3
+    assert "inflight" in scheduler._prefill_states
+    assert all(f"waiting-{index}" in scheduler.running for index in range(3))
+
+
+@pytest.mark.parametrize("blocker", ["capacity", "memory", "store", "freshness"])
+def test_admission_turn_keeps_guards_and_allows_inflight_progress(clock, blocker):
+    scheduler = make_scheduler()
+    scheduler.running["decoder"] = make_request("decoder")
+    add_prefill(scheduler, "inflight")
+    waiting = make_request("waiting", 3)
+    scheduler.add_request(waiting)
+    advanced = []
+
+    def advance(state):
+        advanced.append(state.request.request_id)
+        scheduler._accrue_decode_debt(0.5)
+        return False
+
+    with patch.object(scheduler, "_step_prefill_chunk", side_effect=advance):
+        scheduler.step()
+        scheduler._repay_decode_debt(scheduler._decode_time_owed_s)
+        if blocker == "capacity":
+            scheduler.config.max_num_seqs = 2
+        elif blocker == "memory":
+            scheduler._admission_paused = True
+        elif blocker == "store":
+            scheduler._store_cache_gate = SimpleNamespace(
+                has_capacity=False, in_flight=2, cap=2
+            )
+        else:
+            scheduler._should_defer_for_cache_freshness = lambda request: True
+        scheduler.step()
+
+    assert advanced == ["inflight", "inflight"]
+    assert list(scheduler.waiting) == [waiting]
+
+
+def test_cross_engine_admission_chunk_reports_work_without_advancing_twice(clock):
+    scheduler = make_scheduler()
+    get_decode_activity().publish("other-decoder", 1)
+    add_prefill(scheduler, "inflight")
+    scheduler.add_request(make_request("waiting"))
+    advanced = []
+
+    def advance(state):
+        advanced.append(state.request.request_id)
+        scheduler._accrue_decode_debt(0.5)
+        return False
+
+    with (
+        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
+        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
+    ):
+        scheduler.step()
+        clock.now = get_decode_activity().hold_until()
+        output = scheduler.step()
+
+    assert advanced == ["inflight", "waiting"]
+    assert output.has_work
+    assert prefill_ids(scheduler) == ["inflight", "waiting"]
+    assert not scheduler.running
+    assert not scheduler.waiting
+
+
+def test_cancel_after_admission_turn_preserves_inflight_prefill(clock):
+    scheduler = make_scheduler()
+    scheduler.running["decoder"] = make_request("decoder")
+    add_prefill(scheduler, "inflight")
+    scheduler.add_request(make_request("cancelled"))
+    advanced = []
+
+    def advance(state):
+        advanced.append(state.request.request_id)
+        scheduler._accrue_decode_debt(0.5)
+        return False
+
+    with (
+        patch.object(scheduler, "_step_prefill_chunk", side_effect=advance),
+        patch("omlx.scheduler.make_prompt_cache", return_value=[]),
+    ):
+        scheduler.step()
+        scheduler._repay_decode_debt(scheduler._decode_time_owed_s)
+        scheduler.step()
+        assert prefill_ids(scheduler) == ["inflight", "cancelled"]
+        scheduler.abort_request("cancelled")
+        scheduler._repay_decode_debt(scheduler._decode_time_owed_s)
+        scheduler.step()
+
+    assert advanced == ["inflight", "cancelled", "inflight"]
+    assert "cancelled" not in scheduler.requests
+    assert "cancelled" not in scheduler._prefill_states
+    assert prefill_ids(scheduler) == ["inflight"]
+    assert "decoder" in scheduler.running

@@ -4500,6 +4500,24 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    return _global_settings_response(global_settings)
+
+
+@router.get("/api/global-settings/defaults")
+async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
+    """Return factory defaults without reading overrides or changing saved settings."""
+    from ..settings import GlobalSettings
+
+    current = _get_global_settings()
+    if current is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    defaults = GlobalSettings(base_path=current.base_path)
+    response = _global_settings_response(defaults)
+    response["cache"]["ssd_cache_max_size"] = defaults.cache.ssd_cache_max_size
+    return response
+
+
+def _global_settings_response(global_settings):
     # Get system memory info for auto calculation
     memory_info = get_system_memory_info()
 
