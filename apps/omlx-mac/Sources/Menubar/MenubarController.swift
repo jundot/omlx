@@ -929,18 +929,59 @@ final class MenubarController: NSObject {
         } ?? String(localized: "menubar.alert.pid_unknown",
                     defaultValue: "unknown PID",
                     comment: "Substring used when the conflicting process PID couldn't be determined")
+
+        // We can only offer to adopt or stop the conflicting process when
+        // it's a verified oMLX server with a known pid — never act on an
+        // unrelated or unconfirmed process (matches upstream #3319's "never
+        // kill a foreign process" constraint).
+        let canAct = conflict.isOMLX && conflict.pid != nil
         alert.informativeText = conflict.isOMLX
             ? String(localized: "menubar.alert.port_in_use.omlx",
-                     defaultValue: "Another oMLX server is already running on this port (\(pidStr)). Stop it before starting a new instance, or change the port in Settings.",
+                     defaultValue: "Another oMLX server is already running on this port (\(pidStr)). You can take over managing it, stop it, or change the port in Settings.",
                      comment: "Port-conflict alert body when the conflicting process is another oMLX instance")
             : String(localized: "menubar.alert.port_in_use.other",
                      defaultValue: "Another process (\(pidStr)) is listening on port \(String(port)). Choose a different port in Settings or terminate that process.",
                      comment: "Port-conflict alert body when an unrelated process owns the port")
-        alert.addButton(withTitle: String(localized: "menubar.alert.ok",
-                                          defaultValue: "OK",
-                                          comment: "Default dismiss button on the port-conflict alert"))
+
+        if canAct {
+            alert.addButton(withTitle: String(localized: "menubar.alert.take_over",
+                                              defaultValue: "Take Over",
+                                              comment: "Port-conflict alert button that adopts the already-running oMLX server instead of starting a new one"))
+            alert.addButton(withTitle: String(localized: "menubar.alert.stop_it",
+                                              defaultValue: "Stop It",
+                                              comment: "Port-conflict alert button that terminates the conflicting oMLX server"))
+            alert.addButton(withTitle: String(localized: "menubar.alert.cancel",
+                                              defaultValue: "Cancel",
+                                              comment: "Port-conflict alert button that dismisses without acting"))
+        } else {
+            alert.addButton(withTitle: String(localized: "menubar.alert.ok",
+                                              defaultValue: "OK",
+                                              comment: "Default dismiss button on the port-conflict alert"))
+        }
         alert.window.level = .floating
-        alert.runModal()
+
+        guard canAct else {
+            alert.runModal()
+            return
+        }
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            // adoptExternal() posts stateDidChangeNotification, which
+            // serverStateChanged already routes to refreshMenuState().
+            _ = server?.adoptExternal(conflict)
+        case .alertSecondButtonReturn:
+            // ServerProcess is still .failed at this point — stop() only
+            // acts on a process it considers running, so adopt first (this
+            // is what wires the pid into the adoptedPID fallback that
+            // stop() signals via killExternal) then immediately stop it.
+            guard let server else { break }
+            _ = server.adoptExternal(conflict)
+            Task { @MainActor in
+                await server.stop()
+            }
+        default:
+            break
+        }
     }
 
     private func presentServerFailureAlert(message: String, logURL: URL) {
