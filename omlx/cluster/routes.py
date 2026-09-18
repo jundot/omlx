@@ -1069,6 +1069,11 @@ def _resolve_fabric(
         reason = f"{reason}; falling back to the TCP ring because {blocker}"
     elif blocker:
         reason = blocker
+    elif proposed == "ring" and not rdma["ok"] and rdma["reason"]:
+        # choose_backend now names the TCP ring directly for Thunderbolt
+        # without RDMA (#3037); keep the per-host matrix detail alongside so
+        # the page still says WHICH host has no devices.
+        reason = f"{reason} ({rdma['reason']})"
     backend = "ring" if blocker else proposed
 
     return {

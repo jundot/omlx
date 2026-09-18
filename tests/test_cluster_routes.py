@@ -1667,10 +1667,11 @@ def test_the_fabric_verifies_every_pair_not_only_the_coordinator_links(monkeypat
 
 
 def test_a_thunderbolt_pair_without_rdma_falls_back_to_the_ring_out_loud(monkeypatch):
-    """A Thunderbolt link makes choose_backend say jaccl-ring, which needs a matrix.
+    """Thunderbolt without RDMA devices is the TCP ring, said out loud.
 
-    Posting that backend with no matrix dies inside ClusterDeployment's
-    constructor, where there is nothing the user can act on.
+    Since #3037 choose_backend names the ring directly (jaccl-ring needs
+    RDMA devices on every host, so there is no fast proposal to fall back
+    FROM), and the matrix reason keeps the per-host detail on the page.
     """
 
     _readings(
@@ -1692,9 +1693,9 @@ def test_a_thunderbolt_pair_without_rdma_falls_back_to_the_ring_out_loud(monkeyp
     )
 
     assert body["backend"] == "ring"
-    assert body["fell_back"] is True
+    assert body["fell_back"] is False
     assert "studio.local" in body["backend_reason"]
-    assert "ring" in body["backend_reason"]
+    assert "TCP ring" in body["backend_reason"]
     assert all(host["rdma"] == [] for host in body["hosts"])
 
 
