@@ -24,6 +24,7 @@ def test_qwen4_sparse_gqa_symbol_is_part_of_extension_abi():
 
 
 def test_qwen4_sparse_gqa_route_forwards_compact_blocks_and_transposes(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", "0")
     queries = mx.zeros((1, 24, 3, 256), dtype=mx.bfloat16)
     keys = mx.zeros((1, 2, 20, 256), dtype=mx.bfloat16)
     values = mx.zeros_like(keys)
@@ -201,15 +202,9 @@ def test_qwen4_sparse_gqa_native_matches_fp32_gather_reference(
     selected_valid = mx.concatenate(
         (mx.ones(expanded.shape, dtype=mx.bool_), tail_valid), axis=-1
     )
-    key_rows = keys.transpose(0, 2, 1, 3)
-    value_rows = values.transpose(0, 2, 1, 3)
     safe = mx.where(selected_valid, selected, 0)
-    gathered_k = qsa_fast._batch_gather_tokens(key_rows, safe).transpose(
-        0, 1, 3, 2, 4
-    )
-    gathered_v = qsa_fast._batch_gather_tokens(value_rows, safe).transpose(
-        0, 1, 3, 2, 4
-    )
+    gathered_k = qsa_fast._gather_kv_rows(keys, safe)
+    gathered_v = qsa_fast._gather_kv_rows(values, safe)
     grouped_q = queries.transpose(0, 2, 1, 3).reshape(
         1, query_tokens, 2, 12, 256
     )
@@ -272,12 +267,8 @@ def test_qwen4_sparse_gqa_native_masks_future_blocks_in_first_chunk():
     selected_valid = mx.concatenate((expanded_valid, tail_valid), axis=-1)
     safe = mx.where(selected_valid, selected, 0)
 
-    gathered_k = qsa_fast._batch_gather_tokens(
-        keys.transpose(0, 2, 1, 3), safe
-    ).transpose(0, 1, 3, 2, 4)
-    gathered_v = qsa_fast._batch_gather_tokens(
-        values.transpose(0, 2, 1, 3), safe
-    ).transpose(0, 1, 3, 2, 4)
+    gathered_k = qsa_fast._gather_kv_rows(keys, safe)
+    gathered_v = qsa_fast._gather_kv_rows(values, safe)
     grouped_q = queries.transpose(0, 2, 1, 3).reshape(
         1, query_tokens, 2, 12, 256
     )
@@ -302,3 +293,10 @@ def test_qwen4_sparse_gqa_native_masks_future_blocks_in_first_chunk():
     # keeps probabilities in FP32 while the portable oracle casts them first.
     assert mx.array_equal(native[:, :1], reference[:, :1]).item()
     assert float(mx.max(error).item()) <= 2e-2
+
+
+@pytest.fixture(autouse=True)
+def _reset_native_main_gate():
+    qsa_fast._native_main_min_rows.cache_clear()
+    yield
+    qsa_fast._native_main_min_rows.cache_clear()

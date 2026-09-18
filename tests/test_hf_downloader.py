@@ -7,22 +7,69 @@ import os
 import shutil
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from huggingface_hub import HfApi
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
+from omlx.admin import hf_downloader as hf_downloader_mod
 from omlx.admin.hf_downloader import (
     DownloadStatus,
     DownloadTask,
     HFDownloader,
     _DownloadActivity,
     _DownloadCancelled,
+    _calc_safetensors_disk_size,
+    _histogram_has_packed_u32,
     _is_xet_transport_error,
     _make_cancellable_tqdm,
+    _sum_safetensors_blob_bytes,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_blob_size_cache():
+    hf_downloader_mod._blob_size_cache.clear()
+    yield
+    hf_downloader_mod._blob_size_cache.clear()
+
+
+@pytest.fixture
+async def blocked_worker():
+    """Hold worker-thread work until teardown, even if its awaiter is cancelled."""
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+
+    def call(*args, **kwargs):
+        if kwargs.get("dry_run"):
+            return []
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(5), "Test did not release the worker"
+            return []
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    try:
+        yield SimpleNamespace(call=call, started=started)
+    finally:
+        release.set()
+        if started.is_set():
+            await asyncio.wait_for(finished.wait(), timeout=5)
+
+
+async def _wait_for_downloads(downloader):
+    """Wait for the scheduled downloads instead of guessing their duration."""
+    await asyncio.wait_for(
+        asyncio.gather(*downloader._active_tasks.values()), timeout=5
+    )
+
 
 # =============================================================================
 # DownloadTask Tests
@@ -197,7 +244,7 @@ class TestHFDownloader:
             task = await downloader.start_download("owner/model")
 
             # Wait for task to complete
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.COMPLETED
             assert task.progress == 100.0
@@ -225,7 +272,7 @@ class TestHFDownloader:
             task = await downloader.start_download("owner/model")
 
             # Wait for task to fail
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.FAILED
             assert "Network error" in task.error
@@ -261,7 +308,7 @@ class TestHFDownloader:
 
             task = await downloader.start_download("owner/nonexistent")
 
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.FAILED
             assert "not found" in task.error.lower()
@@ -297,7 +344,7 @@ class TestHFDownloader:
 
             task = await downloader.start_download("owner/gated-model")
 
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.FAILED
             assert "gated" in task.error.lower()
@@ -307,7 +354,7 @@ class TestHFDownloader:
     # --- Cancel Download ---
 
     @pytest.mark.asyncio
-    async def test_cancel_download(self, downloader, model_dir):
+    async def test_cancel_download(self, downloader, model_dir, blocked_worker):
         # In-progress shards live under ._____temp and must be removed,
         # while finalized shards outside it stay for resume on retry.
         target = model_dir / "owner" / "model"
@@ -321,7 +368,7 @@ class TestHFDownloader:
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -331,8 +378,8 @@ class TestHFDownloader:
 
             task = await downloader.start_download("owner/model")
 
-            # Give it a moment to start
-            await asyncio.sleep(0.2)
+            # Wait until the download thread is running
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             active_task = downloader._active_tasks[task.task_id]
             success = await downloader.cancel_download(task.task_id)
@@ -534,13 +581,15 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.CANCELLED
 
     @pytest.mark.asyncio
-    async def test_shutdown_marks_tasks_cancelled_for_thread_abort(self, downloader):
+    async def test_shutdown_marks_tasks_cancelled_for_thread_abort(
+        self, downloader, blocked_worker
+    ):
         """shutdown() flags active tasks so in-flight threads abort via tqdm."""
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -549,7 +598,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             await downloader.shutdown()
             assert task.task_id in downloader._cancelled
@@ -576,7 +625,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
             assert task.status == DownloadStatus.COMPLETED
 
             result = await downloader.cancel_download(task.task_id)
@@ -630,7 +679,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
             assert task.status == DownloadStatus.COMPLETED
 
             result = downloader.remove_task(task.task_id)
@@ -640,12 +689,12 @@ class TestHFDownloader:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
-    async def test_remove_active_task_fails(self, downloader):
+    async def test_remove_active_task_fails(self, downloader, blocked_worker):
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -654,7 +703,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             result = downloader.remove_task(task.task_id)
             assert result is False
@@ -675,12 +724,12 @@ class TestHFDownloader:
     # --- Shutdown ---
 
     @pytest.mark.asyncio
-    async def test_shutdown_cancels_active_tasks(self, downloader):
+    async def test_shutdown_cancels_active_tasks(self, downloader, blocked_worker):
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -689,7 +738,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             await downloader.shutdown()
             assert task.status == DownloadStatus.CANCELLED
@@ -776,7 +825,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             await downloader.start_download("Jundot/Qwen3.6-27B-oQ8-mtp")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             # The actual download call (last call; the first is dry_run).
             call_kwargs = mock_download.call_args[1]
@@ -802,6 +851,7 @@ class TestHFDownloader:
             "parameters": {"BF16": 7_000_000_000},
             "total": 7_000_000_000,
         }
+        mock_info.siblings = None
         mock_api.model_info.return_value = mock_info
 
         def fake_snapshot_download(**kwargs):
@@ -824,6 +874,98 @@ class TestHFDownloader:
         # On completion the estimate is dropped in favor of the measured
         # dir size (nothing was written here, so 0), not the 14 GB guess.
         assert task.downloaded_size == 0
+
+    @pytest.mark.asyncio
+    async def test_run_download_model_info_omits_expand(self, model_dir):
+        """files_metadata and expand together raise in huggingface_hub."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-no-expand", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_info = MagicMock()
+        mock_info.safetensors = {
+            "parameters": {"BF16": 7_000_000_000},
+            "total": 7_000_000_000,
+        }
+        mock_info.siblings = None
+
+        def model_info(*args, **kwargs):
+            if kwargs.get("expand") and (
+                kwargs.get("files_metadata") or kwargs.get("securityStatus")
+            ):
+                raise ValueError(
+                    "`expand` cannot be used if `securityStatus` or "
+                    "`files_metadata` are set."
+                )
+            return mock_info
+
+        mock_api = MagicMock()
+        mock_api.model_info.side_effect = model_info
+        snapshot_calls = []
+
+        def fake_snapshot_download(**kwargs):
+            snapshot_calls.append(kwargs)
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        info_kwargs = mock_api.model_info.call_args.kwargs
+        assert info_kwargs.get("files_metadata") is True
+        assert "expand" not in info_kwargs
+        assert snapshot_calls
+        assert snapshot_calls[0]["ignore_patterns"] == [
+            "*.bin",
+            "original/**",
+            "consolidated.*.pth",
+        ]
+        assert task.status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_dry_run_failure_u32_uses_sibling_blob_size(self, model_dir):
+        """U32 histograms must not be billed at 4 bytes/param for the estimate."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-u32-fallback", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {
+            "parameters": {"U32": 25_235_685_376, "BF16": 570_250_830},
+            "total": 25_805_936_206,
+        }
+        weight = MagicMock()
+        weight.rfilename = "model.safetensors"
+        weight.size = 15_400_000_000
+        mock_info.siblings = [weight]
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.total_size == 15_400_000_000
+        assert task.status == DownloadStatus.COMPLETED
 
     @pytest.mark.asyncio
     async def test_dry_run_failure_no_safetensors_leaves_total_size_zero(
@@ -1361,12 +1503,59 @@ def _make_mock_model(
     m.downloads = downloads
     m.likes = likes
     m.trending_score = trending_score
+    m.siblings = None
     if disk_size_bytes is not None:
         param_count = disk_size_bytes // 2
         m.safetensors = {"parameters": {"BF16": param_count}, "total": param_count}
     else:
         m.safetensors = None
     return m
+
+
+def _make_mock_u32_model(
+    repo_id: str,
+    *,
+    downloads: int = 200,
+    likes: int = 0,
+    trending_score: float = 0,
+    u32_count: int = 25_235_685_376,
+    bf16_count: int = 570_250_830,
+    sibling_bytes: int | None = None,
+):
+    """HF list row for a U32-packed MLX quant (logical param counts under U32)."""
+    m = MagicMock()
+    m.id = repo_id
+    m.downloads = downloads
+    m.likes = likes
+    m.trending_score = trending_score
+    total = u32_count + bf16_count
+    m.safetensors = {
+        "parameters": {"U32": u32_count, "BF16": bf16_count},
+        "total": total,
+    }
+    if sibling_bytes is None:
+        m.siblings = None
+    else:
+        weight = MagicMock()
+        weight.rfilename = "model.safetensors"
+        weight.size = sibling_bytes
+        m.siblings = [weight]
+    return m
+
+
+def _blob_info(repo_id: str, size: int, safetensors=None):
+    """model_info(files_metadata=True) result with one weight shard."""
+    info = MagicMock()
+    info.id = repo_id
+    info.safetensors = safetensors
+    sibling = MagicMock()
+    sibling.rfilename = "model.safetensors"
+    sibling.size = size
+    extra = MagicMock()
+    extra.rfilename = "tokenizer.json"
+    extra.size = 1_000_000
+    info.siblings = [sibling, extra]
+    return info
 
 
 class TestGetRecommendedModels:
@@ -1503,6 +1692,7 @@ class TestGetRecommendedModels:
                 max_memory_bytes=64 * 1024**3
             )
 
+        mock_api.model_info.assert_not_called()
         item = result["trending"][0]
         assert item["repo_id"] == "mlx-community/test-model-4bit"
         assert item["name"] == "test-model-4bit"
@@ -1585,6 +1775,108 @@ class TestGetRecommendedModels:
         item = result["trending"][0]
         assert item["params"] == 7_000_000_000
         assert item["params_formatted"] == "7.0B"
+        mock_api.model_info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_u32_quant_uses_blob_size_not_dtype_histogram(self):
+        """U32-packed 4-bit repos must not be billed at 4 bytes/param (#3401)."""
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model(
+            "mlx-community/gemma-4-26B-A4B-it-4bit",
+            downloads=500,
+            trending_score=5,
+        )
+        inflated = _calc_safetensors_disk_size(model.safetensors)
+        assert inflated > 90 * 1024**3
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.return_value = _blob_info(
+                model.id, blob_bytes, safetensors=model.safetensors
+            )
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=96 * 1024**3
+            )
+
+        mock_api.model_info.assert_called()
+        assert mock_api.model_info.call_args.kwargs.get("files_metadata") is True
+        item = result["trending"][0]
+        assert item["size"] == blob_bytes
+        assert item["size"] != inflated
+        assert "GB" in item["size_formatted"]
+
+    @pytest.mark.asyncio
+    async def test_u32_quant_skips_model_info_when_siblings_have_sizes(self):
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model(
+            "mlx-community/gemma-4-26B-A4B-it-4bit",
+            downloads=500,
+            sibling_bytes=blob_bytes,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=96 * 1024**3
+            )
+
+        mock_api.model_info.assert_not_called()
+        assert result["trending"][0]["size"] == blob_bytes
+
+    @pytest.mark.asyncio
+    async def test_u32_blob_fetch_failure_excludes_from_recommended(self):
+        """Unknown size must not appear on Recommended (memory-fit list)."""
+        model = _make_mock_u32_model(
+            "mlx-community/gemma-4-26B-A4B-it-4bit",
+            downloads=500,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.side_effect = RuntimeError("hub down")
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=16 * 1024**3
+            )
+
+        assert result["trending"] == []
+        assert result["popular"] == []
+
+    @pytest.mark.asyncio
+    async def test_malformed_histogram_does_not_fail_recommended(self):
+        """A None dtype count must not 500 the Recommended listing."""
+        bad = _make_mock_model(
+            "mlx-community/broken",
+            disk_size_bytes=2 * 1024**3,
+            downloads=200,
+        )
+        bad.safetensors = {"parameters": {"BF16": None}, "total": None}
+        good = _make_mock_model(
+            "mlx-community/ok",
+            disk_size_bytes=2 * 1024**3,
+            downloads=200,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [bad, good]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3
+            )
+
+        names = [m["name"] for m in result["trending"]]
+        assert "ok" in names
+        assert "broken" not in names
 
 
 # =============================================================================
@@ -1666,6 +1958,7 @@ class TestSearchModels:
         assert item["likes"] == 42
         assert item["params"] == 3_000_000_000  # 6GB BF16 = 3B params
         assert item["params_formatted"] == "3.0B"
+        mock_api.model_info.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_search_handles_no_safetensors(self):
@@ -1845,6 +2138,88 @@ class TestSearchModels:
         assert len(result["models"]) == 1
         assert result["models"][0]["repo_id"] == "org/medium"
 
+    @pytest.mark.asyncio
+    async def test_search_u32_quant_uses_blob_size(self):
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model("mlx-community/gemma-4-26B-A4B-it-4bit")
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.return_value = _blob_info(
+                model.id, blob_bytes, safetensors=model.safetensors
+            )
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="gemma")
+
+        mock_api.model_info.assert_called()
+        item = result["models"][0]
+        assert item["size"] == blob_bytes
+        assert item["size"] < _calc_safetensors_disk_size(model.safetensors)
+
+    @pytest.mark.asyncio
+    async def test_search_skips_blob_fetch_for_param_filtered_u32(self):
+        """min/max params run before model_info so oversize U32 rows stay off Hub."""
+        huge = _make_mock_u32_model("mlx-community/huge-u32")
+        small = _make_mock_model(
+            "org/small-bf16", disk_size_bytes=2_000_000_000, downloads=100
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [huge, small]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model",
+                max_params=8_000_000_000,
+            )
+
+        mock_api.model_info.assert_not_called()
+        assert [m["repo_id"] for m in result["models"]] == ["org/small-bf16"]
+
+    @pytest.mark.asyncio
+    async def test_search_skips_blob_fetch_when_param_count_is_zero(self):
+        """0 from a malformed histogram is unknown, not a size that passes max_params."""
+        model = _make_mock_u32_model("mlx-community/unknown-u32")
+        model.safetensors = {
+            "parameters": {"U32": 25_235_685_376, "BF16": None},
+            "total": None,
+        }
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="gemma",
+                max_params=8_000_000_000,
+            )
+
+        mock_api.model_info.assert_not_called()
+        assert result["models"] == []
+
+    @pytest.mark.asyncio
+    async def test_search_reuses_cached_blob_size(self):
+        blob_bytes = 15_400_000_000
+        model = _make_mock_u32_model("mlx-community/gemma-4-26B-A4B-it-4bit")
+        info = _blob_info(model.id, blob_bytes, safetensors=model.safetensors)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api.model_info.return_value = info
+            mock_api_cls.return_value = mock_api
+
+            first = await HFDownloader.search_models(query="gemma")
+            second = await HFDownloader.search_models(query="gemma")
+
+        assert mock_api.model_info.call_count == 1
+        assert first["models"][0]["size"] == blob_bytes
+        assert second["models"][0]["size"] == blob_bytes
+
 
 # =============================================================================
 # Stale Token Fallback Tests
@@ -2018,11 +2393,47 @@ class TestGetModelInfo:
         assert result["likes"] == 100
         assert result["params"] == 7_000_000_000
         assert result["params_formatted"] == "7.0B"
+        assert result["size"] == 14_000_000_000
         assert len(result["files"]) == 1
         assert result["files"][0]["name"] == "model.safetensors"
         assert "text-generation" in result["tags"]
         assert result["model_card"] == ""  # No README available
         assert result["is_adapter"] is False
+
+    @pytest.mark.asyncio
+    async def test_u32_size_uses_sibling_blobs_not_histogram(self):
+        mock_info = MagicMock()
+        mock_info.id = "mlx-community/gemma-4-26B-A4B-it-4bit"
+        mock_info.downloads = 1000
+        mock_info.likes = 10
+        mock_info.tags = ["mlx"]
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = {
+            "parameters": {"U32": 25_235_685_376, "BF16": 570_250_830},
+            "total": 25_805_936_206,
+        }
+        mock_info.card_data = None
+        weight = MagicMock()
+        weight.rfilename = "model.safetensors"
+        weight.size = 15_400_000_000
+        tokenizer = MagicMock()
+        tokenizer.rfilename = "tokenizer.json"
+        tokenizer.size = 1_000_000
+        mock_info.siblings = [weight, tokenizer]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.hf_hub_download", side_effect=Exception("no readme")):
+            mock_api = MagicMock()
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_model_info(mock_info.id)
+
+        assert result["size"] == 15_400_000_000
+        assert result["size"] != _calc_safetensors_disk_size(mock_info.safetensors)
+        assert result["params"] == 25_805_936_206
 
     @pytest.mark.asyncio
     async def test_detects_lora_adapter(self):
@@ -2137,6 +2548,11 @@ class TestGetParamCount:
         assert _get_param_count({"parameters": {}}) == 0
         assert _get_param_count({}) == 0
 
+    def test_non_int_count_returns_zero(self):
+        from omlx.admin.hf_downloader import _get_param_count
+
+        assert _get_param_count({"parameters": {"BF16": None}}) == 0
+
 
 class TestCalcSafetensorsDiskSize:
     """Test _calc_safetensors_disk_size helper."""
@@ -2160,6 +2576,103 @@ class TestCalcSafetensorsDiskSize:
         assert _calc_safetensors_disk_size({"parameters": {}}) == 0
         assert _calc_safetensors_disk_size({}) == 0
 
+    def test_non_int_count_returns_zero(self):
+        from omlx.admin.hf_downloader import _calc_safetensors_disk_size
+
+        assert _calc_safetensors_disk_size({"parameters": {"BF16": None}}) == 0
+        assert (
+            _calc_safetensors_disk_size({"parameters": {"BF16": 100, "F32": None}})
+            == 0
+        )
+
+
+class TestSafetensorsBlobSize:
+    """Blob-size helpers for U32-packed MLX quants (#3401)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reject_token", [False, True])
+    async def test_http_timeout_leaves_size_retryable(self, reject_token):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if reject_token and request.headers.get("authorization"):
+                return httpx.Response(401)
+            raise httpx.ReadTimeout("Hub stalled", request=request)
+
+        api = HfApi(token="test-token" if reject_token else False)
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client, patch(
+            "huggingface_hub.hf_api.get_session", return_value=client
+        ), patch.object(hf_downloader_mod, "_HF_API_TIMEOUT", 0.1):
+            for _ in range(2):
+                sizes = await hf_downloader_mod._blob_bytes_for_repos(
+                    api, ["owner/model"]
+                )
+                assert sizes == {"owner/model": 0}
+                assert hf_downloader_mod._cached_blob_size("owner/model") is None
+
+        assert len(requests) == (4 if reject_token else 2)
+        assert all(request.extensions["timeout"]["read"] == 0.1 for request in requests)
+        if reject_token:
+            assert "authorization" not in requests[1].headers
+            assert "authorization" not in requests[3].headers
+
+    def test_empty_or_name_only_siblings(self):
+        assert _sum_safetensors_blob_bytes(None) is None
+        assert _sum_safetensors_blob_bytes([]) is None
+        nameless = MagicMock()
+        nameless.rfilename = "model.safetensors"
+        nameless.size = None
+        assert _sum_safetensors_blob_bytes([nameless]) is None
+
+    def test_sums_safetensors_and_ignores_tokenizer(self):
+        weight = MagicMock()
+        weight.rfilename = "model-00001-of-00002.safetensors"
+        weight.size = 10_000_000_000
+        weight2 = MagicMock()
+        weight2.rfilename = "model-00002-of-00002.safetensors"
+        weight2.size = 5_400_000_000
+        tokenizer = MagicMock()
+        tokenizer.rfilename = "tokenizer.json"
+        tokenizer.size = 1_000_000
+        assert _sum_safetensors_blob_bytes([weight, weight2, tokenizer]) == 15_400_000_000
+
+    def test_issue_3401_histogram_is_packed_u32(self):
+        st = {
+            "parameters": {"U32": 25_235_685_376, "BF16": 570_250_830},
+            "total": 25_805_936_206,
+        }
+        assert _histogram_has_packed_u32(st) is True
+        assert _histogram_has_packed_u32({"parameters": {"BF16": 1_000}}) is False
+        inflated = _calc_safetensors_disk_size(st)
+        assert inflated > 90 * 1024**3
+
+    def test_store_blob_size_drops_expired_entries(self):
+        now = time.monotonic()
+        expired_at = now - hf_downloader_mod._BLOB_SIZE_CACHE_TTL - 1
+        hf_downloader_mod._blob_size_cache["old/a"] = (100, expired_at)
+        hf_downloader_mod._blob_size_cache["old/b"] = (200, expired_at)
+
+        hf_downloader_mod._store_blob_size("fresh/c", 15_400_000_000)
+
+        assert set(hf_downloader_mod._blob_size_cache) == {"fresh/c"}
+        assert hf_downloader_mod._cached_blob_size("fresh/c") == 15_400_000_000
+
+    def test_store_blob_size_caps_cache_length(self):
+        with patch.object(hf_downloader_mod, "_BLOB_SIZE_CACHE_MAX", 3):
+            for i in range(5):
+                hf_downloader_mod._store_blob_size(f"org/m{i}", 1000 + i)
+
+            assert len(hf_downloader_mod._blob_size_cache) == 3
+            assert "org/m0" not in hf_downloader_mod._blob_size_cache
+            assert "org/m1" not in hf_downloader_mod._blob_size_cache
+            assert hf_downloader_mod._cached_blob_size("org/m4") == 1004
+
+    def test_store_blob_size_ignores_non_positive(self):
+        hf_downloader_mod._store_blob_size("org/zero", 0)
+        hf_downloader_mod._store_blob_size("org/neg", -1)
+        assert hf_downloader_mod._blob_size_cache == {}
+
 
 # =============================================================================
 # Timeout Tests
@@ -2170,15 +2683,14 @@ class TestHFAPITimeouts:
     """Test that HF API calls respect timeouts when HuggingFace is unreachable."""
 
     @pytest.mark.asyncio
-    async def test_get_recommended_models_timeout(self):
+    async def test_get_recommended_models_timeout(self, blocked_worker):
         """get_recommended_models should raise TimeoutError when HF is unreachable."""
-        import time as time_mod
 
         def slow_list_models(**kwargs):
-            time_mod.sleep(5)
+            blocked_worker.call()
             return []
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = slow_list_models
@@ -2189,16 +2701,17 @@ class TestHFAPITimeouts:
                     max_memory_bytes=16 * 1024**3
                 )
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_search_models_timeout(self):
+    async def test_search_models_timeout(self, blocked_worker):
         """search_models should raise TimeoutError when HF is unreachable."""
-        import time as time_mod
 
         def slow_list_models(**kwargs):
-            time_mod.sleep(5)
+            blocked_worker.call()
             return []
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = slow_list_models
@@ -2207,15 +2720,16 @@ class TestHFAPITimeouts:
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.search_models(query="test")
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_get_model_info_timeout(self):
+    async def test_get_model_info_timeout(self, blocked_worker):
         """get_model_info should raise TimeoutError when HF is unreachable."""
-        import time as time_mod
 
         def slow_model_info(*args, **kwargs):
-            time_mod.sleep(5)
+            blocked_worker.call()
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.model_info.side_effect = slow_model_info
@@ -2224,20 +2738,22 @@ class TestHFAPITimeouts:
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.get_model_info("org/model")
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_search_models_timeout_on_lazy_iteration(self):
+    async def test_search_models_timeout_on_lazy_iteration(self, blocked_worker):
         """list_models returns a lazy generator; a hang during iteration
         (not the call itself) must still hit the timeout instead of
         blocking the event loop (issue #2325)."""
 
         def lazy_hanging_list_models(**kwargs):
             def gen():
-                time.sleep(5)
+                blocked_worker.call()
                 yield None
 
             return gen()
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = lazy_hanging_list_models
@@ -2246,18 +2762,22 @@ class TestHFAPITimeouts:
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.search_models(query="test")
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_get_recommended_models_timeout_on_lazy_iteration(self):
+    async def test_get_recommended_models_timeout_on_lazy_iteration(
+        self, blocked_worker
+    ):
         """Same lazy-iteration hang, via get_recommended_models."""
 
         def lazy_hanging_list_models(**kwargs):
             def gen():
-                time.sleep(5)
+                blocked_worker.call()
                 yield None
 
             return gen()
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = lazy_hanging_list_models
@@ -2267,6 +2787,8 @@ class TestHFAPITimeouts:
                 await HFDownloader.get_recommended_models(
                     max_memory_bytes=16 * 1024**3
                 )
+
+            assert blocked_worker.started.is_set()
 
     @pytest.mark.asyncio
     async def test_search_models_drains_generator_off_event_loop(self):
@@ -2325,7 +2847,7 @@ class TestHFEndpointPassthrough:
         ), patch("omlx.admin.hf_downloader.snapshot_download") as mock_download:
             downloader = HFDownloader(model_dir=str(model_dir))
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             # Called twice: dry_run + actual download
             assert mock_download.call_count == 2
@@ -2353,7 +2875,7 @@ class TestHFEndpointPassthrough:
 
             downloader = HFDownloader(model_dir=str(model_dir))
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert mock_download.call_count == 2
             call_kwargs = mock_download.call_args[1]
@@ -2498,13 +3020,13 @@ class TestRetryDownload:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
-    async def test_retry_active_download_raises(self, downloader):
+    async def test_retry_active_download_raises(self, downloader, blocked_worker):
         """Retrying an active download should raise ValueError."""
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -2513,7 +3035,7 @@ class TestRetryDownload:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             with pytest.raises(ValueError, match="not retryable"):
                 await downloader.retry_download(task.task_id)
@@ -2808,7 +3330,7 @@ class TestSequentialDownloadQueue:
         return d
 
     @pytest.mark.asyncio
-    async def test_second_download_stays_pending(self, model_dir):
+    async def test_second_download_stays_pending(self, model_dir, blocked_worker):
         """When two downloads are started, only the first should be DOWNLOADING."""
         downloader = HFDownloader(model_dir=str(model_dir))
 
@@ -2816,7 +3338,7 @@ class TestSequentialDownloadQueue:
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(30),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -2827,8 +3349,8 @@ class TestSequentialDownloadQueue:
             task1 = await downloader.start_download("owner/model-a")
             task2 = await downloader.start_download("owner/model-b")
 
-            # Give first task time to acquire semaphore
-            await asyncio.sleep(1)
+            # The running download holds the semaphore.
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             assert task1.status == DownloadStatus.DOWNLOADING
             assert task2.status == DownloadStatus.PENDING
@@ -2854,8 +3376,8 @@ class TestSequentialDownloadQueue:
             task1 = await downloader.start_download("owner/model-a")
             task2 = await downloader.start_download("owner/model-b")
 
-            # Let both tasks finish (snapshot_download returns immediately)
-            await asyncio.sleep(2)
+            # Wait for both scheduled downloads to finish.
+            await _wait_for_downloads(downloader)
 
             assert task1.status == DownloadStatus.COMPLETED
             assert task2.status == DownloadStatus.COMPLETED
@@ -2951,7 +3473,7 @@ class TestEtagTimeout:
 
             downloader = HFDownloader(model_dir=str(model_dir))
             await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert mock_download.call_count == 2
             # Last call is the actual download

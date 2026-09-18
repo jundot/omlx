@@ -1,7 +1,11 @@
 """Regression tests for admin model-settings UI gates."""
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 def _model_settings_template() -> str:
@@ -18,7 +22,9 @@ def _dashboard_script() -> str:
 
 def _status_template() -> str:
     root = Path(__file__).resolve().parents[1]
-    return (root / "omlx/admin/templates/dashboard/_status.html").read_text()
+    return (
+        root / "omlx/admin/templates/dashboard/blocks/_active_models.html"
+    ).read_text()
 
 
 def _section(html: str, start_marker: str, end_marker: str) -> str:
@@ -31,7 +37,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     turboquant = _section(
         html,
         "<!-- TurboQuant KV Cache -->",
-        "<!-- IndexCache (DSA models only) -->",
+        "<!-- MoE Expert Offload -->",
     )
     lightning_mtp = _section(
         html,
@@ -54,18 +60,6 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
 
 
-def test_apply_profile_surfaces_server_validation_error():
-    script = _dashboard_script()
-    method = script.split("async applyProfileToForm(profile) {", 1)[1].split(
-        "async applyTemplateToForm(template) {", 1
-    )[0]
-
-    assert "this.profileError = '';" in method
-    assert "const data = await r.json().catch(() => ({}));" in method
-    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
-    assert "this.profileError = String(e);" in method
-
-
 def test_reasoning_effort_has_presets_and_custom_input():
     """Common strings stay convenient while model-specific values remain usable."""
     html = _model_settings_template()
@@ -84,9 +78,9 @@ def test_reasoning_effort_has_presets_and_custom_input():
     assert 'placeholder="0.9"' in section
     assert "<datalist" not in section
 
-    order = ["low", "medium", "high", "xhigh", "max"]
-    positions = [section.index(f'value="{value}"') for value in order]
-    assert positions == sorted(positions)
+    assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
+    assert ':value="value" x-text="value"' in section
+    assert "!selectedModel?.reasoning_effort_custom && !entry.custom" in section
 
 
 def test_reasoning_effort_add_guard_covers_custom_entries():
@@ -190,8 +184,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
         "qwen35_ane_prefill_gdn_max_layers",
     }
 
-    assert 'x-if="isQwen35AnePrefillModel(selectedModel)"' in html
-    assert "'qwen3_5', 'qwen3_6', 'qwen3_8'" in script
+    assert "x-if=\"selectedModel?.ane_prefill_backend === 'qwen'\"" in html
     for field in fields:
         assert f"modelSettings.{field}" in html
         assert f"{field}:" in script
@@ -239,9 +232,10 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "cancelANETuning()" in html
     assert "applyANETuningRecommendation()" in html
     assert "aneTuningRecommendationText()" in html
-    assert "aneTuningResultText(result)" in html
+    assert "aneTuning.status?.message" in html
+    assert "aneTuningProgressPercent()" in html
     assert "aneTuning.status?.termination_reason" in html
-    assert "aneTuning.status?.results || []" in html
+    assert "!aneTuning.running && aneTuning.status?.recommendation" in html
     assert 'x-model="aneTuningOverrides.allowCpu"' in html
     assert 'x-model="aneTuningOverrides.allowAneGdn"' in html
     assert 'x-model="aneTuningOverrides.allowCpuGdn"' in html
@@ -258,18 +252,18 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
     assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
     assert "recommendation.cpu_shared_resource" in script
-    assert "if (result?.processing_tps === null" in script
-    assert "result?.latency_ms !== null" in script
 
 
 def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
     script = _dashboard_script()
 
     assert "validateQwenAneSettings()" in script
-    assert "ANE prompt block must be a multiple of 64." in script
-    assert "MLP ANE and CPU fractions must total less than 1.0." in script
-    assert "GDN ANE and CPU fractions must total less than 1.0." in script
-    assert "CPU worker count must be between 0 and 64." in script
+    # The messages are localised now, so assert the keys the validator returns
+    # rather than the English copy.
+    assert "window.t('js.error.ane_prompt_block_multiple')" in script
+    assert "window.t('js.error.mlp_ane_cpu_total')" in script
+    assert "window.t('js.error.gdn_ane_cpu_total')" in script
+    assert "window.t('js.error.cpu_workers_range')" in script
     assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
     assert "qwen35_ane_prefill_fraction: Number(" in script
 
@@ -280,19 +274,52 @@ def test_qwen_ane_web_defaults_match_configured_profile():
         "_resetPresetApplicableFields()", 1
     )[0]
 
-    assert "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048" in state
-    assert "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53" in state
-    assert "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
-    assert "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
+    assert (
+        "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
+    )
+    assert (
+        "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
+    )
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
-    assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
-    assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state
-    assert "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false" in state
-    assert "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135" in state
-    assert "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0" in state
-    assert "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0" in state
-    assert "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
-    assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
+    assert (
+        "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false"
+        in state
+    )
 
 
 def test_js_embedded_translations_escape_apostrophes():
@@ -302,7 +329,379 @@ def test_js_embedded_translations_escape_apostrophes():
     # chain instead of interpolating the raw translation.
     import re
 
-    unsafe = re.findall(
-        r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
-    )
+    unsafe = re.findall(r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template())
     assert unsafe == []
+
+
+def test_oq_a8_toggle_is_gated_to_qwen35_models():
+    """The kernels only exist for this checkpoint family, so the UI hides them."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert 'x-if="isQwenOqA8Model(selectedModel)"' in section
+    assert "modelSettings.qwen35_oq_a8_enabled" in section
+    # The detail controls only appear once the feature is on.
+    assert 'x-show="modelSettings.qwen35_oq_a8_enabled"' in section
+    assert "modelSettings.qwen35_oq_a8_min_tokens" in section
+
+
+def test_oq_a8_offers_no_kernel_choice():
+    """The tile is not a user-facing choice: the dispatcher picks it per bit
+    width from a measured default, so the modal exposes only the toggle and
+    the token floor."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert "modelSettings.qwen35_oq_a8_variant" not in section
+
+
+def test_oq_a8_settings_are_registered_in_the_dashboard_script():
+    js = _dashboard_script()
+    for field in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+        # Profile-field registry, modal defaults, server load, and save payload.
+        assert js.count(field) >= 4, field
+    assert "validateQwenOqA8Settings()" in js
+    # The modal has to explain the ANE clash itself rather than let the save
+    # come back as a bare 400 with the toggle already flipped.
+    validator = js.split("validateQwenOqA8Settings()", 1)[1].split("},", 1)[0]
+    assert "qwen35_ane_prefill_enabled" in validator
+    # The tile must not leak into any of those four places, not even as a
+    # hidden default the modal never renders.
+    assert "qwen35_oq_a8_variant" not in js
+
+
+def test_oq_a8_labels_use_i18n_keys():
+    html = _model_settings_template()
+    assert "{{ t('modal.model_settings.qwen_oq_a8') }}" in html
+    assert ">Qwen INT8 Activation Prefill<" not in html
+
+
+def test_oq_a8_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    keys = {
+        "modal.model_settings.qwen_oq_a8",
+        "modal.model_settings.qwen_oq_a8_hint",
+        "modal.model_settings.qwen_oq_a8_min_tokens",
+    }
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        missing = keys - set(catalog)
+        assert not missing, f"{path.name} is missing {sorted(missing)}"
+
+
+def test_profile_api_toggle_state_uses_i18n_keys():
+    """Both expose-as-API toggles localise their ON/OFF state.
+
+    The state was hardcoded before the migration; `API` itself stays a Latin
+    literal because it is the product's own acronym for an API-addressable
+    model, and this PR leaves acronyms untranslated.
+    """
+    html = _model_settings_template()
+
+    # New-profile form and the inline edit form share the one key pair.
+    assert html.count("t('modal.model_settings.profiles.expose_as_model_on')") == 2
+    assert html.count("t('modal.model_settings.profiles.expose_as_model_off')") == 2
+    assert "'ON'" not in html
+    assert "'OFF'" not in html
+
+    assert [line.strip() for line in html.splitlines()].count("API") == 2
+
+
+def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    english = {
+        "modal.model_settings.profiles.expose_as_model_on": "ON",
+        "modal.model_settings.profiles.expose_as_model_off": "OFF",
+    }
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        missing = set(english) - set(catalog)
+        assert not missing, f"{path.name} is missing {sorted(missing)}"
+        if path.name == "zh.json":
+            # Simplified Chinese carries its own labels; every other locale
+            # keeps the English fallback until its own translation lands.
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
+            continue
+        for key, value in english.items():
+            assert (
+                catalog[key] == value
+            ), f"{path.name} {key} is not the English fallback"
+
+
+def test_moe_expert_offload_toggle_blocks_speculative_decoding():
+    """Offload is incompatible with speculative verification paths."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "modelSettings.moe_expert_offload_enabled" in section
+    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert ":disabled" in section
+    for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
+        assert f"modelSettings.{key}" in section
+
+
+def test_profile_editor_behavior():
+    """Execute the dashboard methods, including async response and edit races."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+// The dashboard resolves its copy through window.t, so feed the component the
+// shipped English catalog exactly as base.html does; the assertions below then
+// read the strings the app really renders.
+const catalog = JSON.parse(fs.readFileSync('omlx/admin/i18n/en.json', 'utf8'));
+function setup(fetch) {
+    const context = {
+        localStorage: {getItem: () => null},
+        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        window: {t: key => (catalog[key] !== undefined ? catalog[key] : key)},
+        navigator: {language: 'en'}, document: {}, fetch,
+    };
+    const state = vm.runInNewContext(source + '\n dashboard;', context)();
+    state.selectedModel = {id: 'model-a'};
+    state.models = [state.selectedModel];
+    state.loadProfilesForModel = async () => {};
+    return state;
+}
+
+test('Template apply uses server identity and effective settings', async () => {
+    const requests = [];
+    const state = setup(async (url, options) => {
+        requests.push([url, options.method]);
+        return {ok: true, json: async () => ({settings: {active_profile_name: 'copy-2', temperature: 0.9}})};
+    });
+    state.profiles = [{name:'coding', settings:{temperature:0.1}}];
+    await state.applyTemplateToForm({name:'coding', settings:{temperature:0.2}});
+    assert.deepEqual(requests, [['/admin/api/models/model-a/profile-templates/coding/apply', 'POST']]);
+    assert.equal(state.activeProfileName, 'copy-2');
+    assert.equal(state.modelSettings.temperature, 0.9);
+});
+
+test('Failed template application keeps the form and surfaces the error', async () => {
+    const state = setup(async () => ({ok:false, status:400, json:async()=>({detail:'Rejected'})}));
+    state.modelSettings.temperature = 0.1;
+    await state.applyTemplateToForm({name:'coding'});
+    assert.equal(state.profileError, 'Rejected');
+    assert.equal(state.modelSettings.temperature, 0.1);
+});
+
+test('Save as new invokes the corresponding apply action', async () => {
+    for (const global of [false, true]) {
+        const state = setup(async (url, options) => ({
+            ok: true, json: async () => ({[global ? 'template' : 'profile']: JSON.parse(options.body)}),
+        }));
+        let applied;
+        state.loadTemplates = async () => {};
+        const apply = global ? 'applyTemplateToForm' : 'applyProfileToForm';
+        state[apply] = async profile => { applied = profile; };
+        if (global) {
+            state.newTemplate = {display_name:'Coding', description:''};
+            await state.createTemplate();
+        } else {
+            state.newProfile = {display_name:'Coding', api_name:'coding', description:''};
+            await state.createProfile();
+        }
+        assert.equal(applied.display_name, 'Coding');
+    }
+});
+
+test('Focus refresh updates clean forms and preserves edits made while fetching', async () => {
+    const state = setup();
+    state.showModelSettingsModal = true;
+    state._modelSettingsBaseline = JSON.stringify(state.modelSettings);
+    let opened = 0;
+    state.openModelSettings = async()=>{opened++;};
+    state.loadModels = async()=>{};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    state.loadModels = async()=>{state.modelSettings.temperature = 0.3;};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    await state.refreshOpenModelSettings();
+    assert.equal(state.modelSettings.temperature, 0.3);
+    assert.equal(opened, 1);
+});
+
+test('Apply response cannot replace another model editor', async () => {
+    let resolve;
+    const state = setup(() => new Promise(r => {resolve=r;}));
+    const pending = state.applyTemplateToForm({name:'coding'});
+    state.selectedModel = {id:'model-b'};
+    state.modelSettings.temperature = 0.4;
+    resolve({ok:true, json:async()=>({settings:{temperature:0.9}})});
+    await pending;
+    assert.equal(state.modelSettings.temperature, 0.4);
+});
+
+test('Only a current linked copy marks a global template active', () => {
+    const state = setup();
+    state.templates = [{name:'coding',settings:{temperature:0.9}}];
+    const independent = {name:'coding',settings:{temperature:0.1}};
+    const copy = {name:'copy',source_template:'coding',settings:{temperature:0.9}};
+    state.profiles = [independent, copy];
+    state.activeProfileName = 'coding';
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 1);
+    state.activeProfileName = 'copy';
+    assert.equal(state.activeTemplateName, 'coding');
+    copy.settings.temperature = 0.2;
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 2);
+    copy.settings.temperature = 0.9;
+    copy.expose_as_model = true;
+    assert.equal(state.visibleModelProfiles.length, 2);
+    state.templates = [];
+    assert.equal(state.visibleModelProfiles.length, 2);
+});
+
+
+test('Template matching ignores nested dictionary ordering', () => {
+    const state = setup();
+    state.templates = [{name:'coding', settings:{chat_template_kwargs:{enable_thinking:true,custom:1}}}];
+    const copy = {name:'copy', source_template:'coding', settings:{chat_template_kwargs:{custom:1,enable_thinking:true}}};
+    assert.equal(state.matchingProfileTemplate(copy).name, 'coding');
+    copy.settings.chat_template_kwargs.custom = 2;
+    assert.equal(state.matchingProfileTemplate(copy), null);
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+DASHBOARD_BLOCK_IDS = (
+    "serving_stats",
+    "usage_history",
+    "active_models",
+    "cache_observability",
+    "api_endpoints",
+    "claude_code",
+    "applications",
+    "engine_versions",
+)
+
+
+def test_dashboard_layout_template_contract():
+    """Every block renders as a parked GridStack item with a tray pill."""
+    from jinja2 import Environment, FileSystemLoader
+
+    root = Path(__file__).resolve().parents[1]
+    admin = root / "omlx/admin"
+    env = Environment(loader=FileSystemLoader(str(admin / "templates")))
+    env.globals.update(t=lambda key: key, static=lambda path: path)
+    status = env.get_template("dashboard/_status.html").render()
+    dashboard = (admin / "templates/dashboard.html").read_text()
+    dashboard_js = _dashboard_script()
+
+    for block_id in DASHBOARD_BLOCK_IDS:
+        item = (
+            f'class="grid-stack-item dash-block dash-block-parked" gs-id="{block_id}"'
+        )
+        assert status.count(item) == 1, block_id
+        assert f"dashRemoveBlock('{block_id}')" in status
+        # Alpine directives stay on the wrapper: GridStack clones the pill into
+        # <body> while dragging, outside any x-data scope.
+        pill = (
+            f"""<div class="contents" x-show="!dashPlaced('{block_id}')">\n"""
+            '                            <div class="dash-tray-pill grid-stack-item"'
+            f' gs-w="12" gs-h="1" gs-min-w="6" data-block="{block_id}">'
+        )
+        assert pill in status, block_id
+        assert f"status.layout.block.{block_id}" in status
+
+    assert "css/gridstack.min.css" in dashboard
+    assert "js/gridstack-all.js" in dashboard
+    assert "js/dashboard_layout.js" in dashboard
+    assert "dashboardWidthClass : 'max-w-7xl'" in dashboard
+    assert 'class="max-w-7xl mx-auto px-4' not in dashboard
+
+    assert "ui_dashboard_layout" in dashboard_js
+    assert "columnMax: lib.COLUMNS" in dashboard_js
+
+    locales = sorted((admin / "i18n").glob("*.json"))
+    assert locales
+    keys = [
+        "status.layout.customize",
+        "status.layout.width_full",
+        "status.layout.save",
+        *[f"status.layout.block.{block_id}" for block_id in DASHBOARD_BLOCK_IDS],
+    ]
+    for locale in locales:
+        data = json.loads(locale.read_text(encoding="utf-8"))
+        for key in keys:
+            assert key in data, f"{locale.name} missing {key}"
+
+
+def test_dashboard_layout_normalizer():
+    """dashboard_layout.js clamps hand-edited layouts to the grid contract."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard layout tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+
+const source = fs.readFileSync('omlx/admin/static/js/dashboard_layout.js', 'utf8');
+const context = { window: {} };
+vm.runInNewContext(source, context);
+const lib = context.window.DashboardLayout;
+// Objects built inside the vm realm have a different Object.prototype, so
+// strict deepEqual rejects them; compare plain JSON copies instead.
+const plain = value => JSON.parse(JSON.stringify(value));
+
+assert.equal(lib.COLUMNS, 24);
+assert.equal(lib.MIN_W, 6);
+const def = lib.defaultLayout();
+assert.equal(def.blocks.length, 8);
+assert.ok(def.blocks.every((b, i) => b.x === 0 && b.y === i && b.w === 24));
+assert.deepEqual(plain(lib.normalizeLayout(null)), plain(def));
+assert.deepEqual(plain(lib.normalizeLayout({ blocks: 'nope' })), plain(def));
+
+const messy = lib.normalizeLayout({
+    width: 'huge',
+    blocks: [
+        { id: 'serving_stats', x: 20, y: '3', w: 12 },   // x clamped to 12
+        { id: 'unknown', x: 0, y: 0, w: 24 },            // dropped
+        { id: 'serving_stats', x: 0, y: 0, w: 24 },      // duplicate dropped
+        { id: 'engine_versions', x: 0, y: -4, w: 2 },    // w -> 6, y -> 0
+        { id: 'applications', x: 0, y: 1, w: 99 },       // w -> 24
+    ],
+});
+assert.equal(messy.width, 'default');
+assert.deepEqual(plain(messy.blocks), [
+    { id: 'serving_stats', x: 12, y: 3, w: 12 },
+    { id: 'engine_versions', x: 0, y: 0, w: 6 },
+    { id: 'applications', x: 0, y: 1, w: 24 },
+]);
+assert.deepEqual(plain(lib.normalizeLayout({ width: 'full', blocks: [] }).blocks), []);
+assert.equal(lib.widthClass('wide'), 'max-w-[90rem]');
+assert.equal(lib.widthClass('bogus'), 'max-w-7xl');
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -22,10 +22,63 @@ Architecture:
 import logging
 from typing import Any, Dict, List, Optional
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_vlm.models.cache import RotatingKVCache
 
 logger = logging.getLogger(__name__)
+
+
+# OMLX_QWEN4_STEP_TEXT_POSITIONS=0 keeps decode/MTP-verify steps on rank-three
+# mRoPE positions (Qwen4's gathered-QSA arms then stay off those rows).
+_STEP_TEXT_POSITIONS_DISABLED = os.environ.get(
+    "OMLX_QWEN4_STEP_TEXT_POSITIONS", "1"
+).strip().lower() in {"0", "false", "no", "off"}
+# Cached tokens below which decode/verify rows keep rank-three positions (dense
+# path); the M5 Max crossover for the gathered arms is ~12k serial, higher for MTP.
+_STEP_TEXT_POSITIONS_MIN_CONTEXT = int(
+    os.environ.get("OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT", "32768")
+)
+
+
+class PrefillReadyRotatingKVCache(RotatingKVCache):
+    """Preserve short restored buffers while using the VLM cache API."""
+
+    def size(self):
+        if self.keys is None:
+            return 0
+        return min(super().size(), self.keys.shape[2])
+
+
+def restore_bonsai_quantized_modules(model: nn.Module) -> int:
+    """Keep oMLX's quantized module and kernel paths after VLM loading."""
+    from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
+
+    restored = 0
+    replacements = {
+        OneBitLinear: nn.QuantizedLinear,
+        OneBitEmbedding: nn.QuantizedEmbedding,
+    }
+    for _, module in model.named_modules():
+        replacement = replacements.get(type(module))
+        if replacement is not None:
+            if restored == 0:
+                from ..patches.bonsai_qmv import (
+                    apply_bonsai_construct_patch,
+                    apply_bonsai_qmv_patch,
+                )
+                from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
+
+                apply_bonsai_t5_load_patch()
+                apply_bonsai_construct_patch()
+                apply_bonsai_qmv_patch()
+            # Both classes store the same packed tensors and quantization fields.
+            # Rebinding preserves loaded weights, frozen parameters, and aliases.
+            module.__class__ = replacement
+            restored += 1
+    return restored
 
 
 class VLMModelAdapter(nn.Module):
@@ -67,6 +120,20 @@ class VLMModelAdapter(nn.Module):
         # from this dict + current batch UIDs before each step.
         self._uid_rope_deltas: Dict[int, float] = {}
         self._batch_rope_deltas: Optional[mx.array] = None
+        # External/chunked text prefill owns a stronger position-shape proof
+        # than the generic decode binder: the scheduler has already excluded
+        # media embeddings and is advancing one request's scalar cache. Qwen4
+        # uses that proof to keep its position ids rank two, which is exactly
+        # equivalent to three broadcast-identical mRoPE planes and preserves
+        # the qualified gathered-QSA path. Generic/media/batched binds reset
+        # the proof and retain the ordinary rank-three fail-closed path.
+        self._qwen4_text_prefill_positions = False
+        # UIDs whose prefill the scheduler proved text-only; their batch-one
+        # decode/verify steps may reuse the rank-two position proof.
+        self._uid_text_positions: set = set()
+        # Step-scoped proof (see set_step_rope_deltas): covers every adapter
+        # call of the bound step and is cleared by the next bind.
+        self._qwen4_step_text_positions = False
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
@@ -76,7 +143,10 @@ class VLMModelAdapter(nn.Module):
         self._pending_embeds = None
         self._pending_kwargs = {}
         self._uid_rope_deltas.clear()
+        self._uid_text_positions.clear()
         self._batch_rope_deltas = None
+        self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = False
         self._language_model = None
         self._vlm_model = None
 
@@ -178,6 +248,76 @@ class VLMModelAdapter(nn.Module):
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
 
+    def restore_cache(self, caches):
+        """Bind the stable SSD tensor format to the active model's cache classes."""
+        from mlx_lm.models import cache as lm_cache
+        from mlx_vlm.models.cache import PoolingCache
+
+        from ..cache._rotating_subclass import (
+            PrefillReadyRotatingKVCache as LMRestoredRotatingKVCache,
+        )
+
+        def restore(source, target):
+            if hasattr(source, "_inner"):
+                source = source._inner
+            children = getattr(target, "caches", None)
+            if children is not None:
+                return type(target)(
+                    *(
+                        restore(old, new)
+                        for old, new in zip(source.caches, children, strict=True)
+                    )
+                )
+            restored_rotating = (
+                type(source) is LMRestoredRotatingKVCache
+                and type(target) is RotatingKVCache
+            )
+            if restored_rotating:
+                target = PrefillReadyRotatingKVCache(source.max_size, source.keep)
+            if not restored_rotating and (
+                type(source) is type(target)
+                or type(source).__name__ != type(target).__name__
+            ):
+                return source
+            if type(source) is lm_cache.ArraysCache:
+                target.cache = list(source.cache)
+                target.left_padding = source.left_padding
+                target.lengths = source.lengths
+            elif type(source) in (
+                lm_cache.KVCache,
+                lm_cache.RotatingKVCache,
+                lm_cache.ChunkedKVCache,
+                LMRestoredRotatingKVCache,
+            ):
+                target.keys, target.values = source.keys, source.values
+                target.offset = source.offset
+                if isinstance(source, lm_cache.RotatingKVCache):
+                    target.keep, target.max_size = source.keep, source.max_size
+                    target._idx = source._idx
+                elif type(source) is lm_cache.ChunkedKVCache:
+                    target.chunk_size = source.chunk_size
+                    target.start_position = source.start_position
+            elif type(target) is PoolingCache:
+                state = source.state
+                if len(state) == 5:
+                    # SSD reconstruction uses the oMLX text cache layout.
+                    if any(value is not None for value in state[3:]):
+                        raise ValueError(
+                            "Cannot restore text pooling overlap into VLM cache"
+                        )
+                    state = state[:3]
+                target.meta_state = source.meta_state
+                target.state = state
+            else:
+                target.meta_state = source.meta_state
+                target.state = source.state
+            return target
+
+        return [
+            restore(old, new)
+            for old, new in zip(caches, self.make_cache(), strict=True)
+        ]
+
     def set_pending_embeddings(
         self,
         inputs_embeds: mx.array,
@@ -253,6 +393,8 @@ class VLMModelAdapter(nn.Module):
         self._language_model._position_ids = None
         self._language_model._rope_deltas = None
         self._batch_rope_deltas = None
+        self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = False
 
     def register_rope_delta(self, uid: int, delta: float) -> None:
         """Register rope_delta for a UID after VLM prefill."""
@@ -261,6 +403,23 @@ class VLMModelAdapter(nn.Module):
     def unregister_rope_delta(self, uid: int) -> None:
         """Remove rope_delta for a finished/aborted UID."""
         self._uid_rope_deltas.pop(uid, None)
+        self._uid_text_positions.discard(uid)
+
+    def mark_text_positions(self, uid: int) -> None:
+        """Record the scheduler's text-only proof for ``uid`` (see set_step_rope_deltas)."""
+        self._uid_text_positions.add(uid)
+
+    def set_step_rope_deltas(self, deltas: mx.array, uids) -> None:
+        """Bind rope deltas for one decode/verify step; a text-proven batch-one
+        request keeps Qwen4's rank-two positions, others stay rank-three."""
+        self._batch_rope_deltas = deltas
+        uids = list(uids) if uids is not None else []
+        self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = bool(
+            not _STEP_TEXT_POSITIONS_DISABLED
+            and len(uids) == 1
+            and uids[0] in self._uid_text_positions
+        )
 
     def set_batch_rope_deltas(self, deltas: mx.array) -> None:
         """Set per-request rope_deltas for the current decode batch.
@@ -269,6 +428,20 @@ class VLMModelAdapter(nn.Module):
         an array of rope_deltas aligned to the batch slot order.
         """
         self._batch_rope_deltas = deltas
+        self._qwen4_text_prefill_positions = False
+        self._qwen4_step_text_positions = False
+
+    def set_text_prefill_rope_delta(self, delta: float) -> None:
+        """Bind one scheduler-proven text row for an imminent prefill call.
+
+        This seam is intentionally separate from ``set_batch_rope_deltas``.
+        Only the scheduler's external/chunked non-media prefill paths may call
+        it. A later generic decode, media, or batched bind clears the proof.
+        """
+
+        self._batch_rope_deltas = mx.array([delta])
+        self._qwen4_text_prefill_positions = True
+        self._qwen4_step_text_positions = False
 
     def _batch_rope_deltas_for_size(self, batch_size: int) -> Optional[mx.array]:
         """Return rope deltas aligned to the current model input batch size."""
@@ -300,7 +473,12 @@ class VLMModelAdapter(nn.Module):
         return mx.concatenate([deltas, pad], axis=0)
 
     def _position_ids_from_starts(
-        self, starts: mx.array, batch_size: int, seq_len: int
+        self,
+        starts: mx.array,
+        batch_size: int,
+        seq_len: int,
+        *,
+        qwen4_text_prefill_positions: bool = False,
     ) -> mx.array:
         """Build model-specific decode position_ids from per-row start offsets.
 
@@ -319,6 +497,18 @@ class VLMModelAdapter(nn.Module):
         seq_positions = starts[:, None] + steps[None, :]
         if self._uses_minimax_m3_positions:
             return seq_positions
+        if (
+            self.model_type == "qwen4_exp"
+            and qwen4_text_prefill_positions
+            and batch_size == 1
+        ):
+            # Qwen4's gathered-QSA qualification accepts canonical B1 text
+            # positions as (1, T), never general multimodal (3, B, T) mRoPE.
+            # The generic form constructed below is a broadcast of this exact
+            # row across all three planes, so avoiding that broadcast changes
+            # neither rotary values nor logits; it only preserves the proven
+            # text-only fast-path contract.
+            return seq_positions
         return mx.broadcast_to(seq_positions[None, :, :], (3, batch_size, seq_len))
 
     def get_last_rope_deltas(self) -> float:
@@ -330,6 +520,8 @@ class VLMModelAdapter(nn.Module):
         rd = getattr(self._language_model, "_rope_deltas", None)
         if rd is None:
             return 0.0
+        if isinstance(rd, mx.array):
+            return float(rd.reshape(-1)[0].item())
         if hasattr(rd, "item"):
             return float(rd.item())
         return float(rd)
@@ -338,6 +530,34 @@ class VLMModelAdapter(nn.Module):
     def has_pending_embeddings(self) -> bool:
         """Check if there are pending embeddings for prefill."""
         return self._pending_embeds is not None
+
+    def minimum_prefill_prefix(self, tokens: list[int]) -> int:
+        """Return the prefix that must run together before reusable boundaries."""
+        if self.model_type != "deepseek_v4":
+            return 0
+        config = self._language_model.config
+        if not config.vision_n_layers:
+            return 0
+        return next(
+            (
+                i + 1
+                for i in range(len(tokens) - 1, -1, -1)
+                if tokens[i] >= config.vocab_size
+            ),
+            0,
+        )
+
+    def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
+        """Forward the prompt loop's next-chunk notice to a language model that gathers ahead."""
+        hook = getattr(self._language_model, "prefetch_ple", None)
+        if hook is not None:
+            hook(next_ids, current_ids)
+
+    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+        """Forward the scheduler's cache-only contract to DeepSeek V4.1."""
+        if self.model_type == "deepseek_v41":
+            kwargs["_ced_prefill"] = True
+        return self(input_ids, cache=cache, **kwargs)
 
     def __call__(
         self,
@@ -364,6 +584,13 @@ class VLMModelAdapter(nn.Module):
         Returns:
             Model output (logits as mx.array)
         """
+        # Consume the scheduler proof before doing any work. A failed/cancelled
+        # call therefore cannot leave a text-only capability armed for a later
+        # media or generic request. Each external prefill chunk explicitly
+        # re-arms it at its own model-call boundary.
+        prefill_text_positions = self._qwen4_text_prefill_positions
+        step_text_positions = self._qwen4_step_text_positions
+        self._qwen4_text_prefill_positions = False
         return_hidden = bool(kwargs.get("return_hidden", False))
         if skip_lm_head:
             # Scheduler prefill chunks discard their logits. Translate the
@@ -394,6 +621,13 @@ class VLMModelAdapter(nn.Module):
                         break
                 batch_size, seq_len = input_ids.shape
                 deltas = self._batch_rope_deltas_for_size(batch_size)
+                # The step proof engages only above the context threshold; a
+                # scalar offset is the batch-one case the proof is bound to.
+                qwen4_text_prefill_positions = prefill_text_positions or (
+                    step_text_positions
+                    and isinstance(offsets, (int, float))
+                    and offsets >= _STEP_TEXT_POSITIONS_MIN_CONTEXT
+                )
                 base_offsets = None
                 if isinstance(offsets, mx.array):
                     if offsets.ndim == 0:
@@ -406,7 +640,10 @@ class VLMModelAdapter(nn.Module):
                 if base_offsets is not None and deltas is not None:
                     positions = base_offsets + deltas.astype(base_offsets.dtype)
                     position_ids = self._position_ids_from_starts(
-                        positions, batch_size, seq_len
+                        positions,
+                        batch_size,
+                        seq_len,
+                        qwen4_text_prefill_positions=(qwen4_text_prefill_positions),
                     )
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs
@@ -426,7 +663,10 @@ class VLMModelAdapter(nn.Module):
                 if offsets is not None:
                     batch_size, seq_len = input_ids.shape
                     position_ids = self._position_ids_from_starts(
-                        offsets, batch_size, seq_len
+                        offsets,
+                        batch_size,
+                        seq_len,
+                        qwen4_text_prefill_positions=prefill_text_positions,
                     )
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs

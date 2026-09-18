@@ -13,6 +13,19 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_vlm.models.qwen3_5 import language
+from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+from mlx_vlm.speculative.cache_state import start_speculative_cache
+from mlx_vlm.speculative.ops import linear as linear_ops
+
+
+@pytest.fixture(autouse=True)
+def restore_hooks(monkeypatch):
+    cls = language.Qwen3_5GatedDeltaNet
+    monkeypatch.setattr(cls, "__call__", cls.__call__)
+    verifier = Qwen3_5BatchInvariantForward
+    monkeypatch.setattr(verifier, "_gated_delta", verifier._gated_delta)
+
 
 from omlx.patches import qwen35_gdn_prework as prework_mod
 from omlx.patches.qwen35_gdn_prework import (
@@ -42,14 +55,15 @@ def _composed(qkv, conv_state, conv1d):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("seq", [3, 4, 5, 7, 9])
-def test_fused_prework_bit_exact(seq):
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_fused_prework_bit_exact(seq, batch):
     mx.random.seed(11)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
     conv1d = nn.Conv1d(C, C, kernel_size=4, groups=C, bias=False)
     conv1d.weight = conv_w
-    qkv = (mx.random.normal((1, seq, C)) * 0.5).astype(mx.bfloat16)
-    state = (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16)
+    qkv = (mx.random.normal((batch, seq, C)) * 0.5).astype(mx.bfloat16)
+    state = (mx.random.normal((batch, 3, C)) * 0.5).astype(mx.bfloat16)
     inv = DK**-0.5
     q_scale = mx.array(inv * inv, dtype=mx.bfloat16)
     k_scale = mx.array(inv, dtype=mx.bfloat16)
@@ -279,7 +293,7 @@ def test_qwen4_decode_route_commits_both_states_and_advances_once(monkeypatch):
         lambda *args, **kwargs: True,
     )
     monkeypatch.setattr(
-        q35,
+        linear_ops,
         "_target_verify_linears",
         lambda *args, **kwargs: (
             mx.zeros((1, 1, C), dtype=mx.bfloat16),
@@ -303,7 +317,6 @@ def test_qwen4_decode_route_commits_both_states_and_advances_once(monkeypatch):
         "qwen4_decode_norm_gate_fused",
         lambda *args, **kwargs: fused,
     )
-    monkeypatch.setattr(q35, "_target_verify_linear", lambda *args: fused)
 
     assert prework_mod.apply_qwen35_gdn_prework_patch()
     module = SimpleNamespace(
@@ -319,7 +332,7 @@ def test_qwen4_decode_route_commits_both_states_and_advances_once(monkeypatch):
         A_log=None,
         dt_bias=None,
         norm=SimpleNamespace(weight=None, eps=1e-6),
-        out_proj=None,
+        out_proj=lambda x: fused,
     )
     cache = _FakeCache(old_conv, old_recurrent)
     result = cls.__call__(
@@ -333,7 +346,7 @@ def test_qwen4_decode_route_commits_both_states_and_advances_once(monkeypatch):
     assert cache.advance_calls == 1
 
 
-def test_qwen4_decode_route_restores_states_before_stock_fallback(monkeypatch):
+def test_qwen4_decode_route_does_not_commit_states_on_failure(monkeypatch):
     q35 = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
     cls = q35.Qwen3_5GatedDeltaNet
     old_conv = mx.zeros((1, 3, C), dtype=mx.bfloat16)
@@ -354,7 +367,7 @@ def test_qwen4_decode_route_restores_states_before_stock_fallback(monkeypatch):
         lambda *args, **kwargs: True,
     )
     monkeypatch.setattr(
-        q35,
+        linear_ops,
         "_target_verify_linears",
         lambda *args, **kwargs: (None, None, None, None),
     )
@@ -398,147 +411,75 @@ def test_qwen4_decode_route_restores_states_before_stock_fallback(monkeypatch):
         out_proj=None,
     )
     cache = _FakeCache(old_conv, old_recurrent)
-    result = cls.__call__(
-        module,
-        mx.zeros((1, 1, 2560), dtype=mx.bfloat16),
-        cache=cache,
+    with pytest.raises(RuntimeError, match="late"):
+        cls.__call__(module, mx.zeros((1, 1, 2560), dtype=mx.bfloat16), cache=cache)
+    assert not seen
+    assert cache[0] is old_conv and cache[1] is old_recurrent
+    assert cache.advance_calls == 0
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("seq", [2, 3])
+def test_batched_verify_preserves_output_and_all_rollback_states(
+    monkeypatch, batch, seq
+):
+    import copy
+
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
     )
-    assert result == "stock"
-    assert len(seen) == 1
-    assert seen[0][0] is old_conv
-    assert seen[0][1] is old_recurrent
-    assert seen[0][2] == 0
-
-
-@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_patched_call_restores_conv_state_and_skips_advance_on_failure(monkeypatch):
-    """E3 regression: an exception raised after cache[0] is set to the fused
-    kernel's post-update state (but before the delta update finishes) must
-    not leave that clobbered state behind for the stock fallback to see, and
-    must not have advanced the cache offset yet (which would double-advance
-    once the fallback runs its own single advance)."""
-    q35 = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
-    cls = q35.Qwen3_5GatedDeltaNet
-
-    original_conv_state = mx.full((1, 3, 4), 1.0, dtype=mx.bfloat16)
-    new_conv_state = mx.full((1, 3, 4), 2.0, dtype=mx.bfloat16)
-
-    orig_call_calls = []
-
-    def fake_orig_call(self, inputs, mask=None, cache=None, gdn_sink=None,
-                        target_verify=False):
-        orig_call_calls.append(cache[0])
-        return "stock-result"
-
-    def fake_target_verify_linears(linears, inputs, flag):
-        z = mx.zeros((1, inputs.shape[1], HK, DV))
-        return mx.zeros((1, inputs.shape[1], 1)), z, None, None
-
-    def _raise(*args, **kwargs):
-        raise RuntimeError("boom")
+    mx.random.seed(193)
+    module = q35.Qwen3_5GatedDeltaNet(args)
+    module.set_dtype(mx.bfloat16)
+    module.eval()
+    inputs = mx.random.normal((batch, seq, 64)).astype(mx.bfloat16)
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((batch, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache[1] = mx.random.normal((batch, 4, 128, 128)) * 0.01
+    reference_cache = copy.deepcopy(cache)
+    verifier = Qwen3_5BatchInvariantForward()
+    reference_transaction = start_speculative_cache([reference_cache], seq)
+    reference = verifier._gated_delta(module, inputs, None, reference_cache)
+    mx.eval(reference, reference_cache.state)
 
     monkeypatch.setattr(prework_mod, "_PATCHED", False)
-    monkeypatch.setattr(prework_mod, "gdn_prework_fused",
-                         lambda *a, **kw: (None, None, None, new_conv_state))
-    monkeypatch.setattr(cls, "__call__", fake_orig_call, raising=False)
-    monkeypatch.setattr(cls, "_omlx_gdn_prework_patched", False, raising=False)
-    monkeypatch.setattr(q35, "_target_verify_linears", fake_target_verify_linears)
-    monkeypatch.setattr(q35, "_gated_delta_update_verify_decode", _raise)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    calls = []
+    kernel = prework_mod.gdn_prework_fused
 
-    assert prework_mod.apply_qwen35_gdn_prework_patch() is True
-    patched_call = cls.__call__
-    assert patched_call is not fake_orig_call  # actually installed the wrapper
+    def record(*args):
+        calls.append(args[0].shape)
+        return kernel(*args)
 
-    fake_self = SimpleNamespace(
-        in_proj_qkv=None, in_proj_z=None, in_proj_b=None, in_proj_a=None,
-        conv1d=SimpleNamespace(weight=mx.zeros((1,), dtype=mx.bfloat16), bias=None),
-        head_k_dim=DK, head_v_dim=DV, num_k_heads=HK, num_v_heads=HV,
-        A_log=None, dt_bias=None, training=False, conv_kernel_size=4,
+    monkeypatch.setattr(prework_mod, "gdn_prework_fused", record)
+    transaction = start_speculative_cache([cache], seq)
+    actual = verifier._gated_delta(module, inputs, None, cache)
+    mx.eval(actual, cache.state)
+    assert calls == [(batch, seq, module.conv_dim)]
+    assert mx.array_equal(actual, reference).item()
+    for retained in ([1] * batch, [seq] * batch, [1 + i % seq for i in range(batch)]):
+        actual_cache, actual_tx = copy.deepcopy((cache, transaction))
+        expected_cache, expected_tx = copy.deepcopy(
+            (reference_cache, reference_transaction)
+        )
+        actual_tx.commit(retained)
+        expected_tx.commit(retained)
+        for (_, a), (_, b) in zip(
+            tree_flatten(actual_cache.state), tree_flatten(expected_cache.state)
+        ):
+            assert mx.array_equal(a, b).item()
+    transaction.abort()
+    reference_transaction.abort()
+    assert all(
+        mx.array_equal(a, b).item() for a, b in zip(cache.state, reference_cache.state)
     )
-    cache = _FakeCache(original_conv_state)
-    inputs = mx.zeros((1, 4, 1), dtype=mx.bfloat16)
-
-    result = patched_call(fake_self, inputs, mask=None, cache=cache,
-                           gdn_sink=[], target_verify=True)
-
-    assert result == "stock-result"  # fell back to orig_call
-    assert cache.advance_calls == 0  # never reached the (now-deferred) advance
-    assert len(orig_call_calls) == 1
-    assert bool((orig_call_calls[0] == original_conv_state).all().item()), (
-        "orig_call must see the pre-mutation conv state, not the fused "
-        "kernel's clobbered post-update state"
-    )
-
-
-@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_patched_call_restores_state_and_discards_sink_on_late_failure(monkeypatch):
-    """A failure AFTER the fused arm has appended its gdn_sink entry (e.g.
-    in norm/out_proj) falls back to orig_call, and the stock path appends
-    its own sink entry for the same layer call. The fused entry must be
-    discarded, otherwise the sink holds two entries for one layer and every
-    later layer's rollback capture is shifted by one."""
-    q35 = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
-    cls = q35.Qwen3_5GatedDeltaNet
-
-    original_conv_state = mx.full((1, 3, 4), 1.0, dtype=mx.bfloat16)
-    new_conv_state = mx.full((1, 3, 4), 2.0, dtype=mx.bfloat16)
-    original_recurrent_state = mx.full((1, 1), 3.0, dtype=mx.float32)
-    new_recurrent_state = mx.full((1, 1), 4.0, dtype=mx.float32)
-    stock_recurrent_states = []
-
-    def fake_orig_call(self, inputs, mask=None, cache=None, gdn_sink=None,
-                        target_verify=False):
-        # Mirror the stock path: it appends its own rollback entry when a
-        # sink is present.
-        stock_recurrent_states.append(cache[1])
-        gdn_sink.append("stock-entry")
-        return "stock-result"
-
-    def fake_target_verify_linears(linears, inputs, flag):
-        z = mx.zeros((1, inputs.shape[1], HK, DV))
-        # Last dim matches conv_state so the conv_input concatenate works.
-        return mx.zeros((1, inputs.shape[1], 4), dtype=mx.bfloat16), z, None, None
-
-    def fake_delta_update(*args, **kwargs):
-        out = mx.zeros((1, 4, HV, DV), dtype=mx.bfloat16)
-        return out, new_recurrent_state, None
-
-    def _raise(*args, **kwargs):
-        raise RuntimeError("boom in out_proj")
-
-    monkeypatch.setattr(prework_mod, "_PATCHED", False)
-    monkeypatch.setattr(prework_mod, "gdn_prework_fused",
-                         lambda *a, **kw: (None, None, None, new_conv_state))
-    monkeypatch.setattr(cls, "__call__", fake_orig_call, raising=False)
-    monkeypatch.setattr(cls, "_omlx_gdn_prework_patched", False, raising=False)
-    monkeypatch.setattr(q35, "_target_verify_linears", fake_target_verify_linears)
-    monkeypatch.setattr(q35, "_gated_delta_update_verify_decode", fake_delta_update)
-    monkeypatch.setattr(q35, "_target_verify_linear", _raise)
-
-    assert prework_mod.apply_qwen35_gdn_prework_patch() is True
-    patched_call = cls.__call__
-    assert patched_call is not fake_orig_call
-
-    fake_self = SimpleNamespace(
-        in_proj_qkv=None, in_proj_z=None, in_proj_b=None, in_proj_a=None,
-        conv1d=SimpleNamespace(weight=mx.zeros((1,), dtype=mx.bfloat16), bias=None),
-        head_k_dim=DK, head_v_dim=DV, num_k_heads=HK, num_v_heads=HV,
-        A_log=None, dt_bias=None, training=False, conv_kernel_size=4,
-        norm=lambda out, z: out, out_proj=None,
-    )
-    cache = _FakeCache(original_conv_state, original_recurrent_state)
-    inputs = mx.zeros((1, 4, 1), dtype=mx.bfloat16)
-    sink = []
-
-    result = patched_call(fake_self, inputs, mask=None, cache=cache,
-                           gdn_sink=sink, target_verify=True)
-
-    assert result == "stock-result"
-    assert sink == ["stock-entry"], (
-        f"sink must hold exactly the stock entry, got {len(sink)} entries: "
-        "the fused arm's entry was not discarded on fallback"
-    )
-    assert len(stock_recurrent_states) == 1
-    assert bool(
-        (stock_recurrent_states[0] == original_recurrent_state).all().item()
-    ), "stock fallback must see the pre-call recurrent state"

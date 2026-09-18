@@ -16,16 +16,14 @@ replaces ``gate_proj``/``up_proj`` (mirroring the vendored GLM DSA
 switch layers), and the class ``__call__`` gains a fused branch.
 Instances without ``gate_up_proj`` keep the original code path.
 
-mlx-vlm's qwen3_5_moe target-verify helper calls ``gate_proj``/
-``up_proj`` directly (MTP verify), so applying the fusion also swaps
-that module-level helper for a fused-aware version. Qwen3.5/3.6 MoE
-MTP checkpoints route through the VLM engine, which is why the VLM
-path matters even for text-only serving.
+mlx-vlm's exact verifier reads separate gate/up views of the fused storage.
+Its short-block verify path keeps the upstream numerical contract; normal
+prefill and decode use the fused projection.
 """
 
 from __future__ import annotations
 
-import importlib
+import copy
 import logging
 import os
 from typing import Any
@@ -37,6 +35,18 @@ from mlx_lm.models.switch_layers import (
     SwitchLinear,
     _gather_sort,
     _scatter_unsort,
+)
+from mlx_vlm.models.switch_layers import (
+    DECODE_BLOCK_SIZE,
+)
+from mlx_vlm.models.switch_layers import (
+    QuantizedSwitchLinear as VLMQuantizedSwitchLinear,
+)
+from mlx_vlm.models.switch_layers import (
+    SwitchGLU as VLMSwitchGLU,
+)
+from mlx_vlm.models.switch_layers import (
+    SwitchLinear as VLMSwitchLinear,
 )
 
 from ..scheduler import _sync_and_clear_cache
@@ -75,7 +85,7 @@ def _can_fuse(switch_mlp: Any) -> bool:
     gate, up = switch_mlp.gate_proj, switch_mlp.up_proj
     if type(gate) is not type(up):
         return False
-    if isinstance(gate, QuantizedSwitchLinear):
+    if isinstance(gate, (QuantizedSwitchLinear, VLMQuantizedSwitchLinear)):
         if (gate.group_size, gate.bits, gate.mode) != (
             up.group_size,
             up.bits,
@@ -84,7 +94,7 @@ def _can_fuse(switch_mlp: Any) -> bool:
             return False
         if (gate.get("biases") is None) != (up.get("biases") is None):
             return False
-    elif not isinstance(gate, SwitchLinear):
+    elif not isinstance(gate, (SwitchLinear, VLMSwitchLinear)):
         return False
     if ("bias" in gate) != ("bias" in up):
         return False
@@ -97,7 +107,7 @@ def _fuse_one(switch_mlp: Any) -> None:
     # Concat order is [gate, up] along the output axis, matching the GLM
     # DSA fused layout and the HF gate_up_proj checkpoint convention.
     fused = {"weight": mx.concatenate([gate["weight"], up["weight"]], axis=1)}
-    if isinstance(gate, QuantizedSwitchLinear):
+    if isinstance(gate, (QuantizedSwitchLinear, VLMQuantizedSwitchLinear)):
         fused["scales"] = mx.concatenate([gate["scales"], up["scales"]], axis=1)
         if gate.get("biases") is not None:
             fused["biases"] = mx.concatenate([gate["biases"], up["biases"]], axis=1)
@@ -108,11 +118,20 @@ def _fuse_one(switch_mlp: Any) -> None:
     # Reuse the gate module as the fused container so quant params and
     # frozen state carry over; dropping gate_proj/up_proj frees the
     # original buffers.
-    for name, array in fused.items():
-        setattr(gate, name, array)
-    switch_mlp.gate_up_proj = gate
-    del switch_mlp.gate_proj
-    del switch_mlp.up_proj
+    if type(switch_mlp) is VLMSwitchGLU:
+        gate_up = copy.copy(gate)
+        for name, array in fused.items():
+            setattr(gate_up, name, array)
+            gate[name], up[name] = mx.split(array, 2, axis=-1 if name == "bias" else 1)
+        # Verify uses these views on the engine thread after loading.
+        mx.eval([gate[name] for name in fused], [up[name] for name in fused])
+        switch_mlp.gate_up_proj = gate_up
+    else:
+        for name, array in fused.items():
+            setattr(gate, name, array)
+        switch_mlp.gate_up_proj = gate
+        del switch_mlp.gate_proj
+        del switch_mlp.up_proj
 
 
 def _make_patched_call(orig_call):
@@ -143,54 +162,31 @@ def _make_patched_call(orig_call):
     return patched
 
 
-def _make_patched_target_verify(orig_fn):
-    def patched(switch_mlp, x, indices, target_verify):
-        gate_up = getattr(switch_mlp, "gate_up_proj", None)
-        if gate_up is None:
-            return orig_fn(switch_mlp, x, indices, target_verify)
-        if not (target_verify and x.ndim == 3 and x.shape[1] > 1):
-            return switch_mlp(x, indices)
+def _make_vlm_patched_call(original):
+    fused_call = _make_patched_call(original)
 
-        B, T, D = x.shape
-        k = indices.shape[-1]
-        flat_x = mx.expand_dims(x.reshape(B * T, D), (-2, -3))
-        flat_indices = indices.reshape(B * T, k)
-        x_gate_up = gate_up(flat_x, flat_indices, sorted_indices=False)
-        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
-        out = switch_mlp.down_proj(
-            switch_mlp.activation(x_up, x_gate),
-            flat_indices,
-            sorted_indices=False,
-        )
-        return out.squeeze(-2).reshape(B, T, k, -1)
+    def patched(self, x, indices, weights=None, shared=None, residual=None):
+        # Exact verification reads gate/up views of the same fused storage.
+        if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+            return original(self, x, indices, weights, shared, residual)
+        routed = fused_call(self, x, indices)
+        return self._combine(routed, weights, shared, residual)
 
     return patched
 
 
-def _ensure_vlm_verify_patch() -> None:
-    """Make mlx-vlm's qwen3_5_moe target-verify helper fused-aware."""
-    try:
-        module = importlib.import_module("mlx_vlm.models.qwen3_5_moe.language")
-    except Exception:
-        return
-    if getattr(module, "_omlx_gate_up_fused_verify", False):
-        return
-    orig = getattr(module, "_target_verify_switch_glu", None)
-    if orig is None:
-        return
-    module._target_verify_switch_glu = _make_patched_target_verify(orig)
-    module._omlx_gate_up_fused_verify = True
-
-
 def _ensure_call_patch() -> None:
     global _CALL_PATCHED
-    if _CALL_PATCHED or getattr(SwitchGLU, "_omlx_gate_up_fused_call", False):
-        _CALL_PATCHED = True
-        return
-    orig = SwitchGLU.__call__
-    SwitchGLU.__call__ = _make_patched_call(orig)
-    SwitchGLU._omlx_gate_up_fused_call = True
-    SwitchGLU._omlx_gate_up_original_call = orig
+    for cls, wrap in (
+        (SwitchGLU, _make_patched_call),
+        (VLMSwitchGLU, _make_vlm_patched_call),
+    ):
+        if getattr(cls, "_omlx_gate_up_fused_call", False):
+            continue
+        original = cls.__call__
+        cls.__call__ = wrap(original)
+        cls._omlx_gate_up_fused_call = True
+        cls._omlx_gate_up_original_call = original
     _CALL_PATCHED = True
 
 
@@ -206,12 +202,13 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     if not _is_supported_family(model):
         return 0
     targets = [
-        m for _, m in model.named_modules() if type(m) is SwitchGLU and _can_fuse(m)
+        m
+        for _, m in model.named_modules()
+        if type(m) in (SwitchGLU, VLMSwitchGLU) and _can_fuse(m)
     ]
     if not targets:
         return 0
     _ensure_call_patch()
-    _ensure_vlm_verify_patch()
     for switch_mlp in targets:
         _fuse_one(switch_mlp)
         # The freed gate/up buffers land in the MLX buffer pool, which the

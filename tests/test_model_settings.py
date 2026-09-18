@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 from omlx.model_settings import (
+    SETTINGS_VERSION,
     ModelSettings,
     ModelSettingsManager,
+    resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
 
@@ -48,6 +50,31 @@ class TestModelSettings:
         assert d["is_favorite"] is True
         restored = ModelSettings.from_dict(d)
         assert restored.is_favorite is True
+
+    def test_moe_expert_offload_defaults(self):
+        """Expert offload is opt-in, at 25% residency."""
+        settings = ModelSettings()
+        assert settings.moe_expert_offload_enabled is False
+        assert settings.moe_expert_offload_resident_fraction == 0.25
+
+    def test_moe_expert_offload_roundtrip(self):
+        """Both offload fields survive to_dict -> from_dict."""
+        original = ModelSettings(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+        )
+        d = original.to_dict()
+        assert d["moe_expert_offload_enabled"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.moe_expert_offload_enabled is True
+        assert restored.moe_expert_offload_resident_fraction == 0.5
+
+    def test_moe_expert_offload_fraction_out_of_range_rejected(self):
+        """Residency outside (0, 1] fails at construction, not at load."""
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=0.0)
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=1.5)
 
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""
@@ -641,6 +668,21 @@ class TestModelSettingsManager:
 
         assert merged == {"enable_thinking": True, "custom_flag": "request"}
 
+    @pytest.mark.parametrize("budget", [None, 0, 1])
+    @pytest.mark.parametrize("enabled", [None, True, False])
+    def test_budget_respects_explicit_thinking_mode(self, budget, enabled):
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        kwargs = {} if enabled is None else {"enable_thinking": enabled}
+        expected = {"enable_thinking": True} if not kwargs and budget == 1 else kwargs
+        assert merge_chat_template_kwargs(None, kwargs, thinking_budget=budget) == expected
+
+    def test_zero_thinking_budget_does_not_enable_thinking(self):
+        """Zero means no thinking budget activation at template-render time."""
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        assert merge_chat_template_kwargs(None, thinking_budget=0) == {}
+
     def test_thread_safety(self):
         """Test thread-safe access."""
         import threading
@@ -752,3 +794,141 @@ class TestVlmMtpProcessorExclusivity:
             assert loaded.max_context_window == 8192
             assert loaded.is_pinned is True
             assert loaded.vlm_mtp_draft_model == "gemma-assistant"
+
+
+# --------------------------------------------------------------------------
+# oQ A8 prefill kernels
+# --------------------------------------------------------------------------
+
+
+def test_oq_a8_defaults_to_off():
+    """It changes inference numerics, so it must be opt-in."""
+    settings = ModelSettings()
+    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.qwen35_oq_a8_min_tokens == 128
+
+
+def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
+    """Both wrap Qwen3_5MLP.__call__, so the pair is a silent no-op for
+    whichever patches first rather than two accelerators stacking. Constructing
+    the combination has to raise so the clash reaches the caller."""
+    with pytest.raises(ValueError, match="cannot"):
+        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True)
+
+    # Either one alone is fine.
+    assert ModelSettings(qwen35_oq_a8_enabled=True).qwen35_oq_a8_enabled is True
+    assert (
+        ModelSettings(qwen35_ane_prefill_enabled=True).qwen35_ane_prefill_enabled
+        is True
+    )
+
+
+def test_prefill_conflict_resolution_keeps_ane_and_reports_it():
+    """A dict is downgraded rather than rejected: it may be a whole saved
+    profile, and dropping every other field in it to punish one clash is worse
+    than turning the losing accelerator off and saying so."""
+    resolved, conflicts = resolve_qwen35_prefill_conflicts(
+        {
+            "qwen35_oq_a8_enabled": True,
+            "qwen35_ane_prefill_enabled": True,
+            "max_tokens": 4096,
+        }
+    )
+    assert resolved["qwen35_oq_a8_enabled"] is False
+    assert resolved["qwen35_ane_prefill_enabled"] is True
+    assert resolved["max_tokens"] == 4096
+    assert conflicts == ["qwen35_ane_prefill_enabled"]
+    # The resolved dict has to be constructible -- that is the whole point.
+    assert ModelSettings.from_dict(resolved).qwen35_oq_a8_enabled is False
+
+
+def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
+    for data in (
+        {},
+        {"qwen35_oq_a8_enabled": True},
+        {"qwen35_ane_prefill_enabled": True},
+        {"qwen35_oq_a8_enabled": False, "qwen35_ane_prefill_enabled": True},
+    ):
+        resolved, conflicts = resolve_qwen35_prefill_conflicts(data)
+        assert conflicts == []
+        # Unchanged dicts are returned as-is, not copied.
+        assert resolved is data
+
+
+def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
+    """The load path has to survive a settings file written by an older build
+    or hand-edited: the model keeps its settings, minus the losing toggle."""
+    path = tmp_path / "model_settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": SETTINGS_VERSION,
+                "models": {
+                    "clash/model": {
+                        "qwen35_oq_a8_enabled": True,
+                        "qwen35_ane_prefill_enabled": True,
+                        "qwen35_oq_a8_min_tokens": 512,
+                    }
+                },
+            }
+        )
+    )
+    manager = ModelSettingsManager(tmp_path)
+    settings = manager.get_settings("clash/model")
+    assert settings.qwen35_ane_prefill_enabled is True
+    assert settings.qwen35_oq_a8_enabled is False
+    # The rest of the blob survives the downgrade.
+    assert settings.qwen35_oq_a8_min_tokens == 512
+
+
+def test_oq_a8_exposes_no_kernel_choice():
+    """There is one kernel, so there is nothing for a user to pick.
+
+    The tile is chosen per bit width by the dispatcher from a measured
+    default. Keeping it out of ModelSettings means a saved profile cannot pin
+    a variant that a later build no longer instantiates.
+    """
+    assert not hasattr(ModelSettings(), "qwen35_oq_a8_variant")
+
+
+def test_a_stale_saved_variant_is_ignored_rather_than_fatal():
+    """A settings blob carrying an unknown key must still load.
+
+    from_dict filters to known fields, so the stray key is dropped instead of
+    raising and taking the model's whole settings blob with it.
+    """
+    restored = ModelSettings.from_dict(
+        {
+            "qwen35_oq_a8_enabled": True,
+            "qwen35_oq_a8_variant": 706,
+            "qwen35_oq_a8_min_tokens": 512,
+        }
+    )
+    assert restored.qwen35_oq_a8_enabled is True
+    assert restored.qwen35_oq_a8_min_tokens == 512
+    assert not hasattr(restored, "qwen35_oq_a8_variant")
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_oq_a8_rejects_non_positive_min_tokens(value):
+    with pytest.raises(ValueError, match="qwen35_oq_a8_min_tokens"):
+        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=value)
+
+
+def test_oq_a8_round_trips_through_dict():
+    settings = ModelSettings(
+        qwen35_oq_a8_enabled=True,
+        qwen35_oq_a8_min_tokens=1024,
+    )
+    restored = ModelSettings.from_dict(settings.to_dict())
+    assert restored.qwen35_oq_a8_enabled is True
+    assert restored.qwen35_oq_a8_min_tokens == 1024
+
+
+def test_oq_a8_is_a_model_specific_profile_field():
+    """Never a template field: it is tied to one checkpoint's quantization."""
+    from omlx.model_profiles import MODEL_SPECIFIC_PROFILE_FIELDS, UNIVERSAL_FIELDS_SET
+
+    for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+        assert name in MODEL_SPECIFIC_PROFILE_FIELDS
+        assert name not in UNIVERSAL_FIELDS_SET

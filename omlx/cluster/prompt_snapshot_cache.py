@@ -29,16 +29,19 @@ write that failed on one rank cannot desync the pipeline) is the caller's job
 and lives in the telemetry integration, which has the collective; this module
 stays pure and unit-testable.
 
-Snapshots are process-lifetime. The digest filenames cannot be re-indexed
-without their token tuples, and a file that is not in the index is invisible to
-hits yet still holds disk, so a new store starts by clearing its directory and
-the telemetry teardown removes it. A rank that restarts simply begins empty,
-which the boundary vote already handles.
+When persistence is enabled, a compact atomic manifest records the digest,
+boundary and byte size of every chain segment. The digest already commits to
+the model identity and exact prefix tokens, so the manifest does not duplicate
+the token arrays (which would grow quadratically at long context). Directories
+are scoped by plan hash and rank by the worker, preventing a changed tensor
+split from ever reading another shard layout. A missing or invalid manifest
+fails closed by clearing otherwise-unindexable files.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import struct
@@ -56,6 +59,95 @@ logger = logging.getLogger(__name__)
 # recurrent states), so the count bound mainly limits how many distinct
 # reusable boundaries exist across all prompts; the byte bound is the backstop.
 _MAX_ENTRIES_DEFAULT = 512
+
+
+def _wire_state(entry: Any) -> tuple[Any, Any]:
+    from mlx_lm.models.cache import CacheList, QuantizedKVCache
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    if isinstance(entry, CacheList):
+        states, metadata = zip(*(_wire_state(c) for c in entry.caches))
+        return list(states), ([type(c).__name__ for c in entry.caches], list(metadata))
+    if isinstance(entry, (PoolingCacheSnapshot, EmptyLeafSnapshot, KVCacheSegment)):
+        return entry.state, entry.meta_state
+    if isinstance(entry, QuantizedKVCache):
+        state = entry.keys_and_values() if entry.keys is not None else (None, None)
+        return list(state), (entry.offset, entry.group_size, entry.bits)
+    handler = CacheTypeRegistry.get_handler_for_object(entry)
+    state = handler.serialize_state(entry)
+    return list(state), handler.serialize_meta_state(entry) or ""
+
+
+def _from_wire_state(name: str, state: Any, metadata: Any) -> Any:
+    from mlx_lm.models.cache import CacheList
+
+    wrappers = {
+        c.__name__: c for c in (PoolingCacheSnapshot, EmptyLeafSnapshot, KVCacheSegment)
+    }
+    if name in wrappers:
+        return wrappers[name].from_state(state, metadata)
+    if name == "CacheList":
+        names, child_metadata = metadata
+        return CacheList(
+            *(
+                _from_wire_state(n, s, m)
+                for n, s, m in zip(names, state, child_metadata)
+            )
+        )
+    import mlx_lm.models.cache as cache_module
+
+    cache_class = getattr(cache_module, name)
+    if name in ("KVCache", "ConcatenateKVCache"):
+        cache = cache_class()
+        cache.keys, cache.values = state
+        cache.offset = 0 if cache.keys is None else cache.keys.shape[2]
+        return cache
+    if name == "ArraysCache":
+        cache = cache_class(len(state))
+        cache.cache = list(state)
+        return cache
+    if name == "QuantizedKVCache":
+        offset, group_size, bits = map(int, metadata)
+        return cache_class.from_state((*state, offset, group_size, bits))
+    if name == "BatchKVCache":
+        idx = 0 if state[0] is None else state[0].shape[2]
+        return cache_class.from_state((*state, idx))
+    if name == "BatchRotatingKVCache":
+        max_size, offset, idx, rotated = metadata
+        return cache_class.from_state(
+            (*state, int(max_size), int(offset), int(idx), str(rotated) == "True")
+        )
+    if name == "ChunkedKVCache":
+        chunk_size, start, offset = map(int, metadata)
+        return cache_class.from_state((*state, offset, chunk_size, start))
+    if name == "RotatingKVCache":
+        keep, max_size, offset, idx = map(int, metadata)
+        return cache_class.from_state((*state, offset, keep, max_size, idx))
+    return cache_class.from_state(state, metadata)
+
+
+def _save_prompt_snapshot(path: str, cache: list[Any]) -> None:
+    """Keep the distributed SSD wire format independent of mlx-lm's live state."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    states, metadata = zip(*(_wire_state(c) for c in cache))
+    info = [list(metadata), {}, [type(c).__name__ for c in cache]]
+    mx.save_safetensors(
+        path,
+        dict(tree_flatten(list(states))),
+        {k: str(v) for k, v in tree_flatten(info)},
+    )
+
+
+def _load_prompt_snapshot(path: str) -> list[Any]:
+    import mlx.core as mx
+    from mlx.utils import tree_unflatten
+
+    arrays, metadata = mx.load(path, return_metadata=True)
+    states = tree_unflatten(list(arrays.items()))
+    info, _, names = tree_unflatten(list(metadata.items()))
+    return [_from_wire_state(n, s, m) for n, s, m in zip(names, states, info)]
 
 
 class PoolingCacheSnapshot:
@@ -127,7 +219,7 @@ class EmptyLeafSnapshot:
 
         kept = tuple(
             leaf
-            for _key, leaf in tree_flatten(self._inner.state)
+            for _key, leaf in tree_flatten(_wire_state(self._inner)[0])
             if leaf is not None and leaf.size > 0
         )
         # Same slot-holding placeholder as PoolingCacheSnapshot: the layout
@@ -139,7 +231,7 @@ class EmptyLeafSnapshot:
         from mlx.utils import tree_flatten
 
         layout = []
-        for key, leaf in tree_flatten(self._inner.state):
+        for key, leaf in tree_flatten(_wire_state(self._inner)[0]):
             if leaf is None:
                 layout.append(f"{key}=none")
             elif leaf.size == 0:
@@ -147,12 +239,11 @@ class EmptyLeafSnapshot:
                 layout.append(f"{key}=empty:{shape}:{leaf.dtype}")
             else:
                 layout.append(f"{key}=array")
-        return (type(self._inner).__name__, tuple(layout), self._inner.meta_state)
+        return (type(self._inner).__name__, tuple(layout), _wire_state(self._inner)[1])
 
     @classmethod
     def from_state(cls, state: Any, meta_state: Any) -> Any:
         import mlx.core as mx
-        import mlx_lm.models.cache as cache_module
         from mlx.utils import tree_unflatten
 
         inner_name, layout, inner_meta = meta_state
@@ -169,8 +260,7 @@ class EmptyLeafSnapshot:
                 shape = tuple(int(d) for d in shape_text.split("x") if d)
                 dtype = getattr(mx, dtype_text.rsplit(".", 1)[-1])
                 pairs.append((key, mx.zeros(shape, dtype=dtype)))
-        inner_cls = getattr(cache_module, inner_name)
-        return inner_cls.from_state(tree_unflatten(pairs), inner_meta)
+        return _from_wire_state(inner_name, tree_unflatten(pairs), inner_meta)
 
 
 class KVCacheSegment:
@@ -190,7 +280,7 @@ class KVCacheSegment:
         self._start = start
 
     def _slabs(self) -> tuple[Any, Any]:
-        keys, values = self._inner.state
+        keys, values = self._inner.keys_and_values()
         return (keys[..., self._start :, :], values[..., self._start :, :])
 
     @property
@@ -246,7 +336,8 @@ def _has_unserialisable_leaves(entry: Any) -> bool:
     from mlx.utils import tree_flatten
 
     return any(
-        leaf is None or leaf.size == 0 for _key, leaf in tree_flatten(entry.state)
+        leaf is None or leaf.size == 0
+        for _key, leaf in tree_flatten(_wire_state(entry)[0])
     )
 
 
@@ -315,6 +406,7 @@ class _Entry:
     tokens: tuple[int, ...]
     filename: str
     nbytes: int
+    boundary: int
 
 
 def candidate_boundaries(prompt_len: int, step: int) -> tuple[int, ...]:
@@ -377,11 +469,13 @@ class SSDPromptSnapshotStore:
         step: int = 2048,
         max_entries: int = _MAX_ENTRIES_DEFAULT,
         max_bytes: int | None = None,
+        persistent: bool = False,
     ) -> None:
         self.directory = Path(directory)
         self.step = max(1, int(step))
         self.max_entries = max(1, int(max_entries))
         self.max_bytes = max_bytes
+        self.persistent = bool(persistent)
         self._lock = threading.RLock()
         # Access-ordered: most-recently-used at the end. The order is advanced
         # only by put/load, both driven by the identical request stream every
@@ -396,17 +490,30 @@ class SSDPromptSnapshotStore:
         self._serialisable = True
         _register_snapshot_classes()
         self.directory.mkdir(parents=True, exist_ok=True)
-        # Snapshots are process-lifetime (see the module docstring): whatever a
-        # dead process left behind is unreachable, so reclaim it up front and
-        # keep the directory exactly as large as the live index says it is.
-        for stale in self.directory.iterdir():
-            if stale.is_file():
-                with suppress(OSError):
-                    stale.unlink()
+        if self.persistent:
+            self._load_manifest_or_reset()
+        else:
+            self._clear_directory()
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._index)
+
+    def clear(self, timeout: float = 30.0) -> int:
+        """Atomically forget every live snapshot and reset its manifest.
+
+        This split writes snapshots synchronously, so there is no write-behind
+        queue to flush. ``timeout`` is accepted for parity with the rank cache
+        maintenance hook and with the later asynchronous store.
+        """
+
+        del timeout
+        with self._lock:
+            count = len(self._index)
+            self._clear_directory()
+            self._serialisable = True
+            self._persist_index_locked()
+            return count
 
     @property
     def nbytes(self) -> int:
@@ -415,6 +522,108 @@ class SSDPromptSnapshotStore:
 
     def _path(self, key: str) -> Path:
         return self.directory / f"{key}.safetensors"
+
+    @property
+    def _manifest_path(self) -> Path:
+        return self.directory / "index.json"
+
+    def _clear_directory(self) -> None:
+        self._index.clear()
+        self._nbytes = 0
+        for stale in self.directory.iterdir():
+            if stale.is_file():
+                with suppress(OSError):
+                    stale.unlink()
+
+    @staticmethod
+    def _valid_key(value: object) -> bool:
+        return bool(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(ch in "0123456789abcdef" for ch in value)
+        )
+
+    def _load_manifest_or_reset(self) -> None:
+        """Restore the durable LRU, or fail closed on any malformed state."""
+
+        manifest = self._manifest_path
+        if not manifest.is_file():
+            self._clear_directory()
+            self._persist_index_locked()
+            return
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            if payload.get("version") != 1 or int(payload.get("step")) != self.step:
+                raise ValueError("snapshot manifest contract changed")
+            rows = payload.get("entries")
+            if not isinstance(rows, list):
+                raise ValueError("snapshot manifest entries are invalid")
+            indexed_files = {manifest.name}
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("snapshot manifest entry is invalid")
+                key = row.get("key")
+                filename = row.get("filename")
+                boundary = int(row.get("boundary"))
+                nbytes = int(row.get("nbytes"))
+                if (
+                    not self._valid_key(key)
+                    or filename != f"{key}.safetensors"
+                    or boundary <= 0
+                    or boundary % self.step != 0
+                    or nbytes <= 0
+                ):
+                    raise ValueError("snapshot manifest entry is unsafe")
+                path = self.directory / filename
+                if key in self._index:
+                    raise ValueError("snapshot manifest contains a duplicate key")
+                if not path.is_file() or path.stat().st_size != nbytes:
+                    raise ValueError("snapshot manifest file is missing or changed")
+                self._index[key] = _Entry((), filename, nbytes, boundary)
+                self._nbytes += nbytes
+                indexed_files.add(filename)
+            for stale in self.directory.iterdir():
+                if stale.is_file() and stale.name not in indexed_files:
+                    with suppress(OSError):
+                        stale.unlink()
+            self._evict_locked()
+            self._persist_index_locked()
+        except Exception as error:
+            logger.warning("resetting invalid prompt snapshot manifest: %s", error)
+            self._clear_directory()
+            self._persist_index_locked()
+
+    def _persist_index_locked(self) -> None:
+        if not self.persistent:
+            return
+        payload = {
+            "version": 1,
+            "step": self.step,
+            "entries": [
+                {
+                    "key": key,
+                    "filename": entry.filename,
+                    "nbytes": entry.nbytes,
+                    "boundary": entry.boundary,
+                }
+                for key, entry in self._index.items()
+            ],
+        }
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".index.", suffix=".json", dir=self.directory
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._manifest_path)
+        except OSError as error:
+            with suppress(OSError):
+                os.close(descriptor)
+            with suppress(OSError):
+                os.unlink(temporary)
+            logger.warning("could not persist prompt snapshot manifest: %s", error)
 
     def _chain_keys(self, model: Any, tokens: tuple[int, ...]) -> list[str]:
         """Digest per chain boundary, shortest first, sharing one hash walk."""
@@ -439,8 +648,6 @@ class SSDPromptSnapshotStore:
         what lets branching prompts share their common chain.
         """
 
-        from mlx_lm.models.cache import save_prompt_cache
-
         if not self._serialisable:
             return False
         token_tuple = tuple(int(t) for t in tokens)
@@ -450,8 +657,12 @@ class SSDPromptSnapshotStore:
         key = self._chain_keys(model, token_tuple)[-1]
         with self._lock:
             entry = self._index.get(key)
-            if entry is not None and entry.tokens == token_tuple:
+            if entry is not None and (
+                entry.tokens == token_tuple
+                or (not entry.tokens and entry.boundary == boundary)
+            ):
                 self._index.move_to_end(key)
+                self._persist_index_locked()
                 return True
         wrapped = _wrap_for_save(
             cache, boundary=boundary, segment_start=boundary - self.step
@@ -465,7 +676,7 @@ class SSDPromptSnapshotStore:
                 prefix=f".{key}.", suffix=".safetensors", dir=self.directory
             )
             os.close(descriptor)
-            save_prompt_cache(temporary, wrapped)
+            _save_prompt_snapshot(temporary, wrapped)
             size = os.path.getsize(temporary)
             os.replace(temporary, target)
         except OSError:
@@ -491,10 +702,11 @@ class SSDPromptSnapshotStore:
             previous = self._index.pop(key, None)
             if previous is not None:
                 self._nbytes -= previous.nbytes
-            self._index[key] = _Entry(token_tuple, target.name, size)
+            self._index[key] = _Entry(token_tuple, target.name, size, boundary)
             self._nbytes += size
             self._index.move_to_end(key)
             self._evict_locked()
+            self._persist_index_locked()
         return True
 
     def present_boundaries(self, model: Any, tokens: list[int]) -> tuple[int, ...]:
@@ -512,7 +724,10 @@ class SSDPromptSnapshotStore:
                 entry = self._index.get(key)
                 if (
                     entry is None
-                    or entry.tokens != token_tuple[:boundary]
+                    or (
+                        entry.tokens != token_tuple[:boundary]
+                        and not (not entry.tokens and entry.boundary == boundary)
+                    )
                     or not self._path(key).is_file()
                 ):
                     break
@@ -522,8 +737,6 @@ class SSDPromptSnapshotStore:
     def load(self, model: Any, tokens: list[int], boundary: int) -> list[Any] | None:
         """Assemble the cache for ``tokens[:boundary]`` from its chain."""
 
-        from mlx_lm.models.cache import load_prompt_cache
-
         token_tuple = tuple(int(t) for t in tokens)
         if boundary <= 0 or boundary % self.step != 0 or boundary > len(token_tuple):
             return None
@@ -532,14 +745,19 @@ class SSDPromptSnapshotStore:
             for position, key in enumerate(chain):
                 entry = self._index.get(key)
                 prefix = token_tuple[: (position + 1) * self.step]
-                if entry is None or entry.tokens != prefix:
+                expected_boundary = (position + 1) * self.step
+                if entry is None or (
+                    entry.tokens != prefix
+                    and not (not entry.tokens and entry.boundary == expected_boundary)
+                ):
                     return None
                 if not self._path(key).is_file():
                     self._index.pop(key, None)
                     self._nbytes -= entry.nbytes
+                    self._persist_index_locked()
                     return None
         try:
-            files = [load_prompt_cache(str(self._path(key))) for key in chain]
+            files = [_load_prompt_snapshot(str(self._path(key))) for key in chain]
             assembled = _assemble_chain(files, boundary)
         except Exception:
             return None
@@ -549,6 +767,7 @@ class SSDPromptSnapshotStore:
             for key in chain:
                 if key in self._index:
                     self._index.move_to_end(key)
+            self._persist_index_locked()
         return assembled
 
     def _evict_locked(self) -> None:
@@ -585,7 +804,7 @@ def _assemble_chain(files: list[list[Any]], boundary: int) -> list[Any] | None:
         if hasattr(deepest, "_omlx_segment_start"):
             if not all(hasattr(member, "_omlx_segment_start") for member in members):
                 return None
-            slabs = [member.state for member in members]
+            slabs = [member.keys_and_values() for member in members]
             keys = mx.concatenate([keys for keys, _ in slabs], axis=2)
             values = mx.concatenate([values for _, values in slabs], axis=2)
             if keys.shape[2] != boundary:

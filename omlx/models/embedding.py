@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
+from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
 from .base_model import last_token_pool, mean_pooling, normalize_embeddings
 from .mlx_embeddings_compat import (
@@ -328,6 +329,7 @@ class MLXEmbeddingModel:
                 self.model_name,
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
+            patch_modernbert_attention(self.model)
 
             if hasattr(self.model, "config"):
                 config = self.model.config

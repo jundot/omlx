@@ -2074,45 +2074,19 @@ def _wrap_class(cls: type) -> None:
 
 
 def _install_dispatch() -> bool:
-    global _VLM_GDN_HOOK_INSTALLED, _VLM_HOOK_INSTALLED
+    from omlx.patches.qwen35_q4_mlp import (
+        apply_qwen35_vlm_gdn_projection_hook,
+        register_qwen35_lm_gdn_prefill_backend,
+    )
+
+    register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
     installed = False
     try:
         vlm = importlib.import_module("mlx_vlm.models.qwen3_5.language")
-        register = getattr(vlm, "register_qwen3_5_mlp_prefill_backend", None)
-        register_gdn = getattr(vlm, "register_qwen3_5_gdn_prefill_backend", None)
-        cls = getattr(vlm, "Qwen3_5MLP", None)
-        if cls is not None and getattr(cls, "_omlx_q4_mlp_patched", False):
-            # The exact q4 MLP patch replaces __call__ and therefore bypasses
-            # mlx-vlm's inner registration hook. Wrap that dispatcher so ANE
-            # gets first refusal and the q4 implementation remains fallback.
-            _wrap_class(cls)
-            installed = True
-        elif callable(register):
-            if not _VLM_HOOK_INSTALLED:
-                register(_backend)
-                _VLM_HOOK_INSTALLED = True
-            installed = True
-        else:
-            if cls is not None:
-                _wrap_class(cls)
-                installed = True
-        if callable(register_gdn) and not _VLM_GDN_HOOK_INSTALLED:
-            register_gdn(_gdn_backend)
-            _VLM_GDN_HOOK_INSTALLED = True
-        elif not _VLM_GDN_HOOK_INSTALLED:
-            target_linears = getattr(vlm, "_target_verify_linears", None)
-            if callable(target_linears):
-
-                def ane_target_linears(linears, x, target_verify=False):
-                    gdn = _GDN_MODULES.get(id(linears[0])) if linears else None
-                    if gdn is not None:
-                        output = _gdn_backend(gdn, x, target_verify)
-                        if output is not None:
-                            return output
-                    return target_linears(linears, x, target_verify)
-
-                vlm._target_verify_linears = ane_target_linears
-                _VLM_GDN_HOOK_INSTALLED = True
+        if vlm.Qwen3_5MLP is not None:
+            _wrap_class(vlm.Qwen3_5MLP)
+        apply_qwen35_vlm_gdn_projection_hook()
+        installed = True
     except Exception:
         logger.debug("mlx-vlm Qwen ANE dispatch hook unavailable", exc_info=True)
 
@@ -2121,17 +2095,6 @@ def _install_dispatch() -> bool:
         cls = getattr(lm, "MLP", None)
         if cls is not None:
             _wrap_class(cls)
-            installed = True
-        from omlx.patches.qwen35_q4_mlp import (
-            register_qwen35_lm_gdn_prefill_backend,
-        )
-
-        # The mlx-lm GDN implementation does not use mlx-vlm's
-        # _target_verify_linears helper.  Its q4 compatibility wrapper owns
-        # the projection call site, so register there on every install.  The
-        # assignment is deliberately idempotent and avoids stale process-wide
-        # hook state across VLM -> LLM fallback and model reloads.
-        register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
         installed = True
     except Exception:
         logger.debug("mlx-lm Qwen ANE dispatch hook unavailable", exc_info=True)
@@ -3562,8 +3525,9 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
     prefill needs back once the KV cache has grown into the guard's sizing
     target. Latches every sliced module through the existing per-module
     failure flags first (so the dispatch sites fall back to stock GPU compute
-    and never lazily recompile), then drops the state references; the native
-    models free their programs and mapped blobs when the last reference dies.
+    and never lazily recompile), then drops the state references and clears the
+    per-module state caches that hold the same objects; the native models free
+    their programs and mapped blobs when the last reference dies.
     Idempotent, and scoped to this engine instance: the next load of the
     model rebuilds the banks from its settings.
 
@@ -3587,6 +3551,12 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             setattr(module, failed_attr, True)
             setattr(module, state_attr, None)
             modules_released += 1
+        # Clear cached references too, including states no longer attached.
+        # Loading has finished and the engine step loop is paused for release.
+        for cache_attr in ("_omlx_ane_prefill_cache", "_omlx_ane_gdn_cache"):
+            cache = getattr(module, cache_attr, None)
+            if cache:
+                cache.clear()
     if modules_released:
         # Zero (not delete) the status counters and set the shed marker:
         # attempted=True/configured=False alone is indistinguishable from a

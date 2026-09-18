@@ -17,14 +17,28 @@ output through mlx 0.32.2:
   and the mxfp4 variant carries the same tail bug.
 - Row offsets: the int16 fix that landed in mlx 0.32.0 still misses this
   kernel, so sorted row counts above 32768 overflow the row offset
-  (ml-explore/mlx#3856). Reachable in production: a 4097+ token prefill
-  chunk of a top-8 MoE crosses the boundary.
+  (ml-explore/mlx#3856, fixed upstream by ml-explore/mlx#3922 after the
+  0.32.2 release). Reachable in production: a 4097+ token prefill chunk
+  of a top-8 MoE crosses the boundary, and a top-10 MoE (Qwen4-Exp)
+  crosses it at 3277 tokens.
 
-``sorted_indices`` is a pure performance hint, so the wrapper simply
-drops it for calls that match a defect condition. The unsorted gather
-path guards ``K % 64 == 0`` before entering NAX and falls back to the
-verified steel kernels, at some prefill-throughput cost for the
-affected shapes only.
+``sorted_indices`` is a pure performance hint, so the wrapper can always
+fall back to dropping it. The two defects get different treatment:
+
+- ``K % 64 != 0`` drops the flag: the unsorted gather path guards
+  ``K % 64 == 0`` before entering NAX and falls back to the verified
+  steel kernels, at some prefill-throughput cost for the affected
+  shapes only.
+- Row overflow keeps the flag and splits the call instead. The rhs
+  kernel is only wrong because a *single* call exceeds 32768 rows, so
+  an oversized call is issued as balanced ``<= 32768``-row slices of
+  the (already sorted) activations and indices and the partial outputs
+  are concatenated. Each slice stays on the NAX rhs kernel, which is
+  what makes wide prefill chunks (4096+ tokens on a top-8/top-10 MoE)
+  keep their tensor-unit throughput instead of dropping to the
+  per-row gather kernel. Slices are balanced rather than cut at the
+  cap so every slice still clears mlx's ``rows / experts >= 4`` gate
+  for the batched rhs path.
 
 The wrapper self-arms: the first matching call runs a tiny canary
 against an fp32 dequantized reference and only intervenes when the
@@ -83,12 +97,16 @@ def _sorted_gather_qmm_defective() -> bool:
     if _defective:
         logger.warning(
             "sorted gather_qmm corrupts on this machine (canary max err "
-            "%.3g); rerouting K %% 64 != 0 and >%d-row sorted calls to the "
-            "unsorted path (issue #2267)",
+            "%.3g); rerouting K %% 64 != 0 sorted calls to the unsorted "
+            "path and segmenting >%d-row sorted calls (issue #2267)",
             err,
             _MAX_SORTED_ROWS,
         )
     return _defective
+
+
+def _rhs_indices(args, kwargs):
+    return args[3] if len(args) > 3 else kwargs.get("rhs_indices")
 
 
 def _needs_reroute(x, args, kwargs) -> bool:
@@ -99,7 +117,7 @@ def _needs_reroute(x, args, kwargs) -> bool:
     # rhs_indices, transpose, group_size, bits, mode. sorted_indices is
     # keyword-only.
     lhs = args[2] if len(args) > 2 else kwargs.get("lhs_indices")
-    rhs = args[3] if len(args) > 3 else kwargs.get("rhs_indices")
+    rhs = _rhs_indices(args, kwargs)
     transpose = args[4] if len(args) > 4 else kwargs.get("transpose", True)
     # The rhs kernel is only selected for the rhs-indices-only sorted
     # path with transposed weights (x @ w.T).
@@ -110,8 +128,43 @@ def _needs_reroute(x, args, kwargs) -> bool:
     return rhs.size * x.shape[-2] > _MAX_SORTED_ROWS
 
 
+def _segment_bounds(rows: int) -> list[tuple[int, int]]:
+    """Balanced ``[start, stop)`` slices with at most ``_MAX_SORTED_ROWS`` each."""
+    count = -(-rows // _MAX_SORTED_ROWS)
+    size = -(-rows // count)
+    return [(start, min(start + size, rows)) for start in range(0, rows, size)]
+
+
+def _segmented_sorted_gather_qmm(x, w, args, kwargs):
+    """Issue an oversized sorted rhs call as ``<= 32768``-row slices.
+
+    Only the layout the MoE sorted path produces is handled: a 3-D
+    ``[rows, 1, K]`` activation with a flat sorted ``rhs_indices`` of the
+    same row count. Anything else returns None and the caller falls back
+    to dropping ``sorted_indices``.
+    """
+    rhs = _rhs_indices(args, kwargs)
+    if x.ndim != 3 or x.shape[1] != 1 or rhs.ndim != 1 or rhs.shape[0] != x.shape[0]:
+        return None
+    rows = int(x.shape[0])
+    outputs = []
+    for start, stop in _segment_bounds(rows):
+        seg_args = list(args)
+        seg_kwargs = kwargs
+        if len(args) > 3:
+            seg_args[3] = rhs[start:stop]
+        else:
+            seg_kwargs = dict(kwargs, rhs_indices=rhs[start:stop])
+        outputs.append(_original_gather_qmm(x[start:stop], w, *seg_args, **seg_kwargs))
+    return mx.concatenate(outputs, axis=0)
+
+
 def _gather_qmm_rerouted(x, w, *args, **kwargs):
     if _needs_reroute(x, args, kwargs) and _sorted_gather_qmm_defective():
+        if x.shape[-1] % 64 == 0:
+            out = _segmented_sorted_gather_qmm(x, w, args, kwargs)
+            if out is not None:
+                return out
         kwargs = dict(kwargs, sorted_indices=False)
     return _original_gather_qmm(x, w, *args, **kwargs)
 

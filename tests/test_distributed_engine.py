@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import tempfile
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -49,7 +50,100 @@ def _ready_engine(handler) -> DistributedBatchedEngine:
         base_url="http://127.0.0.1:1",
         transport=httpx.MockTransport(handler),
     )
+    engine._supervisor.port = 8001
     return engine
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_cancel_all_does_not_widen_later_targeted_cancel(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    cancel_path = tmp_path / "engine-test-cancel.json"
+    ack_path = tmp_path / "engine-test-cancel-ack.json"
+    old_epoch = 9_999_999_999_999
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "engine-test",
+                "plan_hash": "d" * 64,
+                "epoch": old_epoch,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    ack_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "engine-test",
+                "plan_hash": "d" * 64,
+                "epoch": old_epoch,
+                "cancelled": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_id = await engine._enter_request("transport-new-client")
+    try:
+        assert await engine.abort_request(request_id, reason="socket closed") is True
+        payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+        assert payload["scope"] == "requests"
+        assert payload["request_ids"] == [request_id]
+    finally:
+        await engine._leave_request(request_id)
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"status": "ok", "rank": 0, "ssd_deleted": 3, "hot_cleared": 0},
+        )
+
+    remote_calls = []
+
+    def remote(ssh_target, command, timeout, runner):
+        remote_calls.append((ssh_target, command, timeout))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"status": "ok", "rank": 1, "ssd_deleted": 5, "hot_cleared": 0}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(distributed, "_run_cluster_ssh", remote)
+    engine = _ready_engine(handler)
+    try:
+        result = await engine.clear_prompt_caches(ssd=True)
+    finally:
+        await engine._client.aclose()
+
+    assert result["ssd_deleted"] == 8
+    assert len(result["ranks"]) == 2
+    assert requests[0].url.path == "/omlx/internal/cache/ssd/clear"
+    assert requests[0].headers["X-oMLX-Plan-Hash"] == "d" * 64
+    assert remote_calls[0][0] == "peer.local"
+    assert "engine-test-cache-clear.json" in remote_calls[0][1]
+    assert '"ssd":true' in remote_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_distributed_cache_clear_refuses_active_requests():
+    engine = _ready_engine(lambda _request: httpx.Response(200, json={}))
+    engine._active_requests = 1
+    try:
+        with pytest.raises(DistributedInferenceError, match="requests are active"):
+            await engine.clear_prompt_caches(ssd=True)
+    finally:
+        await engine._client.aclose()
 
 
 def test_backend_chat_messages_serialize_native_tool_history_once():
@@ -145,6 +239,9 @@ def _stalled_engine():
         raise httpx.ReadTimeout("collective stalled", request=request)
 
     engine = _ready_engine(handler)
+    # Read timeouts now drop a rank-side cancel file; keep it out of the
+    # real runtime state dir.
+    engine._supervisor.state_dir = tempfile.mkdtemp(prefix="omlx-test-runtime-")
     status_calls = []
 
     def status():
@@ -872,9 +969,7 @@ def test_reasoning_effort_retry_payloads_ignores_when_not_requested():
 
     payload = {"chat_template_kwargs": {}}
     assert (
-        _reasoning_effort_retry_payloads(
-            payload, "Unexpected reasoning effort high."
-        )
+        _reasoning_effort_retry_payloads(payload, "Unexpected reasoning effort high.")
         == []
     )
 
@@ -900,7 +995,10 @@ async def test_distributed_chat_retries_unsupported_reasoning_effort():
             200,
             json={
                 "choices": [
-                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
                 ],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             },
@@ -1086,6 +1184,26 @@ def _healthy_supervisor_status():
     return SimpleNamespace(returncode=None, failure_reason=None)
 
 
+def test_runtime_failure_reconciles_supervisor_terminal_state(monkeypatch):
+    """Pool status/release must see a rank death even after a 200 response."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(
+            returncode=0,
+            failure_reason=(
+                "rank 0 exited with code 75 after JACCL all_reduce made no progress"
+            ),
+            phase="failed",
+        ),
+    )
+
+    assert engine.runtime_failed_reason is not None
+    assert "rank 0 exited with code 75" in engine.runtime_failed_reason
+
+
 @pytest.mark.asyncio
 async def test_preflight_rejects_an_unhealthy_rank_before_streaming(monkeypatch):
     # The 200 commits before a streaming body runs, so preflight is the last
@@ -1169,3 +1287,84 @@ async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
         await engine.preflight_chat([{"role": "user", "content": "hi"}])
     finally:
         await engine._client.aclose()
+
+
+def test_failed_runtime_quiescence_evidence(tmp_path, monkeypatch):
+    """A failed runtime or dead rank process must report 0 active requests."""
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    engine._supervisor.state_dir = str(tmp_path)
+    marker_path = tmp_path / "engine-test-rank-0.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999999,
+                "metrics": {"active_requests": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Marker exists with active_requests=3, but pid is dead
+    monkeypatch.setattr(distributed, "marker_owner_is_live", lambda m: False)
+    assert engine.rank_side_active_requests() == 0
+
+    # If pid is live, it reports active_requests
+    monkeypatch.setattr(distributed, "marker_owner_is_live", lambda m: True)
+    assert engine.rank_side_active_requests() == 3
+
+    # If marker has an error, it reports 0
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 1234,
+                "error": "Metal GPU watchdog timeout",
+                "metrics": {"active_requests": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert engine.rank_side_active_requests() == 0
+
+    # If runtime_failed_reason is set on engine, rank_side_active_requests is 0
+    # and has_active_requests is False even if local counter or marker is positive
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 1234,
+                "metrics": {"active_requests": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    engine._active_requests = 2
+    assert engine.has_active_requests() is True
+    assert engine.rank_side_active_requests() == 3
+
+    engine._mark_runtime_failed("worker terminated unexpectedly")
+    assert engine.rank_side_active_requests() == 0
+    assert engine.has_active_requests() is False
+
+
+def test_stale_marker_reports_zero_rank_side_active_requests(tmp_path, monkeypatch):
+    """A stale rank marker (> 45s old) must report 0 rank-side active requests."""
+    from datetime import UTC, datetime, timedelta
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    engine._supervisor.state_dir = str(tmp_path)
+    marker_path = tmp_path / "engine-test-rank-0.json"
+    old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 1234,
+                "metrics": {"active_requests": 3},
+                "updated_at": old_time,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(distributed, "marker_owner_is_live", lambda m: True)
+
+    assert engine.rank_side_active_requests() == 0
+
+

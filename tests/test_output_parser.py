@@ -68,6 +68,63 @@ class CohereTokenizer:
         return "".join(self._token_map[token_id] for token_id in token_ids)
 
 
+def test_k2_reasoning_modes_and_tool_envelopes():
+    from omlx.api.tool_calling import parse_tool_calls
+    from omlx.patches.k2_horizon.tool_parser import parse_tool_call
+
+    markers = [
+        f"{prefix}ifm|{name}>"
+        for name in ("think", "think_fast", "think_faster", "tool_calls")
+        for prefix in ("<", "</")
+    ]
+    ids = {marker: i + 10 for i, marker in enumerate(markers)}
+
+    class Tokenizer(CohereTokenizer):
+        has_tool_calling = True
+        tool_call_start, tool_call_end = markers[-2:]
+        tool_parser = staticmethod(parse_tool_call)
+
+        def convert_tokens_to_ids(self, text):
+            return ids.get(text, -1)
+
+        def encode(self, text, **kwargs):
+            return [ids[text]] if text in ids else []
+
+    tokenizer = Tokenizer(
+        {
+            **{value: key for key, value in ids.items()},
+            1: "reason",
+            2: "answer",
+            3: '<ifm|tool_call>{"name":"weather","arguments":{"city":"Paris"}}</ifm|tool_call>',
+        }
+    )
+    factory = detect_output_parser("k2", tokenizer, {"model_type": "k2_horizon"})
+    tools = [{"type": "function", "function": {"name": "weather"}}]
+    for mode in ("think", "think_fast", "think_faster"):
+        session = factory.create_session(tokenizer)
+        tokens = [
+            ids[f"<ifm|{mode}>"],
+            1,
+            ids[f"</ifm|{mode}>"],
+            2,
+            ids[markers[-2]],
+            3,
+            ids[markers[-1]],
+        ]
+        text = "".join(session.process_token(token).stream_text for token in tokens)
+        final = session.finalize()
+        assert text + final.stream_text == (
+            "<think>\nreason</think>answer<ifm|tool_calls>"
+            + tokenizer.decode([3])
+            + "</ifm|tool_calls>"
+        )
+        assert final.tool_calls == []
+        clean, calls = parse_tool_calls(text + final.stream_text, tokenizer, tools)
+        assert clean == "answer"
+        assert calls[0].function.name == "weather"
+        assert json.loads(calls[0].function.arguments) == {"city": "Paris"}
+
+
 class DeepSeekV4Tokenizer(CohereTokenizer):
     has_tool_calling = True
     tool_call_start = "<｜DSML｜tool_calls>"
@@ -175,6 +232,13 @@ class ByteFallbackTokenizer:
         "<0x9E>": 2,
         "<0xA0>": 3,
     }
+
+    def __len__(self):
+        return len(self.vocab)
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {value: key for key, value in self.vocab.items()}
+        return [reverse[token_id] for token_id in ids]
 
     def decode(self, token_ids, skip_special_tokens: bool = True):
         table = {
@@ -771,14 +835,14 @@ class TestOutputParserFactory:
         assert factory.kind == "minimax_m3"
 
     def test_minimax_m3_parser_extracts_tool_calls(self, monkeypatch):
-        module = types.ModuleType("mlx_vlm.tool_parsers.minimax_m3")
+        module = types.ModuleType("mlx_vlm.tools.parsers.minimax_m3")
 
         def parse_tool_call(text):
             assert "lookup" in text
             return {"name": "lookup", "arguments": {"query": "mlx"}}
 
         module.parse_tool_call = parse_tool_call
-        monkeypatch.setitem(sys.modules, "mlx_vlm.tool_parsers.minimax_m3", module)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.tools.parsers.minimax_m3", module)
 
         start = "]<]minimax[>[<tool_call>"
         end = "]<]minimax[>[</tool_call>"
