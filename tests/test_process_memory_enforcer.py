@@ -54,6 +54,7 @@ def _make_enforcer(
     )
     enforcer._soft_threshold = soft_threshold
     enforcer._get_hard_limit_bytes = lambda: int(ceiling)
+    enforcer._get_abort_limit_bytes = lambda: int(ceiling)
     if breakdown is None:
         breakdown = {
             "static": int(ceiling),
@@ -2889,6 +2890,70 @@ class TestPressureReclaimGrace:
         enforcer._engine_pool._entries = {"big-model": entry}
         enforcer._engine_pool._find_lru_victim.return_value = None
         return engine
+
+    @pytest.mark.asyncio
+    async def test_soft_pressure_reclaims_pool_once_before_hard(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        enforcer._soft_threshold = 0.90
+        enforcer._hard_threshold = 0.95
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_current_usage_bytes", return_value=int(9.2 * 1024**3)
+            ),
+        ):
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+            await enforcer._check_and_enforce()
+
+        engine.scheduler.request_pressure_reclaim.assert_called_once()
+        engine.abort_all_requests.assert_not_awaited()
+        assert enforcer._pressure_level == "soft"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_ceiling_dip_waits_for_reclaim_below_physical_cap(
+        self, enforcer
+    ):
+        engine = self._busy_setup(enforcer)
+        enforcer._soft_threshold = 0.90
+        enforcer._hard_threshold = 0.95
+        enforcer._get_abort_limit_bytes = lambda: 12 * 1024**3
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_current_usage_bytes", return_value=int(11.5 * 1024**3)
+            ) as current_sample,
+            patch.object(enforcer, "_shrink_hot_cache_for_pressure") as shrink,
+        ):
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+            engine.abort_all_requests.assert_not_awaited()
+            engine.scheduler.request_pressure_reclaim.assert_called_once()
+            shrink.assert_not_called()
+            assert enforcer._pressure_reclaim_grace_polls == 1
+
+            # The requested clear runs at the next scheduler boundary.
+            current_sample.return_value = int(9.2 * 1024**3)
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_not_awaited()
+        assert enforcer._pressure_level == "soft"
+        assert enforcer._pressure_reclaim_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_physical_cap_emergency_still_aborts(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        enforcer._get_abort_limit_bytes = lambda: 12 * 1024**3
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_current_usage_bytes", return_value=int(14.5 * 1024**3)
+            ),
+        ):
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reclaim_defers_hot_cache_shrink_and_abort(self, enforcer):

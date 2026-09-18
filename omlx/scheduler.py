@@ -9826,14 +9826,14 @@ class Scheduler:
         self._pending_reclaim_request = True
 
     def request_pressure_reclaim(self) -> None:
-        """Enqueue a hard-pressure Metal cache clear (thread-safe, no Metal touch).
+        """Enqueue a pressure-triggered Metal cache clear (thread-safe, no Metal touch).
 
         Called by ProcessMemoryEnforcer on the asyncio thread when memory
-        pressure is hard. Setting the flag is GIL-atomic; the actual
-        ``_sync_and_clear_cache`` runs on the inference thread at the next
-        step() boundary (see the periodic-cleanup block), which synchronizes
-        in-flight GPU work before clearing — so it is safe even while requests
-        are decoding, unlike the idle-gated ``request_idle_reclaim``.
+        pressure first becomes soft or is hard. Setting the flag is GIL-atomic;
+        the actual ``_sync_and_clear_cache`` runs on the inference thread at
+        the next step() boundary (see the periodic-cleanup block). This
+        synchronizes in-flight GPU work before clearing, so it is safe while
+        requests decode, unlike the idle-gated ``request_idle_reclaim``.
         ``has_work`` reports True while this is pending so an otherwise-idle
         engine keeps stepping until the clear fires.
         """
