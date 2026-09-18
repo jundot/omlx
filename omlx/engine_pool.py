@@ -814,6 +814,19 @@ class EnginePool:
                 getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
             )
 
+        # Qwen4-Exp YaRN: the effective rope target is the per-model context
+        # override when it exceeds the native horizon — that value is baked
+        # into the frequency table at construction, so crossing the boundary
+        # or moving the target must reload the engine. Gate-only overrides on
+        # other model types stay out of the signature.
+        if entry is not None and entry.config_model_type == "qwen4_exp":
+            window = data.get("max_context_window")
+            native = entry.model_context_length or 0
+            add(
+                "qwen4_yarn_target",
+                window if isinstance(window, int) and native and window > native else None,
+            )
+
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:

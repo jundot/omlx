@@ -260,6 +260,7 @@ def _cache_compat_signature(
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
     gdn_sidecar_state_dtype: str | None = None,
+    yarn_context_length: int | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -287,6 +288,12 @@ def _cache_compat_signature(
         payload["payload_layout"] = payload_layout
     if gdn_sidecar_state_dtype is not None:
         payload["gdn_sidecar_state_dtype"] = gdn_sidecar_state_dtype
+    # YaRN-scaled rope (Qwen4-Exp long-context) writes differently rotated
+    # KV/indexer content at an identical layer layout, so the operator's
+    # target participates in compatibility. Only stamped when active so
+    # unscaled signatures stay byte-identical to the previous format.
+    if yarn_context_length is not None:
+        payload["yarn_context_length"] = int(yarn_context_length)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -299,6 +306,7 @@ def cache_signature_for(
     turboquant_kv_bits: float | None = None,
     cachelist_subtypes: dict[str, list[str]] | None = None,
     gdn_sidecar_state_dtype: str | None = None,
+    yarn_context_length: int | None = None,
 ) -> str:
     """Build the legacy/embedded cache compatibility signature.
 
@@ -315,6 +323,7 @@ def cache_signature_for(
         turboquant_kv_bits=turboquant_kv_bits,
         cachelist_subtypes=cachelist_subtypes,
         gdn_sidecar_state_dtype=gdn_sidecar_state_dtype,
+        yarn_context_length=yarn_context_length,
     )
 
 
@@ -336,6 +345,25 @@ def _signature_turboquant_bits(cache_signature: str) -> float | None:
         return None
     try:
         return float(bits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _signature_yarn_context(cache_signature: str) -> int | None:
+    """Extract ``yarn_context_length`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("yarn_context_length")
+    if value is None:
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -1701,6 +1729,11 @@ class PagedSSDCacheManager(CacheManager):
         # the layer signature. None disables the check (legacy managers /
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
+        # Expected YaRN rope target (Qwen4-Exp long-context scaling),
+        # learned via ``set_expected_layer_signature`` like the TurboQuant
+        # depth. Scaled rotary writes different KV content at an identical
+        # layer layout, so the target participates in block compatibility.
+        self._expected_yarn_context_length: int | None = None
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -2719,11 +2752,26 @@ class PagedSSDCacheManager(CacheManager):
             == self._expected_turboquant_kv_bits
         )
 
+    def _signature_yarn_match(self, cache_signature: str) -> bool:
+        """Exact two-way YaRN target check.
+
+        Unlike the TurboQuant depth check — which passes when no depth is
+        expected because quantized layouts are caught by their layer type
+        names — yarn on/off leaves the layer types identical and only
+        changes the rotated KV/indexer content. A block therefore matches
+        only when its stamped target equals the expectation exactly, with
+        None (unstamped/off) on both sides counting as equal.
+        """
+        return (
+            _signature_yarn_context(cache_signature)
+            == self._expected_yarn_context_length
+        )
+
     def is_signature_compatible(self, cache_signature: str) -> bool:
         """Per-block signature gate for restore paths that bypass the
         index scan (hot-cache / pending-write loads never pass through
         ``_is_compatible_block``). Checks the expectation-gated signature
-        fields: TurboQuant depth and CacheList sub composition.
+        fields: TurboQuant depth, YaRN target, and CacheList sub composition.
         """
         return self.signature_mismatch_reason(cache_signature) is None
 
@@ -2748,6 +2796,13 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 "TurboQuant depth: expected "
                 f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+        if not self._signature_yarn_match(cache_signature):
+            actual_yarn = _signature_yarn_context(cache_signature)
+            actual = "missing" if actual_yarn is None else str(actual_yarn)
+            return (
+                "YaRN context length: expected "
+                f"{self._expected_yarn_context_length}, got {actual}"
             )
 
         expected_subtypes = self._expected_cachelist_subtypes
@@ -2788,6 +2843,7 @@ class PagedSSDCacheManager(CacheManager):
         layer_cache_types: list[str],
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
+        yarn_context_length: int | None = None,
     ) -> str:
         """Build a signature using this manager's expected layout settings.
 
@@ -2806,6 +2862,8 @@ class PagedSSDCacheManager(CacheManager):
             turboquant_kv_bits = self._expected_turboquant_kv_bits
         if cachelist_subtypes is None:
             cachelist_subtypes = self._expected_cachelist_subtypes
+        if yarn_context_length is None:
+            yarn_context_length = self._expected_yarn_context_length
         return _cache_compat_signature(
             model_name=model_name,
             num_layers=num_layers,
@@ -2814,6 +2872,7 @@ class PagedSSDCacheManager(CacheManager):
             or [],
             turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
+            yarn_context_length=yarn_context_length,
             payload_layout=self._payload_layout,
         )
 
@@ -3414,6 +3473,9 @@ class PagedSSDCacheManager(CacheManager):
                 cachelist_subtypes=_block_cachelist_subtypes(
                     cache_data, layer_cache_types, layer_meta_states
                 ),
+                # YaRN has no per-block observation: the rope target is an
+                # engine-session property, so stamp the manager's expectation.
+                yarn_context_length=self._expected_yarn_context_length,
                 payload_layout=self._payload_layout,
             )
 
@@ -4325,6 +4387,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
+        yarn_context_length: int | None = None,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -4337,6 +4400,10 @@ class PagedSSDCacheManager(CacheManager):
         sweep: blocks written at another depth have a different packed state
         width and would crash batch concatenation if mixed (#2045).
 
+        ``yarn_context_length`` is the live YaRN rope target (None when the
+        model serves unscaled). YaRN changes rotated KV/indexer content at an
+        identical layer layout, so any target change also triggers the sweep.
+
         Returns True when the canonical signature changed and a stale-signature
         sweep should run. Returns False for empty input or a canonical no-op.
         """
@@ -4348,17 +4415,22 @@ class PagedSSDCacheManager(CacheManager):
         new_bits = (
             float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
         )
+        new_yarn = (
+            int(yarn_context_length) if yarn_context_length is not None else None
+        )
 
         with self._lock:
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
             bits_changed = new_bits != self._expected_turboquant_kv_bits
+            yarn_changed = new_yarn != self._expected_yarn_context_length
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
             if (
                 old_canonical == new_canonical
                 and not bits_changed
+                and not yarn_changed
                 and not subtypes_changed
             ):
                 if old_signature != new_signature:
@@ -4367,16 +4439,18 @@ class PagedSSDCacheManager(CacheManager):
 
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
+            self._expected_yarn_context_length = new_yarn
             self._expected_cachelist_subtypes = cachelist_subtypes
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
             "(%d layers, %d unique types, turboquant_kv_bits=%s, "
-            "cachelist_subtypes=%s)",
+            "yarn_context_length=%s, cachelist_subtypes=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
+            new_yarn,
             "yes" if cachelist_subtypes else "no",
         )
         return True
@@ -4408,6 +4482,7 @@ class PagedSSDCacheManager(CacheManager):
 
         expected = _canonicalize_layer_cache_types(self._expected_layer_cache_types)
         expects_bits = self._expected_turboquant_kv_bits is not None
+        expects_yarn = self._expected_yarn_context_length is not None
 
         with self._index._lock:
             stale: list[bytes] = []
@@ -4421,8 +4496,10 @@ class PagedSSDCacheManager(CacheManager):
                     # guess — newer saves will replace them. With one, the
                     # block can no more prove its packed width than its
                     # layout, so it is unsafe to keep (see
-                    # _signature_bits_match).
-                    if expects_bits:
+                    # _signature_bits_match). The same holds for a YaRN
+                    # target: an unverifiable block cannot prove its rotary
+                    # scaling either.
+                    if expects_bits or expects_yarn:
                         stale.append(h)
                     continue
                 if got != expected:
@@ -4441,12 +4518,14 @@ class PagedSSDCacheManager(CacheManager):
                 if not self._signature_bits_match(meta.cache_signature):
                     stale.append(h)
                     continue
+                if not self._signature_yarn_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
                 if self._expected_cachelist_subtypes is not None and (
                     _signature_cachelist_subtypes(meta.cache_signature)
                     != self._expected_cachelist_subtypes
                 ):
                     stale.append(h)
-
         for h in stale:
             self.forget_block(h)
 
