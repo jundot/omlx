@@ -144,7 +144,12 @@ For hardware validation, serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` with an
 isolated base path and port. Check text, streamed text, two concurrent requests,
 and an image question after a text-only system turn. Repeat a prompt longer than
 one cache block and confirm nonzero cached tokens with the same answer. The model
-must retain its original `prism_hadamard_qwen35` config throughout.
+must retain its original `prism_hadamard_qwen35` config throughout. Send two
+images with different dimensions, then reverse their order and reuse one alone;
+check the answers and per-image vision-cache hits. Replace one image and test
+images across separate turns too. Regression coverage for Qwen vision dispatch,
+feature splitting and image-aware prefix boundaries is in `test_vlm_engine.py`
+and `test_vlm_cache_boundaries.py`.
 
 Repeat with `OMLX_PRISM_FP16_ACTIVATIONS=1` to check the opt-in mixed-precision
 path. Check a fresh 66K-token prompt and its cached repeat, not just short

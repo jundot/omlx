@@ -2311,6 +2311,32 @@ class TestGetStats:
 class TestSplitVisionFeatures:
     """Tests for VLMBatchedEngine._split_vision_features()."""
 
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
+    @pytest.mark.parametrize("as_tuple", [False, True])
+    def test_qwen_vision_features_use_grid_and_tower_dtype(self, model_type, as_tuple):
+        engine = _make_loaded_engine(model_type=model_type)
+        features = mx.arange(24).reshape(6, 4)
+        tower = MagicMock(return_value=(features, None) if as_tuple else features)
+        tower.patch_embed.proj.weight = mx.zeros((1,), dtype=mx.float16)
+        # No encode_image method: exercise the Qwen vision-tower dispatch.
+        engine._vlm_model = SimpleNamespace(
+            config=SimpleNamespace(model_type=model_type), vision_tower=tower
+        )
+        pixels = mx.ones((24, 3), dtype=mx.float32)
+        grid = mx.array([[1, 4, 6]])
+
+        result = engine._compute_vision_features(pixels, {"image_grid_thw": grid})
+
+        assert result is features
+        tower.assert_called_once()
+        actual_pixels, actual_grid = tower.call_args.args
+        assert actual_pixels.dtype == mx.float16
+        assert mx.array_equal(actual_pixels, pixels.astype(mx.float16)).item()
+        assert actual_grid is grid
+        tower.reset_mock()
+        assert engine._compute_vision_features(pixels, {}) is None
+        tower.assert_not_called()
+
     def test_single_image_returns_whole(self):
         """Single image returns the feature tensor as-is in a list."""
         engine = _make_loaded_engine()
@@ -2329,9 +2355,10 @@ class TestSplitVisionFeatures:
         for f in result:
             assert f.shape == (1, 10, 64)
 
-    def test_qwen_flat_split(self):
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
+    def test_qwen_flat_split(self, model_type):
         """Qwen flat (total_tokens, dim) features are split using grid_thw."""
-        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine = _make_loaded_engine(model_type=model_type)
         # Mock spatial_merge_size on vision_tower
         engine._vlm_model.vision_tower = MagicMock()
         engine._vlm_model.vision_tower.spatial_merge_size = 2

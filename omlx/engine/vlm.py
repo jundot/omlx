@@ -1421,6 +1421,7 @@ def _uses_mrope(vlm_model) -> bool:
 
 # Qwen-style VLMs: vision_tower takes (pixel_values, grid_thw).
 _QWEN_VISION_MODELS = {
+    "prism_hadamard_qwen35",
     "qwen3_5",
     "qwen3_5_moe",
     "qwen3_vl",
