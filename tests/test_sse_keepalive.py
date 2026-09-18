@@ -10,9 +10,11 @@ from fastapi import HTTPException
 
 from omlx.server import (
     ClientDisconnectTrackingMiddleware,
+    _json_response_or_keepalive,
     _with_json_keepalive,
     _with_request_disconnect_abort,
     _with_sse_keepalive,
+    _server_state,
 )
 
 
@@ -447,3 +449,73 @@ async def test_json_keepalive_preserves_http_error_after_first_byte(
             "code": None,
         }
     }
+
+
+class TestJsonKeepaliveOff:
+    """When sse_keepalive_mode is 'off', non-streaming responses must not
+    emit keepalive spaces. The response should be a plain Response (not
+    StreamingResponse) so clients/proxies can use read timeouts normally."""
+
+    def _patch_mode(self, mode: str, monkeypatch):
+        from types import SimpleNamespace
+
+        mock_settings = SimpleNamespace(server=SimpleNamespace(sse_keepalive_mode=mode))
+        monkeypatch.setattr(_server_state, "global_settings", mock_settings)
+
+    @pytest.mark.asyncio
+    async def test_off_returns_plain_response(self, monkeypatch):
+        from fastapi.responses import Response
+
+        self._patch_mode("off", monkeypatch)
+
+        async def slow():
+            await asyncio.sleep(0.05)
+            return '{"ok": true}'
+
+        resp = await _json_response_or_keepalive(None, slow())
+        assert isinstance(resp, Response)
+        assert resp.status_code == 200
+        assert resp.body == b'{"ok": true}'
+
+    @pytest.mark.asyncio
+    async def test_off_no_keepalive_bytes_leaked(self, monkeypatch):
+        from fastapi.responses import Response
+
+        self._patch_mode("off", monkeypatch)
+
+        async def slow():
+            await asyncio.sleep(0.05)
+            return '{"result": 42}'
+
+        resp = await _json_response_or_keepalive(None, slow())
+        assert isinstance(resp, Response)
+        assert resp.body == b'{"result": 42}'
+
+    @pytest.mark.asyncio
+    async def test_off_preserves_http_error(self, monkeypatch):
+        from fastapi.responses import JSONResponse
+
+        self._patch_mode("off", monkeypatch)
+
+        async def failing():
+            await asyncio.sleep(3)
+            raise HTTPException(status_code=400, detail="bad request")
+
+        resp = await _json_response_or_keepalive(None, failing())
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 400
+        body = json.loads(resp.body)
+        assert body["error"]["message"] == "bad request"
+
+    @pytest.mark.asyncio
+    async def test_chunk_mode_still_streams(self, monkeypatch):
+        from fastapi.responses import StreamingResponse
+
+        self._patch_mode("chunk", monkeypatch)
+
+        async def slow():
+            await asyncio.sleep(3)
+            return '{"ok": true}'
+
+        resp = await _json_response_or_keepalive(None, slow())
+        assert isinstance(resp, StreamingResponse)
