@@ -359,6 +359,36 @@ def test_failed_probe_keeps_candidate_unverified_for_retry():
     assert service._candidates[("10.0.0.5", 8000)]["verified"] is False
 
 
+def test_probe_carried_friendly_name_refreshes_a_rename_without_mdns():
+    """A renamed Mac must not stay stale on Thunderbolt/manual-add peers.
+
+    Name updates otherwise travel only via mDNS TXT records; the probe is
+    the only deterministic channel on direct-link topologies.
+    """
+
+    names = iter(["Old Name", "New Name"])
+
+    def prober(ip, port, timeout):
+        return {
+            "node_id": "bbbb-node",
+            "version": "0.7.0",
+            "cluster_name": "omlx",
+            "friendly_name": next(names),
+        }
+
+    clock = FakeClock()
+    service, _ = _service("aaaa-node", clock=clock, prober=prober)
+    service.add_manual("10.10.10.2", 8000)
+    service.probe_now()
+    assert service.peers()[0].friendly_name == "Old Name"
+
+    # Peer renames; the next verified probe (heartbeat cadence) refreshes.
+    clock.advance(600)
+    service._candidates[("10.10.10.2", 8000)]["last_probe"] = float("-inf")
+    service.probe_now()
+    assert service.peers()[0].friendly_name == "New Name"
+
+
 def test_http_probe_falls_back_to_system_python_carrier(monkeypatch):
     from omlx.cluster import discovery
 

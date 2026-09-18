@@ -83,8 +83,11 @@ async def cluster_node_id_probe(request: Request):
 
     Deliberately unauthenticated: a discovering node must be able to confirm
     an announced address belongs to the announced node_id before any pairing
-    trust exists. It reveals only the stable node_id, the oMLX version, and
-    the cluster name — no capabilities, no device inventory.
+    trust exists. It reveals only the stable node_id, the oMLX version, the
+    cluster name, and the display-only friendly name — no capabilities, no
+    device inventory. The friendly name rides the probe because it is the
+    only deterministic rename channel on topologies where mDNS does not
+    reach (direct Thunderbolt links, manual Add-by-IP).
     """
 
     client = request.client.host if request.client else "unknown"
@@ -104,6 +107,7 @@ async def cluster_node_id_probe(request: Request):
         "node_id": identity.node_id,
         "version": __version__,
         "cluster_name": _cluster_name(),
+        "friendly_name": identity.friendly_name,
     }
 
 
