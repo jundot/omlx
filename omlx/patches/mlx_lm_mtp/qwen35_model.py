@@ -48,6 +48,13 @@ The patch is intentionally limited to ``mlx_lm.models.qwen3_5``; mlx-vlm's
 
 from __future__ import annotations
 
+from ..mtp_head_norm_convention import fc_norm_is_raw_hf as _fc_norm_is_raw_hf
+from ..mtp_head_norm_convention import (
+    head_layer_norms_are_raw_hf as _head_layer_norms_are_raw_hf,
+)
+from ..mtp_head_norm_convention import is_fc_norm as _is_fc_norm
+from ..mtp_head_norm_convention import is_oq_tracked_tensor as _tracked
+
 import logging
 from typing import Any, Optional
 
@@ -693,6 +700,16 @@ def _patch_text_model(q35: Any) -> None:
             ".pre_fc_norm_embedding.weight",
             "mtp.norm.weight",
         )
+        # A converted pre_fc gamma can sit below the 0.5 cutoff, so the
+        # per-key magnitude test alone would shift it twice. See
+        # omlx/patches/mtp_head_norm_convention.py.
+        _verdict_cache: list = []
+
+        def _fc_norm_is_raw(_value):
+            if not _verdict_cache:
+                _verdict_cache.append(_head_layer_norms_are_raw_hf(weights))
+            return _fc_norm_is_raw_hf(_value, _verdict_cache[0])
+
         for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
@@ -715,6 +732,9 @@ def _patch_text_model(q35: Any) -> None:
                     # Pre-converted checkpoints: per-key decision — a head
                     # norm may still be raw-HF even when a sibling is
                     # already +1 (JANG mixed bundles).
+                    elif _is_fc_norm(k) and not _tracked(v):
+                        if _fc_norm_is_raw(v):
+                            weights[k] = v + 1.0
                     elif _is_oq_tracked_tensor(v):
                         weights[k] = _mark_mtp_norm_conditional_add(v)
                     elif _mtp_norm_is_raw_hf(v, should_shift_norm_weights):

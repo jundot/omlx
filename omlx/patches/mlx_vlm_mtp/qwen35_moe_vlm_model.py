@@ -9,6 +9,13 @@ upstream sanitize body.
 
 from __future__ import annotations
 
+from ..mtp_head_norm_convention import fc_norm_is_raw_hf as _fc_norm_is_raw_hf
+from ..mtp_head_norm_convention import (
+    head_layer_norms_are_raw_hf as _head_layer_norms_are_raw_hf,
+)
+from ..mtp_head_norm_convention import is_fc_norm as _is_fc_norm
+from ..mtp_head_norm_convention import is_oq_tracked_tensor as _tracked
+
 import logging
 
 import mlx.core as mx
@@ -143,6 +150,16 @@ def apply() -> bool:
             except Exception:
                 return _fallback
 
+        # A converted pre_fc gamma can sit below the 0.5 cutoff, so the
+        # per-key magnitude test alone would shift it twice. See
+        # omlx/patches/mtp_head_norm_convention.py.
+        _verdict_cache: list = []
+
+        def _fc_norm_is_raw(_value):
+            if not _verdict_cache:
+                _verdict_cache.append(_head_layer_norms_are_raw_hf(weights))
+            return _fc_norm_is_raw_hf(_value, _verdict_cache[0])
+
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:
@@ -177,8 +194,9 @@ def apply() -> bool:
                         # (raw ~0.87 on 35B-A3B), and mtp.norm (raw ~1.3-1.9),
                         # costing tens of points of draft acceptance.
                         value = value + 1.0
-                    # Pre-converted checkpoints: per-key decision (JANG
-                    # mixed-convention bundles).
+                    elif _is_fc_norm(key) and not _tracked(value):
+                        if _fc_norm_is_raw(value):
+                            value = value + 1.0
                     elif _is_oq_tracked_tensor(value):
                         value = _mark_mtp_norm_conditional_add(value)
                     elif _mtp_norm_is_raw_hf(value, should_shift_norm_weights):

@@ -35,6 +35,13 @@ in ``maybe_apply_pre_load_patches`` which satisfies that requirement.
 
 from __future__ import annotations
 
+from ..mtp_head_norm_convention import fc_norm_is_raw_hf as _fc_norm_is_raw_hf
+from ..mtp_head_norm_convention import (
+    head_layer_norms_are_raw_hf as _head_layer_norms_are_raw_hf,
+)
+from ..mtp_head_norm_convention import is_fc_norm as _is_fc_norm
+from ..mtp_head_norm_convention import is_oq_tracked_tensor as _tracked
+
 import logging
 import weakref
 from typing import Any
@@ -525,47 +532,15 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
             except Exception:
                 return _fallback
 
-        # ``pre_fc_norm_hidden`` / ``pre_fc_norm_embedding`` are the one place
-        # the magnitude test has no discriminating power: the head damps the
-        # target hidden and the next-token embedding before ``fc`` fuses them,
-        # so these gammas sit below 0.5 in BOTH conventions (measured 0.49 and
-        # 0.27 on an already-converted Qwen3.6-35B-A3B oQ6). The per-key test
-        # reads them as raw-HF and shifts an already-shifted weight. mlx-vlm
-        # 0.7.0 hid this by skipping ``Model.sanitize`` for MLX-format shards;
-        # 0.7.1 sanitizes unconditionally, so the misfire went live and cost
-        # roughly half of MTP draft acceptance while leaving the backbone
-        # untouched. Decide these two from the head's per-layer norms, which
-        # ARE magnitude-discriminable, rather than from their own magnitude.
-        _fc_norm_suffixes = (
-            ".pre_fc_norm_hidden.weight",
-            ".pre_fc_norm_embedding.weight",
-        )
-        _layer_norm_suffixes = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-        _head_verdict: list = []
+        # A converted pre_fc gamma can sit below the 0.5 cutoff, so the
+        # per-key magnitude test alone would shift it twice. See
+        # omlx/patches/mtp_head_norm_convention.py.
+        _verdict_cache: list = []
 
-        def _head_layer_norms_are_raw_hf():
-            """Majority convention of the head's per-layer norms, or None."""
-            if _head_verdict:
-                return _head_verdict[0]
-            votes = []
-            for _k, _v in weights.items():
-                if "mtp." not in _k or getattr(_v, "ndim", None) != 1:
-                    continue
-                if not any(_k.endswith(sfx) for sfx in _layer_norm_suffixes):
-                    continue
-                if _is_oq_tracked_tensor(_v):
-                    continue
-                try:
-                    votes.append(float(mx.mean(_v.astype(mx.float32)).item()) < 0.5)
-                except Exception:
-                    continue
-            _head_verdict.append(None if not votes else sum(votes) * 2 > len(votes))
-            return _head_verdict[0]
+        def _fc_norm_is_raw(_value):
+            if not _verdict_cache:
+                _verdict_cache.append(_head_layer_norms_are_raw_hf(weights))
+            return _fc_norm_is_raw_hf(_value, _verdict_cache[0])
 
         sanitized = {}
         for key, value in weights.items():
@@ -593,10 +568,8 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
                 if "mtp." in key:
                     # Per-key: a head norm may still be raw-HF even when a
                     # sibling head norm (e.g. mtp.norm) is already shifted.
-                    if any(key.endswith(sfx) for sfx in _fc_norm_suffixes) and (
-                        _head_layer_norms_are_raw_hf() is not None
-                    ):
-                        if _head_layer_norms_are_raw_hf():
+                    if _is_fc_norm(key) and not _tracked(value):
+                        if _fc_norm_is_raw(value):
                             value = value + 1.0
                     elif _is_oq_tracked_tensor(value):
                         value = _mark_mtp_norm_conditional_add(value)

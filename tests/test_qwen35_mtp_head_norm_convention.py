@@ -22,6 +22,11 @@ import mlx.core as mx
 import pytest
 
 from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_runtime
+from omlx.patches.mtp_head_norm_convention import (
+    fc_norm_is_raw_hf,
+    head_layer_norms_are_raw_hf,
+    is_fc_norm,
+)
 
 DIM = 8
 
@@ -106,3 +111,71 @@ def test_per_layer_norms_keep_their_own_per_key_decision():
     assert _mean(out, "language_model.mtp.norm.weight") == pytest.approx(
         2.9253, abs=1e-4
     ), "an already-shifted mtp.norm must not be shifted again"
+
+
+def test_is_fc_norm_matches_only_the_undiscriminable_pair():
+    assert is_fc_norm("language_model.mtp.pre_fc_norm_hidden.weight")
+    assert is_fc_norm("mtp.pre_fc_norm_embedding.weight")
+    assert not is_fc_norm("mtp.norm.weight")
+    assert not is_fc_norm("mtp.layers.0.input_layernorm.weight")
+
+
+def test_verdict_reads_the_head_not_the_backbone():
+    """Backbone norms must not vote: they are always converted correctly."""
+    weights = {
+        "model.language_model.layers.0.input_layernorm.weight": _norm(1.0312),
+        "mtp.layers.0.input_layernorm.weight": _norm(-0.0951),
+        "mtp.layers.0.self_attn.q_norm.weight": _norm(-0.2328),
+    }
+    assert head_layer_norms_are_raw_hf(weights) is True
+
+
+def test_verdict_is_none_without_readable_head_norms():
+    """No evidence means callers keep their prior behaviour."""
+    assert head_layer_norms_are_raw_hf({}) is None
+    assert (
+        head_layer_norms_are_raw_hf(
+            {"model.language_model.layers.0.input_layernorm.weight": _norm(1.03)}
+        )
+        is None
+    )
+
+
+def test_dense_and_mlx_lm_sanitizers_agree_with_the_moe_one():
+    """All four sanitizer copies share one convention decision."""
+    from omlx.patches.mlx_lm_mtp import qwen35_model
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model, qwen35_vlm_model
+
+    for module in (qwen35_model, qwen35_moe_vlm_model, qwen35_vlm_model):
+        src = module.__file__
+        body = open(src).read()
+        assert "_fc_norm_is_raw(" in body, f"{src} still decides pre_fc by magnitude"
+        assert "mtp_head_norm_convention" in body, f"{src} does not share the decision"
+
+
+def test_sign_decides_the_unambiguous_cases():
+    """Only the 0..0.5 band needs the head's opinion."""
+    # negative gamma is raw-HF no matter what the head says
+    for verdict in (True, False, None):
+        assert fc_norm_is_raw_hf(_norm(-0.44), verdict) is True
+    # at or above the legacy cutoff it is already converted
+    for verdict in (True, False, None):
+        assert fc_norm_is_raw_hf(_norm(0.5393), verdict) is False
+
+
+def test_ambiguous_band_defers_to_the_head():
+    assert fc_norm_is_raw_hf(_norm(0.4937), False) is False
+    assert fc_norm_is_raw_hf(_norm(0.4937), True) is True
+    # no evidence at all keeps the legacy cutoff's answer
+    assert fc_norm_is_raw_hf(_norm(0.4937), None) is True
+
+
+def test_tie_among_head_norms_counts_as_converted():
+    """Shifting is the destructive direction, so it needs a real majority."""
+    weights = {
+        "mtp.layers.0.self_attn.q_norm.weight": _norm(0.75),
+        "mtp.layers.0.self_attn.k_norm.weight": _norm(0.74),
+        "mtp.layers.0.input_layernorm.weight": _norm(0.04),
+        "mtp.layers.0.post_attention_layernorm.weight": _norm(0.21),
+    }
+    assert head_layer_norms_are_raw_hf(weights) is False
