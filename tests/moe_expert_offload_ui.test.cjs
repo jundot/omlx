@@ -46,6 +46,14 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
         app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:value});
         assert.equal(app.modelSettings[percent], Math.round(value * 100));
     }
+    // An out-of-range stored value (the old 12.5% preset) opens silently: the
+    // field reports an error only once the user has typed in it.
+    app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:0.125});
+    assert.equal(app.modelSettings[percent], 13);
+    assert.ok(app.moeExpertOffloadResidentInvalid());
+    assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
+    app.onMoeExpertOffloadResidentPercent();
+    assert.equal(app.modelSettings.moe_expert_offload_resident_touched, true);
     app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:0.33});
     await app.saveModelSettings();
     assert.equal(payload[fraction], 0.33);

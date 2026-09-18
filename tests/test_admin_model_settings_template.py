@@ -457,7 +457,10 @@ def test_moe_expert_offload_resident_fraction_is_a_bounded_percentage():
     assert "modelSettings.moe_expert_offload_resident_percent" in section
     assert ">%</span>" in section
     assert '@blur="onMoeExpertOffloadResidentBlur()"' in section
-    assert 'x-show="moeExpertOffloadResidentInvalid()"' in section
+    assert (
+        'x-show="moeExpertOffloadResidentInvalid() '
+        '&& modelSettings.moe_expert_offload_resident_touched"' in section
+    )
     assert (
         "{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}"
         in section

@@ -1901,6 +1901,7 @@
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     moe_expert_offload_resident_percent: Math.round((s.moe_expert_offload_resident_fraction ?? 0.25) * 100),
+                    moe_expert_offload_resident_touched: false,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -1992,6 +1993,9 @@
             onMoeExpertOffloadResidentPercent() {
                 // Ignore partial or out-of-range typing instead of clamping it, so
                 // typing "0" on the way to "50" cannot rewrite the field to 10.
+                // Typing also marks the field touched: an out-of-range stored
+                // value opens silently and only reports an error once edited.
+                this.modelSettings.moe_expert_offload_resident_touched = true;
                 const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
                 if (
                     Number.isInteger(percent)
