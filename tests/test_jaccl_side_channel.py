@@ -87,6 +87,39 @@ def test_sidecar_orders_ranks_without_using_parent_network(monkeypatch):
     assert results == {"server": b"aabb", "client": b"aabb"}
 
 
+def test_sidecar_sanitizes_pythonhome_and_pythonpath(monkeypatch):
+    """Sidecar helper must not inherit parent PYTHONHOME or PYTHONPATH."""
+    port = _free_loopback_port()
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", f"127.0.0.1:{port}")
+    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TRANSPORT", "sidecar")
+    monkeypatch.setenv("PYTHONHOME", "/invalid/nonexistent/pythonhome")
+    monkeypatch.setenv("PYTHONPATH", "/invalid/nonexistent/pythonpath")
+
+    results: dict[str, bytes] = {}
+    errors: list[BaseException] = []
+
+    first = jaccl_all_gather_factory(0, 2)
+    second = jaccl_all_gather_factory(1, 2)
+
+    def rank_zero() -> None:
+        try:
+            results["server"] = first(b"aa", 2)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=rank_zero)
+    thread.start()
+    results["client"] = second(b"bb", 2)
+    thread.join(3)
+    first.close()
+    second.close()
+
+    assert not thread.is_alive()
+    assert not errors
+    assert results == {"server": b"aabb", "client": b"aabb"}
+
+
 @pytest.mark.parametrize("value", ["", "host", "127.0.0.1:0", "[::1]:8000"])
 def test_side_channel_requires_a_valid_ipv4_coordinator(monkeypatch, value):
     monkeypatch.setenv("MLX_JACCL_COORDINATOR", value)

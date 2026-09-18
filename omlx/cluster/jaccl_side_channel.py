@@ -371,6 +371,9 @@ class _SidecarAllGather:
         executable = _sidecar_python()
         if executable is None:  # defensive: transport selection already checks
             raise RuntimeError("JACCL side-channel helper Python is unavailable")
+        sidecar_env = os.environ.copy()
+        sidecar_env.pop("PYTHONHOME", None)
+        sidecar_env.pop("PYTHONPATH", None)
         self._process = subprocess.Popen(
             [
                 executable,
@@ -387,6 +390,7 @@ class _SidecarAllGather:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=sidecar_env,
         )
         _trace(f"sidecar started rank={rank} size={size} coordinator={host}:{port}")
 
