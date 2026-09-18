@@ -124,6 +124,50 @@ def _cache_dependency(cache_entry: Any, value: Any, mx: Any) -> None:
 
 
 @contextmanager
+def _install_deepseek_v32_pipeline(
+    assignments: Sequence[PipelineAssignment],
+) -> Iterator[bool]:
+    """Teach the vendored GLM-5.2/DeepSeek-V3.2 model the assignment contract.
+
+    ``DeepseekV32Model.pipeline`` computes its own even split from rank and
+    world size alone, so an approved unequal plan (the mechanism that keeps a
+    smaller Mac inside its budget) was silently loaded as an even split and
+    only refused by the post-load validator — after a full multi-hundred-GB
+    load. The vendored class is oMLX's own patch code, but the fix belongs in
+    this worker-only hook rather than in the model: outside the distributed
+    worker the native even split must remain the behavior, and the explicit
+    contract marker keeps ``pipeline_assignment_is_honored`` honest about
+    exactly which method the loader will call.
+    """
+
+    try:
+        from omlx.patches.glm_moe_dsa.deepseek_v32 import DeepseekV32Model
+    except ImportError:
+        yield False
+        return
+
+    saved = DeepseekV32Model.__dict__.get("pipeline", _MISSING)
+
+    def pipeline(pipeline_model: Any, group: Any) -> None:
+        apply_pipeline_assignment(pipeline_model, group, assignments)
+        # DeepseekV32Model.__call__ sizes the cache and the layer loop from
+        # num_layers; the generic assignment deliberately does not touch it.
+        pipeline_model.num_layers = (
+            pipeline_model.end_idx - pipeline_model.start_idx
+        )
+
+    _mark_assignment_contract(pipeline)
+    DeepseekV32Model.pipeline = pipeline
+    try:
+        yield True
+    finally:
+        if saved is _MISSING:
+            delattr(DeepseekV32Model, "pipeline")
+        else:
+            DeepseekV32Model.pipeline = saved
+
+
+@contextmanager
 def _install_nemotron_h_pipeline(
     assignments: Sequence[PipelineAssignment],
 ) -> Iterator[bool]:
@@ -284,4 +328,5 @@ def install_pipeline_compatibility(
     with ExitStack() as stack:
         stack.enter_context(install_unequal_pipeline_plan(assignments))
         stack.enter_context(_install_nemotron_h_pipeline(assignments))
+        stack.enter_context(_install_deepseek_v32_pipeline(assignments))
         yield
