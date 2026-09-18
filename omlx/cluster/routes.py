@@ -61,13 +61,14 @@ from .discovery import (
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain
+from .identity import get_node_identity
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
     DistributedTeardownError,
     preflight_remote_hosts,
-    probe_remote_admission_ceiling,
+    probe_remote_admission_details,
     probe_remote_host,
     run_cluster_performance_probe,
     run_cuda_fabric_probe,
@@ -95,6 +96,7 @@ from .planner import (
     PlanningError,
     ShardPlan,
     complete_model_layout,
+    normalize_memory_guard_tier,
     plan_hybrid,
     plan_proportional_pipeline,
     plan_unequal_pipeline,
@@ -103,7 +105,6 @@ from .planner import (
 )
 from .probe import collect_cluster_status
 from .registry import get_cluster_registry, get_device_registry
-from .identity import get_node_identity
 from .replan import (
     hosts_from_deployment,
     nodes_from_deployment,
@@ -414,6 +415,7 @@ class ClusterPlanNodeRequest(BaseModel):
     memory_guard_tier: Literal["safe", "balanced", "aggressive", "custom"] = (
         "balanced"
     )
+    memory_guard_custom_ceiling_gb: float = Field(default=0.0, ge=0)
     performance: dict[str, Any] | None = None
     accelerator: Literal["metal", "cuda", "cpu"] | None = None
     fabric_kind: str | None = Field(default=None, max_length=64)
@@ -612,6 +614,7 @@ def _node_budgets(
                 target_weight_bytes=target_weight_bytes,
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
+                memory_guard_custom_ceiling_gb=node.memory_guard_custom_ceiling_gb,
                 rank=rank,
                 performance=performance,
             )
@@ -712,6 +715,7 @@ _PLACEMENT_FIELDS = (
     "manual_memory_limit",
     "role",
     "memory_guard_tier",
+    "memory_guard_custom_ceiling_gb",
     "tensor_parallel_rank",
     "tensor_parallel_size",
 )
@@ -3075,9 +3079,11 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
     async def _for(host: Any) -> dict[str, Any]:
         capacity_bytes = 0
         capacity_source: str | None = None
+        memory_guard_tier: str | None = None
+        memory_guard_custom_ceiling_gb: float | None = None
         if not _local_ssh_target(host.ssh):
-            capacity_bytes = await asyncio.to_thread(
-                probe_remote_admission_ceiling,
+            details = await asyncio.to_thread(
+                probe_remote_admission_details,
                 host.ssh,
                 # No fallback to sys.executable: inside the packaged app that
                 # is a bundled interpreter which exists on the peer but cannot
@@ -3085,10 +3091,17 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
                 # probe discovers the peer's own interpreter.
                 python_executable=host.python_executable,
             )
+            capacity_bytes = details.admission_ceiling_bytes
+            memory_guard_tier = normalize_memory_guard_tier(
+                details.memory_guard_tier
+            )
+            memory_guard_custom_ceiling_gb = details.memory_guard_custom_ceiling_gb
             capacity_source = "admission_ceiling"
         budget = await asyncio.to_thread(
             suggest_budget,
             role=request.roles.get(host.node_id, "headless"),
+            memory_guard_tier=memory_guard_tier,
+            memory_guard_custom_ceiling_gb=memory_guard_custom_ceiling_gb,
             ssh_target=host.ssh,
             capacity_bytes=capacity_bytes,
             capacity_source=capacity_source,
