@@ -1541,6 +1541,26 @@ def test_a_minimax_rank_needs_mlx_vlm_even_though_a_rank_is_an_mlx_lm_server(tmp
     assert "mlx_vlm" in modules
 
 
+def test_a_gemma4_rank_needs_mlx_vlm_for_the_draft_head(tmp_path):
+    """Under-asking is the other half, and it is the one that kills a rank.
+
+    Gemma 4 alone ships its draft head as a separate model that only mlx-vlm
+    implements, so ``omlx.patches.mlx_lm_gemma4_assistant`` holds that import
+    and ``mlx_lm_mtp`` does not — true of gemma4, not of every MTP model.
+    """
+
+    from omlx.cluster.autoconfigure import required_imports
+
+    modules = {
+        requirement.module
+        for requirement in required_imports(
+            _model_dir(tmp_path, model_type="gemma4")
+        )
+    }
+
+    assert "mlx_vlm" in modules
+
+
 def test_a_plain_llama_is_not_asked_to_bring_mlx_vlm(tmp_path):
     """Over-asking blocks a cluster that would have worked."""
 
