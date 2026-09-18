@@ -140,6 +140,10 @@ brew services info omlx     # 查看状态
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 管理后台" width="720">
 </p>
 
+### 实验性多 Mac 推理
+
+源码构建版本可通过基于 Ring 或雷雳（Thunderbolt）RDMA/JACCL 的 MLX 流水线秩，将已下载的单一语言模型拆分并运行在多台内存规格不等的 Mac 上。集群仪表盘支持只读节点发现、严格的 SSH/运行时校验、感知字节级差异的分片规划、实测算力与链路负载均衡、感知内存余量的执行调优、激活，并在两台 Mac 上提供实时的分片与性能图谱。交互模式、均衡模式与吞吐量配置模式公开了合并批处理、提示词缓存亲和性、轮换 KV 限制、Ring 连接调优以及受能力门禁控制的实验性纯 Token 输出路径。有关安装设置、安全边界、当前限制以及物理硬件验证清单，请参阅[跨 Mac 分布式推理](docs/distributed-cluster.md)。
+
 ### 视觉语言模型
 
 使用与文本 LLM 相同的连续批处理和分层 KV 缓存堆栈运行 VLM。支持多图聊天、base64/URL/文件图像输入，以及带视觉上下文的工具调用。OCR 模型（DeepSeek-OCR、DOTS-OCR、GLM-OCR）会被自动识别，并使用优化的提示词。
@@ -386,3 +390,9 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 应用包的便携 Python 环境分层
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon 嵌入模型支持
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
+- [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP 的验证形态 Metal 内核由 Youssof Altoukhi 的 MTPLX 提供支持，同时也启发了 depth-k 流水线设计
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核
+- [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制
+---
+
+> 💡 **文档维护说明**：本中文文档由社区志愿者（@JasonYeYuhe）翻译维护，最后同步更新于 2026年8月31日。如发现内容与官方英文原版存在差异或新特性滞后，欢迎提交 PR 共同完善！
