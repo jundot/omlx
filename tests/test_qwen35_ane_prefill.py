@@ -323,6 +323,76 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
     assert "never execute" not in caplog.text
 
 
+def test_oversized_shape_recommends_a_sequence_length_the_validator_accepts(caplog):
+    """A 2048-token chunk can still host a legal shape, so name it."""
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=2048),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
+
+    assert "never execute" in caplog.text
+    assert "Set sequence_length=2048 or smaller" in caplog.text
+    # The advice has to survive the validator it is advising about.
+    ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
+
+
+def test_sub_minimum_delivered_width_reports_an_impossible_geometry(caplog):
+    """A 512-token chunk is below the minimum shape: no sequence_length works.
+
+    The earlier message recommended ``sequence_length=512``, which the
+    validator in this same function rejects, so following it raised
+    ValueError instead of fixing anything.
+    """
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=512),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
+
+    assert "never execute" in caplog.text
+    assert str(ane_patch._ANE_MIN_SEQUENCE_LENGTH) in caplog.text
+    assert "prefill chunk width" in caplog.text
+    # Never advise a shape the validator refuses.
+    assert "sequence_length=512" not in caplog.text
+    for width in (512, 448, 64):
+        assert f"Set sequence_length={width}" not in caplog.text
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 512)
+
+
+def test_validator_and_warning_share_one_minimum(caplog):
+    """The rejected range and the warned range must not drift apart."""
+    minimum = ane_patch._ANE_MIN_SEQUENCE_LENGTH
+    alignment = ane_patch._ANE_SEQUENCE_LENGTH_ALIGNMENT
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(object(), minimum - alignment)
+    with pytest.raises(ValueError):
+        ane_patch.enable_qwen35_ane_prefill(
+            SimpleNamespace(), sequence_length=minimum - alignment
+        )
+
+    # Exactly at the minimum, a chunk of the same width is a clean fit.
+    exact = SimpleNamespace(
+        config=SimpleNamespace(
+            prefill_step_size=2048, paged_cache_block_size=minimum
+        ),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(exact, minimum)
+    assert "never execute" not in caplog.text
+
+
 def test_short_chunks_exit_before_the_tiling_planner(monkeypatch):
     monkeypatch.setattr(
         ane_patch,
