@@ -7,15 +7,18 @@ Anthropic/OpenAI message conversion paths.
 """
 
 import json
+import re
 from unittest.mock import MagicMock
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
+from omlx.api.anthropic_models import ContentBlockText, ContentBlockToolUse
 from omlx.api.anthropic_utils import (
     _extract_tool_result_content,
     truncate_tool_result,
 )
-
 
 # =============================================================================
 # Mock Tokenizer
@@ -162,6 +165,37 @@ class TestTruncateToolResult:
         # The original JSON is broken, but the notice is cleanly separated
         assert "\n\n<truncated " in result
 
+    # -- generative coverage for the token-budget contract (#8) -------------
+
+    # No spaces/newlines/tabs inside a word: keeps WordTokenizer's word count an
+    # exact, predictable proxy for token count, isolating the budget contract
+    # from the line-boundary heuristic (already covered by the example tests
+    # above).
+    _word = st.text(
+        alphabet=st.characters(
+            blacklist_characters=" \n\t", blacklist_categories=("Cs",)
+        ),
+        min_size=1,
+        max_size=8,
+    )
+
+    @given(st.lists(_word, max_size=25), st.integers(min_value=0, max_value=40))
+    def test_truncate_tool_result_respects_token_budget(self, words, max_tokens):
+        """Text within budget is returned unchanged; text over budget is
+        truncated to never exceed the budget."""
+        text = " ".join(words)
+        tokenizer = WordTokenizer()
+        total_tokens = len(tokenizer.encode(text))
+        result = truncate_tool_result(text, max_tokens=max_tokens, tokenizer=tokenizer)
+
+        if total_tokens <= max_tokens:
+            assert result == text
+        else:
+            assert "<truncated " in result
+            match = re.search(r'shown_tokens="(\d+)"', result)
+            assert match is not None
+            assert int(match.group(1)) <= max_tokens
+
 
 # =============================================================================
 # _extract_tool_result_content() Tests
@@ -205,6 +239,43 @@ class TestExtractToolResultContent:
             content, max_tokens=5, tokenizer=tokenizer
         )
         assert "<truncated " in result
+
+    def test_list_content_with_pydantic_model_blocks(self):
+        """A Pydantic content-block object in the list must not be silently
+        dropped — it should normalize the same way _content_block_to_dict
+        does elsewhere in this module (#22)."""
+        content = [
+            ContentBlockText(type="text", text="hello"),
+            {"type": "text", "text": "world"},
+        ]
+        result = _extract_tool_result_content(content)
+        assert result == "hello\nworld"
+
+    # -- generative coverage for heterogeneous list content (#22) -----------
+
+    _text_block = st.builds(
+        lambda text: ContentBlockText(type="text", text=text), text=st.text()
+    )
+    _dict_text_block = st.builds(
+        lambda text: {"type": "text", "text": text}, text=st.text()
+    )
+    _tool_use_block = st.builds(
+        lambda: ContentBlockToolUse(type="tool_use", id="t1", name="Bash", input={})
+    )
+    _any_item = st.one_of(_text_block, _dict_text_block, _tool_use_block, st.text())
+
+    @given(st.lists(_any_item, max_size=10))
+    def test_extract_tool_result_content_only_ever_contains_declared_text(self, items):
+        """Whatever comes back is built only from text-typed items —
+        Pydantic and dict text blocks alike, in list order."""
+        result = _extract_tool_result_content(items)
+        for item in items:
+            if isinstance(item, ContentBlockText):
+                assert item.text in result or item.text == ""
+            elif isinstance(item, dict) and item.get("type") == "text":
+                assert item["text"] in result or item["text"] == ""
+            elif isinstance(item, str):
+                assert item in result or item == ""
 
     def test_dict_content_text_type(self):
         """Dict with type=text returns text value."""
