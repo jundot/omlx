@@ -2582,3 +2582,47 @@ process.stdout.write(JSON.stringify({state: component.wizardState(), active: com
     template = _read(TEMPLATE)
     assert "data-cluster-v2-join-cleanup" in template
     assert 'x-show="join.cleanup_pending"' in template
+
+
+# --- Activate blocker: a greyed button must say why (#3585) --------------------
+
+
+def test_greyed_activate_button_shows_the_blocker_reason():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    # The button is disabled when the proposal cannot proceed; the reason
+    # must be visible right there, not only in a diagnostics export.
+    assert "data-cluster-v2-activate-blocker" in template
+    assert "planBlockerText()" in javascript
+    blocker = javascript.split("planBlockerText() {", 1)[1].split("},", 1)[0]
+    assert "fabric_blocker" in blocker
+    assert "preflight" in blocker
+
+
+def test_activate_blocker_text_comes_from_the_real_proposal_fields():
+    result = _run_wizard(
+        """
+component.planProposal = {
+  ready_to_activate: false,
+  fabric_blocker: 'studio.local reports no RDMA devices',
+  preflight: '2 issues need attention',
+};
+const withFabric = component.planBlockerText();
+component.planProposal = {
+  ready_to_activate: false,
+  preflight: 'peer at 10.0.0.2: worker runtime is not installed',
+};
+const withPreflight = component.planBlockerText();
+component.planProposal = { ready_to_activate: true };
+const whenReady = component.planBlockerText();
+component.planProposal = null;
+const whenNoProposal = component.planBlockerText();
+process.stdout.write(JSON.stringify({withFabric, withPreflight, whenReady, whenNoProposal}));
+""",
+    )
+
+    assert result["withFabric"] == "studio.local reports no RDMA devices"
+    assert result["withPreflight"] == "peer at 10.0.0.2: worker runtime is not installed"
+    assert result["whenReady"] == ""
+    assert result["whenNoProposal"] == ""
