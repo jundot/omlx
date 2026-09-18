@@ -181,10 +181,12 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
 
@@ -229,6 +231,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
         request_id="req-next",
+        text_only=True,
     )
     evict.assert_not_awaited()
 
@@ -339,7 +342,7 @@ async def test_preflight_completion_raises_for_oversize_prompt(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
-    """Each image-bearing content part must add
+    """Each decoded image must add
     ``_IMAGE_TOKEN_UPPER_BOUND_FALLBACK`` to the prompt size the scheduler sees,
     so image-heavy borderline requests can't slip past."""
     from omlx.engine.vlm import _IMAGE_TOKEN_UPPER_BOUND_FALLBACK, VLMBatchedEngine
@@ -365,7 +368,10 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
                     "type": "image_url",
                     "image_url": {"url": _TINY_PNG_DATA_URI},
                 },
-                {"type": "image", "source": {}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _TINY_PNG_DATA_URI},
+                },
                 {"type": "text", "text": "world"},
             ],
         }

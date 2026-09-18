@@ -23,6 +23,9 @@ except ImportError:
     HAS_MLX = False
 
 from ._rotating_subclass import PrefillReadyRotatingKVCache
+from .deepseek_v41_delta import DELTA_CLASS as V41_DELTA_CLASS
+from .deepseek_v41_delta import compact_state as compact_v41_state
+from .deepseek_v41_delta import restore_chain as restore_v41_chain
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
 from .paged_cache import (
@@ -943,6 +946,27 @@ class BlockAwarePrefixCache(CacheManager):
         require_contiguous_pooling_snapshots = bool(
             boundary_snapshots
         ) and _contains_pooling_cache_state(cache_data)
+        snapshot_base_tokens = 0
+        if boundary_snapshots and not pm_layers_present:
+            first_boundary = min(boundary_snapshots.keys())
+            first_snapshot = (
+                boundary_snapshots[first_boundary]
+                if first_boundary > self.block_size else None
+            )
+            if first_snapshot and len(first_snapshot) == len(cache_data):
+                complete = all(
+                    not CacheTypeRegistry.get_handler_by_class_name(
+                        layer.get("class_name", "KVCache")
+                    ).supports_block_slicing
+                    for layer in first_snapshot
+                )
+                for layer in first_snapshot:
+                    for span in layer.get("pooling_delta_ranges", {}).values():
+                        complete = complete and span[0] == 0
+                if complete:
+                    # A full snapshot can follow an indivisible image prefix.
+                    snapshot_base_tokens = first_boundary
+
         # Supersede-on-extend tracking (rotating models only, see below).
         first_new_block_idx: int | None = None
         tip_block_saved = False
@@ -981,6 +1005,7 @@ class BlockAwarePrefixCache(CacheManager):
             # intermediate snapshot.
             if (
                 require_contiguous_pooling_snapshots
+                and global_end >= snapshot_base_tokens
                 and not is_last_block
                 and not has_boundary_snapshot
             ):
@@ -1194,6 +1219,7 @@ class BlockAwarePrefixCache(CacheManager):
                 #      longer needs cache_data's live seq_len for them.
                 if (
                     snapshot_cache_data is None
+                    and global_end >= snapshot_base_tokens
                     and not is_last_block
                     and cache_seq_len > 0
                     and cache_start >= cache_seq_len
@@ -1604,8 +1630,10 @@ class BlockAwarePrefixCache(CacheManager):
             return None
 
         try:
-            if promote_to_hot_cache:
-                self.preload_blocks(block_table)
+            # reconstruct_cache performs the same SSD load and promotes each
+            # block as it is consumed.  preload_blocks is serialized for Metal
+            # safety, so running it here would deserialize the exact chain
+            # twice before returning it.
             restored_cache = self.reconstruct_cache(
                 block_table,
                 promote_to_hot_cache=promote_to_hot_cache,
@@ -1689,6 +1717,15 @@ class BlockAwarePrefixCache(CacheManager):
         """
         if not cache_data:
             return 0
+
+        # V4.1 stores packed rows and a bounded window rather than a 4D KV
+        # tensor. Its first state slot records the absolute token position,
+        # including any prefix restored before this request's prefill.
+        for layer in cache_data:
+            if layer.get("class_name") == "DeepseekV41Cache":
+                state = layer.get("state", ())
+                if len(state) in (7, 8) and state[0].shape == (1,):
+                    return int(state[0].item())
 
         # Non-sliceable cache types use sliding window or have no sequence dimension
         # RotatingKVCache: sliding window, seq_len limited to max_size
@@ -2651,6 +2688,21 @@ class BlockAwarePrefixCache(CacheManager):
                             if has_snapshot
                             else layer_state["state"]
                         )
+                        marker_class = cache_type_name
+                        if cache_type_name == "DeepseekV41Cache":
+                            source_layer = (
+                                snapshot_cache_data[layer_idx]
+                                if has_snapshot
+                                else layer_state
+                            )
+                            state = compact_v41_state(
+                                state,
+                                source_layer.get("meta_state", ()),
+                                start_idx,
+                                end_idx,
+                            )
+                            if len(state) == 8:
+                                marker_class = V41_DELTA_CLASS
                         if isinstance(state, (list, tuple)) and len(state) > 2:
                             cloned = [
                                 (
@@ -2660,7 +2712,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 )
                                 for elem in state
                             ]
-                            block_slices.append(("__nstate__", cache_type_name, cloned))
+                            block_slices.append(("__nstate__", marker_class, cloned))
                         elif isinstance(state, (list, tuple)) and len(state) >= 2:
                             conv_state = (
                                 state[0] if state[0] is not None else mx.array([])
@@ -4256,6 +4308,15 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                         return None
                     reconstructed_caches.append(cache)
+                    continue
+
+                if cache_type_name == "DeepseekV41Cache":
+                    restored = restore_v41_chain(
+                        [block[layer_idx] for block in all_block_data],
+                        [metas[layer_idx] for metas in all_block_meta_states],
+                        valid_token_count,
+                    )
+                    reconstructed_caches.append(restored)
                     continue
 
                 # === Generic N-tuple non-sliceable cache: use latest boundary ===

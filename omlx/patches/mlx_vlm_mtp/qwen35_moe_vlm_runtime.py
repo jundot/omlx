@@ -61,6 +61,12 @@ def apply() -> bool:
         logger.debug(f"mlx_vlm.qwen3_5_moe not importable for MTP runtime: {e}")
         return False
 
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    from . import qwen35_verify_attention, qwen35_verify_linear
+
+    qwen35_verify_linear.apply()
+    qwen35_verify_attention.apply(q35_lang)
     _patch_text_config(q35moe_config)
     _register_mtp_classes_for_vlm(q35moe_lang)
     _patch_vlm_language_model(q35moe_lang)
@@ -222,6 +228,7 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         # Qwen3.6 UD MLX builds, issue #1426) don't trip strict load_weights
         # with "Missing N parameters" and silently fall back to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
+        self._omlx_mtp_multi_request = True
         attach_enabled = bool(is_mtp_attach_enabled())
         self._omlx_mtp_decode_enabled = bool(
             n_mtp > 0 and attach_enabled and is_mtp_active()
@@ -235,6 +242,7 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             from ..mlx_lm_mtp import get_mtp_depth
 
             self._omlx_mtp_chain = True
+            self._omlx_mtp_batch_rollback = True
             self._omlx_mtp_depth = get_mtp_depth()
             # Qwen3_5MoeModel inherits the dense Qwen3_5Model.__call__, so
             # the prompt-priming capture wrap installed by the dense runtime
@@ -248,11 +256,8 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         ``(logits, pre_norm_hidden, gdn_states)``:
         - ``pre_norm_hidden`` is the last-layer activation BEFORE the final
           RMSNorm; the MTP head fuses it with the next-token embedding.
-        - ``gdn_states`` is the list of per-layer (q, k, v, a, b, A_log,
-          dt_bias, state, mask, conv_input, conv_kernel_size) tuples
-          captured by ``Qwen3_5GatedDeltaNet`` when a non-None
-          ``capture_layer_ids`` is in flight. ``LanguageModel.rollback_speculative_cache``
-          consumes this on draft rejection.
+        - ``gdn_states`` is the upstream speculative cache transaction.
+          It must be committed after both partial and full acceptance.
 
         ``n_confirmed`` is accepted and discarded — the mlx-vlm path does
         not need a confirmed/draft split because rollback is done after
@@ -278,6 +283,7 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             mask,
             cache,
             capture_layer_ids=[last_layer_idx],
+            speculative_verify=True,
             **kwargs,
         )
         from mlx_vlm.models.base import LanguageModelOutput

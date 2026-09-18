@@ -163,6 +163,7 @@ class ModelArgs(BaseModelArgs):
     moe_apply_router_weight_on_input: bool = False
     moe_router_logit_softcapping: float = 0.0
     moe_router_use_sigmoid: bool = True
+    moe_router_score_func: str | None = None
 
     def __post_init__(self):
         if self.gating is True:
@@ -358,7 +359,9 @@ class LagunaTopKRouter(nn.Module):
         super().__init__()
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
-        self.use_sigmoid = args.moe_router_use_sigmoid
+        self.score_func = args.moe_router_score_func or (
+            "sigmoid" if args.moe_router_use_sigmoid else "softmax"
+        )
         self.router_logit_softcapping = args.moe_router_logit_softcapping
         self.proj = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.e_score_correction_bias = mx.zeros((args.num_experts,))
@@ -370,7 +373,14 @@ class LagunaTopKRouter(nn.Module):
             c = self.router_logit_softcapping
             logits = mx.tanh(logits / c) * c
 
-        scores = mx.sigmoid(logits) if self.use_sigmoid else mx.softmax(logits, axis=-1)
+        if self.score_func == "sigmoid":
+            scores = mx.sigmoid(logits)
+        elif self.score_func == "sqrtsoftplus":
+            scores = mx.sqrt(nn.softplus(logits))
+        elif self.score_func == "softmax":
+            scores = mx.softmax(logits, axis=-1)
+        else:
+            raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
         # The correction bias changes which experts are selected, but the model
         # weights selected expert outputs using the original router scores.
         corrected_scores = scores + self.e_score_correction_bias.astype(scores.dtype)

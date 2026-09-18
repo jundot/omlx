@@ -1,0 +1,170 @@
+<!-- Applications -->
+<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+    <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+        <div class="flex items-center gap-3">
+            <i data-lucide="layout-grid" class="w-4 h-4 text-neutral-500"></i>
+            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.integrations.section_label') }}</span>
+        </div>
+    </div>
+    <div class="divide-y divide-neutral-100">
+
+        <!-- Claude Code -->
+        <div class="flex items-center gap-4 px-6 py-4 group">
+            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                <img src="/admin/static/img/integrations/claude.png" alt="{{ t('status.integrations.claude_code') }}" class="w-full h-full object-cover">
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.claude_code') }}</div>
+                <code class="text-xs text-neutral-500 font-mono" x-text="claudeCommand"></code>
+            </div>
+            <button x-data="{ copied: false }"
+                    @click="copyToClipboard(claudeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                    :title="window.t('status.integrations.copy_command_tooltip')">
+                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </button>
+        </div>
+
+        <!-- Codex -->
+        <div class="flex items-start gap-4 px-6 py-4 group">
+            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                <img src="/admin/static/img/integrations/codex.png" alt="{{ t('status.integrations.codex') }}" class="w-full h-full object-cover">
+            </div>
+            <div class="flex-1 min-w-0 space-y-2">
+                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.codex') }}</div>
+                <div class="space-y-1.5">
+                    <div class="flex items-center gap-2 min-w-0">
+                        <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">CLI</span>
+                        <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexCommand"></code>
+                        <button x-data="{ copied: false }"
+                                @click="copyToClipboard(codexCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                :title="window.t('status.integrations.copy_command_tooltip')">
+                            <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                            <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                        </button>
+                    </div>
+                    <div class="flex items-center gap-2 min-w-0">
+                        <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">{{ t('status.integrations.app') }}</span>
+                        <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexAppCommand"></code>
+                        <button x-data="{ copied: false }"
+                                @click="copyToClipboard(codexAppCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                :title="window.t('status.integrations.copy_command_tooltip')">
+                            <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                            <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- OpenCode -->
+        <div class="flex items-center gap-4 px-6 py-4 group">
+            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                <img src="/admin/static/img/integrations/opencode.png" alt="{{ t('status.integrations.opencode') }}" class="w-full h-full object-cover">
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.opencode') }}</div>
+                <code class="text-xs text-neutral-500 font-mono" x-text="opencodeCommand"></code>
+            </div>
+            <button x-data="{ copied: false }"
+                    @click="copyToClipboard(opencodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                    :title="window.t('status.integrations.copy_command_tooltip')">
+                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </button>
+        </div>
+
+        <!-- OpenClaw -->
+        <div class="flex items-center gap-4 px-6 py-4 group">
+            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                <img src="/admin/static/img/integrations/openclaw.png" alt="{{ t('status.integrations.openclaw') }}" class="w-full h-full object-cover">
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.openclaw') }}</div>
+                <code class="text-xs text-neutral-500 font-mono" x-text="openclawCommand"></code>
+            </div>
+            <select x-model="globalSettings.integrations.openclaw_tools_profile"
+                    @change="saveIntegrationSettings()"
+                    class="text-xs border border-neutral-200 rounded-md px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300 flex-shrink-0">
+                <option value="minimal">{{ t('status.integrations.tools_profile_minimal') }}</option>
+                <option value="coding">{{ t('status.integrations.tools_profile_coding') }}</option>
+                <option value="messaging">{{ t('status.integrations.tools_profile_messaging') }}</option>
+                <option value="full">{{ t('status.integrations.tools_profile_full') }}</option>
+            </select>
+            <button x-data="{ copied: false }"
+                    @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                    :title="window.t('status.integrations.copy_command_tooltip')">
+                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </button>
+        </div>
+
+        <!-- Hermes Agent -->
+        <div class="flex items-center gap-4 px-6 py-4 group">
+            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                <img src="/admin/static/img/integrations/hermes.svg" alt="{{ t('status.integrations.hermes_agent') }}" class="w-full h-full object-cover">
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.hermes_agent') }}</div>
+                <code class="text-xs text-neutral-500 font-mono" x-text="hermesCommand"></code>
+            </div>
+            <button x-data="{ copied: false }"
+                    @click="copyToClipboard(hermesCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                    :title="window.t('status.integrations.copy_command_tooltip')">
+                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </button>
+        </div>
+
+        <!-- Pi -->
+        <div class="flex items-center gap-4 px-6 py-4 group">
+            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                <img src="/admin/static/img/integrations/pi.svg" alt="{{ t('status.integrations.pi') }}" class="w-full h-full object-cover">
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.pi') }}</div>
+                <code class="text-xs text-neutral-500 font-mono" x-text="piCommand"></code>
+            </div>
+            <button x-data="{ copied: false }"
+                    @click="copyToClipboard(piCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                    :title="window.t('status.integrations.copy_command_tooltip')">
+                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </button>
+        </div>
+
+        <!-- Copilot CLI -->
+        <div class="flex items-center gap-4 px-6 py-4 group">
+            <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                <img src="/admin/static/img/integrations/copilot.svg" alt="{{ t('status.integrations.copilot_cli') }}" class="w-full h-full object-cover">
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.copilot_cli') }}</div>
+                <code class="text-xs text-neutral-500 font-mono" x-text="copilotCommand"></code>
+            </div>
+            <button x-data="{ copied: false }"
+                    @click="copyToClipboard(copilotCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                    :title="window.t('status.integrations.copy_command_tooltip')">
+                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </button>
+        </div>
+
+    </div>
+</div>

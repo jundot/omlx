@@ -1,8 +1,6 @@
 """Tests for the torch-free Pixtral/Mistral3 processor patch (issue #2263).
 
-Covers the vendored PixtralImageProcessor geometry (ported from upstream
-mlx-vlm PR #1502 tests), the method transplant onto the pinned classes,
-and the TokenizersBackend pin for tekken.json checkpoints.
+Covers upstream image geometry and the retained tokenizer backend selection.
 """
 
 import json
@@ -11,13 +9,13 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
-from PIL import Image
-
-from omlx.patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
-from omlx.patches.mlx_vlm_pixtral_torch_free.vendor.image_processing_pixtral import (
+from mlx_vlm.models.pixtral.image_processing_pixtral import (
     PixtralImageProcessor,
     split_image_sizes_by_sample,
 )
+from PIL import Image
+
+from omlx.patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 
 DEVSTRAL_DIR = Path.home() / "Workspace/models/Devstral-Small-2-24B-Instruct-2512-4bit"
 
@@ -63,7 +61,7 @@ def _fake_processor_init(
     self.chat_template = chat_template
 
 
-class TestVendoredImageProcessor:
+class TestImageProcessor:
     """Geometry tests ported from upstream mlx-vlm PR #1502."""
 
     def test_preprocess_resizes_to_patch_multiple_and_pads(self):
@@ -92,38 +90,24 @@ class TestVendoredImageProcessor:
 
 
 class TestPatchInstallation:
-    def test_apply_is_idempotent_and_transplants_methods(self):
-        from mlx_vlm.models.mistral3 import processing_mistral3 as pin_m3
-        from mlx_vlm.models.pixtral import processing_pixtral as pin_px
+    def test_apply_keeps_upstream_image_processing(self):
+        from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
+        from mlx_vlm.models.pixtral.processing_pixtral import PixtralProcessor
 
-        from omlx.patches.mlx_vlm_pixtral_torch_free.vendor import (
-            processing_mistral3 as vendor_m3,
-        )
-        from omlx.patches.mlx_vlm_pixtral_torch_free.vendor import (
-            processing_pixtral as vendor_px,
-        )
+        calls = [cls.__call__ for cls in (Mistral3Processor, PixtralProcessor)]
+        assert apply_pixtral_torch_free_patch()
+        factories = [
+            cls.from_pretrained.__func__
+            for cls in (Mistral3Processor, PixtralProcessor)
+        ]
+        assert apply_pixtral_torch_free_patch()
+        assert calls == [cls.__call__ for cls in (Mistral3Processor, PixtralProcessor)]
+        assert factories == [
+            cls.from_pretrained.__func__
+            for cls in (Mistral3Processor, PixtralProcessor)
+        ]
 
-        assert apply_pixtral_torch_free_patch() is True
-        assert apply_pixtral_torch_free_patch() is True
-
-        assert (
-            pin_m3.Mistral3Processor.__call__
-            is vendor_m3.Mistral3Processor.__dict__["__call__"]
-        )
-        assert (
-            pin_m3.Mistral3Processor.__dict__["from_pretrained"]
-            is vendor_m3.Mistral3Processor.__dict__["from_pretrained"]
-        )
-        assert (
-            pin_px.PixtralProcessor.__call__
-            is vendor_px.PixtralProcessor.__dict__["__call__"]
-        )
-        assert (
-            pin_px.PixtralProcessor.__dict__["from_pretrained"]
-            is vendor_px.PixtralProcessor.__dict__["from_pretrained"]
-        )
-
-    def test_from_pretrained_uses_vendored_image_processor(self, tmp_path):
+    def test_from_pretrained_uses_upstream_image_processor(self, tmp_path):
         assert apply_pixtral_torch_free_patch() is True
 
         from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
@@ -166,7 +150,7 @@ class TestPatchInstallation:
         assert isinstance(processor.image_processor, PixtralImageProcessor)
         assert processor.patch_size == 14
         assert processor.spatial_merge_size == 2
-        # Tokenizer backend pin applies to the tokenizer load only.
+        # Preserve vocabulary access for the streaming detokenizer.
         assert tok_mock.call_args.kwargs.get("fix_mistral_regex") is True
 
         output = processor(text=["[IMG]Describe"], images=[[_make_image()]])

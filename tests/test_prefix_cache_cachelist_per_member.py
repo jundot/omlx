@@ -147,13 +147,13 @@ def _assert_restored(result, expected_seq_len):
     restored = result[0]
     assert type(restored).__name__ == "CacheList"
     kv = list(restored.caches)[0]
-    keys = kv.state[0]
+    keys = kv.keys_and_values()[0]
     assert keys.shape[2] == expected_seq_len
     expected_keys, _ = _position_kv(expected_seq_len)
     assert mx.max(mx.abs(keys - expected_keys)).item() == 0.0
     arrays = list(restored.caches)[1]
     for i, channels in enumerate(CONV_CHANNELS):
-        slot = list(arrays.state)[i]
+        slot = list(arrays.cache)[i]
         assert tuple(slot.shape) == (1, 3, channels)
         assert mx.max(mx.abs(slot - (expected_seq_len + i / 10.0))).item() == 0.0
 

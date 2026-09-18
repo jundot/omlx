@@ -131,8 +131,10 @@ QwenQAffineNaxVariant qwen_q_affine_nax_variant(int variant) {
       return {/* bm = */ 64, /* bk = */ 32, /* bn = */ 64, 2, 2};
     case 5:
       return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 64, 4, 1};
-    case 6:
-      return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 64, 1, 4};
+    // (64, 64, 64, wm=1, wn=4) was variant 6: a 16-column per-simdgroup N
+    // tile that returns wrong output on M5 Max / mlx 0.32.2 (max abs err 5-8
+    // against stock at every shape and bit width; the other tiles match
+    // exactly). Rejected rather than kept as an opt-in footgun.
     default: {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm NAX variant " << variant << ".";

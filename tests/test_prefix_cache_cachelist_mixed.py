@@ -165,7 +165,7 @@ def _assert_restored(result, expected_seq_len):
     assert len(sub_caches) == 2
 
     kv = sub_caches[0]
-    kv_state = kv.state
+    kv_state = kv.keys_and_values()
     keys = kv_state[0]
     assert keys.shape[2] == expected_seq_len, (
         f"restored KV holds {keys.shape[2]} tokens, "
@@ -176,7 +176,7 @@ def _assert_restored(result, expected_seq_len):
     assert mx.max(mx.abs(kv_state[1] - expected_values)).item() == 0.0
 
     arrays = sub_caches[1]
-    slots = list(arrays.state)
+    slots = list(arrays.cache)
     assert len(slots) == 4
     for i, (slot, channels) in enumerate(zip(slots, CONV_CHANNELS)):
         assert slot is not None
@@ -313,6 +313,7 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         block_aware_cache=object(),
         config=SimpleNamespace(paged_cache_block_size=BLOCK_SIZE),
         model=SimpleNamespace(),
+        _model_has_unreconstructible_cache=lambda: False,
         _cache_list_needs_boundary_snapshot=lambda cache: True,
         _boundary_cache_snapshots={},
         _boundary_snapshot_store=None,
@@ -584,26 +585,40 @@ def test_glm_pooling_cachelist_blanked_kv_roundtrips(tmp_path):
         assert mx.max(row).item() == float(i + 1), f"pooled row {i} misplaced"
 
 
-def test_arrays_cache_extract_none_guard():
-    """Extract from an ArraysCache with untouched (None) slots — the state
-    of a request aborted before its first forward — must not crash.
-    filter/extend/merge already tolerate None slots; extract lacked the
-    guard until the omlx patch."""
+@pytest.mark.parametrize("cache_module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"])
+def test_arrays_cache_extract_none_guard(cache_module):
+    """Extract a batch row while preserving untouched recurrent slots."""
+    from importlib import import_module
+
     from omlx.patches.arrays_cache_extract import (
         apply_arrays_cache_extract_guard,
     )
 
+    caches = import_module(cache_module)
     assert apply_arrays_cache_extract_guard() is True
+    extract = caches.ArraysCache.extract
+    assert apply_arrays_cache_extract_guard() is True
+    assert caches.ArraysCache.extract is extract
 
-    ac = ArraysCache(size=4)
-    ac[0] = mx.ones((2, 3, 8))
+    ac = caches.ArraysCache(size=4)
+    ac[0] = mx.arange(48).reshape(2, 3, 8)
     out = ac.extract(1)
+    assert type(out) is caches.ArraysCache
     assert out.cache[0].shape == (1, 3, 8)
+    assert mx.array_equal(out[0], ac[0][1:2]).item()
     assert out.cache[1] is None
     assert out.cache[2] is None
+    assert out.cache[3] is None
 
-    all_none = ArraysCache(size=4).extract(0)
+    all_none = caches.ArraysCache(size=4).extract(0)
     assert all(slot is None for slot in all_none.cache)
+
+    nested = caches.CacheList(caches.CacheList(ac, caches.ArraysCache(4)))
+    row = nested.extract(1)
+    assert type(row) is caches.CacheList
+    assert type(row[0][0]) is caches.ArraysCache
+    assert mx.array_equal(row[0][0][0], ac[0][1:2]).item()
+    assert all(slot is None for slot in row[0][1].cache)
 
 
 def test_none_conv_slots_roundtrip(tmp_path):
@@ -620,11 +635,11 @@ def test_none_conv_slots_roundtrip(tmp_path):
     assert result is not None
     restored = result[0]
     assert type(restored).__name__ == "CacheList"
-    slots = list(restored.caches[1].state)
+    slots = list(restored.caches[1].cache)
     assert slots[1] is None
     assert slots[3] is None
     assert slots[0] is not None and slots[2] is not None
-    kv_state = restored.caches[0].state
+    kv_state = restored.caches[0].keys_and_values()
     assert kv_state[0].shape[2] == BLOCK_SIZE
 
 
@@ -641,7 +656,7 @@ def test_kv_batch_pooling_cachelist_pm_roundtrip(tmp_path):
     the scheduler's non-pm fallback blanked the KV member of this layer
     while the legacy restore last-blocked the refilled per-block slices —
     silently truncating the KV sequence to one block."""
-    from mlx_vlm.models.cache import BatchPoolingCache
+    from omlx.patches.deepseek_v4.cache_extras import BatchPoolingCache
 
     from omlx.patches.deepseek_v4 import apply_pooling_cache_support
     from omlx.scheduler import Scheduler

@@ -670,7 +670,10 @@ class Glm5NextSparseAttention(nn.Module):
             if deps:
                 cache[0].keys = mx.depends(cache[0].keys, deps)
 
-        if L == 1:
+        # Short verification blocks use the same latent-space attention as
+        # decode. Expanding every cached key and value into all heads makes
+        # verification cost grow with the complete context length.
+        if L <= 8:
             q = self.embed_q(q)
             k = v = kv_latent
         else:
@@ -680,7 +683,7 @@ class Glm5NextSparseAttention(nn.Module):
         output = scaled_dot_product_attention(
             q, k, v, cache=cache, scale=self.scale, mask=attn_mask
         )
-        if L == 1:
+        if L <= 8:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -933,7 +936,16 @@ class LanguageModel(nn.Module):
 
         remapped = {}
         conv_parts = {}
-        fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight")
+        fg_parts = (
+            "A_log",
+            "dt_bias",
+            "f_a_proj.weight",
+            "f_a_proj.scales",
+            "f_a_proj.biases",
+            "f_b_proj.weight",
+            "f_b_proj.scales",
+            "f_b_proj.biases",
+        )
         for k, v in weights.items():
             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
 

@@ -27,7 +27,13 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Header(model: vm.model)
+            HStack(alignment: .center, spacing: 0) {
+                Header(model: vm.model)
+                SnapshotActions(vm: vm, client: services.client)
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 10)
+            }
+            .zIndex(1)
 
             SectionPicker(selection: $vm.section)
 
@@ -53,13 +59,7 @@ struct ModelSettingsScreen: View {
                 AdvancedTab(vm: vm, client: services.client)
             }
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -67,6 +67,9 @@ struct ModelSettingsScreen: View {
             }
         }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await vm.load(modelID: modelID, client: services.client, preservingEdits: true) }
+        }
     }
 
     @ViewBuilder
@@ -116,6 +119,437 @@ private struct Header: View {
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
+    }
+}
+
+
+// MARK: - Snapshot actions (reset / optimal / recipe)
+
+private struct SnapshotActions: View {
+    let vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+    @State private var hoveredAction: String?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if vm.isApplyingSettings {
+                ProgressView().controlSize(.small)
+            }
+            actionButton(String(localized: "settings.actions.reset",
+                          defaultValue: "Reset defaults",
+                          comment: "Header button that returns every setting of the model to its default"),
+                         systemImage: "arrow.counterclockwise") {
+                vm.pendingReset = true
+            }
+            actionButton(String(localized: "settings.actions.optimal",
+                          defaultValue: "Apply optimal settings",
+                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"),
+                         systemImage: "wand.and.stars") {
+                Task { await vm.loadOptimalCandidates(client: client) }
+            }
+            actionButton(String(localized: "settings.actions.recipe",
+                          defaultValue: "Apply custom recipe",
+                          comment: "Header button that opens the paste-a-recipe sheet"),
+                         systemImage: "doc.on.clipboard") {
+                vm.applyError = nil
+                vm.applyOutcome = .recipeInput
+            }
+        }
+        .buttonStyle(.omlx(.normal, size: .small))
+        .buttonBorderShape(.roundedRectangle(radius: 6))
+        .fixedSize(horizontal: true, vertical: false)
+        .disabled(vm.isApplyingSettings)
+        .overlay(alignment: .topTrailing) {
+            if let hoveredAction {
+                Text(hoveredAction)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    .shadow(color: .black.opacity(0.12), radius: 3, y: 2)
+                    .fixedSize()
+                    .offset(y: 34)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .confirmationDialog(
+            String(localized: "settings.actions.reset.confirm_title",
+                   defaultValue: "Reset every setting of this model?",
+                   comment: "Confirmation dialog title before resetting all model settings"),
+            isPresented: Binding(
+                get: { vm.pendingReset },
+                set: { if !$0 { vm.pendingReset = false } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "settings.actions.reset.confirm_button",
+                          defaultValue: "Reset",
+                          comment: "Destructive button inside the reset-settings confirmation dialog"),
+                   role: .destructive) {
+                vm.pendingReset = false
+                Task { await vm.resetDefaults(client: client) }
+            }
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Generic cancel button"),
+                   role: .cancel) { vm.pendingReset = false }
+        } message: {
+            Text(String(localized: "settings.actions.reset.confirm_message",
+                        defaultValue: "Sampling, acceleration, pinned/default flags, aliases and the display name all return to their defaults.",
+                        comment: "Body text inside the reset-settings confirmation dialog"))
+        }
+        .sheet(isPresented: Binding(
+            get: { vm.applyOutcome != nil },
+            set: { if !$0 && !vm.isApplyingSettings { vm.applyOutcome = nil } }
+        )) {
+            SettingsApplySheet(vm: vm, client: client)
+                .environment(\.omlxTheme, theme)
+        }
+    }
+
+    private func actionButton(
+        _ title: String, systemImage: String, action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            hoveredAction = nil
+            action()
+        } label: {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.iconOnly)
+                .font(.omlxText(12))
+                .frame(width: 20, height: 22)
+        }
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            if hovering {
+                hoveredAction = title
+            } else if hoveredAction == title {
+                hoveredAction = nil
+            }
+        }
+    }
+}
+
+private struct SettingsApplySheet: View {
+    let vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+    @State private var recipeText = ""
+
+    private static let benchmarksURL = URL(string: "https://omlx.ai/benchmarks/performance")!
+
+    var body: some View {
+        Group {
+            switch vm.applyOutcome {
+            case .optimalCandidates(let candidates):
+                candidatesBody(candidates)
+            case .optimal(let result):
+                resultBody(result, fromRecipe: false)
+            case .recipe(let result):
+                resultBody(result, fromRecipe: true)
+            case .recipeInput, nil:
+                inputBody
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .background(theme.windowBg)
+    }
+
+    private var closeButton: some View {
+        Button(String(localized: "common.close",
+                      defaultValue: "Close",
+                      comment: "Generic close button")) { vm.applyOutcome = nil }
+            .buttonStyle(.omlx(.primary, size: .small))
+            .disabled(vm.isApplyingSettings)
+    }
+
+    @ViewBuilder
+    private var errorLine: some View {
+        if let error = vm.applyError {
+            Text(error)
+                .font(.omlxText(12))
+                .foregroundStyle(theme.redDot)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var inputBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(String(localized: "settings.apply.recipe.title",
+                        defaultValue: "Apply custom recipe",
+                        comment: "Title of the paste-a-recipe sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            Text(String(localized: "settings.apply.recipe.hint",
+                        defaultValue: "Paste a recipe copied from the Recipe row of a benchmark detail page on omlx.ai.",
+                        comment: "Hint explaining where a settings recipe can be copied from"))
+                .font(.omlxText(12))
+                .foregroundStyle(theme.textSecondary)
+            linkButton(Self.benchmarksURL,
+                       title: String(localized: "settings.apply.result.open_search",
+                                     defaultValue: "Open community benchmarks",
+                                     comment: "Link button that opens the omlx.ai performance leaderboard"))
+            TextEditor(text: $recipeText)
+                .font(.omlxMono(11))
+                .scrollContentBackground(.hidden)
+                .frame(height: 110)
+                .padding(6)
+                .background(theme.inputBg)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(theme.inputBorder, lineWidth: 0.5)
+                )
+            errorLine
+            HStack(spacing: 10) {
+                if vm.isApplyingSettings {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.recipe.applying",
+                                defaultValue: "Applying the recipe...",
+                                comment: "Progress text while a pasted recipe is being applied"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+                Button(String(localized: "common.cancel",
+                              defaultValue: "Cancel",
+                              comment: "Generic cancel button")) { vm.applyOutcome = nil }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(vm.isApplyingSettings)
+                Button(String(localized: "settings.apply.recipe.apply",
+                              defaultValue: "Apply",
+                              comment: "Primary button of the paste-a-recipe sheet")) {
+                    Task { await vm.applyRecipe(recipeText, client: client) }
+                }
+                .buttonStyle(.omlx(.primary, size: .small))
+                .disabled(recipeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || vm.isApplyingSettings)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func candidatesBody(_ candidates: OptimalCandidatesDTO?) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(String(localized: "settings.apply.result.title_optimal",
+                        defaultValue: "Optimal settings from omlx.ai",
+                        comment: "Title of the optimal-settings sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            if let candidates {
+                if candidates.found {
+                    Text(String(localized: "settings.apply.choose.hint",
+                                defaultValue: "Pick a benchmark result to apply its settings. Rows are the best matches for this chip and model with the same or less memory, at a 4k prompt.",
+                                comment: "Hint above the benchmark candidate list"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            candidateGroup(
+                                String(localized: "settings.apply.choose.group_pp",
+                                       defaultValue: "Best prompt processing (PP)",
+                                       comment: "Label above the candidates ranked by prompt processing speed"),
+                                rows: candidates.byPp)
+                            candidateGroup(
+                                String(localized: "settings.apply.choose.group_tg",
+                                       defaultValue: "Best token generation (TG)",
+                                       comment: "Label above the candidates ranked by token generation speed"),
+                                rows: candidates.byTg)
+                        }
+                    }
+                    .frame(maxHeight: 360)
+                } else {
+                    noneBody(searchUrl: candidates.searchUrl)
+                }
+                errorLine
+            } else if let error = vm.applyError {
+                Text(error)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.redDot)
+                    .textSelection(.enabled)
+            } else {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.optimal.loading",
+                                defaultValue: "Fetching the best benchmark results from omlx.ai...",
+                                comment: "Progress text while omlx.ai candidates are fetched"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                .padding(.vertical, 12)
+            }
+            HStack(spacing: 10) {
+                if vm.isApplyingSettings, candidates != nil {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.optimal.applying",
+                                defaultValue: "Applying the benchmark settings...",
+                                comment: "Progress text while a chosen benchmark snapshot is applied"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+                closeButton
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func candidateGroup(_ label: String, rows: [OptimalCandidateDTO]) -> some View {
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(label)
+                    .font(.omlxText(11, weight: .semibold))
+                    .foregroundStyle(theme.textSecondary)
+                ForEach(rows) { row in
+                    HStack(alignment: .center, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            if let urlText = row.benchmarkUrl, let url = URL(string: urlText) {
+                                linkButton(url, title: urlText)
+                            } else {
+                                Text(row.benchmarkId)
+                                    .font(.omlxMono(11))
+                                    .foregroundStyle(theme.text)
+                            }
+                            Text(ModelSettingsScreenVM.candidateStats(
+                                pp: row.ppTps, tg: row.tgTps, memoryGb: row.memoryGb,
+                                quantization: row.quantization, omlxVersion: row.omlxVersion))
+                                .font(.omlxMono(11))
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                        Spacer()
+                        Button(String(localized: "settings.apply.recipe.apply",
+                                      defaultValue: "Apply",
+                                      comment: "Primary button of the paste-a-recipe sheet")) {
+                            Task { await vm.applyOptimalCandidate(row.benchmarkId, client: client) }
+                        }
+                        .buttonStyle(.omlx(.primary, size: .small))
+                        .disabled(vm.isApplyingSettings)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(theme.groupBg)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(theme.groupBorder, lineWidth: 0.5)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func noneBody(searchUrl: String?) -> some View {
+        Text(String(localized: "settings.apply.result.none_title",
+                    defaultValue: "No benchmark result matches this device and model.",
+                    comment: "Headline when omlx.ai has no benchmark for the current device and model"))
+            .font(.omlxText(13, weight: .medium))
+            .foregroundStyle(theme.text)
+        Text(String(localized: "settings.apply.result.none_body",
+                    defaultValue: "Find a similar model on the community benchmarks and apply its recipe with Apply custom recipe.",
+                    comment: "Guidance shown when no matching benchmark exists"))
+            .font(.omlxText(12))
+            .foregroundStyle(theme.textSecondary)
+        linkButton(URL(string: searchUrl ?? "") ?? Self.benchmarksURL,
+                   title: String(localized: "settings.apply.result.open_search",
+                                 defaultValue: "Open community benchmarks",
+                                 comment: "Link button that opens the omlx.ai performance leaderboard"))
+    }
+
+    @ViewBuilder
+    private func resultBody(_ result: SettingsApplyResultDTO, fromRecipe: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(fromRecipe
+                 ? String(localized: "settings.apply.result.title_recipe",
+                          defaultValue: "Custom recipe applied",
+                          comment: "Title of the result sheet after applying a pasted recipe")
+                 : String(localized: "settings.apply.result.title_optimal",
+                          defaultValue: "Optimal settings from omlx.ai",
+                          comment: "Title of the optimal-settings sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            Text(result.changed == false
+                 ? String(localized: "settings.apply.result.no_change",
+                          defaultValue: "Settings already matched; nothing changed.",
+                          comment: "Result line when the snapshot equals the current settings")
+                 : (fromRecipe
+                    ? String(localized: "settings.apply.result.done_recipe",
+                             defaultValue: "The settings below were applied from the recipe!",
+                             comment: "Result line after a pasted recipe was applied")
+                    : String(localized: "settings.apply.result.done_optimal",
+                             defaultValue: "The settings below were applied from the selected benchmark!",
+                             comment: "Result line after a chosen benchmark snapshot was applied")))
+                .font(.omlxText(13, weight: .medium))
+                .foregroundStyle(theme.text)
+            if let urlText = result.benchmarkUrl, let url = URL(string: urlText) {
+                linkButton(url, title: urlText)
+                Text(ModelSettingsScreenVM.candidateStats(
+                    pp: result.ppTps, tg: result.tgTps,
+                    quantization: result.quantization, omlxVersion: result.omlxVersion))
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            let skipped = ModelSettingsScreenVM.summarizeSkipped(result.skipped)
+            if !skipped.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(String(localized: "settings.apply.result.skipped",
+                                defaultValue: "Skipped on this machine",
+                                comment: "Label above the list of features the server dropped while applying a snapshot"))
+                        .font(.omlxText(12, weight: .semibold))
+                        .foregroundStyle(theme.warningText)
+                    ForEach(skipped, id: \.self) { line in
+                        Text(line)
+                            .font(.omlxText(12))
+                            .foregroundStyle(theme.warningText)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(theme.warningBg)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            Text(String(localized: "settings.apply.result.applied",
+                        defaultValue: "Applied settings",
+                        comment: "Label above the JSON of the applied settings"))
+                .font(.omlxText(11, weight: .medium))
+                .foregroundStyle(theme.textSecondary)
+            ScrollView {
+                Text(ModelSettingsScreenVM.appliedJSON(result.applied))
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.text)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 220)
+            .padding(8)
+            .background(theme.codeBg)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            if result.requiresReload == true {
+                Text(String(localized: "settings.apply.result.reload_note",
+                            defaultValue: "The model will use the new settings after its next load.",
+                            comment: "Note shown when applied settings only take effect at model load"))
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            HStack {
+                Spacer()
+                closeButton
+            }
+        }
+    }
+
+    private func linkButton(_ url: URL, title: String) -> some View {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
+            Label(title, systemImage: "arrow.up.right.square")
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .buttonStyle(.omlx(.plain, size: .small))
     }
 }
 
@@ -170,7 +604,7 @@ private struct ProfilesTab: View {
         VStack(alignment: .leading, spacing: 0) {
             // Active state banner — three variants (working / named / defaults).
             ActiveProfileBanner(
-                state: vm.activeProfileState,
+                state: vm.displayProfileState,
                 isSlim: false,
                 onUpdateBasedOn: {
                     if case .working(let basedOn) = vm.activeProfileState, let basedOn {
@@ -227,6 +661,7 @@ private struct ProfilesTab: View {
                               defaultValue: "Global Profiles",
                               comment: "Section label above the user-defined global profile templates chip group"),
                 names: vm.templates.filter { $0.templateScope == .global }.map(\.name),
+                displayNames: Dictionary(uniqueKeysWithValues: vm.templates.map { ($0.name, $0.displayName) }),
                 activeName: vm.activeProfileState.activeName(in: .global),
                 basedOnName: vm.activeProfileState.basedOnName(in: .global),
                 previewName: preview?.scope == .global ? preview?.name : nil,
@@ -244,8 +679,11 @@ private struct ProfilesTab: View {
                               defaultValue: "Model Profiles · \(vm.model?.id ?? vm.modelID)",
                               comment: "Section label for the per-model profile chip group; placeholder is the model id"),
                 names: vm.profiles
-                    .filter { $0.sourceTemplate == nil }
+                    .filter { profile in
+                        profile.exposeAsModel == true || profile.matchingTemplate(in: vm.templates) == nil
+                    }
                     .map(\.name),
+                displayNames: Dictionary(uniqueKeysWithValues: vm.profiles.map { ($0.name, $0.displayName) }),
                 activeName: vm.activeProfileState.activeName(in: .model),
                 basedOnName: vm.activeProfileState.basedOnName(in: .model),
                 previewName: preview?.scope == .model ? preview?.name : nil,
@@ -294,7 +732,7 @@ private struct ProfilesTab: View {
     private var detailCard: some View {
         if let preview, let tpl = lookupSettings(scope: preview.scope, name: preview.name) {
             ProfileDetailCard(
-                name: preview.name,
+                name: vm.profileDisplayName(scope: preview.scope, name: preview.name),
                 scope: preview.scope,
                 settings: tpl,
                 isActive: vm.activeProfileState.activeName(in: preview.scope) == preview.name,
@@ -334,9 +772,9 @@ private struct ProfilesTab: View {
                     }
                 },
                 onClosePreview: { self.preview = nil },
-                exposeAsModel: modelProfile(named: preview.name)?.exposeAsModel ?? false,
-                exposedModelId: modelProfile(named: preview.name)?.modelId,
-                hasEngineFields: modelProfile(named: preview.name)?.hasEngineFields ?? false,
+                exposeAsModel: modelProfile(scope: preview.scope, named: preview.name)?.exposeAsModel ?? false,
+                exposedModelId: modelProfile(scope: preview.scope, named: preview.name)?.modelId,
+                hasEngineFields: modelProfile(scope: preview.scope, named: preview.name)?.hasEngineFields ?? false,
                 onToggleExpose: preview.scope == .model
                     ? { exposed in
                         Task {
@@ -359,7 +797,9 @@ private struct ProfilesTab: View {
                     settings: vm.currentSettingsDict(),
                     isActive: true,
                     isWorking: true,
-                    basedOn: basedOn,
+                    basedOn: basedOn.map {
+                        .init(scope: $0.scope, name: vm.profileDisplayName(scope: $0.scope, name: $0.name))
+                    },
                     isWorkingBase: false,
                     compact: false,
                     hasWorking: true
@@ -367,7 +807,7 @@ private struct ProfilesTab: View {
             case .named(let scope, let name):
                 let settings = lookupSettings(scope: scope, name: name) ?? [:]
                 ProfileDetailCard(
-                    name: name,
+                    name: vm.profileDisplayName(scope: scope, name: name),
                     scope: scope,
                     settings: settings,
                     isActive: true,
@@ -376,9 +816,9 @@ private struct ProfilesTab: View {
                     isWorkingBase: false,
                     compact: false,
                     hasWorking: false,
-                    exposeAsModel: modelProfile(named: name)?.exposeAsModel ?? false,
-                    exposedModelId: modelProfile(named: name)?.modelId,
-                    hasEngineFields: modelProfile(named: name)?.hasEngineFields ?? false,
+                    exposeAsModel: modelProfile(scope: scope, named: name)?.exposeAsModel ?? false,
+                    exposedModelId: modelProfile(scope: scope, named: name)?.modelId,
+                    hasEngineFields: modelProfile(scope: scope, named: name)?.hasEngineFields ?? false,
                     onToggleExpose: scope == .model
                         ? { exposed in
                             Task {
@@ -409,8 +849,9 @@ private struct ProfilesTab: View {
 
     /// Per-model profile DTO lookup — source of the expose-as-model state
     /// and the derived model ID shown on the detail card.
-    private func modelProfile(named name: String) -> ProfileDTO? {
-        vm.profiles.first { $0.name == name }
+    private func modelProfile(scope: ProfileScope, named name: String) -> ProfileDTO? {
+        if scope == .model { return vm.profiles.first { $0.name == name } }
+        return vm.profiles.first { $0.matchingTemplate(in: vm.templates)?.name == name }
     }
 
     private func previewChip(scope: ProfileScope, name: String) {
@@ -514,7 +955,7 @@ private struct BasicTab: View {
                 sublabel: String(localized: "settings.basic.alias.sub",
                                  defaultValue: "Falls back to the model id",
                                  comment: "Sublabel for the model alias field")) {
-                TextInput(text: $vm.alias, placeholder: vm.modelID, mono: true, width: 220)
+                TextInput(text: $vm.alias, placeholder: vm.modelID, mono: true, width: .controlMedium)
                     .onSubmit { Task { await vm.save(.alias, client: client) } }
             }
             Row(label: String(localized: "settings.basic.model_type.label",
@@ -522,7 +963,7 @@ private struct BasicTab: View {
                               comment: "Row label for the model type override popup")) {
                 Popup(
                     selection: vm.bind($vm.modelTypeOverride, save: { Task { await vm.save(.modelType, client: client) } }),
-                    width: 170,
+                    width: .controlMedium,
                     options: ModelSettingsScreenVM.modelTypeOptions
                 )
             }
@@ -532,7 +973,7 @@ private struct BasicTab: View {
                 sublabel: String(localized: "settings.basic.context_window.sub",
                                  defaultValue: "Maximum tokens per request",
                                  comment: "Sublabel for the context window field")) {
-                TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: 110)
+                TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
             }
             Row(label: String(localized: "settings.basic.max_tokens.label",
                               defaultValue: "Max Tokens",
@@ -544,7 +985,7 @@ private struct BasicTab: View {
                           placeholder: String(localized: "settings.basic.max_tokens.placeholder",
                                               defaultValue: "Default",
                                               comment: "Placeholder shown when Max Tokens is empty (server default applies)"),
-                          mono: true, width: 110)
+                          mono: true, width: .controlCompact)
             }
             Row(label: String(localized: "settings.basic.temperature.label",
                               defaultValue: "Temperature",
@@ -552,7 +993,7 @@ private struct BasicTab: View {
                 sublabel: String(localized: "settings.basic.temperature.sub",
                                  defaultValue: "Sampling randomness (≥ 0). 0 = deterministic.",
                                  comment: "Sublabel describing the temperature field range")) {
-                TextInput(text: vm.bindProfile($vm.temperature), placeholder: "0.7", mono: true, width: 90)
+                TextInput(text: vm.bindProfile($vm.temperature), placeholder: "0.7", mono: true, width: .controlNarrow)
             }
             if !vm.isDiffusionModel {
                 Row(label: String(localized: "settings.basic.top_p.label",
@@ -561,7 +1002,7 @@ private struct BasicTab: View {
                     sublabel: String(localized: "settings.basic.top_p.sub",
                                      defaultValue: "Nucleus sampling cutoff (0 < p ≤ 1).",
                                      comment: "Sublabel describing the top-p valid range")) {
-                    TextInput(text: vm.bindProfile($vm.topP), mono: true, width: 90)
+                    TextInput(text: vm.bindProfile($vm.topP), mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "settings.basic.top_k.label",
                                   defaultValue: "Top K",
@@ -569,7 +1010,7 @@ private struct BasicTab: View {
                     sublabel: String(localized: "settings.basic.top_k.sub",
                                      defaultValue: "Limit candidates to top K (positive integer).",
                                      comment: "Sublabel describing the top-k field")) {
-                    TextInput(text: vm.bindProfile($vm.topK), mono: true, width: 90)
+                    TextInput(text: vm.bindProfile($vm.topK), mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "settings.basic.min_p.label",
                                   defaultValue: "Min P",
@@ -577,7 +1018,7 @@ private struct BasicTab: View {
                     sublabel: String(localized: "settings.basic.min_p.sub",
                                      defaultValue: "Minimum probability floor (0 ≤ p ≤ 1).",
                                      comment: "Sublabel describing the min-p field range")) {
-                    TextInput(text: vm.bindProfile($vm.minP), mono: true, width: 90)
+                    TextInput(text: vm.bindProfile($vm.minP), mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "settings.basic.repetition_penalty.label",
                                   defaultValue: "Repetition Penalty",
@@ -587,7 +1028,7 @@ private struct BasicTab: View {
                         : String(localized: "settings.basic.repetition_penalty.sub",
                                  defaultValue: "Penalize repeated tokens (−2 to 2).",
                                  comment: "Sublabel describing repetition-penalty range")) {
-                    TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: 90)
+                    TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: .controlNarrow)
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
                 }
@@ -599,7 +1040,7 @@ private struct BasicTab: View {
                         : String(localized: "settings.basic.presence_penalty.sub",
                                  defaultValue: "Penalize tokens already present (−2 to 2).",
                                  comment: "Sublabel describing presence-penalty range")) {
-                    TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: 90)
+                    TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: .controlNarrow)
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
                 }
@@ -617,7 +1058,7 @@ private struct BasicTab: View {
                           placeholder: String(localized: "settings.basic.ttl.placeholder",
                                               defaultValue: "No TTL",
                                               comment: "Placeholder shown when no TTL is configured"),
-                          mono: true, suffix: "s", width: 110)
+                          mono: true, suffix: "s", width: .controlCompact)
                     .onSubmit { Task { await vm.save(.ttl, client: client) } }
             }
         }
@@ -643,7 +1084,7 @@ private struct BasicEditBanner: View {
         default:
             VStack(alignment: .leading, spacing: 0) {
                 ActiveProfileBanner(
-                    state: vm.activeProfileState,
+                    state: vm.displayProfileState,
                     isSlim: true,
                     onUpdateBasedOn: {
                         if case .working(let basedOn) = vm.activeProfileState, let basedOn {
@@ -705,11 +1146,14 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.enable_thinking.label",
                                   defaultValue: "Enable Thinking",
                                   comment: "Row label for the enable-thinking toggle"),
-                    sublabel: String(localized: "settings.advanced.enable_thinking.sub",
+                    sublabel: vm.thinkingForced ? String(
+                        localized: "settings.k2.thinking_hint",
+                        defaultValue: "K2 uses reasoning effort. Use Thinking Budget to limit reasoning.")
+                        : String(localized: "settings.advanced.enable_thinking.sub",
                                      defaultValue: "Enable reasoning/thinking mode for this model",
                                      comment: "Sublabel for the enable-thinking toggle")) {
-                    Toggle("", isOn: vm.bindProfile($vm.enableThinking))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.thinkingForced ? .constant(true) : vm.bindProfile($vm.enableThinking))
+                        .disabled(vm.thinkingForced)
                 }
                 if vm.isQwen4Exp && vm.qwen4PleSsdOffloadSupported {
                     Row(label: String(localized: "settings.advanced.qwen4_ssd_offload.label",
@@ -722,7 +1166,7 @@ private struct AdvancedTab: View {
                             : String(localized: "settings.advanced.qwen4_ssd_offload.sub",
                                      defaultValue: "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes.",
                                      comment: "Sublabel for the Qwen4 PLE SSD mmap toggle")) {
-                        Toggle("", isOn: vm.bind(
+                        RowSwitch(isOn: vm.bind(
                             $vm.qwen4PleSsdOffload,
                             save: {
                                 Task {
@@ -730,8 +1174,6 @@ private struct AdvancedTab: View {
                                 }
                             }
                         ))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
                         .disabled(vm.qwen4PleSsdOffloadForced)
                     }
                 }
@@ -744,10 +1186,9 @@ private struct AdvancedTab: View {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
-                                      mono: true, suffix: "tk", width: 110)
+                                      mono: true, suffix: "tk", width: .controlCompact)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                     }
                 }
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
@@ -760,10 +1201,9 @@ private struct AdvancedTab: View {
                         if vm.limitToolResults {
                             TextInput(text: vm.bindProfile($vm.toolResultLimitTokens),
                                       placeholder: "4096",
-                                      mono: true, suffix: "tk", width: 110)
+                                      mono: true, suffix: "tk", width: .controlCompact)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.limitToolResults))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.limitToolResults))
                     }
                 }
                 Row(label: String(localized: "settings.advanced.force_sampling.label",
@@ -772,8 +1212,7 @@ private struct AdvancedTab: View {
                     sublabel: String(localized: "settings.advanced.force_sampling.sub",
                                      defaultValue: "Override request sampling parameters with configured values",
                                      comment: "Sublabel for the force-sampling toggle")) {
-                    Toggle("", isOn: vm.bindProfile($vm.forceSampling))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.forceSampling))
                 }
                 Row(label: String(localized: "settings.advanced.reasoning_parser.label",
                                   defaultValue: "Reasoning Parser",
@@ -782,7 +1221,7 @@ private struct AdvancedTab: View {
                                      defaultValue: "Override the chain-of-thought parser. Leave empty to use the model's default.",
                                      comment: "Sublabel for the reasoning-parser override field")) {
                     TextInput(text: vm.bindProfile($vm.reasoningParser),
-                              placeholder: "auto", mono: true, width: 150)
+                              placeholder: "auto", mono: true, width: .controlCompact)
                 }
             }
             Row(label: String(localized: "settings.advanced.pin_memory.label",
@@ -791,10 +1230,9 @@ private struct AdvancedTab: View {
                 sublabel: String(localized: "settings.advanced.pin_memory.sub",
                                  defaultValue: "Keep this model resident between requests",
                                  comment: "Sublabel for the pin-in-memory toggle")) {
-                Toggle("", isOn: vm.bind($vm.isPinned, save: {
+                RowSwitch(isOn: vm.bind($vm.isPinned, save: {
                     Task { await vm.save(.isPinned, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
             Row(label: String(localized: "settings.advanced.favorite.label",
                               defaultValue: "Favorite",
@@ -802,10 +1240,9 @@ private struct AdvancedTab: View {
                 sublabel: String(localized: "settings.advanced.favorite.sub",
                                  defaultValue: "List this model first in model lists",
                                  comment: "Sublabel for the favorite toggle")) {
-                Toggle("", isOn: vm.bind($vm.isFavorite, save: {
+                RowSwitch(isOn: vm.bind($vm.isFavorite, save: {
                     Task { await vm.save(.isFavorite, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
@@ -818,10 +1255,9 @@ private struct AdvancedTab: View {
                                  defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
                                  comment: "Sublabel describing the security implications of trust-remote-code"),
                 isLast: true) {
-                Toggle("", isOn: vm.bind($vm.trustRemoteCode, save: {
+                RowSwitch(isOn: vm.bind($vm.trustRemoteCode, save: {
                     Task { await vm.save(.trustRemoteCode, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
                 .tint(theme.redDot)
             }
         }
@@ -904,7 +1340,7 @@ private struct ChatTemplateKwargsEditor: View {
             // `enable_thinking` and `reasoning_effort` are server-side
             // singletons — once added, the menu hides them so the user
             // can't push duplicate keys into `chat_template_kwargs`.
-            if !vm.isDiffusionModel,
+            if !vm.isDiffusionModel, !vm.thinkingForced,
                !vm.chatTemplateEntries.contains(where: { $0.kind == .enableThinking }) {
                 Button("enable_thinking") {
                     vm.addKwarg(.enableThinking)
@@ -938,7 +1374,7 @@ private struct EntryEditor: View {
     let client: OMLXClient
     let entryID: UUID
 
-    private static let reasoningEffortValueWidth: CGFloat = 130
+    private static let reasoningEffortValueWidth: CGFloat = .controlCompact
 
     @Environment(\.omlxTheme) private var theme
 
@@ -1009,7 +1445,7 @@ private struct EntryEditor: View {
             HStack(spacing: 8) {
                 Popup(
                     selection: vm.bindProfile(binding.value),
-                    width: 130,
+                    width: .controlCompact,
                     options: [("true", "true"), ("false", "false")]
                 )
                 forceCheckbox
@@ -1061,6 +1497,7 @@ private struct EntryEditor: View {
             .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
+        .disabled(vm.model?.reasoningEffortCustom != true && !entry.usesCustomReasoningEffort)
     }
 
     @ViewBuilder
@@ -1076,8 +1513,7 @@ private struct EntryEditor: View {
             Popup(
                 selection: vm.bindProfile(binding.value),
                 width: Self.reasoningEffortValueWidth,
-                fillsWidth: true,
-                options: ChatTemplateKwargsCodec.reasoningEffortPresets.map {
+                options: vm.reasoningEffortPresets.map {
                     ($0, $0)
                 }
             )
@@ -1115,8 +1551,7 @@ private struct AccelerationSection: View {
                               comment: "Row label for the Lightning MTP toggle"),
                 sublabel: mtpSublabel,
                 isLast: true) {
-                Toggle("", isOn: vm.bindProfile($vm.mtpEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
                     .disabled(mtpToggleDisabled)
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
             }
@@ -1155,35 +1590,93 @@ private struct ExperimentalSection: View {
         // edits. Applying a profile persists the load-time settings and the
         // engine picks them up when it reloads.
         ListGroup {
-            if vm.isQwen35AnePrefillModel {
-                Row(label: String(localized: "settings.experimental.qwen_ane.label",
-                                  defaultValue: "Qwen ANE Prefill",
-                                  comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
-                    sublabel: String(localized: "settings.experimental.qwen_ane.sub",
-                                     defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
-                                     comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
-                    Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
-                        .labelsHidden().toggleStyle(.switch)
+            if vm.model?.anePrefillBackend != nil {
+                if (vm.model?.anePrefillBackend == "k2") {
+                    Row(label: String(localized: "settings.experimental.k2_ane.label", defaultValue: "K2 ANE Prompt Processing"),
+                        sublabel: String(localized: "settings.experimental.k2_ane.sub", defaultValue: "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload.")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                    }
+                    if vm.qwen35AnePrefillEnabled {
+                        Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label", defaultValue: "ANE Prompt Block")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillSequenceLength), placeholder: "2048", mono: true,
+                                      isNumeric: true, range: 1024...262_144, step: 64, width: .controlCompact)
+                        }
+                        Row(label: String(localized: "settings.experimental.k2_ane.dense", defaultValue: "Dense MLP on ANE")) {
+                            Popup(selection: vm.bindProfile($vm.qwen35AnePrefillFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillFraction, presets: vm.model?.anePrefillMlpFractions ?? []))
+                        }
+                        Row(label: String(localized: "settings.experimental.k2_ane.shared", defaultValue: "Shared MLP on ANE")) {
+                            Popup(selection: vm.bindProfile($vm.qwen35AnePrefillSharedFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillSharedFraction, presets: vm.model?.anePrefillSharedFractions ?? []))
+                        }
+                    }
+                }
+                if vm.isQwenOqA8Model {
+                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                      defaultValue: "Qwen INT8 Activation Prefill",
+                                      comment: "Row label for the oQ INT8-activation prefill kernels"),
+                        sublabel: qwenOqA8Sublabel) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
+                            .disabled(vm.qwen35OqA8ConflictReason != nil)
+                            .help(vm.qwen35OqA8ConflictReason ?? "")
+                    }
+                    if vm.qwen35OqA8Enabled {
+                        Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
+                                          defaultValue: "Minimum Prompt Tokens",
+                                          comment: "Row label for the oQ A8 minimum prompt length"),
+                            sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
+                                             defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
+                                             comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                                      placeholder: "128", mono: true,
+                                      isNumeric: true, range: 1...262_144,
+                                      step: 64, width: .controlCompact)
+                        }
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.label",
+                                      defaultValue: "Qwen ANE Prefill",
+                                      comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
+                        sublabel: qwenAnePrefillSublabel) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                            .disabled(vm.qwen35AnePrefillConflictReason != nil)
+                            .help(vm.qwen35AnePrefillConflictReason ?? "")
+                    }
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
-                                  comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
-                                     defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
-                                     comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
+                                  comment: "Row label for the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
-                        if !vm.aneTuningIsRunning {
-                            Menu("Tuner overrides") {
-                                Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
-                                Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
+                        if !vm.aneTuningIsRunning && vm.model?.anePrefillBackend != "k2" {
+                            Menu(String(localized: "settings.experimental.qwen_ane.tuner.menu",
+                                        defaultValue: "Tuner overrides",
+                                        comment: "Menu label for hardware overrides in the ANE split tuner")) {
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_offload",
+                                              defaultValue: "Allow CPU offload",
+                                              comment: "ANE tuner override: allow offloading work to the CPU"),
+                                       isOn: $vm.aneTuningAllowCPU)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_gate",
+                                              defaultValue: "Allow CPU gate/up",
+                                              comment: "ANE tuner override: allow the gate and up projections on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUGate)
                                     .disabled(!vm.aneTuningAllowCPU)
-                                Toggle("Allow CPU down projection", isOn: $vm.aneTuningAllowCPUDown)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_down",
+                                              defaultValue: "Allow CPU down projection",
+                                              comment: "ANE tuner override: allow the down projection on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUDown)
                                     .disabled(!vm.aneTuningAllowCPU)
-                                Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
-                                Toggle("Allow GDN on CPU", isOn: $vm.aneTuningAllowCPUGDN)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_ane_gdn",
+                                              defaultValue: "Allow GDN on ANE",
+                                              comment: "ANE tuner override: allow GDN layers on the ANE"),
+                                       isOn: $vm.aneTuningAllowANEGDN)
+                                Toggle(String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_gdn",
+                                              defaultValue: "Allow GDN on CPU",
+                                              comment: "ANE tuner override: allow GDN layers on the CPU"),
+                                       isOn: $vm.aneTuningAllowCPUGDN)
                                     .disabled(!vm.aneTuningAllowCPU || !vm.aneTuningAllowANEGDN)
                                 Toggle(
-                                    "Allow performance-aware CPU scheduling",
+                                    String(localized: "settings.experimental.qwen_ane.tuner.allow_cpu_shared",
+                                           defaultValue: "Allow performance-aware CPU scheduling",
+                                           comment: "ANE tuner override: allow performance-aware CPU scheduling"),
                                     isOn: $vm.aneTuningAllowCPUSharedResource
                                 )
                                 .disabled(!vm.aneTuningAllowCPU)
@@ -1196,7 +1689,8 @@ private struct ExperimentalSection: View {
                                 Text(status.message)
                                     .font(.omlxText(11))
                                     .foregroundStyle(theme.textSecondary)
-                                    .lineLimit(1)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.trailing)
                                 ProgressView(
                                     value: Double(status.current),
                                     total: Double(max(status.total, 1))
@@ -1206,7 +1700,9 @@ private struct ExperimentalSection: View {
                                 ProgressView()
                                     .controlSize(.small)
                             }
-                            Button("Cancel") {
+                            Button(String(localized: "common.cancel",
+                                          defaultValue: "Cancel",
+                                          comment: "Generic Cancel button label")) {
                                 Task { await vm.cancelANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.destructive, size: .small))
@@ -1214,24 +1710,30 @@ private struct ExperimentalSection: View {
                             Text(aneRecommendationText(recommendation))
                                 .font(.omlxText(11))
                                 .foregroundStyle(theme.textSecondary)
-                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .multilineTextAlignment(.trailing)
-                            Button("Use result") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.use_result",
+                                          defaultValue: "Use result",
+                                          comment: "Button that applies the ANE tuner recommendation")) {
                                 vm.applyANETuningRecommendation()
                             }
                             .buttonStyle(.omlx(.primary, size: .small))
-                            Button("Tune again") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_again",
+                                          defaultValue: "Tune again",
+                                          comment: "Button that re-runs the ANE split tuner")) {
                                 Task { await vm.startANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         } else {
-                            Button("Tune for this Mac") {
+                            Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_for_mac",
+                                          defaultValue: "Tune for this Mac",
+                                          comment: "Button that starts ANE split tuning for the current Mac")) {
                                 Task { await vm.startANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         }
 
-                        if let status = vm.aneTuningStatus {
+                        if !vm.aneTuningIsRunning, let status = vm.aneTuningStatus {
                             if let reason = status.terminationReason,
                                !reason.isEmpty {
                                 Text(reason)
@@ -1244,44 +1746,11 @@ private struct ExperimentalSection: View {
                                     .fixedSize(horizontal: false, vertical: true)
                                     .multilineTextAlignment(.trailing)
                             }
-
-                            if !status.results.isEmpty {
-                                VStack(spacing: 3) {
-                                    HStack(spacing: 8) {
-                                        Text("Test")
-                                        Spacer(minLength: 8)
-                                        Text("Prompt tok/s")
-                                    }
-                                    .font(.omlxText(9, weight: .semibold))
-                                    .foregroundStyle(theme.textSecondary)
-
-                                    Divider()
-
-                                    ForEach(status.results) { result in
-                                        HStack(spacing: 8) {
-                                            Text(result.detail ?? result.label)
-                                                .lineLimit(1)
-                                                .foregroundStyle(
-                                                    result.state == "failed"
-                                                        ? Color.red
-                                                        : theme.textSecondary
-                                                )
-                                            Spacer(minLength: 8)
-                                            Text(aneCandidateResultText(result))
-                                                .monospacedDigit()
-                                                .foregroundStyle(theme.text)
-                                                .frame(minWidth: 78, alignment: .trailing)
-                                        }
-                                        .font(.omlxText(10))
-                                    }
-                                }
-                                .frame(width: 285)
-                            }
                         }
                     }
                     .frame(minWidth: 285, alignment: .trailing)
                 }
-                if vm.qwen35AnePrefillEnabled {
+                if vm.qwen35AnePrefillEnabled && vm.isQwen35AnePrefillModel {
                     Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label",
                                       defaultValue: "ANE Prompt Block",
                                       comment: "Row label for the fixed Qwen ANE prompt block size"),
@@ -1291,7 +1760,7 @@ private struct ExperimentalSection: View {
                         TextInput(text: vm.bindProfile($vm.qwen35AnePrefillSequenceLength),
                                   placeholder: "2048", mono: true,
                                   isNumeric: true, range: 1024...262_144,
-                                  step: 64, width: 190)
+                                  step: 64, width: .controlCompact)
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.tail_padding.label",
                                       defaultValue: "Pad Intermediate Tails From",
@@ -1302,7 +1771,7 @@ private struct ExperimentalSection: View {
                         TextInput(text: vm.bindProfile($vm.qwen35AnePrefillTailPaddingMinTokens),
                                   placeholder: "0", mono: true,
                                   isNumeric: true, range: 0...262_143,
-                                  step: 1, width: 190)
+                                  step: 1, width: .controlCompact)
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
                                       defaultValue: "MLP on ANE",
@@ -1313,7 +1782,7 @@ private struct ExperimentalSection: View {
                         TextInput(text: vm.bindProfile($vm.qwen35AnePrefillFraction),
                                   placeholder: "0.53", mono: true,
                                   isNumeric: true, range: 0.05...0.90,
-                                  step: 0.005, width: 190)
+                                  step: 0.005, width: .controlCompact)
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_layers.label",
                                       defaultValue: "MLP Layer Limit",
@@ -1324,7 +1793,7 @@ private struct ExperimentalSection: View {
                         TextInput(text: vm.bindProfile($vm.qwen35AnePrefillMaxLayers),
                                   placeholder: "64", mono: true,
                                   isNumeric: true, range: 1...256,
-                                  step: 1, width: 190)
+                                  step: 1, width: .controlCompact)
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.dual.label",
                                       defaultValue: "Use Both ANEs",
@@ -1332,8 +1801,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.dual.sub",
                                          defaultValue: "Pin one resident procedure bank to each physical ANE. Recommended on M3 Ultra.",
                                          comment: "Sublabel describing dual-ANE Qwen prefill")) {
-                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillDualAne))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillDualAne))
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.cpu.label",
                                       defaultValue: "Share MLP Work with CPU",
@@ -1341,8 +1809,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.cpu.sub",
                                          defaultValue: "Requires a separate q4 checkpoint clone whose floating tensors are FP16. Retune the ANE MLP share when enabled.",
                                          comment: "Constraint and tuning guidance for Qwen CPU prefill sharing")) {
-                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillCpuEnabled))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillCpuEnabled))
                     }
                     if vm.qwen35AnePrefillCpuEnabled {
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_fraction.label",
@@ -1354,7 +1821,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuFraction),
                                       placeholder: "0.135", mono: true,
                                       isNumeric: true, range: 0...0.25,
-                                      step: 0.005, width: 190)
+                                      step: 0.005, width: .controlCompact)
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_threads.label",
                                           defaultValue: "CPU Workers",
@@ -1365,7 +1832,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuThreads),
                                       placeholder: "8", mono: true,
                                       isNumeric: true, range: 0...64,
-                                      step: 1, width: 190)
+                                      step: 1, width: .controlCompact)
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_down_fraction.label",
                                           defaultValue: "Down Projection on CPU",
@@ -1376,7 +1843,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuDownFraction),
                                       placeholder: "0", mono: true,
                                       isNumeric: true, range: 0...0.50,
-                                      step: 0.005, width: 190)
+                                      step: 0.005, width: .controlCompact)
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_gdn_fraction.label",
                                           defaultValue: "GDN on CPU",
@@ -1387,7 +1854,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuGdnFraction),
                                       placeholder: "0", mono: true,
                                       isNumeric: true, range: 0...0.50,
-                                      step: 0.005, width: 190)
+                                      step: 0.005, width: .controlCompact)
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.label",
                                           defaultValue: "Performance-Aware Scheduling",
@@ -1395,8 +1862,7 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.sub",
                                              defaultValue: "Distributes independent CPU shards across processor clusters and falls back automatically when unsupported.",
                                              comment: "Sublabel explaining performance-aware CPU scheduling")) {
-                            Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillCpuSharedResource))
-                                .labelsHidden().toggleStyle(.switch)
+                            RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillCpuSharedResource))
                         }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.gdn.label",
@@ -1405,8 +1871,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.gdn.sub",
                                          defaultValue: "Also split eligible GDN z+qkv input projections across ANE and GPU.",
                                          comment: "Sublabel describing Qwen GDN ANE acceleration")) {
-                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillGdn))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillGdn))
                     }
                     if vm.qwen35AnePrefillGdn {
                         Row(label: String(localized: "settings.experimental.qwen_ane.gdn_fraction.label",
@@ -1418,7 +1883,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnFraction),
                                       placeholder: "0.5", mono: true,
                                       isNumeric: true, range: 0.05...0.90,
-                                      step: 0.005, width: 190)
+                                      step: 0.005, width: .controlCompact)
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.gdn_layers.label",
                                           defaultValue: "GDN Layer Limit",
@@ -1429,7 +1894,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnMaxLayers),
                                       placeholder: "48", mono: true,
                                       isNumeric: true, range: 0...256,
-                                      step: 1, width: 190)
+                                      step: 1, width: .controlCompact)
                         }
                     }
                 }
@@ -1444,12 +1909,11 @@ private struct ExperimentalSection: View {
                     if vm.turboquantKvEnabled {
                         Popup(
                             selection: vm.bindProfile($vm.turboquantKvBits),
-                            width: 120,
+                            width: .controlCompact,
                             options: ModelSettingsScreenVM.turboquantKvBitsOptions
                         )
                     }
-                    Toggle("", isOn: vm.bindProfile($vm.turboquantKvEnabled))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
@@ -1467,10 +1931,9 @@ private struct ExperimentalSection: View {
                     HStack(spacing: 8) {
                         if vm.indexCacheEnabled {
                             TextInput(text: vm.bindProfile($vm.indexCacheFreq),
-                                      placeholder: "4", mono: true, width: 80)
+                                      placeholder: "4", mono: true, width: .controlNarrow)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.indexCacheEnabled))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.indexCacheEnabled))
                     }
                 }
             }
@@ -1480,8 +1943,7 @@ private struct ExperimentalSection: View {
                               defaultValue: "SpecPrefill",
                               comment: "Row label for the SpecPrefill toggle"),
                 sublabel: specprefillSublabel) {
-                Toggle("", isOn: vm.bindProfile($vm.specprefillEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.specprefillEnabled))
                     .disabled(vm.vlmMtpEnabled)
                     .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
             }
@@ -1494,7 +1956,7 @@ private struct ExperimentalSection: View {
                                      comment: "Sublabel for the SpecPrefill draft-model picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.specprefillDraftModel),
-                        width: 260,
+                        width: .controlWide,
                         options: vm.draftModelOptions()
                     )
                 }
@@ -1503,7 +1965,7 @@ private struct ExperimentalSection: View {
                                   comment: "Row label for the SpecPrefill keep-rate dropdown")) {
                     Popup(
                         selection: vm.bindProfile($vm.specprefillKeepPct),
-                        width: 320,
+                        width: .controlWide,
                         options: ModelSettingsScreenVM.specprefillKeepPctOptions
                     )
                 }
@@ -1514,7 +1976,7 @@ private struct ExperimentalSection: View {
                                      defaultValue: "Min prompt tokens to trigger (shorter prompts use full prefill).",
                                      comment: "Sublabel for the SpecPrefill threshold field")) {
                     TextInput(text: vm.bindProfile($vm.specprefillThreshold),
-                              placeholder: "8192", mono: true, suffix: "tk", width: 110)
+                              placeholder: "8192", mono: true, suffix: "tk", width: .controlCompact)
                 }
             }
 
@@ -1523,8 +1985,7 @@ private struct ExperimentalSection: View {
                               defaultValue: "DFlash",
                               comment: "Row label for the DFlash toggle"),
                 sublabel: dflashSublabel) {
-                Toggle("", isOn: vm.bindProfile($vm.dflashEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.dflashEnabled))
                     .disabled(dflashToggleDisabled)
                     .help(dflashHelp)
             }
@@ -1534,7 +1995,7 @@ private struct ExperimentalSection: View {
                                   comment: "Row label for the DFlash draft-model picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.dflashDraftModel),
-                        width: 260,
+                        width: .controlWide,
                         options: vm.draftModelOptions()
                     )
                 }
@@ -1544,8 +2005,7 @@ private struct ExperimentalSection: View {
                     sublabel: String(localized: "settings.experimental.dflash.draft_quant.sub",
                                      defaultValue: "Enable quantization for the draft model (weight, activation bits & group size).",
                                      comment: "Sublabel for the DFlash draft quantization toggle")) {
-                    Toggle("", isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
                 }
                 if vm.dflashDraftQuantEnabled {
                     Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
@@ -1553,7 +2013,7 @@ private struct ExperimentalSection: View {
                                       comment: "Row label for the DFlash draft quantization weight bits picker")) {
                         Popup(
                             selection: vm.bindProfile($vm.dflashDraftQuantWeightBits),
-                            width: 110,
+                            width: .controlCompact,
                             options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
                         )
                     }
@@ -1562,7 +2022,7 @@ private struct ExperimentalSection: View {
                                       comment: "Row label for the DFlash draft quantization activation bits picker")) {
                         Popup(
                             selection: vm.bindProfile($vm.dflashDraftQuantActivationBits),
-                            width: 110,
+                            width: .controlCompact,
                             options: ModelSettingsScreenVM.dflashDraftQuantActivationBitsOptions
                         )
                     }
@@ -1571,7 +2031,7 @@ private struct ExperimentalSection: View {
                                       comment: "Row label for the DFlash draft quantization group size picker")) {
                         Popup(
                             selection: vm.bindProfile($vm.dflashDraftQuantGroupSize),
-                            width: 110,
+                            width: .controlCompact,
                             options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
                         )
                     }
@@ -1586,7 +2046,7 @@ private struct ExperimentalSection: View {
                               placeholder: String(localized: "settings.experimental.dflash.max_ctx.placeholder",
                                                   defaultValue: "unlimited",
                                                   comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
-                              mono: true, suffix: "tk", width: 130)
+                              mono: true, suffix: "tk", width: .controlCompact)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
                                   defaultValue: "Verify Mode",
@@ -1596,7 +2056,7 @@ private struct ExperimentalSection: View {
                                      comment: "Sublabel for the DFlash verify mode picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.dflashVerifyMode),
-                        width: 140,
+                        width: .controlMedium,
                         options: ModelSettingsScreenVM.dflashVerifyModeOptions
                     )
                 }
@@ -1607,7 +2067,7 @@ private struct ExperimentalSection: View {
                                      defaultValue: "Draft model sliding-attention window. Empty = dflash default (2048).",
                                      comment: "Sublabel for the DFlash draft window size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
-                              placeholder: "2048", mono: true, width: 110)
+                              placeholder: "2048", mono: true, width: .controlCompact)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
                                   defaultValue: "Draft Sink Size",
@@ -1616,7 +2076,7 @@ private struct ExperimentalSection: View {
                                      defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
                                      comment: "Sublabel for the DFlash draft sink size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
-                              placeholder: "0", mono: true, width: 110)
+                              placeholder: "0", mono: true, width: .controlCompact)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.block_size.label",
                                   defaultValue: "Runtime Block Size",
@@ -1625,7 +2085,7 @@ private struct ExperimentalSection: View {
                                      defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
                                      comment: "Sublabel for the DFlash runtime block size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashBlockSize),
-                              placeholder: "checkpoint", mono: true, width: 110)
+                              placeholder: "checkpoint", mono: true, width: .controlCompact)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
                                   defaultValue: "DFlash in-memory cache",
@@ -1636,10 +2096,9 @@ private struct ExperimentalSection: View {
                     HStack(spacing: 8) {
                         if vm.dflashInMemoryCache {
                             TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheGib),
-                                      placeholder: "8", mono: true, suffix: "GiB", width: 110)
+                                      placeholder: "8", mono: true, suffix: "GiB", width: .controlCompact)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.dflashInMemoryCache))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.dflashInMemoryCache))
                     }
                 }
                 if vm.dflashInMemoryCache {
@@ -1650,15 +2109,14 @@ private struct ExperimentalSection: View {
                                          defaultValue: "Maximum prefix snapshots kept in RAM. Each entry stores KV + draft GDN state.",
                                          comment: "Sublabel for the DFlash L1 cache max entries field")) {
                         TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheMaxEntries),
-                                  placeholder: "4", mono: true, width: 110)
+                                  placeholder: "4", mono: true, width: .controlCompact)
                     }
                 }
                 Row(label: String(localized: "settings.experimental.dflash.ssd_cache.label",
                                   defaultValue: "DFlash SSD cache",
                                   comment: "Row label for the DFlash L2 SSD cache toggle"),
                     sublabel: dflashSsdSublabel) {
-                    Toggle("", isOn: vm.bindProfile($vm.dflashSsdCache))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.dflashSsdCache))
                         .disabled(!(vm.model?.dflashSsdCacheAvailable ?? false) || !vm.dflashInMemoryCache)
                 }
                 if vm.dflashSsdCache && (vm.model?.dflashSsdCacheAvailable ?? false) {
@@ -1669,7 +2127,7 @@ private struct ExperimentalSection: View {
                                          defaultValue: "Disk budget for L2 spill; oldest entries are evicted when exceeded.",
                                          comment: "Sublabel for the DFlash SSD cache size field")) {
                         TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
-                                  placeholder: "20", mono: true, suffix: "GiB", width: 110)
+                                  placeholder: "20", mono: true, suffix: "GiB", width: .controlCompact)
                     }
                 }
             }
@@ -1681,8 +2139,7 @@ private struct ExperimentalSection: View {
                               comment: "Row label for the VLM MTP toggle"),
                 sublabel: vlmMtpSublabel,
                 isLast: !vm.vlmMtpEnabled) {
-                Toggle("", isOn: vm.bindProfile($vm.vlmMtpEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
                     .disabled(vlmMtpToggleDisabled)
                     .help(vm.vlmMtpConflictReason ?? "")
             }
@@ -1695,7 +2152,7 @@ private struct ExperimentalSection: View {
                                      comment: "Sublabel for the VLM MTP draft-model picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.vlmMtpDraftModel),
-                        width: 260,
+                        width: .controlWide,
                         options: vm.vlmMtpDraftModelOptions()
                     )
                 }
@@ -1707,7 +2164,7 @@ private struct ExperimentalSection: View {
                                      comment: "Sublabel for the VLM MTP draft block-size field"),
                     isLast: true) {
                     TextInput(text: vm.bindProfile($vm.vlmMtpDraftBlockSize),
-                              placeholder: "4", mono: true, width: 80)
+                              placeholder: "4", mono: true, width: .controlNarrow)
                 }
             }
         }
@@ -1772,6 +2229,20 @@ private struct ExperimentalSection: View {
                       comment: "Default sublabel for the DFlash SSD cache toggle")
     }
 
+    private var qwenOqA8Sublabel: String {
+        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_oq_a8.sub",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      comment: "Sublabel describing the oQ INT8-activation prefill kernels")
+    }
+
+    private var qwenAnePrefillSublabel: String {
+        if let reason = vm.qwen35AnePrefillConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_ane.sub",
+                      defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")
+    }
+
     private var vlmMtpToggleDisabled: Bool {
         vm.vlmMtpConflictReason != nil
     }
@@ -1788,9 +2259,14 @@ private struct ExperimentalSection: View {
     ) -> String {
         if !recommendation.enabled {
             guard let tps = recommendation.processingTps else {
-                return "GPU-only recommended"
+                return "Winner: GPU only"
             }
-            return String(format: "GPU-only recommended (%.1f tok/s)", tps)
+            return String(format: "Winner: GPU only · %.1f prompt tok/s", tps)
+        }
+        if recommendation.backend == "k2" {
+            return String(format: "Winner: ANE dense %.0f%% · shared expert %.0f%% · %.1f prompt tok/s",
+                          (recommendation.mlpFraction ?? 0) * 100,
+                          (recommendation.sharedFraction ?? 0) * 100, recommendation.processingTps ?? 0)
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
         var parts = [
@@ -1813,29 +2289,11 @@ private struct ExperimentalSection: View {
         if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
             parts.append("Pad tails ≥\(threshold)")
         }
-        let summary = parts.joined(separator: " · ")
-        guard let tps = recommendation.processingTps,
-              let speedup = recommendation.speedupPercent else {
+        let summary = "Winner: " + parts.joined(separator: " · ")
+        guard let tps = recommendation.processingTps else {
             return summary
         }
-        return String(format: "%@ · %.1f tok/s (%+.1f%%)", summary, tps, speedup)
-    }
-
-    private func aneCandidateResultText(
-        _ result: ANETuningCandidateDTO
-    ) -> String {
-        guard let processingTps = result.processingTps else {
-            if let latencyMs = result.latencyMs {
-                return String(format: "%.2f ms", latencyMs)
-            }
-            // Deliberately blank: the row remains visible so an interrupted
-            // run shows which tests did not complete.
-            return ""
-        }
-        if let speedup = result.speedupPercent {
-            return String(format: "%.1f (%+.1f%%)", processingTps, speedup)
-        }
-        return String(format: "%.1f", processingTps)
+        return String(format: "%@ · %.1f prompt tok/s", summary, tps)
     }
 }
 

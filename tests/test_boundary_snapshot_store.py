@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for BoundarySnapshotSSDStore and _BoundarySnapshotProvider."""
 
-import json
-import shutil
-import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -302,6 +299,45 @@ class TestBoundarySnapshotSSDStore:
         # Session directory still exists (recreated).
         assert self.store._snapshot_dir.exists()
 
+    def test_take_staged_file_leaves_request_dir_for_queued_writes(self):
+        """Promoting one boundary must not remove the directory a queued write stages into."""
+        from unittest.mock import patch
+
+        from omlx.cache import boundary_snapshot_store as mod
+
+        request_id = "req-staging"
+        last_tmp = self.store._file_path(request_id, 3072)
+        last_tmp = last_tmp.with_name(last_tmp.stem + "_tmp.safetensors")
+        original_write = mod._write_safetensors_no_mx
+        promoted: list[Path | None] = []
+
+        def promote_earlier_boundaries_first(path, tensors_raw, metadata):
+            # The writer has just created the request directory and is about
+            # to stage the last boundary; the store thread promotes the two
+            # earlier boundaries at exactly that moment.
+            if Path(path) == last_tmp and not promoted:
+                promoted.append(
+                    self.store.take_staged_file(request_id, 1024, timeout_s=5.0)
+                )
+                promoted.append(
+                    self.store.take_staged_file(request_id, 2048, timeout_s=5.0)
+                )
+            return original_write(path, tensors_raw, metadata)
+
+        with patch.object(
+            mod,
+            "_write_safetensors_no_mx",
+            side_effect=promote_earlier_boundaries_first,
+        ):
+            for token_count in (1024, 2048, 3072):
+                assert self.store.save(
+                    request_id, token_count, [MagicMock()], _mock_extract_cache_states
+                )
+            staged = self.store.take_staged_file(request_id, 3072, timeout_s=5.0)
+
+        assert promoted and all(path is not None for path in promoted)
+        assert staged is not None and staged.is_file()
+
     def test_take_staged_file_survives_concurrent_cleanup_all(self):
         """Caller-owned promotion files must outlive session cleanup."""
         import threading
@@ -352,12 +388,9 @@ class TestBoundarySnapshotSSDStore:
 
     def test_load_from_disk_after_pending_writes_cleared(self):
         """After background writer completes, load should read from disk."""
-        import time
-
         self.store.save("req-1", 1024, [MagicMock()], _mock_extract_cache_states)
 
-        # Wait for background writer to complete.
-        time.sleep(0.5)
+        self._wait_for_disk(self.store, "req-1", 1024)
 
         # Force clear pending writes to simulate post-write state.
         with self.store._pending_lock:
@@ -504,20 +537,29 @@ class TestBoundarySnapshotSSDStore:
 
     def test_cleanup_request_skips_queued_writes(self):
         """Writer thread should skip items for a cleaned-up request."""
-        import time
+        import threading
+        from unittest.mock import patch
 
-        self.store.save("req-1", 1024, [MagicMock()], _mock_extract_cache_states)
-        self.store.save("req-1", 2048, [MagicMock()], _mock_extract_cache_states)
+        drained = threading.Event()
+        processed = 0
+        process_item = self.store._process_write_item
 
-        # Cleanup before writer thread processes items.
-        self.store.cleanup_request("req-1")
+        def track_item(item):
+            nonlocal processed
+            try:
+                return process_item(item)
+            finally:
+                processed += 1
+                if processed == 2:
+                    drained.set()
 
-        # Wait for writer to process remaining queue items.
-        time.sleep(1.0)
+        with patch.object(self.store, "_process_write_item", side_effect=track_item):
+            self.store.save("req-1", 1024, [MagicMock()], _mock_extract_cache_states)
+            self.store.save("req-1", 2048, [MagicMock()], _mock_extract_cache_states)
+            self.store.cleanup_request("req-1")
+            assert drained.wait(timeout=5.0), "Queued writes did not finish"
 
-        # No files should have been written for req-1.
-        req_dir = self.store._request_dir("req-1")
-        assert not req_dir.exists()
+        assert not self.store._request_dir("req-1").exists()
 
     def test_cleanup_all_drains_queue(self):
         """cleanup_all() should leave the snapshot directory empty no
@@ -557,7 +599,6 @@ class TestBoundarySnapshotSSDStore:
         rmtree and an orphan survives.
         """
         import threading
-        import time
         from unittest.mock import patch
 
         writer_in_item = threading.Event()
@@ -605,9 +646,6 @@ class TestBoundarySnapshotSSDStore:
             assert cleanup_done.wait(timeout=10.0), "cleanup_all hung"
             t.join(timeout=5.0)
 
-        # Give the writer one more tick to fully exit _process_write_item
-        # before asserting on the directory.
-        time.sleep(0.1)
         snapshot_dir = self.store._snapshot_dir
         assert snapshot_dir.exists()
         assert list(snapshot_dir.iterdir()) == []
@@ -618,7 +656,6 @@ class TestBoundarySnapshotSSDStore:
         writer's late ``os.rename`` lands under the just-cleaned dir.
         """
         import threading
-        import time
         from unittest.mock import patch
 
         writer_in_item = threading.Event()
@@ -658,7 +695,6 @@ class TestBoundarySnapshotSSDStore:
             t.join(timeout=5.0)
 
         # After cleanup_request the per-request directory must be gone.
-        time.sleep(0.1)
         req_dir = self.store._snapshot_dir / "req-cleanup"
         assert not req_dir.exists()
 

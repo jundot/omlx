@@ -86,7 +86,7 @@ def _tokens(n, seed=0):
 def _kv_entries(mtp_cache):
     out = []
     for c in mtp_cache:
-        keys, values = c.state
+        keys, values = c.keys_and_values()
         out.append((keys, values))
     return out
 
@@ -756,3 +756,575 @@ class TestActivationHandoff:
         state = getattr(gen_batch, "_omlx_mtp_state", None)
         assert state is not None
         assert state.hist_offset == 1
+
+
+def test_owned_batch_calibration_history_matches_full_prompt_fold(strict_model):
+    """Five ordinary batch steps retain each UID's complete head history."""
+    from mlx_lm.generate import _merge_caches
+
+    model = strict_model
+    histories = [_tokens(6, seed=81), _tokens(6, seed=82)]
+    caches = []
+    for uid, tokens in zip([11, 12], histories):
+        prompt_priming.prepare_prefix_context(
+            model,
+            request_id=str(uid),
+            prompt_tokens=tokens.tolist(),
+            cached_tokens=0,
+            prefix_cache=None,
+        )
+        cache = _make_cache(model)
+        model(tokens[None, :], cache=cache)
+        prompt_priming.bind_uid(model, str(uid), uid)
+        caches.append(cache)
+    merged = _merge_caches(caches[::-1])
+    with prompt_priming.decode_scope(model, [12, 11]):
+        for step in range(5):
+            next_tokens = mx.array([[40 + step], [30 + step]])
+            mx.eval(model(next_tokens, cache=merged))
+            histories[0] = mx.concatenate([histories[0], next_tokens[1]])
+            histories[1] = mx.concatenate([histories[1], next_tokens[0]])
+    owned = prompt_priming._owned(model)[1]
+    for uid, tokens in zip([11, 12], histories):
+        ctx = owned.uids[uid][0]
+        assert ctx.expected_offset == 11
+        assert ctx.folded == 10
+        ref = _reference_head_cache(model, tokens)
+        for (keys, values), (ref_keys, ref_values) in zip(
+            _kv_entries(ctx.mtp_cache), _kv_entries(ref)
+        ):
+            assert mx.allclose(keys, ref_keys, rtol=1e-4, atol=1e-4)
+            assert mx.allclose(values, ref_values, rtol=1e-4, atol=1e-4)
+
+
+class RecordingHead:
+    _omlx_mtp_decode_enabled = True
+    _omlx_mtp_chain = True
+    mtp = object()
+
+    def mtp_forward(self, hidden, tokens, cache, logits_keep=1):
+        cache[0].pairs.extend(zip(hidden[0, :, 0].tolist(), tokens[0].tolist()))
+
+
+def context(offset):
+    ctx = prompt_priming._PrimeCtx(
+        mtp_cache=[SimpleNamespace(pairs=[])], folded=offset, expected_offset=offset
+    )
+    ctx.deferred_pairs = []
+    return ctx
+
+
+@pytest.mark.parametrize("chunks", [(1, 1, 1, 1), (1, 3), (4,)])
+@pytest.mark.parametrize("replay_chunk", [1, 2, 512])
+def test_deferred_pairs_and_activation_seam(chunks, replay_chunk):
+    host, ctx = RecordingHead(), context(10)
+    setattr(host, prompt_priming._CTX_ATTR, ctx)
+    position = 10
+    for count in chunks:
+        tokens = mx.arange(position, position + count)[None]
+        hidden = (tokens * 10)[..., None]
+        position += count
+        prompt_priming._capture_single(
+            host, tokens, hidden, [SimpleNamespace(offset=position)]
+        )
+        assert not ctx.mtp_cache[0].pairs
+    prompt_priming._flush_deferred_history(host, ctx, chunk_size=replay_chunk)
+    assert ctx.mtp_cache[0].pairs == [(100, 11), (110, 12), (120, 13)]
+    assert ctx.folded == 13
+    result = prompt_priming.take_primed(host, [], mx.array(14), cache_offset=15)
+    assert result[1] == 14
+    assert result[0][0].pairs == [(100, 11), (110, 12), (120, 13), (130, 14)]
+    assert prompt_priming._find_ctx(host) is None
+
+
+@pytest.mark.parametrize("actual_offset", [9, 10, 12])
+def test_discontinuous_capture_rejected_without_mutation(actual_offset):
+    host, ctx = RecordingHead(), context(10)
+    setattr(host, prompt_priming._CTX_ATTR, ctx)
+    with pytest.raises(RuntimeError, match="timeline"):
+        prompt_priming._capture_single(
+            host,
+            mx.array([[10]]),
+            mx.array([[[100]]]),
+            [SimpleNamespace(offset=actual_offset)],
+        )
+    assert ctx.expected_offset == 10
+    assert ctx.pending_hidden is None
+    assert ctx.deferred_pairs == []
+
+
+def test_uid_reorder_cancel_and_reactivation():
+    host = RecordingHead()
+    _, owned = prompt_priming._owned(host, create=True)
+    first, second = context(10), context(30)
+    owned.uids.update({3: (first, None), 7: (second, None)})
+    with prompt_priming.decode_scope(host, [7, 3]):
+        prompt_priming.maybe_capture(
+            host,
+            mx.array([[30], [10]]),
+            mx.array([[[300]], [[100]]]),
+            [SimpleNamespace(offset=mx.array([31, 11]))],
+        )
+        prompt_priming.maybe_capture(
+            host,
+            mx.array([[31], [11]]),
+            mx.array([[[310]], [[110]]]),
+            [SimpleNamespace(offset=mx.array([32, 12]))],
+        )
+    prompt_priming.release_uids(host, [7])
+    assert 7 not in owned.uids
+    assert prompt_priming._find_ctx(host) is None
+    result = prompt_priming.take_primed(host, [], mx.array(12), uid=3, cache_offset=13)
+    assert result[0][0].pairs == [(100, 11), (110, 12)]
+    assert owned.uids == {}
+    assert second.mtp_cache[0].pairs == []
+
+
+def test_bad_activation_does_not_run_catchup():
+    host, ctx = RecordingHead(), context(10)
+    setattr(host, prompt_priming._CTX_ATTR, ctx)
+    ctx.deferred_pairs = [(mx.array([[[90]]]), mx.array([[10]]))]
+    with pytest.raises(RuntimeError, match="activation seam"):
+        prompt_priming.take_primed(host, [], mx.array(11), cache_offset=13)
+    assert ctx.mtp_cache[0].pairs == []
+
+
+def parked_batch():
+    host = RecordingHead()
+    states = {
+        uid: SimpleNamespace(
+            chain=True,
+            queue=[],
+            next_main=mx.array([offset]),
+            head_clone=True,
+            hist_offset=offset,
+            head_history_primed=True,
+            mtp_cache=[SimpleNamespace(pairs=[])],
+        )
+        for uid, offset in [(3, 10), (7, 30)]
+    }
+    batch = SimpleNamespace(
+        model=host,
+        uids=[3, 7],
+        prompt_cache=[SimpleNamespace(offset=mx.array([10, 30]))],
+    )
+    return batch, SimpleNamespace(states=states, head=None)
+
+
+def test_retained_cache_survives_handoff_without_duplicate_pair():
+    batch, owner = parked_batch()
+    prompt_priming.retain_batch_head_history(batch, owner)
+    _, owned = prompt_priming._owned(batch.model)
+    for uid in batch.uids:
+        assert owned.uids[uid][0].mtp_cache is owner.states[uid].mtp_cache
+    with prompt_priming.decode_scope(batch.model, batch.uids):
+        prompt_priming.maybe_capture(
+            batch.model,
+            mx.array([[10], [30]]),
+            mx.array([[[100]], [[300]]]),
+            [SimpleNamespace(offset=mx.array([11, 31]))],
+        )
+        prompt_priming.maybe_capture(
+            batch.model,
+            mx.array([[11], [31]]),
+            mx.array([[[110]], [[310]]]),
+            [SimpleNamespace(offset=mx.array([12, 32]))],
+        )
+    for uid, offset in [(3, 10), (7, 30)]:
+        result = prompt_priming.take_primed(
+            batch.model, [], mx.array(offset + 2), uid=uid, cache_offset=offset + 3
+        )
+        assert result[0][0].pairs == [
+            (offset * 10, offset + 1),
+            ((offset + 1) * 10, offset + 2),
+        ]
+        assert result[1] == offset + 2
+    assert owned.uids == {}
+
+
+@pytest.mark.parametrize("failure", ["queued", "owned"])
+def test_retention_preflight_does_not_replace_another_row(failure):
+    batch, owner = parked_batch()
+    _, owned = prompt_priming._owned(batch.model, create=True)
+    existing = context(30)
+    if failure == "queued":
+        owner.states[7].queue = [object()]
+    else:
+        owned.uids[7] = (existing, None)
+    before = dict(owned.uids)
+    with pytest.raises(RuntimeError):
+        prompt_priming.retain_batch_head_history(batch, owner)
+    assert owned.uids == before
+    assert all(not state.mtp_cache[0].pairs for state in owner.states.values())
+
+
+def test_retention_requires_an_observed_priming_context():
+    batch, owner = parked_batch()
+    owner.states[7].head_history_primed = False
+    prompt_priming.retain_batch_head_history(batch, owner)
+    _, owned = prompt_priming._owned(batch.model)
+    assert set(owned.uids) == {3}
+    assert not owner.states[7].mtp_cache[0].pairs
+
+
+@pytest.mark.parametrize("frontier", ["queued", "legacy", "missing_main"])
+def test_non_drained_handoff_does_not_start_history_retention(frontier, monkeypatch):
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    batch, owner = parked_batch()
+    if frontier == "queued":
+        owner.states[7].queue = [object()]
+    elif frontier == "legacy":
+        owner.states[7].chain = False
+    else:
+        owner.states[7].next_main = None
+
+    def unexpected(*args):
+        raise AssertionError("History retention started outside its valid frontier")
+
+    monkeypatch.setattr(prompt_priming, "retain_batch_head_history", unexpected)
+    assert not bg._feed_batch_mains_to_standard(batch, owner)
+
+
+class HeadHost:
+    _omlx_mtp_decode_enabled = True
+    _omlx_mtp_chain = True
+    _omlx_mtp_multi_request = True
+    mtp = object()
+
+    def make_mtp_cache(self):
+        return [SimpleNamespace(pairs=[])]
+
+    def mtp_forward(self, hidden, tokens, cache, logits_keep=0):
+        cache[0].pairs.extend(
+            zip(hidden.reshape(-1).tolist(), tokens.reshape(-1).tolist())
+        )
+
+
+def test_chunked_ragged_prefill_ignores_padding_and_preserves_pending_request():
+    host = HeadHost()
+    prepare(host, "pending", [30, 31])
+    capture(host, [30, 31], 2)
+    pending = prompt_priming._find_ctx(host)
+    cache = [SimpleNamespace(offset=mx.array([0, 0]))]
+    with prompt_priming.prefill_scope(
+        host, [11, 12], [[1, 2, 3, 4, 5], [9, 8, 7]], cache
+    ):
+        for tokens in ([[1, 2], [9, 8]], [[3, 4], [7, 0]], [[5], [0]]):
+            inputs = mx.array(tokens)
+            cache[0].offset += inputs.shape[1]
+            prompt_priming.maybe_capture(host, inputs, inputs[..., None], cache)
+    assert prompt_priming._find_ctx(host) is pending
+    a = prompt_priming.take_primed(host, [], mx.array(6), uid=11, cache_offset=6)
+    b = prompt_priming.take_primed(host, [], mx.array(6), uid=12, cache_offset=4)
+    assert a[0][0].pairs == [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]
+    assert b[0][0].pairs == [(9, 8), (8, 7), (7, 6)]
+    assert prompt_priming._find_ctx(host) is pending
+
+
+def test_prefill_scope_extends_owned_scheduler_histories_in_uid_order():
+    host = HeadHost()
+    for uid, tokens in [(11, [1, 2]), (12, [5, 6, 7])]:
+        prepare(host, str(uid), tokens)
+        capture(host, tokens, len(tokens))
+        prompt_priming.bind_uid(host, str(uid), uid)
+    cache = [SimpleNamespace(offset=mx.array([3, 2]))]
+    with prompt_priming.prefill_scope(host, [12, 11], [[8, 9], [3]], cache):
+        inputs = mx.array([[8, 9], [3, 0]])
+        cache[0].offset += 2
+        prompt_priming.maybe_capture(host, inputs, inputs[..., None], cache)
+    a = prompt_priming.take_primed(host, [], mx.array(4), uid=11, cache_offset=4)
+    b = prompt_priming.take_primed(host, [], mx.array(10), uid=12, cache_offset=6)
+    assert a[0][0].pairs == [(1, 2), (2, 3), (3, 4)]
+    assert b[0][0].pairs == [(5, 6), (6, 7), (7, 8), (8, 9), (9, 10)]
+
+
+def test_prefill_scope_restores_after_exception_and_skips_empty_batches():
+    host = HeadHost()
+    with prompt_priming.prefill_scope(host, [], [], []):
+        assert prompt_priming._PREFILL_SCOPE.get() is None
+    with pytest.raises(ValueError):
+        with prompt_priming.prefill_scope(
+            host, [11], [[1, 2]], [SimpleNamespace(offset=0)]
+        ):
+            assert prompt_priming._PREFILL_SCOPE.get() is not None
+            raise ValueError("cancelled")
+    assert prompt_priming._PREFILL_SCOPE.get() is None
+    prompt_priming.release_uids(host, [11])
+    assert not prompt_priming._owned(host)[1].uids
+
+
+def test_single_stream_model_does_not_start_batched_head_prefill():
+    host = HeadHost()
+    host._omlx_mtp_multi_request = False
+    with prompt_priming.prefill_scope(
+        host, [11, 12], [[1, 2], [3, 4]], [SimpleNamespace(offset=mx.array([0, 0]))]
+    ):
+        assert prompt_priming._PREFILL_SCOPE.get() is None
+    assert prompt_priming._owned(host)[1] is None
+    with prompt_priming.prefill_scope(
+        host, [11], [[1, 2]], [SimpleNamespace(offset=0)]
+    ):
+        assert prompt_priming._PREFILL_SCOPE.get() is not None
+
+
+def test_generator_remove_and_close_release_prefill_uids_only():
+    from collections import deque
+
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.patches.mlx_lm_mtp import batch_generator
+
+    batch_generator.apply()
+    host = HeadHost()
+    prepare(host, "waiting", [20, 21])
+    capture(host, [20, 21], 2)
+    with prompt_priming.prefill_scope(
+        host, [11, 12], [[1, 2], [5, 6]], [SimpleNamespace(offset=mx.array([0, 0]))]
+    ):
+        inputs = mx.array([[1, 2], [5, 6]])
+        prompt_priming.maybe_capture(
+            host, inputs, inputs[..., None], [SimpleNamespace(offset=mx.array([2, 2]))]
+        )
+
+    class Batch:
+        def __init__(self, uids):
+            self.uids = uids
+
+        def __len__(self):
+            return len(self.uids)
+
+        def filter(self, indices):
+            self.uids = [self.uids[i] for i in indices]
+
+    generator = BatchGenerator.__new__(BatchGenerator)
+    generator.model = host
+    generator._old_wired_limit = None
+    generator._unprocessed_sequences = deque()
+    generator._currently_processing = [object(), object()]
+    generator._prompt_batch = Batch([11, 12])
+    generator._generation_batch = Batch([])
+    state = prompt_priming._owned(host)[1]
+    try:
+        generator.remove([11])
+        assert set(state.uids) == {12}
+        generator.close()
+        assert not state.uids and set(state.requests) == {"waiting"}
+    finally:
+        generator.close()
+
+
+def prepare(host, request_id, tokens):
+    prompt_priming.prepare_prefix_context(
+        host,
+        request_id=request_id,
+        prompt_tokens=tokens,
+        cached_tokens=0,
+        prefix_cache=None,
+    )
+
+
+def capture(host, tokens, offset):
+    inputs = mx.array([tokens])
+    prompt_priming.maybe_capture(
+        host, inputs, inputs[..., None], [SimpleNamespace(offset=offset)]
+    )
+
+
+def test_interleaved_equal_length_requests_keep_distinct_history():
+    host = HeadHost()
+    prepare(host, "a", [1, 2, 3, 4])
+    capture(host, [1, 2], 2)
+    prepare(host, "b", [5, 6, 7, 8])
+    capture(host, [5, 6], 2)
+    prompt_priming.activate_request(host, "a")
+    capture(host, [3, 4], 4)
+    prompt_priming.bind_uid(host, "a", 11)
+    prompt_priming.activate_request(host, "b")
+    capture(host, [7, 8], 4)
+    prompt_priming.bind_uid(host, "b", 12)
+    _, state = prompt_priming._owned(host)
+    assert not state.requests
+    assert state.uids[11][0] is not state.uids[12][0]
+    assert state.uids[11][0].mtp_cache[0].pairs == [(1, 2), (2, 3), (3, 4)]
+    assert state.uids[12][0].mtp_cache[0].pairs == [(5, 6), (6, 7), (7, 8)]
+
+
+def test_decode_reordering_and_unequal_offsets_preserve_pending_request():
+    host = HeadHost()
+    for uid, tokens in [(11, [1, 2]), (12, [5, 6, 7])]:
+        prepare(host, str(uid), tokens)
+        capture(host, tokens, len(tokens))
+        prompt_priming.bind_uid(host, str(uid), uid)
+    prepare(host, "pending", [20, 21])
+    capture(host, [20, 21], 2)
+    previous = prompt_priming._find_ctx(host)
+    with prompt_priming.decode_scope(host, [12, 11]):
+        inputs = mx.array([[8], [3]])
+        prompt_priming.maybe_capture(
+            host, inputs, inputs[..., None], [SimpleNamespace(offset=mx.array([4, 3]))]
+        )
+    assert prompt_priming._find_ctx(host) is previous
+    a = prompt_priming.take_primed(
+        host, [SimpleNamespace(offset=4)], mx.array(4), uid=11
+    )
+    b = prompt_priming.take_primed(
+        host, [SimpleNamespace(offset=5)], mx.array(9), uid=12
+    )
+    assert a[0][0].pairs == [(1, 2), (2, 3), (3, 4)]
+    assert b[0][0].pairs == [(5, 6), (6, 7), (7, 8), (8, 9)]
+    assert prompt_priming._find_ctx(host) is previous
+    assert not prompt_priming._owned(host)[1].uids
+
+
+def test_identical_prompts_have_separate_contexts_and_cancel_releases_only_owner():
+    host = HeadHost()
+    for uid in [11, 12]:
+        prepare(host, str(uid), [1, 2])
+        capture(host, [1, 2], 2)
+        prompt_priming.bind_uid(host, str(uid), uid)
+    prompt_priming.release_request(host, "11")
+    state = prompt_priming._owned(host)[1]
+    assert set(state.uids) == {12}
+    prompt_priming.release_uids(host, [12])
+    assert not state.uids
+    prepare(host, "waiting", [1, 2])
+    capture(host, [1, 2], 2)
+    prompt_priming.clear_owned(host)
+    assert not state.requests and not state.uids
+    assert prompt_priming._find_ctx(host) is None
+
+
+def test_missing_uid_does_not_steal_equal_offset_pending_context():
+    host = HeadHost()
+    prepare(host, "pending", [1, 2])
+    capture(host, [1, 2], 2)
+    previous = prompt_priming._find_ctx(host)
+    assert (
+        prompt_priming.take_primed(
+            host, [SimpleNamespace(offset=3)], mx.array(3), uid=99
+        )
+        is None
+    )
+    assert prompt_priming._find_ctx(host) is previous
+
+
+def test_offset_rewind_invalidates_head_without_adopting_other_history():
+    host = HeadHost()
+    prepare(host, "a", [1, 2])
+    capture(host, [1, 2], 2)
+    prompt_priming.bind_uid(host, "a", 11)
+    with prompt_priming.decode_scope(host, [11]):
+        capture(host, [3], 2)  # Offset did not advance.
+    assert (
+        prompt_priming.take_primed(
+            host, [SimpleNamespace(offset=3)], mx.array(4), uid=11
+        )
+        is None
+    )
+
+
+def test_decode_scope_restores_after_exception_and_models_do_not_share_state():
+    first, second = HeadHost(), HeadHost()
+    prepare(first, "a", [1, 2])
+    prepare(second, "a", [5, 6])
+    with (
+        pytest.raises(ValueError),
+        prompt_priming.decode_scope(first, [1]),
+    ):  # noqa: SIM117
+        with prompt_priming.decode_scope(second, [2]):
+            raise ValueError("cancelled")
+    assert prompt_priming._DECODE_SCOPE.get() is None
+    assert prompt_priming._owned(first)[1] is not prompt_priming._owned(second)[1]
+
+
+def test_dspark_context_is_owned_by_custom_hook():
+    host = HeadHost()
+    host._omlx_dspark_decode_enabled = True
+    custom = object()
+    setattr(host, prompt_priming._CTX_ATTR, custom)
+    prepare(host, "a", [1, 2])
+    prompt_priming.release_request(host, "a")
+    prompt_priming.clear_owned(host)
+    assert prompt_priming._find_ctx(host) is custom
+    assert prompt_priming._owned(host)[1] is None
+
+
+@pytest.mark.parametrize("operation", ["reset", "deep_reset", "shutdown"])
+def test_scheduler_teardown_releases_owned_histories(
+    mock_model, mock_tokenizer, operation
+):
+    from omlx.scheduler import Scheduler
+
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    mock_model._omlx_mtp_decode_enabled = True
+    mock_model._omlx_mtp_chain = True
+    mock_model.mtp = object()
+    prepare(mock_model, "waiting", [1, 2])
+    prepare(mock_model, "inserted", [3, 4])
+    prompt_priming.bind_uid(mock_model, "inserted", 11)
+    state = prompt_priming._owned(mock_model)[1]
+    assert state.requests and state.uids
+    getattr(scheduler, operation)()
+    assert not state.requests and not state.uids
+
+
+def test_scheduler_abort_releases_only_cancelled_request(mock_model, mock_tokenizer):
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler
+
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    mock_model._omlx_mtp_decode_enabled = True
+    mock_model._omlx_mtp_chain = True
+    mock_model.mtp = object()
+    scheduler.add_request(
+        Request(request_id="waiting", prompt="Hello", sampling_params=SamplingParams())
+    )
+    prepare(mock_model, "waiting", [1, 2])
+    prepare(mock_model, "inserted", [3, 4])
+    prompt_priming.bind_uid(mock_model, "inserted", 11)
+    state = prompt_priming._owned(mock_model)[1]
+    scheduler.abort_request("waiting")
+    scheduler._process_pending_aborts()
+    assert not state.requests and set(state.uids) == {11}
+    prompt_priming.clear_owned(mock_model)
+
+
+def test_scheduler_completion_releases_unused_priming(mock_model, mock_tokenizer):
+    from omlx.scheduler import Scheduler
+
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    mock_model._omlx_mtp_decode_enabled = True
+    mock_model._omlx_mtp_chain = True
+    mock_model.mtp = object()
+    prepare(mock_model, "finished", [1, 2])
+    prompt_priming.bind_uid(mock_model, "finished", 11)
+    state = prompt_priming._owned(mock_model)[1]
+    scheduler._cleanup_finished({"finished"})
+    assert not state.requests and not state.uids
+
+
+def test_generation_scope_uses_uids_after_realignment(monkeypatch):
+    from contextlib import contextmanager
+
+    from mlx_lm.generate import GenerationBatch
+
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    bg.apply()
+    batch = SimpleNamespace(model=HeadHost(), uids=[11, 12])
+    batch._omlx_realign_rows = lambda: setattr(batch, "uids", [12, 11])
+
+    class ScopeReachedError(Exception):
+        pass
+
+    @contextmanager
+    def capture_scope(model, uids):
+        assert model is batch.model
+        assert list(uids) == [12, 11]
+        raise ScopeReachedError
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(prompt_priming, "decode_scope", capture_scope)
+    with pytest.raises(ScopeReachedError):
+        GenerationBatch.next(batch)
