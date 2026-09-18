@@ -1989,6 +1989,31 @@ class TestHfCacheDiscovery:
                 },
                 False,
             ),
+            # The loader reads the affine mode only, so a declared mxfp4/mxfp8
+            # source — and a width that is not an integer — stays hidden too
+            # instead of being admitted and then raising "Unsupported source
+            # quantization mode" at load time.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 4, "group_size": 64, "mode": "mxfp4"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": True, "group_size": 64, "mode": "affine"},
+                },
+                False,
+            ),
             ({"model_type": "deepseek_v41", "quantization": "mlx"}, False),
             (
                 {"model_type": "deepseek_v4", "omlx_deepseek_v41": {"version": 1}},

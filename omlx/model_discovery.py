@@ -1425,8 +1425,9 @@ def _is_deepseek_v41_loadable_config(config) -> bool:
     repo names carry no MLX token, so the generic heuristics skip them.
     Community ``mlx_lm`` affine conversions declare the format in a top-level
     ``quantization`` dict instead of the spec, so they are accepted when that
-    dict is a readable MLX quantization; a declaration the loader cannot read
-    is still rejected.
+    dict declares the affine mode the loader reads with an integer bit width;
+    a declaration the loader cannot read — another mode, a missing or
+    non-integer width — is still rejected here rather than at load time.
     """
     if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
         return False
@@ -1440,11 +1441,12 @@ def _is_deepseek_v41_loadable_config(config) -> bool:
         return True
     if not isinstance(quantization, dict):
         return False
-    return quantization.get("mode", "affine") in (
-        "affine",
-        "mxfp4",
-        "mxfp8",
-    ) and isinstance(quantization.get("bits"), int)
+    bits = quantization.get("bits")
+    return (
+        quantization.get("mode", "affine") == "affine"
+        and isinstance(bits, int)
+        and not isinstance(bits, bool)
+    )
 
 
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
