@@ -1474,19 +1474,26 @@ function clusterV2Wizard() {
 
         // exo-style address choice: prefer a routable IPv4 on a direct or
         // known interface; a bare link-local fe80:: (no scope zone) can never
-        // be dialed, so it ranks below everything.
+        // be dialed, so it is not a candidate at all — only a scoped zone is.
+        isUndialableAddr(ip) {
+            const text = String(ip || '').toLowerCase();
+            // IPv6 link-local is fe80::/10 (fe80–febf); without a %zone it
+            // cannot be dialed, and a peer's zone is only valid on that peer.
+            return !text.includes('%') && /^fe[89ab][0-9a-f]:/.test(text);
+        },
+
         bestDeviceAddr(device) {
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
             const preferred = ['manual', 'tb', 'thunderbolt', 'ethernet', 'tailscale'];
             const scored = addrs
                 .filter((addr) => addr && addr.ip)
+                .filter((addr) => !this.isUndialableAddr(addr.ip))
                 .map((addr) => {
                     const ip = String(addr.ip);
                     let score = 0;
                     const rank = preferred.indexOf(String(addr.if_type || ''));
                     if (rank >= 0) score += 100 - rank;
                     if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) score += 50;
-                    if (ip.toLowerCase().startsWith('fe80:')) score -= 1000;
                     return { addr, score };
                 })
                 .sort((a, b) => b.score - a.score);
