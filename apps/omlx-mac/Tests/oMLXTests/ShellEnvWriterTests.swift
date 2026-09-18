@@ -185,7 +185,7 @@ final class ShellEnvWriterTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
-    func testShimExportsBootstrapBasePath() throws {
+    func testShimPreservesBasePathPrecedence() throws {
         let appURL = try makeFakeAppURL()
         let output = tempHome.appendingPathComponent("base-path-output.txt")
         let cli = appURL
@@ -205,7 +205,7 @@ final class ShellEnvWriterTests: XCTestCase {
             .appendingPathComponent("Application Support", isDirectory: true)
             .appendingPathComponent("oMLX", isDirectory: true)
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        try "/tmp/custom-omlx\n".write(
+        try "/tmp/custom omlx\n".write(
             to: support.appendingPathComponent("base-path"),
             atomically: true,
             encoding: .utf8
@@ -215,17 +215,25 @@ final class ShellEnvWriterTests: XCTestCase {
             .appendingPathComponent(".omlx", isDirectory: true)
             .appendingPathComponent("bin", isDirectory: true)
             .appendingPathComponent("omlx")
-        let process = Process()
-        process.executableURL = shim
-        process.environment = [
-            "HOME": tempHome.path,
-            "PATH": "/usr/bin:/bin",
+        let cases: [(String?, String)] = [
+            (nil, "/tmp/custom omlx"),
+            ("", "/tmp/custom omlx"),
+            ("/tmp/explicit omlx", "/tmp/explicit omlx"),
         ]
-        try process.run()
-        process.waitUntilExit()
+        for (environmentPath, expectedPath) in cases {
+            let process = Process()
+            process.executableURL = shim
+            process.environment = [
+                "HOME": tempHome.path,
+                "PATH": "/usr/bin:/bin",
+            ]
+            process.environment?["OMLX_BASE_PATH"] = environmentPath
+            try process.run()
+            process.waitUntilExit()
 
-        XCTAssertEqual(process.terminationStatus, 0)
-        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), "/tmp/custom-omlx")
+            XCTAssertEqual(process.terminationStatus, 0)
+            XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), expectedPath)
+        }
     }
 
     func testEnsureCLIShimSkipsPromptWhenShellExportInstalled() throws {
