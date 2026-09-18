@@ -7387,6 +7387,7 @@ async def stream_responses_api(
     last_output = None
     accumulated_text = ""
     accumulated_reasoning = ""
+    message_deltas = []
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
@@ -7671,6 +7672,7 @@ async def stream_responses_api(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
+                        message_deltas.append(content_delta)
                         seq += 1
                         yield format_sse_event(
                             "response.output_text.delta",
@@ -7736,6 +7738,7 @@ async def stream_responses_api(
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
+                message_deltas.append(content_delta)
                 seq += 1
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -7756,6 +7759,7 @@ async def stream_responses_api(
                         yield ev
                 for ev in _open_message():
                     yield ev
+                message_deltas.append(remaining)
                 seq += 1
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -7798,6 +7802,7 @@ async def stream_responses_api(
         if not stream_content and cleaned_text:
             for ev in _open_message():
                 yield ev
+            message_deltas.append(cleaned_text)
             seq += 1
             yield format_sse_event(
                 "response.output_text.delta",
@@ -7828,6 +7833,7 @@ async def stream_responses_api(
                     yield ev
             for ev in _open_message():
                 yield ev
+            message_deltas.append(recovered_content)
             seq += 1
             yield format_sse_event(
                 "response.output_text.delta",
@@ -7853,13 +7859,12 @@ async def stream_responses_api(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    final_text = cleaned_text.strip() if cleaned_text else ""
+    # Final message content must preserve the bytes already emitted to clients.
+    final_text = "".join(message_deltas)
 
     # Process response_format if specified
     if response_format and not tool_calls:
-        _, parsed_json, is_valid, error = parse_json_output(final_text, response_format)
-        if parsed_json is not None:
-            final_text = json.dumps(parsed_json)
+        _, _, is_valid, error = parse_json_output(final_text, response_format)
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
