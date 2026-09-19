@@ -56,10 +56,14 @@ struct ModelSettingsScreen: View {
             case .basic:
                 BasicTab(vm: vm, client: services.client)
             case .advanced:
-                AdvancedTab(vm: vm, client: services.client)
+                AdvancedTab(
+                    vm: vm,
+                    tuning: services.aneTuning,
+                    client: services.client
+                )
             }
 
-            FooterBar(error: vm.lastError)
+            FooterBar(error: vm.lastError ?? services.aneTuning.error(for: modelID))
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -1128,6 +1132,7 @@ private struct BasicEditBanner: View {
 
 private struct AdvancedTab: View {
     @Bindable var vm: ModelSettingsScreenVM
+    @Bindable var tuning: ANETuningSessionVM
     let client: OMLXClient
 
     @Environment(\.omlxTheme) private var theme
@@ -1291,7 +1296,7 @@ private struct AdvancedTab: View {
                                  defaultValue: "Speculative decoding, KV-cache quantization, and other research features.",
                                  comment: "Subtitle for the Experimental settings section")
             )
-            ExperimentalSection(vm: vm, client: client)
+            ExperimentalSection(vm: vm, tuning: tuning, client: client)
         }
     }
 }
@@ -1581,6 +1586,7 @@ private struct AccelerationSection: View {
 
 private struct ExperimentalSection: View {
     @Bindable var vm: ModelSettingsScreenVM
+    @Bindable var tuning: ANETuningSessionVM
     let client: OMLXClient
 
     @Environment(\.omlxTheme) private var theme
@@ -1646,7 +1652,7 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
-                        if !vm.aneTuningIsRunning && vm.model?.anePrefillBackend != "k2" {
+                        if !tuning.isRunning && vm.model?.anePrefillBackend != "k2" {
                             Menu(String(localized: "settings.experimental.qwen_ane.tuner.menu",
                                         defaultValue: "Tuner overrides",
                                         comment: "Menu label for hardware overrides in the ANE split tuner")) {
@@ -1684,8 +1690,8 @@ private struct ExperimentalSection: View {
                             .menuStyle(.borderlessButton)
                             .fixedSize()
                         }
-                        if vm.aneTuningIsRunning {
-                            if let status = vm.aneTuningStatus {
+                        if tuning.isRunning(for: vm.modelID) {
+                            if let status = tuning.status(for: vm.modelID) {
                                 Text(status.message)
                                     .font(.omlxText(11))
                                     .foregroundStyle(theme.textSecondary)
@@ -1703,10 +1709,10 @@ private struct ExperimentalSection: View {
                             Button(String(localized: "common.cancel",
                                           defaultValue: "Cancel",
                                           comment: "Generic Cancel button label")) {
-                                Task { await vm.cancelANETuning(client: client) }
+                                tuning.cancel(client: client)
                             }
                             .buttonStyle(.omlx(.destructive, size: .small))
-                        } else if let recommendation = vm.aneTuningStatus?.recommendation {
+                        } else if let recommendation = tuning.status(for: vm.modelID)?.recommendation {
                             Text(aneRecommendationText(recommendation))
                                 .font(.omlxText(11))
                                 .foregroundStyle(theme.textSecondary)
@@ -1715,25 +1721,37 @@ private struct ExperimentalSection: View {
                             Button(String(localized: "settings.experimental.qwen_ane.tuner.use_result",
                                           defaultValue: "Use result",
                                           comment: "Button that applies the ANE tuner recommendation")) {
-                                vm.applyANETuningRecommendation()
+                                vm.applyANETuningRecommendation(recommendation)
                             }
                             .buttonStyle(.omlx(.primary, size: .small))
                             Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_again",
                                           defaultValue: "Tune again",
                                           comment: "Button that re-runs the ANE split tuner")) {
-                                Task { await vm.startANETuning(client: client) }
+                                tuning.start(
+                                    modelID: vm.modelID,
+                                    sequenceLengthText: vm.qwen35AnePrefillSequenceLength,
+                                    overrides: vm.aneTuningOverrides,
+                                    client: client
+                                )
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         } else {
                             Button(String(localized: "settings.experimental.qwen_ane.tuner.tune_for_mac",
                                           defaultValue: "Tune for this Mac",
                                           comment: "Button that starts ANE split tuning for the current Mac")) {
-                                Task { await vm.startANETuning(client: client) }
+                                tuning.start(
+                                    modelID: vm.modelID,
+                                    sequenceLengthText: vm.qwen35AnePrefillSequenceLength,
+                                    overrides: vm.aneTuningOverrides,
+                                    client: client
+                                )
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
+                            .disabled(tuning.isRunning)
                         }
 
-                        if !vm.aneTuningIsRunning, let status = vm.aneTuningStatus {
+                        if !tuning.isRunning(for: vm.modelID),
+                           let status = tuning.status(for: vm.modelID) {
                             if let reason = status.terminationReason,
                                !reason.isEmpty {
                                 Text(reason)

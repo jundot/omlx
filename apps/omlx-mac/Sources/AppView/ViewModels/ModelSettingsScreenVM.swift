@@ -296,9 +296,6 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillCpuThreads: String = "8"
     var qwen35AnePrefillCpuSharedResource: Bool = true
     var qwen35AnePrefillFusedDown: Bool = false
-    var aneTuningID: String?
-    var aneTuningIsRunning: Bool = false
-    var aneTuningStatus: ANETuningStatusResponse?
     var aneTuningAllowCPU: Bool = true
     var aneTuningAllowCPUGate: Bool = true
     var aneTuningAllowCPUDown: Bool = true
@@ -312,6 +309,17 @@ final class ModelSettingsScreenVM {
     var applyOutcome: SettingsApplyOutcome?
     /// Error shown inside the snapshot sheet so the user can retry.
     var applyError: String?
+
+    var aneTuningOverrides: ANETuningOverrides {
+        ANETuningOverrides(
+            allowCPU: aneTuningAllowCPU,
+            allowCPUGate: aneTuningAllowCPUGate,
+            allowCPUDown: aneTuningAllowCPUDown,
+            allowANEGDN: aneTuningAllowANEGDN,
+            allowCPUGDN: aneTuningAllowCPUGDN,
+            allowCPUSharedResource: aneTuningAllowCPUSharedResource
+        )
+    }
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -539,11 +547,6 @@ final class ModelSettingsScreenVM {
         if preservingEdits && profileDirty { return }
         loadSequence += 1
         let sequence = loadSequence
-        if self.modelID != modelID {
-            aneTuningID = nil
-            aneTuningIsRunning = false
-            aneTuningStatus = nil
-        }
         self.modelID = modelID
         do {
             let models = try await client.listModels().models
@@ -888,70 +891,10 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    func startANETuning(client: OMLXClient) async {
-        guard !aneTuningIsRunning else { return }
-        guard let sequenceLength = Int(qwen35AnePrefillSequenceLength) else {
-            lastError = "ANE prompt block must be a number."
-            return
-        }
-        aneTuningIsRunning = true
-        aneTuningStatus = nil
-        lastError = nil
-        do {
-            let started = try await client.startANETuning(
-                ANETuningStartRequest(
-                    modelId: modelID,
-                    sequenceLength: sequenceLength,
-                    repeats: 2,
-                    allowCpu: aneTuningAllowCPU,
-                    allowCpuGate: aneTuningAllowCPU && aneTuningAllowCPUGate,
-                    allowCpuDown: aneTuningAllowCPU && aneTuningAllowCPUDown,
-                    allowAneGdn: aneTuningAllowANEGDN,
-                    allowCpuGdn: aneTuningAllowCPU
-                        && aneTuningAllowANEGDN
-                        && aneTuningAllowCPUGDN,
-                    allowCpuSharedResource: aneTuningAllowCPU
-                        && aneTuningAllowCPUSharedResource
-                )
-            )
-            aneTuningID = started.tuningId
-            while aneTuningIsRunning {
-                let snapshot = try await client.getANETuningResults(
-                    tuningId: started.tuningId
-                )
-                aneTuningStatus = snapshot
-                if snapshot.status != "running" {
-                    aneTuningIsRunning = false
-                    // Benchmark termination is rendered with its partial
-                    // matrix in the tuner row. Reserve lastError for transport
-                    // and settings failures so the reason is not duplicated.
-                    lastError = nil
-                    break
-                }
-                try await Task.sleep(for: .seconds(1))
-            }
-        } catch is CancellationError {
-            aneTuningIsRunning = false
-        } catch {
-            aneTuningIsRunning = false
-            lastError = error.omlxDescription
-        }
-    }
-
-    func cancelANETuning(client: OMLXClient) async {
-        guard let tuningID = aneTuningID, aneTuningIsRunning else { return }
-        do {
-            _ = try await client.cancelANETuning(tuningId: tuningID)
-        } catch {
-            lastError = error.omlxDescription
-        }
-    }
-
     /// Stage the best tuner result in the working profile. The user can then
     /// update the active profile or save it as a new one without detaching the
     /// model from its current profile via a direct settings write.
-    func applyANETuningRecommendation() {
-        guard let recommendation = aneTuningStatus?.recommendation else { return }
+    func applyANETuningRecommendation(_ recommendation: ANETuningRecommendationDTO) {
         qwen35AnePrefillEnabled = recommendation.enabled
         if recommendation.enabled {
             // The two prefill accelerators are mutually exclusive, and the
