@@ -449,24 +449,17 @@ def apply_qwen35_vlm_gdn_projection_hook():
 
 
 class _VLMQuantizedPrefillLinear(nn.QuantizedLinear):
+    # Every decode step calls this wrapper once per projection, so the routing
+    # thresholds are read from the environment when the patch installs.
+    _route_min_tokens = 2048
+    _route_q8_min_tokens = _Q8_MIN_TOKENS
+    _route_variant = 8
+
     def __call__(self, x):
-        if (
-            x.ndim == 3
-            and _can_route_affine_linear(
-                self,
-                x,
-                int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048")),
-                int(
-                    os.environ.get(
-                        "OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS)
-                    )
-                ),
-            )
-            and os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") != "0"
+        if x.ndim == 3 and _can_route_affine_linear(
+            self, x, self._route_min_tokens, self._route_q8_min_tokens
         ):
-            return _backend_or_qmm(
-                self, x, int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8"))
-            )
+            return _backend_or_qmm(self, x, self._route_variant)
         return super().__call__(x)
 
 
@@ -474,6 +467,15 @@ def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
     """Route the loaded Qwen projections without replacing their forward graph."""
     if os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0" or not _has_native_qmm():
         return False
+    _VLMQuantizedPrefillLinear._route_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048")
+    )
+    _VLMQuantizedPrefillLinear._route_q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+    _VLMQuantizedPrefillLinear._route_variant = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8")
+    )
     installed = False
     projection_names = {
         "q_proj",
