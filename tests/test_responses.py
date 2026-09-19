@@ -21,16 +21,19 @@ from omlx.api.responses_utils import (
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
+    build_response_object,
     build_response_store_record,
     build_response_usage,
     convert_responses_input_to_messages,
     convert_responses_tools,
-    convert_stored_response_to_messages,
     format_sse_event,
     normalize_response_output_to_messages,
     split_namespace_tool_name,
+    validate_responses_request,
 )
 from omlx.api.shared_models import IDPrefix, generate_id
+from omlx.api.tool_bindings import ToolBindingRegistry, ensure_call_id
+from omlx.exceptions import InvalidRequestError
 
 # =============================================================================
 # ID Generation Tests
@@ -538,6 +541,101 @@ class TestConvertResponsesInput:
         assert messages[0]["tool_calls"][0]["function"]["name"] == "lookup"
         assert messages[0]["reasoning_content"] == "thinking"
 
+    def test_reasoning_content_only_item_is_read(self):
+        """Responses-dialect clients send reasoning as content[].reasoning_text."""
+        items = [
+            InputItem(
+                type="reasoning",
+                content=[{"type": "reasoning_text", "text": "raw cot"}],
+            ),
+            InputItem(type="message", role="assistant", content="answer"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["reasoning_content"] == "raw cot"
+        assert messages[0]["content"] == "answer"
+
+    def test_reasoning_summary_wins_over_duplicate_content(self):
+        """Both shapes carry the same upstream string; do not concatenate it."""
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "cot"}],
+                content=[{"type": "reasoning_text", "text": "cot"}],
+            ),
+            InputItem(type="message", role="assistant", content="answer"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["reasoning_content"] == "cot"
+
+    @pytest.mark.parametrize(
+        "item_type",
+        [
+            "computer_call",
+            "web_search_call",
+            "file_search_call",
+            "mcp_call",
+            "image_generation_call",
+            "code_interpreter_call",
+            "local_shell_call",
+            "custom_tool_call",
+            "custom_tool_call_output",
+            "item_reference",
+        ],
+    )
+    def test_unsupported_input_item_types_are_rejected(self, item_type):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_input_to_messages([InputItem(type=item_type)])
+        assert item_type in str(excinfo.value)
+        assert excinfo.value.field == "input"
+
+    def test_unknown_input_item_type_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_input_to_messages([InputItem(type="mystery")])
+        assert "mystery" in str(excinfo.value)
+
+    def test_type_less_item_without_role_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_input_to_messages([InputItem(content="hi")])
+        assert excinfo.value.field == "input"
+
+    def test_unknown_message_role_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_input_to_messages(
+                [InputItem(type="message", role="wizard", content="hi")]
+            )
+        assert "wizard" in str(excinfo.value)
+
+    def test_unsupported_content_part_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_input_to_messages(
+                [
+                    InputItem(
+                        type="message",
+                        role="user",
+                        content=[{"type": "input_file", "file_id": "file_1"}],
+                    )
+                ]
+            )
+        assert "input_file" in str(excinfo.value)
+        assert excinfo.value.field == "input"
+
+    def test_omitted_call_ids_still_pair(self):
+        """function_call and its output generate the same fallback id."""
+        items = [
+            InputItem(type="function_call", name="lookup", arguments="{}"),
+            InputItem(type="function_call_output", output="result"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        call_id = messages[0]["tool_calls"][0]["id"]
+        assert call_id.startswith("call_")
+        assert messages[1]["tool_call_id"] == call_id
+
+    def test_ensure_call_id_is_stable_and_nonempty(self):
+        assert ensure_call_id("call_abc") == "call_abc"
+        assert ensure_call_id(None).startswith("call_")
+        assert ensure_call_id("").startswith("call_")
+        assert ensure_call_id("  ").startswith("call_")
+
 
 IMAGE_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
 
@@ -703,25 +801,78 @@ class TestConvertResponsesTools:
         assert "description" not in result[0]["function"]
         assert "parameters" not in result[0]["function"]
 
-    def test_non_function_tools_skipped(self):
-        """Non-function tool types (local_shell, mcp, etc.) should be skipped."""
+    @pytest.mark.parametrize(
+        "tool_type,label",
+        [
+            ("local_shell", "local_shell (hosted)"),
+            ("mcp", "mcp (hosted)"),
+            ("web_search", "web_search (hosted)"),
+            ("web_search_preview", "web_search_preview (hosted)"),
+            ("file_search", "file_search (hosted)"),
+            ("computer_use_preview", "computer_use_preview (hosted)"),
+            ("code_interpreter", "code_interpreter (hosted)"),
+            ("image_generation", "image_generation (hosted)"),
+            ("custom", "custom (hosted)"),
+            ("not_a_real_tool_type", "not_a_real_tool_type (unknown type)"),
+        ],
+    )
+    def test_unsupported_tool_types_are_accepted_but_not_exposed(
+        self, tool_type, label
+    ):
+        """A declaration the model cannot use is accepted and named, not 400.
+
+        Declaring a capability is separate from using it: the model never sees
+        the tool, so an unused declaration cannot change the response. Codex
+        declares ``web_search`` unconditionally, so rejecting it made the
+        endpoint unusable. The degradation is reported instead of silent.
+        """
+        unexposed = []
+        result = convert_responses_tools(
+            [ResponsesTool(type=tool_type)], unexposed=unexposed
+        )
+        assert result is None
+        assert unexposed == [label]
+
+    def test_unexposed_label_cannot_inject_a_header(self):
+        """A client-supplied type is constrained to header-safe characters."""
+        unexposed = []
+        convert_responses_tools(
+            [ResponsesTool(type='web"search\r\nX-Evil: 1')], unexposed=unexposed
+        )
+        assert unexposed == ["web_search__X-Evil:_1 (unknown type)"]
+        for label in unexposed:
+            assert '"' not in label and "\r" not in label and "\n" not in label
+
+    def test_supported_and_unsupported_tools_mixed_keeps_supported(self):
+        """A supported tool is still exposed alongside an unexposed declaration."""
+        unexposed = []
         tools = [
-            ResponsesTool(type="local_shell"),
             ResponsesTool(type="function", name="fn_a"),
-            ResponsesTool(type="mcp"),
+            ResponsesTool(type="web_search"),
+        ]
+        result = convert_responses_tools(tools, unexposed=unexposed)
+        assert [t["function"]["name"] for t in result] == ["fn_a"]
+        assert unexposed == ["web_search (hosted)"]
+
+    def test_function_tool_without_a_name_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_tools([ResponsesTool(type="function")])
+        assert "name" in str(excinfo.value)
+        assert excinfo.value.field == "tools"
+
+    def test_tool_search_is_a_noop(self):
+        """tool_search only lazy-loads namespace members, which oMLX exposes
+        eagerly, so accepting it does not change which tools the model sees."""
+        tools = [
+            ResponsesTool(type="tool_search"),
+            ResponsesTool(type="function", name="fn_a"),
         ]
         result = convert_responses_tools(tools)
-        assert len(result) == 1
-        assert result[0]["function"]["name"] == "fn_a"
-
-    def test_only_non_function_tools_returns_none(self):
-        tools = [ResponsesTool(type="local_shell")]
-        result = convert_responses_tools(tools)
-        assert result is None
+        assert [t["function"]["name"] for t in result] == ["fn_a"]
 
     def test_namespace_tools_are_expanded(self):
         """Namespace groups hold client-executed function tools (#3371)."""
-        aliases = {}
+        registry = ToolBindingRegistry()
         tools = [
             ResponsesTool(
                 type="namespace",
@@ -742,7 +893,7 @@ class TestConvertResponsesTools:
                 ],
             )
         ]
-        result = convert_responses_tools(tools, aliases)
+        result = convert_responses_tools(tools, registry)
         assert result is not None
         # Wire names join the namespace like Codex's join_tool_name().
         assert [t["function"]["name"] for t in result] == [
@@ -754,14 +905,14 @@ class TestConvertResponsesTools:
             "Get the current weather for a city."
         )
         assert result[0]["function"]["parameters"]["required"] == ["city"]
-        assert aliases == {
+        assert registry.aliases() == {
             "mcp__demo__get_weather": ("mcp__demo__", "get_weather"),
             "mcp__demo__get_time": ("mcp__demo__", "get_time"),
         }
 
     def test_namespace_wire_name_survives_collision(self):
         """A flat tool already holding the joined name must not be shadowed."""
-        aliases = {}
+        registry = ToolBindingRegistry()
         tools = [
             ResponsesTool(type="function", name="mcp__demo__get_weather"),
             ResponsesTool(
@@ -770,25 +921,113 @@ class TestConvertResponsesTools:
                 tools=[{"type": "function", "name": "get_weather"}],
             ),
         ]
-        result = convert_responses_tools(tools, aliases)
+        result = convert_responses_tools(tools, registry)
         assert [t["function"]["name"] for t in result] == [
             "mcp__demo__get_weather",
             "mcp__demo__get_weather_2",
         ]
-        assert aliases == {"mcp__demo__get_weather_2": ("mcp__demo__", "get_weather")}
+        assert registry.aliases() == {
+            "mcp__demo__get_weather_2": ("mcp__demo__", "get_weather")
+        }
+
+    def test_namespace_member_without_a_name_is_rejected(self):
+        tools = [
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                tools=[{"type": "function"}],
+            )
+        ]
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_tools(tools)
+        assert "mcp__demo__" in str(excinfo.value)
+        assert excinfo.value.field == "tools"
+
+    def test_namespace_with_hosted_member_is_dropped_and_reported(self):
+        """A hosted namespace member follows the same declared-vs-used rule."""
+        unexposed = []
+        tools = [
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                tools=[{"type": "web_search"}],
+            )
+        ]
+        result = convert_responses_tools(tools, unexposed=unexposed)
+        assert result is None
+        assert unexposed == ["web_search (hosted) in namespace mcp__demo__"]
+
+    def test_nested_namespace_is_dropped_and_reported(self):
+        """A nested namespace is never exposed, so it too is accepted."""
+        unexposed = []
+        tools = [
+            ResponsesTool(
+                type="namespace",
+                name="mcp__demo__",
+                tools=[{"type": "namespace", "name": "inner__"}],
+            )
+        ]
+        result = convert_responses_tools(tools, unexposed=unexposed)
+        assert result is None
+        assert unexposed == ["namespace (nested) in namespace mcp__demo__"]
 
     def test_split_namespace_tool_name(self):
-        aliases = {"mcp__demo__get_weather": ("mcp__demo__", "get_weather")}
-        assert split_namespace_tool_name("mcp__demo__get_weather", aliases) == (
+        registry = ToolBindingRegistry()
+        convert_responses_tools(
+            [
+                ResponsesTool(
+                    type="namespace",
+                    name="mcp__demo__",
+                    tools=[{"type": "function", "name": "get_weather"}],
+                )
+            ],
+            registry,
+        )
+        assert split_namespace_tool_name("mcp__demo__get_weather", registry) == (
             "mcp__demo__",
             "get_weather",
         )
         # Flat calls, and calls the model invented, pass through unchanged.
-        assert split_namespace_tool_name("get_weather", aliases) == (
+        assert split_namespace_tool_name("get_weather", registry) == (
             None,
             "get_weather",
         )
         assert split_namespace_tool_name("get_weather") == (None, "get_weather")
+
+    def test_registry_rebinds_history_to_current_wire_name(self):
+        """A preserved namespace call follows a collision rename in this turn."""
+        registry = ToolBindingRegistry()
+        convert_responses_tools(
+            [
+                ResponsesTool(type="function", name="mcp__demo__get_weather"),
+                ResponsesTool(
+                    type="namespace",
+                    name="mcp__demo__",
+                    tools=[{"type": "function", "name": "get_weather"}],
+                ),
+            ],
+            registry,
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {},
+                            "namespace": "mcp__demo__",
+                        },
+                    }
+                ],
+            }
+        ]
+        registry.apply_to_messages(messages)
+        function = messages[0]["tool_calls"][0]["function"]
+        assert function["name"] == "mcp__demo__get_weather_2"
+        assert "namespace" not in function
 
     def test_namespace_serializes_only_when_set(self):
         namespaced = build_function_call_output_item(
@@ -806,14 +1045,146 @@ class TestConvertResponsesTools:
         # Other optional fields keep serializing as null, as before.
         assert flat["role"] is None and flat["summary"] is None
 
-    def test_namespace_without_usable_members_contributes_nothing(self):
+    def test_empty_namespace_contributes_nothing(self):
         tools = [
             ResponsesTool(type="namespace", name="empty__"),
-            ResponsesTool(type="namespace", name="junk__", tools=["not-a-tool"]),
             ResponsesTool(type="function", name="fn_a"),
         ]
         result = convert_responses_tools(tools)
         assert [t["function"]["name"] for t in result] == ["fn_a"]
+
+    def test_namespace_member_not_a_tool_object_is_rejected(self):
+        tools = [ResponsesTool(type="namespace", name="junk__", tools=["nope"])]
+        with pytest.raises(InvalidRequestError) as excinfo:
+            convert_responses_tools(tools)
+        assert "junk__" in str(excinfo.value)
+
+
+class TestValidateResponsesRequest:
+    """Unimplemented capabilities are refused by field, never echoed back."""
+
+    def _request(self, **kwargs):
+        return ResponsesRequest(model="m", input="hi", **kwargs)
+
+    def test_auto_and_none_are_accepted(self):
+        validate_responses_request(self._request(tool_choice="auto"))
+        validate_responses_request(self._request(tool_choice="none"))
+        validate_responses_request(self._request())
+
+    def test_required_tool_choice_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(self._request(tool_choice="required"))
+        assert excinfo.value.field == "tool_choice"
+
+    def test_named_function_tool_choice_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(
+                self._request(
+                    tool_choice={"type": "function", "name": "get_weather"}
+                )
+            )
+        assert excinfo.value.field == "tool_choice"
+
+    def test_unknown_tool_choice_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(self._request(tool_choice="sometimes"))
+        assert excinfo.value.field == "tool_choice"
+
+    def test_truncation_disabled_is_accepted(self):
+        validate_responses_request(self._request(truncation="disabled"))
+
+    def test_truncation_auto_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(self._request(truncation="auto"))
+        assert excinfo.value.field == "truncation"
+
+    def test_invalid_truncation_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(self._request(truncation="maybe"))
+        assert excinfo.value.field == "truncation"
+
+    def test_parallel_tool_calls_true_is_accepted(self):
+        validate_responses_request(self._request(parallel_tool_calls=True))
+
+    def test_parallel_tool_calls_false_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(
+                self._request(parallel_tool_calls=False)
+            )
+        assert excinfo.value.field == "parallel_tool_calls"
+
+    def test_background_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(self._request(background=True))
+        assert excinfo.value.field == "background"
+
+    def test_conversation_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(
+                self._request(conversation={"id": "conv_1"})
+            )
+        assert excinfo.value.field == "conversation"
+
+    def test_max_tool_calls_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(self._request(max_tool_calls=3))
+        assert excinfo.value.field == "max_tool_calls"
+
+    def test_top_logprobs_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(self._request(top_logprobs=5))
+        assert excinfo.value.field == "top_logprobs"
+
+    def test_encrypted_reasoning_include_is_a_documented_noop(self):
+        validate_responses_request(
+            self._request(include=["reasoning.encrypted_content"])
+        )
+
+    def test_other_include_values_are_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(
+                self._request(include=["file_search_call.results"])
+            )
+        assert excinfo.value.field == "include"
+
+    def test_json_schema_format_requires_a_schema(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(
+                self._request(
+                    text=TextConfig(format=TextFormatConfig(type="json_schema"))
+                )
+            )
+        assert excinfo.value.field == "text.format"
+
+    def test_unknown_text_format_is_rejected(self):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            validate_responses_request(
+                self._request(
+                    text=TextConfig(format=TextFormatConfig(type="xml"))
+                )
+            )
+        assert excinfo.value.field == "text.format"
+
+    def test_known_text_formats_are_accepted(self):
+        validate_responses_request(
+            self._request(text=TextConfig(format=TextFormatConfig(type="text")))
+        )
+        validate_responses_request(
+            self._request(
+                text=TextConfig(format=TextFormatConfig(type="json_object"))
+            )
+        )
+        validate_responses_request(
+            self._request(
+                text=TextConfig(
+                    format=TextFormatConfig(
+                        type="json_schema",
+                        name="out",
+                        schema={"type": "object"},
+                    )
+                )
+            )
+        )
 
 
 # =============================================================================
@@ -912,10 +1283,114 @@ class TestBuildOutputItems:
         assert item.summary[0].type == "summary_text"
         assert item.summary[0].text == "Step 1: foo. Step 2: bar."
 
+    def test_build_reasoning_output_item_publishes_both_shapes(self):
+        """Clients disagree on where the CoT lives, so it goes in both places.
+
+        OpenAI's hosts publish ``summary``; Responses-dialect clients read
+        ``content[]`` with a ``reasoning_text`` part and show nothing without it.
+        """
+        text = "Step 1: foo. Step 2: bar."
+        item = build_reasoning_output_item(text)
+        assert [part.text for part in item.content] == [text]
+        assert item.content[0].type == "reasoning_text"
+
     def test_build_reasoning_output_item_empty_text(self):
         item = build_reasoning_output_item("")
         assert item.type == "reasoning"
         assert item.summary == []
+        assert item.content == []
+
+    def test_build_response_object_is_a_complete_envelope(self):
+        """Both response paths serialize this, so it must carry every field.
+
+        Nullable spec fields stay present as null rather than being dropped;
+        a caller that serialized with exclude_none would otherwise emit a
+        different key set from the other path.
+        """
+        env = build_response_object(
+            ResponsesRequest(model="m", input="hi"),
+            response_id="resp_test",
+            created_at=1,
+            output_items=[],
+            usage=None,
+            truncated=False,
+            temperature=None,
+            top_p=None,
+        ).model_dump()
+        for key in (
+            "id",
+            "object",
+            "created_at",
+            "model",
+            "status",
+            "output",
+            "usage",
+            "text",
+            "truncation",
+            "error",
+            "incomplete_details",
+            "instructions",
+            "store",
+            "parallel_tool_calls",
+            "reasoning",
+            "metadata",
+            "previous_response_id",
+        ):
+            assert key in env, key
+        assert env["status"] == "completed"
+
+    def test_build_response_object_marks_truncation(self):
+        env = build_response_object(
+            ResponsesRequest(model="m", input="hi", max_output_tokens=8),
+            response_id="resp_test",
+            created_at=1,
+            output_items=[],
+            usage=None,
+            truncated=True,
+            temperature=None,
+            top_p=None,
+        )
+        assert env.status == "incomplete"
+        assert env.incomplete_details == {"reason": "max_output_tokens"}
+
+    def test_build_response_object_echoes_truncation_mode(self):
+        """The request's truncation mode must round-trip, not just be null."""
+        default = build_response_object(
+            ResponsesRequest(model="m", input="hi"),
+            response_id="resp_test",
+            created_at=1,
+            output_items=[],
+            usage=None,
+            truncated=False,
+            temperature=None,
+            top_p=None,
+        )
+        assert default.truncation == "disabled"
+        disabled = build_response_object(
+            ResponsesRequest(model="m", input="hi", truncation="disabled"),
+            response_id="resp_test",
+            created_at=1,
+            output_items=[],
+            usage=None,
+            truncated=False,
+            temperature=None,
+            top_p=None,
+        )
+        assert disabled.truncation == "disabled"
+
+    def test_build_response_object_status_override_for_stream_open(self):
+        env = build_response_object(
+            ResponsesRequest(model="m", input="hi"),
+            response_id="resp_test",
+            created_at=1,
+            output_items=[],
+            usage=None,
+            truncated=False,
+            temperature=None,
+            top_p=None,
+            status="in_progress",
+        )
+        assert env.status == "in_progress"
 
 
 class TestResponseObject:
@@ -1119,61 +1594,6 @@ class TestResponseStore:
 
 
 class TestConvertStoredResponse:
-    def test_message_output(self):
-        stored = {
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "Hello!"}],
-                }
-            ]
-        }
-        messages = convert_stored_response_to_messages(stored)
-        assert len(messages) == 1
-        assert messages[0]["role"] == "assistant"
-        assert messages[0]["content"] == "Hello!"
-
-    def test_function_call_output(self):
-        stored = {
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "Let me check."}],
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_abc",
-                    "name": "get_weather",
-                    "arguments": '{"location": "Paris"}',
-                },
-            ]
-        }
-        messages = convert_stored_response_to_messages(stored)
-        assert len(messages) == 1
-        assert messages[0]["role"] == "assistant"
-        assert messages[0]["content"] == "Let me check."
-        assert messages[0]["tool_calls"][0]["function"]["name"] == "get_weather"
-        # arguments should be parsed as dict for Jinja2 chat templates
-        assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
-            "location": "Paris"
-        }
-
-    def test_empty_output(self):
-        stored = {"output": []}
-        messages = convert_stored_response_to_messages(stored)
-        assert messages == []
-
-    def test_state_record_prefers_output_messages(self):
-        stored = {
-            "output_messages": [
-                {"role": "assistant", "content": "Stored"},
-            ]
-        }
-        messages = convert_stored_response_to_messages(stored)
-        assert messages == [{"role": "assistant", "content": "Stored"}]
-
     def test_normalize_response_output_merges_assistant_tool_call_turn(self):
         output_items = [
             {
@@ -1230,6 +1650,146 @@ class TestConvertStoredResponse:
         assert messages[0]["role"] == "assistant"
         assert messages[0]["tool_calls"][0]["function"]["name"] == "lookup"
         assert messages[0]["reasoning_content"] == "deciding"
+
+    def test_normalize_reasoning_content_only_item(self):
+        output_items = [
+            {
+                "type": "reasoning",
+                "content": [{"type": "reasoning_text", "text": "raw cot"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}],
+            },
+        ]
+        messages = normalize_response_output_to_messages(output_items)
+        assert messages[0]["reasoning_content"] == "raw cot"
+
+    def test_normalize_unknown_output_item_raises_corrupt(self):
+        """A stored item we cannot replay must not be dropped silently."""
+        with pytest.raises(ResponseStateCorruptError) as excinfo:
+            normalize_response_output_to_messages([{"type": "web_search_call"}])
+        assert "web_search_call" in str(excinfo.value)
+
+    def test_normalize_function_call_without_call_id_gets_one(self):
+        messages = normalize_response_output_to_messages(
+            [
+                {
+                    "type": "function_call",
+                    "name": "lookup",
+                    "arguments": "{}",
+                }
+            ]
+        )
+        assert messages[0]["tool_calls"][0]["id"].startswith("call_")
+
+
+class TestPreviousResponseToolRoundTrip:
+    """The reasoning → tool → result → final sequence survives the store."""
+
+    def test_reasoning_tool_result_final_round_trip(self, tmp_path):
+        store = ResponseStore(max_size=10, state_dir=tmp_path)
+        output = [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "need weather"}],
+                "content": [{"type": "reasoning_text", "text": "need weather"}],
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Let me check."}],
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_abc",
+                "name": "get_weather",
+                "arguments": '{"city": "Paris"}',
+            },
+        ]
+        public = {"id": "resp_1", "created_at": 1, "output": output}
+        store.put(
+            "resp_1",
+            build_response_store_record(
+                public,
+                [{"role": "user", "content": "weather?"}],
+                normalize_response_output_to_messages(output),
+            ),
+        )
+
+        history = store.resolve_chain_messages("resp_1")
+        messages = convert_responses_input_to_messages(
+            [
+                InputItem(
+                    type="function_call_output",
+                    call_id="call_abc",
+                    output="sunny",
+                )
+            ],
+            previous_messages=history,
+        )
+
+        assistant = [m for m in messages if m.get("tool_calls")]
+        tool = [m for m in messages if m.get("role") == "tool"]
+        assert assistant[0]["tool_calls"][0]["id"] == "call_abc"
+        assert assistant[0]["reasoning_content"] == "need weather"
+        assert tool[0]["tool_call_id"] == "call_abc"
+        assert tool[0]["content"] == "sunny"
+
+    def test_instructions_are_not_reinherited_from_chain(self, tmp_path):
+        """A new turn's instructions stand alone; the prior turn's are gone."""
+        store = ResponseStore(max_size=10, state_dir=tmp_path)
+        store.put(
+            "resp_1",
+            build_response_store_record(
+                {"id": "resp_1", "created_at": 1, "output": []},
+                [{"role": "user", "content": "one"}],
+                [{"role": "assistant", "content": "first"}],
+            ),
+        )
+        history = store.resolve_chain_messages("resp_1")
+        messages = convert_responses_input_to_messages(
+            "two",
+            instructions="Only this turn's instruction",
+            previous_messages=history,
+        )
+        system = [m for m in messages if m["role"] == "system"]
+        assert len(system) == 1
+        assert system[0]["content"] == "Only this turn's instruction"
+
+    def test_call_id_stays_stable_across_chain(self, tmp_path):
+        """A tool call's id is the same in the stored response and next turn."""
+        store = ResponseStore(max_size=10, state_dir=tmp_path)
+        output = [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_stable",
+                "name": "lookup",
+                "arguments": "{}",
+            }
+        ]
+        public = {"id": "resp_1", "created_at": 1, "output": output}
+        store.put(
+            "resp_1",
+            build_response_store_record(
+                public,
+                [],
+                normalize_response_output_to_messages(output),
+            ),
+        )
+        assert store.get("resp_1")["output"][0]["call_id"] == "call_stable"
+        history = store.resolve_chain_messages("resp_1")
+        replayed = [
+            call
+            for message in history
+            for call in message.get("tool_calls", [])
+        ]
+        assert replayed[0]["id"] == "call_stable"
 
 
 # =============================================================================
@@ -1357,3 +1917,9 @@ class TestResponsesRequest:
         assert len(req.tools) == 2
         assert req.tools[0].type == "local_shell"
         assert req.tools[1].name == "read_file"
+        # local_shell has no local executor: its declaration is accepted but
+        # never exposed, and is named so the caller can be warned.
+        unexposed = []
+        result = convert_responses_tools(req.tools, unexposed=unexposed)
+        assert [t["function"]["name"] for t in result] == ["read_file"]
+        assert unexposed == ["local_shell (hosted)"]

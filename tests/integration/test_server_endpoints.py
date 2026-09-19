@@ -2408,10 +2408,24 @@ class TestJsonOutputParsing:
         parsed = json.loads(content)
         assert parsed == {"key": "value"}
 
-    def test_responses_parses_markdown_json(self, client, mock_llm_engine):
-        """Responses API should parse markdown-wrapped JSON with text.format."""
+    def test_responses_parses_markdown_json(
+        self, client, mock_llm_engine, monkeypatch
+    ):
+        """Responses API should parse markdown-wrapped JSON with text.format.
+
+        Grammar compilation is stubbed: the endpoint refuses text.format when
+        no grammar can be compiled (see the companion test), so a real engine
+        is the only place the markdown-wrapping parse path is reachable.
+        """
         import json
 
+        import omlx.server as server_module
+
+        monkeypatch.setattr(
+            server_module,
+            "_compile_grammar_for_request",
+            lambda *args, **kwargs: object(),
+        )
         mock_llm_engine.chat = AsyncMock(
             return_value=MockGenerationOutput(
                 text='```json\n{"city": "Seoul", "temp": 15}\n```',
@@ -2438,6 +2452,25 @@ class TestJsonOutputParsing:
         output_text = data["output"][0]["content"][0]["text"]
         parsed = json.loads(output_text)
         assert parsed == {"city": "Seoul", "temp": 15}
+
+    def test_responses_rejects_format_when_grammar_cannot_compile(
+        self, client, mock_llm_engine
+    ):
+        """text.format is a contract: refuse rather than ship non-matching JSON.
+
+        This deliberately differs from /v1/chat/completions, which warns and
+        degrades to prompt injection.
+        """
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Return weather JSON",
+                "text": {"format": {"type": "json_object"}},
+            },
+        )
+        assert response.status_code == 400
+        assert "text.format" in response.text
 
     def test_responses_without_format_unchanged(self, client, mock_llm_engine):
         """Responses API without text.format should return raw text."""

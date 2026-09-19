@@ -139,17 +139,16 @@ from .api.rerank_models import (
 )
 from .api.responses_models import (
     OutputItem,
-    ResponseObject,
     ResponsesRequest,
 )
 from .api.responses_utils import (
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
-    apply_namespace_tool_aliases,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
+    build_response_object,
     build_response_store_record,
     build_response_usage,
     convert_responses_input_to_messages,
@@ -157,7 +156,10 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
     split_namespace_tool_name,
+    validate_responses_request,
 )
+from .api.shared_models import IDPrefix, generate_id, get_unix_timestamp
+from .api.tool_bindings import ToolBindingRegistry, ensure_call_id
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallExtraction,
@@ -4856,6 +4858,25 @@ def _response_format_warning_header(response_format) -> str:
     return f'199 omlx "{text}"'
 
 
+def _unexposed_tools_warning_header(unexposed_tools: list[str]) -> str:
+    """Build an RFC 7234 ``Warning`` header for accepted-but-unexposed tools.
+
+    ``convert_responses_tools`` accepts a tool declaration oMLX cannot expose
+    (hosted/server-executed types such as ``web_search``, unknown types, nested
+    namespaces) and leaves it out of what the model sees.  Accepting the
+    declaration is safe -- an unused declaration cannot change the response --
+    but the degradation must not be silent, so the caller is told through the
+    same ``Warning`` mechanism the structured-output path uses (#3757).  The
+    labels are sanitised to header-safe characters where they are built.
+    """
+    listed = ", ".join(unexposed_tools)
+    text = (
+        f"tools accepted but not exposed to the model: {listed}; "
+        "oMLX cannot execute hosted tools and did not tell the model about them"
+    )
+    return f'199 omlx "{text}"'
+
+
 # =============================================================================
 # Streaming Helpers
 # =============================================================================
@@ -6886,6 +6907,10 @@ async def create_response(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
 
+    # Refuse unimplemented capabilities up front, before any model work, so a
+    # client never gets a success for a tool or mode the model never saw.
+    validate_responses_request(request)
+
     load_start = time.perf_counter()
     lease = _LLMEngineLease()
     try:
@@ -6923,11 +6948,23 @@ async def create_response(
             preserve_images=preserve_tool_images,
         )
 
-        # Convert tools: flat → nested. namespace_aliases maps each expanded
-        # namespace member's wire name back for the return path.
-        namespace_aliases: dict = {}
-        openai_tools = convert_responses_tools(request.tools, namespace_aliases)
-        apply_namespace_tool_aliases(messages, namespace_aliases)
+        # Convert tools: flat → nested. The registry is the one place both
+        # emission paths resolve a wire name back to its client-facing
+        # (namespace, name), so a namespace call round-trips intact (#3371).
+        # Declarations oMLX cannot expose are accepted and listed here so the
+        # degradation can be reported in a Warning header rather than failing
+        # the request or passing silently (#3757).
+        tool_bindings = ToolBindingRegistry()
+        unexposed_tools: list[str] = []
+        openai_tools = convert_responses_tools(
+            request.tools, tool_bindings, unexposed=unexposed_tools
+        )
+        tools_warning = (
+            _unexposed_tools_warning_header(unexposed_tools)
+            if unexposed_tools
+            else None
+        )
+        tool_bindings.apply_to_messages(messages)
         if (
             getattr(engine, "is_diffusion_model", False)
             and not getattr(engine, "supports_tool_calling", False)
@@ -6966,7 +7003,6 @@ async def create_response(
         # Handle text.format (structured output)
         response_format = None
         compiled_grammar = None
-        response_format_warning = None
         if request.text and request.text.format:
             fmt = request.text.format
             if fmt.type == "json_object":
@@ -6996,14 +7032,18 @@ async def create_response(
                     reasoning_parser=reasoning_parser,
                 )
                 if compiled_grammar is None:
-                    # Non-strict formats still degrade to prompt injection, so
-                    # surface it to the caller with the same Warning response
-                    # header /v1/chat/completions uses; the log line alone only
-                    # ever reaches the operator (#1241).
-                    response_format_warning = _response_format_warning_header(rf)
-                    json_instruction = build_json_system_prompt(rf)
-                    if json_instruction:
-                        messages = _inject_json_instruction(messages, json_instruction)
+                    # Unlike /v1/chat/completions, which warns and degrades to
+                    # prompt injection, Responses refuses: text.format is an
+                    # explicit output contract, and returning text that need not
+                    # satisfy the schema is worse than a clear error.
+                    raise InvalidRequestError(
+                        "text.format could not be enforced for this model: no "
+                        "grammar could be compiled, so the output would not "
+                        "reliably match the requested schema. Remove "
+                        "text.format or use a model that supports structured "
+                        "output here.",
+                        field="text.format",
+                    )
             else:
                 compiled_grammar = None
 
@@ -7174,8 +7214,8 @@ async def create_response(
 
         if request.stream:
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
-            if response_format_warning:
-                sse_headers["Warning"] = response_format_warning
+            if tools_warning:
+                sse_headers["Warning"] = tools_warning
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -7190,7 +7230,7 @@ async def create_response(
                                 resolved_model=resolved_model,
                                 response_format=response_format,
                                 native_reasoning=native_reasoning,
-                                namespace_aliases=namespace_aliases,
+                                tool_bindings=tool_bindings,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -7300,19 +7340,20 @@ async def create_response(
                         name = tc.function.name
                         arguments = tc.function.arguments
                     elif isinstance(tc, dict):
-                        call_id = tc.get(
-                            "call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                        )
+                        call_id = ensure_call_id(tc.get("call_id") or tc.get("id"))
                         name = tc.get("name", "")
                         arguments = tc.get("arguments", "{}")
                     else:
-                        continue
-                    namespace, name = split_namespace_tool_name(name, namespace_aliases)
+                        raise InvalidRequestError(
+                            "Tool-call parser returned an unsupported entry.",
+                            field="tools",
+                        )
+                    namespace, name = split_namespace_tool_name(name, tool_bindings)
                     output_items.append(
                         build_function_call_output_item(
                             name=name,
                             arguments=arguments,
-                            call_id=call_id,
+                            call_id=ensure_call_id(call_id),
                             namespace=namespace,
                         )
                     )
@@ -7331,18 +7372,15 @@ async def create_response(
             # incomplete turn from a natural stop. The Responses API has no
             # finish_reason field; status + incomplete_details is the signal.
             truncated = getattr(output, "finish_reason", None) == "length"
-            response_obj = ResponseObject(
-                model=request.model,
-                status="incomplete" if truncated else "completed",
-                output=output_items,
+            response_obj = build_response_object(
+                request,
+                response_id=generate_id(IDPrefix.RESPONSE),
+                created_at=get_unix_timestamp(),
+                output_items=output_items,
                 usage=usage,
-                tools=request.tools or [],
-                tool_choice=request.tool_choice or "auto",
+                truncated=truncated,
                 temperature=temperature,
                 top_p=top_p,
-                max_output_tokens=request.max_output_tokens,
-                previous_response_id=request.previous_response_id,
-                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
             )
 
             # Store response
@@ -7354,11 +7392,11 @@ async def create_response(
 
             return response_obj.model_dump_json()
 
-        json_headers = (
-            {"Warning": response_format_warning} if response_format_warning else None
-        )
         return await _json_response_or_keepalive(
-            http_request, _build_responses_api(), lease=lease, headers=json_headers
+            http_request,
+            _build_responses_api(),
+            lease=lease,
+            headers={"Warning": tools_warning} if tools_warning else None,
         )
 
     except BaseException:
@@ -7376,12 +7414,10 @@ async def stream_responses_api(
     resolved_model: Optional[str] = None,
     response_format=None,
     native_reasoning: bool = False,
-    namespace_aliases: Optional[dict] = None,
+    tool_bindings: Optional[ToolBindingRegistry] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
-    from .api.shared_models import IDPrefix, generate_id
-
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
@@ -7418,18 +7454,18 @@ async def stream_responses_api(
     reasoning_output_index: Optional[int] = None  # captured when reasoning opens
     msg_output_index: Optional[int] = None  # captured when message opens
 
-    # Build initial response object (in_progress, empty output)
-    initial_response = ResponseObject(
-        id=response_id,
-        model=request.model,
+    # Build the opening snapshot from the same envelope builder as the terminal
+    # event, so response.created/in_progress echo the same request fields.
+    initial_response = build_response_object(
+        request,
+        response_id=response_id,
+        created_at=get_unix_timestamp(),
+        output_items=[],
+        usage=None,
+        truncated=False,
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
         status="in_progress",
-        output=[],
-        tools=request.tools or [],
-        tool_choice=request.tool_choice or "auto",
-        temperature=request.temperature,
-        top_p=request.top_p,
-        max_output_tokens=request.max_output_tokens,
-        previous_response_id=request.previous_response_id,
     )
     initial_data = initial_response.model_dump(exclude_none=True)
 
@@ -7518,6 +7554,22 @@ async def stream_responses_api(
                 },
             )
         )
+        # Close the raw-reasoning channel opened by reasoning_text.delta so a
+        # client listening to that channel sees a complete part.
+        seq += 1
+        events.append(
+            format_sse_event(
+                "response.reasoning_text.done",
+                {
+                    "type": "response.reasoning_text.done",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_output_index,
+                    "content_index": 0,
+                    "text": reasoning_text,
+                    "sequence_number": seq,
+                },
+            )
+        )
         seq += 1
         events.append(
             format_sse_event(
@@ -7544,6 +7596,20 @@ async def stream_responses_api(
                         "id": reasoning_id,
                         "status": "completed",
                         "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        # Same dual shape as build_reasoning_output_item, so the
+                        # item a streamed response ends on matches the one a
+                        # non-streamed response returns.
+                        "content": (
+                            [
+                                {
+                                    "type": "reasoning_text",
+                                    "text": reasoning_text,
+                                    "annotations": [],
+                                }
+                            ]
+                            if reasoning_text
+                            else []
+                        ),
                     },
                     "sequence_number": seq,
                 },
@@ -7609,6 +7675,24 @@ async def stream_responses_api(
                     "item_id": reasoning_id,
                     "output_index": reasoning_output_index,
                     "summary_index": 0,
+                    "delta": delta,
+                    "sequence_number": seq,
+                },
+            )
+        )
+        # The same text on the raw-reasoning channel. Clients differ in which
+        # one they listen to: OpenAI's hosts publish summaries, while
+        # Responses-dialect clients such as @ai-sdk/open-responses read
+        # response.reasoning_text.delta and show nothing without it.
+        seq += 1
+        events.append(
+            format_sse_event(
+                "response.reasoning_text.delta",
+                {
+                    "type": "response.reasoning_text.delta",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_output_index,
+                    "content_index": 0,
                     "delta": delta,
                     "sequence_number": seq,
                 },
@@ -7929,6 +8013,13 @@ async def stream_responses_api(
                 "id": reasoning_id,
                 "status": "completed",
                 "summary": [{"type": "summary_text", "text": reasoning_text}],
+                "content": [
+                    {
+                        "type": "reasoning_text",
+                        "text": reasoning_text,
+                        "annotations": [],
+                    }
+                ],
             }
         )
     output_items.append(
@@ -7950,15 +8041,16 @@ async def stream_responses_api(
                 name = tc.function.name
                 arguments = tc.function.arguments
             elif isinstance(tc, dict):
-                call_id = tc.get(
-                    "call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                )
+                call_id = ensure_call_id(tc.get("call_id") or tc.get("id"))
                 name = tc.get("name", "")
                 arguments = tc.get("arguments", "{}")
             else:
-                continue
+                raise InvalidRequestError(
+                    "Tool-call parser returned an unsupported entry.",
+                    field="tools",
+                )
 
-            namespace, name = split_namespace_tool_name(name, namespace_aliases)
+            namespace, name = split_namespace_tool_name(name, tool_bindings)
             fc_id = generate_id(IDPrefix.FUNCTION_CALL)
             fc_item = {
                 "type": "function_call",
@@ -8094,28 +8186,16 @@ async def stream_responses_api(
     # 13. Emit the terminal event matching the final response status.
     truncated = getattr(last_output, "finish_reason", None) == "length"
     terminal_event = "response.incomplete" if truncated else "response.completed"
-    final_response = {
-        "id": response_id,
-        "object": "response",
-        "created_at": initial_response.created_at,
-        "model": request.model,
-        "status": "incomplete" if truncated else "completed",
-        "output": output_items,
-        "usage": usage_data,
-        "tool_choice": request.tool_choice or "auto",
-        "tools": (
-            [t.model_dump(exclude_none=True) for t in request.tools]
-            if request.tools
-            else []
-        ),
-        "temperature": request.temperature,
-        "top_p": request.top_p,
-        "max_output_tokens": request.max_output_tokens,
-    }
-    if truncated:
-        final_response["incomplete_details"] = {"reason": "max_output_tokens"}
-    if request.previous_response_id:
-        final_response["previous_response_id"] = request.previous_response_id
+    final_response = build_response_object(
+        request,
+        response_id=response_id,
+        created_at=initial_response.created_at,
+        output_items=output_items,
+        usage=usage_data,
+        truncated=truncated,
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
+    ).model_dump(exclude_none=True)
 
     seq += 1
     yield format_sse_event(

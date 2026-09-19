@@ -5273,3 +5273,354 @@ def test_responses_namespace_tool_continuation(
             for call in message.get("tool_calls", [])
         ] == ["mcp__demo", "mcp__other"]
     client.close()
+
+
+# =============================================================================
+# Responses API: streaming / non-streaming semantic parity and loud failures
+# =============================================================================
+
+
+def _responses_events(response) -> list[dict]:
+    return [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def _canonicalize(node, ids: dict):
+    """Normalize a response for parity comparison.
+
+    Generated ids differ between two runs of the same request, so they are
+    dropped (and call ids mapped to encounter-order placeholders); ``null`` and
+    an absent key are treated as the same thing, which is the one place the
+    streaming (``exclude_none``) and non-streaming envelopes differ by design.
+    """
+    if isinstance(node, dict):
+        result = {}
+        for key in sorted(node):
+            value = node[key]
+            if value is None:
+                continue
+            if key in ("id", "created_at", "sequence_number", "call_id"):
+                if key == "call_id" and isinstance(value, str):
+                    result[key] = ids.setdefault(value, f"call#{len(ids)}")
+                continue
+            result[key] = _canonicalize(value, ids)
+        return result
+    if isinstance(node, list):
+        return [_canonicalize(item, ids) for item in node]
+    return node
+
+
+def _response_completed(response) -> dict:
+    return next(
+        event["response"]
+        for event in _responses_events(response)
+        if event.get("type") == "response.completed"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Hello there",
+        "<think>Need to reason.</think>The answer is 42.",
+        '<tool_call>{"name": "get_weather", '
+        '"arguments": {"city": "Paris"}}</tool_call>',
+        "<think>Check.</think>"
+        '<tool_call>{"name": "get_weather", '
+        '"arguments": {"city": "Paris"}}</tool_call>',
+    ],
+)
+def test_responses_stream_nonstream_semantic_parity(monkeypatch, body):
+    """Aggregated stream and non-stream bodies must be semantically equal."""
+    client = _responses_tool_call_client(monkeypatch, body)
+    payload = {
+        "model": "test-model",
+        "input": "What is the weather in Paris?",
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    nonstream = client.post("/v1/responses", json={**payload, "stream": False})
+    stream = client.post("/v1/responses", json={**payload, "stream": True})
+    assert nonstream.status_code == 200, nonstream.text
+    assert stream.status_code == 200, stream.text
+
+    assert _canonicalize(_response_completed(stream), {}) == _canonicalize(
+        nonstream.json(), {}
+    )
+    client.close()
+
+
+def test_responses_stream_event_order_and_delta_done_pairing(monkeypatch):
+    """Event order, item ids and delta/done pairs a streaming client relies on."""
+    client = _responses_tool_call_client(
+        monkeypatch, "<think>Need to reason.</think>Final answer."
+    )
+    response = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "Hi", "stream": True},
+    )
+    assert response.status_code == 200, response.text
+    events = _responses_events(response)
+    types = [event["type"] for event in events]
+
+    summary_delta = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.reasoning_summary_text.delta"
+    )
+    assert summary_delta == "Need to reason."
+    summary_done = next(
+        event
+        for event in events
+        if event["type"] == "response.reasoning_summary_text.done"
+    )
+    assert summary_done["text"] == summary_delta
+    raw_delta = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.reasoning_text.delta"
+    )
+    assert raw_delta == summary_delta
+    raw_done = next(
+        event for event in events if event["type"] == "response.reasoning_text.done"
+    )
+    assert raw_done["text"] == raw_delta
+
+    text_delta = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.output_text.delta"
+    )
+    assert text_delta == "Final answer."
+    text_done = next(
+        event for event in events if event["type"] == "response.output_text.done"
+    )
+    assert text_done["text"] == text_delta
+
+    # The message item opens only after reasoning has closed.
+    message_added = next(
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "response.output_item.added"
+        and event["item"]["type"] == "message"
+    )
+    assert types.index("response.reasoning_summary_text.done") < message_added
+    assert types[-1] == "response.completed"
+
+    reasoning_done = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "reasoning"
+    )
+    message_done = next(
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "message"
+    )
+    # Ids are stable across the delta, done and item.done events.
+    assert summary_done["item_id"] == reasoning_done["item"]["id"]
+    assert raw_done["item_id"] == reasoning_done["item"]["id"]
+    assert text_done["item_id"] == message_done["item"]["id"]
+    # Output indexes increase and are the ones the item events reported.
+    assert reasoning_done["output_index"] == 0
+    assert message_done["output_index"] == 1
+    assert text_done["output_index"] == message_done["output_index"]
+    assert text_done["content_index"] == 0
+    assert reasoning_done["item"]["summary"][0]["text"] == summary_delta
+    assert reasoning_done["item"]["content"][0]["text"] == summary_delta
+    client.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "tool,needle",
+    [
+        ({"type": "local_shell"}, "local_shell (hosted)"),
+        ({"type": "web_search"}, "web_search (hosted)"),
+        ({"type": "web_search_preview"}, "web_search_preview (hosted)"),
+        ({"type": "file_search", "vector_store_ids": ["vs_1"]}, "file_search (hosted)"),
+        ({"type": "mcp", "server_label": "demo"}, "mcp (hosted)"),
+        ({"type": "computer_use_preview"}, "computer_use_preview (hosted)"),
+        ({"type": "code_interpreter", "container": {"type": "auto"}},
+         "code_interpreter (hosted)"),
+        ({"type": "image_generation"}, "image_generation (hosted)"),
+        ({"type": "custom", "name": "free_form"}, "custom (hosted)"),
+        ({"type": "some_future_tool"}, "some_future_tool (unknown type)"),
+    ],
+)
+def test_responses_unsupported_tool_declarations_are_accepted_with_warning(
+    monkeypatch, stream, tool, needle
+):
+    """A declared hosted tool must not 400; it is named in a Warning header.
+
+    Codex 0.154 declares ``web_search`` in every session, so a 400 here made a
+    real client unusable. The declaration is accepted but never exposed to the
+    model, and the degradation is reported on both the streaming and
+    non-streaming paths (the stream carries headers with the SSE response).
+    """
+    client = _responses_tool_call_client(monkeypatch, "I cannot.")
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "stream": stream,
+            "tools": [tool],
+        },
+    )
+    assert response.status_code == 200, response.text
+    warning = response.headers.get("warning")
+    assert warning is not None, response.headers
+    assert warning.startswith('199 omlx "'), warning
+    assert needle in warning, warning
+    client.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_codex_tool_list_with_web_search_succeeds(monkeypatch, stream):
+    """The Codex 0.154 shape -- functions + namespace + web_search -- works.
+
+    This is the regression the policy change exists for: the session must
+    complete with its function tool still exposed, and the hosted declaration
+    must be named in the Warning rather than failing the request.
+    """
+    client = _responses_tool_call_client(
+        monkeypatch,
+        '<tool_call>{"name": "exec_command", '
+        '"arguments": {"cmd": "echo hi"}}</tool_call>',
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "run echo hi",
+            "stream": stream,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+                {"type": "namespace", "name": "multi_agent_v1", "tools": []},
+                {"type": "web_search"},
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    warning = response.headers.get("warning", "")
+    assert "web_search (hosted)" in warning, warning
+    items = _response_output_items(response, stream)
+    calls = [item for item in items if item["type"] == "function_call"]
+    assert [call["name"] for call in calls] == ["exec_command"]
+    client.close()
+
+
+@pytest.mark.parametrize(
+    "item_type",
+    [
+        "web_search_call",
+        "computer_call",
+        "file_search_call",
+        "mcp_call",
+        "image_generation_call",
+        "code_interpreter_call",
+        "local_shell_call",
+        "custom_tool_call",
+        "item_reference",
+    ],
+)
+def test_responses_unsupported_input_items_fail_loudly(monkeypatch, item_type):
+    client = _responses_tool_call_client(monkeypatch, "ok")
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": item_type},
+            ],
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert item_type in response.text
+    client.close()
+
+
+@pytest.mark.parametrize(
+    "payload,field",
+    [
+        ({"tool_choice": "required"}, "tool_choice"),
+        ({"tool_choice": {"type": "function", "name": "fn"}}, "tool_choice"),
+        ({"tool_choice": "sometimes"}, "tool_choice"),
+        ({"truncation": "auto"}, "truncation"),
+        ({"parallel_tool_calls": False}, "parallel_tool_calls"),
+        ({"background": True}, "background"),
+        ({"max_tool_calls": 2}, "max_tool_calls"),
+        ({"top_logprobs": 3}, "top_logprobs"),
+        ({"include": ["file_search_call.results"]}, "include"),
+    ],
+)
+def test_responses_unimplemented_capabilities_fail_loudly(
+    monkeypatch, payload, field
+):
+    client = _responses_tool_call_client(monkeypatch, "ok")
+    response = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", **payload},
+    )
+    assert response.status_code == 400, response.text
+    assert field in response.text
+    client.close()
+
+
+def test_responses_accepts_documented_noops(monkeypatch):
+    """Fields that provably do not change semantics are accepted, not refused."""
+    client = _responses_tool_call_client(monkeypatch, "ok")
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "truncation": "disabled",
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "include": ["reasoning.encrypted_content"],
+            "service_tier": "auto",
+            "prompt_cache_key": "k",
+            "user": "u",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["truncation"] == "disabled"
+    client.close()
+
+
+def test_responses_invalid_previous_response_id_is_404(monkeypatch):
+    client = _responses_tool_call_client(monkeypatch, "ok")
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "previous_response_id": "resp_does_not_exist",
+        },
+    )
+    assert response.status_code == 404, response.text
+    client.close()
