@@ -144,20 +144,36 @@ class TestVLMEngineSpecPrefillForwarding:
         engine._engine._mlx_executor = ThreadPoolExecutor(max_workers=1)
         engine._engine.generate = AsyncMock(return_value=self._fake_output())
 
-        # VLM prompts are pre-tokenized (list[int]) by _process_chat_messages;
-        # full_tokens = len(prompt) = 10, non_system_tokens = 4, so
-        # system_end = 10 - 4 = 6.
-        engine._tokenizer = MagicMock()
-        engine._tokenizer.apply_chat_template.return_value = "USER_ONLY"
-        engine._tokenizer.encode.side_effect = lambda text, **kwargs: [0] * 4
+        # The boundary is measured against the rendered prompt, so the fake
+        # template has to render like a real one: a static leading block, then
+        # the conversation. See tests/test_specprefill_boundary.py for the full
+        # matrix; here we only check the engine wires it up and that the
+        # protected prefix actually covers the system text.
+        static_block = "<sys> you are helpful </sys>"
 
-        def _mock_process(messages, tools, kwargs):
-            return list(range(10)), None, None, None, 0, []
+        def fake_template(msgs, *args, **kwargs):
+            parts = [static_block]
+            for m in msgs:
+                if m["role"] in ("system", "developer"):
+                    continue
+                parts.append(f"<{m['role']}> {m['content']} </{m['role']}>")
+            return " ".join(parts)
+
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.encode.side_effect = lambda text, **kwargs: [
+            hash(piece) % 5000 for piece in text.split()
+        ]
+        engine._apply_chat_template = fake_template
 
         messages = [
             {"role": "system", "content": "you are helpful"},
             {"role": "user", "content": "hello"},
         ]
+        prompt_ids = engine._tokenizer.encode(fake_template(messages))
+
+        def _mock_process(messages_, tools_, kwargs_):
+            return prompt_ids, None, None, None, 0, []
+
         try:
             with patch.object(engine, "_process_chat_messages", side_effect=_mock_process):
                 await engine.chat(messages)
@@ -165,7 +181,9 @@ class TestVLMEngineSpecPrefillForwarding:
             engine._engine._mlx_executor.shutdown(wait=False)
 
         call_kwargs = engine._engine.generate.call_args.kwargs
-        assert call_kwargs["specprefill_system_end"] == 6
+        system_end = call_kwargs["specprefill_system_end"]
+        assert system_end >= len(engine._tokenizer.encode(static_block))
+        assert system_end < len(prompt_ids)
 
     @pytest.mark.asyncio
     async def test_chat_skips_system_end_when_specprefill_disabled(self):
