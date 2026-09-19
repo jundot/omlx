@@ -359,6 +359,7 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_draft_quant_activation_bits",
     "dflash_draft_quant_group_size",
     "dflash_max_ctx",
+    "dflash_min_tokens_per_cycle",
     "dflash_in_memory_cache",
     "dflash_in_memory_cache_max_entries",
     "dflash_in_memory_cache_max_bytes",

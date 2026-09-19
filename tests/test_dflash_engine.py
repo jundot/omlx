@@ -26,6 +26,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_draft_quant_activation_bits is None
         assert settings.dflash_draft_quant_group_size is None
         assert settings.dflash_max_ctx is None
+        assert settings.dflash_min_tokens_per_cycle is None
         assert settings.dflash_in_memory_cache is True
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
@@ -554,6 +555,110 @@ class TestDFlashEngineInit:
         )
         assert engine._should_fallback([0] * 4095) is False
         assert engine._should_fallback([0] * 4096) is True
+
+    @staticmethod
+    def _dflash_module():
+        """Import the engine module, skipping when dflash-mlx is absent."""
+        try:
+            from omlx.engine import dflash
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        return dflash
+
+    @staticmethod
+    def _spec_summary(tokens_per_cycle):
+        """Minimal SummaryEvent stand-in for _record_speculation_summary."""
+        gen_tokens, accepted = 100, 20
+        return SimpleNamespace(
+            generation_tokens=gen_tokens,
+            cycles_completed=10,
+            acceptance_ratio=accepted / gen_tokens,
+            accepted_from_draft=accepted,
+            tokens_per_cycle=tokens_per_cycle,
+            fallback_ar=False,
+        )
+
+    def test_speculation_fallback_stays_off_when_threshold_unset(self):
+        """An unset min_tokens_per_cycle must reproduce the original behaviour."""
+        dflash = self._dflash_module()
+        engine = dflash.DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_min_tokens_per_cycle=None),
+        )
+        for _ in range(dflash._SPEC_FALLBACK_WINDOW + 2):
+            engine._record_speculation_summary(self._spec_summary(0.0))
+        assert engine._should_fallback([0] * 10) is False
+
+    def test_speculation_fallback_waits_for_a_full_window(self):
+        """The handoff evicts the draft model until reload, so a window is required."""
+        dflash = self._dflash_module()
+        engine = dflash.DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_min_tokens_per_cycle=1.5),
+        )
+        for _ in range(dflash._SPEC_FALLBACK_MIN_SAMPLES - 1):
+            engine._record_speculation_summary(self._spec_summary(1.0))
+        assert engine._should_fallback([0] * 10) is False
+
+        engine._record_speculation_summary(self._spec_summary(1.0))
+        assert engine._should_fallback([0] * 10) is True
+
+    def test_speculation_fallback_keeps_dflash_while_speculation_pays(self):
+        dflash = self._dflash_module()
+        engine = dflash.DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_min_tokens_per_cycle=1.5),
+        )
+        for _ in range(dflash._SPEC_FALLBACK_WINDOW + 2):
+            engine._record_speculation_summary(self._spec_summary(3.0))
+        assert engine._should_fallback([0] * 10) is False
+
+    def test_speculation_fallback_clears_once_low_samples_age_out(self):
+        dflash = self._dflash_module()
+        engine = dflash.DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_min_tokens_per_cycle=1.5),
+        )
+        for _ in range(dflash._SPEC_FALLBACK_WINDOW):
+            engine._record_speculation_summary(self._spec_summary(1.0))
+        assert engine._should_fallback([0] * 10) is True
+
+        for _ in range(dflash._SPEC_FALLBACK_WINDOW):
+            engine._record_speculation_summary(self._spec_summary(3.0))
+        assert engine._should_fallback([0] * 10) is False
+
+    def test_context_fallback_wins_over_speculation_reason(self):
+        """A long prompt reports the context trigger, not the profitability one."""
+        dflash = self._dflash_module()
+        engine = dflash.DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_max_ctx=4096,
+                dflash_min_tokens_per_cycle=1.5,
+            ),
+        )
+        for _ in range(dflash._SPEC_FALLBACK_WINDOW):
+            engine._record_speculation_summary(self._spec_summary(1.0))
+
+        assert engine._should_fallback([0] * 4096) is True
+        assert engine._fallback_reason([0] * 4096) == "context 4096 >= 4096"
+        assert engine._fallback_reason([0] * 10) == (
+            "speculation unprofitable: mean 1.00 tokens/cycle < 1.5"
+        )
+
+    def test_fallback_reason_is_none_when_dflash_should_keep_serving(self):
+        dflash = self._dflash_module()
+        engine = dflash.DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(),
+        )
+        assert engine._fallback_reason([0] * 10_000) is None
 
     def test_build_quant_spec(self):
         try:

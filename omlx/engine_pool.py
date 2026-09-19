@@ -939,6 +939,10 @@ class EnginePool:
                     data.get("dflash_draft_quant_group_size", 64),
                 )
             add("dflash_max_ctx", data.get("dflash_max_ctx"))
+            add(
+                "dflash_min_tokens_per_cycle",
+                data.get("dflash_min_tokens_per_cycle"),
+            )
             add("dflash_in_memory_cache", data.get("dflash_in_memory_cache", True))
             add(
                 "dflash_in_memory_cache_max_entries",

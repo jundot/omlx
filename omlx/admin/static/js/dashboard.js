@@ -58,6 +58,7 @@
         'dflash_draft_quant_activation_bits',
         'dflash_draft_quant_group_size',
         'dflash_max_ctx',
+        'dflash_min_tokens_per_cycle',
         'dflash_in_memory_cache',
         'dflash_in_memory_cache_max_entries',
         'dflash_in_memory_cache_max_bytes',
@@ -1925,6 +1926,7 @@
                     dflash_draft_quant_activation_bits: s.dflash_draft_quant_activation_bits || 16,
                     dflash_draft_quant_group_size: s.dflash_draft_quant_group_size || 64,
                     dflash_max_ctx: s.dflash_max_ctx ?? null,
+                    dflash_min_tokens_per_cycle: s.dflash_min_tokens_per_cycle ?? null,
                     dflash_in_memory_cache: s.dflash_in_memory_cache !== false,
                     dflash_in_memory_cache_max_entries: s.dflash_in_memory_cache_max_entries || 4,
                     dflash_in_memory_cache_max_gib: s.dflash_in_memory_cache_max_bytes
@@ -2931,6 +2933,9 @@
                                 dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
                                     ? parseInt(this.modelSettings.dflash_max_ctx)
                                     : null,
+                                dflash_min_tokens_per_cycle: this.modelSettings.dflash_enabled && this.modelSettings.dflash_min_tokens_per_cycle
+                                    ? parseFloat(this.modelSettings.dflash_min_tokens_per_cycle)
+                                    : null,
                                 dflash_in_memory_cache: this.modelSettings.dflash_enabled
                                     ? !!this.modelSettings.dflash_in_memory_cache
                                     : true,
@@ -3021,6 +3026,7 @@
                                     dflash_draft_quant_activation_bits: null,
                                     dflash_draft_quant_group_size: null,
                                     dflash_max_ctx: null,
+                                    dflash_min_tokens_per_cycle: null,
                                     dflash_in_memory_cache: true,
                                     dflash_in_memory_cache_max_entries: 4,
                                     dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
@@ -3281,6 +3287,7 @@
                         this.modelSettings.dflash_draft_quant_activation_bits = null;
                         this.modelSettings.dflash_draft_quant_group_size = null;
                         this.modelSettings.dflash_max_ctx = null;
+                        this.modelSettings.dflash_min_tokens_per_cycle = null;
                         this.modelSettings.dflash_in_memory_cache = true;
                         this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;

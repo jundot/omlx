@@ -7,6 +7,8 @@ Silicon for Qwen, Gemma4, and Laguna model families. By default it serves all
 requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
 evicting the dflash models and delegating long-context requests to omlx's
 BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
+``model_settings.dflash_min_tokens_per_cycle`` opts into the same handoff when
+speculation measures as unprofitable instead of merely long.
 """
 
 import asyncio
@@ -18,6 +20,7 @@ import math
 import re
 import threading
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -49,6 +52,13 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 _EXECUTOR_DRAIN_TIMEOUT = 10.0
+
+# Rolling window behind the speculation-profitability fallback.
+# Tokens-per-cycle is noisy per request (an answer that ends mid-block reports a
+# short final cycle), and the verdict evicts the draft model for the rest of the
+# model's residency, so it needs several consecutive samples before it may fire.
+_SPEC_FALLBACK_WINDOW = 8
+_SPEC_FALLBACK_MIN_SAMPLES = 4
 
 
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
@@ -297,6 +307,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     from memory and delegates to a fallback engine (BatchedEngine or
     VLMBatchedEngine) that provides paged cache, SSD cache, and continuous
     batching.
+
+    The same handoff also runs when ``model_settings.dflash_min_tokens_per_cycle``
+    is set and measured speculation falls below it, so a draft pair that cannot
+    pay for its own verify overhead on this machine stops being used. Both
+    triggers share ``_should_fallback``; leaving both settings unset reproduces
+    the original serve-everything-through-dflash behaviour.
     """
 
     def __init__(
@@ -376,9 +392,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             "accepted_draft_tokens": 0,
             "cycles": 0,
         }
+        self._spec_tokens_per_cycle: deque[float] = deque(
+            maxlen=_SPEC_FALLBACK_WINDOW
+        )
 
         self._max_dflash_ctx = (
             getattr(model_settings, "dflash_max_ctx", None) if model_settings else None
+        )
+        self._min_tokens_per_cycle = (
+            getattr(model_settings, "dflash_min_tokens_per_cycle", None)
+            if model_settings
+            else None
         )
         self._in_memory_cache_enabled = (
             bool(getattr(model_settings, "dflash_in_memory_cache", True))
@@ -1078,10 +1102,59 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         return True
         return False
 
+    def _fallback_reason(self, prompt_tokens: list[int]) -> str | None:
+        """Why this request must leave dflash, or None to keep serving it.
+
+        Two independent, individually opt-in triggers:
+
+        * ``dflash_max_ctx`` — the prompt is long enough that verifying a block
+          against a large KV cache stops paying for itself.
+        * ``dflash_min_tokens_per_cycle`` — speculation measures as too weak to
+          pay for the draft/verify overhead at all (#2604, #2632).
+
+        ``_should_fallback`` is the boolean view of this. The call sites read
+        the reason only to label a handoff that is already happening.
+        """
+        if (
+            self._max_dflash_ctx is not None
+            and len(prompt_tokens) >= self._max_dflash_ctx
+        ):
+            return f"context {len(prompt_tokens)} >= {self._max_dflash_ctx}"
+        if self._speculation_unprofitable():
+            return (
+                f"speculation unprofitable: mean {self._mean_tokens_per_cycle():.2f} "
+                f"tokens/cycle < {self._min_tokens_per_cycle}"
+            )
+        return None
+
     def _should_fallback(self, prompt_tokens: list[int]) -> bool:
-        if self._max_dflash_ctx is None:
+        # The single decision point for leaving dflash. Engine paths and tests
+        # patch this method, so every trigger must resolve through it.
+        return self._fallback_reason(prompt_tokens) is not None
+
+    def _spec_tokens_per_cycle_samples(self) -> list[float]:
+        with self._spec_stats_lock:
+            return list(self._spec_tokens_per_cycle)
+
+    def _mean_tokens_per_cycle(self) -> float:
+        samples = self._spec_tokens_per_cycle_samples()
+        return sum(samples) / len(samples) if samples else 0.0
+
+    def _speculation_unprofitable(self) -> bool:
+        """True when recent requests show speculation cannot pay for itself.
+
+        DFlash commits ``tokens_per_cycle`` tokens per target verify pass where
+        plain decoding commits one, so a mean below the configured threshold
+        means the draft and verify work buys back nothing. A full window is
+        required because the handoff evicts the draft model until the next
+        reload: one noisy request must never trigger it.
+        """
+        if self._min_tokens_per_cycle is None:
             return False
-        return len(prompt_tokens) >= self._max_dflash_ctx
+        samples = self._spec_tokens_per_cycle_samples()
+        if len(samples) < _SPEC_FALLBACK_MIN_SAMPLES:
+            return False
+        return (sum(samples) / len(samples)) < self._min_tokens_per_cycle
 
     def _get_think_token_id(self, attr: str) -> int | None:
         """Safely read think_start_id / think_end_id from the tokenizer."""
@@ -1438,9 +1511,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if self._should_fallback(prompt_tokens):
             async with self._fallback_lock:
                 if not self._in_fallback_mode:
+                    reason = (
+                        self._fallback_reason(prompt_tokens) or "configured trigger"
+                    )
                     logger.info(
-                        f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                        f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                        f"DFlash fallback ({reason}): evicting dflash models and "
+                        f"switching to {self._fallback_engine_type} engine"
                     )
                     await self._evict_dflash_and_start_fallback()
             return await self._fallback_engine.generate(
@@ -1675,9 +1751,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if self._should_fallback(prompt_tokens):
             async with self._fallback_lock:
                 if not self._in_fallback_mode:
+                    reason = (
+                        self._fallback_reason(prompt_tokens) or "configured trigger"
+                    )
                     logger.info(
-                        f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                        f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                        f"DFlash fallback ({reason}): evicting dflash models and "
+                        f"switching to {self._fallback_engine_type} engine"
                     )
                     await self._evict_dflash_and_start_fallback()
             async for output in self._fallback_engine.stream_generate(
@@ -2125,6 +2204,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             self._spec_totals["generation_tokens"] += gen_tokens
             self._spec_totals["accepted_draft_tokens"] += accepted
             self._spec_totals["cycles"] += cycles
+            self._spec_tokens_per_cycle.append(tokens_per_cycle)
 
     def get_speculation_stats(self) -> dict[str, Any] | None:
         """Session speculation counters for the admin dashboard.

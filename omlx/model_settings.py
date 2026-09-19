@@ -254,6 +254,8 @@ class ModelSettings:
         dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
         dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
         dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
+        dflash_min_tokens_per_cycle: Fall back to BatchedEngine when the rolling mean
+            tokens per verify cycle stays below this (None = never).
         dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
@@ -405,6 +407,9 @@ class ModelSettings:
     dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
     dflash_max_ctx: Optional[int] = (
         None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    )
+    dflash_min_tokens_per_cycle: Optional[float] = (
+        None  # None = never; same fallback when speculation measures below this
     )
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)

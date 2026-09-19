@@ -1366,6 +1366,12 @@
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_max_ctx_hint') }}</p>
                                         </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_min_tokens_per_cycle') }}</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_min_tokens_per_cycle" min="0" step="0.1" placeholder="{{ t('modal.model_settings.dflash_min_tokens_per_cycle_placeholder') }}"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_min_tokens_per_cycle_hint') }}</p>
+                                        </div>
                                         <div class="pt-2 border-t border-neutral-200 space-y-3">
                                             <p class="text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('modal.model_settings.dflash_long_context_tuning') }}</p>
                                             <div class="grid grid-cols-2 gap-3">

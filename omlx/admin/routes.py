@@ -359,6 +359,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_quant_activation_bits: int | None = None
     dflash_draft_quant_group_size: int | None = None
     dflash_max_ctx: int | None = None
+    dflash_min_tokens_per_cycle: float | None = None
     dflash_in_memory_cache: bool | None = None
     dflash_in_memory_cache_max_entries: int | None = None
     dflash_in_memory_cache_max_bytes: int | None = None
@@ -900,6 +901,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_quant_activation_bits",
         "dflash_draft_quant_group_size",
         "dflash_max_ctx",
+        "dflash_min_tokens_per_cycle",
         "dflash_draft_window_size",
         "dflash_draft_sink_size",
         "dflash_block_size",
@@ -1006,6 +1008,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_quant_activation_bits = None
     settings.dflash_draft_quant_group_size = None
     settings.dflash_max_ctx = None
+    settings.dflash_min_tokens_per_cycle = None
     settings.dflash_in_memory_cache = True
     settings.dflash_in_memory_cache_max_entries = 4
     settings.dflash_in_memory_cache_max_bytes = 8 * 1024 * 1024 * 1024
@@ -3087,6 +3090,12 @@ async def update_model_settings(
         # 0/None means "unlimited" — the engine treats None as no fallback threshold
         value = request.dflash_max_ctx
         current_settings.dflash_max_ctx = value if value and value > 0 else None
+    if "dflash_min_tokens_per_cycle" in sent:
+        # <=0/None means "never" — the engine treats None as no profitability guard
+        value = request.dflash_min_tokens_per_cycle
+        current_settings.dflash_min_tokens_per_cycle = (
+            float(value) if value and value > 0 else None
+        )
     if "dflash_in_memory_cache" in sent:
         current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
     if "dflash_in_memory_cache_max_entries" in sent:
@@ -3396,6 +3405,7 @@ async def update_model_settings(
         or "dflash_draft_quant_activation_bits" in sent
         or "dflash_draft_quant_group_size" in sent
         or "dflash_max_ctx" in sent
+        or "dflash_min_tokens_per_cycle" in sent
         or "dflash_in_memory_cache" in sent
         or "dflash_in_memory_cache_max_entries" in sent
         or "dflash_in_memory_cache_max_bytes" in sent
