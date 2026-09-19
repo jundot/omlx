@@ -278,6 +278,98 @@ class TestDFlashEngineInit:
         assert engine._draft_quant_activation_bits == 32
         assert engine._draft_quant_group_size == 128
 
+    def test_ane_prefill_helper_forwards_dflash_target_settings(self, monkeypatch):
+        from omlx.engine.dflash import _enable_qwen35_ane_prefill_for_dflash
+        from omlx.patches import qwen35_ane_prefill, qwen35_q4_mlp
+
+        target = SimpleNamespace(_omlx_ane_gdn_prefill_count=0)
+        captured = {}
+        bridge_calls = []
+
+        monkeypatch.setattr(
+            qwen35_q4_mlp,
+            "apply_qwen35_q4_lm_prefill_linear_patch",
+            lambda: bridge_calls.append(True) or True,
+        )
+
+        def fake_enable(model, **kwargs):
+            captured["model"] = model
+            captured.update(kwargs)
+            return 3
+
+        monkeypatch.setattr(
+            qwen35_ane_prefill,
+            "enable_qwen35_ane_prefill",
+            fake_enable,
+        )
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_sequence_length=4096,
+            qwen35_ane_prefill_tail_padding_min_tokens=3072,
+            qwen35_ane_prefill_fraction=0.45,
+            qwen35_ane_prefill_fused_down=True,
+            qwen35_ane_prefill_max_layers=12,
+            qwen35_ane_prefill_gdn=True,
+            qwen35_ane_prefill_gdn_fraction=0.40,
+            qwen35_ane_prefill_gdn_max_layers=8,
+            qwen35_ane_prefill_dual_ane=False,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_fraction=0.10,
+            qwen35_ane_prefill_cpu_down_fraction=0.20,
+            qwen35_ane_prefill_cpu_gdn_fraction=0.15,
+            qwen35_ane_prefill_cpu_threads=6,
+            qwen35_ane_prefill_cpu_shared_resource=False,
+        )
+
+        sequence_length = _enable_qwen35_ane_prefill_for_dflash(target, settings)
+
+        assert sequence_length == 4096
+        assert bridge_calls == []
+        assert captured == {
+            "model": target,
+            "sequence_length": 4096,
+            "tail_padding_min_tokens": 3072,
+            "fraction": 0.45,
+            "max_layers": 12,
+            "gdn": True,
+            "gdn_fraction": 0.40,
+            "gdn_max_layers": 8,
+            "dual_ane": False,
+            "ane_down_fraction": 0.45,
+            "fused_down": True,
+            "cpu_fraction": 0.10,
+            "cpu_down_fraction": 0.20,
+            "cpu_gdn_fraction": 0.15,
+            "cpu_threads": 6,
+            "cpu_shared_resource": False,
+        }
+
+    def test_ane_prefill_helper_accepts_gdn_only_activation(self, monkeypatch):
+        from omlx.engine.dflash import _enable_qwen35_ane_prefill_for_dflash
+        from omlx.patches import qwen35_ane_prefill, qwen35_q4_mlp
+
+        target = SimpleNamespace(_omlx_ane_gdn_prefill_count=2)
+        monkeypatch.setattr(
+            qwen35_q4_mlp,
+            "apply_qwen35_q4_lm_prefill_linear_patch",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            qwen35_ane_prefill,
+            "enable_qwen35_ane_prefill",
+            lambda *args, **kwargs: 0,
+        )
+
+        sequence_length = _enable_qwen35_ane_prefill_for_dflash(
+            target,
+            ModelSettings(
+                qwen35_ane_prefill_enabled=True,
+                qwen35_ane_prefill_sequence_length=2048,
+            ),
+        )
+
+        assert sequence_length == 2048
+
     def test_get_stats_no_verify_mode(self):
         """Stats should not include verify_mode (removed in v2)."""
         try:
@@ -440,19 +532,60 @@ class TestDFlashEngineInit:
         DFlashEngine._end_runtime_cache_request(object())
 
     @pytest.mark.asyncio
-    async def test_start_passes_verify_config_to_target_load(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "model_type,ane_enabled,cpu_enabled,compiled_layers",
+        [
+            ("gemma4", False, False, 0),
+            ("gemma4", True, True, 0),
+            ("qwen3_5", False, False, 0),
+            ("qwen3_5", True, False, 2),
+            ("qwen3_5", True, True, 2),
+            ("qwen3_5_moe", True, True, 2),
+            ("qwen3_5", True, True, 0),
+        ],
+    )
+    async def test_start_passes_verify_config_to_target_load(
+        self, monkeypatch, model_type, ane_enabled, cpu_enabled, compiled_layers
+    ):
         try:
             from dflash_mlx.runtime import loading as dflash_loading
 
             from omlx.engine import dflash as dflash_mod
             from omlx.engine.dflash import DFlashEngine
-            from omlx.patches import dflash_lifecycle, qwen35_moe_gate_up
+            from omlx.patches import (
+                dflash_lifecycle,
+                qwen35_ane_prefill,
+                qwen35_moe_gate_up,
+                qwen35_q4_mlp,
+            )
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
         captured = {}
+        load_thread = threading.get_ident()
+
+        def fake_enable_ane(model, **kwargs):
+            assert threading.get_ident() != load_thread
+            assert captured["prefill_hook_installed_before_load"]
+            gdn_only = model_type == "qwen3_5_moe"
+            model._omlx_ane_mlp_prefill_count = 0 if gdn_only else compiled_layers
+            model._omlx_ane_gdn_prefill_count = compiled_layers if gdn_only else 0
+            captured["ane_kwargs"] = kwargs
+            return model._omlx_ane_mlp_prefill_count
+
+        monkeypatch.setattr(
+            qwen35_q4_mlp,
+            "apply_qwen35_q4_lm_prefill_linear_patch",
+            lambda: captured.setdefault("prefill_hook_installed", True),
+        )
+        monkeypatch.setattr(
+            qwen35_ane_prefill, "enable_qwen35_ane_prefill", fake_enable_ane
+        )
 
         def fake_load_target_bundle(model_ref, **kwargs):
+            captured["prefill_hook_installed_before_load"] = captured.get(
+                "prefill_hook_installed", False
+            )
             captured["model_ref"] = model_ref
             captured.update(kwargs)
             return SimpleNamespace(
@@ -462,7 +595,7 @@ class TestDFlashEngineInit:
                     eos_token_id=1,
                     eos_token_ids=[1],
                 ),
-                meta={"config": {"model_type": "gemma4"}},
+                meta={"config": {"model_type": model_type}},
                 target_ops=SimpleNamespace(),
             )
 
@@ -509,7 +642,25 @@ class TestDFlashEngineInit:
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
-            model_settings=ModelSettings(dflash_verify_mode="off"),
+            model_settings=ModelSettings(
+                dflash_verify_mode="off",
+                qwen35_ane_prefill_enabled=ane_enabled,
+                qwen35_ane_prefill_sequence_length=4096,
+                qwen35_ane_prefill_tail_padding_min_tokens=1024,
+                qwen35_ane_prefill_fraction=0.25,
+                qwen35_ane_prefill_max_layers=2,
+                qwen35_ane_prefill_gdn=True,
+                qwen35_ane_prefill_gdn_fraction=0.30,
+                qwen35_ane_prefill_gdn_max_layers=3,
+                qwen35_ane_prefill_dual_ane=False,
+                qwen35_ane_prefill_fused_down=True,
+                qwen35_ane_prefill_cpu_enabled=cpu_enabled,
+                qwen35_ane_prefill_cpu_fraction=0.125,
+                qwen35_ane_prefill_cpu_down_fraction=0.25,
+                qwen35_ane_prefill_cpu_gdn_fraction=0.15,
+                qwen35_ane_prefill_cpu_threads=4,
+                qwen35_ane_prefill_cpu_shared_resource=False,
+            ),
         )
 
         await engine.start()
@@ -524,6 +675,29 @@ class TestDFlashEngineInit:
             assert captured["bound_target_ops"] is engine._target_ops
             assert engine._draft_window_size == 2048
             assert engine._runtime_context.runtime.draft_window_size == 2048
+            if ane_enabled and model_type in ("qwen3_5", "qwen3_5_moe"):
+                assert captured["ane_kwargs"] == {
+                    "sequence_length": 4096,
+                    "tail_padding_min_tokens": 1024,
+                    "fraction": 0.25,
+                    "max_layers": 2,
+                    "gdn": True,
+                    "gdn_fraction": 0.30,
+                    "gdn_max_layers": 3,
+                    "dual_ane": False,
+                    "ane_down_fraction": 0.25,
+                    "fused_down": True,
+                    "cpu_fraction": 0.125 if cpu_enabled else 0.0,
+                    "cpu_down_fraction": 0.25 if cpu_enabled else 0.0,
+                    "cpu_gdn_fraction": 0.15 if cpu_enabled else 0.0,
+                    "cpu_threads": 4,
+                    "cpu_shared_resource": False,
+                }
+            else:
+                assert "ane_kwargs" not in captured
+            expected_step = 4096 if compiled_layers else 2048
+            assert engine._runtime_context.runtime.prefill_step_size == expected_step
+            assert engine._prefill_guard._prefill_step_size == expected_step
         finally:
             await engine.stop()
 

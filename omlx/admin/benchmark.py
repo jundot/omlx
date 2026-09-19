@@ -1856,12 +1856,17 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             # uploaded metadata reflect the runtime state (the patch can find
             # no eligible layers or drop layers at the program budget).
             loaded_model = getattr(engine, "_model", None)
+            if loaded_model is None:
+                loaded_model = getattr(engine, "_target_model", None)
             compiled_mlp = getattr(
                 loaded_model, "_omlx_ane_mlp_prefill_count", None
             )
             compiled_gdn = getattr(
                 loaded_model, "_omlx_ane_gdn_prefill_count", None
             )
+            # Keep counters only: retaining the model here prevents the later
+            # unload memory barrier from reclaiming its weights and ANE banks.
+            del loaded_model
             ane_active = bool(compiled_mlp or compiled_gdn)
             ane_trace_config = {
                 "sequence_length": int(

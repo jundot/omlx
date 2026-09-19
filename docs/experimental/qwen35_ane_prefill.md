@@ -74,6 +74,20 @@ token threshold as that patch: below `OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS`
 (default 16384, which covers every fixed ANE shape) q8 b/a use stock MLX,
 where the native q8 tile is not profitable.
 
+## DFlash
+
+Qwen DFlash targets use the same per-model ANE and CPU-sharing settings
+for prefill. Draft generation and verification do not use ANE. If ANE
+setup fails or finds no eligible layers, loading falls back to ordinary
+DFlash.
+
+GDN offload requires the Qwen prefill projection patch; otherwise, only
+eligible MLP layers can use ANE.
+
+The tuner measures target prefill without the drafter. Validate its
+recommendation with uncached prompts on the actual target/draft pair,
+measuring prefill and generation throughput separately.
+
 ## Per-model settings
 
 ```json

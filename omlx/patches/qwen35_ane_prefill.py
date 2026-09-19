@@ -15,6 +15,8 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -27,10 +29,13 @@ from omlx.utils import hardware, proc_memory
 logger = logging.getLogger(__name__)
 
 _COMPILE_LOCK = threading.RLock()
-_PATCHED_CLASSES: set[type] = set()
+_PATCHED_CLASSES: dict[type, Callable[..., mx.array]] = {}
 _VLM_HOOK_INSTALLED = False
 _VLM_GDN_HOOK_INSTALLED = False
 _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+_ANE_PREFILL_SUSPENDED: ContextVar[bool] = ContextVar(
+    "omlx_ane_prefill_suspended", default=False
+)
 # Legacy extensions compile one program per slice, and the private runtime on
 # the reference M3 Ultra accepts 120 resident programs. Current extensions pack
 # all slices into one multi-procedure program per ANE instance and bypass this
@@ -1643,6 +1648,16 @@ def _gdn_backend_exact(
         return None
 
 
+@contextmanager
+def suspend_qwen35_ane_prefill():
+    """Keep speculative verification on checkpoint-precision projections."""
+    token = _ANE_PREFILL_SUSPENDED.set(True)
+    try:
+        yield
+    finally:
+        _ANE_PREFILL_SUSPENDED.reset(token)
+
+
 def _gdn_backend(
     gdn: Any, x: mx.array, target_verify: bool = False
 ) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
@@ -1654,7 +1669,7 @@ def _gdn_backend(
     original GPU operation.
     """
     config = getattr(gdn, "_omlx_ane_gdn_config", None)
-    if config is None or target_verify:
+    if config is None or target_verify or _ANE_PREFILL_SUSPENDED.get():
         return None
     input_dim = int(x.shape[-1]) if x.ndim else 0
     rows = int(x.size // input_dim) if input_dim else 0
@@ -1999,7 +2014,7 @@ def _backend(
     complete fixed-shape tile fall through to the original wide GPU operation.
     """
     config = getattr(mlp, "_omlx_ane_prefill_config", None)
-    if config is None or target_verify:
+    if config is None or target_verify or _ANE_PREFILL_SUSPENDED.get():
         return None
     input_dim = int(x.shape[-1]) if x.ndim else 0
     rows = int(x.size // input_dim) if input_dim else 0
@@ -2058,7 +2073,10 @@ def _backend(
 
 
 def _wrap_class(cls: type) -> None:
-    if cls in _PATCHED_CLASSES:
+    # A later Q4 patch can replace __call__ and bypass ANE. Only skip
+    # wrapping if our wrapper is still the active __call__; otherwise,
+    # wrap the new callable so ANE gets first choice again.
+    if cls.__call__ is _PATCHED_CLASSES.get(cls):
         return
     original: Callable[..., mx.array] = cls.__call__
 
@@ -2070,7 +2088,7 @@ def _wrap_class(cls: type) -> None:
 
     cls.__call__ = patched
     cls._omlx_ane_prefill_original_call = original
-    _PATCHED_CLASSES.add(cls)
+    _PATCHED_CLASSES[cls] = patched
 
 
 def _install_dispatch() -> bool:
