@@ -33,6 +33,7 @@ from omlx.patches.qwen35_gdn_prework import (
     qwen4_decode_norm_gate_fused,
     qwen4_decode_prework_fused,
 )
+from omlx.patches.qwen35_q4_mlp import _VLMQuantizedPrefillLinear
 
 HK, HV, DK, DV = 16, 48, 128, 128
 C = 2 * HK * DK + HV * DV
@@ -225,15 +226,7 @@ def _fake_quantized_linear(input_dims, output_dims, bits, group_size):
     return linear
 
 
-@pytest.mark.parametrize(
-    "signatures",
-    [
-        ((6, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 0
-        ((4, 64), (5, 128), (5, 128), (5, 128)),  # physical layer 1
-        ((5, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 29
-    ],
-)
-def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
+def _canonical_qwen4_decode_module(signatures):
     module_type = type("Qwen4ExpGatedDeltaNet", (), {})
     module_type.__module__ = "mlx_vlm.models.qwen4_exp.language"
     module = module_type()
@@ -265,10 +258,32 @@ def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
         module.in_proj_a,
     ) = projections
     module.out_proj = _fake_quantized_linear(6144, 2560, 5, 128)
+    return module
+
+
+@pytest.mark.parametrize(
+    "signatures",
+    [
+        ((6, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 0
+        ((4, 64), (5, 128), (5, 128), (5, 128)),  # physical layer 1
+        ((5, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 29
+    ],
+)
+def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
+    module = _canonical_qwen4_decode_module(signatures)
 
     assert prework_mod._qwen4_decode_static_eligible(module)
     module.in_proj_z.group_size = 64 if module.in_proj_z.group_size == 128 else 128
     assert not prework_mod._qwen4_decode_static_eligible(module)
+
+
+def test_qwen4_decode_static_gate_survives_prefill_linear_reclass():
+    """The VLM engine reclasses projections for q4 prefill routing (#3755)."""
+    module = _canonical_qwen4_decode_module(((6, 64), (6, 64), (6, 64), (6, 64)))
+    for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
+        getattr(module, name).__class__ = _VLMQuantizedPrefillLinear
+
+    assert prework_mod._qwen4_decode_static_eligible(module)
 
 
 def test_qwen4_decode_route_commits_both_states_and_advances_once(monkeypatch):

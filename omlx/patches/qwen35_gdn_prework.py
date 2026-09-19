@@ -462,8 +462,10 @@ def _qwen4_decode_static_eligible(module) -> bool:
     ):
         return False
 
+    # The q4 prefill routing reclasses these projections to a QuantizedLinear
+    # subclass; the fused decode reads their packed storage, not their forward.
     def canonical_projection(linear, rows, signatures):
-        if type(linear) is not nn.QuantizedLinear or linear.mode != "affine":
+        if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
             return False
         signature = (linear.bits, linear.group_size)
         if signature not in signatures:
@@ -502,7 +504,7 @@ def _qwen4_decode_static_eligible(module) -> bool:
 
     out = module.out_proj
     return (
-        type(out) is nn.QuantizedLinear
+        isinstance(out, nn.QuantizedLinear)
         and out.bits == 5
         and out.group_size == 128
         and out.mode == "affine"
