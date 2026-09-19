@@ -69,13 +69,15 @@ def reused_tokens(tokens, ranges_a, ranges_b, hash_a, hash_b):
     return table.num_tokens if table else 0
 
 
+@pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
 @pytest.mark.parametrize("first_prefix_len", [10, 60])
-def test_grid_boundaries_ignore_rerendered_reasoning(first_prefix_len):
+def test_grid_boundaries_ignore_rerendered_reasoning(first_prefix_len, model_type):
     full = [1] * 4 + [99] * 4 + [2] * 4 + [99] * 4 + [3] * 4
     result, images, calls = prepare_case(
         full,
         {1: [1] * first_prefix_len, 3: [2] * 16},
         grid=[[1, 4, 4], [1, 4, 4]],
+        model_type=model_type,
     )
     tokens, _, _, whole_hash, start, ranges = result
     assert tokens == full
@@ -90,13 +92,15 @@ def test_grid_boundaries_ignore_rerendered_reasoning(first_prefix_len):
     assert ranges[0][1] == compute_image_hash(images[:1])
 
 
-def test_adjacent_images_and_multiple_images_per_turn():
+@pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
+def test_adjacent_images_and_multiple_images_per_turn(model_type):
     full = [1] * 4 + [99] * 12 + [2] * 4 + [99] * 4 + [3] * 4
     result, images, calls = prepare_case(
         full,
         {1: [1] * 4, 3: full[:20]},
         counts=(2, 1),
         grid=[[1, 4, 4], [1, 4, 8], [1, 4, 4]],
+        model_type=model_type,
     )
     assert result[5] == [
         (4, compute_image_hash(images[:2])),

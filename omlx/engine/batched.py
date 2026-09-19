@@ -681,6 +681,9 @@ class BatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         signature = getattr(self._model, "_omlx_k2_ane_signature", None)
+        prism_signature = getattr(self._model, "_omlx_prism_activation_signature", None)
+        if isinstance(prism_signature, str) and prism_signature:
+            signature = prism_signature
         if signature:
             scheduler_config.model_name = (
                 (scheduler_config.model_name or self._model_name) + ":" + signature

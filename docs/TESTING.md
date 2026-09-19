@@ -130,3 +130,134 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+# Prism Hadamard model loading
+
+Run `python -m pytest tests/test_prism_hadamard.py tests/test_prism_decode.py
+tests/test_model_loading.py tests/test_active_models_visibility.py`.
+The tests compare packed projection and embedding results against an independent
+dense Hadamard matrix, load tiny text and vision checkpoints through the production
+dispatch, and check malformed packs, strict weight loading and image-message format.
+No downloaded model or checkpoint Python is needed.
+
+The decoder tests also cover runtime keyword forwarding: `gdn_sink=None`
+preserves the singleton capacity optimization, while active capture sinks
+(including empty lists) and unfamiliar options retain upstream cache handling.
+When checking an alternate mlx-vlm runtime, run the resident checkpoint through
+`maybe_load_custom_quantization(path, is_vlm=True)` and `mlx_vlm.generate` for
+both text and image inputs. This catches release/pinned-commit skew where the
+outer language model forwards keywords absent from the main dependency pin.
+
+For hardware validation, serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` with an
+isolated base path and port. Check text, streamed text, two concurrent requests,
+and an image question after a text-only system turn. Repeat a prompt longer than
+one cache block and confirm nonzero cached tokens with the same answer. The model
+must retain its original `prism_hadamard_qwen35` config throughout. Send two
+images with different dimensions, then reverse their order and reuse one alone;
+check the answers and per-image vision-cache hits. Replace one image and test
+images across separate turns too. Regression coverage for Qwen vision dispatch,
+feature splitting and image-aware prefix boundaries is in `test_vlm_engine.py`
+and `test_vlm_cache_boundaries.py`.
+
+Repeat with `OMLX_PRISM_FP16_ACTIVATIONS=1` to check the opt-in mixed-precision
+path. Check a fresh 66K-token prompt and its cached repeat, not just short
+generation. The FP16 path uses a separate prefix-cache model signature so it
+cannot restore the original FP32 states. Compare next-token distributions and
+task outputs against the default path: activation rounding changes, although
+checkpoint weights and recurrent state retain their original precision.
+
+For a matched prefill timing, set `MODEL_DIR` to the checkpoint directory and
+run the snippet below twice, with `OMLX_PRISM_FP16_ACTIVATIONS=0` and `=1`.
+Use the same idle GPU and checkpoint. It warms the exact shape once, then times
+three fresh-cache passes, including the final-token output projection.
+
+```python
+import os, statistics, time
+import mlx.core as mx
+from omlx.utils.model_loading import maybe_load_custom_quantization
+
+model, processor = maybe_load_custom_quantization(os.environ["MODEL_DIR"], is_vlm=True)
+lm = model.language_model
+text = "The community garden has apple trees, a wooden bench, and a small pond. Birds visit each morning. "
+ids = mx.array([processor.tokenizer.encode(text * 100)[:1024]])
+times = []
+for trial in range(4):
+    cache = lm.make_cache()
+    start = time.perf_counter()
+    hidden = lm.model(ids, cache=cache)
+    mx.eval(lm.lm_head(hidden[:, -1:]))
+    if trial:
+        times.append(time.perf_counter() - start)
+print(times, "seconds;", ids.shape[-1] / statistics.median(times), "tokens/sec")
+```
+
+Run `python -m pytest tests/test_sdpa256_attention.py` for the FP32 bounded
+attention regression. On M1, forcing MLX's fused FP32 head-dim-256 kernel fails
+at evaluation with a threadgroup-memory error; the fallback must remain bounded
+and preserve FP32 rather than silently narrowing attention inputs.
+
+
+## Prism singleton decode capacity
+
+Generate at least 192 tokens after a long prompt; two-token smoke tests do not
+expose cache-buffer growth. Verify stable memory, visible prefill progress,
+prefix reuse, and the transition from two concurrent replies to one. The tiny
+model tests compare logits and cache contents with upstream decoding, including
+padded batches, multi-row batches, prefill and hidden-state capture.
+
+For a cheap, isolated cache-copy reproduction, set `MODEL_DIR` and run the
+following with `BASELINE=1` and `BASELINE=0` in separate processes. Use identical
+`OMLX_PRISM_FP16_ACTIVATIONS` and an idle GPU. This constructs **synthetic zero
+KV states** at 66,500 tokens: it measures decoder throughput and allocation,
+not semantic quality or full-server latency. The baseline restores mlx-vlm's
+original singleton decoder, retaining this PR's loader and precision settings.
+A 40 GiB allocation guard limits the baseline's buffer growth. Compare equal
+32-token runs first; then extend the fixed run with `STEPS=192`.
+
+```python
+import gc, os, time
+import mlx.core as mx
+from mlx_lm.generate import BatchGenerator
+from mlx_vlm.models.qwen3_5.language import Qwen3_5Model
+from omlx.models.vlm import VLMModelAdapter
+from omlx.utils.model_loading import maybe_load_custom_quantization
+
+model, _ = maybe_load_custom_quantization(os.environ["MODEL_DIR"], is_vlm=True)
+lm = model.language_model
+if os.environ.get("BASELINE") == "1":
+    lm.model.__class__ = Qwen3_5Model
+cache = lm.make_cache()
+logits = lm(mx.array([[100]]), cache=cache).logits
+mx.eval(logits, [c.state for c in cache])
+length = 66500
+for c in cache:
+    if getattr(c, "keys", None) is not None:
+        shape = list(c.keys.shape)
+        shape[2] = ((length + 255) // 256) * 256
+        c.keys = mx.zeros(shape, dtype=c.keys.dtype)
+        c.values = mx.zeros(shape, dtype=c.values.dtype)
+        c.offset = length
+mx.eval([c.state for c in cache])
+del logits
+gc.collect()
+mx.clear_cache()
+steps = int(os.environ.get("STEPS", "32"))
+bg = BatchGenerator(VLMModelAdapter(model), max_tokens=steps + 5,
+                    stop_tokens=[], prefill_batch_size=1, completion_batch_size=1)
+bg.insert([[100]], caches=[cache])
+cache = None
+start = time.monotonic()
+try:
+    for i in range(steps):
+        list(bg.next_generated())
+        active, pool = mx.get_active_memory(), mx.get_cache_memory()
+        if active + pool > 40 * 1024**3:
+            break
+    print({"tokens": i + 1, "tok/s": (i + 1) / (time.monotonic() - start),
+           "active_GiB": active / 1024**3, "pool_GiB": pool / 1024**3})
+finally:
+    bg.close()
+```
+
+Separately compare real-prompt outputs before and after the decoder change;
+synthetic KV benchmarks cannot validate language or image behavior.

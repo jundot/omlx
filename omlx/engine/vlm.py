@@ -1421,6 +1421,7 @@ def _uses_mrope(vlm_model) -> bool:
 
 # Qwen-style VLMs: vision_tower takes (pixel_values, grid_thw).
 _QWEN_VISION_MODELS = {
+    "prism_hadamard_qwen35",
     "qwen3_5",
     "qwen3_5_moe",
     "qwen3_vl",
@@ -2204,6 +2205,10 @@ class VLMBatchedEngine(BaseEngine):
             scheduler_config.paged_ssd_cache_dir = str(
                 Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
             )
+
+        signature = getattr(self._vlm_model, "_omlx_prism_activation_signature", None)
+        if isinstance(signature, str) and signature:
+            scheduler_config.model_name = self._model_name + ":" + signature
 
         engine_config = EngineConfig(
             model_name=self._model_name,
