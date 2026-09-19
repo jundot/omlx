@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from mlx_vlm.models.cache import BatchKVCache
 from mlx_vlm.models.qwen3_5.config import TextConfig
-from mlx_vlm.models.qwen3_5.language import LanguageModel
+from mlx_vlm.models.qwen3_5.language import LanguageModel, Qwen3_5Model
 
 from omlx.patches.prism_hadamard.decode import CapacityPreservingModel
 
@@ -129,3 +129,50 @@ def test_prefill_and_hidden_capture_keep_upstream_behavior():
         np.asarray(expected.hidden_states[0]),
         atol=1e-5,
     )
+
+
+@pytest.mark.parametrize(
+    "extra_kwargs,borrow",
+    [
+        ({"gdn_sink": None}, True),
+        ({"gdn_sink": []}, False),
+        ({"future_sink": []}, False),
+        ({"future_option": None}, False),
+    ],
+)
+def test_runtime_kwargs_forwarded_without_borrowing_capture_cache(
+    monkeypatch, extra_kwargs, borrow
+):
+    """New runtime arguments reach upstream, including empty capture sinks."""
+    model = _model()
+    seed = model.make_cache()
+    mx.eval(model(mx.array([[1, 2, 3]]), cache=seed).logits)
+    cache = [type(c).merge([c]) for c in seed]
+    model.model.__class__ = CapacityPreservingModel
+    marker = object()
+    calls = []
+
+    def upstream(self, inputs, **kwargs):
+        calls.append(kwargs)
+        for name, value in extra_kwargs.items():
+            assert kwargs[name] is value
+            if isinstance(value, list):
+                value.append(marker)
+        return marker
+
+    monkeypatch.setattr(Qwen3_5Model, "__call__", upstream)
+    result = model.model(mx.array([[4]]), cache=cache, **extra_kwargs)
+    assert result is marker
+    assert len(calls) == 1
+    forwarded_cache = calls[0]["cache"]
+    if borrow:
+        from mlx_vlm.models.cache import KVCache
+
+        row = forwarded_cache[model.model.fa_idx]
+        assert type(row) is KVCache
+        assert row.keys is cache[model.model.fa_idx].keys
+    else:
+        assert forwarded_cache is cache
+    for value in extra_kwargs.values():
+        if isinstance(value, list):
+            assert value == [marker]

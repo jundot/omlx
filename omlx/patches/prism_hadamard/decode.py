@@ -27,6 +27,7 @@ class CapacityPreservingModel(Qwen3_5Model):
         position_ids=None,
         capture_layer_ids=None,
         hidden_sink=None,
+        **kwargs,
     ):
         rows = None
         borrowed = []
@@ -36,6 +37,10 @@ class CapacityPreservingModel(Qwen3_5Model):
             and inputs.shape[:2] == (1, 1)
             and hidden_sink is None
             and capture_layer_ids is None
+            # Some mlx-vlm releases always pass gdn_sink=None. Capture and
+            # unfamiliar options must retain upstream cache handling.
+            and kwargs.get("gdn_sink") is None
+            and not (kwargs.keys() - {"gdn_sink"})
             and type(cache[self.fa_idx]) is BatchKVCache
         ):
             candidates = [
@@ -67,6 +72,7 @@ class CapacityPreservingModel(Qwen3_5Model):
             cache=rows if rows is not None else cache,
             position_ids=position_ids,
             hidden_sink=hidden_sink,
+            **kwargs,
         )
         for entry, row in borrowed:
             entry.keys, entry.values = row.keys, row.values

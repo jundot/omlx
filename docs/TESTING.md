@@ -140,6 +140,14 @@ dense Hadamard matrix, load tiny text and vision checkpoints through the product
 dispatch, and check malformed packs, strict weight loading and image-message format.
 No downloaded model or checkpoint Python is needed.
 
+The decoder tests also cover runtime keyword forwarding: `gdn_sink=None`
+preserves the singleton capacity optimization, while active capture sinks
+(including empty lists) and unfamiliar options retain upstream cache handling.
+When checking an alternate mlx-vlm runtime, run the resident checkpoint through
+`maybe_load_custom_quantization(path, is_vlm=True)` and `mlx_vlm.generate` for
+both text and image inputs. This catches release/pinned-commit skew where the
+outer language model forwards keywords absent from the main dependency pin.
+
 For hardware validation, serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` with an
 isolated base path and port. Check text, streamed text, two concurrent requests,
 and an image question after a text-only system turn. Repeat a prompt longer than
