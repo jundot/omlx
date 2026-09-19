@@ -6614,6 +6614,20 @@ async def create_anthropic_message(
         if request.stop_sequences:
             chat_kwargs["stop"] = request.stop_sequences
 
+        # SpecPrefill: same per-request overrides the OpenAI endpoint accepts,
+        # with the same meaning — omitted leaves the model/server setting in
+        # charge, true forces it on, false forces it off.
+        if request.specprefill is not None:
+            chat_kwargs["specprefill"] = request.specprefill
+        if request.specprefill_keep_pct is not None:
+            chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+        elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
+            chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
+        if request.specprefill_threshold is not None:
+            chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
+        elif _server_state.settings_manager and ms.specprefill_threshold is not None:
+            chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
+
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)
