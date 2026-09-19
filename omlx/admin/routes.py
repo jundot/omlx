@@ -4446,11 +4446,55 @@ async def update_global_settings(
             f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
         )
 
-    # Apply scheduler settings (restart required)
+    # Apply scheduler settings
     if request.max_concurrent_requests is not None:
-        global_settings.scheduler.max_concurrent_requests = (
+        if request.max_concurrent_requests <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid max_concurrent_requests: must be > 0",
+            )
+        if (
             request.max_concurrent_requests
-        )
+            != global_settings.scheduler.max_concurrent_requests
+        ):
+            global_settings.scheduler.max_concurrent_requests = (
+                request.max_concurrent_requests
+            )
+            # Live-apply the admission cap. Scheduler._effective_max_num_seqs(),
+            # the waiting-queue bound and the pressure-gate regrowth all read
+            # config.max_num_seqs per decision, so updating the pool template
+            # (engines loaded later) plus every loaded scheduler takes effect
+            # on the next admission tick without unloading models: raising
+            # admits sooner, lowering stops admitting until in-flight requests
+            # drain. The _StoreCacheGate keeps its own pressure-shrunk cap and
+            # regrows toward the new max on its own; do not force it back up.
+            from ..server import _server_state
+
+            pool = _server_state.engine_pool
+            if pool is not None:
+                pool._scheduler_config.max_num_seqs = (
+                    request.max_concurrent_requests
+                )
+                for mid, entry in pool._entries.items():
+                    if entry is None or entry.engine is None:
+                        continue
+                    async_core = getattr(entry.engine, "_engine", None)
+                    core = (
+                        getattr(async_core, "engine", None)
+                        if async_core is not None
+                        else None
+                    )
+                    scheduler = (
+                        getattr(core, "scheduler", None) if core is not None else None
+                    )
+                    if scheduler is not None and hasattr(scheduler, "config"):
+                        scheduler.config.max_num_seqs = (
+                            request.max_concurrent_requests
+                        )
+            runtime_applied.append("max_concurrent_requests")
+            logger.info(
+                f"Max concurrent requests set to {request.max_concurrent_requests} (live)"
+            )
 
     # Apply embedding batch size setting (Live for loaded embedding engines)
     if request.embedding_batch_size is not None:
