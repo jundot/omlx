@@ -350,7 +350,7 @@ class TestAdminRouteAndUI:
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        html = (root / "omlx/admin/templates/dashboard/_status.html").read_text(
+        html = (root / "omlx/admin/templates/dashboard/blocks/_claude_code.html").read_text(
             encoding="utf-8"
         )
         assert "globalSettings.claude_code.desktop_enabled" in html
@@ -448,7 +448,7 @@ class TestRestoreButton:
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        html = (root / "omlx/admin/templates/dashboard/_status.html").read_text(
+        html = (root / "omlx/admin/templates/dashboard/blocks/_claude_code.html").read_text(
             encoding="utf-8"
         )
         assert "restoreClaudeDesktopConfig()" in html

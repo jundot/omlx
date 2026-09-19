@@ -376,7 +376,7 @@ class TestAdminRoutes:
 class TestAdminUI:
     def test_toggle_shows_state_and_reapply(self):
         root = Path(__file__).resolve().parents[1]
-        html = (root / "omlx/admin/templates/dashboard/_status.html").read_text(
+        html = (root / "omlx/admin/templates/dashboard/blocks/_claude_code.html").read_text(
             encoding="utf-8"
         )
         assert "claudeDesktop.configured" in html

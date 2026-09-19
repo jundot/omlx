@@ -184,7 +184,8 @@ class TestDashboard:
             / "admin"
             / "templates"
             / "dashboard"
-            / "_status.html"
+            / "blocks"
+            / "_claude_code.html"
         )
         content = html_path.read_text(encoding="utf-8")
         assert 'x-text="claudeDesktopCommand"' in content
