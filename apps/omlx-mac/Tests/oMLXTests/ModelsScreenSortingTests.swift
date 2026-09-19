@@ -40,7 +40,43 @@ final class ModelsScreenSortingTests: XCTestCase {
         XCTAssertEqual(ids, ["Qwen", "gemma", "llama"])
     }
 
-    private func makeModel(_ id: String, displayName: String? = nil) -> ModelDTO {
+    func testModelLibraryRowsExposeProfileWithoutDuplicatingBaseSize() throws {
+        let profile = ProfileDTO(
+            name: "thinking",
+            displayName: "Thinking",
+            description: nil,
+            createdAt: nil,
+            updatedAt: nil,
+            sourceTemplate: nil,
+            isBuiltin: false,
+            exposeAsModel: true,
+            modelId: "qwen:thinking",
+            hasEngineFields: false,
+            settings: nil
+        )
+        let base = makeModel(
+            "qwen",
+            removalKind: "local_cache",
+            exposedProfiles: [profile]
+        )
+
+        let rows = modelLibraryRows([base])
+
+        XCTAssertEqual(Set(rows.map(\.id)), ["qwen", "qwen:thinking"])
+        let profileRow = try XCTUnwrap(rows.first { $0.id == "qwen:thinking" })
+        XCTAssertEqual(profileRow.removalKind, "profile")
+        XCTAssertEqual(profileRow.sourceModelId, "qwen")
+        XCTAssertEqual(profileRow.profileName, "thinking")
+        XCTAssertEqual(profileRow.estimatedSize, 0)
+        XCTAssertEqual(profileRow.deletable, true)
+    }
+
+    private func makeModel(
+        _ id: String,
+        displayName: String? = nil,
+        removalKind: String? = nil,
+        exposedProfiles: [ProfileDTO]? = nil
+    ) -> ModelDTO {
         ModelDTO(
             id: id,
             displayName: displayName,
@@ -69,6 +105,13 @@ final class ModelsScreenSortingTests: XCTestCase {
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
             virtual: nil,
+            sourceType: nil,
+            sourceRepoId: nil,
+            deletable: nil,
+            removalKind: removalKind,
+            sourceModelId: nil,
+            profileName: nil,
+            exposedProfiles: exposedProfiles,
             settings: nil
         )
     }
