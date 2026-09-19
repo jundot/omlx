@@ -20,6 +20,7 @@ from ..model_settings import (
     validate_ane_prefill,
 )
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..specprefill.boundary import resolve_static_prefix_end
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
@@ -940,14 +941,17 @@ class BatchedEngine(BaseEngine):
         ct_kwargs: dict[str, Any] | None,
         kwargs: dict[str, Any],
     ) -> None:
-        """Compute the system-prompt token boundary and add it to ``kwargs``.
+        """Compute the static-prefix token boundary and add it to ``kwargs``.
 
-        SpecPrefill protects the system-prompt region from token dropping. The
-        boundary is derived by subtracting the non-system prompt token count
-        from the full prompt token count (system-only messages usually can't be
-        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
-        non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
+        SpecPrefill protects the prompt's static prefix — the system/developer
+        material and any tool-instruction scaffolding the template emits ahead
+        of the first conversation turn — from token dropping. The boundary is
+        measured against the rendered prompt by
+        ``specprefill.boundary.resolve_static_prefix_end``; see that module for
+        why it is not a subtraction of two renders. Shared by ``chat`` and
+        ``stream_chat`` so the non-streaming path protects the same region.
+        No-op unless the model has SpecPrefill enabled and the request has a
+        system or developer message.
         """
         specprefill_model_enabled = (
             getattr(self._model_settings, "specprefill_enabled", False)
@@ -956,21 +960,24 @@ class BatchedEngine(BaseEngine):
         )
         if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
             return
-        non_system = [
-            m for m in messages if m.get("role") not in ("system", "developer")
-        ]
-        if len(non_system) < len(messages) and non_system:
-            try:
-                non_system_prompt = self._apply_chat_template(
-                    non_system, template_tools, chat_template_kwargs=ct_kwargs
+        try:
+
+            def render_tokens(probe_messages: list[dict[str, Any]]) -> list[int]:
+                return self._tokenizer.encode(
+                    self._apply_chat_template(
+                        probe_messages,
+                        template_tools,
+                        chat_template_kwargs=ct_kwargs,
+                    )
                 )
-                full_tokens = len(self._tokenizer.encode(prompt))
-                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                system_end = full_tokens - non_system_tokens
-                if system_end > 0:
-                    kwargs["specprefill_system_end"] = system_end
-            except Exception as e:
-                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+
+            system_end = resolve_static_prefix_end(
+                messages, self._tokenizer.encode(prompt), render_tokens
+            )
+            if system_end > 0:
+                kwargs["specprefill_system_end"] = system_end
+        except Exception as e:
+            logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
     def _prepare_k2_tool_grammar(self, tools, kwargs):
         if self.model_type == "k2_horizon" and tools:
