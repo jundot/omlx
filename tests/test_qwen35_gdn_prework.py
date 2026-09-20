@@ -8,7 +8,7 @@ next conv-state slice) at every verify width it claims (S in 3..9).
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -73,6 +73,180 @@ def test_fused_prework_bit_exact(seq, batch):
     for name, r, g in zip(("q", "k", "v", "conv_state"), ref, got):
         assert r.shape == g.shape, name
         assert bool((r == g).all().item()), f"{name} not bit-exact at S={seq}"
+
+
+def _composed_l2(qkv, conv_state, conv1d):
+    """Stock Qwen4 chain: same prework, Qwen4 L2 q/k normalization."""
+    batch, seq, _ = qkv.shape
+    conv_input = mx.concatenate([conv_state, qkv], axis=1)
+    new_state = mx.contiguous(conv_input[:, -3:, :])
+    co = nn.silu(conv1d(conv_input))
+    q, k, v = mx.split(co, [KEY_DIM, 2 * KEY_DIM], -1)
+    q = q.reshape(batch, seq, HK, DK)
+    k = k.reshape(batch, seq, HK, DK)
+    v = v.reshape(batch, seq, HV, DV)
+    q = q * mx.rsqrt(mx.sum(mx.square(q), axis=-1, keepdims=True) + 1e-6)
+    k = k * mx.rsqrt(mx.sum(mx.square(k), axis=-1, keepdims=True) + 1e-6)
+    return q * (DK**-0.5), k, v, new_state
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_fused_prework_l2_bit_exact(seq, batch):
+    mx.random.seed(41)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
+    conv1d = nn.Conv1d(C, C, kernel_size=4, groups=C, bias=False)
+    conv1d.weight = conv_w
+    qkv = (mx.random.normal((batch, seq, C)) * 0.5).astype(mx.bfloat16)
+    state = (mx.random.normal((batch, 3, C)) * 0.5).astype(mx.bfloat16)
+    inv = DK**-0.5
+    q_scale = mx.array(inv, dtype=mx.bfloat16)
+    k_scale = mx.array(1.0, dtype=mx.bfloat16)
+
+    ref = _composed_l2(qkv, state, conv1d)
+    got = gdn_prework_fused(
+        qkv, state, conv_w, q_scale, k_scale, HK, HV, DK, DV, l2=True
+    )
+    for name, r, g in zip(("q", "k", "v", "conv_state"), ref, got):
+        assert r.shape == g.shape, name
+        assert bool((r == g).all().item()), f"{name} not bit-exact at S={seq}"
+
+
+def test_verify_gate_routes_qwen4_l2_norm(monkeypatch):
+    q4 = pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    # Mirror the patch's runtime resolution: compat vendor wins when
+    # installed, upstream mlx-vlm otherwise.
+    ver_cls = getattr(q4, "_Qwen4Verifier", None) or getattr(
+        q4, "Qwen4ExpBatchInvariantForward", None
+    )
+    assert ver_cls is not None
+
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    mx.random.seed(77)
+    module = q35.Qwen3_5GatedDeltaNet(args)
+    # The gate pins the Qwen4 L2 site by layer identity; graft it onto the
+    # q35 test module (same shape, same _normalize_qk function object).
+    module.__class__ = type(
+        "Q4GatedDeltaNet",
+        (q35.Qwen3_5GatedDeltaNet,),
+        {"_normalize_qk": q4.Qwen4ExpGatedDeltaNet._normalize_qk},
+    )
+    module.set_dtype(mx.bfloat16)
+    module.eval()
+    inputs = mx.random.normal((2, 4, 64)).astype(mx.bfloat16)
+
+    seen = []
+    kernel = prework_mod.gdn_prework_fused
+
+    def record(*call_args, **call_kwargs):
+        seen.append(call_kwargs.get("l2"))
+        return kernel(*call_args, **call_kwargs)
+
+    monkeypatch.setattr(prework_mod, "gdn_prework_fused", record)
+
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((2, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache[1] = mx.random.normal((2, 4, 128, 128)) * 0.01
+    transaction = start_speculative_cache([cache], 4)
+    ver_cls()._gated_delta(module, inputs, None, cache)
+    mx.eval(cache.state)
+    assert seen == [True]
+    transaction.abort()
+
+    seen.clear()
+    cache2 = ArraysCache(size=2)
+    cache2[0] = mx.random.normal((2, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache2[1] = mx.random.normal((2, 4, 128, 128)) * 0.01
+    transaction2 = start_speculative_cache([cache2], 4)
+    Qwen3_5BatchInvariantForward()._gated_delta(module, inputs, None, cache2)
+    mx.eval(cache2.state)
+    assert seen == [False]
+    transaction2.abort()
+
+
+def test_verify_gate_resolves_compat_vendor_verifier(monkeypatch):
+    """Regression: the compat vendor inserts its qwen4_exp module at
+    __path__[0], whose verifier is ``_Qwen4Verifier`` (no
+    ``Qwen4ExpBatchInvariantForward``). The gate must capture it and
+    engage the L2 variant, pinned to the layer's ``_normalize_qk`` site.
+    """
+    import sys
+
+    from mlx_vlm.models.cache import ArraysCache
+
+    pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+
+    class VendorGDN(language.Qwen3_5GatedDeltaNet):
+        @staticmethod
+        def _normalize_qk(q, k):
+            scale = q.shape[-1] ** -0.5
+            q = q * mx.rsqrt(mx.sum(mx.square(q), axis=-1, keepdims=True) + 1e-6)
+            k = k * mx.rsqrt(mx.sum(mx.square(k), axis=-1, keepdims=True) + 1e-6)
+            return q * scale, k
+
+    class VendorVerifier(Qwen3_5BatchInvariantForward):
+        @staticmethod
+        def _normalize_gated_delta_qk(layer, q, k):
+            return layer._normalize_qk(q, k)
+
+    fake = ModuleType("mlx_vlm.models.qwen4_exp.language")
+    fake._Qwen4Verifier = VendorVerifier
+    fake.Qwen4ExpGatedDeltaNet = VendorGDN
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen4_exp.language", fake)
+    import mlx_vlm.models.qwen4_exp as q4_pkg
+
+    monkeypatch.setattr(q4_pkg, "language", fake, raising=False)
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    mx.random.seed(79)
+    module = VendorGDN(args)
+    module.set_dtype(mx.bfloat16)
+    module.eval()
+    inputs = mx.random.normal((2, 4, 64)).astype(mx.bfloat16)
+
+    seen = []
+    kernel = prework_mod.gdn_prework_fused
+
+    def record(*call_args, **call_kwargs):
+        seen.append(call_kwargs.get("l2"))
+        return kernel(*call_args, **call_kwargs)
+
+    monkeypatch.setattr(prework_mod, "gdn_prework_fused", record)
+
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((2, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache[1] = mx.random.normal((2, 4, 128, 128)) * 0.01
+    transaction = start_speculative_cache([cache], 4)
+    VendorVerifier()._gated_delta(module, inputs, None, cache)
+    mx.eval(cache.state)
+    assert seen == [True]
+    transaction.abort()
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -353,8 +527,7 @@ def test_qwen4_decode_route_does_not_commit_states_on_failure(monkeypatch):
     old_recurrent = mx.zeros((1, HV, DV, DK), dtype=mx.float32)
     seen = []
 
-    def stock(self, inputs, mask=None, cache=None, gdn_sink=None,
-              target_verify=False):
+    def stock(self, inputs, mask=None, cache=None, gdn_sink=None, target_verify=False):
         seen.append((cache[0], cache[1], cache.advance_calls))
         return "stock"
 
@@ -457,9 +630,9 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
     calls = []
     kernel = prework_mod.gdn_prework_fused
 
-    def record(*args):
+    def record(*args, **kwargs):
         calls.append(args[0].shape)
-        return kernel(*args)
+        return kernel(*args, **kwargs)
 
     monkeypatch.setattr(prework_mod, "gdn_prework_fused", record)
     transaction = start_speculative_cache([cache], seq)
