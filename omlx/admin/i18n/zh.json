@@ -112,6 +112,7 @@
   "status.stat.total_tokens": "预填充 Token 总数",
   "status.stat.cached_tokens": "已缓存 Token",
   "status.stat.cache_efficiency": "缓存效率",
+  "status.stat.generated_tokens": "生成 Token",
   "status.speed.section_label": "平均速度",
   "status.speed.prompt_processing": "提示词处理",
   "status.speed.prompt_processing_note": "（不含已缓存）",

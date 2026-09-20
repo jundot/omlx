@@ -112,6 +112,7 @@
   "status.stat.total_tokens": "Всего токенов префилла",
   "status.stat.cached_tokens": "Токены из кэша",
   "status.stat.cache_efficiency": "Эффективность кэша",
+  "status.stat.generated_tokens": "Сгенерированные токены",
   "status.speed.section_label": "Средняя скорость",
   "status.speed.prompt_processing": "Обработка промпта",
   "status.speed.prompt_processing_note": "(без кэша)",
