@@ -2209,7 +2209,8 @@
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
-                        <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
+                        <input type="number"
+                            :value="modelSettings.thinking_budget_tokens ?? ''"
                             @focus="_thinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
                             @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
                             @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
@@ -2780,6 +2781,11 @@
                 const el = event.target;
                 const raw = Number(el.value);
                 const prev = Number(this._thinkingBudgetBeforeInput);
+                // Empty field: let the user type freely; don't overwrite with NaN.
+                if (el.value === '' || el.value === '-') {
+                    this.modelSettings.thinking_budget_tokens = null;
+                    return;
+                }
                 if (Number.isFinite(prev) && Number.isFinite(raw) && raw !== prev) {
                     const delta = raw - prev;
                     // Native spinners use (min + n*step); 4096 is off-grid when min=1, step=100/1024
