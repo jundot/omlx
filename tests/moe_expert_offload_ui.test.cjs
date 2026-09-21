@@ -52,6 +52,13 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
     assert.equal(app.modelSettings[percent], 13);
     assert.ok(app.moeExpertOffloadResidentInvalid());
     assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
+    // Focus and blur without typing settles nothing: the stored fraction the
+    // field cannot express (12.5%) has to survive, not be clamped to 20%.
+    app.onMoeExpertOffloadResidentBlur();
+    assert.equal(app.modelSettings[fraction], 0.125, 'blur alone must not rewrite a stored fraction');
+    assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
+    await app.saveModelSettings();
+    assert.equal(payload[fraction], 0.125);
     app.onMoeExpertOffloadResidentPercent();
     assert.equal(app.modelSettings.moe_expert_offload_resident_touched, true);
     app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:0.33});

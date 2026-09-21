@@ -1972,9 +1972,15 @@
             },
 
             onMoeExpertOffloadResidentBlur() {
-                // Leaving the field settles it: an out-of-range entry is shown as
-                // an error while it is typed, then becomes the nearest allowed
-                // percentage rather than staying unsaveable.
+                // A field nobody typed in settles nothing. The API accepts any
+                // fraction in (0, 1], so a model stored at 12.5% or 90% — the
+                // shapes this field cannot express — keeps its value until the
+                // field is actually edited; merely focusing and leaving it must
+                // not rewrite what is stored.
+                if (!this.modelSettings.moe_expert_offload_resident_touched) return;
+                // Leaving an edited field settles it: an out-of-range entry is
+                // shown as an error while it is typed, then becomes the nearest
+                // allowed percentage rather than staying unsaveable.
                 if (this.moeExpertOffloadResidentInvalid()) {
                     const percent = Math.round(
                         Number(this.modelSettings.moe_expert_offload_resident_percent)
