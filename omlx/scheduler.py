@@ -12606,8 +12606,16 @@ class Scheduler:
         self._reclaim_prefill_headroom()
 
         # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
+        # re-scores cleanly. Clearing the id alone does not do that: the
+        # wrapper is installed on the shared model by sparse_prefill and only
+        # `cleanup_rope` removes it, and once the id is clear
+        # `_cleanup_specprefill` will not run either. The retry, and every
+        # request after it, would then decode through this request's position
+        # offset.
         if self._specprefill_active_request_id == request.request_id:
+            from .patches.specprefill import cleanup_rope
+
+            cleanup_rope(self.model)
             self._specprefill_active_request_id = None
 
         # Restore mRoPE deltas if an external VLM prefill was interrupted before
