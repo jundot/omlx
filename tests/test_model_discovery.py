@@ -1980,8 +1980,10 @@ class TestHfCacheDiscovery:
                 },
                 True,
             ),
-            # A quantization declaration the V4.1 loader cannot read stays
-            # hidden rather than failing at load time.
+            # A quantization declaration the V4.1 loader cannot read is refused
+            # by this gate. (The generic MLX heuristics below can still admit a
+            # real mlx_lm shard by metadata or repo name, so the gate is not the
+            # only place loadability is decided.)
             (
                 {
                     "model_type": "deepseek_v41",
@@ -1989,9 +1991,30 @@ class TestHfCacheDiscovery:
                 },
                 False,
             ),
+            # The loader needs a group size as well as a width.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 2, "mode": "affine"},
+                },
+                False,
+            ),
+            # A per-module override the loader would reject counts too.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {
+                        "bits": 2,
+                        "group_size": 64,
+                        "mode": "affine",
+                        "language_model.layers.0.attn.wq_a": {"mode": "mxfp4"},
+                    },
+                },
+                False,
+            ),
             # The loader reads the affine mode only, so a declared mxfp4/mxfp8
-            # source — and a width that is not an integer — stays hidden too
-            # instead of being admitted and then raising "Unsupported source
+            # source — and a width that is not an integer — is refused here
+            # rather than being admitted and then raising "Unsupported source
             # quantization mode" at load time.
             (
                 {

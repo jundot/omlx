@@ -16,6 +16,39 @@ from mlx.utils import tree_flatten
 from test_deepseek_v41 import write_affine_checkpoint
 
 
+@pytest.mark.parametrize("index_order", ["sorted", "insertion"])
+def test_source_affine_checkpoint_loads_whatever_the_index_order(tmp_path, index_order):
+    """The loader must not depend on the order the index lists tensors in.
+
+    `mlx_lm.utils.save_model` writes the weight map sorted, which puts every
+    `<module>.biases` ahead of its `<module>.weight`; a loader that only skips
+    metadata after reading its weight raises
+    "Unexpected target tensor shape: language_model.embed.biases" on exactly
+    the checkpoints this module exists for.
+    """
+    from omlx.patches.deepseek_v41.loading import load
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+
+    source, _ = write_affine_checkpoint(tmp_path, vision=False, index_order=index_order)
+    model, _ = load(source)
+    try:
+        packed = model.language_model.layers[0].attn.wq_a
+        assert isinstance(packed, QuantizedProjection)
+        assert (packed.bits, packed.mode, packed.group_size) == (2, "affine", 64)
+    finally:
+        model.close()
+
+
+def test_sorted_index_puts_metadata_before_its_weight(tmp_path):
+    """Keep the fixture on the realistic order the test above depends on."""
+    source, _ = write_affine_checkpoint(tmp_path, vision=False)
+    keys = list(
+        json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
+    )
+    assert keys == sorted(keys)
+    assert keys.index("head.biases") < keys.index("head.weight")
+
+
 def test_source_affine_checkpoint_loads_packed_and_declared_dense(tmp_path):
     """Packed projections become QuantizedProjection, declared-dense ones do not."""
     from omlx.patches.deepseek_v41.loading import load

@@ -201,7 +201,15 @@ def strip_draft_config(config):
 def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
     """Repack one projection at a time for either direct loading or export."""
     source = Path(source)
-    readers, consumed = {}, set()
+    # Quantization metadata belongs to the `.weight` it describes, whichever
+    # order the index lists them in. `mlx_lm.utils.save_model` rewrites the
+    # index with the weight map sorted, which puts every `<module>.biases`
+    # ahead of its `<module>.weight`; claiming the metadata here, rather than
+    # when the weight is repacked, keeps the loader independent of that order.
+    readers, consumed = (
+        {},
+        {key for key in mapping if key.endswith((".scales", ".biases", ".scale"))},
+    )
 
     def read(key):
         filename = mapping[key]
@@ -300,8 +308,6 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
                     {prefix: spec} if spec else {},
                 )
                 del values
-            elif key.endswith((".scale", ".scales")):
-                continue
             else:
                 raw, dtype = read(key)
                 value = decode_array(raw, dtype)

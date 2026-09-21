@@ -396,7 +396,12 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
 
 
 def write_affine_checkpoint(
-    tmp_path, vision=False, bits=2, group_size=64, **config_overrides
+    tmp_path,
+    vision=False,
+    bits=2,
+    group_size=64,
+    index_order="sorted",
+    **config_overrides,
 ):
     """A source checkpoint whose projections are mlx_lm-style affine packed.
 
@@ -449,8 +454,13 @@ def write_affine_checkpoint(
     # mx.load is lazy: materialize before overwriting the file it reads from.
     mx.eval(list(tensors.values()))
     mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    # `mlx_lm.utils.save_model` rewrites the index with the weight map sorted,
+    # so a real conversion lists `<module>.biases` before `<module>.weight`.
+    # That order is the default here; `index_order="insertion"` keeps the
+    # unsorted layout the official release ships.
+    keys = sorted(tensors) if index_order == "sorted" else list(tensors)
     (source / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+        json.dumps({"weight_map": {k: "model.safetensors" for k in keys}})
     )
     config = json.loads((source / "config.json").read_text())
     config["quantization"] = config["quantization_config"] = {

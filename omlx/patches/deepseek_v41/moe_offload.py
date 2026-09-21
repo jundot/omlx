@@ -81,7 +81,7 @@ class ExpertOffloadPlan:
         self.path = Path(path)
         self.mapping = mapping
         self.converted = raw.get("omlx_deepseek_v41")
-        self.quantization = raw
+        self.config = raw
         self.count = config.n_routed_experts
         self.floor = config.n_activated_experts
         self.capacity = min(self.count, max(self.floor, round(self.count * fraction)))
@@ -195,7 +195,7 @@ class ExpertOffloadPlan:
                 elif dtype == "U32":
                     # mlx_lm affine packing: the declared format fixes the
                     # logical width, and the shapes below must agree with it.
-                    current = source_quantization_spec(self.quantization, name)
+                    current = source_quantization_spec(self.config, name)
                     if current is None:
                         raise ValueError(
                             f"Expert is declared dense but stored packed: {name}"
