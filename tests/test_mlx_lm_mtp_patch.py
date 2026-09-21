@@ -328,14 +328,13 @@ class TestQwen35Model:
 
 
 class TestQwen35MtpNormShift:
-    """Per-key +1 RMSNorm shift for mixed-convention MTP checkpoints (PR #1507).
+    """MTP-head RMSNorm +1 shift follows the checkpoint layout, not the tensor.
 
-    Some pre-quantized Qwen3.6 MXFP4 bundles ship MTP-head norms in a mixed
-    convention: ``mtp.norm`` already in MLX's +1 convention (mean ~1.27) while
-    the per-layer head norms are still raw-HF (mean ~0). The backbone-only
-    conv1d signal evaluates False for such a checkpoint, so the old global
-    flag left the raw-HF head norms unshifted and MTP acceptance collapsed to
-    ~0%. The fix decides the shift per-key from each weight's own magnitude.
+    Raw-HF (unsanitized conv1d) shifts every zero-centered gamma by +1. An
+    MLX-format checkpoint is loaded as stored: the old per-tensor
+    ``mean < 0.5`` guess re-shifted already converted ``pre_fc_norm_*``
+    gammas (+0.49 / +0.27 on Qwen3.6-35B-A3B) and halved draft acceptance
+    (#3742). Legacy mixed heads are handled by ``norm_repair`` instead.
     """
 
     @pytest.fixture(autouse=True)
@@ -359,35 +358,31 @@ class TestQwen35MtpNormShift:
     def _first(arr):
         return float(arr[0])
 
-    def test_mixed_convention_shifts_only_raw_hf_mtp_norms(self):
-        """No unsanitized conv1d (backbone already MLX) -> should_shift False.
-        Raw-HF head norms get +1, already-MLX siblings are left untouched."""
+    def test_mlx_checkpoint_loads_mtp_norms_as_stored(self):
+        """No unsanitized conv1d -> every MTP norm is loaded as stored, even
+        when its mean sits below the old 0.5 cutoff (#3742 reproduction)."""
         import mlx.core as mx
 
         m = self._model()
+        stored = {
+            "model.layers.0.self_attn.conv1d.weight": mx.zeros((8, 3, 1)),
+            "mtp.norm.weight": 1.27,
+            "mtp.layers.0.self_attn.q_norm.weight": 0.75,
+            # Converted Qwen3.6-35B-A3B pre-fc gammas sit below 0.5.
+            "mtp.pre_fc_norm_hidden.weight": 0.4937,
+            "mtp.pre_fc_norm_embedding.weight": 0.2734,
+            # A raw-looking value is still loaded as stored.
+            "mtp.layers.0.input_layernorm.weight": 0.04,
+        }
         weights = {
-            # Already-MLX (mean >= 0.5) -> must NOT shift.
-            "mtp.norm.weight": mx.full((16,), 1.27),
-            "mtp.layers.0.self_attn.q_norm.weight": mx.full((16,), 0.75),
-            "mtp.layers.0.self_attn.k_norm.weight": mx.full((16,), 0.74),
-            # Raw-HF (mean < 0.5) -> must shift by +1.
-            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
-            "mtp.layers.0.post_attention_layernorm.weight": mx.full((16,), 0.21),
-            "mtp.pre_fc_norm_embedding.weight": mx.full((16,), -0.44),
-            "mtp.pre_fc_norm_hidden.weight": mx.full((16,), -0.17),
+            k: (v if isinstance(v, mx.array) else mx.full((16,), v))
+            for k, v in stored.items()
         }
         out = m.sanitize(weights)
-        g = self._first
-
-        # Already-MLX siblings left untouched.
-        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
-        assert abs(g(out["mtp.layers.0.self_attn.q_norm.weight"]) - 0.75) < 1e-3
-        assert abs(g(out["mtp.layers.0.self_attn.k_norm.weight"]) - 0.74) < 1e-3
-        # Raw-HF head norms shifted by +1.
-        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
-        assert abs(g(out["mtp.layers.0.post_attention_layernorm.weight"]) - 1.21) < 1e-3
-        assert abs(g(out["mtp.pre_fc_norm_embedding.weight"]) - 0.56) < 1e-3
-        assert abs(g(out["mtp.pre_fc_norm_hidden.weight"]) - 0.83) < 1e-3
+        for k, v in stored.items():
+            if isinstance(v, mx.array):
+                continue
+            assert abs(self._first(out[k]) - v) < 1e-3, k
 
     def test_pure_raw_hf_shifts_backbone_and_mtp(self):
         """Unsanitized conv1d present -> should_shift True. Backbone and all
@@ -400,14 +395,17 @@ class TestQwen35MtpNormShift:
             "model.layers.0.self_attn.conv1d.weight": mx.zeros((8, 4, 3)),
             "model.layers.0.input_layernorm.weight": mx.full((16,), 0.05),
             "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
-            "mtp.norm.weight": mx.full((16,), 0.27),
+            # Raw gammas above 0.5 shift too; the layout decides, not the mean.
+            "mtp.layers.0.post_attention_layernorm.weight": mx.full((16,), 0.87),
+            "mtp.norm.weight": mx.full((16,), 1.93),
         }
         out = m.sanitize(weights)
         g = self._first
 
         assert abs(g(out["model.layers.0.input_layernorm.weight"]) - 1.05) < 1e-3
         assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
-        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+        assert abs(g(out["mtp.layers.0.post_attention_layernorm.weight"]) - 1.87) < 1e-3
+        assert abs(g(out["mtp.norm.weight"]) - 2.93) < 1e-3
 
     def test_pure_mlx_leaves_everything_untouched(self):
         """Already-converted checkpoint: no conv1d signal and all norms in the
@@ -431,11 +429,8 @@ class TestQwen35MtpNormShift:
         """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
         placeholders. On a raw-HF source (unsanitized conv1d present) every
         Qwen3-Next RMSNorm gamma is zero-centered, so MTP-head norms record
-        the same unconditional +1 "add" transform as the backbone norms.
-        (The old conditional add_if_mean_lt_0_5 misclassified q_norm/k_norm
-        [raw mean ~0.75] and mtp.norm [raw ~1.27], costing ~14pp of draft
-        acceptance on Qwen3.6-27B.) Pre-converted sources — no unsanitized
-        conv1d — keep the per-key conditional for mixed-convention bundles."""
+        the same unconditional +1 "add" transform as the backbone norms. A
+        pre-converted source records no transform at all."""
         import mlx.core as mx
 
         from omlx.oq import _discover_sanitize_plan
@@ -462,6 +457,16 @@ class TestQwen35MtpNormShift:
         assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
         assert plan["mtp.layers.0.input_layernorm.weight"]["transform"] == "add"
         assert plan["mtp.norm.weight"]["transform"] == "add"
+
+        # Pre-converted source: no transform is recorded for any norm.
+        meta["model.layers.0.self_attn.conv1d.weight"] = ((2048, 4, 1), mx.float32)
+        plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
+        for key in (
+            "model.layers.0.input_layernorm.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.norm.weight",
+        ):
+            assert plan[key]["transform"] == "passthrough", key
 
 
 class TestQwen35MoeSanitize:

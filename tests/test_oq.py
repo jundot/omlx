@@ -2923,39 +2923,6 @@ class TestDiscoverSanitizePlan:
             np.array(discovered.pop("switch.down.weight")), expected_down
         )
 
-    def test_conditional_mtp_norm_add_materializes_by_mean(self, tmp_path):
-        path = tmp_path / "mtp_norms.safetensors"
-        tensors = {
-            "raw.weight": np.full((8,), 0.04, dtype=np.float16),
-            "shifted.weight": np.full((8,), 1.27, dtype=np.float16),
-        }
-        _write_safetensors(str(path), tensors)
-        idx = _LazyTensorIndex([str(path)])
-
-        plan = {
-            "raw.weight": {
-                "sources": ["raw.weight"],
-                "transform": "add_if_mean_lt_0_5",
-                "shape": (8,),
-                "axis": None,
-            },
-            "shifted.weight": {
-                "sources": ["shifted.weight"],
-                "transform": "add_if_mean_lt_0_5",
-                "shape": (8,),
-                "axis": None,
-            },
-        }
-        discovered = _DiscoveredPlan(plan, idx)
-
-        raw = discovered.pop("raw.weight")
-        shifted = discovered.pop("shifted.weight")
-
-        assert float(raw.astype(mx.float32)[0].item()) == pytest.approx(1.04, abs=1e-3)
-        assert float(shifted.astype(mx.float32)[0].item()) == pytest.approx(
-            1.27, abs=1e-3
-        )
-
 
 # =============================================================================
 # Test _model_exceeds_ram guard
