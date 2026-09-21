@@ -1816,3 +1816,133 @@ def test_glm5_next_flat_overhead_charges_pool_once_and_releases_on_reclaim():
     ns._prefill_transient_tracker.record_flat_reclaim(20 * _GB)
     charged = ns._predicted_chunk_transient(2047, 2048)
     assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)
+
+
+# --------------------------------------------------------------------------
+# DeepSeek V4.1 (deepseek_v41) packed sparse prefill: static profile +
+# flat-overhead pricing (port of the GLM-5.x blueprint for the 2026-09-21
+# v41 diagnosis: EWMA priced a chunk at 2.81GB while the footprint crossed
+# the throttle target; resident KV is 4-bit packed on 4+8 source layers)
+# --------------------------------------------------------------------------
+
+
+def _v41_text_dict():
+    ratios = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
+    return {
+        "model_type": "deepseek_v41",
+        "text_config": {
+            "vocab_size": 129280,
+            "hidden_size": 5120,
+            "moe_intermediate_size": 2304,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 64,
+            "head_dim": 512,
+            "q_lora_rank": 1280,
+            "o_lora_rank": 1024,
+            "o_groups": 8,
+            "sliding_window": 128,
+            "compress_ratios": ratios,
+            "kv_source_layer_ids": [2, 8, 14, 20],
+            "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+            "index_n_heads": 32,
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "n_routed_experts": 384,
+            "num_experts_per_tok": 6,
+        },
+    }
+
+
+def _v41_config():
+    from omlx.patches.deepseek_v41.config import ModelConfig
+
+    return ModelConfig.from_dict(_v41_text_dict())
+
+
+def _v41_monitor():
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=40,
+        num_kv_heads=64,
+        head_dim=512,
+        dtype_size=2,
+        num_attention_heads=64,
+        num_kv_cache_layers=40,
+        prefill_memory_profile=make_prefill_memory_profile(
+            _v41_config(), compute_dtype_size=2
+        ),
+    )
+    return monitor
+
+
+def test_v41_prefill_profile_registered():
+    profile = make_prefill_memory_profile(_v41_config(), compute_dtype_size=2)
+    assert profile is not None
+    # Resident KV is 4-bit packed (dim//2 + dim//16 bytes per latent) only on
+    # the source layers: kv sources at ratios [2,2,2,1] -> 144*3 + 288,
+    # index sources at ratios [2,2,2,1,1,1,1,1] -> 36*3 + 72*5.
+    per_token = (144 * 3 + 288) + (36 * 3 + 72 * 5)
+    assert profile.estimate_resident_kv_bytes(1000) == per_token * 1000
+    short = profile.estimate_prefill_transient_bytes(2048, 2048)
+    long_ctx = profile.estimate_prefill_transient_bytes(2048, 32768)
+    assert short > 0 and long_ctx > 0
+    # The attention core runs inside the packed native kernel: the score
+    # surface is priced as a gather over index_topk + window latents, never
+    # as dense query x kv_len scoring — bounded as the context grows.
+    gather_bound = 2048 * (512 + 128) * 512 * 2
+    dense_scores = 64 * 2048 * 32768 * 2
+    assert long_ctx < dense_scores
+    assert long_ctx <= gather_bound * 4
+
+
+def test_v41_flat_overhead_guard_admits_chunk_at_2337_numbers():
+    """Regression for the 2026-09-21 23:00 abort path: v41 at 134-expert
+    residency, footprint 102.93GB with the EWMA still charging 8.89GB of
+    pool bytes the footprint already retained, crossing the 105.75GB
+    throttle target after chunk 1. With the static packed-attention profile
+    and flat-overhead accounting the same admission passes at full chunk."""
+    monitor = _v41_monitor()
+    assert monitor.uses_flat_overhead_accounting() is True
+    assert monitor.is_qwen4_gathered_prefill_profile() is False
+    hard = int(123.5 * _GB)
+    current = int(102.93 * _GB)
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=monitor, reclaim_to=current, min_chunk=512
+    )
+    ns._fake_current = current
+    ns._prefill_speed_priority = True
+    # Chunk 2 of pp=8192: 2048 query tokens over kv_len=2048.
+    n = _guard_call(ns, 2048, kv_len=2048)
+    assert n == 2048
+
+
+def test_v41_flat_overhead_charges_pool_once_and_releases_on_reclaim():
+    """The 8-14GB per-chunk IOAccelerator sawtooth is retained pool churn:
+    the flat path must price it once from the measured residual and never
+    re-charge it on top of a footprint that already contains it."""
+    monitor = _v41_monitor()
+    ns = _throttle_ctx(
+        current=0, hard=int(123.5 * _GB), monitor=monitor, min_chunk=512
+    )
+    ns._fake_current = 0
+    predicted = ns._predicted_chunk_transient(2047, 2048)
+    static = monitor.estimate_chunk_transient_bytes(
+        2047, 2048 + 2047
+    ) + monitor.estimate_prompt_kv_bytes(2047)
+    assert predicted == pytest.approx(static * 1.3, rel=1e-6)
+    Scheduler._record_chunk_transient(
+        ns,
+        2047,
+        pre_bytes=0,
+        post_bytes=int(12 * _GB),
+        request_id="r",
+        loop_label="test",
+        kv_len=2048,
+    )
+    retained = ns._predicted_chunk_transient(2047, 2048)
+    assert retained == pytest.approx(static * 1.3, rel=1e-6)
+    flat = ns._prefill_transient_tracker.flat_overhead_bytes_for(False)
+    assert flat > 0
+    ns._prefill_transient_tracker.record_flat_reclaim(12 * _GB)
+    charged = ns._predicted_chunk_transient(2047, 2048)
+    assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)

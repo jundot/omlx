@@ -13370,17 +13370,29 @@ class Scheduler:
                     config = sub
                     break
 
-            # Extract KV cache dimensions
-            num_layers = _cfg_get(config, "num_hidden_layers") or _cfg_get(
-                config, "n_layer"
+            # Extract KV cache dimensions. Vendor-pinned model ports (the
+            # mlx_vlm deepseek_v41 fork) expose their runtime ModelConfig
+            # under legacy field names (n_layers / dim / n_heads); without
+            # these fallbacks every probe returned None, the whole model-info
+            # block was skipped, and the guard priced those models from the
+            # footprint-delta EWMA alone.
+            num_layers = (
+                _cfg_get(config, "num_hidden_layers")
+                or _cfg_get(config, "n_layer")
+                or _cfg_get(config, "n_layers")
             )
             num_kv_heads = (
                 _cfg_get(config, "num_key_value_heads")
                 or _cfg_get(config, "num_attention_heads")
                 or _cfg_get(config, "n_head")
+                or _cfg_get(config, "n_heads")
             )
             head_dim = _cfg_get(config, "head_dim")
-            hidden_size = _cfg_get(config, "hidden_size") or _cfg_get(config, "n_embd")
+            hidden_size = (
+                _cfg_get(config, "hidden_size")
+                or _cfg_get(config, "n_embd")
+                or _cfg_get(config, "dim")
+            )
 
             # Calculate head_dim if not directly available
             if head_dim is None and hidden_size and num_kv_heads:
