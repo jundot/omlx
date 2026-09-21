@@ -371,12 +371,24 @@ def shadow_slice_cap(config: object, request: object, n: int) -> int:
     Recovery publishes at a cache block boundary because that is the only
     place canonical state exists for a non-sliceable layer. It does not have
     to *compute* a whole block at a time, and the two were the same number
-    only because nothing had separated them. The one a foreground request
-    waits for is this one: a slice cannot be interrupted once it is handed to
-    the model, and at the block grain an arriving request waited up to 14.4 s
-    behind one.
+    only because nothing had separated them.
 
-    Shrinking it changes nothing about publication.
+    The one a foreground request waits for is this one. A slice cannot be
+    interrupted once it is handed to the model, so a whole-block recovery unit
+    can delay an arriving request for the duration of that unit. Smaller
+    execution slices bound that blocking interval, independently of the
+    canonical publication grain.
+
+    Three controls, three different jobs:
+
+    - the recovery budget governs how *often* recovery collides with a
+      foreground request;
+    - the execution slice governs how *long* that request is blocked when it
+      does;
+    - the publication grain governs *when* reusable canonical state may be
+      committed, and is fixed by the cache layout rather than chosen.
+
+    Shrinking the slice changes nothing about publication.
     ``clamp_prefill_chunk_to_boundary`` already stops a slice overshooting a
     boundary, ``should_emit_prefill_boundary`` fires only on exact block
     multiples, and ``safe_publish_boundary`` floors publication to them. More

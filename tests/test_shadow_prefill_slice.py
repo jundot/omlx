@@ -2,9 +2,9 @@
 """The recovery execution slice is not the canonical publication grain.
 
 A recovery slice cannot be interrupted once it is handed to the model, so the
-worst wait a foreground request can suffer is one slice. Measured with the
-slice at a whole cache block that was up to 14.4 s, which is not a latency an
-interactive request can be asked to absorb.
+worst wait a foreground request can suffer is one slice. At the block grain
+that unit is a whole cache-block forward, which is long enough that an
+interactive request cannot be asked to absorb it.
 
 Lowering the budget does not help, and the reason is worth stating because it
 is what these tests exist to act on: a budget is a ceiling on how *often* a
@@ -78,7 +78,11 @@ class TestTheCapAppliesToRecoveryOnly:
         assert shadow_slice_cap(scheduler.config, _request(True), 2048) == 256
 
     def test_zero_leaves_recovery_on_the_ordinary_step_size(self):
-        """The default, and the state the 14.4 s measurement was taken in."""
+        """The default: recovery runs at the ordinary prefill step size.
+
+        This is the state the block-grain blocking interval was characterised
+        in, and it is what the cap exists to narrow.
+        """
         scheduler = _make_scheduler(shadow_prefill_slice_tokens=0)
         assert shadow_slice_cap(scheduler.config, _request(True), 2048) == 2048
 
