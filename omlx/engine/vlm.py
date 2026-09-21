@@ -617,6 +617,9 @@ def _has_audio_weights(model_dir: Path) -> bool:
 # Text-only oQ checkpoints can retain embed_vision without a vision tower.
 _VISION_TOWER_MARKER = "vision_tower"
 _VISION_TENSOR_MARKERS = (_VISION_TOWER_MARKER, "embed_vision")
+# Moondream stores its tower under `vision` (current, converted) or
+# `vision_encoder` (2024 revisions) and never declares a vision_config.
+_VISION_TOWER_PATH_MARKERS = (_VISION_TOWER_MARKER, "vision", "vision_encoder")
 
 
 def _is_vision_tensor_key(key: str) -> bool:
@@ -626,7 +629,7 @@ def _is_vision_tensor_key(key: str) -> bool:
 
 def _is_vision_tower_key(key: str) -> bool:
     """Exclude orphan projection weights when detecting a vision tower."""
-    return _VISION_TOWER_MARKER in key.split(".")
+    return any(marker in key.split(".") for marker in _VISION_TOWER_PATH_MARKERS)
 
 
 def _has_vision_tower_weights(model_dir: Path) -> bool:

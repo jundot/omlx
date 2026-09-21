@@ -13,7 +13,24 @@ from omlx.engine.vlm import _strip_vision_config_if_orphaned
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
 
-@pytest.mark.parametrize("case", ["declared", "tower", "unreadable", "no_config"])
+_TOWER_KEYS = {
+    "tower": "model.encoder.vision_tower.weight",
+    "moondream_tower": "model.vision.encoder.blocks.0.attn.qkv.weight",
+    "moondream_legacy_tower": "vision_encoder.encoder.model.visual.pos_embed",
+}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "declared",
+        "tower",
+        "moondream_tower",
+        "moondream_legacy_tower",
+        "unreadable",
+        "no_config",
+    ],
+)
 def test_leaves_loader_unchanged(tmp_path, case):
     config = {"model_type": "diffusion_gemma"}
     if case == "declared":
@@ -24,7 +41,7 @@ def test_leaves_loader_unchanged(tmp_path, case):
     if case == "unreadable":
         shard.write_bytes(b"broken")
     else:
-        key = "model.encoder.vision_tower.weight" if case == "tower" else "weight"
+        key = _TOWER_KEYS.get(case, "weight")
         mx.save_safetensors(str(shard), {key: mx.zeros((1,))})
     before = (vu.update_module_configs, nn.Module.load_weights)
     with _strip_vision_config_if_orphaned(tmp_path):

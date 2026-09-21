@@ -1075,6 +1075,39 @@ class TestMoondreamCompatibility:
         )
         assert processor.tokenizer.encode("hello", add_special_tokens=False) == [2]
 
+    def test_legacy_phi_checkpoint_uses_bundled_tokenizer_and_prompt(
+        self, tmp_path, monkeypatch, moondream
+    ):
+        from mlx_vlm.utils import load_processor
+        from PIL import Image
+        from transformers import AutoTokenizer
+
+        self._tokenizer(starmie=False).save_pretrained(tmp_path)
+        _write_config(
+            tmp_path,
+            '{"model_type": "moondream1", "architectures": ["Moondream"],'
+            ' "text_config": {"model_type": "phi"}}',
+        )
+        original = AutoTokenizer.from_pretrained
+        sources = []
+
+        def record(path, **kwargs):
+            sources.append(str(path))
+            return original(path, **kwargs)
+
+        monkeypatch.setattr(AutoTokenizer, "from_pretrained", record)
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        processor = load_processor(tmp_path, add_detokenizer=False)
+        assert sources == [str(tmp_path)]
+        bos = processor.tokenizer.bos_token_id
+        question = processor.tokenizer.encode(
+            "\n\nQuestion: hello\n\nAnswer:", add_special_tokens=False
+        )
+        with_image = processor(text="hello", images=[Image.new("RGB", (64, 64))])
+        assert with_image["input_ids"][0].tolist() == [bos] + [0] * 729 + question
+        assert with_image["pixel_values"].shape[0] == with_image["num_crops"][0]
+        assert processor(text="hello")["input_ids"].tolist() == [[bos, 1]]
+
     @pytest.mark.parametrize("stale_local", [False, True])
     def test_external_starmie_preserves_load_options(
         self, tmp_path, monkeypatch, moondream, stale_local

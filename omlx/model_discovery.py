@@ -166,6 +166,8 @@ VLM_ARCHITECTURES = {
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
+    "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }
 
 # Known embedding model types from mlx-embeddings

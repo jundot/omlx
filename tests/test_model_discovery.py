@@ -378,6 +378,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    @pytest.mark.parametrize("architecture", ["HfMoondream", "Moondream"])
+    def test_detect_moondream_as_vlm(self, tmp_path, architecture):
+        """Moondream configs carry no vision sub-config; the architecture decides."""
+        config = {
+            "model_type": "moondream1",
+            "architectures": [architecture],
+            "config": {},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_muse_glimmer_as_vlm(self, tmp_path):
         """Meta Muse Glimmer 30B is served by mlx-vlm."""
         config = {
