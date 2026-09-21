@@ -2136,7 +2136,10 @@ async def test_shutdown_persists_snapshot_on_generation_thread(
             persisted.write_bytes(b"snapshot")
 
         monkeypatch.setattr(cache_manager, "shutdown_runtime_cache_manager", persist)
-        await getattr(engine, method)()
+        if method == "stop":
+            await engine.stop()
+        else:
+            await engine._evict_dflash_and_start_fallback("shutdown requested")
 
     assert persisted.read_bytes() == b"snapshot"
     assert engine._target_model is None
