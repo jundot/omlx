@@ -4535,7 +4535,10 @@ class PagedSSDCacheManager(CacheManager):
 
         Uses a 30-second TTL cache for shutil.disk_usage() results.
         """
-        if self._cache_dir is None:
+        # Hot-cache-only mode never touches the SSD directory (init skips
+        # creating it), so disk headroom is irrelevant here; querying it
+        # would fail with ENOENT on every poll and spam this warning.
+        if self._cache_dir is None or self._hot_cache_only:
             return self._max_size
 
         # Take the lock so a concurrent writer-thread invalidation
