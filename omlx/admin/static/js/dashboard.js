@@ -130,7 +130,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, systemone_enabled: false, systemone_model: '', systemone_readable_models: [], max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
@@ -1161,6 +1161,8 @@
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
+                            systemone_enabled: this.globalSettings.server.systemone_enabled,
+                            systemone_model: this.globalSettings.server.systemone_model || '',
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,

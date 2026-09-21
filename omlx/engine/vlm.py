@@ -31,7 +31,9 @@ import inspect
 import json
 import logging
 import os
+import random
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,6 +52,7 @@ from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..systemone.types import SlotDistribution, StructuredReadResult, normalized
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -4998,6 +5001,287 @@ class VLMBatchedEngine(BaseEngine):
                 cancel_event.set()
                 await future
                 self._diffusion_cancel_events.discard(cancel_event)
+                self._diffusion_active_requests -= 1
+
+    # ------------------------------------------------------------------
+    # Structured reads (System One)
+    # ------------------------------------------------------------------
+
+    @property
+    def diffusion_canvas_length(self) -> int:
+        """Served canvas width from the model config (0 when unknown)."""
+
+        config = getattr(self._vlm_model, "config", None)
+        return int(getattr(config, "canvas_length", 0) or 0)
+
+    def _diffusion_vocab_size(self) -> int:
+        config = getattr(self._vlm_model, "config", None)
+        text_config = getattr(config, "text_config", None) or config
+        vocab = int(getattr(text_config, "vocab_size", 0) or 0)
+        if vocab:
+            return vocab
+        tokenizer = self._tokenizer
+        for candidate in (
+            getattr(tokenizer, "vocab_size", None),
+            len(tokenizer) if tokenizer is not None else None,
+        ):
+            if candidate:
+                return int(candidate)
+        raise InvalidRequestError(
+            "Cannot determine vocabulary size for structured reads.",
+            field="model",
+        )
+
+    def _structured_read_sync(
+        self,
+        prompt_ids: list[int],
+        groups: list[Any],
+        *,
+        samples: int,
+        steps: int,
+        pixel_values: Any | None = None,
+        mm_token_type_ids: Any | None = None,
+        attention_mask: Any | None = None,
+        seed: int | None = None,
+        should_cancel: Any | None = None,
+    ) -> StructuredReadResult:
+        """Prefill once, then read distributions from narrow canvas forwards.
+
+        Runs on the MLX executor thread. The cache is written only by the
+        encoder, so one prefill legally serves every canvas of this request:
+        ``diffusion_decoder_logits`` reads the cached prefix and applies
+        bidirectional masks over the canvas rows without appending. Nothing here
+        commits a canvas, detokenizes it, or inspects EOS — a noise draw that
+        lands an end-of-turn token in a slot must not end anything.
+
+        Probabilities come from **raw** softcapped logits. The denoise
+        schedule's temperature ramp lives in ``stream_diffusion_generate`` and
+        never touches this path, which is the whole reason the read calls the
+        model's public methods instead of the generator.
+        """
+
+        model = self._vlm_model
+        if model is None:
+            raise InvalidRequestError(
+                "Model is not loaded.",
+                field="model",
+            )
+
+        try:
+            from mlx_vlm.generate.common import generation_stream, wired_limit
+
+            limit_ctx = wired_limit(model, [generation_stream])
+        except Exception:
+            limit_ctx = contextlib.nullcontext()
+
+        vocab = self._diffusion_vocab_size()
+        seed_used = int(seed) if seed is not None else random.randrange(1 << 48)
+        rng = random.Random(seed_used)
+        if seed is not None:
+            mx.random.seed(seed_used)
+
+        result = StructuredReadResult(
+            seed=seed_used,
+            samples=samples,
+            steps=steps,
+            prompt_tokens=len(prompt_ids),
+        )
+        # sums[key] accumulates per-draw probabilities; counts[key] is how many
+        # draws landed, so a cancelled read averages over what it completed.
+        sums: dict[str, list[float]] = {}
+        counts: dict[str, int] = {}
+        order: list[Any] = []
+        for group in groups:
+            for slot in group.slots:
+                sums[slot.key] = [0.0] * slot.n_labels
+                counts[slot.key] = 0
+                order.append(slot)
+
+        try:
+            with limit_ctx:
+                ids = mx.array([prompt_ids])
+                cache = model.make_cache()
+                started = time.perf_counter()
+                cache = model.diffusion_prefill_cache(
+                    ids,
+                    attention_mask=attention_mask,
+                    cache=cache,
+                    pixel_values=pixel_values,
+                    mm_token_type_ids=mm_token_type_ids,
+                    prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
+                    chunk_prefill=False,
+                )
+                mx.eval(
+                    [
+                        c.state
+                        for c in (cache or [])
+                        if c is not None and getattr(c, "state", None) is not None
+                    ]
+                )
+                mx.synchronize()
+                result.prefill_ms = (time.perf_counter() - started) * 1000.0
+
+                decode_started = time.perf_counter()
+                for group in groups:
+                    if should_cancel is not None and should_cancel():
+                        break
+                    # Exact width, no padding: canvas rows attend to every other
+                    # canvas row, so a pad row would perturb the label slots.
+                    canvas = mx.array([group.canvas(None, vocab)])
+                    # The mask is a dict keyed by layer type and depends only on
+                    # (batch, width, cache state) — `_make_decoder_masks` returns
+                    # a dict verbatim, so reusing it is the identity path.
+                    masks = model.diffusion_decoder_masks(canvas, cache, None)
+                    for _ in range(samples):
+                        if should_cancel is not None and should_cancel():
+                            break
+                        canvas = mx.array([group.canvas(rng, vocab)])
+                        logits = model.diffusion_decoder_logits(
+                            canvas,
+                            cache=cache,
+                            decoder_attention_mask=masks,
+                        )
+                        mx.eval(logits)
+                        result.forwards += 1
+                        result.canvas_tokens += group.width
+                        for slot in group.slots:
+                            row = logits[0][slot.position]
+                            values = mx.take(
+                                row,
+                                mx.array(list(slot.label_ids), dtype=mx.uint32),
+                                axis=0,
+                            )
+                            probs = mx.softmax(
+                                values.astype(mx.float32), axis=-1, precise=True
+                            )
+                            mx.eval(probs)
+                            draws = probs.tolist()
+                            bucket = sums[slot.key]
+                            for i, value in enumerate(draws):
+                                bucket[i] += float(value)
+                            counts[slot.key] += 1
+
+                result.decode_ms = (time.perf_counter() - decode_started) * 1000.0
+                for slot in order:
+                    n = counts[slot.key]
+                    if n:
+                        probabilities = normalized(
+                            [value / n for value in sums[slot.key]]
+                        )
+                    else:
+                        # A read cancelled before this group ran still answers
+                        # every key the client asked about, with a neutral prior.
+                        probabilities = tuple(
+                            1.0 / slot.n_labels for _ in range(slot.n_labels)
+                        )
+                    result.distributions.append(
+                        SlotDistribution(
+                            key=slot.key,
+                            label_ids=tuple(slot.label_ids),
+                            label_keys=tuple(slot.label_keys),
+                            probabilities=probabilities,
+                        )
+                    )
+                return result
+        finally:
+            mx.synchronize()
+            mx.clear_cache()
+
+    async def structured_read(
+        self,
+        *,
+        prompt_ids: list[int],
+        groups: list[Any],
+        samples: int = 1,
+        steps: int = 1,
+        pixel_values: Any | None = None,
+        mm_token_type_ids: Any | None = None,
+        attention_mask: Any | None = None,
+        seed: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> StructuredReadResult:
+        """Answer a structured read without generating a token.
+
+        Serialised onto the diffusion lane like every other request on it: the
+        lane lock is not a limitation this adds, ``get_mlx_executor()`` is a
+        single-worker pool because MLX GPU work must be serialized across all
+        models. Cancellation is cooperative at group/sample boundaries — an
+        in-flight Metal op is allowed to finish so the cache stays consistent.
+        """
+
+        from ..engine_core import get_mlx_executor
+
+        if not self.is_diffusion_model:
+            raise InvalidRequestError(
+                "Structured reads require a diffusion model.",
+                field="model",
+            )
+        if not prompt_ids:
+            raise InvalidRequestError("Prompt is empty.", field="prompt")
+        if not groups:
+            raise InvalidRequestError("No read groups supplied.", field="questions")
+        if steps != 1:
+            raise InvalidRequestError(
+                "Multi-step structured reads are not implemented yet; use steps=1.",
+                field="steps",
+            )
+        if not 1 <= int(samples) <= 32:
+            raise InvalidRequestError(
+                f"samples must be between 1 and 32, got {samples}.",
+                field="samples",
+            )
+
+        canvas_length = self.diffusion_canvas_length
+        for group in groups:
+            width = int(getattr(group, "width", 0) or 0)
+            if width < 1:
+                raise InvalidRequestError(
+                    "Read groups need a non-empty canvas template.",
+                    field="questions",
+                )
+            if canvas_length and width > canvas_length:
+                raise InvalidRequestError(
+                    f"Canvas template of {width} tokens exceeds the served canvas "
+                    f"length of {canvas_length}; split the questions into groups.",
+                    field="questions",
+                )
+
+        async with self._diffusion_lock:
+            self._diffusion_active_requests += 1
+            lane_cancel = threading.Event()
+            self._diffusion_cancel_events.add(lane_cancel)
+            loop = asyncio.get_running_loop()
+
+            def _cancelled() -> bool:
+                return lane_cancel.is_set() or (
+                    cancel_event is not None and cancel_event.is_set()
+                )
+
+            def _worker() -> StructuredReadResult:
+                return self._structured_read_sync(
+                    prompt_ids,
+                    groups,
+                    samples=int(samples),
+                    steps=int(steps),
+                    pixel_values=pixel_values,
+                    mm_token_type_ids=mm_token_type_ids,
+                    attention_mask=attention_mask,
+                    seed=seed,
+                    should_cancel=_cancelled,
+                )
+
+            future = loop.run_in_executor(get_mlx_executor(), _worker)
+            try:
+                return await future
+            except asyncio.CancelledError:
+                lane_cancel.set()
+                if cancel_event is not None:
+                    cancel_event.set()
+                with contextlib.suppress(BaseException):
+                    await future
+                raise
+            finally:
+                self._diffusion_cancel_events.discard(lane_cancel)
                 self._diffusion_active_requests -= 1
 
     def count_chat_tokens(

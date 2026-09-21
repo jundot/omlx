@@ -1087,6 +1087,36 @@ class EnginePool:
         model_type = (entry.config_model_type or "").lower().replace("-", "_")
         return model_type == "diffusion_gemma"
 
+    def supports_systemone(self, model_id: str) -> bool:
+        """True when a discovered model can answer a structured System One read.
+
+        Reads the entry's config, so no engine is loaded and no tokenizer is
+        touched: an autoregressive model is refused before its weights move.
+        Takes a physical id - resolve an alias first, or use
+        :meth:`resolve_systemone_model_id`.
+        """
+        entry = self._entries.get(model_id)
+        return bool(entry and self._entry_is_diffusion_model(entry))
+
+    def resolve_systemone_model_id(self, model_id_or_alias: str) -> str | None:
+        """Resolve any accepted name to a readable model, or None.
+
+        Aliases and exposed-profile ids resolve through the same path /v1/chat
+        uses, because ``get_engine`` keys its entries by physical id and does
+        not resolve. Returning None means the name is unknown, or names a model
+        with no canvas to read.
+        """
+        resolved = self.resolve_model_id(model_id_or_alias, self._settings_manager)
+        return resolved if self.supports_systemone(resolved) else None
+
+    def systemone_model_ids(self) -> list[str]:
+        """Physical ids of every discovered model that can answer reads."""
+        return [
+            mid
+            for mid, entry in self._entries.items()
+            if self._entry_is_diffusion_model(entry)
+        ]
+
     def apply_settings_overrides(
         self, settings_manager: ModelSettingsManager
     ) -> None:

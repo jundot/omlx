@@ -88,6 +88,8 @@ class TestServerSettings:
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
             "distributed_inference_enabled": False,
+            "systemone_enabled": False,
+            "systemone_model": "",
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
             "max_image_side_length": 2048,
@@ -101,6 +103,20 @@ class TestServerSettings:
             ).distributed_inference_enabled
             is True
         )
+
+    def test_from_dict_systemone_is_opt_in_and_round_trips(self):
+        assert ServerSettings.from_dict({}).systemone_enabled is False
+        assert ServerSettings.from_dict({}).systemone_model == ""
+        s = ServerSettings.from_dict(
+            {"systemone_enabled": True, "systemone_model": "diffusiongemma"}
+        )
+        assert s.systemone_enabled is True
+        assert s.systemone_model == "diffusiongemma"
+        # to_dict writes it and from_dict must read it back, or the switch
+        # reverts to off on the next load.
+        restored = ServerSettings.from_dict(s.to_dict())
+        assert restored.systemone_enabled is True
+        assert restored.systemone_model == "diffusiongemma"
 
     def test_from_dict_sse_keepalive_mode(self):
         """sse_keepalive_mode round-trips through from_dict / to_dict."""

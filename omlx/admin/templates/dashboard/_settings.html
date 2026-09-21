@@ -877,6 +877,43 @@
                                         </div>
                                     </div>
 
+                                    <!-- System One structured reads subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="brain-circuit" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.systemone') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1 min-w-0">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.systemone_enabled') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.systemone_enabled_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="globalSettings.server.systemone_enabled = !globalSettings.server.systemone_enabled"
+                                                    :class="globalSettings.server.systemone_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="globalSettings.server.systemone_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1 min-w-0">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.systemone_model') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.systemone_model_hint') }}</p>
+                                            </div>
+                                            <select x-model="globalSettings.server.systemone_model"
+                                                    :disabled="!globalSettings.server.systemone_enabled"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all disabled:opacity-50">
+                                                <option value="">{{ t('settings.advanced.systemone_model_auto') }}</option>
+                                                <template x-for="mid in (globalSettings.server.systemone_readable_models || [])" :key="mid">
+                                                    <option :value="mid" x-text="mid"></option>
+                                                </template>
+                                            </select>
+                                        </div>
+                                    </div>
+
                                     <!-- Performance subsection -->
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
