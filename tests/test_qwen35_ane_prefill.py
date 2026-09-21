@@ -1,8 +1,9 @@
 import logging
 import re
+import sys
 import weakref
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -2392,7 +2393,7 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
         raise ImportError(name)
 
     monkeypatch.setattr(ane_patch.importlib, "import_module", import_module)
-    monkeypatch.setattr(ane_patch, "_PATCHED_CLASSES", set())
+    monkeypatch.setattr(ane_patch, "_PATCHED_CLASSES", {})
     monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
     monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
 
@@ -3412,3 +3413,60 @@ def test_tuner_floor_delegates_to_the_patch_rule():
     assert ane_tuning._min_viable_gdn_fraction(
         patch, gdn, 128
     ) == patch._min_viable_gdn_fraction(gdn, 128)
+
+
+@pytest.mark.parametrize("sequence_length", [1024, 2048])
+@pytest.mark.parametrize("install_order", ["ane_then_q4", "q4_then_ane"])
+def test_ane_mlp_dispatch_survives_q4_install_order(
+    monkeypatch, install_order, sequence_length
+):
+    from mlx_lm.models import qwen3_5 as qwen
+
+    from omlx.patches import qwen35_q4_mlp as q4
+
+    class MLP(qwen.MLP):
+        _omlx_q4_mlp_patched = False
+
+        def __call__(self, inputs, *args, **kwargs):
+            return inputs
+
+    module = ModuleType("_test_ane_q4_mlp_order")
+    module.MLP = MLP
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(ane_patch, "_PATCHED_CLASSES", {})
+    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP", "1")
+    monkeypatch.setattr(q4, "_native_qmm_for_bits", lambda bits: object())
+    monkeypatch.setattr(q4, "_qmm_supports_group_size", lambda size: True)
+
+    def native_qmm(linear, inputs, variant):
+        return mx.zeros((*inputs.shape[:-1], linear.weight.shape[0]), inputs.dtype)
+
+    monkeypatch.setattr(q4, "_linear_qmm", native_qmm)
+    with mx.stream(mx.cpu):
+        model = MLP(64, 128)
+        nn.quantize(model, group_size=64, bits=4)
+        model.set_dtype(mx.float16)
+        model._omlx_ane_prefill_config = ane_patch._AnePrefillConfig(
+            sequence_length, 0.5, 8
+        )
+        # Distinct outputs identify each path: stock=1, Q4=0, ANE=2.
+        inputs = mx.ones((1, sequence_length, 64), dtype=mx.float16)
+        ane_output = inputs + 1
+        monkeypatch.setattr(ane_patch, "_backend_exact", lambda *args: ane_output)
+
+        if install_order == "ane_then_q4":
+            ane_patch._wrap_class(MLP)
+        assert q4._patch_class(module.__name__, "MLP", 8, sequence_length, 16384)
+        ane_patch._wrap_class(MLP)
+        assert model(inputs) is ane_output
+
+        installed_call = MLP.__call__
+        ane_patch._wrap_class(MLP)
+        assert MLP.__call__ is installed_call
+
+        with ane_patch.suspend_qwen35_ane_prefill():
+            assert mx.all(model(inputs) == 0).item()
+        assert model(inputs, target_verify=True) is inputs
+        decode = inputs[:, :1, :]
+        assert model(decode) is decode
+        assert model(inputs) is ane_output

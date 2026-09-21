@@ -19,6 +19,7 @@ import re
 import threading
 import time
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from ..memory_monitor import (
     raise_if_prefill_exceeds,
     set_model_info_from_model,
 )
+from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
@@ -49,6 +51,159 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 _EXECUTOR_DRAIN_TIMEOUT = 10.0
+
+
+def _prepare_qwen_prefill_for_dflash() -> bool:
+    """Install projection dispatch beneath DFlash's process-wide hooks."""
+    from mlx_lm.models import qwen3_5
+
+    from ..patches.dflash_lifecycle import get_dflash_guard_base
+    from ..patches.qwen35_q4_mlp import apply_qwen35_q4_lm_prefill_linear_patch
+
+    gdn_cls = qwen3_5.GatedDeltaNet
+    gdn_base = get_dflash_guard_base(gdn_cls)
+    attention_cls = getattr(qwen3_5, "Attention", None)
+    attention_base = (
+        get_dflash_guard_base(attention_cls) if attention_cls is not None else None
+    )
+    if gdn_base is not None or attention_base is not None:
+        # Another DFlash model is resident. Wrapping its speculative call with
+        # the projection hook could bypass rollback for wide verification.
+        return gdn_base is not None and gdn_base is getattr(
+            gdn_cls, "_omlx_q4_lm_gdn_wrapper", None
+        )
+    return apply_qwen35_q4_lm_prefill_linear_patch()
+
+
+class _AnePrefillTargetOps:
+    """Delegate target operations while excluding verification from ANE."""
+
+    def __init__(self, target_ops: Any):
+        self._target_ops = target_ops
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._target_ops, name)
+
+    def verify_block(self, **kwargs):
+        from ..patches.qwen35_ane_prefill import suspend_qwen35_ane_prefill
+
+        with suspend_qwen35_ane_prefill():
+            return self._target_ops.verify_block(**kwargs)
+
+    def verify_tree_block(self, **kwargs):
+        from ..patches.qwen35_ane_prefill import suspend_qwen35_ane_prefill
+
+        with suspend_qwen35_ane_prefill():
+            return self._target_ops.verify_tree_block(**kwargs)
+
+
+def _enable_qwen35_ane_prefill_for_dflash(
+    model: Any,
+    model_settings: Any | None,
+    *,
+    gdn_dispatch_ready: bool = True,
+) -> int:
+    """Attach the configured Qwen ANE prefill backend to a DFlash target.
+
+    DFlash owns a separate target-loading pipeline. Projection dispatch must
+    already sit beneath its speculative hooks; installing it here would wrap
+    those hooks and could bypass the rollback tape for wide verification.
+
+    Returns the active fixed tile width, or zero when no ANE procedure was
+    attached. Callers treat failures as optional-accelerator failures.
+    """
+    if not bool(getattr(model_settings, "qwen35_ane_prefill_enabled", False)):
+        return 0
+
+    from ..patches.qwen35_ane_prefill import (
+        enable_qwen35_ane_prefill,
+        release_qwen35_ane_prefill,
+    )
+
+    fraction = ane_prefill_fraction(
+        getattr(model_settings, "qwen35_ane_prefill_fraction", None), "qwen3_5"
+    )
+    gdn_enabled = bool(getattr(model_settings, "qwen35_ane_prefill_gdn", True))
+    if gdn_enabled and not gdn_dispatch_ready:
+        logger.warning(
+            "Qwen ANE GDN prefill unavailable for DFlash: "
+            "projection dispatch was not installed before speculative hooks"
+        )
+
+    sequence_length = int(
+        getattr(model_settings, "qwen35_ane_prefill_sequence_length", 2048)
+    )
+    try:
+        enabled = enable_qwen35_ane_prefill(
+            model,
+            sequence_length=sequence_length,
+            tail_padding_min_tokens=int(
+                getattr(
+                    model_settings,
+                    "qwen35_ane_prefill_tail_padding_min_tokens",
+                    0,
+                )
+                or 0
+            ),
+            fraction=fraction,
+            max_layers=getattr(model_settings, "qwen35_ane_prefill_max_layers", 64),
+            gdn=gdn_enabled and gdn_dispatch_ready,
+            gdn_fraction=getattr(
+                model_settings,
+                "qwen35_ane_prefill_gdn_fraction",
+                0.50,
+            ),
+            gdn_max_layers=getattr(
+                model_settings,
+                "qwen35_ane_prefill_gdn_max_layers",
+                48,
+            ),
+            dual_ane=getattr(model_settings, "qwen35_ane_prefill_dual_ane", True),
+            ane_down_fraction=(
+                fraction
+                if getattr(model_settings, "qwen35_ane_prefill_fused_down", False)
+                else 0.0
+            ),
+            fused_down=getattr(
+                model_settings,
+                "qwen35_ane_prefill_fused_down",
+                False,
+            ),
+            cpu_fraction=(
+                getattr(model_settings, "qwen35_ane_prefill_cpu_fraction", 0.135)
+                if getattr(model_settings, "qwen35_ane_prefill_cpu_enabled", False)
+                else 0.0
+            ),
+            cpu_down_fraction=(
+                getattr(
+                    model_settings,
+                    "qwen35_ane_prefill_cpu_down_fraction",
+                    0.0,
+                )
+                if getattr(model_settings, "qwen35_ane_prefill_cpu_enabled", False)
+                else 0.0
+            ),
+            cpu_gdn_fraction=(
+                getattr(
+                    model_settings,
+                    "qwen35_ane_prefill_cpu_gdn_fraction",
+                    0.0,
+                )
+                if getattr(model_settings, "qwen35_ane_prefill_cpu_enabled", False)
+                else 0.0
+            ),
+            cpu_threads=getattr(model_settings, "qwen35_ane_prefill_cpu_threads", 8),
+            cpu_shared_resource=getattr(
+                model_settings,
+                "qwen35_ane_prefill_cpu_shared_resource",
+                True,
+            ),
+        )
+    except Exception:
+        release_qwen35_ane_prefill(model)
+        raise
+    gdn_enabled = int(getattr(model, "_omlx_ane_gdn_prefill_count", 0) or 0)
+    return sequence_length if enabled or gdn_enabled else 0
 
 
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
@@ -354,6 +509,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._prefill_guard: _DFlashPrefillGuard | None = None
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
+        self._ane_prefill_sequence_length = 0
         self._suppress_token_ids: set[int] = set()
         # Protocol-specific output parser factory (gemma4 / harmony).
         # Detected once in start() after the target model is loaded; None means
@@ -500,6 +656,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
         )
+        if self._ane_prefill_sequence_length:
+            # The GDN projection bridge normally starts at 2048 tokens. Keep
+            # DFlash's default floor for smaller ANE tiles, which tile inside
+            # the backend; widen the chunk for larger compiled procedures.
+            cfg = replace(
+                cfg,
+                prefill_step_size=max(
+                    cfg.prefill_step_size, self._ane_prefill_sequence_length
+                ),
+            )
         return build_runtime_context(cfg)
 
     @staticmethod
@@ -534,6 +700,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         from ..engine_core import get_mlx_executor
 
         loop = asyncio.get_running_loop()
+        self._ane_prefill_sequence_length = 0
         runtime_context = self._build_runtime_context()
 
         def _load_models():
@@ -553,6 +720,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             maybe_apply_pre_load_patches(
                 self._model_name, model_settings=self._model_settings
             )
+
+            # Prepare dispatch even when this target has ANE off: another
+            # resident Qwen target can enable it later without wrapping the
+            # process-wide speculative hooks from this load.
+            gdn_dispatch_ready = False
+            if (
+                getattr(self._model_settings, "qwen35_q4_mlp_prefill_enabled", True)
+                is not False
+            ):
+                try:
+                    gdn_dispatch_ready = _prepare_qwen_prefill_for_dflash()
+                except Exception:
+                    logger.warning(
+                        "Qwen prefill projection dispatch not installed for DFlash",
+                        exc_info=True,
+                    )
 
             # dflash-mlx 0.1.10 has no Laguna backend. Register oMLX's strict
             # TargetOps plus the official gated Laguna drafter specialization
@@ -601,6 +784,29 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "DFlash target MoE gate+up fusion not applied",
                         exc_info=True,
                     )
+
+            config = target_bundle.meta.get("config", {})
+            model_type = (
+                config.get("model_type")
+                if isinstance(config, dict)
+                else getattr(config, "model_type", None)
+            )
+            ane_prefill_sequence_length = 0
+            if ane_prefill_backend(model_type) == "qwen":
+                try:
+                    ane_prefill_sequence_length = _enable_qwen35_ane_prefill_for_dflash(
+                        target_bundle.model,
+                        self._model_settings,
+                        gdn_dispatch_ready=gdn_dispatch_ready,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Qwen ANE prefill not enabled for DFlash target",
+                        exc_info=True,
+                    )
+            target_ops = target_bundle.target_ops
+            if ane_prefill_sequence_length:
+                target_ops = _AnePrefillTargetOps(target_ops)
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 draft_quant=(
@@ -616,19 +822,32 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
-                target_ops=target_bundle.target_ops,
+                target_ops=target_ops,
             )
             draft_backend = EagerDraftBackend()
-            return target_bundle, draft, draft_backend, draft_meta
+            return (
+                target_bundle,
+                draft,
+                draft_backend,
+                draft_meta,
+                ane_prefill_sequence_length,
+                target_ops,
+            )
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
-        target_bundle, self._draft_model, self._draft_backend, draft_meta = result
+        (
+            target_bundle,
+            self._draft_model,
+            self._draft_backend,
+            draft_meta,
+            self._ane_prefill_sequence_length,
+            self._target_ops,
+        ) = result
         self._draft_window_size = self._resolve_draft_window_size(draft_meta)
         runtime_context = self._build_runtime_context()
         self._runtime_context = runtime_context
         self._target_model = target_bundle.model
         self._tokenizer_obj = target_bundle.tokenizer
-        self._target_ops = target_bundle.target_ops
         target_meta = target_bundle.meta
 
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
@@ -688,8 +907,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     max_kv_cache_memory=None, eviction_enabled=False
                 )
                 set_model_info_from_model(monitor, self._target_model)
-                step = (
-                    getattr(self._scheduler_config, "prefill_step_size", 2048) or 2048
+                step = int(
+                    getattr(runtime_context.runtime, "prefill_step_size", 2048) or 2048
                 )
                 self._prefill_guard = _DFlashPrefillGuard(monitor, step)
             except Exception as exc:
@@ -708,6 +927,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         window_used = getattr(runtime_cfg, "draft_window_size", "?")
         sink_used = getattr(runtime_cfg, "draft_sink_size", "?")
         verify_used = getattr(runtime_cfg, "verify_mode", "?")
+        prefill_step_used = getattr(runtime_cfg, "prefill_step_size", "?")
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
@@ -715,7 +935,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             f"fallback={self._fallback_engine_type}, "
             f"l1_cache={self._in_memory_cache_enabled}, "
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
-            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
+            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}, "
+            f"prefill_step={prefill_step_used}, "
+            f"ane_prefill={bool(self._ane_prefill_sequence_length)}"
         )
 
     def _record_prefill_guard_active_memory(self) -> None:
@@ -778,6 +1000,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._runtime_context = None
         self._target_model = None
         self._target_ops = None
+        self._ane_prefill_sequence_length = 0
         self._draft_model = None
         self._draft_backend = None
         self._executor_tokenizer = None
@@ -865,6 +1088,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._runtime_context = None
         self._target_model = None
         self._target_ops = None
+        self._ane_prefill_sequence_length = 0
         self._draft_model = None
         self._draft_backend = None
         self._tokenizer_obj = None
@@ -2062,6 +2286,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             "fallback_engine_type": self._fallback_engine_type,
             "in_fallback_mode": self._in_fallback_mode,
             "loaded": self._loaded,
+            "ane_prefill_sequence_length": self._ane_prefill_sequence_length or None,
             "in_memory_cache": self._in_memory_cache_enabled,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
             "pairing_warning": self._pairing_warning,

@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import time
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -747,7 +748,7 @@ class _FakeBenchEnginePool:
 
 
 class TestBenchmarkEngineSelection:
-    async def _run(self, *, settings=None, force_lm_engine=False):
+    async def _run(self, *, settings=None, force_lm_engine=False, engine=None):
         run = BenchmarkRun(
             bench_id="bench-test",
             request=BenchmarkRequest(
@@ -757,10 +758,72 @@ class TestBenchmarkEngineSelection:
                 force_lm_engine=force_lm_engine,
             ),
         )
-        pool = _FakeBenchEnginePool(settings)
+        pool = _FakeBenchEnginePool(settings, engine=engine)
         with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
             await run_benchmark(run, pool)
         return run, pool
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_attr", ["_model", "_target_model"])
+    @pytest.mark.parametrize("compiled_layers", [0, 2])
+    async def test_ane_metadata_uses_compiled_target_layers(
+        self, model_attr, compiled_layers
+    ):
+        from omlx.model_settings import ModelSettings
+
+        engine = _FakeBenchEngine()
+        setattr(
+            engine,
+            model_attr,
+            SimpleNamespace(
+                _omlx_ane_mlp_prefill_count=compiled_layers,
+                _omlx_ane_gdn_prefill_count=0,
+            ),
+        )
+        run, _ = await self._run(
+            settings=ModelSettings(qwen35_ane_prefill_enabled=True), engine=engine
+        )
+
+        assert run.status == "completed"
+        assert ("qwen35_ane_prefill" in run.experimental_features) == bool(
+            compiled_layers
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_attr", ["_model", "_target_model"])
+    async def test_ane_metadata_releases_model_before_unload(self, model_attr):
+        from omlx.model_settings import ModelSettings
+
+        class Model:
+            _omlx_ane_mlp_prefill_count = 2
+            _omlx_ane_gdn_prefill_count = 1
+
+        engine = _FakeBenchEngine()
+        setattr(engine, model_attr, Model())
+        model_ref = weakref.ref(getattr(engine, model_attr))
+        pool = _FakeBenchEnginePool(
+            ModelSettings(qwen35_ane_prefill_enabled=True), engine=engine
+        )
+        released_during_unload = []
+
+        async def unload(model_id):
+            setattr(engine, model_attr, None)
+            released_during_unload.append(model_ref() is None)
+
+        pool._unload_engine = unload
+        run = BenchmarkRun(
+            bench_id="bench-release-model",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+            ),
+        )
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert released_during_unload == [True]
 
     @pytest.mark.asyncio
     async def test_auto_uses_vlm_engine_for_vlm_mtp_with_drafter(self):
