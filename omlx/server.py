@@ -4417,7 +4417,7 @@ async def create_chat_completion(
                 choices=[
                     ChatCompletionChoice(
                         message=AssistantMessage(
-                            content=cleaned_text.strip() if cleaned_text else None,
+                            content=cleaned_text.strip() if cleaned_text else "",
                             reasoning_content=(
                                 cleaned_thinking if cleaned_thinking else None
                             ),
