@@ -446,3 +446,28 @@ def test_transient_failure_preserves_other_models_and_recovers(monkeypatch, path
     )
     mx.eval(failed(inputs))
     mx.eval(other(decode, target_verify=True))
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("batch,length", [(1, 3), (2, 2), (2, 8)])
+def test_fused_rows_match_independent_singletons(bits, batch, length):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(3770 + bits)
+    module = _module(bits)
+    x = mx.random.normal((batch, length, WIDTH)).astype(mx.bfloat16)
+    actual, _, actual_injection = hc_fused.fused_forward(module, x)
+    singletons = [
+        hc_fused.fused_forward(module, row.reshape(1, 1, WIDTH))
+        for row in x.reshape(-1, WIDTH)
+    ]
+    expected = mx.concatenate([row[0] for row in singletons], axis=1).reshape(
+        batch, length, HIDDEN
+    )
+    expected_injection = mx.concatenate([row[2] for row in singletons], axis=1).reshape(
+        batch, length, HC
+    )
+    mx.eval(actual, expected, actual_injection, expected_injection)
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(actual_injection, expected_injection).item()

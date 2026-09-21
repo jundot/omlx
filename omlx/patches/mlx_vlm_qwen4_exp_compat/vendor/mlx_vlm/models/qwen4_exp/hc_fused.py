@@ -201,24 +201,23 @@ _U_SOURCE = r"""
     const device T* sp = up_s + (size_t)n * GROUPS_R;
     const device T* bp = up_b + (size_t)n * GROUPS_R;
     float xv[CH];
-    for (int r = 0; r < S; ++r) {
-        const device T* a = act + (size_t)r * R;
-        float acc = 0.0f;
-        for (int gq = 0; gq < GROUPS_R; ++gq) {
-            const float sc = float(sp[gq]);
-            const float bi = float(bp[gq]);
-            for (int c = 0; c < CPG; ++c) {
-                const int e = gq * 64 + c * CH;
-                float sum = hc_load_vector<T, CH, BITS_U>(a + e, xv);
-                acc += hc_qdot<CH, BITS_U>(w + e * BP / PF, xv, sc, bi, sum);
-            }
+    const int r = threadgroup_position_in_grid.z;
+    const device T* a = act + (size_t)r * R;
+    float acc = 0.0f;
+    for (int gq = 0; gq < GROUPS_R; ++gq) {
+        const float sc = float(sp[gq]);
+        const float bi = float(bp[gq]);
+        for (int c = 0; c < CPG; ++c) {
+            const int e = gq * 64 + c * CH;
+            float sum = hc_load_vector<T, CH, BITS_U>(a + e, xv);
+            acc += hc_qdot<CH, BITS_U>(w + e * BP / PF, xv, sc, bi, sum);
         }
-        float gate = 1.0f / (1.0f + metal::exp(-acc));
-        float v = gate * float(xn[(size_t)r * K + n]);
-        v += simd_shuffle_down(v, 1);
-        v += simd_shuffle_down(v, 2);
-        if (s == 0) mixed[(size_t)r * H + h] = T(v / float(HC));
     }
+    float gate = 1.0f / (1.0f + metal::exp(-acc));
+    float v = gate * float(xn[(size_t)r * K + n]);
+    v += simd_shuffle_down(v, 1);
+    v += simd_shuffle_down(v, 2);
+    if (s == 0) mixed[(size_t)r * H + h] = T(v / float(HC));
 """
 
 
@@ -477,9 +476,8 @@ def fused_forward(module, hyper_input):
                 ("R", lowrank),
                 ("HC", hc),
                 ("H", hidden),
-                ("S", rows),
             ],
-            grid=(256, hidden // 64, 1),
+            grid=(256, hidden // 64, rows),
             threadgroup=(256, 1, 1),
             output_shapes=[(rows, hidden)],
             output_dtypes=[dtype],
