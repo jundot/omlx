@@ -2329,9 +2329,10 @@ class TestSplitVisionFeatures:
         for f in result:
             assert f.shape == (1, 10, 64)
 
-    def test_qwen_flat_split(self):
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
+    def test_qwen_flat_split(self, model_type):
         """Qwen flat (total_tokens, dim) features are split using grid_thw."""
-        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine = _make_loaded_engine(model_type=model_type)
         # Mock spatial_merge_size on vision_tower
         engine._vlm_model.vision_tower = MagicMock()
         engine._vlm_model.vision_tower.spatial_merge_size = 2

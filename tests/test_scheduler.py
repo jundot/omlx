@@ -3876,15 +3876,16 @@ class TestSchedulerArraysCacheBlockAlignment:
 
         return HybridModel()
 
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
     def test_qwen35_wide_prefill_aligns_block_size_to_4096(
-        self, mock_tokenizer, tmp_path
+        self, mock_tokenizer, tmp_path, model_type
     ):
         with (
             patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
         ):
             scheduler = Scheduler(
-                model=self._hybrid_model(),
+                model=self._hybrid_model(model_type),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
                     paged_ssd_cache_dir=str(tmp_path),

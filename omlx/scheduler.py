@@ -2809,7 +2809,11 @@ class Scheduler:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            is_qwen35 = model_type.startswith("qwen3_5")
+            # Ternary Bonsai 2 packs run the Qwen3.5 GDN stack under their own type.
+            is_qwen35 = (
+                model_type.startswith("qwen3_5")
+                or model_type == "prism_hadamard_qwen35"
+            )
             is_qwen4 = model_type.startswith("qwen4_exp")
             if is_qwen4:
                 from .custom_kernels.glm_moe_dsa import fast
