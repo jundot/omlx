@@ -784,7 +784,12 @@ def maybe_apply_pre_load_patches(
     # correctly, but Model.__init__ skips ``self.mtp = MTPModule(args)``;
     # the resulting model is indistinguishable from a stock model that
     # never had MTP heads.
-    if _is_mtp_compatible(config, model_type):
+    # The batched DFlash drafter rides the Lightning MTP verify path, so its
+    # patches are installed even when the checkpoint declares no MTP heads.
+    dflash_batched = for_vlm and dflash_batched_supported(
+        model_type, "vlm"
+    ) and dflash_batched_requested(model_settings)
+    if _is_mtp_compatible(config, model_type) or dflash_batched:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
@@ -1161,6 +1166,26 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     """
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
     return _checkpoint_weight_prefix(model_path, prefixes) is not None
+
+
+_DFLASH_BATCHED_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe")
+
+
+def dflash_batched_supported(model_type: str | None, engine_type: str | None) -> bool:
+    """True when DFlash runs as a block drafter inside the batched VLM engine.
+
+    Other DFlash targets (gemma4, laguna, muse, mlx-lm text loads) keep the
+    single-stream DFlashEngine.
+    """
+    return engine_type == "vlm" and model_type in _DFLASH_BATCHED_MODEL_TYPES
+
+
+def dflash_batched_requested(model_settings: Any | None) -> bool:
+    return bool(
+        model_settings is not None
+        and getattr(model_settings, "dflash_enabled", False)
+        and getattr(model_settings, "dflash_draft_model", None)
+    )
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:

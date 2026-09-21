@@ -591,7 +591,11 @@ class VLMModelAdapter(nn.Module):
         prefill_text_positions = self._qwen4_text_prefill_positions
         step_text_positions = self._qwen4_step_text_positions
         self._qwen4_text_prefill_positions = False
-        return_hidden = bool(kwargs.get("return_hidden", False))
+        # Layer captures (block drafter prefill seeds) also need the full
+        # output object rather than bare logits.
+        return_hidden = bool(kwargs.get("return_hidden", False)) or bool(
+            kwargs.get("capture_layer_ids")
+        )
         if skip_lm_head:
             # Scheduler prefill chunks discard their logits. Translate the
             # shared cache-only contract into the official Qwen model hook so

@@ -1713,6 +1713,9 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        # Holds the DFlash block drafter attached to Lightning MTP when
+        # dflash_enabled routes here instead of DFlashEngine.
+        self._dflash_drafter: Any | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -2652,6 +2655,32 @@ class VLMBatchedEngine(BaseEngine):
     def vlm_mtp_drafter(self) -> Any | None:
         return self._vlm_mtp_drafter
 
+    @property
+    def vlm_model(self) -> Any | None:
+        """The loaded mlx-vlm model (target for external drafters)."""
+        return self._vlm_model
+
+    def set_dflash_drafter(self, drafter: Any) -> None:
+        """Attach a DFlash block drafter to the Lightning MTP decode path."""
+        from ..speculative.dflash_drafter import attach_drafter
+
+        language_model = getattr(self._adapter, "_language_model", None)
+        if language_model is None:
+            raise RuntimeError("VLM engine has no language model for the drafter")
+        attach_drafter(language_model, drafter)
+        self._dflash_drafter = drafter
+        logger.info(
+            "DFlash drafter attached to engine: %s (kind=%s, block=%d, layers=%s)",
+            self._model_name,
+            drafter.kind,
+            drafter.block_size,
+            drafter.target_layer_ids,
+        )
+
+    @property
+    def dflash_drafter(self) -> Any | None:
+        return self._dflash_drafter
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
@@ -2684,6 +2713,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_tokenizer",
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
+                "_dflash_drafter",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),

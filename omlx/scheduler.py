@@ -63,6 +63,7 @@ from .exceptions import (
     is_cache_corruption_error,
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
+from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .prefill_boundaries import (
@@ -3795,11 +3796,20 @@ class Scheduler:
                     )
                     prefetch(input_arr[:, n_to_process : n_to_process + next_n], input_arr[:, :n_to_process])
                 prefill_model = getattr(self.model, "_omlx_prefill", self.model)
-                prefill_model(
+                capture_from = self._dflash_prefill_capture(
+                    request,
+                    prefill_model,
+                    base_size + processed_tokens,
+                    n_to_process,
+                    model_kwargs,
+                )
+                prefill_out = prefill_model(
                     input_arr[:, :n_to_process],
                     cache=prompt_cache,
                     **model_kwargs,
                 )
+                if capture_from is not None:
+                    self._dflash_seed_prefill(request, prefill_out, capture_from)
                 mx.eval([c.state for c in prompt_cache])
                 input_arr = input_arr[:, n_to_process:]
                 if embeds_array is not None:
@@ -4803,8 +4813,52 @@ class Scheduler:
         self._store_cache_admission_blocked_request_id = None
         self._store_cache_admission_blocked_since = 0.0
 
+    def _dflash_prefill_capture(
+        self,
+        request: "Request",
+        prefill_model: Any,
+        start: int,
+        n_tokens: int,
+        model_kwargs: dict,
+    ) -> Optional[int]:
+        """Request drafter layer captures for the chunk's tail inside the window.
+
+        Returns the chunk-local offset of the first position to keep, or None
+        when the chunk ends before the drafter's context window starts. The
+        window covers the prompt's last tokens; the last prompt token itself
+        is captured by the ordinary decode step after insert.
+        """
+        drafter = _block_drafter_for(self.model)
+        if drafter is None or prefill_model is not self.model:
+            return None
+        keep_from = len(request.prompt_token_ids) - drafter.window
+        end = start + n_tokens
+        if end <= keep_from:
+            return None
+        model_kwargs["capture_layer_ids"] = list(drafter.target_layer_ids)
+        return max(0, keep_from - start)
+
+    def _dflash_seed_prefill(
+        self, request: "Request", output: Any, keep_from: int
+    ) -> None:
+        drafter = _block_drafter_for(self.model)
+        hidden = getattr(output, "hidden_states", None)
+        if drafter is None or not hidden:
+            return
+        drafter.seed_request(
+            request.request_id, [layer[:, keep_from:] for layer in hidden]
+        )
+
+    def _dflash_bind_uid(self, request_id: str, uid: int) -> None:
+        drafter = _block_drafter_for(self.model)
+        if drafter is not None:
+            drafter.bind_uid(request_id, uid)
+
     def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
         _mtp_priming.release_request(getattr(self, "model", None), request_id)
+        drafter = _block_drafter_for(getattr(self, "model", None))
+        if drafter is not None:
+            drafter.release_request(request_id)
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
         self._throttle_notified_requests.discard(request_id)
@@ -5592,10 +5646,19 @@ class Scheduler:
             )
             state.request.text_positions_proven = True
             prefill_model = getattr(self.model, "_omlx_prefill", self.model)
+            chunk_kwargs = {}
             if self._supports_skip_lm_head():
-                prefill_model(chunk, cache=state.cache, skip_lm_head=True)
-            else:
-                prefill_model(chunk, cache=state.cache)
+                chunk_kwargs["skip_lm_head"] = True
+            capture_from = self._dflash_prefill_capture(
+                state.request,
+                prefill_model,
+                state.base_size + state.tokens_processed,
+                n,
+                chunk_kwargs,
+            )
+            prefill_out = prefill_model(chunk, cache=state.cache, **chunk_kwargs)
+            if capture_from is not None:
+                self._dflash_seed_prefill(state.request, prefill_out, capture_from)
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
@@ -5863,6 +5926,7 @@ class Scheduler:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
             _mtp_priming.bind_uid(self.model, request.request_id, uid)
+            self._dflash_bind_uid(request.request_id, uid)
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
             now = time.monotonic()
@@ -11416,6 +11480,7 @@ class Scheduler:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
                 _mtp_priming.bind_uid(self.model, request.request_id, uid)
+                self._dflash_bind_uid(request.request_id, uid)
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 now = time.monotonic()
@@ -11834,6 +11899,9 @@ class Scheduler:
 
         for request_id in finished_ids:
             _mtp_priming.release_request(self.model, request_id)
+            finished_drafter = _block_drafter_for(self.model)
+            if finished_drafter is not None:
+                finished_drafter.release_request(request_id)
             request = self.running.get(request_id)
 
             # Store cache for future reuse (G2-async): submit to background

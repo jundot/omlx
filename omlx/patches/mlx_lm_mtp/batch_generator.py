@@ -12,6 +12,7 @@ Auto depth and parking use the measured cost of the whole active batch.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import time
@@ -84,7 +85,9 @@ def apply() -> bool:
         original_extend = GenerationBatch.extend
 
         def patched_init(self, model, uids, *args, **kwargs):
-            with _prompt_priming.decode_scope(model, uids):
+            with _prompt_priming.decode_scope(model, uids), _drafter_scope(
+                model, uids
+            ):
                 original_init(self, model, uids, *args, **kwargs)
             # Do not activate MTP here. Fresh singleton batches created by
             # PromptProcessingBatch.generate() may still be merged into a larger
@@ -220,6 +223,7 @@ def apply() -> bool:
             old_uids = list(getattr(self, "uids", []) or [])
             result = original_filter(self, keep, *args, **kwargs)
             _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
+            _release_drafter_uids(self.model, set(old_uids) - set(self.uids))
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
             _drop_invalid_mtp_batch_state(
                 self,
@@ -235,9 +239,9 @@ def apply() -> bool:
             if callable(realign_rows):
                 realign_rows()
             _maybe_clear_multirow_marker(self)
-            with _prompt_priming.decode_scope(
-                getattr(self, "model", None), getattr(self, "uids", ())
-            ):
+            model = getattr(self, "model", None)
+            uids = getattr(self, "uids", ())
+            with _prompt_priming.decode_scope(model, uids), _drafter_scope(model, uids):
                 return patched_next(self, *args, **kwargs)
 
         GenerationBatch.__init__ = patched_init
@@ -255,6 +259,7 @@ def apply() -> bool:
             uids = tuple(uids)
             result = original_bg_remove(self, uids, *args, **kwargs)
             _prompt_priming.release_uids(self.model, uids)
+            _release_drafter_uids(self.model, uids)
             return result
 
         def patched_bg_close(self):
@@ -266,6 +271,7 @@ def apply() -> bool:
                 return original_bg_close(self)
             finally:
                 _prompt_priming.release_uids(getattr(self, "model", None), uids)
+                _release_drafter_uids(getattr(self, "model", None), uids)
 
         def patched_bg_next(self, *args, **kwargs):
             gen_batch = getattr(self, "_generation_batch", None)
@@ -328,6 +334,55 @@ def _model_has_mtp_module(model: Any) -> bool:
     """
     inner = getattr(model, "language_model", model)
     return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
+
+
+def _drafter_for(model: Any) -> Optional[Any]:
+    """Return the external block drafter attached to the model, if any.
+
+    A drafter replaces the embedded MTP head as the draft source. It is
+    stamped on the language model as ``_omlx_drafter`` at attach time and
+    exposes ``depth``, ``target_layer_ids``, ``draft``, ``observe``,
+    ``release`` and ``decode_scope`` (see omlx.speculative.dflash_drafter).
+    """
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        drafter = getattr(candidate, "_omlx_drafter", None)
+        if drafter is not None:
+            return drafter
+    return None
+
+
+def _drafter_capture_ids(model: Any) -> Optional[List[int]]:
+    drafter = _drafter_for(model)
+    if drafter is None:
+        return None
+    return list(drafter.target_layer_ids)
+
+
+def _release_drafter_uids(model: Any, uids) -> None:
+    drafter = _drafter_for(model)
+    if drafter is not None:
+        drafter.release(uids)
+
+
+@contextlib.contextmanager
+def _drafter_scope(model: Any, uids):
+    """Attribute ordinary decode forwards inside the scope to ``uids``.
+
+    The model runtime captures the drafter's layers on every plain decode
+    forward while a scope is open, so tokens processed by ordinary steps
+    (batch init, calibration, late-join handoff) stay in the drafter context.
+    """
+    drafter = _drafter_for(model) if model is not None else None
+    if drafter is None or uids is None:
+        yield
+        return
+    with drafter.decode_scope(uids):
+        yield
 
 
 def _model_mtp_decode_enabled(model: Any) -> bool:
@@ -404,10 +459,12 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
             return False
     if not hasattr(gen_batch, "model"):
         return False
-    if not hasattr(gen_batch.model, "mtp_forward"):
-        return False
-    if not _model_has_mtp_module(gen_batch.model):
-        return False
+    drafter = _drafter_for(gen_batch.model)
+    if drafter is None:
+        if not hasattr(gen_batch.model, "mtp_forward"):
+            return False
+        if not _model_has_mtp_module(gen_batch.model):
+            return False
     if not _model_mtp_decode_enabled(gen_batch.model):
         return False
     uids = getattr(gen_batch, "uids", None)
@@ -1132,11 +1189,20 @@ def _initial_batch_forward(gen_batch):
     if offsets is None:
         return None
     _set_batched_mrope_deltas(gen_batch, list(gen_batch.uids))
-    logits, hidden, _ = _call_backbone(
-        gen_batch.model, gen_batch._next_tokens[:, None], gen_batch.prompt_cache
+    logits, hidden, _, captured = _call_backbone_captured(
+        gen_batch.model,
+        gen_batch._next_tokens[:, None],
+        gen_batch.prompt_cache,
+        capture_layer_ids=_drafter_capture_ids(gen_batch.model),
     )
     _clear_rollback(gen_batch.prompt_cache)
-    return logits, hidden, [offset + 1 for offset in offsets]
+    return logits, hidden, [offset + 1 for offset in offsets], captured
+
+
+def _slice_captured(captured: Optional[List[Any]], idx: int) -> Optional[List[Any]]:
+    if captured is None:
+        return None
+    return [layer[idx : idx + 1] for layer in captured]
 
 
 def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState]:
@@ -1162,10 +1228,15 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
         if shared is None:
             _post_init_mtp(row)
         else:
-            logits, hidden, offsets = shared
+            logits, hidden, offsets, captured = shared
             _post_init_mtp(
                 row,
-                verify_result=(logits[idx : idx + 1], hidden[idx : idx + 1], None),
+                verify_result=(
+                    logits[idx : idx + 1],
+                    hidden[idx : idx + 1],
+                    None,
+                    _slice_captured(captured, idx),
+                ),
                 priming_offset=offsets[idx],
             )
         state = getattr(row, "_omlx_mtp_state", None)
@@ -1199,7 +1270,11 @@ def _batch_policy_for_next(gen_batch: Any):
     policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
     if policy is None or policy.uids != tuple(gen_batch.uids):
         chain, depth, _ = _resolve_mtp_chain_depth(gen_batch.model)
-        policy = BatchPolicy(gen_batch.uids, depth if chain else 1)
+        policy = BatchPolicy(
+            gen_batch.uids,
+            depth if chain else 1,
+            fixed=_drafter_for(gen_batch.model) is not None,
+        )
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
 
@@ -1583,9 +1658,47 @@ def _call_backbone(
     cache: List[Any],
     n_confirmed: int = 0,
 ) -> Tuple[Any, Any, Optional[list]]:
+    """Backbone forward without layer captures; see ``_call_backbone_impl``."""
+    return _call_backbone_impl(model, inputs, cache, n_confirmed, None)[:3]
+
+
+def _call_backbone_captured(
+    model: Any,
+    inputs: Any,
+    cache: List[Any],
+    n_confirmed: int = 0,
+    capture_layer_ids: Optional[List[int]] = None,
+) -> Tuple[Any, Any, Optional[list], Optional[List[Any]]]:
+    """``_call_backbone`` plus the drafter's layer captures as a 4th entry.
+
+    Without a capture request this defers to ``_call_backbone`` so the
+    plain forward keeps one entry point.
+    """
+    if not capture_layer_ids:
+        if n_confirmed:
+            plain = _call_backbone(model, inputs, cache, n_confirmed=n_confirmed)
+        else:
+            plain = _call_backbone(model, inputs, cache)
+        return (*plain, None)
+    return _call_backbone_impl(model, inputs, cache, n_confirmed, capture_layer_ids)
+
+
+def _call_backbone_impl(
+    model: Any,
+    inputs: Any,
+    cache: List[Any],
+    n_confirmed: int,
+    capture_layer_ids: Optional[List[int]],
+) -> Tuple[Any, Any, Optional[list], Optional[List[Any]]]:
     """Run the backbone with ``return_hidden=True`` and normalise the result.
 
-    Returns ``(logits, hidden_pre_norm, gdn_states_or_None)``:
+    Returns ``(logits, hidden_pre_norm, gdn_states_or_None, captured)``.
+    ``captured`` is the list of per-layer hidden states requested through
+    ``capture_layer_ids`` (block drafters consume them), or ``None``. The
+    MTP head's ``hidden_pre_norm`` is the same array with or without a
+    capture request.
+
+    The first three entries:
 
     - mlx-lm path returns the 2-tuple ``(logits, hidden)``; ``gdn_states``
       is ``None`` and rollback uses ``cache.rollback_state``.
@@ -1604,6 +1717,8 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
+    if capture_layer_ids:
+        kwargs["capture_layer_ids"] = list(capture_layer_ids)
     dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
@@ -1621,7 +1736,17 @@ def _call_backbone(
     # LanguageModelOutput (mlx-vlm dataclass)
     if hasattr(result, "logits") and hasattr(result, "hidden_states"):
         hidden = result.hidden_states
+        captured = None
         if isinstance(hidden, list):
+            if capture_layer_ids:
+                # The runtime wrapper orders the list as the requested
+                # captures followed by the head's last-layer hidden.
+                captured = list(hidden[:-1])
+                if len(captured) != len(capture_layer_ids):
+                    raise TypeError(
+                        "backbone returned %d captures for %d requested layers"
+                        % (len(captured), len(capture_layer_ids))
+                    )
             hidden = hidden[-1] if hidden else None
         rollback_state = getattr(result, "gdn_states", None)
         try:
@@ -1637,12 +1762,14 @@ def _call_backbone(
                 inputs.shape[1],
             )
             rollback_state = None
-        return result.logits, hidden, rollback_state
+        return result.logits, hidden, rollback_state, captured
     if isinstance(result, tuple):
+        if capture_layer_ids:
+            raise TypeError("backbone tuple output cannot carry layer captures")
         if len(result) == 3:
-            return result
+            return (*result, None)
         if len(result) == 2:
-            return result[0], result[1], None
+            return result[0], result[1], None, None
     raise TypeError(f"backbone returned unexpected shape: {type(result).__name__}")
 
 
@@ -2548,11 +2675,16 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     # 1-token backbone forward at main_tok with hidden state. No draft yet,
     # so no rollback is possible — discard gdn_states.
     # Inherits the per-engine stream from the enclosing BatchGenerator context.
+    drafter = _drafter_for(gen_batch.model)
     if verify_result is None:
-        verify_result = _call_backbone(
-            gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
+        verify_result = _call_backbone_captured(
+            gen_batch.model,
+            main_tok[:, None],
+            gen_batch.prompt_cache,
+            capture_layer_ids=_drafter_capture_ids(gen_batch.model),
         )
-    logits, hidden, rollback_state = verify_result
+    logits, hidden, rollback_state = verify_result[:3]
+    captured = verify_result[3] if len(verify_result) > 3 else None
     if rollback_state is not None:
         gen_batch.model.rollback_speculative_cache(
             gen_batch.prompt_cache, rollback_state, 0, 1
@@ -2575,6 +2707,22 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
+        if drafter is not None:
+            # Block drafters keep their own per-request context and draft a
+            # fixed block, so neither the head cache nor the depth
+            # controller applies. The captured hidden of main_tok is the
+            # newest context entry; next_main is the anchor.
+            state.mtp_cache = []
+            state.next_main = _ensure_uint32(next_main_tok)
+            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+            state.queue.append(
+                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            )
+            drafter.draft(
+                [(gen_batch, state, captured, state.next_main, prev_buf)]
+            )
+            gen_batch._omlx_mtp_state = state
+            return
         if depth > 1:
             factory = getattr(
                 _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
@@ -2861,8 +3009,20 @@ def _feed_batch_mains_to_standard(gen_batch: Any, batch_state: _MtpBatchState) -
     inputs = mx.stack([state.next_main for state in states])
     # Match GenerationBatch._step, including models whose hidden capture is
     # singleton-only even though their ordinary forward accepts a batch.
+    drafter = _drafter_for(gen_batch.model)
     with _prompt_priming.decode_scope(gen_batch.model, gen_batch.uids):
-        logits = gen_batch.model(inputs, cache=gen_batch.prompt_cache)
+        if drafter is not None:
+            # Keep every committed token in the drafter context, even the
+            # ones processed by an ordinary step.
+            logits, _, _, captured = _call_backbone_captured(
+                gen_batch.model,
+                inputs,
+                gen_batch.prompt_cache,
+                capture_layer_ids=list(drafter.target_layer_ids),
+            )
+            drafter.observe(gen_batch.uids, captured)
+        else:
+            logits = gen_batch.model(inputs, cache=gen_batch.prompt_cache)
     tokens, logprobs = [], []
     for i, (row, (procs, previous)) in enumerate(zip(rows, contexts)):
         last = _apply_processors(procs, previous, logits[i : i + 1, -1, :])
@@ -2894,9 +3054,15 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].update_and_fetch(state.next_main)
-        logits, _, _ = _call_backbone(
-            gen_batch.model, state.next_main[:, None], gen_batch.prompt_cache
+        drafter = _drafter_for(gen_batch.model)
+        logits, _, _, captured = _call_backbone_captured(
+            gen_batch.model,
+            state.next_main[:, None],
+            gen_batch.prompt_cache,
+            capture_layer_ids=_drafter_capture_ids(gen_batch.model),
         )
+        if drafter is not None:
+            drafter.observe(gen_batch.uids, captured)
         last = _apply_processors(procs, prev_buf, logits[:, -1, :])
         lp_2d = _logprobs(last)
         next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(lp_2d))
@@ -3182,11 +3348,19 @@ def _run_verify_cycle_chain(
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
+    drafter = _drafter_for(gen_batch.model)
     if verify_result is None:
-        verify_result = _call_backbone(
-            gen_batch.model, inputs[None, :], gen_batch.prompt_cache, n_confirmed=1
+        verify_result = _call_backbone_captured(
+            gen_batch.model,
+            inputs[None, :],
+            gen_batch.prompt_cache,
+            n_confirmed=1,
+            capture_layer_ids=_drafter_capture_ids(gen_batch.model),
         )
-    logits, hidden, gdn_states = verify_result
+    logits, hidden, gdn_states = verify_result[:3]
+    captured = verify_result[3] if len(verify_result) > 3 else None
+    if drafter is not None and captured is None:
+        raise _MtpStepFallback("block drafter verify returned no layer captures")
     state.stats.backbone_ms += verify_ms
     rows = logits[0]  # (k+1, vocab)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
@@ -3341,7 +3515,10 @@ def _run_verify_cycle_chain(
         # --- commit: queue emits + cache rollback ---
         t0 = time.perf_counter()
         for j in range(m):
-            state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
+            # Block drafters carry no draft distribution; the target row is
+            # the distribution the accepted token was verified against.
+            draft_lp = state.draft_lps[j] if state.draft_lps else combined_lp[j]
+            state.queue.append((int(draft_ids[j]), draft_lp, "draft"))
         state.queue.append(
             (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
         )
@@ -3371,7 +3548,14 @@ def _run_verify_cycle_chain(
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
-        if draft_jobs is None:
+        if drafter is not None:
+            rows_hidden = [c[:, : m + 1] for c in captured]
+            job = (gen_batch, state, rows_hidden, committed, prev_buf)
+            if draft_jobs is None:
+                drafter.draft([job])
+            else:
+                draft_jobs.append(job)
+        elif draft_jobs is None:
             _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
@@ -3429,10 +3613,12 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
         prev_buf = gen_batch._token_context[0].update_and_fetch(boundary_tok)
 
     t0 = time.perf_counter()
-    logits, hidden, _ = _call_backbone(
+    drafter = _drafter_for(gen_batch.model)
+    logits, hidden, _, captured = _call_backbone_captured(
         gen_batch.model,
         boundary_tok[:, None],
         gen_batch.prompt_cache,
+        capture_layer_ids=_drafter_capture_ids(gen_batch.model),
     )
     _clear_rollback(gen_batch.prompt_cache)
     next_logits = _apply_processors(procs, prev_buf, logits[:, -1, :])
@@ -3442,13 +3628,16 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    _chain_next_drafts(
-        gen_batch,
-        state,
-        hidden[:, -1:],
-        next_tok,
-        prev_buf,
-    )
+    if drafter is not None:
+        drafter.draft([(gen_batch, state, captured, next_tok, prev_buf)])
+    else:
+        _chain_next_drafts(
+            gen_batch,
+            state,
+            hidden[:, -1:],
+            next_tok,
+            prev_buf,
+        )
     state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
     next_id = int(next_tok.tolist()[0])
     state.next_main = next_tok

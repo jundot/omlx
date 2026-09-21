@@ -112,6 +112,10 @@ Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/t
 
 Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
 
+### Batched DFlash drafter
+
+Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash_batched or block_drafter"`. `test_dflash_batched.py` builds a tiny DFlash2 drafter with random weights and checks that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, plus the prefill seed window slicing and block-size clamping. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows. Real drafter acceptance and throughput need a Qwen3.5-family VLM checkpoint with its `z-lab` DFlash draft and are measured against the standard batched engine.
+
 # VLM cache boundary tests
 
 Run `python -m pytest -q tests/test_vlm_cache_boundaries.py tests/test_vlm_engine.py tests/test_prefix_cache.py tests/test_paged_cache.py` to check image-aware prefix keys. Boundary cases cover reasoning-dependent template prefixes, final grid token positions, adjacent images, multiple images per turn, block edges, invalid metadata, and isolation when earlier or later images change. These tests use synthetic processor inputs and KV arrays; checkpoint preprocessing and inference comparisons require local models.

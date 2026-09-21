@@ -13,10 +13,14 @@ class BatchPolicy:
     Ordinary decode supplies its own baseline; depth-zero MTP is not a proxy.
     """
 
-    def __init__(self, uids, max_depth):
+    def __init__(self, uids, max_depth, *, fixed=False):
         self.uids = tuple(uids)
         self.max_depth = max(1, max_depth)
         self.cur = self.max_depth
+        # A fixed policy drafts max_depth every cycle: no ordinary-decode
+        # calibration, no depth search and no parking. Block drafters use it
+        # because their block is trained, not chosen.
+        self.fixed = bool(fixed)
         self.standard = deque(maxlen=8)
         self.standard_warmup = 2
         self.costs = {}
@@ -48,6 +52,8 @@ class BatchPolicy:
         return max(0.0, (finished - begin) * 1000)
 
     def needs_standard(self):
+        if self.fixed:
+            return False
         return self.standard_warmup > 0 or len(self.standard) < 3 or self.remaining > 0
 
     def observe_standard(self, milliseconds):
@@ -84,7 +90,7 @@ class BatchPolicy:
                 break
             rate = sum(count > position for count in accepted) / reached
             self.acceptance[position] += 0.08 * (rate - self.acceptance[position])
-        if milliseconds is None:
+        if milliseconds is None or self.fixed:
             return
         self.elapsed_ms += milliseconds
         # A depth transition combines the previous asynchronous head and a new
@@ -114,7 +120,7 @@ class BatchPolicy:
                 self.last_probe_ms = self.elapsed_ms
 
     def should_park(self):
-        return self.losing >= 16
+        return not self.fixed and self.losing >= 16
 
     def park(self):
         self.remaining = self.cooldown

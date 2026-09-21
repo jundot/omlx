@@ -267,14 +267,36 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
         if not return_hidden:
+            drafter = getattr(self, "_omlx_drafter", None)
+            scope = getattr(drafter, "scope_uids", None)
+            if (
+                scope
+                and inputs is not None
+                and inputs.ndim == 2
+                and inputs.shape[0] == len(scope)
+                and inputs.shape[1] == 1
+                and kwargs.get("capture_layer_ids") is None
+            ):
+                # An ordinary decode step while a block drafter is attached:
+                # keep the committed token in the drafter context.
+                out = original_call(
+                    self,
+                    inputs,
+                    inputs_embeds,
+                    mask,
+                    cache,
+                    capture_layer_ids=list(drafter.target_layer_ids),
+                    **kwargs,
+                )
+                drafter.observe(scope, out.hidden_states)
+                return out
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
 
         # Passing any non-None ``capture_layer_ids`` makes stock
         # ``LanguageModel.__call__`` allocate ``hidden_sink`` AND ``gdn_sink``,
-        # both of which we need.  Pop any existing value from kwargs to avoid
-        # "got multiple values for keyword argument" when the caller already
-        # passed capture_layer_ids (e.g. speculative_verify_logits).
-        kwargs.pop("capture_layer_ids", None)
+        # both of which we need. Caller layers (block drafters) are merged
+        # with the head's last layer into one capture request.
+        requested = list(kwargs.pop("capture_layer_ids", None) or [])
         last_layer_idx = len(self.model.layers) - 1
         out = original_call(
             self,
@@ -282,16 +304,19 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             inputs_embeds,
             mask,
             cache,
-            capture_layer_ids=[last_layer_idx],
+            capture_layer_ids=sorted({*requested, last_layer_idx}),
             speculative_verify=True,
             **kwargs,
         )
         from mlx_vlm.models.base import LanguageModelOutput
 
-        hidden_pre_norm = out.hidden_states[0]
+        # Stock capture order is ascending layer index. Return the caller's
+        # layers in the order requested, then the head's last-layer hidden.
+        by_layer = dict(zip(sorted({*requested, last_layer_idx}), out.hidden_states))
+        hidden_states = [by_layer[i] for i in requested] + [by_layer[last_layer_idx]]
         return LanguageModelOutput(
             logits=out.logits,
-            hidden_states=[hidden_pre_norm],
+            hidden_states=hidden_states,
             gdn_states=out.gdn_states,
             shared_kv_states={} if return_shared_kv else None,
         )

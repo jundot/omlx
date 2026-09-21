@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 from types import SimpleNamespace
@@ -3291,6 +3292,156 @@ def test_late_join_does_not_duplicate_or_skip_tokens():
     assert output[1] == list(range(13, 21))
 
 
+class CapturingCountingModel(CountingModel):
+    """CountingModel whose forward honours layer captures like mlx-vlm."""
+
+    def __init__(self):
+        super().__init__()
+        self.mtp = None
+        self.captures = []
+
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        return_hidden=False,
+        n_confirmed=0,
+        capture_layer_ids=None,
+    ):
+        from mlx_vlm.models.base import LanguageModelOutput
+
+        drafter = getattr(self, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        if not return_hidden and scope and capture_layer_ids is None:
+            # Mirror the runtime wrapper: ordinary steps feed the drafter.
+            logits, hidden = super().__call__(
+                inputs, cache=cache, return_hidden=True, n_confirmed=n_confirmed
+            )
+            drafter.observe(scope, [hidden for _ in drafter.target_layer_ids])
+            return logits
+        result = super().__call__(
+            inputs, cache=cache, return_hidden=return_hidden, n_confirmed=n_confirmed
+        )
+        if not return_hidden:
+            return result
+        logits, hidden = result
+        captured = [hidden * (10 * (i + 1)) for i in capture_layer_ids or []]
+        self.captures.append((tuple(inputs.shape), list(capture_layer_ids or [])))
+        return LanguageModelOutput(
+            logits=logits, hidden_states=captured + [hidden], gdn_states=None
+        )
+
+
+class TableDrafter:
+    """Block drafter proposing successors, optionally wrong from a position."""
+
+    target_layer_ids = [1, 3]
+
+    def __init__(self, depth, wrong_from=None):
+        self.depth = depth
+        self.wrong_from = wrong_from
+        self.fed = {}
+        self.released = []
+        self.jobs = 0
+        self.scope_uids = None
+
+    @contextlib.contextmanager
+    def decode_scope(self, uids):
+        previous = self.scope_uids
+        self.scope_uids = tuple(uids)
+        try:
+            yield
+        finally:
+            self.scope_uids = previous
+
+    def draft(self, jobs):
+        for row_batch, state, captured, committed, _ in jobs:
+            assert len(captured) == len(self.target_layer_ids)
+            hidden = mx.concatenate(list(captured), axis=-1)
+            assert hidden.shape[0] == 1 and hidden.shape[1] == committed.shape[0]
+            self.fed[state.uid] = self.fed.get(state.uid, 0) + int(hidden.shape[1])
+            anchor = int(committed.reshape(-1)[-1].item())
+            drafts = [(anchor + 1 + j) % 64 for j in range(self.depth)]
+            if self.wrong_from is not None and self.wrong_from < self.depth:
+                drafts[self.wrong_from] = (drafts[self.wrong_from] + 7) % 64
+            state.drafts = mx.array(drafts, dtype=mx.uint32)
+            state.draft_lps = []
+            # Stochastic rows need the draft distribution q; a one-hot q
+            # makes every draft a certain proposal.
+            state.draft_accept_lps = (
+                []
+                if bg._is_greedy(row_batch)
+                else [
+                    mx.where(mx.arange(64) == token, 0.0, -float("inf"))
+                    for token in drafts
+                ]
+            )
+            self.jobs += 1
+
+    def observe(self, uids, captured):
+        assert len(captured) == len(self.target_layer_ids)
+        for index, uid in enumerate(uids):
+            self.fed[uid] = self.fed.get(uid, 0) + int(captured[0].shape[1])
+
+    def release(self, uids):
+        self.released.extend(uids)
+
+
+def _drafted_counting_model(depth, wrong_from=None):
+    model = CapturingCountingModel()
+    model._omlx_mtp_depth = depth
+    model._omlx_drafter = TableDrafter(depth, wrong_from=wrong_from)
+    return model
+
+
+@pytest.mark.parametrize("wrong_from", [None, 0, 2])
+@pytest.mark.parametrize("late_join", [False, True])
+def test_block_drafter_matches_standard_and_feeds_committed_context(
+    wrong_from, late_join
+):
+    prompts = [[1, 2], [10, 11, 12], [30, 31]]
+    limits = [12, 8, 15]
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits, late_join=late_join)
+
+    model = _drafted_counting_model(5, wrong_from=wrong_from)
+    output, terminal = generate(model, prompts, limits, late_join=late_join)
+    assert output == expected
+    drafter = model._omlx_drafter
+    assert drafter.jobs > 0
+    # Every verify forward asked for the drafter's layers plus the head layer.
+    assert all(ids == drafter.target_layer_ids for _, ids in model.captures)
+    # Each row's context holds exactly one hidden per committed position:
+    # the last prompt token, then every emitted token except the newest
+    # one, which is still the anchor. Rejected drafts never enter it.
+    for uid in terminal:
+        assert drafter.fed[uid] == len(output[uid])
+    # Finished rows leave the drafter registry.
+    assert sorted(drafter.released) == sorted(terminal)
+
+
+def test_block_drafter_serves_sampled_rows_with_draft_distribution():
+    """A sampled row rides Leviathan acceptance against the drafter's q."""
+    from omlx.utils.sampling import make_sampler
+
+    mx.random.seed(11)
+    model = _drafted_counting_model(3)
+    stochastic = make_sampler(temp=0.7)
+    output, terminal = generate(
+        model, [[1, 2], [10, 11]], [6, 6], samplers=[None, stochastic]
+    )
+    assert output[0] == list(range(3, 9))
+    # CountingModel logits are near one-hot, so sampling still follows the
+    # successor rule; the row must finish with the requested length.
+    assert output[1] == list(range(12, 18))
+    assert {uid: r.finish_reason for uid, r in terminal.items()} == {
+        0: "length",
+        1: "length",
+    }
+    assert model._omlx_drafter.jobs > 0
+
+
 @pytest.mark.parametrize("unequal_acceptance", [False, True])
 def test_active_batch_admits_new_row_without_rebuilding_old_rows(
     monkeypatch, unequal_acceptance
@@ -4840,3 +4991,48 @@ def test_lightning_verify_preserves_quantized_linear_dispatch(monkeypatch, batch
     assert verifier._linears((layer, layer), x) == (x, x)
     assert verifier.quantized_linear(layer, x) is x
     assert calls == [x.shape] * 7
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("batch,length", [(1, 8), (2, 6), (4, 6), (1, 24), (3, 5)])
+def test_verify_qmm_routes_batched_rows_through_mma_kernel(
+    monkeypatch, batch, length, bits
+):
+    """rows = batch x block share one weight pass and match stock numerics."""
+    from omlx.patches import qwen35_verify_qmm
+
+    qwen35_verify_qmm.apply_verify_qmm_patch()
+    monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: True)
+    monkeypatch.setattr(qwen35_verify_qmm, "_MIN_MMA_ROUTE_N", 256)
+    monkeypatch.setattr(qwen35_verify_qmm, "_MIN_ROUTE_N", 256)
+    routed = []
+    original = qwen35_verify_qmm.vk_qmm_mma
+
+    def spy(x2, *args, **kwargs):
+        routed.append(tuple(x2.shape))
+        return original(x2, *args, **kwargs)
+
+    monkeypatch.setattr(qwen35_verify_qmm, "vk_qmm_mma", spy)
+    mx.random.seed(7)
+    layer = nn.QuantizedLinear(512, 288, bits=bits, group_size=64)
+    x = (mx.random.normal((batch, length, 512)) * 0.5).astype(mx.bfloat16)
+    expected = mx.quantized_matmul(
+        x,
+        layer.weight,
+        layer.scales,
+        layer.biases,
+        transpose=True,
+        group_size=64,
+        bits=bits,
+    ).astype(mx.float32)
+    out = layer(x).astype(mx.float32)
+    mx.eval(out, expected)
+    rows = batch * length
+    if rows >= 7:
+        assert routed == [(rows, 512)]
+    else:
+        # Below seven rows the 5-bit layout has no small-M kernel.
+        assert routed == []
+    assert out.shape == (batch, length, 288)
+    tolerance = 2.0 * mx.abs(expected).max().item() / 256 + 1e-2
+    assert mx.abs(out - expected).max().item() <= tolerance
