@@ -220,6 +220,18 @@ def run_specprefill_target_prefill(
             ):
                 attention_module.rope._adjustment -= 1
 
+        # sparse_prefill leaves an adjustment here only when it found no
+        # ``.rope`` to wrap. That model rotates from positions handed in, and
+        # decode reads them as ``cache offset + request delta``, so the same
+        # number goes to that carrier instead — kickoff decrement included.
+        decode_adjustment = getattr(
+            target_model, "_specprefill_decode_adjustment", None
+        )
+        if decode_adjustment is not None and hasattr(
+            target_model, "register_rope_delta"
+        ):
+            request.rope_deltas = float(int(decode_adjustment) - 1)
+
         selected_token_count = int(selected.shape[0])
         prefill_seconds = time.monotonic() - prefill_started_at
         system_cache_summary = (
