@@ -951,3 +951,155 @@ class TestMaterializeLazyState:
         t1.join()
 
         assert not errors, f"cross-thread eval failed: {errors}"
+
+
+class TestMoondreamCompatibility:
+    @pytest.fixture
+    def moondream(self, tmp_path, monkeypatch):
+        from mlx_vlm.models.moondream2 import Model, ModelConfig
+        from mlx_vlm.models.moondream2.processing_moondream2 import Moondream2Processor
+
+        monkeypatch.setattr(Model, "sanitize", Model.sanitize)
+        monkeypatch.setattr(
+            Moondream2Processor,
+            "from_pretrained",
+            Moondream2Processor.__dict__["from_pretrained"],
+        )
+        _write_config(tmp_path, '{"model_type": "moondream2"}')
+        return Model, ModelConfig, Moondream2Processor
+
+    @pytest.mark.parametrize("layout", ["legacy", "current", "converted"])
+    def test_checkpoint_layout_loads_strictly(self, tmp_path, moondream, layout):
+        from mlx.utils import tree_flatten
+
+        model_cls, config_cls, _ = moondream
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        model = model_cls(
+            config_cls.from_dict(
+                {
+                    "text_config": {
+                        "num_hidden_layers": 1,
+                        "hidden_size": 32,
+                        "intermediate_size": 64,
+                        "num_attention_heads": 2,
+                        "num_key_value_heads": 2,
+                        "vocab_size": 64,
+                    },
+                    "vision_config": {
+                        "num_hidden_layers": 1,
+                        "hidden_size": 32,
+                        "intermediate_size": 64,
+                        "num_attention_heads": 2,
+                        "proj_inner_dim": 64,
+                        "proj_out_dim": 32,
+                    },
+                }
+            )
+        )
+        weights = dict(tree_flatten(model.parameters()))
+        legacy = {
+            "text.model.embed_tokens.weight": "text_model.transformer.embd.wte.weight",
+            "text.model.layers.0.attn.qkv.weight": "text_model.transformer.h.0.mixer.Wqkv.weight",
+            "text.model.layers.0.attn.proj.weight": "text_model.transformer.h.0.mixer.out_proj.weight",
+            "text.model.post_ln.weight": "text_model.lm_head.ln.weight",
+            "text.lm_head.weight": "text_model.lm_head.linear.weight",
+            "vision.encoder.patch_emb.weight": "vision_encoder.encoder.model.visual.patch_embed.linear.weight",
+            "vision.encoder.pos_emb": "vision_encoder.encoder.model.visual.pos_embed",
+            "vision.encoder.blocks.0.ln1.weight": "vision_encoder.encoder.model.visual.blocks.0.norm1.weight",
+            "vision.encoder.blocks.0.ln2.weight": "vision_encoder.encoder.model.visual.blocks.0.norm2.weight",
+            "vision.encoder.post_ln.weight": "vision_encoder.encoder.model.visual.norm.weight",
+            "vision.proj_mlp.fc1.weight": "vision_encoder.projection.mlp.fc1.weight",
+        }
+        current = {
+            "text.model.embed_tokens.weight": "model.text.wte",
+            "text.model.layers.0.attn.qkv.weight": "model.text.blocks.0.attn.qkv.weight",
+            "text.model.post_ln.weight": "model.text.post_ln.weight",
+            "text.lm_head.weight": "model.text.lm_head.weight",
+            "vision.encoder.patch_emb.weight": "model.vision.patch_emb.weight",
+            "vision.proj_mlp.fc1.weight": "model.vision.proj_mlp.fc1.weight",
+        }
+        mapping = {"legacy": legacy, "current": current, "converted": {}}[layout]
+        for target, source in mapping.items():
+            weights[source] = weights.pop(target)
+        if layout != "converted":
+            prefix = "region_model" if layout == "legacy" else "model.region"
+            weights[f"{prefix}.unused.weight"] = next(iter(weights.values()))
+        model.load_weights(list(model.sanitize(weights).items()), strict=True)
+
+    @staticmethod
+    def _tokenizer(starmie=True):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        vocab = (
+            {
+                "<|endoftext|>": 0,
+                "<unk>": 1,
+                "hello": 2,
+                "<|md_reserved_2|>": 3,
+                "<|md_reserved_3|>": 4,
+            }
+            if starmie
+            else {"<unk>": 0, "hello": 1, "<|endoftext|>": 2}
+        )
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="<unk>")),
+            eos_token="<|endoftext|>",
+        )
+
+    @pytest.mark.parametrize("model_type", ["moondream1", "moondream2"])
+    def test_local_starmie_loads_offline(
+        self, tmp_path, monkeypatch, moondream, model_type
+    ):
+        from mlx_vlm.utils import load_processor
+        from transformers import AutoTokenizer
+
+        self._tokenizer().save_pretrained(tmp_path)
+        _write_config(tmp_path, '{"model_type": "' + model_type + '"}')
+        original = AutoTokenizer.from_pretrained
+
+        def local_only(path, **kwargs):
+            assert str(path) == str(tmp_path)
+            assert kwargs["local_files_only"] is True
+            assert kwargs["trust_remote_code"] is False
+            return original(path, **kwargs)
+
+        monkeypatch.setattr(AutoTokenizer, "from_pretrained", local_only)
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        processor = load_processor(
+            tmp_path,
+            add_detokenizer=False,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+        assert processor.tokenizer.encode("hello", add_special_tokens=False) == [2]
+
+    @pytest.mark.parametrize("stale_local", [False, True])
+    def test_external_starmie_preserves_load_options(
+        self, tmp_path, monkeypatch, moondream, stale_local
+    ):
+        from transformers import AutoTokenizer
+
+        if stale_local:
+            self._tokenizer(starmie=False).save_pretrained(tmp_path)
+        loader = MagicMock(return_value=self._tokenizer())
+        monkeypatch.setattr(AutoTokenizer, "from_pretrained", loader)
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        processor = moondream[2].from_pretrained(
+            tmp_path,
+            local_files_only=True,
+            trust_remote_code=False,
+            cache_dir="/tmp/tokenizer-cache",
+            token="test-token",
+            revision="model-revision",
+            eos_token_ids=[0],
+        )
+        loader.assert_called_once_with(
+            "moondream/starmie-v1",
+            local_files_only=True,
+            trust_remote_code=False,
+            cache_dir="/tmp/tokenizer-cache",
+            token="test-token",
+        )
+        assert processor.tokenizer.convert_tokens_to_ids("<|md_reserved_2|>") == 3

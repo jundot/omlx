@@ -559,6 +559,12 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
+    if for_vlm and model_type in {"moondream1", "moondream2"}:
+        from ..patches.moondream2_compat import apply_moondream2_compat_patch
+
+        if apply_moondream2_compat_patch():
+            logger.info("Moondream2 compatibility patch applied for %s", model_name)
+
     if model_type == "deepseek_v41":
         from ..patches.deepseek_v41 import apply_patch
 
