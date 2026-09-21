@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,29 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
         apply_pooling_cache_support()
         _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+        # Upstream mlx-vlm ships glm5_next since PR 2030 merged, and model
+        # discovery imports it before this patch runs. A plain import would
+        # then return the cached site-packages module and silently ignore the
+        # vendor tree — every vendor fix (fp16 native boundary, prefill eval
+        # backpressure) becomes dead code. Purge the cached package first so
+        # the re-import resolves from the vendor path.
+        for name in [
+            n
+            for n in list(sys.modules)
+            if n == "mlx_vlm.models.glm5_next"
+            or n.startswith("mlx_vlm.models.glm5_next.")
+        ]:
+            del sys.modules[name]
         importlib.import_module("mlx_vlm.models.glm5_next")
+        language = importlib.import_module("mlx_vlm.models.glm5_next.language")
+        if not str(Path(language.__file__).resolve()).startswith(
+            str(_VENDOR_MLX_VLM.resolve())
+        ):
+            logger.error(
+                "GLM-5.3 compat patch did not take effect: language.py resolves to %s",
+                language.__file__,
+            )
+            return False
 
         # mlx-vlm has no glm5_next entry in MODEL_CONFIG, so get_message_json()
         # raises "Unsupported model: glm5_next" on every turn that carries no
@@ -54,7 +77,7 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
 
         MODEL_CONFIG.setdefault("glm5_next", MessageFormat.LIST_WITH_IMAGE_FIRST)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("GLM-5.3 mlx-vlm registration failed: %s", exc)
+        logger.warning("GLM-5.3 mlx-vlm registration failed: %s", exc)
         return False
 
     _APPLIED = True

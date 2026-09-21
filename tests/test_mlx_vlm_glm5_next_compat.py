@@ -784,3 +784,193 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
     mx.eval(actual, reference)
 
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkeypatch):
+    """oQ quantized scales promote every projection output to fp32, and the
+    native DSA kernels accept fp16/bf16 only — fp32 inputs silently rejected
+    both routes, so every sparse layer fell back to unfused dense attention
+    and materialized [heads, L, Kv] scores (the ~28GB/chunk peak at 32K
+    context that never appears on dense models). The attention boundary must
+    hand the native kernels fp16/bf16 tensors."""
+    import mlx_vlm.models.glm5_next.language as lang
+
+    text = lang.TextConfig(
+        model_type="glm5_next_text",
+        vocab_size=128,
+        hidden_size=4096,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        n_shared_experts=None,
+        n_routed_experts=None,
+        routed_scaling_factor=1.0,
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_rope_head_dim=0,
+        v_head_dim=256,
+        qk_nope_head_dim=256,
+        mla_use_nope=True,
+        num_experts_per_tok=2,
+        first_k_dense_replace=99,
+        max_position_embeddings=8192,
+        rms_norm_eps=1e-5,
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=32,
+        layer_types=["deepseek_sparse_attention"],
+        mlp_layer_types=["dense"],
+        linear_attn_config={
+            "num_heads": 2,
+            "head_dim": 32,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+        },
+        index_kpool=4,
+        hc_mult=2,
+        hc_sinkhorn_iters=2,
+    )
+    attn = lang.Glm5NextSparseAttention(text)
+
+    seen = []
+
+    def spy_sma(q_latent, q_pe, kv_latent, k_pe, topk_indices, scale, **kw):
+        seen.append(
+            ("sparse_mla", *(t.dtype for t in (q_latent, q_pe, kv_latent, k_pe)))
+        )
+        # Native sparse MLA returns latent-width output [B, H, L, 512].
+        return mx.zeros(
+            q_latent.shape[:2] + (q_latent.shape[2], 512), dtype=q_latent.dtype
+        )
+
+    def spy_eba(q, k, v, topk_indices, scale, **kw):
+        seen.append(("exact_block", *(t.dtype for t in (q, k, v))))
+        return mx.zeros(q.shape, dtype=q.dtype)
+
+    monkeypatch.setattr(lang, "sparse_mla_attention", spy_sma)
+    monkeypatch.setattr(lang, "exact_block_token_attention", spy_eba)
+    monkeypatch.setattr(lang, "q8_vup_flat", lambda *a, **k: None)
+
+    x = mx.random.normal((1, 4096, 4096), dtype=mx.float32)
+    out = attn(x, mask=None, cache=None)
+    mx.eval(out)
+    sma = [s for s in seen if s[0] == "sparse_mla"]
+    assert sma, "Kv>=4096 must attempt the native sparse MLA route"
+    assert all(dt == mx.float16 for dt in sma[0][1:]), (
+        f"native sparse MLA received {sma[0][1:]}, expected fp16"
+    )
+
+    seen.clear()
+    x = mx.random.normal((1, 2500, 4096), dtype=mx.float32)
+    out = attn(x, mask=None, cache=None)
+    mx.eval(out)
+    eba = [s for s in seen if s[0] == "exact_block"]
+    assert eba, "2048<Kv<4096 must attempt the native exact-block route"
+    assert all(dt == mx.float16 for dt in eba[0][1:]), (
+        f"native exact-block received {eba[0][1:]}, expected fp16"
+    )
+
+
+def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
+    """The CPU enqueues a whole 2048-token prefill chunk in ~1s while the
+    GPU needs ~10x longer; with the layer loop fully lazy every intermediate
+    (fp32 hyper-connection stream, MoE gathers, GDN scans, expanded heads)
+    stays pinned until the final logits eval, spiking the footprint by ~30GB
+    per chunk. The model loop must eval the running stream during prefill so
+    the allocator releases intermediates as the GPU progresses; decode stays
+    lazy for latency."""
+    import mlx_vlm.models.glm5_next.language as lang
+
+    text = _tiny_config().text_config
+    model = lang.Glm5NextModel(text)
+
+    calls = []
+    clears = []
+    real_eval = mx.eval
+    real_clear = mx.clear_cache
+
+    def spy(*args, **kw):
+        calls.append(sum(len(a) if isinstance(a, (tuple, list)) else 1 for a in args))
+        return real_eval(*args, **kw)
+
+    def clear_spy(**kw):
+        clears.append(1)
+        return real_clear(**kw)
+
+    monkeypatch.setattr(lang.mx, "eval", spy)
+    monkeypatch.setattr(lang.mx, "clear_cache", clear_spy)
+
+    ids = mx.zeros((1, 256), dtype=mx.int32)
+    out = model(ids)
+    real_eval(out)
+    assert len(calls) >= text.num_hidden_layers, (
+        f"prefill width must eval the stream per layer, got {len(calls)} eval calls"
+        f" for {text.num_hidden_layers} layers"
+    )
+    # The allocator caches freed buffers per size class; per-layer sizes
+    # differ (expert route counts, 2047/2048 chunk widths), so the pool
+    # grows monotonically through a chunk unless it is cleared at the same
+    # eval boundaries.
+    assert len(clears) >= text.num_hidden_layers, (
+        f"prefill must clear the allocator pool per layer, got {len(clears)}"
+        f" clears for {text.num_hidden_layers} layers"
+    )
+
+    calls.clear()
+    clears.clear()
+    decode = mx.zeros((1, 1), dtype=mx.int32)
+    out = model(decode)
+    real_eval(out)
+    assert len(calls) < text.num_hidden_layers, (
+        "decode width must stay lazy (no per-layer eval)"
+    )
+    assert not clears, "decode width must not clear the pool per layer"
+
+
+def test_patch_overrides_site_packages_glm5_next_copy():
+    """Upstream mlx-vlm ships glm5_next since PR 2030 merged, and model
+    discovery imports it before the compat patch runs. A plain import then
+    returns the cached site-packages module and the vendor tree — which
+    carries the fp16 native-boundary and prefill eval fixes — is silently
+    ignored. apply() must purge the cached package so the vendor copy wins."""
+    import sys
+    from pathlib import Path
+
+    import mlx_vlm.models
+
+    pkg = "mlx_vlm.models.glm5_next"
+    vendor_str = str(compat._VENDOR_MLX_VLM)
+
+    saved_modules = {
+        n: sys.modules.pop(n)
+        for n in list(sys.modules)
+        if n == pkg or n.startswith(pkg + ".")
+    }
+    saved_path = list(mlx_vlm.models.__path__)
+    for p in [p for p in list(mlx_vlm.models.__path__) if vendor_str in p]:
+        mlx_vlm.models.__path__.remove(p)
+    applied = compat._APPLIED
+    compat._APPLIED = False
+    try:
+        # Server state: discovery imported the site-packages copy BEFORE the
+        # patch ran, so the package is cached in sys.modules already.
+        import mlx_vlm.models.glm5_next.language as early
+
+        assert vendor_str not in str(early.__file__)
+        assert compat.apply_mlx_vlm_glm5_next_compat_patch() is True
+        import mlx_vlm.models.glm5_next.language as lang
+
+        assert str(Path(lang.__file__).resolve()).startswith(
+            str(Path(vendor_str).resolve())
+        ), f"patch did not override: {lang.__file__}"
+        src = Path(lang.__file__).read_text()
+        assert "native_dtype" in src, "vendor language.py fix missing"
+        assert "clear_cache" in src, "vendor eval backpressure missing"
+    finally:
+        for n in [n for n in list(sys.modules) if n == pkg or n.startswith(pkg + ".")]:
+            del sys.modules[n]
+        sys.modules.update(saved_modules)
+        mlx_vlm.models.__path__[:] = saved_path
+        compat._APPLIED = applied

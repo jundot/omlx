@@ -407,12 +407,23 @@ def _patch_model_call(g5_lang: Any) -> None:
         )
         h = mx.contiguous(h)
 
+        # Mirror the vendor model loop's prefill backpressure (see
+        # Glm5NextModel.__call__): eval per layer so intermediates retire as
+        # the GPU progresses, and clear the allocator pool there because
+        # per-layer sizes differ and the pool caches one buffer per size
+        # class. This loop REPLACES the vendor loop on MTP models, so the
+        # fix must live here too or the server never runs it.
+        prefill = h.shape[1] >= 256
+
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             if gdn_sink is not None:
                 h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
             else:
                 h = layer(h, mask=mask, cache=c)
+            if prefill:
+                mx.eval(h)
+                mx.clear_cache()
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary

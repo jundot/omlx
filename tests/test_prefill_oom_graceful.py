@@ -1425,9 +1425,13 @@ def test_speed_priority_context_mode_shrink_unchanged():
     assert _call(ns, 2048, kv_len=5000) < 2048
 
 
-def test_speed_priority_guard_aborts_at_full_step_instead_of_shrinking():
-    """The guard's abort gate charges the full chunk in speed mode: a chunk
-    that context mode would shrink aborts upfront instead."""
+def test_speed_priority_guard_shrinks_when_full_chunk_breaches():
+    """Speed priority must not convert a full-chunk breach into a hard
+    reject: it keeps the full chunk only while it fits, and shrinks to the
+    largest fitting chunk once it breaches (GLM-5.3 60%-residency cliff —
+    the benchmark pinned speed_priority and every pp>=4096 run died at
+    chunk 2 even though 1024-token chunks fit under the cap). Only a
+    floor-size breach may abort."""
     hard = 42 * _GB
     current = 30 * _GB
     bpt = 27 * 1024 * 1024
@@ -1436,8 +1440,11 @@ def test_speed_priority_guard_aborts_at_full_step_instead_of_shrinking():
     # Context-mode control on the identical setup shrinks (guard test above).
     assert _guard_call(ns, 2048, kv_len=122_000) < 2048
     ns._prefill_speed_priority = True
-    with pytest.raises(PrefillMemoryExceededError):
-        _guard_call(ns, 2048, kv_len=122_000)
+    n = _guard_call(ns, 2048, kv_len=122_000)
+    assert ns._prefill_min_chunk_tokens <= n < 2048
+    # The shrunk chunk's predicted peak fits under the safety cap.
+    cap = ns._prefill_abort_cap()
+    assert current + ns._admission_transient_bound(n, 122_000) <= cap
 
 
 def test_speed_priority_guard_passes_full_chunk_that_fits():
@@ -1638,3 +1645,128 @@ def test_guard_rejects_image_prefix_that_cannot_fit_whole():
             loop_label="image-prefix",
             minimum_tokens=2048,
         )
+
+
+# --------------------------------------------------------------------------
+# GLM-5.x (glm5_next) DSA prefill: static profile + flat-overhead pricing
+# --------------------------------------------------------------------------
+
+
+def _glm5_next_config():
+    # Real GLM-5.3-Flash text_config dims (head_dim=0 by design: NoPE MLA,
+    # head width lives in qk_nope_head_dim). 45 layers: 34 GDN + 11 DSA.
+    layer_types = [
+        "deepseek_sparse_attention" if i % 4 == 3 else "linear_attention"
+        for i in range(45)
+    ]
+    return SimpleNamespace(
+        model_type="glm5_next_text",
+        num_hidden_layers=45,
+        num_attention_heads=64,
+        head_dim=0,
+        qk_nope_head_dim=256,
+        v_head_dim=256,
+        kv_lora_rank=512,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        index_kpool=4,
+        linear_attn_config={"num_heads": 64, "head_dim": 128},
+        num_experts_per_tok=8,
+        hidden_size=4096,
+        layer_types=layer_types,
+    )
+
+
+def _glm5_next_monitor():
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=45,
+        num_kv_heads=64,
+        head_dim=0,
+        dtype_size=2,
+        num_attention_heads=64,
+        num_kv_cache_layers=11,
+        prefill_memory_profile=make_prefill_memory_profile(
+            _glm5_next_config(), compute_dtype_size=2
+        ),
+    )
+    return monitor
+
+
+def test_glm5_next_prefill_profile_registered():
+    profile = make_prefill_memory_profile(
+        _glm5_next_config(), compute_dtype_size=2
+    )
+    assert profile is not None
+    # Resident KV: 11 sparse layers x (512 latent + 128/4 pooled index key)
+    # x fp16 per token; GDN state is fixed and probed separately.
+    assert profile.estimate_resident_kv_bytes(1000) == 11 * (512 + 32) * 2 * 1000
+    dense = profile.estimate_prefill_transient_bytes(2048, 2048)
+    assert dense > 0
+    # Past index_topk the indexer + gathered-latent core take over and the
+    # price stays bounded (does not fall back to dense Q x kv_len scoring).
+    sparse = profile.estimate_prefill_transient_bytes(2048, 4096)
+    assert sparse > 0
+    gathered_bound = 2048 * 2048 * 512 * 2
+    assert sparse <= gathered_bound * 2
+
+
+def test_glm5_next_flat_overhead_guard_admits_full_chunk_at_1948_numbers():
+    """Regression for the 2026-09-21 19:48 abort: GLM-5.3 at 60% expert
+    residency, current=80.67GB, speed_priority pinned by the benchmark.
+    The footprint-delta EWMA charged 42.65GB again on top of a footprint
+    that already retained those pool bytes and the guard rejected pp=4096
+    chunk 2 (80.67 + 42.65 > 117.32). With the static DSA profile and
+    flat-overhead accounting the same admission passes at the full chunk."""
+    monitor = _glm5_next_monitor()
+    assert monitor.uses_flat_overhead_accounting() is True
+    assert monitor.is_qwen4_gathered_prefill_profile() is False
+    hard = int(123.5 * _GB)
+    current = int(80.67 * _GB)
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=monitor, reclaim_to=current, min_chunk=512
+    )
+    ns._fake_current = current
+    ns._prefill_speed_priority = True
+    # Chunk 2 of pp=4096: 2047 remaining query tokens over kv_len=2048.
+    n = _guard_call(ns, 2047, kv_len=2048)
+    assert n == 2047
+
+
+def test_glm5_next_flat_overhead_charges_pool_once_and_releases_on_reclaim():
+    """The flat-overhead path never re-charges retained pool bytes (they are
+    already in the current footprint reading); only pool bytes a reclaim
+    actually returned are charged back as reallocatable next chunk."""
+    monitor = _glm5_next_monitor()
+    ns = _throttle_ctx(
+        current=0, hard=int(123.5 * _GB), monitor=monitor, min_chunk=512
+    )
+    ns._fake_current = 0
+    predicted = ns._predicted_chunk_transient(2047, 2048)
+    # Static profile pricing only — no EWMA term feeds this route.
+    static = monitor.estimate_chunk_transient_bytes(
+        2047, 2048 + 2047
+    ) + monitor.estimate_prompt_kv_bytes(2047)
+    assert predicted == pytest.approx(static * 1.3, rel=1e-6)
+    # A chunk that grew the footprint by 20GB records the residual over the
+    # static shape as flat overhead. While the pool retains it, it must NOT
+    # be charged again on top of the footprint that already contains it.
+    Scheduler._record_chunk_transient(
+        ns,
+        2047,
+        pre_bytes=0,
+        post_bytes=int(20 * _GB),
+        request_id="r",
+        loop_label="test",
+        kv_len=2048,
+    )
+    retained = ns._predicted_chunk_transient(2047, 2048)
+    assert retained == pytest.approx(static * 1.3, rel=1e-6)
+    flat = ns._prefill_transient_tracker.flat_overhead_bytes_for(False)
+    assert flat > 0
+    # Once a pool clear returns those bytes they become reallocatable and are
+    # charged back — once, not token-linearly.
+    ns._prefill_transient_tracker.record_flat_reclaim(20 * _GB)
+    charged = ns._predicted_chunk_transient(2047, 2048)
+    assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)

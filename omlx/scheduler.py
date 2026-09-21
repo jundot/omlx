@@ -3491,6 +3491,17 @@ class Scheduler:
         checker = getattr(monitor, "is_qwen4_gathered_prefill_profile", None)
         return callable(checker) and checker() is True
 
+    def _prefill_flat_overhead_enabled(self) -> bool:
+        """True when the engine prices token-scaled prefill work statically
+        and charges measured pool overhead once as flat overhead (Qwen4 QSA,
+        GLM-5.x DSA). QSA-route-specific gates stay qwen4-only; this gate
+        covers the shared flat-overhead accounting machinery."""
+        monitor = getattr(self, "memory_monitor", None)
+        checker = getattr(monitor, "uses_flat_overhead_accounting", None)
+        if callable(checker):
+            return checker() is True
+        return Scheduler._qwen4_prefill_accounting_enabled(self)
+
     def _qwen4_text_gathered_pricing(self, text_only: bool) -> bool:
         """True when this engine can price Qwen4 text prefill as gathered QSA.
 
@@ -4064,9 +4075,10 @@ class Scheduler:
         """Predict additional memory needed for the next prefill chunk.
 
         Generic models use the largest static, EWMA, or last-chunk estimate,
-        including recent reclaim. Qwen4 uses its nonlinear static profile
-        plus observed overhead released from the pool. Retained overhead is
-        already included in current footprint and must not be charged again.
+        including recent reclaim. Flat-overhead profiles (Qwen4 QSA, GLM-5.x
+        DSA) use their nonlinear static profile plus observed overhead
+        released from the pool. Retained overhead is already included in
+        current footprint and must not be charged again.
         """
         if n_tokens <= 0:
             return 0.0
@@ -4083,7 +4095,7 @@ class Scheduler:
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
             per_token = static_per_token
-        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
+        qwen4_flat_overhead = Scheduler._prefill_flat_overhead_enabled(self)
         if tracker is not None:
             if qwen4_flat_overhead:
                 # Qwen4 models token-scaled work statically. Add measured
@@ -4323,6 +4335,13 @@ class Scheduler:
 
         # Predicted to breach — reclaim transients and re-measure once.
         current = self._reclaim_prefill_headroom()
+        if self._prefill_speed_priority:
+            # Speed priority refuses to shrink a chunk that fits (the
+            # early-return above); it must not refuse to run one that
+            # doesn't. When even the reclaimed full chunk breaches the
+            # cap, fall back to the ordinary shrink floor — a slower step
+            # beats a rejected request (GLM-5.3 60%-residency cliff).
+            min_chunk = max(1, self._prefill_min_chunk_tokens, minimum_tokens)
         min_transient = self._admission_transient_bound(
             min_chunk, kv_len, gathered_core=gathered_core
         )
@@ -4408,7 +4427,7 @@ class Scheduler:
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
-        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
+        qwen4_flat_overhead = Scheduler._prefill_flat_overhead_enabled(self)
         if qwen4_flat_overhead:
             n_fit = Scheduler._largest_fitting_prefill_chunk(
                 self,
@@ -4553,7 +4572,7 @@ class Scheduler:
 
         current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
-        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
+        qwen4_flat_overhead = Scheduler._prefill_flat_overhead_enabled(self)
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
         # measurement so it tracks growth with kv_len instead of lagging behind
@@ -4958,11 +4977,11 @@ class Scheduler:
         return current >= self._memory_limit_bytes
 
     def _clear_cache(self) -> None:
-        """Clear the Metal pool and account for Qwen4 buffers that may return."""
+        """Clear the Metal pool and account for flat-overhead buffers that may return."""
         tracker = getattr(self, "_prefill_transient_tracker", None)
         track = (
             tracker is not None
-            and Scheduler._qwen4_prefill_accounting_enabled(self)
+            and Scheduler._prefill_flat_overhead_enabled(self)
         )
         before = get_phys_footprint() if track else 0
         _sync_and_clear_cache(self._stream)
@@ -4994,7 +5013,7 @@ class Scheduler:
         if (
             MemoryMonitor is not None
             and isinstance(monitor, MemoryMonitor)
-            and monitor.is_qwen4_gathered_prefill_profile()
+            and monitor.uses_flat_overhead_accounting()
         ):
             min_chunk = max(1, self._prefill_min_chunk_tokens)
             representative = n_tokens >= min_chunk and not (
@@ -5015,7 +5034,7 @@ class Scheduler:
                 representative=representative,
             )
             logger.debug(
-                "[throttle:%s] qwen4-flat rid=%s n=%d kv_len=%d "
+                "[throttle:%s] flat-overhead rid=%s n=%d kv_len=%d "
                 "delta=%.2fMB static=%.2fMB overhead=%.2fMB debt=%.2fMB",
                 loop_label,
                 request_id,
@@ -13492,7 +13511,14 @@ class Scheduler:
             def _pos_int(v: Any) -> bool:
                 return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
-            if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            if _pos_int(num_layers) and _pos_int(num_kv_heads) and (
+                # MLA-style configs (glm5_next) carry head_dim=0 by design:
+                # the head width lives in qk_nope_head_dim and the profile
+                # owns the pricing. Refusing head_dim=0 here kept the
+                # profile out of the monitor and left the guard pricing
+                # those models from the footprint-delta EWMA alone.
+                _pos_int(head_dim) or prefill_memory_profile is not None
+            ):
                 from .memory_monitor import _ane_prefill_transient_bytes
 
                 self.memory_monitor.set_model_info(
