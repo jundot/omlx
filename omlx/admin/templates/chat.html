@@ -2216,7 +2216,7 @@
                             @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
                             @input="onThinkingBudgetTokensInput($event)"
                             @change="clampThinkingBudgetTokens()"
-                            placeholder="4001" min="1" step="1000"
+                            placeholder="4096" min="0" step="1024"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
                             style="color: var(--text-primary);">
                     </div>
@@ -2591,7 +2591,6 @@
             _adminModelsList: null,
             _adminModelsListPromise: null,
             _thinkingBudgetBeforeInput: null,
-            _thinkingBudgetStepping: false,
             chatSessions: {},
             messages: [],
             inputMessage: '',
@@ -2777,28 +2776,23 @@
             },
 
             onThinkingBudgetTokensInput(event) {
-                if (this._thinkingBudgetStepping) return;
+                // The field is the only writer of the model here. Typing must land
+                // verbatim: an earlier revision re-stepped any change smaller than
+                // the step size, which turned a typed "512" into 1029 and made the
+                // first digit flash. Stepping happens only where it is explicit —
+                // the arrow keys below, and the native spinner, whose grid the
+                // input's own step/min attributes line up with 1024.
                 const el = event.target;
-                const raw = Number(el.value);
-                const prev = Number(this._thinkingBudgetBeforeInput);
-                // Empty field: let the user type freely; don't overwrite with NaN.
-                if (el.value === '' || el.value === '-') {
+                // Cleared (or a lone sign, which browsers keep out of a number
+                // input's value): record "no budget" instead of NaN.
+                if (el.value === '') {
+                    this._thinkingBudgetBeforeInput = null;
                     this.modelSettings.thinking_budget_tokens = null;
+                    this.onModelSettingsChange();
                     return;
                 }
-                if (Number.isFinite(prev) && Number.isFinite(raw) && raw !== prev) {
-                    const delta = raw - prev;
-                    // Native spinners use (min + n*step); 4096 is off-grid when min=1, step=100/1024
-                    if (delta !== 0 && Math.abs(delta) < 1024) {
-                        this._thinkingBudgetStepping = true;
-                        this.modelSettings.thinking_budget_tokens = prev;
-                        this.stepThinkingBudgetTokens(delta > 0 ? 1 : -1);
-                        el.value = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetStepping = false;
-                        return;
-                    }
-                }
+                const raw = Number(el.value);
+                if (!Number.isFinite(raw)) return;
                 this._thinkingBudgetBeforeInput = raw;
                 this.modelSettings.thinking_budget_tokens = raw;
                 this.onModelSettingsChange();
