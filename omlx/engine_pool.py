@@ -2980,6 +2980,15 @@ class EnginePool:
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
+                if dflash_enabled and not dflash_draft:
+                    from .patches.dflash_mimo_v2 import (
+                        resolve_bundled_mimo_draft,
+                    )
+
+                    dflash_draft = resolve_bundled_mimo_draft(
+                        entry.model_path,
+                        dflash_draft,
+                    )
                 if (
                     dflash_enabled
                     and dflash_draft
