@@ -550,9 +550,23 @@ class OffloadSwitchGLU(nn.Module):
         for start, end in zip(cuts[:-1], cuts[1:]):
             chunk_ids = sorted_ids[start:end]
             c.ensure(mx.array(np.unique(chunk_ids), dtype=mx.int32))
+            n_routes = end - start
+            padded_routes = n_routes
+            # Keep MLX's small-chunk QMV path; padding must not select sorted QMM.
+            if n_routes >= max(16, 4 * c.capacity):
+                # Reuse allocation sizes across layers without clearing the global Metal pool.
+                padded_routes = 1 << (n_routes - 1).bit_length()
+            token_ids = order[start:end] // k
+            if padded_routes != n_routes:
+                chunk_ids = np.pad(
+                    chunk_ids, (0, padded_routes - n_routes), mode="edge"
+                )
+                token_ids = np.pad(
+                    token_ids, (0, padded_routes - n_routes), mode="edge"
+                )
             slots = mx.take(c.map, mx.array(chunk_ids, dtype=mx.int32))
             slots = slots.reshape(-1, 1)
-            t_idx = mx.array(order[start:end] // k, dtype=mx.int32)
+            t_idx = mx.array(token_ids, dtype=mx.int32)
             xe = mx.expand_dims(mx.take(flat_x, t_idx, axis=0), (-2, -3))
             inv = None
             if do_sort:
@@ -561,8 +575,8 @@ class OffloadSwitchGLU(nn.Module):
             gate = c.qmm("gate_proj", xe, slots, do_sort)
             o = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
             if do_sort:
-                o = _scatter_unsort(o, inv, (end - start, 1))
-            o = o.squeeze(-2)[:, 0, :]
+                o = _scatter_unsort(o, inv, (padded_routes, 1))
+            o = o.squeeze(-2)[:n_routes, 0, :]
             mx.eval(o)
             outs.append(o)
         out = mx.concatenate(outs, axis=0)
