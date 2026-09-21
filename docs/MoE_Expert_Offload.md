@@ -100,7 +100,10 @@ All backbone layers must have the expected tensor names, shapes, storage
 dtypes, and quantization metadata. Fused or renamed projections, missing
 experts, unquantized weights, and per-expert linear bias are rejected.
 DeepSeek V4.1 has a separate adapter described below. DeepSeek V4 and
-GLM-5.3 are outside the current support list.
+GLM-5.3 keep their own weighted expert kernels, which this adapter cannot
+read: their checkpoints now pass the layout check like any other family and
+the toggle appears, but the adapter leaves those layers resident instead of
+streaming them, and they receive no offload admission discount.
 
 When offload wraps layers, the Qwen gate/up fusion is skipped automatically:
 fusion rewrites stock expert weights in RAM, which cannot apply to experts
