@@ -956,3 +956,55 @@ class TestCallBackbone:
         assert result[0] is logits
         assert result[1] is hidden
         assert result[2] is gdn
+
+
+def test_qwen_external_round_clears_before_replay_and_commits_before_yield(monkeypatch):
+    from mlx_vlm.speculative.mtp import _MTPVerifyResult
+
+    events = []
+    draft = SimpleNamespace(
+        config=SimpleNamespace(model_type="qwen3_5_mtp"),
+        accept_verified_tokens=lambda: events.append("replay"),
+    )
+    monkeypatch.setattr(
+        vlm_mtp, "_sync_and_clear_cache", lambda stream: events.append("clear")
+    )
+    monkeypatch.setattr(vlm_mtp, "_buffer_mtp_target_cache", lambda *args: None)
+    with mx.stream(vlm_mtp._vlm_generation_stream):
+        expected_stream = mx.default_stream(mx.gpu)
+
+    def commit(*args):
+        assert mx.default_stream(mx.gpu) == expected_stream
+        events.append("commit")
+
+    monkeypatch.setattr(_MTPVerifyResult, "commit", commit)
+
+    def rounds(target, drafter, *args, **kwargs):
+        try:
+            drafter.accept_verified_tokens()
+            result = _MTPVerifyResult(hidden=None, shared_kv_states={})
+            result.commit(None, [], 2, 3)
+            yield 11, None
+            yield 12, None
+        finally:
+            events.append("closed")
+
+    monkeypatch.setattr(vlm_mtp, "_mtp_rounds", rounds)
+    gen = vlm_mtp.run_vlm_mtp_decode(
+        target_language_model=SimpleNamespace(),
+        drafter=vlm_mtp.VLMMTPDrafter(draft, "mtp", "/p"),
+        prompt_cache=[],
+        hidden=mx.zeros((1, 1, 8)),
+        shared_kv_states={},
+        first_bonus=7,
+        max_tokens=4,
+        sampler=lambda x: x,
+    )
+    assert next(gen) == 7
+    assert events == []
+    assert next(gen) == 11
+    assert events == ["clear", "replay", "commit"]
+    assert next(gen) == 12
+    assert events == ["clear", "replay", "commit"]
+    gen.close()
+    assert events[-1] == "closed"

@@ -58,6 +58,7 @@ from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
     _mtp_rounds_batch,
 )
 
+from ..patches.mlx_vlm_mtp import apply_external_mtp_runtime_patch  # noqa: E402
 from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
 from ..utils.model_loading import materialize_lazy_state  # noqa: E402
 
@@ -140,17 +141,27 @@ class _VLMAdapterMTPProxy:
 
 
 class _MTPResetBindingProxy:
-    """Temporarily expose ``language_model`` during drafter reset."""
+    """Bind the adapter for reset and preserve the Qwen replay cleanup boundary."""
 
-    def __init__(self, drafter: nn.Module, target_proxy: _VLMAdapterMTPProxy) -> None:
+    def __init__(
+        self, drafter: nn.Module, target_proxy: _VLMAdapterMTPProxy | None
+    ) -> None:
         self._drafter = drafter
         self._target_proxy = target_proxy
+        self.clear_before_replay = False
 
     def __getattr__(self, name: str) -> Any:
+        if name == "accept_verified_tokens" and self.clear_before_replay:
+            return self._accept_verified_tokens
         return getattr(self._drafter, name)
 
+    def _accept_verified_tokens(self, *args: Any, **kwargs: Any) -> Any:
+        # Release the idle pool before replay and commit replace live cache state.
+        _sync_and_clear_cache(_vlm_generation_stream)
+        return self._drafter.accept_verified_tokens(*args, **kwargs)
+
     def reset(self, target_model: Any, *args: Any, **kwargs: Any) -> Any:
-        if target_model is self._target_proxy:
+        if self._target_proxy is not None and target_model is self._target_proxy:
             self._target_proxy._expose_language_model = True
             try:
                 return self._drafter.reset(target_model, *args, **kwargs)
@@ -281,6 +292,7 @@ def run_vlm_mtp_decode(
     (``emitted = 1`` baked in at the top of both helpers).
     """
     target_for_rounds = target_language_model
+    apply_external_mtp_runtime_patch()
     drafter_model = drafter.model
     adapter_lm = getattr(target_language_model, "_language_model", None)
     if adapter_lm is not None:
@@ -288,6 +300,13 @@ def run_vlm_mtp_decode(
         drafter_model = _MTPResetBindingProxy(drafter.model, target_for_rounds)
 
     is_batch = isinstance(first_bonus, mx.array) and first_bonus.size > 1
+    clear_before_replay = (
+        not is_batch and _read_model_type(drafter.model) == "qwen3_5_mtp"
+    )
+    if clear_before_replay:
+        if not isinstance(drafter_model, _MTPResetBindingProxy):
+            drafter_model = _MTPResetBindingProxy(drafter.model, None)
+        drafter_model.clear_before_replay = True
 
     if is_batch:
         first_bonus_list = first_bonus.tolist()  # forces eval once
@@ -331,7 +350,7 @@ def run_vlm_mtp_decode(
     yield first_bonus_int
 
     _buffer_mtp_target_cache(prompt_cache, drafter_model, draft_block_size)
-    for tok, _ in _mtp_rounds(
+    rounds = _mtp_rounds(
         target_for_rounds,
         drafter_model,
         prompt_cache,
@@ -343,7 +362,13 @@ def run_vlm_mtp_decode(
         sampler=sampler,
         draft_block_size=draft_block_size,
         token_dtype=token_dtype,
-    ):
-        # Same two-stream drain as the batched branch above.
-        _sync_and_clear_cache(_vlm_generation_stream)
-        yield tok
+    )
+    try:
+        for tok, _ in rounds:
+            if not clear_before_replay:
+                _sync_and_clear_cache(_vlm_generation_stream)
+            yield tok
+    finally:
+        close = getattr(rounds, "close", None)
+        if close is not None:
+            close()
