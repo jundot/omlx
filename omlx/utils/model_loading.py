@@ -410,6 +410,16 @@ def _checkpoint_has_t5_weights(model_path: str | Path) -> bool:
     return False
 
 
+def _config_model_type(model_path: str | Path) -> str | None:
+    """The checkpoint's declared ``model_type``, or None when unreadable."""
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    value = config.get("model_type") if isinstance(config, dict) else None
+    return value if isinstance(value, str) else None
+
+
 def maybe_apply_pre_load_patches(
     model_name: str,
     model_settings: Any | None = None,
@@ -470,7 +480,8 @@ def maybe_apply_pre_load_patches(
                         "dflash_enabled",
                     )
                 },
-            }
+            },
+            model_type=_config_model_type(model_name),
         )
 
     if (

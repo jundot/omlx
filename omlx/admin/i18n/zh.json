@@ -1166,6 +1166,7 @@
   "modal.model_settings.moe_expert_offload": "MoE 专家卸载",
   "modal.model_settings.moe_expert_offload_hint": "按需从检查点流式加载混合专家（MoE）权重，仅保留一小部分常驻。可容纳大于内存的 MoE 模型；代价是解码速度。需要重新加载。",
   "modal.model_settings.moe_expert_offload_speculative_hint": "不能与 Lightning MTP、VLM MTP 或 DFlash 同时使用。",
+  "modal.model_settings.moe_expert_offload_speculative_hint_v41": "可与 Lightning MTP 同时开启：草稿头常驻，主干专家从 SSD 流式加载。不能与 VLM MTP 或 DFlash 同时使用。",
   "modal.model_settings.moe_expert_offload_fraction_label": "常驻专家",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "请输入 5 到 95 之间的数值。",

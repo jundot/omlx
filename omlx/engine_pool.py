@@ -429,7 +429,15 @@ class EnginePool:
                     )
 
                     base = max(
-                        0, base - estimate_expert_savings(entry.model_path, fraction)
+                        0,
+                        base
+                        - estimate_expert_savings(
+                            entry.model_path,
+                            fraction,
+                            mtp_resident=bool(
+                                getattr(runtime_settings, "mtp_enabled", False)
+                            ),
+                        ),
                     )
             elif qwen4_estimate is None:
                 base = estimate_offload_admission_bytes(
@@ -551,7 +559,9 @@ class EnginePool:
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(
-                    entry.model_path, settings.moe_expert_offload_resident_fraction
+                    entry.model_path,
+                    settings.moe_expert_offload_resident_fraction,
+                    mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
                 )
                 estimate = replace(
                     estimate,

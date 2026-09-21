@@ -75,7 +75,7 @@ def _to_array(slab, raw):
 class ExpertOffloadPlan:
     """Validate every routed tensor before promising any memory savings."""
 
-    def __init__(self, path, raw, mapping, config, fraction):
+    def __init__(self, path, raw, mapping, config, fraction, mtp_resident=False):
         if not 0 < fraction <= 1:
             raise ValueError("MoE resident fraction must be in (0, 1]")
         self.path = Path(path)
@@ -85,6 +85,7 @@ class ExpertOffloadPlan:
         self.count = config.n_routed_experts
         self.floor = config.n_activated_experts
         self.capacity = min(self.count, max(self.floor, round(self.count * fraction)))
+        self.mtp_resident = bool(mtp_resident)
         self.layers = {}
         self.layer_bytes = {}
         self.excluded_keys = set()
@@ -98,7 +99,14 @@ class ExpertOffloadPlan:
         if self.converted is not None:
             for key in mapping:
                 if key.startswith("language_model.mtp."):
-                    entry = self._entry(key)
+                    # ``_entry`` registers the key for exclusion as a side
+                    # effect. When the draft head is resident we still want the
+                    # byte count for reporting, so read the header directly and
+                    # leave the key out of ``excluded_keys``.
+                    if self.mtp_resident:
+                        entry = self._header(self.mapping[key])[key]
+                    else:
+                        entry = self._entry(key)
                     self.draft_bytes += (
                         entry["data_offsets"][1] - entry["data_offsets"][0]
                     )
@@ -538,7 +546,7 @@ class OffloadedExpert(nn.Module):
         return outputs
 
 
-def _plan(path, fraction):
+def _plan(path, fraction, mtp_resident=False):
     from .config import ModelConfig
 
     path = Path(path)
@@ -546,18 +554,29 @@ def _plan(path, fraction):
     mapping = json.loads((path / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
-    return ExpertOffloadPlan(path, raw, mapping, ModelConfig.from_dict(raw), fraction)
+    return ExpertOffloadPlan(
+        path,
+        raw,
+        mapping,
+        ModelConfig.from_dict(raw),
+        fraction,
+        mtp_resident=mtp_resident,
+    )
 
 
-def estimate_expert_savings(path, fraction):
-    return _estimate_expert_savings(str(path), fraction, checkpoint_signature(path))
+def estimate_expert_savings(path, fraction, *, mtp_resident=False):
+    return _estimate_expert_savings(
+        str(path), fraction, checkpoint_signature(path), bool(mtp_resident)
+    )
 
 
 @lru_cache(maxsize=32)
-def _estimate_expert_savings(path, fraction, signature):
-    plan = _plan(path, fraction)
+def _estimate_expert_savings(path, fraction, signature, mtp_resident):
+    plan = _plan(path, fraction, mtp_resident)
     # Keep the existing residency estimator's 5% nonexpert safety allowance.
-    return plan.full_bytes - plan.resident_bytes + plan.draft_bytes
+    # The draft head only counts as savings when offload strips it.
+    draft = 0 if plan.mtp_resident else plan.draft_bytes
+    return plan.full_bytes - plan.resident_bytes + draft
 
 
 def _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes):
@@ -568,7 +587,8 @@ def _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes):
     has no residency estimate and discounts the savings from the discovery
     size (shard file sizes with a 5% allowance) instead.
     """
-    saved = plan.full_bytes - plan.resident_bytes_at(capacity) + plan.draft_bytes
+    draft = 0 if plan.mtp_resident else plan.draft_bytes
+    saved = plan.full_bytes - plan.resident_bytes_at(capacity) + draft
     if estimate.supported:
         base = estimate.mmap_bytes if engram_ssd_offload else estimate.resident_bytes
         return max(0, base - int(saved * 1.05))
@@ -581,23 +601,29 @@ def _file_bytes(path):
     return lambda: estimate_model_size(Path(path))
 
 
-def admission_bytes(path, fraction, *, engram_ssd_offload=True):
+def admission_bytes(path, fraction, *, engram_ssd_offload=True, mtp_resident=False):
     """The engine pool's admission estimate for expert offload at ``fraction``."""
     return _admission_bytes(
-        str(path), float(fraction), bool(engram_ssd_offload), checkpoint_signature(path)
+        str(path),
+        float(fraction),
+        bool(engram_ssd_offload),
+        checkpoint_signature(path),
+        bool(mtp_resident),
     )
 
 
 @lru_cache(maxsize=32)
-def _admission_bytes(path, fraction, engram_ssd_offload, signature):
-    plan = _plan(path, fraction)
+def _admission_bytes(path, fraction, engram_ssd_offload, signature, mtp_resident):
+    plan = _plan(path, fraction, mtp_resident)
     estimate = deepseek_v41_residency_estimate(path)
     return _admission(
         plan, plan.capacity, estimate, engram_ssd_offload, _file_bytes(path)
     )
 
 
-def fit_resident_fraction(path, budget_bytes, *, engram_ssd_offload=True):
+def fit_resident_fraction(
+    path, budget_bytes, *, engram_ssd_offload=True, mtp_resident=False
+):
     """Largest resident fraction whose admission estimate fits ``budget_bytes``.
 
     Returns ``None`` when even the routing floor does not fit. The result is
@@ -609,12 +635,15 @@ def fit_resident_fraction(path, budget_bytes, *, engram_ssd_offload=True):
         int(budget_bytes),
         bool(engram_ssd_offload),
         checkpoint_signature(path),
+        bool(mtp_resident),
     )
 
 
 @lru_cache(maxsize=32)
-def _fit_resident_fraction(path, budget_bytes, engram_ssd_offload, signature):
-    plan = _plan(path, 1.0)
+def _fit_resident_fraction(
+    path, budget_bytes, engram_ssd_offload, signature, mtp_resident
+):
+    plan = _plan(path, 1.0, mtp_resident)
     estimate = deepseek_v41_residency_estimate(path)
     file_bytes = _file_bytes(path)
     for capacity in range(plan.count, plan.floor - 1, -1):

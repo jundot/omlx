@@ -88,10 +88,14 @@ def load(
             raise ValueError("Converted checkpoint MTP layout cannot be overridden")
         config.preserve_mtp = bool(preserve_mtp)
     if moe_expert_offload_resident_fraction is not None:
-        if preserve_mtp is True:
-            raise ValueError("MoE expert offload cannot enable DSpark MTP")
-        # Retained draft weights need not consume RAM when speculation is forbidden.
-        config.preserve_mtp = False
+        from ..mlx_lm_mtp import is_mtp_active
+
+        # Offload strips the draft head unless DSpark is armed: the draft is
+        # small, fully resident, and its experts are verified by the streamed
+        # backbone. When speculation is off, retained draft weights need not
+        # consume RAM, so drop them exactly as before.
+        if not is_mtp_active():
+            config.preserve_mtp = False
     if ced_prefill:
         if config.ced_layout_supported():
             config.ced_prefill = True
@@ -157,7 +161,12 @@ def load(
             from .moe_offload import ExpertOffloadPlan, OffloadedExpert
 
             offload = ExpertOffloadPlan(
-                path, raw, mapping, config, moe_expert_offload_resident_fraction
+                path,
+                raw,
+                mapping,
+                config,
+                moe_expert_offload_resident_fraction,
+                mtp_resident=config.preserve_mtp,
             )
             model._moe_offload_plan = offload
             for layer_id, layer in enumerate(model.language_model.layers):
@@ -165,14 +174,15 @@ def load(
                 layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
             logger.info(
                 "DeepSeek V4.1 MoE offload: %d/%d experts resident per layer "
-                "(%.2f GiB -> %.2f GiB expert weights)",
+                "(%.2f GiB -> %.2f GiB expert weights)%s",
                 offload.capacity,
                 offload.count,
                 offload.full_bytes / 1024**3,
                 offload.resident_bytes / 1024**3,
+                ", DSpark draft head resident" if config.preserve_mtp else "",
             )
         offload_keys = set(offload.excluded_keys) if offload is not None else set()
-        if offload is not None and not source_checkpoint:
+        if offload is not None and not source_checkpoint and not config.preserve_mtp:
             offload_keys.update(
                 k for k in mapping if k.startswith("language_model.mtp.")
             )

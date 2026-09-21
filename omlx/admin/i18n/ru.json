@@ -1166,6 +1166,7 @@
   "modal.model_settings.moe_expert_offload": "MoE Expert Offload",
   "modal.model_settings.moe_expert_offload_hint": "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",
   "modal.model_settings.moe_expert_offload_speculative_hint": "Cannot be combined with Lightning MTP, VLM MTP, or DFlash.",
+  "modal.model_settings.moe_expert_offload_speculative_hint_v41": "Можно сочетать с Lightning MTP: черновая голова остаётся в памяти, а эксперты основной модели загружаются с SSD. Нельзя сочетать с VLM MTP или DFlash.",
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "Enter a number from 5 to 95.",

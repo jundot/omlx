@@ -1899,6 +1899,10 @@
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
+                    // Families whose loader keeps the speculative draft head
+                    // resident while backbone experts stream (V4.1); the two
+                    // toggles may both be on there.
+                    moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
