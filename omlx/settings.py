@@ -332,6 +332,14 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
+    # Ceiling on the share of process wall time background canonical-state
+    # recovery may receive, **aggregated across every engine** sharing the
+    # accelerator. Server-level rather than per-model on purpose: the engine
+    # pool rewrites the per-model recovery knobs on its shared scheduler
+    # config before every load, so a cap read from one of them would be
+    # whichever model happened to load last. Models keep their own
+    # enable/disable; they do not keep their own ceiling.
+    shadow_prefill_global_budget_pct: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -358,6 +366,10 @@ class SchedulerSettings:
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
+            shadow_prefill_global_budget_pct=max(
+                0.0,
+                min(100.0, float(data.get("shadow_prefill_global_budget_pct", 0.0) or 0.0)),
+            ),
         )
 
 
@@ -1875,6 +1887,9 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            shadow_prefill_global_budget_pct=(
+                self.scheduler.shadow_prefill_global_budget_pct
+            ),
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

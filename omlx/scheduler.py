@@ -20,6 +20,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
@@ -72,6 +73,17 @@ from .prefill_boundaries import (
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .shadow_prefill import (
+    DEFAULT_BUDGET_WINDOW_S,
+    MAX_BLOCKED_IDLE_STEPS,
+    MAX_CONSECUTIVE_YIELDS,
+    ShadowBudget,
+    ShadowCounters,
+    ShadowJob,
+    safe_publish_boundary,
+    shadow_is_runnable,
+    shadow_slice_cap,
+)
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
     MTPProcessorContractError,
@@ -519,6 +531,9 @@ class _PrefillState:
     # Tail snapshot plan, see _prefill_tail_plan.
     tail_at: int | None = None
     end_tail: bool = False
+    # Set only for a shadow prefill: the target this state was built for, so a
+    # chunk completing after the job grew can tell that its `done` is stale.
+    shadow_target_tokens: int | None = None
 
 
 @dataclass
@@ -1659,6 +1674,38 @@ class SchedulerConfig:
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
     gdn_sidecar_state_dtype: str = "fp32"
 
+    # Shadow prefill: a scheduler-owned dense re-read of a range a sparse
+    # prefill already served, run only while the scheduler is idle, publishing
+    # ordinary canonical cache state at block boundaries.
+    # Off by default: it spends foreground-capable compute and changes what the
+    # prefix cache contains, so it is opt-in per deployment.
+    shadow_prefill_enabled: bool = False
+    # The window the ceiling is granted in. The allowance replenishes every
+    # window, so a chunk that overran it is late by at most one window rather
+    # than locked out for the rest of the session.
+    shadow_prefill_budget_window_s: float = DEFAULT_BUDGET_WINDOW_S
+
+    # The process-global recovery budget, created by EnginePool before any
+    # engine loads and reaching every Scheduler through the same shallow-copy
+    # path `hot_cache_budget` uses: a scalar on this config is snapshotted per
+    # engine, an object is shared. That difference is the whole of the fix —
+    # a per-scheduler budget let M loaded engines grant M times the configured
+    # share of one accelerator.
+    shadow_budget: Any | None = None
+
+    # The ceiling, as a percentage of wall time, aggregated across every
+    # engine sharing the accelerator. There is exactly one, and it is
+    # server-level: models choose whether to recover, not how much of the
+    # machine recovery may have. A per-model ceiling would also be read off
+    # this same config, which the pool rewrites before every load, so it
+    # would be whichever model happened to load last.
+    shadow_prefill_global_budget_pct: float = 0.0
+
+    # Tokens per recovery *execution* slice, which is deliberately not the
+    # publication grain. 0 leaves recovery on the ordinary prefill step size,
+    # which is what made the worst foreground wait a whole cache block.
+    shadow_prefill_slice_tokens: int = 0
+
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
     model_path: str = ""  # Filesystem path to the model (e.g., "/cache/models--Org--Name/snapshots/abc123")
@@ -2082,6 +2129,64 @@ class Scheduler:
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
 
+        # ---- Shadow prefill --------------------------------------------------
+        # One job per engine, single-flight: an append-only session extends the
+        # live job rather than starting a second one that would recompute the
+        # same prefix and race it to publication.
+        self._shadow_job: ShadowJob | None = None
+        # Snapshotted at construction, not polled. SchedulerConfig is a single
+        # object shared by every engine in the pool, so a scheduler that read
+        # these on every step would have the feature switched on and off under
+        # it whenever another model was loaded. This matches how model_name is
+        # consumed: at load time.
+        self._shadow_enabled_flag = bool(
+            getattr(self.config, "shadow_prefill_enabled", False)
+        )
+        # The budget is adopted when the pool supplied one and created
+        # privately when it did not. A bare Scheduler — tests, embedded use —
+        # has no pool and therefore no peers to share an accelerator with, so
+        # a private budget is the correct reading of the same invariant rather
+        # than a degraded one. It reads the same server-level percentage:
+        # there is one ceiling, and who owns the object does not change it.
+        self._shadow_owner_key: str = f"shadow:{_model_label}:{id(self):x}"
+        shared_budget = getattr(self.config, "shadow_budget", None)
+        if isinstance(shared_budget, ShadowBudget):
+            self._shadow_budget = shared_budget
+        else:
+            self._shadow_budget = ShadowBudget(
+                pct=float(
+                    getattr(self.config, "shadow_prefill_global_budget_pct", 0.0) or 0.0
+                ),
+                window_s=float(
+                    getattr(
+                        self.config,
+                        "shadow_prefill_budget_window_s",
+                        DEFAULT_BUDGET_WINDOW_S,
+                    )
+                    or DEFAULT_BUDGET_WINDOW_S
+                ),
+            )
+        self._shadow_budget.register(self._shadow_owner_key)
+        self._shadow_counters = ShadowCounters()
+        # Steps in a row with nothing to do. A shadow chunk holds the
+        # interpreter lock for its whole duration, so starting one on the first
+        # idle step leaves no window in which an arriving request can announce
+        # itself.
+        self._consecutive_idle_steps = 0
+        # Idle steps in a row on which the job was allowed to run and did not.
+        # See _shadow_note_blocked_step: this is the deadline that keeps a
+        # latent runtime state from pinning the engine loop forever.
+        self._shadow_blocked_idle_steps = 0
+        # Requests that exist but whose admission has not run yet. Admission
+        # happens on the same single-worker executor as step(), so between the
+        # HTTP layer accepting a request and add_request() running, the
+        # scheduler's own lists say "idle" while a request is already waiting.
+        # Held with a deadline rather than as a bare counter: an entry that is
+        # never admitted must expire, or the shadow stays blocked forever
+        # (the liveness defect the earlier prototype had).
+        self._shadow_inbound: dict[str, float] = {}
+        self._shadow_inbound_ttl_s = 30.0
+
         # DEBUG-only prefix-cache divergence probe (issue #1003): recent
         # stored cache sequences, so a miss can be traced to the exact
         # token where the new prompt diverges from what was cached.
@@ -2490,7 +2595,8 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
-    ) -> None:
+        retain_request_entry: bool = False,
+    ) -> Any:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
@@ -2565,12 +2671,24 @@ class Scheduler:
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table and self.paged_cache_manager is not None:
-                self.paged_cache_manager.release_for_eviction(block_table.block_ids)
-            if self.block_aware_cache is not None:
-                self.block_aware_cache.clear_request_entry(request_id)
+            # A caller that is still writing to this request id keeps its block
+            # table and its refs; it releases them when it finishes or is
+            # dropped. Every ordinary completion takes the branch below.
+            if not retain_request_entry:
+                if block_table and self.paged_cache_manager is not None:
+                    self.paged_cache_manager.release_for_eviction(
+                        block_table.block_ids
+                    )
+                if self.block_aware_cache is not None:
+                    self.block_aware_cache.clear_request_entry(request_id)
+            # Returned so a caller that needs to know whether anything was
+            # actually persisted can ask. The completion path ignores it; the
+            # shadow does not, because a store that stopped at zero tokens and
+            # a store that wrote the whole prefix look identical otherwise.
+            return block_table
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+        return None
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -5569,6 +5687,7 @@ class Scheduler:
             state.tokens_processed, remaining
         )
         n = min(prefill_step_size, remaining)
+        n = shadow_slice_cap(self.config, state.request, n)
 
         if state.tokens_processed == 0:
             Scheduler._clear_cache(self)
@@ -8856,6 +8975,12 @@ class Scheduler:
         if request.request_id in self._prefix_cache_prepared:
             return
 
+        # Record which prefix-cache instance is serving this request. One
+        # served model can present more than one, and recovery has to know
+        # which one a restore would actually consult: state published into
+        # the other is valid, durable and unreachable.
+        if self.block_aware_cache is not None:
+            request._serving_prefix_cache_id = id(self.block_aware_cache)
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
         minimum_prefix = (
             prefix_hook(request.prompt_token_ids) if callable(prefix_hook) else 0
@@ -9116,6 +9241,10 @@ class Scheduler:
                 current_depth=len(self.waiting),
                 max_depth=max_waiting,
             )
+
+        # Admission has reached the executor: the request is now visible in
+        # self.waiting, so the inbound marker has done its job.
+        self.note_admitted_request(request.request_id)
 
         # Tokenize if needed
         if request.prompt_token_ids is None:
@@ -10202,7 +10331,61 @@ class Scheduler:
             or self._deferred_clear_at is not None
             or self._pending_reclaim_request
             or self._pending_pressure_clear
+            or self._has_shadow_work()
         )
+
+    def _has_shadow_work(self) -> bool:
+        """Whether an unfinished shadow job needs the engine loop to keep stepping.
+
+        Without this the shadow can never run. The loop only calls step() while
+        has_requests() is true, so an engine that has just gone idle — which is
+        the only moment the shadow is allowed to run at all — stops stepping
+        before the shadow's idle-step requirement can ever be met. Deferred
+        Metal clears and enforcer reclaims are in this predicate for the same
+        reason.
+
+        This is deliberately narrow: it reports work only while a job is live
+        and has not reached its target. A finished, cancelled or dropped job
+        must not hold the loop awake, or an idle server spins forever.
+
+        A spent window is not work either. An earlier version left the
+        allowance out of this predicate on the belief that reporting no work
+        would park the loop until an unrelated request woke it, which on an
+        idle server is never. That is not what the loop does: it re-reads this
+        predicate once per ``step_interval`` whether or not it stepped last
+        time, so a job waiting for its window to replenish is picked up within
+        50 ms of the roll either way.
+
+        The difference is what happens in between. Holding the predicate true
+        makes the loop run a full scheduler step 20 times a second for a job
+        it may not serve, and those steps are not free: each one advances
+        ``_step_counter``, which gates ``gc.collect()`` and the periodic
+        process-global ``mx.clear_cache()``. A capped recovery job waiting on
+        an otherwise idle server therefore drove a process-wide buffer-pool
+        clear roughly every 26 seconds, and that pool is shared with every
+        other model the process serves.
+
+        A budget of zero percent is different in kind: it grants no service in
+        any window, so its job is not waiting, it is never going to run. That
+        one is excluded, or an idle server polls forever on a job it may not
+        serve.
+        """
+        if not self._shadow_enabled():
+            return False
+        if self._shadow_budget.pct <= 0:
+            return False
+        job = self._shadow_job
+        if job is None or job.cancelled or job.done:
+            return False
+        if not self._shadow_budget.allows():
+            return False
+        # Another engine working is the same kind of wait as a spent window,
+        # and gets the same treatment. Holding the predicate true through it
+        # meant a job blocked behind a peer's recovery stepped this engine
+        # twenty times a second for as long as the peer held its allowance —
+        # which, with a job that waits minutes between slices, is most of the
+        # time. The loop re-reads this within 50 ms either way.
+        return not (self._shadow_foreign_engine_busy() or self._shadow_claim_blocked())
 
     def has_pending_route_preflight_cleanup(self) -> bool:
         """Return whether finished-request memory is still being reclaimed.
@@ -10286,6 +10469,12 @@ class Scheduler:
         Returns:
             List of failed request IDs.
         """
+        # Background recovery is not a request and nothing here will end it,
+        # but it does keep has_requests() true. An engine that cannot become
+        # quiescent after an unrecoverable error never unloads and never
+        # stops stepping, so the job goes first and explicitly.
+        with suppress(Exception):
+            self.cancel_shadow_work("fail_all_requests")
         failed_ids: list[str] = []
         for request_id in list(self.running):
             failed_ids.append(request_id)
@@ -10330,6 +10519,12 @@ class Scheduler:
         # returns the last queued output).
         for request_id in list(self.requests):
             if request_id in self._inflight_store_futures:
+                continue
+            request = self.requests.get(request_id)
+            if request is not None and request.is_shadow:
+                # Scheduler-owned background work, cancelled above. It has no
+                # collector to receive a failure, and reporting it as a failed
+                # request would name an id no client ever sent.
                 continue
             failed_ids.append(request_id)
             req = self.requests.pop(request_id, None)
@@ -12000,6 +12195,14 @@ class Scheduler:
             _mtp_priming.release_request(self.model, request_id)
             request = self.running.get(request_id)
 
+            # A request that took the sparse route stores nothing, so the
+            # reusable dense prefix ends where it ended before this turn. Offer
+            # its prompt to the shadow, which is the only thing that will
+            # advance it.
+            if request is not None:
+                with suppress(Exception):
+                    self.note_shadow_candidate(request)
+
             # Store cache for future reuse (G2-async): submit to background
             # executor so the post-finish 28GB+ memcpy doesn't block response
             # streaming. The inference thread does mx.synchronize +
@@ -12591,6 +12794,13 @@ class Scheduler:
                 return
             if request.is_finished():
                 return
+            if request.is_shadow:
+                # Scheduler-owned background work is reached here because it
+                # sits in self.requests and in no queue, which is the shape
+                # this sweep exists to find. Re-prefilling it would schedule
+                # it as foreground work with nothing to emit to; its owner
+                # drops it instead, and losing its progress costs only reuse.
+                return
             seen.add(request_id)
             collected.append(request)
 
@@ -12686,6 +12896,13 @@ class Scheduler:
             if request_id in seen or request_id in self._inflight_store_futures:
                 return
             if request.is_finished():
+                return
+            if request.is_shadow:
+                # Scheduler-owned background work is reached here because it
+                # sits in self.requests and in no queue, which is the shape
+                # this sweep exists to find. Re-prefilling it would schedule
+                # it as foreground work with nothing to emit to; its owner
+                # drops it instead, and losing its progress costs only reuse.
                 return
             seen.add(request_id)
             retry_candidates.append(request)
@@ -12848,6 +13065,884 @@ class Scheduler:
             request.request_id,
             eviction.reason,
         )
+
+    # ---------------------------------------------------------------- shadow
+    # Shadow prefill.
+    #
+    # A sparse prefill serves its request and leaves the reusable dense prefix
+    # exactly where it was: _cleanup_finished refuses to extract a cache whose
+    # specprefill_indices is set, so no checkpoint is written, and every later
+    # turn recomputes the suffix the sparse turn did not canonicalize. The
+    # shadow is a dense re-read of that range, run as scheduler-owned work
+    # while nothing else is running, publishing through the ordinary store
+    # path so it inherits that path's locking and lifecycle rather than
+    # copying them.
+
+    def note_inbound_request(self, request_id: str) -> None:
+        """Record that a request exists before its admission runs.
+
+        Admission runs on the same single-worker executor as step(), so a
+        request accepted by the transport is invisible to the scheduler until
+        that hand-off completes. Without this the shadow reads its own lists,
+        believes the engine idle, and starts a chunk in front of a request that
+        had already arrived.
+        """
+        self._shadow_inbound[request_id] = time.monotonic()
+    def note_admitted_request(self, request_id: str) -> None:
+        self._shadow_inbound.pop(request_id, None)
+
+    def _shadow_inbound_count(self) -> int:
+        """Inbound requests that have not been admitted and have not expired.
+
+        The expiry is the difference between this and a bare counter. A request
+        that is counted inbound and then never admitted — cancelled in flight,
+        rejected before add_request, or lost to an exception — would otherwise
+        block the shadow for the life of the process.
+        """
+        if not self._shadow_inbound:
+            return 0
+        deadline = time.monotonic() - self._shadow_inbound_ttl_s
+        stale = [rid for rid, at in self._shadow_inbound.items() if at < deadline]
+        for rid in stale:
+            self._shadow_inbound.pop(rid, None)
+            logger.debug("Shadow: expiring stale inbound marker for %s", rid)
+        return len(self._shadow_inbound)
+
+    def _shadow_enabled(self) -> bool:
+        return bool(
+            self._shadow_enabled_flag
+            and self.block_aware_cache is not None
+            and self.config.paged_cache_block_size > 0
+        )
+
+    def note_shadow_candidate(self, request: Any) -> None:
+        """Offer a finished request's prompt to the shadow.
+
+        Only a request that actually took the sparse route leaves debt behind,
+        so only that request creates work here. Growth is single-flight: an
+        append extends the live job, and anything that is not an append
+        replaces it, because publishing canonical state for a prefix the
+        session no longer has is the failure the placeholder rejection exists
+        to prevent.
+        """
+        if not self._shadow_enabled():
+            return
+        if self._shadow_budget.pct <= 0:
+            # The feature is on and the budget grants nothing in any window,
+            # so the job would never run. Declining here rather than queueing
+            # it keeps the prompt's whole token list from being retained for
+            # the life of the session for no possible benefit.
+            return
+        if getattr(request, "specprefill_indices", None) is None:
+            return
+        if self._model_has_unreconstructible_cache():
+            return
+
+        # Bind to the instance that served this request, and refuse the job
+        # outright when this scheduler is not that one. Publishing into a
+        # prefix cache the request never touched produces canonical state that
+        # is valid, durable and unreachable.
+        serving_cache_id = getattr(request, "_serving_prefix_cache_id", None)
+        if serving_cache_id is None or serving_cache_id != id(self.block_aware_cache):
+            logger.debug(
+                "Shadow: declining %s, this scheduler's prefix cache did not "
+                "serve it (served=%s, here=%s)",
+                getattr(request, "request_id", "?"),
+                serving_cache_id,
+                id(self.block_aware_cache),
+            )
+            return
+
+        tokens = list(getattr(request, "prompt_token_ids", None) or [])
+        block = self.config.paged_cache_block_size
+        # Only whole blocks are publishable, so the job targets the last whole
+        # block — plus one token. The prefill path holds the final token back
+        # for the generation kickoff, so a job targeting exactly the boundary
+        # stops one token short of it and publishes the block *before* it
+        # instead. On a session whose whole prompt is two blocks that is the
+        # difference between recovering half of it and recovering all of it:
+        # the job reached its target on every idle window, committed 4,096 of
+        # 8,192 every time, and re-read the same tokens for the rest of the
+        # session. The extra token is not published; it is there so the
+        # boundary below it can be.
+        boundary = (len(tokens) // block) * block
+        if boundary <= 0:
+            return
+        target = min(len(tokens), boundary + 1)
+        tokens = tokens[:target]
+
+        job = self._shadow_job
+        if (
+            job is not None
+            and not job.cancelled
+            and len(tokens) == job.target_tokens
+            and tokens == job.tokens[: len(tokens)]
+        ):
+            # The turn grew the session but not past the next block boundary,
+            # so there is nothing new that could be published and the live
+            # job already covers everything that can be. `extend` refuses a
+            # target that did not move, and the old code read that refusal as
+            # "not an append" and destroyed the job — losing its committed
+            # prefix, its reported canonical prefix, and the append path every
+            # later turn would have taken.
+            logger.debug(
+                "Shadow: turn adds no new publishable block, keeping the job "
+                "at %d tokens (committed %d)",
+                job.target_tokens,
+                job.committed_tokens,
+            )
+            return
+        if job is not None and not job.cancelled and job.extend(tokens):
+            logger.debug(
+                "Shadow: extended job to %d tokens (committed %d)",
+                job.target_tokens,
+                job.committed_tokens,
+            )
+            return
+
+        if job is not None:
+            self._shadow_drop_job("replaced")
+        self._shadow_job = ShadowJob(
+            session_key=str(getattr(request, "request_id", "shadow")),
+            tokens=tokens,
+            target_tokens=target,
+            block_size=block,
+            serving_cache_id=serving_cache_id,
+            serving_cache_ref=weakref.ref(self.block_aware_cache),
+        )
+        logger.info(
+            "Shadow: queued dense re-read of %d tokens (budget %.1f%%)",
+            target,
+            self._shadow_budget.pct,
+        )
+
+    def cancel_shadow_work(self, reason: str = "cancelled") -> bool:
+        """Drop any live shadow job and stop reporting shadow work.
+
+        Shadow work counts towards ``has_requests()`` so the engine loop keeps
+        stepping while a job is live. The unload path drains on the same
+        predicate, so without a way to cancel, an engine with a live shadow job
+        never becomes quiescent: the unload is queued "until active scheduler
+        work drains", it never drains, and every later request to that model is
+        refused with 409 while the pending marker is installed. Background work
+        must never be the reason a model cannot be unloaded.
+        """
+        if self._shadow_job is None:
+            return False
+        self._shadow_drop_job(reason)
+        return True
+
+    def _shadow_drop_job(self, reason: str) -> None:
+        """Release a job's cache footprint. Published blocks are not unpublished.
+
+        The dropped job's own request entry and paged blocks must go back, or a
+        cancelled job leaves block refs the cache can never reclaim. What it
+        already published stays published: it is ordinary canonical state and
+        the next request is entitled to restore from it.
+        """
+        job = self._shadow_job
+        if job is None:
+            return
+        job.cancelled = True
+        state = job.prefill_state
+        rid = self._shadow_request_id(job)
+        if state is not None:
+            job.prefill_state = None
+        self._drop_boundary_snapshots_for_request(rid)
+        self._release_paged_cache_for_request(rid)
+        # That released against the *current* prefix cache. On the one drop
+        # path where the instance changed under the job — which is the path
+        # that exists because it can — the current one never issued this
+        # request id and the bound one still holds its block references. Ask
+        # the bound one too, while it is alive; a weak reference, because a
+        # replaced cache is usually being torn down and recovery must not be
+        # the reason it stays.
+        bound_ref = getattr(job, "serving_cache_ref", None)
+        bound = bound_ref() if callable(bound_ref) else None
+        if bound is not None and bound is not self.block_aware_cache:
+            with suppress(Exception):
+                bound.release_cache(rid)
+        self.requests.pop(rid, None)
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        self._shadow_job = None
+        logger.info(
+            "Shadow: dropped job (%s) after %d/%d tokens, %d committed",
+            reason,
+            job.processed_tokens,
+            job.target_tokens,
+            job.committed_tokens,
+        )
+
+    @staticmethod
+    def _shadow_request_id(job: ShadowJob) -> str:
+        return f"shadow:{job.session_key}"
+
+    def _specprefill_rope_installed(self) -> bool:
+        """Whether a SpecPrefill RoPE wrapper is installed on the shared model.
+
+        `_specprefill_active_request_id` is bookkeeping and is not a reliable
+        answer to this question: `sparse_prefill` installs the wrapper in a
+        `finally` that runs before the id is ever set, and `_unwrap_rope`
+        documents a wrapper surviving between requests as an expected state
+        (#766). A dense forward taken while the wrapper is installed
+        reads another request's position offset, and the shadow would then
+        publish positionally wrong KV as ordinary canonical state — the one
+        failure this design exists to make impossible. So ask the model.
+        """
+        if self._specprefill_active_request_id is not None:
+            return True
+        try:
+            from .patches.specprefill import (
+                _find_attention_layers,
+                _get_attn_module,
+            )
+
+            layers = _find_attention_layers(self.model) or ()
+        except Exception:  # noqa: BLE001
+            # If the model cannot be inspected, the safe answer is "installed".
+            return True
+        for _idx, layer in layers:
+            attn = _get_attn_module(layer)
+            rope = getattr(attn, "rope", None) if attn is not None else None
+            if rope is not None and type(rope).__name__ in (
+                "_OffsetAdjustedRoPE",
+                "_PositionMappedRoPE",
+            ):
+                return True
+        return False
+
+    def _shadow_foreign_engine_busy(self) -> bool:
+        """Foreground work on another engine in this process.
+
+        `EnginePool` gives every model its own `Scheduler` and its own loop,
+        and they share one GPU. This scheduler's lists therefore answer "am I
+        idle", not "is the machine idle", and a recovery chunk started on the
+        strength of the first one lands on a GPU the second one is using. The
+        foreground prefill path already reads the process-global decode
+        registry for exactly this reason; recovery reads it too, and the
+        prefill tracker with it, because a recovery chunk is a prefill and a
+        foreign prefill is what it would collide with.
+
+        Every recovery entry is excluded from the prefill half, not just this
+        scheduler's own. A job holds its tracker entry from its first chunk
+        until it parks, finishes or is dropped — across every gap in between,
+        including the minutes it spends waiting for an allowance — so reading
+        a foreign recovery job as foreground made one engine stand down for
+        another's *waiting*, indefinitely and invisibly. Recovery excluding
+        recovery is not a loss of mutual exclusion: that is the budget's
+        claim, taken before a slice starts rather than inferred afterwards
+        from a side effect of chunking.
+        """
+        if self._others_decoding():
+            return True
+        with suppress(Exception):
+            if get_prefill_tracker().any_active(exclude_prefix="shadow:"):
+                return True
+        return False
+
+    def _shadow_claim_blocked(self) -> bool:
+        """Whether another engine currently holds the recovery claim."""
+        with suppress(Exception):
+            return self._shadow_budget.claim_held_by_other(self._shadow_owner_key)
+        return False
+
+    def _shadow_runnable(self) -> bool:
+        return shadow_is_runnable(
+            enabled=self._shadow_enabled(),
+            budget=self._shadow_budget,
+            # A job that has reached its target is not work. Without the
+            # `done` clause it is: the state is retired on completion, so the
+            # next idle step rebuilds it and re-reads the whole target from
+            # the last committed boundary, publishes nothing new, finishes,
+            # and does it again on the next window — all of it charged to the
+            # budget. One 8K session spent every idle window of its run
+            # re-reading the same 4,096 tokens.
+            has_job=(
+                self._shadow_job is not None
+                and not self._shadow_job.cancelled
+                and not self._shadow_job.done
+            ),
+            waiting_requests=len(self.waiting),
+            running_requests=len(self.running),
+            prefilling_requests=len(self.prefilling),
+            specprefill_active=self._specprefill_rope_installed(),
+            inbound_requests=self._shadow_inbound_count(),
+            consecutive_idle_steps=self._consecutive_idle_steps,
+            foreign_engine_busy=(
+                self._shadow_foreign_engine_busy() or self._shadow_claim_blocked()
+            ),
+        )
+
+    def _shadow_begin_state(self, job: ShadowJob) -> Any:
+        """Build the dense prefill state for *job*, reusing canonical state.
+
+        The shadow restores whatever canonical prefix already exists before it
+        starts, so it re-reads only the range no checkpoint covers. Without
+        this it would recompute the whole prompt every time the job restarts,
+        which is duplicated work charged against the same budget.
+        """
+        rid = self._shadow_request_id(job)
+        # A job restarts whenever it is extended or resumed. Without dropping
+        # these two markers the prefix-cache preparation returns early, the
+        # request keeps a null prompt_cache, and the shadow re-reads the whole
+        # prompt from token zero with base_size 0 — charged to the same budget
+        # it is supposed to be spending on new tokens.
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        request = Request(
+            request_id=rid,
+            prompt=None,
+            prompt_token_ids=list(job.tokens),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        # The shadow never samples and never emits a token; it exists only for
+        # what it leaves in the cache.
+        request.specprefill_indices = None
+        request._specprefill_enabled = False
+        request.is_shadow = True
+        self.requests[rid] = request
+        self._prepare_prefix_cache_for_request(request)
+
+        tokens_to_process = request.remaining_tokens or list(job.tokens)
+        cache_to_use = request.prompt_cache
+        if cache_to_use is None:
+            cache_to_use = make_prompt_cache(self.model)
+        if len(tokens_to_process) < 2:
+            return None
+        state = self._begin_prefill(request, tokens_to_process, cache_to_use)
+        # Remember which target this state was built for, so a chunk that
+        # finishes after the job was extended can tell that its `done` is stale.
+        state.shadow_target_tokens = job.target_tokens
+        job.processed_tokens = max(job.processed_tokens, request.cached_tokens or 0)
+        job.note_published(
+            safe_publish_boundary(
+                tokens_committed=request.cached_tokens or 0,
+                block_size=job.block_size,
+            )
+        )
+        return state
+
+    def _shadow_step(self) -> bool:
+        """Advance the shadow by one chunk, charging the whole step.
+
+        The timing wraps everything, not just the model forward. Restoring
+        the published prefix, extracting and storing the new boundary and
+        reading it back all run on the engine thread and all delay an
+        arriving request exactly as the forward does. Charging only the
+        forward made the reported share a lower bound on the recovery's real
+        wall cost, which for an experiment about fitting inside a budget is
+        the one number that has to be right.
+        """
+        owner = self._shadow_owner_key
+        # Before the state build, not after the first chunk. The interval
+        # between those two is the one where this engine has removed its old
+        # tracker entry and not yet written a new one, so a peer checking in
+        # it sees a process with no recovery running and starts a slice of its
+        # own. The claim is the only thing either engine can see during a
+        # slice, because a slice is otherwise opaque from outside.
+        if not self._shadow_budget.try_claim(owner):
+            return False
+        started = time.perf_counter()
+        try:
+            return self._shadow_step_inner()
+        finally:
+            elapsed = time.perf_counter() - started
+            self._shadow_budget.note_service(elapsed)
+            self._shadow_counters.service_s += elapsed
+            self._shadow_budget.release_claim(owner)
+
+    def _shadow_step_inner(self) -> bool:
+        """One chunk, the same grain the foreground chunked prefill uses,
+        because a chunk cannot be interrupted once it is handed to the model
+        and the budget can only be enforced between chunks."""
+        job = self._shadow_job
+        if job is None:
+            return False
+
+        if job.prefill_state is None:
+            try:
+                job.prefill_state = self._shadow_begin_state(job)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Shadow: could not start dense re-read: %s", e)
+                self._shadow_drop_job("start_failed")
+                return False
+            if job.prefill_state is None:
+                # Nothing to re-read: the published prefix already covers
+                # every whole block of the target. That is a job with nothing
+                # to do *yet*, not a job to destroy — destroying it forfeits
+                # the committed prefix it reports and the append path a later
+                # turn would have taken, so the next turn starts a new job and
+                # pays a full prefix reconstruct to learn what this one knew.
+                self._shadow_park_job(job, "nothing_to_do")
+                return False
+
+        state = job.prefill_state
+        try:
+            done = self._step_prefill_chunk(state)
+        except _PrefillEvictionNeeded:
+            # The adaptive throttle wants headroom before the next chunk. That
+            # is a pause, not a failure: the job keeps its state and its
+            # published prefix, and retries on a later idle step. Dropping here
+            # is what made the shadow lose a 12,288-token prefix to a transient
+            # memory reading. But nothing the shadow does satisfies the
+            # throttle, so the pause is bounded — otherwise the job stays live,
+            # the loop keeps stepping to serve it, and an idle engine spins.
+            Scheduler._clear_cache(self)
+            self._shadow_note_yield(job, "the prefill memory throttle")
+            return False
+        except _PrefillAbortedError:
+            Scheduler._clear_cache(self)
+            self._shadow_note_yield(job, "an aborted chunk")
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Shadow: chunk failed, dropping job: %s", e)
+            Scheduler._clear_cache(self)
+            self._shadow_drop_job("chunk_failed")
+            return False
+
+        self._shadow_counters.chunks += 1
+        job.consecutive_yields = 0
+        job.processed_tokens = state.base_size + state.tokens_processed
+
+        if job.target_tokens > getattr(state, "shadow_target_tokens", job.target_tokens):
+            # The job was extended while this chunk was in flight. The state was
+            # built from the old token list and will report `done` at the old
+            # target, so believing it here would finish the job and leave the
+            # appended range unread until some later turn happened to extend
+            # again. Retire the state and let the next idle window rebuild it
+            # over the longer target, reusing what has been published.
+            logger.debug(
+                "Shadow: job extended to %d during a chunk; rebuilding state",
+                job.target_tokens,
+            )
+            # Publish first. The chunk that just ran may be sitting exactly on
+            # a boundary, and that boundary is valid state for a prefix the
+            # extended job still has — `extend` verified the append. Retiring
+            # the state before publishing threw the block away and made the
+            # next window recompute it.
+            boundary = job.publishable_boundary()
+            if boundary:
+                self._shadow_publish(job, boundary, state)
+            self._shadow_retire_state(job)
+            return True
+
+        boundary = job.publishable_boundary()
+        if boundary:
+            self._shadow_publish(job, boundary, state)
+
+        if done:
+            job.note_reached_target()
+            self._shadow_finish(job)
+        return True
+
+    def _shadow_retire_state(self, job: ShadowJob) -> None:
+        """Give back everything the live prefill state was holding.
+
+        The job survives; only its work does not. The last publish retained
+        the request entry on purpose — `retain_request_entry=not job.done`,
+        and a job that is about to be rebuilt is not done — so the entry and
+        its block references are still held here and releasing them is this
+        method's job. Without it the next `_shadow_begin_state` re-registers
+        the same request id, the block table is overwritten, and the previous
+        references are orphaned: never decremented, never evictable, filling
+        the paged cache until the memory throttle starts refusing the recovery
+        chunks outright.
+        """
+        job.prefill_state = None
+        rid = self._shadow_request_id(job)
+        self._drop_boundary_snapshots_for_request(rid)
+        self.requests.pop(rid, None)
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        self._release_paged_cache_for_request(rid)
+
+    def _shadow_park_job(self, job: ShadowJob, reason: str) -> None:
+        """Retire a job's work without retiring the job.
+
+        The job stops being runnable — `done` is what both `_shadow_runnable`
+        and `_has_shadow_work` read — and keeps its committed prefix, its
+        session key and its identity, so a later turn extends it rather than
+        starting over. `extend` clears `reached_target`, which is what makes
+        the job runnable again.
+        """
+        logger.debug(
+            "Shadow: parking job (%s) at %d/%d tokens, %d committed",
+            reason,
+            job.processed_tokens,
+            job.target_tokens,
+            job.committed_tokens,
+        )
+        job.note_reached_target()
+        self._shadow_retire_state(job)
+
+    def _shadow_note_yield(self, job: ShadowJob, reason: str) -> None:
+        """Count a chunk that did not run, and give up after too many."""
+        self._shadow_counters.yielded_steps += 1
+        job.consecutive_yields += 1
+        if job.consecutive_yields >= MAX_CONSECUTIVE_YIELDS:
+            logger.info(
+                "Shadow: giving up after %d consecutive yields to %s "
+                "(%d tokens committed)",
+                job.consecutive_yields,
+                reason,
+                job.committed_tokens,
+            )
+            self._shadow_drop_job("yield_limit")
+        else:
+            logger.info("Shadow: yielding a chunk to %s", reason)
+
+    def _shadow_note_blocked_step(self) -> None:
+        """Bound how long a live job may hold the loop without being served.
+
+        The engine is idle, the window grants service, and the job still did
+        not run. Something outside the budget refused it, and the one such
+        condition this runtime can leave latent is a SpecPrefill RoPE wrapper
+        that was never cleaned up: ``_unwrap_rope`` documents the leftover
+        wrapper as an expected state (#766), ``_specprefill_rope_installed``
+        is right to refuse a dense forward under it, and nothing the recovery
+        job does will ever take it off.
+
+        The yield limit does not cover this. ``consecutive_yields`` is only
+        raised from inside a chunk and no chunk is ever reached here, so
+        without a deadline the job never runs, never finishes and never gives
+        up — on a loop that keeps stepping for it and on an engine that
+        cannot become quiescent while it is live. Recovery is allowed to lose
+        its work; it is not allowed to be the reason a model cannot unload.
+        """
+        if not self._shadow_budget.allows():
+            # The budget is the reason, which is ordinary waiting rather than
+            # a stall. `_has_shadow_work` parks the loop for that case.
+            self._shadow_blocked_idle_steps = 0
+            return
+        self._shadow_blocked_idle_steps += 1
+        if self._shadow_blocked_idle_steps < MAX_BLOCKED_IDLE_STEPS:
+            return
+        job = self._shadow_job
+        logger.warning(
+            "Shadow: dropping job after %d idle steps it was allowed to run "
+            "and could not (%d tokens committed)",
+            self._shadow_blocked_idle_steps,
+            job.committed_tokens if job is not None else 0,
+        )
+        self._shadow_blocked_idle_steps = 0
+        self._shadow_drop_job("blocked")
+
+    def _shadow_publish(self, job: ShadowJob, boundary: int, state: Any) -> None:
+        """Hand a boundary-aligned canonical prefix to the ordinary store path.
+
+        Three conditions are re-checked here rather than trusted from queue
+        time, because the model, the cache and the alignment can all change
+        between a job being queued and a block being published:
+
+        - the model's cache must still be reconstructible;
+        - the boundary must be exactly where the live state sits, so the
+          stored block is the state at its own end rather than a state that
+          has already ingested tokens past it;
+        - the prefix cache must still exist.
+
+        A hybrid model's non-sliceable layers cannot be stored from the live
+        cache alone: every block but the last would get a placeholder, and a
+        later restore would walk back to nothing or be rejected outright. The
+        per-block state lives in the boundary snapshots this job's own chunks
+        captured, so the payload is assembled from those. An earlier version of
+        this method passed no snapshots, and the store stopped at zero tokens
+        while the log line above it said the prefix had been published — which
+        is why nothing below trusts the call and everything checks the result.
+        """
+        if self.block_aware_cache is None:
+            return
+        if (
+            job.serving_cache_id is not None
+            and job.serving_cache_id != id(self.block_aware_cache)
+        ):
+            # The prefix-cache instance changed under the job. Anything
+            # published now would land somewhere the serving restore path does
+            # not look, so fail closed rather than write unreachable state and
+            # count it.
+            logger.warning(
+                "Shadow: refusing to publish, serving prefix cache changed "
+                "(bound=%s, now=%s)",
+                job.serving_cache_id,
+                id(self.block_aware_cache),
+            )
+            self._shadow_drop_job("serving_cache_changed")
+            return
+        if self._model_has_unreconstructible_cache():
+            logger.info("Shadow: refusing to publish, cache is unreconstructible")
+            self._shadow_drop_job("unreconstructible")
+            return
+        live_tokens = state.base_size + state.tokens_processed
+        if live_tokens != boundary:
+            logger.debug(
+                "Shadow: skipping publish, live state at %d is not the boundary %d",
+                live_tokens,
+                boundary,
+            )
+            return
+
+        rid = self._shadow_request_id(job)
+        tokens = list(job.tokens[:boundary])
+
+        override = self._get_boundary_store_override(rid, tokens)
+        logger.debug(
+            "Shadow: publishing %d tokens from %s",
+            boundary,
+            "a boundary snapshot" if override is not None else "the live cache",
+        )
+        if override is not None:
+            # Take only the boundary-aligned token range and the snapshot
+            # provider from the override. The payload it carries is the
+            # boundary snapshot, which holds the non-sliceable layers alone —
+            # 48 of this model's 64 — and storing that as `cache_data` stamps
+            # the block `num_layers: 48`. A later restore compares that with
+            # the model's 64 and rejects the whole chain as cross-model
+            # contamination, which is how a correctly published prefix became
+            # unreadable by the serving path. The live cache sits exactly on
+            # this boundary, asserted above, so it is the same state at full
+            # width — and it is what the completion path stores.
+            tokens, _snapshot_payload, _snapshot_config, snapshots = override
+            try:
+                with mx.stream(self._stream):
+                    extracted, model_cache_config = self._extract_cache_states(
+                        state.cache
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Shadow: could not extract state to publish: %s", e)
+                return
+            if not extracted:
+                return
+        elif self._detect_boundary_snapshot_need():
+            # Non-sliceable state with no snapshot to store it from. Publishing
+            # the live cache here would write placeholders for every block but
+            # the last, so there is nothing safe to publish yet.
+            logger.debug(
+                "Shadow: no boundary snapshot available at %d tokens, not publishing",
+                boundary,
+            )
+            return
+        else:
+            snapshots = None
+            try:
+                with mx.stream(self._stream):
+                    extracted, model_cache_config = self._extract_cache_states(
+                        state.cache
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Shadow: could not extract state to publish: %s", e)
+                return
+            if not extracted:
+                return
+
+        try:
+            with mx.stream(self._stream):
+                arrays = self._collect_arrays_from_extracted_cache(extracted)
+                if snapshots is not None:
+                    # The override returns either a {token_count: cache} mapping
+                    # or a lazy provider; the completion path iterates the
+                    # provider, so this does too rather than assuming a dict.
+                    iter_snapshots = getattr(
+                        snapshots, "iter_in_memory_extracted", None
+                    )
+                    members = (
+                        iter_snapshots()
+                        if callable(iter_snapshots)
+                        else (snapshots.values() if hasattr(snapshots, "values") else ())
+                    )
+                    for snapshot in members:
+                        arrays.extend(
+                            self._collect_arrays_from_extracted_cache(snapshot)
+                        )
+                if arrays:
+                    # FULL eval on the owner thread. The store worker slices and
+                    # views these buffers; a lazy op left for it re-dispatches to
+                    # this thread's stream index, which does not exist there.
+                    mx.eval(*arrays)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Shadow: could not materialize state to publish: %s", e)
+            return
+
+        try:
+            # Through the ordinary worker, which holds _mx_buffer_access_lock
+            # for its buffer access. `retain_request_entry` keeps the job's
+            # block table registered: the worker's normal tail releases the
+            # blocks for eviction and drops the request entry, which is right
+            # once at request completion and wrong at every boundary of a job
+            # that is still running. Dropping the entry makes the next publish
+            # re-serialize the whole prefix instead of appending to it, and
+            # releasing the blocks lets the prefix the job is still building on
+            # be evicted underneath it.
+            block_table = self._async_store_cache_worker(
+                rid,
+                tokens,
+                extracted,
+                model_cache_config,
+                snapshots,
+                None,
+                None,
+                None,
+                not self._bypass_hot_cache_under_pressure(),
+                retain_request_entry=not job.done,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Shadow: publish failed at %d tokens: %s", boundary, e)
+            return
+
+        stored = len(getattr(block_table, "block_ids", None) or []) * job.block_size
+        if stored <= job.committed_tokens:
+            # The store declined, or wrote no more than the last one did. Say so
+            # rather than recording a commit the cache cannot honour.
+            logger.warning(
+                "Shadow: store at %d tokens persisted %d tokens; not counted",
+                boundary,
+                stored,
+            )
+            return
+
+        published = min(boundary, stored)
+
+        # The invariant this whole path exists to hold:
+        #     canonical_committed_tokens <= independently_restorable_tokens
+        # A store that reports success is not evidence of canonical
+        # publication. The counter advances only after the ordinary matching
+        # path, on the serving cache, can actually see the boundary.
+        restorable = self._shadow_readback_tokens(job, tokens)
+        if restorable < published:
+            logger.warning(
+                "Shadow: %d tokens published but only %d are restorable by the "
+                "serving path; not counted",
+                published,
+                restorable,
+            )
+            return
+
+        job.note_published(published)
+        self._shadow_counters.publishes += 1
+        logger.info(
+            "Shadow: published canonical prefix at %d tokens (store %d, "
+            "independently restorable %d)",
+            published,
+            stored,
+            restorable,
+        )
+
+    def _shadow_readback_tokens(self, job: ShadowJob, tokens: list[int]) -> int:
+        """Tokens the ordinary matching path can resolve for *tokens*, right now.
+
+        Uses the serving cache's own `fetch_cache`, which is the same lookup a
+        real request takes, under a throwaway request id that is released
+        immediately. It answers "would a request see this?", which is the only
+        sense in which a boundary is published.
+        """
+        cache = self.block_aware_cache
+        if cache is None or not tokens:
+            return 0
+        probe_id = f"shadow-readback:{job.session_key}"
+        try:
+            block_table, remaining = cache.fetch_cache(probe_id, list(tokens))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Shadow: read-back probe failed: %s", e)
+            return 0
+        finally:
+            with suppress(Exception):
+                cache.release_cache(probe_id)
+            with suppress(Exception):
+                cache.clear_request_entry(probe_id)
+        matched = getattr(block_table, "num_tokens", 0) or 0
+        if remaining is not None:
+            matched = max(matched, len(tokens) - len(remaining))
+        return int(matched)
+
+    def _shadow_finish(self, job: ShadowJob) -> None:
+        logger.info(
+            "Shadow: target reached at %d tokens, %d committed",
+            job.processed_tokens,
+            job.committed_tokens,
+        )
+        job.prefill_state = None
+        rid = self._shadow_request_id(job)
+        self._drop_boundary_snapshots_for_request(rid)
+        self.requests.pop(rid, None)
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        # The last publish retained the request entry — `job.done` is still
+        # false at that point, because `note_reached_target` runs after the
+        # publish — so the entry and its block references are still held here
+        # and releasing them is this method's job. Without it every restart
+        # of the same request id overwrites the block table and orphans the
+        # references the previous one acquired: those blocks can never be
+        # decremented, are never evictable, and fill the paged cache until
+        # the memory throttle starts refusing the recovery chunks outright.
+        self._release_paged_cache_for_request(rid)
+        # The job itself stays so a later turn can extend it rather than
+        # restart it from nothing.
+
+    def _shadow_local_requests(self) -> bool:
+        """Foreground requests this engine is holding.
+
+        Deliberately not ``has_requests()``: that predicate reports the
+        shadow's own job as work, so using it here would let the shadow reset
+        its own idle counter on every step and never become runnable.
+
+        The two callers below each add one clause, and the difference between
+        them is the whole reason there are two.
+        """
+        return bool(
+            self.waiting
+            or self.prefilling
+            or self.running
+            or self._pending_async_removes
+            or self._pending_reclaim_request
+        )
+
+    def _shadow_foreground_busy(self) -> bool:
+        """Whether a dense forward would be unsafe or unwelcome right now.
+
+        Adds the RoPE wrapper, because a dense forward taken while SpecPrefill
+        has one installed reads another request's position offset.
+        """
+        return self._shadow_local_requests() or self._specprefill_rope_installed()
+
+    def _shadow_engine_has_foreground(self) -> bool:
+        """Whether something that ends is the reason recovery did not run.
+
+        Adds the waits, and deliberately *not* the RoPE wrapper: that one can
+        be left installed with no request behind it (#766), so reading it as a
+        busy engine is what let a job block on it indefinitely with nothing
+        noticing. This predicate exists to keep the stall deadline off waits
+        that resolve on their own — a request here, a peer's foreground work,
+        a peer's recovery slice.
+        """
+        return bool(
+            self._shadow_local_requests()
+            or self._shadow_inbound_count()
+            or self._shadow_foreign_engine_busy()
+            or self._shadow_claim_blocked()
+        )
+
+    def _shadow_note_step(self, did_foreground_work: bool) -> None:
+        """Count idle steps, and stand the recovery job down when work appears.
+
+        A chunk holds the interpreter for its whole duration, so starting one
+        on the first idle step leaves no window in which an arriving request
+        can announce itself. Two consecutive idle steps buy that window back
+        at a cost of one step interval per chunk.
+        """
+        job = self._shadow_job
+        live = job is not None and not job.done and not job.cancelled
+        busy = bool(
+            did_foreground_work
+            or self._shadow_foreground_busy()
+            or self._shadow_inbound_count()
+        )
+        if busy:
+            # A yield is about the job as it stands now: the engine got busy
+            # and a live job stood down for it.
+            if self._consecutive_idle_steps and live:
+                self._shadow_counters.yielded_steps += 1
+            self._consecutive_idle_steps = 0
+            return
+        self._consecutive_idle_steps += 1
 
     def step(self) -> SchedulerOutput:
         """
@@ -13147,7 +14242,61 @@ class Scheduler:
 
         self._publish_admin_snapshot()
 
+        # Progressive shadow prefill. Last in the step on purpose: every
+        # foreground decision above has already been made, so the idle
+        # judgement below is about this step's real outcome rather than a
+        # prediction of it.
+        #
+        # Guarded, because this runs *after* step()'s own try/except. Anything
+        # escaping here leaves step() altogether, and the engine loop answers
+        # an escaped exception by calling fail_all_requests() — every live
+        # request in the batch errored, by background work that is allowed to
+        # lose nothing but its own progress.
+        if self._shadow_enabled():
+            try:
+                self._shadow_after_step(output)
+            except Exception:  # noqa: BLE001
+                logger.exception("Shadow: step failed; dropping the recovery job")
+                with suppress(Exception):
+                    self._shadow_drop_job("step_failed")
+
         return output
+
+    def _shadow_after_step(self, output: SchedulerOutput) -> None:
+        """Advance the recovery job, if this step left the engine idle for it.
+
+        A chunk runs only when the engine had nothing to do for two
+        consecutive steps; the second step is the window in which an arriving
+        request can announce itself, which a back-to-back slice would
+        otherwise never leave open.
+        """
+        self._shadow_note_step(bool(output.has_work))
+        if self._shadow_runnable():
+            self._shadow_blocked_idle_steps = 0
+            ran = self._shadow_step()
+            # Reset on a yield too. The two-idle-step rule exists to leave
+            # a step in which an arriving request can announce itself, and
+            # a yield that did not reset it re-entered the shadow on the
+            # very next step — up to eight times in a row, with no such
+            # window between them.
+            self._consecutive_idle_steps = 0
+            if ran:
+                # A shadow chunk is work, so the engine loop keeps
+                # stepping rather than sleeping between chunks.
+                output.has_work = True
+        elif (
+            self._shadow_job is not None
+            and not self._shadow_job.cancelled
+            and not self._shadow_job.done
+        ):
+            if self._shadow_engine_has_foreground():
+                # A busy engine is a reason, and it ends. The loop would be
+                # stepping for the foreground anyway.
+                self._shadow_blocked_idle_steps = 0
+            else:
+                self._shadow_note_blocked_step()
+        else:
+            self._shadow_blocked_idle_steps = 0
 
     def _publish_admin_snapshot(self) -> None:
         """Atomically publish a fresh admin-visible snapshot.
@@ -13203,6 +14352,21 @@ class Scheduler:
 
     def reset(self) -> None:
         """Reset the scheduler state."""
+        self.cancel_shadow_work("reset")
+        # The recovery telemetry has to go with it. Left alone, the budget's
+        # own wall clock, its window, the counters and the idle denominator
+        # all survive an engine switch, and the two service shares then splice
+        # two runs together with nothing on the wire to say so.
+        # Local telemetry only. A shared budget belongs to every engine in the
+        # pool, and discarding the service they have already spent — mid
+        # window, with the carried overshoot — would lift their ceiling every
+        # time any one engine reset. Under memory pressure the pool unloads
+        # and reloads repeatedly, so that would be most cycles.
+        if not self._shadow_budget.shared:
+            self._shadow_budget.reset()
+        self._shadow_counters = ShadowCounters()
+        self._consecutive_idle_steps = 0
+        self._shadow_blocked_idle_steps = 0
         _mtp_priming.clear_owned(getattr(self, "model", None))
         with suppress(Exception):
             get_decode_activity().remove(self._decode_activity_key)
@@ -13349,6 +14513,13 @@ class Scheduler:
         Flushes hot cache to SSD and closes the background writer.
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
+        self.cancel_shadow_work("shutdown")
+        # Deregister rather than reset: the share this engine was using goes
+        # back, and everything the remaining owners have spent stays spent.
+        # The carried overshoot stays on the budget too, or unloading would be
+        # a way to discharge a debt.
+        with suppress(Exception):
+            self._shadow_budget.deregister(self._shadow_owner_key)
         teardown = getattr(self, "_engine_teardown", None)
         _mtp_priming.clear_owned(getattr(self, "model", None))
         logger.info("Scheduler shutdown initiated...")

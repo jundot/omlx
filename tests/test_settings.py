@@ -384,6 +384,7 @@ class TestSchedulerSettings:
             "chunked_prefill": False,
             "prefill_priority": "context",
             "decode_fairness": True,
+            "shadow_prefill_global_budget_pct": 0.0,
         }
 
     def test_decode_fairness_from_dict(self):

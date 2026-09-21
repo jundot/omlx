@@ -258,6 +258,13 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
+        shadow_prefill_enabled: Enable shadow prefill, a scheduler-owned
+            dense re-read of a range a sparse prefill already served, run
+            only while the scheduler is idle.
+        shadow_prefill_slice_tokens: Tokens per recovery execution slice; 0
+            leaves it at the ordinary prefill step size. Not the publication
+            grain — recovery publishes only at cache block boundaries either
+            way. This is the slice a foreground request can arrive behind.
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_enabled: Enable draft model quantization.
@@ -407,6 +414,14 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
+    # Shadow prefill: a scheduler-owned dense re-prefill of ranges a sparse
+    # SpecPrefill turn left uncanonicalized. Off by default.
+    shadow_prefill_enabled: bool = False
+    # Tokens per recovery execution slice; 0 = the ordinary prefill step size.
+    # Not the publication grain: recovery still publishes only at cache block
+    # boundaries. This is the slice a foreground request can arrive behind.
+    shadow_prefill_slice_tokens: int = 0
+
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
@@ -534,6 +549,8 @@ class ModelSettings:
                     "vlm_mtp decode path does not apply"
                 )
         validate_moe_expert_offload(self.to_dict())
+        if self.shadow_prefill_slice_tokens < 0:
+            raise ValueError("shadow_prefill_slice_tokens must not be negative")
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

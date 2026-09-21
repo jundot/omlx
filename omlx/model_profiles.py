@@ -92,6 +92,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_draft_model",
     "specprefill_keep_pct",
     "specprefill_threshold",
+    "shadow_prefill_enabled",
+    "shadow_prefill_slice_tokens",
     "index_cache_freq",
 )
 
