@@ -552,9 +552,11 @@ class OffloadSwitchGLU(nn.Module):
             c.ensure(mx.array(np.unique(chunk_ids), dtype=mx.int32))
             n_routes = end - start
             padded_routes = n_routes
-            # Keep MLX's small-chunk QMV path; padding must not select sorted QMM.
+            # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
+            # (E = resident slots); below that, padding would change kernels.
             if n_routes >= max(16, 4 * c.capacity):
-                # Reuse allocation sizes across layers without clearing the global Metal pool.
+                # Power-of-two sizes repeat across layers, so the Metal pool
+                # reuses those buffers instead of keeping one per size.
                 padded_routes = 1 << (n_routes - 1).bit_length()
             token_ids = order[start:end] // k
             if padded_routes != n_routes:
