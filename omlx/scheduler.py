@@ -13920,6 +13920,14 @@ class Scheduler:
             logger.debug("CanonicalRecovery: read-back probe failed: %s", e)
             return 0
         finally:
+            # The probe holds a reference on every block it matched, and
+            # `release_cache` does not return them: it frees through the
+            # request table that only `store_cache` writes, and this probe
+            # deliberately never stores. Without the explicit release the
+            # blocks a recovery publishes are pinned by the very check that
+            # verifies the publish, and each boundary pins a longer chain.
+            with suppress(Exception):
+                cache.release_fetched_blocks(probe_id)
             with suppress(Exception):
                 cache.release_cache(probe_id)
             with suppress(Exception):
