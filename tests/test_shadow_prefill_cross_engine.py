@@ -38,7 +38,7 @@ def _make_scheduler(**config_over) -> Scheduler:
         chunked_prefill=True,
         paged_cache_block_size=256,
         shadow_prefill_enabled=True,
-        shadow_prefill_budget_pct=10.0,
+        shadow_prefill_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(

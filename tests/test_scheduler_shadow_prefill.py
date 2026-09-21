@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from omlx.scheduler import Scheduler, SchedulerConfig
-from omlx.shadow_prefill import PublishMode
 
 
 def _make_scheduler(**config_over) -> Scheduler:
@@ -28,7 +27,7 @@ def _make_scheduler(**config_over) -> Scheduler:
         chunked_prefill=True,
         paged_cache_block_size=256,
         shadow_prefill_enabled=True,
-        shadow_prefill_budget_pct=10.0,
+        shadow_prefill_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -274,17 +273,9 @@ class TestSafetyReviewConditions:
         assert scheduler._shadow_job is None
 
 
-class TestPublishModes:
-    def test_terminal_publishes_nothing_mid_target(self):
-        scheduler = _make_scheduler(shadow_prefill_publish_mode="terminal")
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
-        job = scheduler._shadow_job
-        assert job.publish_mode is PublishMode.TERMINAL
-        job.processed_tokens = 512
-        assert job.publishable_boundary() == 0
-
-    def test_progressive_publishes_mid_target(self):
-        scheduler = _make_scheduler(shadow_prefill_publish_mode="progressive")
+class TestPublication:
+    def test_a_new_boundary_publishes_mid_target(self):
+        scheduler = _make_scheduler()
         scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
         job = scheduler._shadow_job
         job.processed_tokens = 512
@@ -303,24 +294,7 @@ class TestPublishModes:
         assert job.committed_tokens == 0
 
 
-class TestStats:
-    def test_stats_are_reported_even_when_nothing_ran(self):
-        """A build with the instrumentation reporting zeros must be
-        distinguishable from a build without it."""
-        scheduler = _make_scheduler()
-        stats = scheduler.shadow_stats()
-        assert stats["enabled"] is True
-        assert stats["scheduled_steps"] == 0
-        assert stats["budget_pct"] == 10.0
-
-    def test_debt_is_recorded_from_the_foreground_prompt(self):
-        scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
-        assert scheduler.shadow_stats()["canonical_debt_tokens"] == 1000
-        scheduler._shadow_job.committed_tokens = 768
-        scheduler.note_shadow_candidate(_sparse_request(2000, rid="r2", scheduler=scheduler))
-        assert scheduler.shadow_stats()["canonical_debt_tokens"] == 2000 - 768
-
+class TestIdleAccounting:
     def test_a_step_with_foreground_work_resets_the_idle_run(self):
         scheduler = _make_scheduler()
         scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
@@ -527,8 +501,7 @@ class TestTelemetrySurvivesNothing:
         scheduler._shadow_budget.note_service(12.0)
         scheduler._shadow_note_step(did_foreground_work=False)
         scheduler.reset()
-        stats = scheduler.shadow_stats()
-        assert stats["service_s"] == 0.0
+        assert scheduler._shadow_counters.service_s == 0.0
         assert scheduler._shadow_budget.service_s == 0.0
 
     def test_a_shared_budget_is_not_reset_by_one_engine(self):
@@ -783,11 +756,6 @@ class TestPerModelSettings:
         assert scheduler._shadow_enabled()
         scheduler.config.shadow_prefill_enabled = False
         assert scheduler._shadow_enabled()
-
-    def test_a_later_publish_mode_change_does_not_reach_a_live_scheduler(self):
-        scheduler = _make_scheduler(shadow_prefill_publish_mode="progressive")
-        scheduler.config.shadow_prefill_publish_mode = "terminal"
-        assert scheduler._shadow_publish_mode() is PublishMode.PROGRESSIVE
 
 
 class TestDisabledIsInert:

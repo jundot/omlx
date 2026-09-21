@@ -33,6 +33,7 @@ from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from omlx.request import Request, SamplingParams
 from omlx.scheduler import (
     PrefillEvictionRequest,
     Scheduler,
@@ -55,7 +56,7 @@ def _make_scheduler(**config_over) -> Scheduler:
         chunked_prefill=True,
         paged_cache_block_size=256,
         shadow_prefill_enabled=True,
-        shadow_prefill_budget_pct=10.0,
+        shadow_prefill_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -1075,3 +1076,83 @@ class TestRetiringStateMidChunkGivesTheFootprintBack:
         assert not job.cancelled
         assert not job.done
         assert job.committed_tokens == BLOCK
+
+
+# --------------------------------------------------------------------------
+# The recovery request is not a user request
+# --------------------------------------------------------------------------
+
+
+class TestTheRecoveryRequestIsInvisibleToTheRequestSweeps:
+    """Three existing sweeps walk ``self.requests`` and reach the job's own
+    synthetic request, which sits there in no queue at all.
+
+    That is precisely the shape two of them exist to find: a request popped
+    off ``waiting`` and being prefilled right now is reachable through no
+    queue either, and missing it hung clients (#2372). The recovery request
+    has the same shape and none of the meaning — no collector, no client, no
+    output — so failing it names an id nobody sent, and re-prefilling it
+    schedules background work as foreground with nothing to emit to.
+
+    Recovery is allowed to lose its work. It is not allowed to become a
+    request, and it is not allowed to be the reason an engine cannot quiesce
+    after an unrecoverable error.
+    """
+
+    @staticmethod
+    def _with_both(scheduler):
+        """One foreground request and one recovery request, both queue-less.
+
+        The foreground one is the control: every assertion about the recovery
+        request has a matching one saying the sweep still does its job.
+        """
+        foreground = Request(
+            request_id="user-1",
+            prompt=None,
+            prompt_token_ids=[1, 2, 3, 4],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        recovery = Request(
+            request_id=RID,
+            prompt=None,
+            prompt_token_ids=list(range(4 * BLOCK)),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        recovery.is_shadow = True
+        scheduler.requests[foreground.request_id] = foreground
+        scheduler.requests[recovery.request_id] = recovery
+        return foreground, recovery
+
+    def test_a_fatal_error_does_not_fail_it_as_a_user_request(self):
+        scheduler = _make_scheduler()
+        foreground, _recovery = self._with_both(scheduler)
+        failed = scheduler.fail_all_requests()
+        assert foreground.request_id in failed
+        assert RID not in failed
+
+    def test_a_fatal_error_ends_the_job_so_the_engine_can_quiesce(self):
+        """`has_requests()` reports a live recovery job, and the unload path
+        drains on that predicate. A job that survives the failure that killed
+        every request keeps the engine awake and unloadable forever."""
+        scheduler = _make_scheduler()
+        scheduler.note_shadow_candidate(_sparse_request(4 * BLOCK, scheduler=scheduler))
+        assert scheduler._shadow_job is not None
+        assert scheduler.has_requests()
+        scheduler.fail_all_requests()
+        assert scheduler._shadow_job is None
+        assert not scheduler.has_requests()
+
+    def test_cache_corruption_recovery_does_not_resurrect_it(self):
+        scheduler = _make_scheduler()
+        foreground, _recovery = self._with_both(scheduler)
+        collected = scheduler._collect_corruption_retry_requests()
+        assert foreground in collected
+        assert all(not request.is_shadow for request in collected)
+
+    def test_generation_overflow_rescheduling_does_not_resurrect_it(self):
+        scheduler = _make_scheduler()
+        foreground, recovery = self._with_both(scheduler)
+        scheduler._reschedule_generation_overflow_requests()
+        assert recovery not in scheduler.waiting
+        assert recovery.request_id in scheduler.requests
+        assert foreground in scheduler.waiting

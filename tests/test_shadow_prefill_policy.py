@@ -11,12 +11,8 @@ import pytest
 
 from omlx.shadow_prefill import (
     DEFAULT_BUDGET_WINDOW_S,
-    PublishMode,
     ShadowBudget,
-    ShadowCounters,
     ShadowJob,
-    canonical_debt,
-    catch_up_ratio,
     safe_publish_boundary,
     shadow_is_runnable,
 )
@@ -35,24 +31,6 @@ class TestSafeBoundary:
     @pytest.mark.parametrize("block_size", [0, -1])
     def test_a_nonpositive_block_size_publishes_nothing(self, block_size):
         assert safe_publish_boundary(tokens_committed=9999, block_size=block_size) == 0
-
-
-class TestDebt:
-    def test_debt_is_the_uncanonicalized_remainder(self):
-        assert canonical_debt(prompt_tokens=48000, longest_committed_prefix=28672) == 19328
-
-    def test_debt_never_goes_negative(self):
-        assert canonical_debt(prompt_tokens=1000, longest_committed_prefix=4096) == 0
-
-    def test_catch_up_ratio_is_none_when_context_did_not_grow(self):
-        assert catch_up_ratio(
-            delta_committed_tokens=1024, delta_required_context_tokens=0
-        ) is None
-
-    def test_catch_up_ratio_above_one_means_gaining(self):
-        assert catch_up_ratio(
-            delta_committed_tokens=16384, delta_required_context_tokens=8192
-        ) == 2.0
 
 
 class TestBudget:
@@ -145,7 +123,6 @@ class TestReplenishingBudget:
         assert not budget.allows(now=5.0)   # the rest of the window it overran
         assert not budget.allows(now=10.0)  # the next window, paying the debt
         assert budget.allows(now=20.0)      # and no later than the one after
-        assert budget.locked_out_windows == 1
         assert budget.overshoot_s == pytest.approx(5.0)
 
     def test_a_zero_budget_allows_nothing_in_any_window(self):
@@ -218,22 +195,18 @@ class TestReplenishingBudget:
         assert budget.windows == 4
         assert budget.allows(now=40.0)      # and never more than one window
 
-    def test_a_part_spent_window_is_not_a_lockout(self):
-        """A window that opens in debt but still grants service is not a
-        lockout. Counting it as one reported 500 lockouts across 667 windows
-        on a sweep where no service was ever withheld."""
+    def test_a_part_spent_window_still_grants_service(self):
+        """A window that opens in debt but has allowance left still serves."""
         budget = self._budget()                 # 1 s allowance, 10 s window
         assert budget.allows(now=0.0)
         budget.note_service(1.5)                # half an allowance of debt
         assert budget.allows(now=10.0)          # 0.5 s still available
-        assert budget.locked_out_windows == 0
 
-    def test_a_fully_spent_window_is_a_lockout(self):
+    def test_a_fully_spent_window_grants_nothing(self):
         budget = self._budget()
         assert budget.allows(now=0.0)
         budget.note_service(2.5)                # a full allowance of debt
         assert not budget.allows(now=10.0)
-        assert budget.locked_out_windows == 1
 
     def test_a_non_positive_window_is_corrected_not_interpreted(self):
         """Nothing writes this field today, so a bad value would arrive by
@@ -244,15 +217,10 @@ class TestReplenishingBudget:
         assert budget.window_s == DEFAULT_BUDGET_WINDOW_S
         assert budget.allowance_s > 0
 
-    def test_as_dict_reports_the_service_that_was_actually_noted(self):
-        """The reported share, windows, lockouts and overshoot match the run.
-
-        The sequence below is: 3 s served in window 1 against a 1 s allowance
-        (2 s of overshoot), window 2 locked out paying 1 s of that debt, then
-        two 0.5 s chunks in window 3. Total service is 4 s over 30 s of wall
-        time. ``as_dict`` does not roll the window, so ``budget_windows`` is
-        the count as of the last ``allows``, which is window 3.
-        """
+    def test_the_accounting_matches_the_run(self):
+        """3 s served in window 1 against a 1 s allowance (2 s of overshoot),
+        window 2 spent paying 1 s of that debt, then two 0.5 s chunks in
+        window 3. Four seconds of service over thirty of wall time."""
         budget = self._budget()
         assert budget.allows(now=0.0)
         budget.note_service(3.0)
@@ -262,14 +230,12 @@ class TestReplenishingBudget:
         assert budget.allows(now=25.0)
         budget.note_service(0.5)
 
-        payload = budget.as_dict(now=30.0)
-        assert budget.service_s == pytest.approx(3.0 + 0.5 + 0.5)
-        assert payload["budget_allowance_s"] == pytest.approx(1.0)
-        assert payload["service_share"] == pytest.approx(4.0 / 30.0, abs=1e-6)
-        assert payload["budget_windows"] == 3
-        assert payload["budget_locked_out_windows"] == 1
-        assert payload["budget_overshoot_s"] == pytest.approx(2.0)
-        assert payload["window_service_s"] == pytest.approx(1.0)
+        assert budget.service_s == pytest.approx(4.0)
+        assert budget.allowance_s == pytest.approx(1.0)
+        assert budget.share(now=30.0) == pytest.approx(4.0 / 30.0, abs=1e-6)
+        assert budget.windows == 3
+        assert budget.overshoot_s == pytest.approx(2.0)
+        assert budget.window_service_s == pytest.approx(1.0)
 
 
 class TestRunnable:
@@ -328,54 +294,40 @@ class TestRunnable:
 
 
 class TestPublication:
-    def _job(self, mode, **over):
+    def _job(self, **over):
         kwargs = dict(
             session_key="s", tokens=list(range(4096)), target_tokens=4096,
-            block_size=1024, publish_mode=mode,
+            block_size=1024,
         )
         kwargs.update(over)
         return ShadowJob(**kwargs)
 
-    def test_terminal_publishes_nothing_before_the_target_finishes(self):
-        job = self._job(PublishMode.TERMINAL)
-        job.processed_tokens = 3072
-        assert job.publishable_boundary() == 0
-
-    def test_terminal_publishes_at_the_target(self):
-        job = self._job(PublishMode.TERMINAL)
-        job.processed_tokens = 4096
-        assert job.publishable_boundary() == 4096
-
-    def test_progressive_publishes_each_new_boundary(self):
-        job = self._job(PublishMode.PROGRESSIVE)
+    def test_each_new_boundary_publishes(self):
+        job = self._job()
         job.processed_tokens = 1024
         assert job.publishable_boundary() == 1024
         job.note_published(1024)
         job.processed_tokens = 2048
         assert job.publishable_boundary() == 2048
 
-    def test_progressive_does_not_republish_a_boundary(self):
-        job = self._job(PublishMode.PROGRESSIVE)
+    def test_a_boundary_is_not_republished(self):
+        job = self._job()
         job.processed_tokens = 2048
         job.note_published(2048)
         job.processed_tokens = 2500
         assert job.publishable_boundary() == 0
 
-    def test_an_interrupted_progressive_job_keeps_what_it_published(self):
-        """This is the whole difference between PASS and Shadow-End."""
-        progressive = self._job(PublishMode.PROGRESSIVE)
-        terminal = self._job(PublishMode.TERMINAL)
-        for job in (progressive, terminal):
-            job.processed_tokens = 3072
-            boundary = job.publishable_boundary()
-            if boundary:
-                job.note_published(boundary)
-            job.cancelled = True
-        assert progressive.committed_tokens == 3072
-        assert terminal.committed_tokens == 0
+    def test_an_interrupted_job_keeps_what_it_published(self):
+        """The point of publishing at every boundary: a job that never
+        reaches its target is still worth the prefix it got to."""
+        job = self._job()
+        job.processed_tokens = 3072
+        job.note_published(job.publishable_boundary())
+        job.cancelled = True
+        assert job.committed_tokens == 3072
 
     def test_a_cancelled_job_publishes_nothing_further(self):
-        job = self._job(PublishMode.PROGRESSIVE)
+        job = self._job()
         job.processed_tokens = 4096
         job.cancelled = True
         assert job.publishable_boundary() == 0
@@ -437,22 +389,6 @@ class TestSingleFlightGrowth:
         assert job.target_tokens == 1000
 
 
-class TestCounters:
-    def test_counters_round_trip_to_a_dict(self):
-        counters = ShadowCounters(runnable_steps=3, scheduled_steps=2, service_s=1.23456789)
-        payload = counters.as_dict()
-        assert payload["runnable_steps"] == 3
-        assert payload["scheduled_steps"] == 2
-        assert payload["service_s"] == pytest.approx(1.234568)
-
-    def test_service_and_runnable_are_reported_separately(self):
-        """"The shadow got no service" and "the shadow got service and it was
-        not enough" are different results; the counters must tell them apart."""
-        counters = ShadowCounters(runnable_steps=100, scheduled_steps=0)
-        payload = counters.as_dict()
-        assert payload["runnable_steps"] and not payload["scheduled_steps"]
-
-
 class TestTargetCompletion:
     """The prefill path holds the last token back for the generation kickoff.
 
@@ -464,7 +400,7 @@ class TestTargetCompletion:
     def _job(self):
         return ShadowJob(
             session_key="s", tokens=list(range(8192)), target_tokens=8192,
-            block_size=4096, publish_mode=PublishMode.TERMINAL,
+            block_size=4096,
         )
 
     def test_one_token_short_is_not_done_by_count_alone(self):

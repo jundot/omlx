@@ -76,7 +76,7 @@ def _engine(config: SchedulerConfig | None = None, label: str = "m") -> Schedule
             chunked_prefill=True,
             paged_cache_block_size=256,
             shadow_prefill_enabled=True,
-            shadow_prefill_budget_pct=PCT,
+            shadow_prefill_global_budget_pct=PCT,
             shadow_prefill_budget_window_s=WINDOW_S,
         ),
     )
@@ -129,7 +129,7 @@ class TestOneBudgetForTheProcess:
     def test_the_two_schedulers_hold_the_same_budget_object(self, two_engines):
         a, b = two_engines
         assert a._shadow_budget.shared is True
-        assert a._shadow_budget.owner_count() == 2
+        assert len(a._shadow_budget.owners) == 2
         assert a._shadow_owner_key != b._shadow_owner_key
 
     def test_service_on_one_engine_is_charged_against_the_other(self, two_engines):
@@ -381,13 +381,13 @@ class TestReloadBuysNothing:
 
         # unload
         budget.deregister(a._shadow_owner_key)
-        assert budget.owner_count() == 1
+        assert len(budget.owners) == 1
         assert budget.window_service_s == spent
         assert budget.overshoot_s == overshoot
 
         # reload
         budget.register(a._shadow_owner_key)
-        assert budget.owner_count() == 2
+        assert len(budget.owners) == 2
         assert budget.window_service_s == spent
         assert budget.overshoot_s == overshoot
         assert budget.window_start_s == window_start
@@ -426,7 +426,7 @@ class TestABareSchedulerStillRecovers:
         solo = _engine()
         assert solo._shadow_budget.shared is False
         assert solo._shadow_budget.pct == PCT
-        assert solo._shadow_budget.owner_count() == 1
+        assert len(solo._shadow_budget.owners) == 1
 
     def test_two_bare_schedulers_do_not_share(self):
         first, second = _engine(), _engine()

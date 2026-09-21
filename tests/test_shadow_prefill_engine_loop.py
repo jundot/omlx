@@ -43,7 +43,7 @@ def _make_scheduler(**config_over) -> Scheduler:
         chunked_prefill=True,
         paged_cache_block_size=256,
         shadow_prefill_enabled=True,
-        shadow_prefill_budget_pct=10.0,
+        shadow_prefill_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -189,7 +189,7 @@ class TestASpentWindowCostsNoSteps:
 
     def test_a_zero_budget_is_still_a_different_case(self):
         """Zero percent never replenishes, so its job is not waiting at all."""
-        scheduler = _make_scheduler(shadow_prefill_budget_pct=0.0)
+        scheduler = _make_scheduler(shadow_prefill_global_budget_pct=0.0)
         scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
         assert scheduler._shadow_job is None
         assert not scheduler.has_requests()

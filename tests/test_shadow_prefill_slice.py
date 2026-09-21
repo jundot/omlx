@@ -30,7 +30,6 @@ from omlx.model_settings import ModelSettings
 from omlx.prefill_boundaries import clamp_prefill_chunk_to_boundary
 from omlx.scheduler import Scheduler, SchedulerConfig
 from omlx.shadow_prefill import (
-    PublishMode,
     ShadowJob,
     apply_shadow_prefill_settings,
     safe_publish_boundary,
@@ -52,7 +51,7 @@ def _make_scheduler(**config_over) -> Scheduler:
         chunked_prefill=True,
         paged_cache_block_size=BLOCK,
         shadow_prefill_enabled=True,
-        shadow_prefill_budget_pct=10.0,
+        shadow_prefill_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -104,7 +103,6 @@ def _walk(slice_tokens: int, target: int, block: int = BLOCK):
         tokens=list(range(target)),
         target_tokens=target,
         block_size=block,
-        publish_mode=PublishMode.PROGRESSIVE,
     )
     processed = 0
     slices = 0
@@ -198,7 +196,6 @@ class TestTheSliceReachesTheScheduler:
             config,
             ModelSettings(
                 shadow_prefill_enabled=True,
-                shadow_prefill_budget_pct=5.0,
                 shadow_prefill_slice_tokens=512,
             ),
         )

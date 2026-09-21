@@ -44,7 +44,7 @@ def _make_scheduler(**config_over) -> Scheduler:
         chunked_prefill=True,
         paged_cache_block_size=BLOCK,
         shadow_prefill_enabled=True,
-        shadow_prefill_budget_pct=10.0,
+        shadow_prefill_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -592,33 +592,6 @@ class TestB4CompactionDivergence:
         assert new.published_boundaries == []
         assert new.processed_tokens == 0
         assert new.reached_target is False
-
-    def test_the_reported_debt_is_measured_against_the_lineage_that_owns_it(self):
-        """The debt on a diverging turn is the whole prompt, not the netted one.
-
-        `_shadow_last_debt` used to be computed before the job decision, so it
-        netted the new prompt against the committed prefix of whatever job was
-        installed at the time. On the turn that diverges that is a lineage the
-        session has just discarded, and the reported debt came out one whole
-        committed prefix too small — 16,384 - 8,192 for a prompt that owed all
-        16,384. Only that turn was wrong, which is exactly what makes it worth
-        a test: the next turn nets against the new job and looks right.
-        """
-        scheduler = _make_scheduler()
-        self._started_job(scheduler, published=2 * BLOCK)
-
-        scheduler.note_shadow_candidate(
-            _sparse_request_on(self._compacted(), rid="r2", scheduler=scheduler)
-        )
-        assert scheduler.shadow_stats()["canonical_debt_tokens"] == 4 * BLOCK
-
-        # The turn after the divergence nets against the new lineage's own
-        # committed count, which is zero, and reports the whole prompt.
-        longer = self._compacted() + [9_500_000 + i for i in range(BLOCK)]
-        scheduler.note_shadow_candidate(
-            _sparse_request_on(longer, rid="r3", scheduler=scheduler)
-        )
-        assert scheduler.shadow_stats()["canonical_debt_tokens"] == 5 * BLOCK
 
     def test_nothing_is_published_for_the_old_lineage_across_the_divergence(self):
         scheduler = _make_scheduler()
