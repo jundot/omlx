@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Failure injection for progressive shadow prefill.
+"""Failure injection for progressive canonical state recovery.
 
-``test_scheduler_shadow_prefill.py`` asks what the recovery job does when its
+``test_scheduler_canonical_recovery.py`` asks what the recovery job does when its
 collaborators behave. This file asks what it does when they do not.
 
 The invariant is **fail closed**. A recovery failure may cost reuse — that is
@@ -14,10 +14,10 @@ unload path drains on the same predicate).
 Every test asserts five things about one injected fault:
 
 a. no exception escapes into the caller — the scheduler step path returns;
-b. ``_shadow_job`` is left somewhere defensible, and the test says which of
+b. ``_canonical_recovery_job`` is left somewhere defensible, and the test says which of
    dropped / parked / intact it observed;
 c. ``job.committed_tokens`` advanced only behind a real publish *and* read-back;
-d. the cleanup calls fired for ``shadow:{session_key}`` — the paged-cache
+d. the cleanup calls fired for ``canonical-recovery:{session_key}`` — the paged-cache
    release, the boundary-snapshot drop, the prefill tracker's ``remove`` and
    the ``requests`` pop;
 e. ``has_requests()`` afterwards reflects reality, because a dropped job that
@@ -41,7 +41,7 @@ from omlx.scheduler import (
     _PrefillAbortedError,
     _PrefillEvictionNeeded,
 )
-from omlx.shadow_prefill import MAX_CONSECUTIVE_YIELDS
+from omlx.canonical_recovery import MAX_CONSECUTIVE_YIELDS
 
 
 def _make_scheduler(**config_over) -> Scheduler:
@@ -55,15 +55,15 @@ def _make_scheduler(**config_over) -> Scheduler:
         prefill_step_size=64,
         chunked_prefill=True,
         paged_cache_block_size=256,
-        shadow_prefill_enabled=True,
-        shadow_prefill_global_budget_pct=10.0,
+        canonical_state_recovery_enabled=True,
+        canonical_state_recovery_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
         model=model, tokenizer=tokenizer, config=SchedulerConfig(**config_kwargs)
     )
-    # A prefix cache must exist for the shadow to be enabled at all; the
-    # publish tests replace it with their own double.
+    # A prefix cache must exist for canonical state recovery to be enabled at
+    # all; the publish tests replace it with their own double.
     scheduler.block_aware_cache = MagicMock()
     scheduler._unreconstructible_cache_model = False
     mock_bg = MagicMock()
@@ -96,8 +96,8 @@ def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
 # --------------------------------------------------------------------------
 
 BLOCK = 256
-RID = "shadow:r1"
-PROBE_ID = "shadow-readback:r1"
+RID = "canonical-recovery:r1"
+PROBE_ID = "canonical-recovery-readback:r1"
 
 
 class _RecordingRequests(dict):
@@ -118,13 +118,13 @@ class _RecordingRequests(dict):
 
 @contextmanager
 def _cleanup_spy(scheduler, rid: str = RID):
-    """Watch the four calls that give a shadow request's footprint back.
+    """Watch the four calls that give a recovery request's footprint back.
 
     The request entry and the prepared-prefix marker are seeded first, so the
     removals are observable as state changes and not only as mock calls.
     """
     scheduler.requests = _RecordingRequests(scheduler.requests)
-    scheduler.requests[rid] = MagicMock(name="live-shadow-request")
+    scheduler.requests[rid] = MagicMock(name="live-recovery-request")
     scheduler._prefix_cache_prepared.add(rid)
     tracker = MagicMock()
     # The spy exists to watch `remove`. Left as a bare MagicMock its
@@ -172,10 +172,10 @@ def _assert_cleanup_not_fired(spy):
 
 
 def _queued(scheduler, prompt_tokens: int = 1000):
-    scheduler.note_shadow_candidate(
+    scheduler.note_canonical_recovery_candidate(
         _sparse_request(prompt_tokens, scheduler=scheduler)
     )
-    job = scheduler._shadow_job
+    job = scheduler._canonical_recovery_job
     assert job is not None
     return job
 
@@ -186,7 +186,7 @@ def _live_state(job, *, processed: int, base: int = 0):
         base_size=base,
         tokens_processed=processed,
         cache=[MagicMock()],
-        shadow_target_tokens=job.target_tokens,
+        canonical_recovery_target_tokens=job.target_tokens,
     )
 
 
@@ -223,7 +223,7 @@ def _publish_path(
     readback=BLOCK,
     snapshot_needed=False,
 ):
-    """Stub everything ``_shadow_publish`` talks to below the fault under test.
+    """Stub everything ``_canonical_recovery_publish`` talks to below the fault under test.
 
     ``extract`` and ``worker`` take either a return value or an exception
     instance to raise; ``readback=None`` leaves the real read-back probe in
@@ -257,7 +257,7 @@ def _publish_path(
         if readback is not None:
             readback_mock = enter(
                 patch.object(
-                    scheduler, "_shadow_readback_tokens", return_value=readback
+                    scheduler, "_canonical_recovery_readback_tokens", return_value=readback
                 )
             )
         yield SimpleNamespace(worker=worker_mock, readback=readback_mock)
@@ -269,7 +269,7 @@ def _publish_path(
 
 
 class TestStateBuildFails:
-    """`_shadow_begin_state` raises: the job is dropped, not retried."""
+    """`_canonical_recovery_begin_state` raises: the job is dropped, not retried."""
 
     def test_a_failed_state_build_drops_the_job_and_frees_the_loop(self):
         """Fault 1. Dropped. Nothing published, everything released.
@@ -284,22 +284,22 @@ class TestStateBuildFails:
 
         with _cleanup_spy(scheduler) as spy, patch.object(
             scheduler,
-            "_shadow_begin_state",
+            "_canonical_recovery_begin_state",
             side_effect=RuntimeError("state build failed"),
         ):
             # (a) the step path returns rather than raising.
-            assert scheduler._shadow_step() is False
+            assert scheduler._canonical_recovery_step() is False
             # (d) the footprint went back.
             _assert_cleanup_fired(spy)
 
         # (b) dropped.
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert job.cancelled is True
         assert job.prefill_state is None
         # (c) the committed prefix is the one a real publish left; the failure
         #     did not advance it, and the drop does not unpublish it either.
         assert job.committed_tokens == 512
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         # (e) a dropped job must not hold the engine loop awake.
         assert scheduler.has_requests() is False
 
@@ -312,15 +312,15 @@ class TestStateBuildFails:
         scheduler = _make_scheduler()
         _queued(scheduler)
         with patch.object(
-            scheduler, "_shadow_begin_state", side_effect=RuntimeError("boom")
+            scheduler, "_canonical_recovery_begin_state", side_effect=RuntimeError("boom")
         ):
-            scheduler._shadow_step()
-        assert scheduler._shadow_counters.service_s > 0
-        assert scheduler._shadow_budget.service_s > 0
+            scheduler._canonical_recovery_step()
+        assert scheduler._canonical_recovery_counters.service_s > 0
+        assert scheduler._canonical_recovery_budget.service_s > 0
 
 
 class TestNothingToReRead:
-    """`_shadow_begin_state` returns None: the job is parked, not destroyed."""
+    """`_canonical_recovery_begin_state` returns None: the job is parked, not destroyed."""
 
     def test_nothing_to_re_read_parks_the_job_and_keeps_its_prefix(self):
         """Fault 2. Parked. The job survives; its committed prefix survives.
@@ -334,25 +334,25 @@ class TestNothingToReRead:
         job.note_published(768)
 
         with _cleanup_spy(scheduler) as spy, patch.object(
-            scheduler, "_shadow_begin_state", return_value=None
+            scheduler, "_canonical_recovery_begin_state", return_value=None
         ):
             # (a)
-            assert scheduler._shadow_step() is False
+            assert scheduler._canonical_recovery_step() is False
             # (d) park releases the same four things a drop does.
             _assert_cleanup_fired(spy)
 
         # (b) parked: same object, still installed.
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         assert job.cancelled is False
         assert job.prefill_state is None
         assert job.reached_target is True
         # (c)
         assert job.committed_tokens == 768
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         # (e) a parked job is `done`, so it is neither runnable nor work.
-        scheduler._shadow_note_step(did_foreground_work=False)
-        scheduler._shadow_note_step(did_foreground_work=False)
-        assert scheduler._shadow_runnable() is False
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        assert scheduler._canonical_recovery_runnable() is False
         assert scheduler.has_requests() is False
 
     def test_a_parked_job_wakes_on_an_append_rather_than_on_a_retry(self):
@@ -363,16 +363,16 @@ class TestNothingToReRead:
         """
         scheduler = _make_scheduler()
         job = _queued(scheduler)
-        with patch.object(scheduler, "_shadow_begin_state", return_value=None):
-            scheduler._shadow_step()
-        assert scheduler._shadow_job is job
-        scheduler.note_shadow_candidate(
+        with patch.object(scheduler, "_canonical_recovery_begin_state", return_value=None):
+            scheduler._canonical_recovery_step()
+        assert scheduler._canonical_recovery_job is job
+        scheduler.note_canonical_recovery_candidate(
             _sparse_request(1400, scheduler=scheduler)
         )
-        scheduler._shadow_note_step(did_foreground_work=False)
-        scheduler._shadow_note_step(did_foreground_work=False)
-        assert scheduler._shadow_job is job
-        assert scheduler._shadow_runnable() is True
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        assert scheduler._canonical_recovery_job is job
+        assert scheduler._canonical_recovery_runnable() is True
         assert scheduler.has_requests() is True
 
 
@@ -384,11 +384,11 @@ class TestNothingToReRead:
 class TestChunkYields:
     """A chunk that did not run is a pause, and the pause is bounded.
 
-    Dropping on the first throttle reading cost the shadow a 12,288-token
-    prefix to a transient memory sample. Retrying forever is the opposite
-    failure: nothing the shadow does satisfies the throttle, so the job stays
-    live, `has_requests()` stays true, and an idle engine spins holding the
-    job's whole prefill state resident.
+    Dropping on the first throttle reading cost the recovery job a
+    12,288-token prefix to a transient memory sample. Retrying forever is the
+    opposite failure: nothing the recovery job does satisfies the throttle, so
+    the job stays live, `has_requests()` stays true, and an idle engine spins
+    holding the job's whole prefill state resident.
     """
 
     def _drive_to_the_limit(self, scheduler, job, state, error_factory):
@@ -397,10 +397,10 @@ class TestChunkYields:
                 scheduler, "_step_prefill_chunk", side_effect=error_factory()
             ):
                 # (a) every one of them returns rather than raising.
-                assert scheduler._shadow_step() is False
+                assert scheduler._canonical_recovery_step() is False
             if turn < MAX_CONSECUTIVE_YIELDS:
                 # (b) intact, mid-pause.
-                assert scheduler._shadow_job is job
+                assert scheduler._canonical_recovery_job is job
                 assert job.consecutive_yields == turn
                 assert job.prefill_state is state
                 # (e) a job that is only pausing is still work.
@@ -420,13 +420,13 @@ class TestChunkYields:
             _assert_cleanup_fired(spy)
 
         # (b) dropped, after exactly MAX_CONSECUTIVE_YIELDS.
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert job.consecutive_yields == MAX_CONSECUTIVE_YIELDS
-        assert scheduler._shadow_counters.yielded_steps == MAX_CONSECUTIVE_YIELDS
+        assert scheduler._canonical_recovery_counters.yielded_steps == MAX_CONSECUTIVE_YIELDS
         # (c) a yield publishes nothing and forfeits nothing.
         assert job.committed_tokens == 512
         assert job.published_boundaries == [512]
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         # (e)
         assert scheduler.has_requests() is False
 
@@ -445,10 +445,10 @@ class TestChunkYields:
             self._drive_to_the_limit(scheduler, job, state, _aborted)
             _assert_cleanup_fired(spy)
 
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert job.consecutive_yields == MAX_CONSECUTIVE_YIELDS
         assert job.committed_tokens == 512
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         assert scheduler.has_requests() is False
 
     def test_a_single_yield_does_not_drop_or_publish(self):
@@ -464,10 +464,10 @@ class TestChunkYields:
             with patch.object(
                 scheduler, "_step_prefill_chunk", side_effect=_eviction_needed()
             ):
-                assert scheduler._shadow_step() is False
+                assert scheduler._canonical_recovery_step() is False
             _assert_cleanup_not_fired(spy)
 
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         assert job.prefill_state is state
         assert job.committed_tokens == 512
         assert scheduler.has_requests() is True
@@ -491,19 +491,19 @@ class TestChunkFails:
             scheduler, "_step_prefill_chunk", side_effect=RuntimeError("chunk blew up")
         ):
             # (a)
-            assert scheduler._shadow_step() is False
+            assert scheduler._canonical_recovery_step() is False
             # (d)
             _assert_cleanup_fired(spy)
 
         # (b) dropped.
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert job.cancelled is True
         assert job.prefill_state is None
         # (c) the already-published prefix stands; nothing new was counted.
         assert job.committed_tokens == 512
         assert job.published_boundaries == [512]
-        assert scheduler._shadow_counters.publishes == 0
-        assert scheduler._shadow_counters.chunks == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.chunks == 0
         # (e)
         assert scheduler.has_requests() is False
 
@@ -525,7 +525,7 @@ class TestPublishFailsWithoutCommitting:
     def _assert_nothing_was_published(self, scheduler, job):
         assert job.committed_tokens == 0
         assert job.published_boundaries == []
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
 
     def test_a_failed_cache_extraction_publishes_nothing(self):
         """Fault 6. Intact. `_extract_cache_states` raised inside the publish.
@@ -542,14 +542,14 @@ class TestPublishFailsWithoutCommitting:
             scheduler, extract=RuntimeError("extract failed")
         ) as path:
             # (a)
-            assert scheduler._shadow_publish(job, BLOCK, state) is None
+            assert scheduler._canonical_recovery_publish(job, BLOCK, state) is None
             # The store was never reached.
             path.worker.assert_not_called()
             # (d) nothing was released, because nothing was dropped.
             _assert_cleanup_not_fired(spy)
 
         # (b) intact.
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         assert job.cancelled is False
         # (c)
         self._assert_nothing_was_published(scheduler, job)
@@ -575,7 +575,7 @@ class TestPublishFailsWithoutCommitting:
             scheduler, worker=RuntimeError("store worker failed")
         ) as path:
             # (a)
-            assert scheduler._shadow_publish(job, BLOCK, state) is None
+            assert scheduler._canonical_recovery_publish(job, BLOCK, state) is None
             path.worker.assert_called_once()
             # No read-back was attempted: there is nothing to read back.
             path.readback.assert_not_called()
@@ -583,7 +583,7 @@ class TestPublishFailsWithoutCommitting:
             _assert_cleanup_not_fired(spy)
 
         # (b) intact.
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         # (c)
         self._assert_nothing_was_published(scheduler, job)
         # (e)
@@ -591,7 +591,7 @@ class TestPublishFailsWithoutCommitting:
 
         # The deferral is only sound if the eventual drop does release it.
         with _cleanup_spy(scheduler) as spy:
-            scheduler._shadow_drop_job("later")
+            scheduler._canonical_recovery_drop_job("later")
             _assert_cleanup_fired(spy)
 
     def test_a_store_that_persisted_less_than_claimed_is_not_counted(self):
@@ -614,7 +614,7 @@ class TestPublishFailsWithoutCommitting:
             readback=768,                            # the read-back would have passed
         ) as path:
             # (a)
-            assert scheduler._shadow_publish(job, 768, state) is None
+            assert scheduler._canonical_recovery_publish(job, 768, state) is None
             path.worker.assert_called_once()
             # The short store is caught before the read-back, so the probe is
             # never even run — the claim is checked against the store's own
@@ -623,11 +623,11 @@ class TestPublishFailsWithoutCommitting:
             _assert_cleanup_not_fired(spy)
 
         # (b) intact.
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         # (c) the counter stands where the last *real* publish left it.
         assert job.committed_tokens == 512
         assert job.published_boundaries == [512]
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         # (e)
         assert scheduler.has_requests() is True
 
@@ -663,18 +663,18 @@ class TestRestorableInvariantUnderFault:
             readback=512,                                 # serving path sees 512
         ) as path:
             # (a)
-            assert scheduler._shadow_publish(job, 768, state) is None
+            assert scheduler._canonical_recovery_publish(job, 768, state) is None
             path.worker.assert_called_once()
             path.readback.assert_called_once()
             _assert_cleanup_not_fired(spy)
 
         # (b) intact: the store is not evidence of a bad job, only of a
         #     boundary that is not yet reachable.
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         # (c) the invariant holds: committed (0) <= restorable (512).
         assert job.committed_tokens == 0
         assert job.published_boundaries == []
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         # (e)
         assert scheduler.has_requests() is True
 
@@ -690,10 +690,10 @@ class TestRestorableInvariantUnderFault:
             worker=SimpleNamespace(block_ids=[1, 2, 3]),
             readback=768,
         ):
-            scheduler._shadow_publish(job, 768, state)
+            scheduler._canonical_recovery_publish(job, 768, state)
 
         assert job.committed_tokens == 768
-        assert scheduler._shadow_counters.publishes == 1
+        assert scheduler._canonical_recovery_counters.publishes == 1
 
     def test_a_read_back_probe_that_raises_reports_zero_and_still_cleans_up(self):
         """Fault 10. Intact. `fetch_cache` raised inside the probe.
@@ -710,12 +710,12 @@ class TestRestorableInvariantUnderFault:
 
         # (a) the probe answers rather than raising, and (c) its answer is the
         #     conservative one.
-        assert scheduler._shadow_readback_tokens(job, list(range(BLOCK))) == 0
+        assert scheduler._canonical_recovery_readback_tokens(job, list(range(BLOCK))) == 0
         # (d) the probe's own footprint went back anyway.
         scheduler.block_aware_cache.release_cache.assert_any_call(PROBE_ID)
         scheduler.block_aware_cache.clear_request_entry.assert_any_call(PROBE_ID)
         # (b)/(e) the probe does not touch the job.
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         assert scheduler.has_requests() is True
 
     def test_a_raising_read_back_probe_blocks_the_commit(self):
@@ -737,12 +737,12 @@ class TestRestorableInvariantUnderFault:
             worker=SimpleNamespace(block_ids=[1, 2, 3]),
             readback=None,          # the real probe, against the raising cache
         ):
-            assert scheduler._shadow_publish(job, 768, state) is None
+            assert scheduler._canonical_recovery_publish(job, 768, state) is None
             _assert_cleanup_not_fired(spy)
 
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         assert job.committed_tokens == 0
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         assert scheduler.has_requests() is True
 
 
@@ -770,17 +770,17 @@ class TestServingCacheChangesUnderTheJob:
 
         with _cleanup_spy(scheduler) as spy, _publish_path(scheduler) as path:
             # (a)
-            assert scheduler._shadow_publish(job, BLOCK, state) is None
+            assert scheduler._canonical_recovery_publish(job, BLOCK, state) is None
             path.worker.assert_not_called()
             # (d)
             _assert_cleanup_fired(spy)
 
         # (b) dropped, not retried: the binding cannot come back.
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert job.cancelled is True
         # (c)
         assert job.committed_tokens == 0
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         # (e)
         assert scheduler.has_requests() is False
 
@@ -804,10 +804,10 @@ class TestServingCacheChangesUnderTheJob:
         new_cache = MagicMock()
         scheduler.block_aware_cache = new_cache
         with _publish_path(scheduler):
-            scheduler._shadow_publish(job, BLOCK, state)
+            scheduler._canonical_recovery_publish(job, BLOCK, state)
 
         bound_cache.release_cache.assert_any_call(RID)
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
 
 
 class TestModelBecomesUnreconstructible:
@@ -828,19 +828,19 @@ class TestModelBecomesUnreconstructible:
             scheduler, "_model_has_unreconstructible_cache", return_value=True
         ), _publish_path(scheduler) as path:
             # (a)
-            assert scheduler._shadow_publish(job, 768, state) is None
+            assert scheduler._canonical_recovery_publish(job, 768, state) is None
             path.worker.assert_not_called()
             # (d)
             _assert_cleanup_fired(spy)
 
         # (b) dropped.
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert job.cancelled is True
         # (c) what was already published stays published and stays counted on
         #     the job object; the refused boundary is not added.
         assert job.committed_tokens == 512
         assert job.published_boundaries == [512]
-        assert scheduler._shadow_counters.publishes == 0
+        assert scheduler._canonical_recovery_counters.publishes == 0
         # (e)
         assert scheduler.has_requests() is False
 
@@ -853,7 +853,7 @@ class TestModelBecomesUnreconstructible:
 class TestCancellationHalfway:
     """Background work must never be the reason a model cannot be unloaded.
 
-    The unload path drains on `has_requests()`, which reports a live shadow
+    The unload path drains on `has_requests()`, which reports a live recovery
     job as work. Without a cancel that really clears it, the unload is queued
     "until active scheduler work drains", it never drains, and every later
     request to that model is refused with 409.
@@ -869,12 +869,12 @@ class TestCancellationHalfway:
 
         with _cleanup_spy(scheduler) as spy:
             # (a)
-            assert scheduler.cancel_shadow_work("unload") is True
+            assert scheduler.cancel_canonical_recovery_work("unload") is True
             # (d)
             _assert_cleanup_fired(spy)
 
         # (b) dropped, and the state reference is let go.
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert job.cancelled is True
         assert job.prefill_state is None
         # (c) a cancel does not unpublish: published blocks are ordinary
@@ -890,10 +890,10 @@ class TestCancellationHalfway:
         scheduler = _make_scheduler()
         job = _queued(scheduler)
         job.prefill_state = _live_state(job, processed=600)
-        assert scheduler.cancel_shadow_work("unload") is True
+        assert scheduler.cancel_canonical_recovery_work("unload") is True
 
         with _cleanup_spy(scheduler) as spy:
-            assert scheduler.cancel_shadow_work("unload") is False
+            assert scheduler.cancel_canonical_recovery_work("unload") is False
             _assert_cleanup_not_fired(spy)
         assert scheduler.has_requests() is False
 
@@ -903,10 +903,10 @@ class TestCancellationHalfway:
         scheduler = _make_scheduler()
         job = _queued(scheduler)
         job.prefill_state = _live_state(job, processed=600)
-        scheduler.cancel_shadow_work("unload")
+        scheduler.cancel_canonical_recovery_work("unload")
 
         with patch.object(scheduler, "_step_prefill_chunk") as chunk:
-            assert scheduler._shadow_step() is False
+            assert scheduler._canonical_recovery_step() is False
         chunk.assert_not_called()
         assert scheduler.has_requests() is False
 
@@ -919,39 +919,39 @@ class TestCancellationHalfway:
 class TestTheForegroundIsUnaffected:
     """The point of all of the above: a recovery failure costs reuse only.
 
-    `step()` is driven for real here rather than `_shadow_step()`, because the
-    claim is about the step the engine loop calls, not about the shadow method
-    it calls in turn.
+    `step()` is driven for real here rather than `_canonical_recovery_step()`, because the
+    claim is about the step the engine loop calls, not about the recovery
+    method it calls in turn.
     """
 
-    def test_a_step_whose_shadow_drops_returns_normally(self):
-        """The shadow becomes runnable on the second idle step, fails to build
+    def test_a_step_whose_canonical_recovery_drops_returns_normally(self):
+        """The recovery job becomes runnable on the second idle step, fails to build
         its state, and drops. The step must not notice."""
         scheduler = _make_scheduler()
         _queued(scheduler)
 
         with patch.object(
             scheduler,
-            "_shadow_begin_state",
+            "_canonical_recovery_begin_state",
             side_effect=RuntimeError("state build failed"),
         ):
             first = scheduler.step()
-            second = scheduler.step()      # the shadow runs and drops in this one
+            second = scheduler.step()      # the recovery job runs and drops here
 
         # (a) the step path returned, twice.
         assert first.has_work is False
         assert second.has_work is False
-        # No request was failed, finished or rejected by the shadow's failure.
+        # No request was failed, finished or rejected by the recovery failure.
         for output in (first, second):
             assert output.outputs == []
             assert output.finished_request_ids == set()
             assert output.scheduled_request_ids == []
             assert output.prefill_eviction_request is None
         # (b)/(e) the job is gone and the loop is free to park.
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert scheduler.has_requests() is False
 
-    def test_a_step_whose_shadow_chunk_raises_returns_normally(self):
+    def test_a_step_whose_canonical_recovery_chunk_raises_returns_normally(self):
         """The same claim for the other drop path, where the fault happens
         inside the model call rather than before it."""
         scheduler = _make_scheduler()
@@ -967,12 +967,12 @@ class TestTheForegroundIsUnaffected:
         assert output.outputs == []
         assert output.finished_request_ids == set()
         assert output.prefill_eviction_request is None
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert scheduler.has_requests() is False
 
 
-class TestAShadowFailureCannotFailTheBatch:
-    """The shadow block runs after `step()`'s own try/except.
+class TestACanonicalRecoveryFailureCannotFailTheBatch:
+    """The canonical state recovery block runs after `step()`'s own try/except.
 
     Anything escaping it leaves `step()` altogether, and the engine loop
     answers an escaped exception by calling `fail_all_requests()` — every live
@@ -987,11 +987,11 @@ class TestAShadowFailureCannotFailTheBatch:
         scheduler = _make_scheduler()
         _queued(scheduler)
         with patch.object(
-            scheduler, "_shadow_note_step", side_effect=RuntimeError("boom")
+            scheduler, "_canonical_recovery_note_step", side_effect=RuntimeError("boom")
         ):
             output = scheduler.step()
         assert output is not None
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert not scheduler.has_requests()
 
     def test_a_raising_runnable_predicate_does_not_escape_the_step(self):
@@ -999,29 +999,29 @@ class TestAShadowFailureCannotFailTheBatch:
         scheduler = _make_scheduler()
         _queued(scheduler)
         with patch.object(
-            scheduler, "_shadow_runnable", side_effect=RuntimeError("no rope")
+            scheduler, "_canonical_recovery_runnable", side_effect=RuntimeError("no rope")
         ):
             output = scheduler.step()
         assert output is not None
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
 
     def test_a_raising_chunk_path_does_not_escape_the_step(self):
         scheduler = _make_scheduler()
         _queued(scheduler)
-        scheduler._shadow_note_step(did_foreground_work=False)
-        scheduler._shadow_note_step(did_foreground_work=False)
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
         with patch.object(
-            scheduler, "_shadow_step", side_effect=RuntimeError("boom")
+            scheduler, "_canonical_recovery_step", side_effect=RuntimeError("boom")
         ):
             output = scheduler.step()
         assert output is not None
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
 
     def test_the_foreground_outputs_are_untouched_by_the_failure(self):
         scheduler = _make_scheduler()
         _queued(scheduler)
         with patch.object(
-            scheduler, "_shadow_note_step", side_effect=RuntimeError("boom")
+            scheduler, "_canonical_recovery_note_step", side_effect=RuntimeError("boom")
         ):
             output = scheduler.step()
         assert output.outputs == []
@@ -1038,14 +1038,14 @@ class TestRetiringStateMidChunkGivesTheFootprintBack:
     done. The next window rebuilds under the same request id, which overwrites
     the block table and orphans the previous references: never decremented,
     never evictable, filling the paged cache until the memory throttle starts
-    refusing the recovery chunks outright. `_shadow_finish`'s own comment names
+    refusing the recovery chunks outright. `_canonical_recovery_finish`'s own comment names
     that consequence for the path it guards; this is the path that did not.
     """
 
     def _extended_mid_chunk(self, scheduler):
         job = _queued(scheduler)
         state = _live_state(job, processed=BLOCK)
-        state.shadow_target_tokens = job.target_tokens
+        state.canonical_recovery_target_tokens = job.target_tokens
         job.prefill_state = state
         # The turn that lands while the chunk is in flight.
         job.target_tokens += BLOCK
@@ -1057,8 +1057,8 @@ class TestRetiringStateMidChunkGivesTheFootprintBack:
         job, _state = self._extended_mid_chunk(scheduler)
         with _cleanup_spy(scheduler) as spy, patch.object(
             scheduler, "_step_prefill_chunk", return_value=False
-        ), patch.object(scheduler, "_shadow_publish"):
-            assert scheduler._shadow_step_inner() is True
+        ), patch.object(scheduler, "_canonical_recovery_publish"):
+            assert scheduler._canonical_recovery_step_inner() is True
             _assert_cleanup_fired(spy)
         assert job.prefill_state is None
 
@@ -1070,9 +1070,9 @@ class TestRetiringStateMidChunkGivesTheFootprintBack:
         job.note_published(BLOCK)
         with patch.object(
             scheduler, "_step_prefill_chunk", return_value=False
-        ), patch.object(scheduler, "_shadow_publish"):
-            scheduler._shadow_step_inner()
-        assert scheduler._shadow_job is job
+        ), patch.object(scheduler, "_canonical_recovery_publish"):
+            scheduler._canonical_recovery_step_inner()
+        assert scheduler._canonical_recovery_job is job
         assert not job.cancelled
         assert not job.done
         assert job.committed_tokens == BLOCK
@@ -1118,7 +1118,7 @@ class TestTheRecoveryRequestIsInvisibleToTheRequestSweeps:
             prompt_token_ids=list(range(4 * BLOCK)),
             sampling_params=SamplingParams(max_tokens=1),
         )
-        recovery.is_shadow = True
+        recovery.is_canonical_recovery = True
         scheduler.requests[foreground.request_id] = foreground
         scheduler.requests[recovery.request_id] = recovery
         return foreground, recovery
@@ -1135,11 +1135,11 @@ class TestTheRecoveryRequestIsInvisibleToTheRequestSweeps:
         drains on that predicate. A job that survives the failure that killed
         every request keeps the engine awake and unloadable forever."""
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(4 * BLOCK, scheduler=scheduler))
-        assert scheduler._shadow_job is not None
+        scheduler.note_canonical_recovery_candidate(_sparse_request(4 * BLOCK, scheduler=scheduler))
+        assert scheduler._canonical_recovery_job is not None
         assert scheduler.has_requests()
         scheduler.fail_all_requests()
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert not scheduler.has_requests()
 
     def test_cache_corruption_recovery_does_not_resurrect_it(self):
@@ -1147,7 +1147,7 @@ class TestTheRecoveryRequestIsInvisibleToTheRequestSweeps:
         foreground, _recovery = self._with_both(scheduler)
         collected = scheduler._collect_corruption_retry_requests()
         assert foreground in collected
-        assert all(not request.is_shadow for request in collected)
+        assert all(not request.is_canonical_recovery for request in collected)
 
     def test_generation_overflow_rescheduling_does_not_resurrect_it(self):
         scheduler = _make_scheduler()

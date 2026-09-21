@@ -29,11 +29,11 @@ import pytest
 from omlx.model_settings import ModelSettings
 from omlx.prefill_boundaries import clamp_prefill_chunk_to_boundary
 from omlx.scheduler import Scheduler, SchedulerConfig
-from omlx.shadow_prefill import (
-    ShadowJob,
-    apply_shadow_prefill_settings,
+from omlx.canonical_recovery import (
+    CanonicalRecoveryJob,
+    apply_canonical_recovery_settings,
     safe_publish_boundary,
-    shadow_slice_cap,
+    canonical_recovery_slice_cap,
 )
 
 BLOCK = 4096
@@ -50,8 +50,8 @@ def _make_scheduler(**config_over) -> Scheduler:
         prefill_step_size=2048,
         chunked_prefill=True,
         paged_cache_block_size=BLOCK,
-        shadow_prefill_enabled=True,
-        shadow_prefill_global_budget_pct=10.0,
+        canonical_state_recovery_enabled=True,
+        canonical_state_recovery_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -62,20 +62,22 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _request(is_shadow: bool):
+def _request(is_canonical_recovery: bool):
     request = MagicMock()
-    request.is_shadow = is_shadow
+    request.is_canonical_recovery = is_canonical_recovery
     return request
 
 
 class TestTheCapAppliesToRecoveryOnly:
     def test_a_foreground_request_keeps_the_ordinary_step_size(self):
-        scheduler = _make_scheduler(shadow_prefill_slice_tokens=256)
-        assert shadow_slice_cap(scheduler.config, _request(False), 2048) == 2048
+        scheduler = _make_scheduler(canonical_state_recovery_slice_tokens=256)
+        cap = scheduler._canonical_recovery_slice_tokens
+        assert canonical_recovery_slice_cap(cap, _request(False), 2048) == 2048
 
     def test_a_recovery_request_is_capped(self):
-        scheduler = _make_scheduler(shadow_prefill_slice_tokens=256)
-        assert shadow_slice_cap(scheduler.config, _request(True), 2048) == 256
+        scheduler = _make_scheduler(canonical_state_recovery_slice_tokens=256)
+        cap = scheduler._canonical_recovery_slice_tokens
+        assert canonical_recovery_slice_cap(cap, _request(True), 2048) == 256
 
     def test_zero_leaves_recovery_on_the_ordinary_step_size(self):
         """The default: recovery runs at the ordinary prefill step size.
@@ -83,17 +85,20 @@ class TestTheCapAppliesToRecoveryOnly:
         This is the state the block-grain blocking interval was characterised
         in, and it is what the cap exists to narrow.
         """
-        scheduler = _make_scheduler(shadow_prefill_slice_tokens=0)
-        assert shadow_slice_cap(scheduler.config, _request(True), 2048) == 2048
+        scheduler = _make_scheduler(canonical_state_recovery_slice_tokens=0)
+        cap = scheduler._canonical_recovery_slice_tokens
+        assert canonical_recovery_slice_cap(cap, _request(True), 2048) == 2048
 
     def test_the_cap_only_ever_lowers(self):
-        scheduler = _make_scheduler(shadow_prefill_slice_tokens=8192)
-        assert shadow_slice_cap(scheduler.config, _request(True), 512) == 512
+        scheduler = _make_scheduler(canonical_state_recovery_slice_tokens=8192)
+        cap = scheduler._canonical_recovery_slice_tokens
+        assert canonical_recovery_slice_cap(cap, _request(True), 512) == 512
 
-    def test_a_request_with_no_shadow_marker_is_foreground(self):
-        scheduler = _make_scheduler(shadow_prefill_slice_tokens=256)
+    def test_a_request_with_no_canonical_recovery_marker_is_foreground(self):
+        scheduler = _make_scheduler(canonical_state_recovery_slice_tokens=256)
         plain = MagicMock(spec=[])
-        assert shadow_slice_cap(scheduler.config, plain, 2048) == 2048
+        cap = scheduler._canonical_recovery_slice_tokens
+        assert canonical_recovery_slice_cap(cap, plain, 2048) == 2048
 
 
 def _walk(slice_tokens: int, target: int, block: int = BLOCK):
@@ -102,7 +107,7 @@ def _walk(slice_tokens: int, target: int, block: int = BLOCK):
     Uses the runtime's own clamp rather than a re-implementation of it, so the
     test fails if the clamp stops being what makes this work.
     """
-    job = ShadowJob(
+    job = CanonicalRecoveryJob(
         session_key="s",
         tokens=list(range(target)),
         target_tokens=target,
@@ -149,7 +154,7 @@ class TestPublicationDoesNotMoveWithTheSlice:
         If a smaller slice made the job recompute, `processed_tokens` would go
         backwards somewhere in the walk.
         """
-        job = ShadowJob(
+        job = CanonicalRecoveryJob(
             session_key="s",
             tokens=list(range(4 * BLOCK)),
             target_tokens=4 * BLOCK,
@@ -196,20 +201,50 @@ class TestPublicationDoesNotMoveWithTheSlice:
 class TestTheSliceReachesTheScheduler:
     def test_a_model_setting_carries_onto_the_scheduler_config(self):
         config = SchedulerConfig()
-        apply_shadow_prefill_settings(
+        apply_canonical_recovery_settings(
             config,
             ModelSettings(
-                shadow_prefill_enabled=True,
-                shadow_prefill_slice_tokens=512,
+                canonical_state_recovery_enabled=True,
+                canonical_state_recovery_slice_tokens=512,
             ),
         )
-        assert config.shadow_prefill_slice_tokens == 512
+        assert config.canonical_state_recovery_slice_tokens == 512
 
     def test_an_absent_setting_is_zero_rather_than_a_guess(self):
         config = SchedulerConfig()
-        apply_shadow_prefill_settings(config, ModelSettings())
-        assert config.shadow_prefill_slice_tokens == 0
+        apply_canonical_recovery_settings(config, ModelSettings())
+        assert config.canonical_state_recovery_slice_tokens == 0
 
     def test_a_negative_slice_is_refused(self):
-        with pytest.raises(ValueError, match="shadow_prefill_slice_tokens"):
-            ModelSettings(shadow_prefill_slice_tokens=-1)
+        with pytest.raises(ValueError, match="canonical_state_recovery_slice_tokens"):
+            ModelSettings(canonical_state_recovery_slice_tokens=-1)
+
+
+class TestTheSliceSizeIsThisEnginesOwn:
+    """A second model's load must not resize a running engine's slices.
+
+    `SchedulerConfig` is one object shared by every engine in the pool, and
+    `apply_canonical_recovery_settings` rewrites it at every load. The enabled
+    flag is snapshotted at construction for exactly that reason. The slice size
+    was read live, so loading a second model with a larger slice would have
+    lengthened the worst-case foreground blocking of a model already running,
+    without that model's own settings having changed.
+    """
+
+    def test_a_later_load_does_not_change_this_scheduler(self):
+        scheduler = _make_scheduler(canonical_state_recovery_slice_tokens=256)
+        assert scheduler._canonical_recovery_slice_tokens == 256
+
+        # a second model loads, rewriting the shared config
+        apply_canonical_recovery_settings(
+            scheduler.config,
+            ModelSettings(
+                canonical_state_recovery_enabled=True,
+                canonical_state_recovery_slice_tokens=8192,
+            ),
+        )
+        assert scheduler.config.canonical_state_recovery_slice_tokens == 8192
+
+        assert scheduler._canonical_recovery_slice_tokens == 256
+        cap = scheduler._canonical_recovery_slice_tokens
+        assert canonical_recovery_slice_cap(cap, _request(True), 2048) == 256

@@ -33,7 +33,7 @@ from omlx.decode_activity import get_decode_activity
 from omlx.engine_pool import EnginePool
 from omlx.prefill_progress import get_prefill_tracker
 from omlx.scheduler import Scheduler, SchedulerConfig
-from omlx.shadow_prefill import ShadowBudget
+from omlx.canonical_recovery import CanonicalRecoveryBudget
 
 WINDOW_S = 30.0
 PCT = 10.0
@@ -52,13 +52,13 @@ def _pool_config(pct: float = PCT) -> SchedulerConfig:
         prefill_step_size=64,
         chunked_prefill=True,
         paged_cache_block_size=256,
-        shadow_prefill_enabled=True,
-        shadow_prefill_budget_window_s=WINDOW_S,
-        shadow_prefill_global_budget_pct=pct,
+        canonical_state_recovery_enabled=True,
+        canonical_state_recovery_budget_window_s=WINDOW_S,
+        canonical_state_recovery_global_budget_pct=pct,
     )
     pool = EnginePool.__new__(EnginePool)
     pool._scheduler_config = config
-    EnginePool.configure_shadow_budget(pool)
+    EnginePool.configure_canonical_recovery_budget(pool)
     return config
 
 
@@ -75,9 +75,9 @@ def _engine(config: SchedulerConfig | None = None, label: str = "m") -> Schedule
             prefill_step_size=64,
             chunked_prefill=True,
             paged_cache_block_size=256,
-            shadow_prefill_enabled=True,
-            shadow_prefill_global_budget_pct=PCT,
-            shadow_prefill_budget_window_s=WINDOW_S,
+            canonical_state_recovery_enabled=True,
+            canonical_state_recovery_global_budget_pct=PCT,
+            canonical_state_recovery_budget_window_s=WINDOW_S,
         ),
     )
     scheduler.block_aware_cache = MagicMock()
@@ -99,8 +99,8 @@ def _sparse_request(prompt_tokens: int, rid: str, scheduler: Scheduler):
 
 
 def _idle(scheduler: Scheduler) -> None:
-    scheduler._shadow_note_step(did_foreground_work=False)
-    scheduler._shadow_note_step(did_foreground_work=False)
+    scheduler._canonical_recovery_note_step(did_foreground_work=False)
+    scheduler._canonical_recovery_note_step(did_foreground_work=False)
 
 
 @pytest.fixture(autouse=True)
@@ -119,7 +119,7 @@ def two_engines():
     config = _pool_config()
     a = _engine(config, "a")
     b = _engine(config, "b")
-    assert a._shadow_budget is b._shadow_budget
+    assert a._canonical_recovery_budget is b._canonical_recovery_budget
     return a, b
 
 
@@ -128,25 +128,25 @@ class TestOneBudgetForTheProcess:
 
     def test_the_two_schedulers_hold_the_same_budget_object(self, two_engines):
         a, b = two_engines
-        assert a._shadow_budget.shared is True
-        assert len(a._shadow_budget.owners) == 2
-        assert a._shadow_owner_key != b._shadow_owner_key
+        assert a._canonical_recovery_budget.shared is True
+        assert len(a._canonical_recovery_budget.owners) == 2
+        assert a._canonical_recovery_owner_key != b._canonical_recovery_owner_key
 
     def test_service_on_one_engine_is_charged_against_the_other(self, two_engines):
         a, b = two_engines
-        assert a._shadow_budget.allows()
-        assert b._shadow_budget.allows()
+        assert a._canonical_recovery_budget.allows()
+        assert b._canonical_recovery_budget.allows()
 
-        a._shadow_budget.note_service(ALLOWANCE_S * 0.75)
-        assert b._shadow_budget.allows()      # a quarter of one allowance left
+        a._canonical_recovery_budget.note_service(ALLOWANCE_S * 0.75)
+        assert b._canonical_recovery_budget.allows()      # a quarter of one allowance left
 
-        b._shadow_budget.note_service(ALLOWANCE_S * 0.5)
+        b._canonical_recovery_budget.note_service(ALLOWANCE_S * 0.5)
         # Together they have spent 1.25 allowances. Neither may run again in
         # this window; a per-engine budget would have granted each of them a
         # whole allowance of their own.
-        assert not a._shadow_budget.allows()
-        assert not b._shadow_budget.allows()
-        assert a._shadow_budget.window_service_s == pytest.approx(
+        assert not a._canonical_recovery_budget.allows()
+        assert not b._canonical_recovery_budget.allows()
+        assert a._canonical_recovery_budget.window_service_s == pytest.approx(
             ALLOWANCE_S * 1.25
         )
 
@@ -155,14 +155,14 @@ class TestOneBudgetForTheProcess:
         granted. The charge lands after the grant, so the bound is one
         allowance plus at most the slice that overran it."""
         a, b = two_engines
-        budget = a._shadow_budget
+        budget = a._canonical_recovery_budget
         slice_s = 0.4
         granted = 0.0
         for window in range(4):
             budget.window_start_s -= WINDOW_S      # roll one window forward
             for engine in (a, b):
-                while engine._shadow_budget.allows():
-                    engine._shadow_budget.note_service(slice_s)
+                while engine._canonical_recovery_budget.allows():
+                    engine._canonical_recovery_budget.note_service(slice_s)
                     granted += slice_s
         # The bound comes out tight — exactly one allowance per window plus
         # the single slice that overran the last of them — so it is compared
@@ -176,32 +176,32 @@ class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
 
     def test_a_foreign_decode_withdraws_the_chunk(self, two_engines):
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
         _idle(a)
-        assert a._shadow_runnable()
+        assert a._canonical_recovery_runnable()
 
         get_decode_activity().publish(b._decode_activity_key, 1)
-        assert not a._shadow_runnable()
+        assert not a._canonical_recovery_runnable()
         assert not a.has_requests()
 
         get_decode_activity().publish(b._decode_activity_key, 0)
-        assert a._shadow_runnable()
+        assert a._canonical_recovery_runnable()
 
     def test_a_foreign_foreground_prefill_withdraws_the_chunk(self, two_engines):
         """The half the decode registry cannot see: an engine that is
         prefilling publishes a decode count of zero, which *removes* its
         registry entry."""
         a, _b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
         _idle(a)
-        assert a._shadow_runnable()
+        assert a._canonical_recovery_runnable()
 
         get_prefill_tracker().update("b-foreground", 100, 8000, "model-b")
-        assert not a._shadow_runnable()
+        assert not a._canonical_recovery_runnable()
         assert not a.has_requests()
 
         get_prefill_tracker().remove("b-foreground")
-        assert a._shadow_runnable()
+        assert a._canonical_recovery_runnable()
 
     def test_a_foreign_recovery_job_is_not_foreground(self, two_engines):
         """And the reason it must not be.
@@ -212,13 +212,13 @@ class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
         indefinitely. Mutual exclusion between recovery jobs is the claim.
         """
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
-        b.note_shadow_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
         _idle(a)
         get_prefill_tracker().update(
-            b._shadow_request_id(b._shadow_job), 256, 8000, "model-b"
+            b._canonical_recovery_request_id(b._canonical_recovery_job), 256, 8000, "model-b"
         )
-        assert not a._shadow_foreign_engine_busy()
+        assert not a._canonical_recovery_foreign_engine_busy()
 
 
 class TestTheFirstSliceIsNotInvisible:
@@ -226,11 +226,11 @@ class TestTheFirstSliceIsNotInvisible:
 
     def test_the_claim_is_held_before_the_state_build(self, two_engines):
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
-        b.note_shadow_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
         _idle(a)
         _idle(b)
-        assert a._shadow_runnable() and b._shadow_runnable()
+        assert a._canonical_recovery_runnable() and b._canonical_recovery_runnable()
 
         seen = {}
 
@@ -238,13 +238,13 @@ class TestTheFirstSliceIsNotInvisible:
             # The instant the state build could begin, the peer must already
             # see a process with recovery running. Before the claim this was
             # the whole duration of the first slice.
-            seen["b_blocked"] = b._shadow_claim_blocked()
-            seen["b_runnable"] = b._shadow_runnable()
+            seen["b_blocked"] = b._canonical_recovery_claim_blocked()
+            seen["b_runnable"] = b._canonical_recovery_runnable()
             seen["b_has_work"] = b.has_requests()
             return False
 
-        with patch.object(a, "_shadow_step_inner", side_effect=_inner):
-            a._shadow_step()
+        with patch.object(a, "_canonical_recovery_step_inner", side_effect=_inner):
+            a._canonical_recovery_step()
 
         assert seen["b_blocked"] is True
         assert seen["b_runnable"] is False
@@ -252,35 +252,35 @@ class TestTheFirstSliceIsNotInvisible:
 
     def test_the_claim_is_released_when_the_slice_ends(self, two_engines):
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
-        b.note_shadow_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
         _idle(b)
-        with patch.object(a, "_shadow_step_inner", return_value=False):
-            a._shadow_step()
-        assert not b._shadow_claim_blocked()
-        assert b._shadow_runnable()
+        with patch.object(a, "_canonical_recovery_step_inner", return_value=False):
+            a._canonical_recovery_step()
+        assert not b._canonical_recovery_claim_blocked()
+        assert b._canonical_recovery_runnable()
 
     def test_a_slice_that_raises_still_releases_the_claim(self, two_engines):
         """Otherwise one failure stops recovery for the whole process."""
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
-        b.note_shadow_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
         _idle(b)
         with patch.object(
-            a, "_shadow_step_inner", side_effect=RuntimeError("boom")
+            a, "_canonical_recovery_step_inner", side_effect=RuntimeError("boom")
         ), pytest.raises(RuntimeError):
-            a._shadow_step()
-        assert not b._shadow_claim_blocked()
+            a._canonical_recovery_step()
+        assert not b._canonical_recovery_claim_blocked()
 
     def test_a_stale_claim_expires(self, two_engines):
         """A holder that dies mid-slice must not hold it for the process's
         life. The backstop the decode registry uses, for the same reason."""
         a, b = two_engines
-        budget = a._shadow_budget
-        assert budget.try_claim(a._shadow_owner_key)
-        assert not budget.try_claim(b._shadow_owner_key)
+        budget = a._canonical_recovery_budget
+        assert budget.try_claim(a._canonical_recovery_owner_key)
+        assert not budget.try_claim(b._canonical_recovery_owner_key)
         budget.claim_at_s -= budget.claim_ttl_s + 1
-        assert budget.try_claim(b._shadow_owner_key)
+        assert budget.try_claim(b._canonical_recovery_owner_key)
 
 
 class TestAnExhaustedBudgetParksEveryEngine:
@@ -288,11 +288,11 @@ class TestAnExhaustedBudgetParksEveryEngine:
 
     def test_neither_engine_steps_while_the_window_is_spent(self, two_engines):
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
-        b.note_shadow_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
         assert a.has_requests() and b.has_requests()
 
-        a._shadow_budget.note_service(WINDOW_S)     # far past one allowance
+        a._canonical_recovery_budget.note_service(WINDOW_S)     # far past one allowance
         assert not a.has_requests()
         assert not b.has_requests()
 
@@ -303,13 +303,13 @@ class TestAnExhaustedBudgetParksEveryEngine:
                     engine.step()
                     steps += 1
         assert steps == 0
-        assert a._shadow_job is not None and b._shadow_job is not None
+        assert a._canonical_recovery_job is not None and b._canonical_recovery_job is not None
 
     def test_both_wake_when_the_window_replenishes(self, two_engines):
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
-        b.note_shadow_candidate(_sparse_request(1000, "r2", b))
-        budget = a._shadow_budget
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
+        budget = a._canonical_recovery_budget
         budget.note_service(WINDOW_S)
         assert not a.has_requests()
 
@@ -322,12 +322,12 @@ class TestAnExhaustedBudgetParksEveryEngine:
         """The deadline that drops a job which may run and cannot must not
         fire on a job that is waiting for a reason that ends."""
         a, b = two_engines
-        a.note_shadow_candidate(_sparse_request(1000, "r1", a))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
         get_prefill_tracker().update("b-foreground", 100, 8000, "model-b")
         for _ in range(200):
-            a._shadow_after_step(MagicMock(has_work=False))
-        assert a._shadow_job is not None
-        assert a._shadow_blocked_idle_steps == 0
+            a._canonical_recovery_after_step(MagicMock(has_work=False))
+        assert a._canonical_recovery_job is not None
+        assert a._canonical_recovery_blocked_idle_steps == 0
 
 
 class TestOneOwnersResetSparesTheRest:
@@ -337,8 +337,8 @@ class TestOneOwnersResetSparesTheRest:
         self, two_engines
     ):
         a, b = two_engines
-        budget = a._shadow_budget
-        a._shadow_budget.note_service(ALLOWANCE_S * 1.5)   # A overran
+        budget = a._canonical_recovery_budget
+        a._canonical_recovery_budget.note_service(ALLOWANCE_S * 1.5)   # A overran
         spent = budget.window_service_s
         overshoot = budget.overshoot_s
         window_start = budget.window_start_s
@@ -356,15 +356,15 @@ class TestOneOwnersResetSparesTheRest:
     def test_a_shared_budget_refuses_a_direct_reset(self, two_engines):
         a, _b = two_engines
         with pytest.raises(RuntimeError, match="shared recovery budget"):
-            a._shadow_budget.reset()
+            a._canonical_recovery_budget.reset()
 
     def test_a_private_budget_still_resets(self):
         """The bare-Scheduler path keeps the semantics it always had."""
         solo = _engine()
-        assert solo._shadow_budget.shared is False
-        solo._shadow_budget.note_service(1.0)
+        assert solo._canonical_recovery_budget.shared is False
+        solo._canonical_recovery_budget.note_service(1.0)
         solo.reset()
-        assert solo._shadow_budget.service_s == 0.0
+        assert solo._canonical_recovery_budget.service_s == 0.0
 
 
 class TestReloadBuysNothing:
@@ -372,7 +372,7 @@ class TestReloadBuysNothing:
 
     def test_a_returning_owner_finds_the_window_where_it_left_it(self, two_engines):
         a, b = two_engines
-        budget = a._shadow_budget
+        budget = a._canonical_recovery_budget
         budget.note_service(ALLOWANCE_S * 1.5)
         spent = budget.window_service_s
         overshoot = budget.overshoot_s
@@ -380,13 +380,13 @@ class TestReloadBuysNothing:
         assert not budget.allows()
 
         # unload
-        budget.deregister(a._shadow_owner_key)
+        budget.deregister(a._canonical_recovery_owner_key)
         assert len(budget.owners) == 1
         assert budget.window_service_s == spent
         assert budget.overshoot_s == overshoot
 
         # reload
-        budget.register(a._shadow_owner_key)
+        budget.register(a._canonical_recovery_owner_key)
         assert len(budget.owners) == 2
         assert budget.window_service_s == spent
         assert budget.overshoot_s == overshoot
@@ -396,26 +396,26 @@ class TestReloadBuysNothing:
     def test_reconfiguring_the_cap_keeps_the_window_and_the_debt(self):
         """A settings change must not hand every engine a clean slate either."""
         config = _pool_config(pct=PCT)
-        budget = config.shadow_budget
+        budget = config.canonical_recovery_budget
         budget.note_service(ALLOWANCE_S * 1.5)
         spent, overshoot = budget.window_service_s, budget.overshoot_s
 
-        config.shadow_prefill_global_budget_pct = 20.0
+        config.canonical_state_recovery_global_budget_pct = 20.0
         pool = EnginePool.__new__(EnginePool)
         pool._scheduler_config = config
-        EnginePool.configure_shadow_budget(pool)
+        EnginePool.configure_canonical_recovery_budget(pool)
 
-        assert config.shadow_budget is budget
+        assert config.canonical_recovery_budget is budget
         assert budget.pct == 20.0
         assert budget.window_service_s == spent
         assert budget.overshoot_s == overshoot
 
     def test_a_departing_owner_releases_its_claim(self, two_engines):
         a, b = two_engines
-        budget = a._shadow_budget
-        assert budget.try_claim(a._shadow_owner_key)
-        budget.deregister(a._shadow_owner_key)
-        assert budget.try_claim(b._shadow_owner_key)
+        budget = a._canonical_recovery_budget
+        assert budget.try_claim(a._canonical_recovery_owner_key)
+        budget.deregister(a._canonical_recovery_owner_key)
+        assert budget.try_claim(b._canonical_recovery_owner_key)
 
 
 class TestABareSchedulerStillRecovers:
@@ -424,17 +424,17 @@ class TestABareSchedulerStillRecovers:
 
     def test_a_scheduler_without_a_pool_gets_its_own_budget(self):
         solo = _engine()
-        assert solo._shadow_budget.shared is False
-        assert solo._shadow_budget.pct == PCT
-        assert len(solo._shadow_budget.owners) == 1
+        assert solo._canonical_recovery_budget.shared is False
+        assert solo._canonical_recovery_budget.pct == PCT
+        assert len(solo._canonical_recovery_budget.owners) == 1
 
     def test_two_bare_schedulers_do_not_share(self):
         first, second = _engine(), _engine()
-        assert first._shadow_budget is not second._shadow_budget
+        assert first._canonical_recovery_budget is not second._canonical_recovery_budget
 
     def test_recovery_still_runs_on_a_bare_scheduler(self):
         solo = _engine()
-        solo.note_shadow_candidate(_sparse_request(1000, "r1", solo))
+        solo.note_canonical_recovery_candidate(_sparse_request(1000, "r1", solo))
         _idle(solo)
-        assert solo._shadow_runnable()
+        assert solo._canonical_recovery_runnable()
         assert solo.has_requests()

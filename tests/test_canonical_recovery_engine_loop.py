@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """What a live recovery job costs the engine loop while it is not running.
 
-A shadow job is only allowed to run on an idle engine, and it keeps the engine
+A recovery job is only allowed to run on an idle engine, and it keeps the engine
 loop stepping so that the idle moment it needs can actually arrive. Those two
 facts together are a resource question, not a scheduling one: for as long as a
 job is live and waiting, the loop runs a full scheduler step twenty times a
@@ -28,7 +28,7 @@ import pytest
 
 from omlx.engine_core import EngineConfig, EngineCore
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput
-from omlx.shadow_prefill import MAX_BLOCKED_IDLE_STEPS
+from omlx.canonical_recovery import MAX_BLOCKED_IDLE_STEPS
 
 
 def _make_scheduler(**config_over) -> Scheduler:
@@ -42,8 +42,8 @@ def _make_scheduler(**config_over) -> Scheduler:
         prefill_step_size=64,
         chunked_prefill=True,
         paged_cache_block_size=256,
-        shadow_prefill_enabled=True,
-        shadow_prefill_global_budget_pct=10.0,
+        canonical_state_recovery_enabled=True,
+        canonical_state_recovery_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -71,13 +71,13 @@ def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
 
 def _spend_the_window(scheduler: Scheduler) -> None:
     """Charge a whole window's wall time, which no allowance can cover."""
-    scheduler._shadow_budget.note_service(scheduler._shadow_budget.window_s)
+    scheduler._canonical_recovery_budget.note_service(scheduler._canonical_recovery_budget.window_s)
 
 
 class TestTheLoopRepollsWithoutAWake:
     """The premise the parking decision rests on, measured rather than assumed.
 
-    An earlier version of ``_has_shadow_work`` held the predicate true through
+    An earlier version of ``_has_canonical_recovery_work`` held the predicate true through
     a spent window on the belief that reporting no work would park the loop
     until an unrelated request woke it — "which on an idle server is never".
     The loop does not behave that way, and these two tests are why the belief
@@ -160,7 +160,7 @@ class TestASpentWindowCostsNoSteps:
 
     def test_a_spent_window_takes_no_scheduler_steps(self):
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         _spend_the_window(scheduler)
         counter_before = scheduler._step_counter
         assert self._drive(scheduler, 50) == 0
@@ -169,29 +169,29 @@ class TestASpentWindowCostsNoSteps:
     def test_an_allowed_window_does_step(self):
         """The contrast, so the test above is not passing for the wrong reason."""
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         counter_before = scheduler._step_counter
-        with patch.object(scheduler, "_shadow_step", return_value=False):
+        with patch.object(scheduler, "_canonical_recovery_step", return_value=False):
             assert self._drive(scheduler, 5) == 5
         assert scheduler._step_counter == counter_before + 5
 
     def test_the_job_survives_being_parked(self):
         """Parking is not cancelling: the job and its committed prefix stay."""
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
-        job = scheduler._shadow_job
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        job = scheduler._canonical_recovery_job
         job.note_published(512)
         _spend_the_window(scheduler)
         assert not scheduler.has_requests()
-        assert scheduler._shadow_job is job
+        assert scheduler._canonical_recovery_job is job
         assert not job.cancelled
         assert job.committed_tokens == 512
 
     def test_a_zero_budget_is_still_a_different_case(self):
         """Zero percent never replenishes, so its job is not waiting at all."""
-        scheduler = _make_scheduler(shadow_prefill_global_budget_pct=0.0)
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
-        assert scheduler._shadow_job is None
+        scheduler = _make_scheduler(canonical_state_recovery_global_budget_pct=0.0)
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        assert scheduler._canonical_recovery_job is None
         assert not scheduler.has_requests()
 
 
@@ -215,13 +215,13 @@ class TestAStalledJobIsGivenUpOn:
 
     def test_a_job_blocked_by_a_leftover_rope_wrapper_is_dropped(self):
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
             self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS - 1)
-            assert scheduler._shadow_job is not None
-            assert scheduler._shadow_blocked_idle_steps == MAX_BLOCKED_IDLE_STEPS - 1
+            assert scheduler._canonical_recovery_job is not None
+            assert scheduler._canonical_recovery_blocked_idle_steps == MAX_BLOCKED_IDLE_STEPS - 1
             self._run_idle_steps(scheduler, 1)
-        assert scheduler._shadow_job is None
+        assert scheduler._canonical_recovery_job is None
         assert not scheduler.has_requests()
 
     def test_a_busy_engine_is_not_a_stall(self):
@@ -231,34 +231,34 @@ class TestAStalledJobIsGivenUpOn:
         and it buys nothing: the loop is stepping for the foreground anyway.
         """
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         # A request that has arrived and not yet been admitted: foreground
         # pressure the scheduler's own lists cannot see, and the hardest case
         # for the deadline to get right.
         scheduler.note_inbound_request("inbound-1")
         self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS * 2)
-        assert scheduler._shadow_job is not None
-        assert scheduler._shadow_blocked_idle_steps == 0
+        assert scheduler._canonical_recovery_job is not None
+        assert scheduler._canonical_recovery_blocked_idle_steps == 0
 
     def test_a_spent_budget_is_not_a_stall(self):
         """Waiting for an allowance is the ordinary case, and parking covers it."""
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         _spend_the_window(scheduler)
         with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
             self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS * 2)
-        assert scheduler._shadow_job is not None
-        assert scheduler._shadow_blocked_idle_steps == 0
+        assert scheduler._canonical_recovery_job is not None
+        assert scheduler._canonical_recovery_blocked_idle_steps == 0
 
     def test_a_chunk_that_runs_clears_the_deadline(self):
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
             self._run_idle_steps(scheduler, 10)
-        assert scheduler._shadow_blocked_idle_steps == 10
-        with patch.object(scheduler, "_shadow_step", return_value=True):
+        assert scheduler._canonical_recovery_blocked_idle_steps == 10
+        with patch.object(scheduler, "_canonical_recovery_step", return_value=True):
             self._run_idle_steps(scheduler, 2)
-        assert scheduler._shadow_blocked_idle_steps == 0
+        assert scheduler._canonical_recovery_blocked_idle_steps == 0
 
 
 class TestForegroundPriorityIsEngineGlobal:
@@ -271,27 +271,27 @@ class TestForegroundPriorityIsEngineGlobal:
     """
 
     def _idle(self, scheduler: Scheduler) -> None:
-        scheduler._shadow_note_step(did_foreground_work=False)
-        scheduler._shadow_note_step(did_foreground_work=False)
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
 
     def test_an_idle_engine_admits_a_chunk(self):
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         self._idle(scheduler)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
     @pytest.mark.parametrize("queue", ["waiting", "running", "prefilling"])
     def test_any_foreground_queue_withdraws_the_chunk(self, queue):
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         self._idle(scheduler)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
         held = getattr(scheduler, queue)
         if isinstance(held, dict):
             held["foreground"] = MagicMock()
         else:
             held.append(MagicMock())
-        assert not scheduler._shadow_runnable()
+        assert not scheduler._canonical_recovery_runnable()
 
     def test_a_request_that_has_arrived_but_not_been_admitted_withdraws_it(self):
         """The window the scheduler's own lists cannot see.
@@ -301,28 +301,28 @@ class TestForegroundPriorityIsEngineGlobal:
         list says idle while a request is already waiting.
         """
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         self._idle(scheduler)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
         scheduler.note_inbound_request("inbound-1")
-        assert not scheduler._shadow_runnable()
+        assert not scheduler._canonical_recovery_runnable()
         scheduler.note_admitted_request("inbound-1")
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
     def test_foreground_work_resets_the_idle_run(self):
         """A chunk holds the interpreter for its whole duration, so the rule
         is two idle steps, not one: the second is the window an arriving
         request has to announce itself in."""
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         self._idle(scheduler)
-        assert scheduler._shadow_runnable()
-        scheduler._shadow_note_step(did_foreground_work=True)
-        assert not scheduler._shadow_runnable()
-        scheduler._shadow_note_step(did_foreground_work=False)
-        assert not scheduler._shadow_runnable()
-        scheduler._shadow_note_step(did_foreground_work=False)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
+        scheduler._canonical_recovery_note_step(did_foreground_work=True)
+        assert not scheduler._canonical_recovery_runnable()
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        assert not scheduler._canonical_recovery_runnable()
+        scheduler._canonical_recovery_note_step(did_foreground_work=False)
+        assert scheduler._canonical_recovery_runnable()
 
     def test_a_second_lineage_does_not_buy_a_second_budget(self):
         """The bound is engine-global: one job slot, one budget object.
@@ -331,14 +331,14 @@ class TestForegroundPriorityIsEngineGlobal:
         nothing per-session to multiply.
         """
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(
+        scheduler.note_canonical_recovery_candidate(
             _sparse_request(1000, rid="a", scheduler=scheduler)
         )
-        first = scheduler._shadow_job
-        budget = scheduler._shadow_budget
+        first = scheduler._canonical_recovery_job
+        budget = scheduler._canonical_recovery_budget
         other = _sparse_request(1000, rid="b", scheduler=scheduler)
         other.prompt_token_ids = list(range(5000, 6000))
-        scheduler.note_shadow_candidate(other)
-        assert scheduler._shadow_job is not first
-        assert scheduler._shadow_budget is budget
+        scheduler.note_canonical_recovery_candidate(other)
+        assert scheduler._canonical_recovery_job is not first
+        assert scheduler._canonical_recovery_budget is budget
         assert first.cancelled

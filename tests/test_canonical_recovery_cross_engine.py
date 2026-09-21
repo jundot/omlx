@@ -37,8 +37,8 @@ def _make_scheduler(**config_over) -> Scheduler:
         prefill_step_size=64,
         chunked_prefill=True,
         paged_cache_block_size=256,
-        shadow_prefill_enabled=True,
-        shadow_prefill_global_budget_pct=10.0,
+        canonical_state_recovery_enabled=True,
+        canonical_state_recovery_global_budget_pct=10.0,
     )
     config_kwargs.update(config_over)
     scheduler = Scheduler(
@@ -76,31 +76,31 @@ def _clean_registries():
 
 
 def _idle(scheduler: Scheduler) -> None:
-    scheduler._shadow_note_step(did_foreground_work=False)
-    scheduler._shadow_note_step(did_foreground_work=False)
+    scheduler._canonical_recovery_note_step(did_foreground_work=False)
+    scheduler._canonical_recovery_note_step(did_foreground_work=False)
 
 
 class TestAnotherEnginesDecodeWithdrawsTheChunk:
     def test_a_foreign_decode_makes_the_job_not_runnable(self):
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         _idle(scheduler)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
         get_decode_activity().publish("another-engine:beef", 1)
-        assert not scheduler._shadow_runnable()
+        assert not scheduler._canonical_recovery_runnable()
 
         get_decode_activity().publish("another-engine:beef", 0)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
     def test_this_engines_own_entry_is_not_a_foreign_one(self):
         """Its own decode is already covered by `running`, and counting it
         here would mean a scheduler stood down for itself."""
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         _idle(scheduler)
         get_decode_activity().publish(scheduler._decode_activity_key, 1)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
 
 class TestAnotherEnginesPrefillWithdrawsTheChunk:
@@ -114,25 +114,25 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
 
     def test_a_foreign_prefill_makes_the_job_not_runnable(self):
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         _idle(scheduler)
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
         get_prefill_tracker().update("other-request", 100, 8000, "another-model")
-        assert not scheduler._shadow_runnable()
+        assert not scheduler._canonical_recovery_runnable()
 
         get_prefill_tracker().remove("other-request")
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
     def test_the_jobs_own_prefill_entry_is_excluded(self):
         """A job between chunks still holds its entry, so counting it would
         stop the job it belongs to from ever taking a second chunk."""
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         _idle(scheduler)
-        rid = scheduler._shadow_request_id(scheduler._shadow_job)
+        rid = scheduler._canonical_recovery_request_id(scheduler._canonical_recovery_job)
         get_prefill_tracker().update(rid, 256, 768, "this-model")
-        assert scheduler._shadow_runnable()
+        assert scheduler._canonical_recovery_runnable()
 
     def test_a_foreign_prefill_parks_the_loop_and_keeps_the_job(self):
         """Standing down for another engine is waiting, not finishing.
@@ -144,7 +144,7 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
         it either — there is a reason, and the reason ends.
         """
         scheduler = _make_scheduler()
-        scheduler.note_shadow_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         assert scheduler.has_requests()
 
         get_prefill_tracker().update("other-request", 100, 8000, "another-model")
@@ -158,8 +158,8 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
                 scheduler.step()
                 steps += 1
         assert steps == 0
-        assert scheduler._shadow_job is not None
-        assert scheduler._shadow_blocked_idle_steps == 0
+        assert scheduler._canonical_recovery_job is not None
+        assert scheduler._canonical_recovery_blocked_idle_steps == 0
 
         get_prefill_tracker().remove("other-request")
         assert scheduler.has_requests()

@@ -22,8 +22,8 @@ from .model_profiles import (
     filter_profile_fields,
     filter_universal_fields,
     slugify_profile_api_name,
-    validate_profile_name,
     utcnow,
+    validate_profile_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -258,10 +258,16 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
-        shadow_prefill_enabled: Enable shadow prefill, a scheduler-owned
+        canonical_state_recovery_enabled: Enable canonical state recovery, a scheduler-owned
             dense re-read of a range a sparse prefill already served, run
-            only while the scheduler is idle.
-        shadow_prefill_slice_tokens: Tokens per recovery execution slice; 0
+            only while the scheduler is idle. Off by default, and this
+            switch alone does not make recovery run: the server must also
+            grant a non-zero `scheduler.canonical_state_recovery_global_budget_pct`,
+            which is 0 by default. The two grants are deliberately
+            independent — a model opts into recovery, and the server rations
+            the accelerator every model shares — because sparse execution does
+            not imply that the debt it leaves is worth repaying.
+        canonical_state_recovery_slice_tokens: Tokens per recovery execution slice; 0
             leaves it at the ordinary prefill step size. Not the publication
             grain — recovery publishes only at cache block boundaries either
             way. This is the slice a foreground request can arrive behind.
@@ -414,13 +420,13 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
-    # Shadow prefill: a scheduler-owned dense re-prefill of ranges a sparse
+    # Canonical state recovery: a scheduler-owned dense re-prefill of ranges a sparse
     # SpecPrefill turn left uncanonicalized. Off by default.
-    shadow_prefill_enabled: bool = False
+    canonical_state_recovery_enabled: bool = False
     # Tokens per recovery execution slice; 0 = the ordinary prefill step size.
     # Not the publication grain: recovery still publishes only at cache block
     # boundaries. This is the slice a foreground request can arrive behind.
-    shadow_prefill_slice_tokens: int = 0
+    canonical_state_recovery_slice_tokens: int = 0
 
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
@@ -549,8 +555,8 @@ class ModelSettings:
                     "vlm_mtp decode path does not apply"
                 )
         validate_moe_expert_offload(self.to_dict())
-        if self.shadow_prefill_slice_tokens < 0:
-            raise ValueError("shadow_prefill_slice_tokens must not be negative")
+        if self.canonical_state_recovery_slice_tokens < 0:
+            raise ValueError("canonical_state_recovery_slice_tokens must not be negative")
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

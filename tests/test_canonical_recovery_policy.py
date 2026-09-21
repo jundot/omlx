@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the shadow-prefill decision layer.
+"""Tests for the canonical-recovery decision layer.
 
 These are the conditions an earlier background-densification prototype got
 wrong, written as assertions rather than as review notes. Nothing here loads a
@@ -9,12 +9,12 @@ this speed.
 
 import pytest
 
-from omlx.shadow_prefill import (
+from omlx.canonical_recovery import (
     DEFAULT_BUDGET_WINDOW_S,
-    ShadowBudget,
-    ShadowJob,
+    CanonicalRecoveryBudget,
+    CanonicalRecoveryJob,
     safe_publish_boundary,
-    shadow_is_runnable,
+    canonical_recovery_is_runnable,
 )
 
 
@@ -42,21 +42,21 @@ class TestBudget:
     """
 
     def test_a_zero_budget_never_allows_service(self):
-        budget = ShadowBudget(pct=0.0, wall_start_s=0.0, window_start_s=0.0)
+        budget = CanonicalRecoveryBudget(pct=0.0, wall_start_s=0.0, window_start_s=0.0)
         assert not budget.allows(now=100.0)
 
     def test_the_lifetime_share_is_service_over_wall_time(self):
-        budget = ShadowBudget(pct=10.0, wall_start_s=0.0, window_start_s=0.0)
+        budget = CanonicalRecoveryBudget(pct=10.0, wall_start_s=0.0, window_start_s=0.0)
         budget.note_service(5.0)
         assert budget.share(now=100.0) == pytest.approx(0.05)
 
     def test_the_share_is_zero_before_any_time_has_passed(self):
         """A ratio against a zero denominator is not a measurement."""
-        budget = ShadowBudget(pct=10.0, wall_start_s=0.0, window_start_s=0.0)
+        budget = CanonicalRecoveryBudget(pct=10.0, wall_start_s=0.0, window_start_s=0.0)
         assert budget.share(now=0.0) == 0.0
 
     def test_negative_service_cannot_buy_back_budget(self):
-        budget = ShadowBudget(pct=10.0, wall_start_s=0.0, window_start_s=0.0)
+        budget = CanonicalRecoveryBudget(pct=10.0, wall_start_s=0.0, window_start_s=0.0)
         budget.note_service(10.0)
         budget.note_service(-5.0)
         assert budget.service_s == 10.0
@@ -81,7 +81,7 @@ class TestReplenishingBudget:
         ``perf_counter`` and can never be driven by an explicit ``now``. The
         defaults give a 1 s allowance in a 10 s window.
         """
-        return ShadowBudget(
+        return CanonicalRecoveryBudget(
             pct=pct, window_s=window_s, wall_start_s=0.0, window_start_s=0.0
         )
 
@@ -212,7 +212,7 @@ class TestReplenishingBudget:
         """Nothing writes this field today, so a bad value would arrive by
         mistake. Left alone it published a zero allowance beside a non-zero
         service share, which is telemetry that contradicts itself."""
-        budget = ShadowBudget(pct=10.0, window_s=-5.0, wall_start_s=0.0,
+        budget = CanonicalRecoveryBudget(pct=10.0, window_s=-5.0, wall_start_s=0.0,
                               window_start_s=0.0)
         assert budget.window_s == DEFAULT_BUDGET_WINDOW_S
         assert budget.allowance_s > 0
@@ -242,7 +242,7 @@ class TestRunnable:
     def _kwargs(self, **over):
         base = dict(
             enabled=True,
-            budget=ShadowBudget(pct=10.0, wall_start_s=0.0),
+            budget=CanonicalRecoveryBudget(pct=10.0, wall_start_s=0.0),
             has_job=True,
             waiting_requests=0,
             running_requests=0,
@@ -256,41 +256,41 @@ class TestRunnable:
         return base
 
     def test_idle_scheduler_with_budget_is_runnable(self):
-        assert shadow_is_runnable(**self._kwargs())
+        assert canonical_recovery_is_runnable(**self._kwargs())
 
-    def test_an_active_specprefill_blocks_the_shadow(self):
+    def test_an_active_specprefill_blocks_recovery(self):
         """The offset RoPE wrapper is installed on the shared model.
 
         A dense forward taken while it is installed would read the foreground
         request's position offset, so this is a correctness condition, not a
         fairness one.
         """
-        assert not shadow_is_runnable(**self._kwargs(specprefill_active=True))
+        assert not canonical_recovery_is_runnable(**self._kwargs(specprefill_active=True))
 
-    def test_an_inbound_request_blocks_the_shadow(self):
+    def test_an_inbound_request_blocks_recovery(self):
         """A request is invisible to the scheduler until admission runs."""
-        assert not shadow_is_runnable(**self._kwargs(inbound_requests=1))
+        assert not canonical_recovery_is_runnable(**self._kwargs(inbound_requests=1))
 
     @pytest.mark.parametrize(
         "field", ["waiting_requests", "running_requests", "prefilling_requests"]
     )
-    def test_any_foreground_work_blocks_the_shadow(self, field):
-        assert not shadow_is_runnable(**self._kwargs(**{field: 1}))
+    def test_any_foreground_work_blocks_recovery(self, field):
+        assert not canonical_recovery_is_runnable(**self._kwargs(**{field: 1}))
 
     def test_one_idle_step_is_not_enough(self):
         """Back-to-back slices leave no window for a request to announce itself."""
-        assert not shadow_is_runnable(**self._kwargs(consecutive_idle_steps=1))
+        assert not canonical_recovery_is_runnable(**self._kwargs(consecutive_idle_steps=1))
 
-    def test_an_exhausted_budget_blocks_the_shadow(self):
-        budget = ShadowBudget(pct=10.0, wall_start_s=0.0)
+    def test_an_exhausted_budget_blocks_recovery(self):
+        budget = CanonicalRecoveryBudget(pct=10.0, wall_start_s=0.0)
         budget.note_service(50.0)
-        assert not shadow_is_runnable(**self._kwargs(budget=budget, now=100.0))
+        assert not canonical_recovery_is_runnable(**self._kwargs(budget=budget, now=100.0))
 
     def test_no_job_is_not_runnable(self):
-        assert not shadow_is_runnable(**self._kwargs(has_job=False))
+        assert not canonical_recovery_is_runnable(**self._kwargs(has_job=False))
 
     def test_disabled_is_not_runnable(self):
-        assert not shadow_is_runnable(**self._kwargs(enabled=False))
+        assert not canonical_recovery_is_runnable(**self._kwargs(enabled=False))
 
 
 class TestPublication:
@@ -300,7 +300,7 @@ class TestPublication:
             block_size=1024,
         )
         kwargs.update(over)
-        return ShadowJob(**kwargs)
+        return CanonicalRecoveryJob(**kwargs)
 
     def test_each_new_boundary_publishes(self):
         job = self._job()
@@ -346,7 +346,7 @@ class TestHeldBackToken:
     """
 
     def _job(self, target, block=4096):
-        return ShadowJob(
+        return CanonicalRecoveryJob(
             session_key="s", tokens=list(range(target)), target_tokens=target,
             block_size=block,
         )
@@ -364,14 +364,14 @@ class TestHeldBackToken:
 
 class TestSingleFlightGrowth:
     def test_an_append_extends_the_live_job(self):
-        job = ShadowJob(
+        job = CanonicalRecoveryJob(
             session_key="s", tokens=list(range(1000)), target_tokens=1000, block_size=256
         )
         assert job.extend(list(range(1500)))
         assert job.target_tokens == 1500
 
     def test_a_shorter_prompt_is_not_a_growth(self):
-        job = ShadowJob(
+        job = CanonicalRecoveryJob(
             session_key="s", tokens=list(range(1000)), target_tokens=1000, block_size=256
         )
         assert not job.extend(list(range(500)))
@@ -380,7 +380,7 @@ class TestSingleFlightGrowth:
     def test_a_rewritten_prefix_is_refused(self):
         """Publishing state for a prefix the session no longer has is the failure
         the placeholder rejection exists to prevent. Refuse it here too."""
-        job = ShadowJob(
+        job = CanonicalRecoveryJob(
             session_key="s", tokens=list(range(1000)), target_tokens=1000, block_size=256
         )
         rewritten = list(range(1500))
@@ -398,7 +398,7 @@ class TestTargetCompletion:
     """
 
     def _job(self):
-        return ShadowJob(
+        return CanonicalRecoveryJob(
             session_key="s", tokens=list(range(8192)), target_tokens=8192,
             block_size=4096,
         )

@@ -890,7 +890,7 @@ class EngineCore:
             # own, but it does keep the scheduler non-quiescent. An unload that
             # waits for the scheduler to drain would wait forever.
             with contextlib.suppress(Exception):
-                sched_for_filter.cancel_shadow_work("abort_all_requests")
+                sched_for_filter.cancel_canonical_recovery_work("abort_all_requests")
             pending_aborts = set(
                 getattr(sched_for_filter, "_pending_abort_ids", None) or ()
             )

@@ -148,7 +148,7 @@ class Request:
     # Scheduler-owned background work rather than a user request: it has no
     # collector, no client and no output, so the paths that fail, retry or
     # reschedule live requests must all leave it alone. Its own owner ends it.
-    is_shadow: bool = False
+    is_canonical_recovery: bool = False
     # Emit per-chunk timing diagnostics for an internal throughput benchmark.
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False

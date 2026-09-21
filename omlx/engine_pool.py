@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from .canonical_recovery import apply_canonical_recovery_settings
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -58,7 +59,6 @@ from .model_settings import (
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
-from .shadow_prefill import apply_shadow_prefill_settings
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -314,7 +314,7 @@ class EnginePool:
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
         self.configure_hot_cache_budget()
-        self.configure_shadow_budget()
+        self.configure_canonical_recovery_budget()
 
     def _distributed_deployment_for_entry(
         self, entry: EngineEntry
@@ -636,7 +636,7 @@ class EnginePool:
         """Current memory used by loaded models in bytes."""
         return self._current_model_memory
 
-    def configure_shadow_budget(self) -> None:
+    def configure_canonical_recovery_budget(self) -> None:
         """Ensure every scheduler in the pool shares one recovery budget.
 
         The same ownership shape as `configure_hot_cache_budget`, for the same
@@ -650,22 +650,22 @@ class EnginePool:
         built from the per-model percentage, which is the arrangement that
         granted M engines M times the cap.
         """
-        from .shadow_prefill import DEFAULT_BUDGET_WINDOW_S, ShadowBudget
+        from .canonical_recovery import DEFAULT_BUDGET_WINDOW_S, CanonicalRecoveryBudget
 
         pct = float(
-            getattr(self._scheduler_config, "shadow_prefill_global_budget_pct", 0.0)
+            getattr(self._scheduler_config, "canonical_state_recovery_global_budget_pct", 0.0)
             or 0.0
         )
         window_s = float(
             getattr(
                 self._scheduler_config,
-                "shadow_prefill_budget_window_s",
+                "canonical_state_recovery_budget_window_s",
                 DEFAULT_BUDGET_WINDOW_S,
             )
             or DEFAULT_BUDGET_WINDOW_S
         )
-        current = getattr(self._scheduler_config, "shadow_budget", None)
-        if isinstance(current, ShadowBudget):
+        current = getattr(self._scheduler_config, "canonical_recovery_budget", None)
+        if isinstance(current, CanonicalRecoveryBudget):
             # Keep the object, and with it the window clock, the spent
             # allowance and the carried overshoot. Replacing it on a settings
             # change would hand every engine a fresh window, which is the
@@ -673,7 +673,7 @@ class EnginePool:
             current.pct = pct
             current.window_s = window_s if window_s > 0 else DEFAULT_BUDGET_WINDOW_S
             return
-        self._scheduler_config.shadow_budget = ShadowBudget(
+        self._scheduler_config.canonical_recovery_budget = CanonicalRecoveryBudget(
             pct=pct, window_s=window_s, shared=True
         )
 
@@ -971,12 +971,12 @@ class EnginePool:
             add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
             add("specprefill_threshold", data.get("specprefill_threshold"))
 
-        shadow_prefill_active = bool(data.get("shadow_prefill_enabled", False))
-        add("shadow_prefill_enabled", shadow_prefill_active)
-        if shadow_prefill_active:
+        canonical_recovery_active = bool(data.get("canonical_state_recovery_enabled", False))
+        add("canonical_state_recovery_enabled", canonical_recovery_active)
+        if canonical_recovery_active:
             add(
-                "shadow_prefill_slice_tokens",
-                data.get("shadow_prefill_slice_tokens", 0),
+                "canonical_state_recovery_slice_tokens",
+                data.get("canonical_state_recovery_slice_tokens", 0),
             )
 
         dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
@@ -1540,7 +1540,7 @@ class EnginePool:
         # polls this predicate would never go ready, the pending marker would
         # stay installed, and every later acquisition of this model would be
         # refused. Background work yields to an unload; it never blocks one.
-        cancel_background = getattr(scheduler, "cancel_shadow_work", None)
+        cancel_background = getattr(scheduler, "cancel_canonical_recovery_work", None)
         if callable(cancel_background):
             with suppress(Exception):
                 cancel_background("unload_pending")
@@ -3039,10 +3039,10 @@ class EnginePool:
             self._scheduler_config.model_name = model_id
             self._scheduler_config.model_path = entry.model_path
 
-            # Shadow prefill is scheduler-owned and its two per-model knobs
+            # Canonical state recovery is scheduler-owned and its two per-model knobs
             # ride the same shared scheduler config as model_name/model_path
             # above. The ceiling is not among them: it is server-level.
-            apply_shadow_prefill_settings(self._scheduler_config, model_settings)
+            apply_canonical_recovery_settings(self._scheduler_config, model_settings)
 
             # Native MTP forces LM-only dispatch even for VLM models. Vision
             # encoder weights are ignored because the patched mtp_forward only

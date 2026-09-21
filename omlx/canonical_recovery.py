@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shadow prefill: bookkeeping for a scheduler-owned dense re-prefill.
+"""Canonical state recovery: bookkeeping for a scheduler-owned dense re-prefill.
 
 A sparse (SpecPrefill) prefill serves its request and leaves nothing the prefix
 cache will accept: ``_cleanup_finished`` refuses to extract a cache whose
@@ -8,7 +8,7 @@ only carry real state at a captured block boundary. The reusable dense prefix
 therefore stops advancing, and every later turn in the session pays to
 recompute the suffix the sparse turn did not canonicalize.
 
-This module holds the *decision* half of a shadow prefill: a dense re-read of a
+This module holds the *decision* half of a canonical state recovery: a dense re-read of a
 token range the session has already been served, run as scheduler-owned work,
 which publishes ordinary canonical cache state. It deliberately contains no MLX
 and touches no cache, so the policy can be tested without a model. The
@@ -28,14 +28,17 @@ one session would recompute the same prefix twice and race to publish it.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 
+logger = logging.getLogger(__name__)
+
 # How many consecutive yields a job may take before it is given up on. A yield
 # means the chunk did not run — the memory throttle wanted headroom, or the
-# chunk was aborted — and nothing the shadow itself does will change that, so
-# retrying forever only keeps an idle engine awake.
+# chunk was aborted — and nothing the recovery job itself does will change
+# that, so retrying forever only keeps an idle engine awake.
 MAX_CONSECUTIVE_YIELDS = 8
 
 # How many consecutive idle steps a job may be *allowed* to run and still not
@@ -72,7 +75,7 @@ def safe_publish_boundary(*, tokens_committed: int, block_size: int) -> int:
 
 
 @dataclass
-class ShadowBudget:
+class CanonicalRecoveryBudget:
     """A replenishing bounded share of wall time, aggregated over the process.
 
     There is one of these per process, created by ``EnginePool`` and adopted by
@@ -281,7 +284,7 @@ class ShadowBudget:
 
 
 @dataclass
-class ShadowCounters:
+class CanonicalRecoveryCounters:
     """What a recovery job did, for the tests that assert on it."""
 
     publishes: int = 0
@@ -291,7 +294,7 @@ class ShadowCounters:
 
 
 @dataclass
-class ShadowJob:
+class CanonicalRecoveryJob:
     """One session's dense re-read, extended rather than replaced as it grows."""
 
     session_key: str
@@ -365,7 +368,7 @@ class ShadowJob:
         return self.reached_target or self.processed_tokens >= self.target_tokens
 
 
-def shadow_slice_cap(config: object, request: object, n: int) -> int:
+def canonical_recovery_slice_cap(slice_tokens: int, request: object, n: int) -> int:
     """Cap a recovery slice, which is not the same thing as its block.
 
     Recovery publishes at a cache block boundary because that is the only
@@ -383,8 +386,12 @@ def shadow_slice_cap(config: object, request: object, n: int) -> int:
 
     - the recovery budget governs how *often* recovery collides with a
       foreground request;
-    - the execution slice governs how *long* that request is blocked when it
-      does;
+    - the execution slice narrows how *long* that request is blocked when it
+      does — narrows, not determines: a slice is timed and charged as a whole
+      in ``_canonical_recovery_step``, and the state build that restores the
+      published prefix and the publish that extracts, stores and reads back
+      the new boundary are inside that whole and do not shrink with the cap.
+      The measured blocking bound is the whole unit, not the forward alone;
     - the publication grain governs *when* reusable canonical state may be
       committed, and is fixed by the cache layout rather than chosen.
 
@@ -395,20 +402,24 @@ def shadow_slice_cap(config: object, request: object, n: int) -> int:
     slices reach the same boundaries; they simply leave a gap in between for a
     request to arrive in.
 
-    A free function because it is a property of the config and the request
-    rather than of the scheduler, and the chunk path should not acquire a new
-    reason to reach through ``self`` for it.
+    Takes the cap rather than the config on purpose. The slice size is a
+    per-model setting and ``SchedulerConfig`` is one object shared by every
+    engine in the pool, so reading it here would have let a second model's load
+    rewrite the slice size of a scheduler already running — lengthening another
+    model's worst-case foreground blocking without that model's settings having
+    changed. The caller passes the value its own engine was loaded with, which
+    is how the enabled flag is already handled.
     """
-    if not getattr(request, "is_shadow", False):
+    if not getattr(request, "is_canonical_recovery", False):
         return n
-    cap = int(getattr(config, "shadow_prefill_slice_tokens", 0) or 0)
+    cap = int(slice_tokens or 0)
     return min(n, cap) if cap > 0 else n
 
 
-def shadow_is_runnable(
+def canonical_recovery_is_runnable(
     *,
     enabled: bool,
-    budget: ShadowBudget,
+    budget: CanonicalRecoveryBudget,
     has_job: bool,
     waiting_requests: int,
     running_requests: int,
@@ -420,7 +431,7 @@ def shadow_is_runnable(
     min_idle_steps: int = 2,
     now: float | None = None,
 ) -> bool:
-    """Whether a shadow chunk may start on this step.
+    """Whether a recovery chunk may start on this step.
 
     Every clause is a defect from the earlier prototype's safety review, or a
     constraint read out of the runtime, written down as a condition rather than
@@ -429,7 +440,7 @@ def shadow_is_runnable(
     - ``specprefill_active`` — SpecPrefill installs ``_OffsetAdjustedRoPE`` on
       the *shared* model and keeps it installed until generation ends. A dense
       forward taken while it is installed reads that request's position offset,
-      so the shadow must not run in that window at all.
+      so the recovery job must not run in that window at all.
     - ``inbound_requests`` — a request is invisible to the scheduler until its
       admission runs on the single-worker executor. Idleness judged from the
       admitted lists alone starts a slice in front of a request that has
@@ -457,10 +468,10 @@ def shadow_is_runnable(
     return budget.allows(now)
 
 
-def apply_shadow_prefill_settings(
+def apply_canonical_recovery_settings(
     scheduler_config: object, model_settings: object
 ) -> None:
-    """Carry a model's shadow-prefill knobs onto a shared ``SchedulerConfig``.
+    """Carry a model's canonical-recovery knobs onto a shared ``SchedulerConfig``.
 
     Two of them, and neither is a ceiling: a model chooses whether to recover
     and how large a slice it does it in. How much of the accelerator recovery
@@ -468,12 +479,34 @@ def apply_shadow_prefill_settings(
     shares one accelerator and this config object is rewritten per load.
 
     Mirrors how ``model_name``/``model_path`` are wired per model at engine
-    load: shadow prefill is scheduler-owned, not per-request, so its settings
+    load: canonical state recovery is scheduler-owned, not per-request, so its settings
     live on the config object rather than flowing through per-call kwargs.
     """
-    scheduler_config.shadow_prefill_enabled = bool(
-        getattr(model_settings, "shadow_prefill_enabled", False)
+    scheduler_config.canonical_state_recovery_enabled = bool(
+        getattr(model_settings, "canonical_state_recovery_enabled", False)
     )
-    scheduler_config.shadow_prefill_slice_tokens = int(
-        getattr(model_settings, "shadow_prefill_slice_tokens", 0) or 0
+    scheduler_config.canonical_state_recovery_slice_tokens = int(
+        getattr(model_settings, "canonical_state_recovery_slice_tokens", 0) or 0
     )
+    # Recovery takes two independent grants and neither implies the other: a
+    # model opts in here, and the server separately grants a process-wide
+    # share of the accelerator. That separation is deliberate — sparse
+    # execution does not imply that the debt it leaves is worth repaying, and
+    # one model must not be able to spend the machine every other model shares.
+    #
+    # It does leave one state that says nothing about itself: opted in, with
+    # the share still at its default of zero. `CanonicalRecoveryBudget.allows` is then
+    # False in every window and every candidate is declined before it runs,
+    # and nothing downstream reports it. Say so once per load, where the two
+    # grants are first seen together, so the operator learns it from the log
+    # rather than from an absence of counters.
+    if scheduler_config.canonical_state_recovery_enabled and float(
+        getattr(scheduler_config, "canonical_state_recovery_global_budget_pct", 0.0) or 0.0
+    ) <= 0.0:
+        logger.warning(
+            "canonical state recovery is enabled for %s but the server-level recovery "
+            "budget (scheduler.canonical_state_recovery_global_budget_pct) is 0%%, so "
+            "recovery will never be scheduled; both grants are required, "
+            "raise the budget to let recovery run",
+            getattr(scheduler_config, "model_name", None) or "this model",
+        )
