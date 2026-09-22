@@ -411,7 +411,9 @@ class ExpertCache:
         """
         if self.warm:  # nothing can miss; skip it
             return
-        needed = set(int(e) for e in idx.reshape(-1).tolist())
+        # Ascending expert id = ascending file offset per shard, so misses
+        # are read in on-disk order (set iteration order scrambles it).
+        needed = sorted(set(int(e) for e in idx.reshape(-1).tolist()))
         pool = _io_pool()
         queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
         window = _io_batch()
