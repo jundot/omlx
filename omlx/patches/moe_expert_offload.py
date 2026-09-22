@@ -294,6 +294,20 @@ def _io_batch() -> int:
     return _IO_BATCH
 
 
+def _pin_frac() -> float:
+    """Resident-slot fraction protected by hot-set pinning (0 disables).
+
+    Swept 0.75/0.875/1.0 on MiMo at fraction 0.125: 0.875 (28 pinned, 4
+    dynamic slots) beat 0.75 (24/8) slightly and 1.0 (31/1) clearly — the
+    unpredictable tail needs a few churn slots."""
+    try:
+        return min(
+            max(float(os.environ.get("OMLX_MOE_OFFLOAD_PIN", 0.875)), 0.0), 1.0
+        )
+    except ValueError:
+        return 0.875
+
+
 def _shutdown_io_pool() -> None:
     """Drop the pool; the next fetch re-reads the environment (tests)."""
     global _IO_POOL, _IO_BATCH, _IO_CONFIGURED
@@ -350,6 +364,20 @@ class ExpertCache:
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
         self.hits = self.misses = 0
         self.warm = False
+        # Hot-set pinning: ``ensure`` calls (the device-side path used by
+        # decode) update a per-expert route counter; the top ``pin_n`` are
+        # then refused as eviction victims. Decode routing is heavily
+        # skewed (measured: top-32 experts cover ~78% of routes vs 12.5%
+        # uniform) while prefill's profile does not transfer to decode —
+        # so ``ensure_ids`` (the prefill chunker's host path) never
+        # teaches. ``freq``/``pins`` stay unused when the pin fraction is 0.
+        self.pin_n = max(
+            0, min(int(self.capacity * _pin_frac()), self.capacity - 1)
+        )
+        self.freq = (
+            np.zeros(self.n_experts, dtype=np.int64) if self.pin_n else None
+        )
+        self.pins = frozenset()
 
     def _plans(self, e: int) -> list:
         """Read plans for expert ``e``'s tensors, in slot-write order."""
@@ -373,12 +401,20 @@ class ExpertCache:
         """
         if self.free:
             return self.free.pop()
-        old_e = next(iter(self.slot_of))  # LRU victim
-        if protected:
-            for cand in self.slot_of:
-                if cand not in protected:
-                    old_e = cand
-                    break
+        prot = protected or ()
+        pins = self.pins
+        fallback = None
+        for cand in self.slot_of:
+            if cand in prot:
+                continue
+            if fallback is None:
+                fallback = cand
+            if cand not in pins:
+                slot = self.slot_of.pop(cand)
+                self.map[cand] = -1
+                return slot
+        # Every non-protected resident is pinned — degrade to plain LRU.
+        old_e = fallback if fallback is not None else next(iter(self.slot_of))
         slot = self.slot_of.pop(old_e)
         self.map[old_e] = -1
         return slot
@@ -429,7 +465,9 @@ class ExpertCache:
         """
         if self.warm:  # nothing can miss; skip it
             return
-        self.ensure_ids(int(e) for e in idx.reshape(-1).tolist())
+        self.ensure_ids(
+            (int(e) for e in idx.reshape(-1).tolist()), learn=True
+        )
 
     def stage_ids(self, ids) -> dict:
         """Speculatively read non-resident experts' bytes on the IO pool.
@@ -454,17 +492,29 @@ class ExpertCache:
             ]
         return staged
 
-    def ensure_ids(self, ids, staged: dict | None = None) -> None:
+    def ensure_ids(
+        self, ids, staged: dict | None = None, learn: bool = False
+    ) -> None:
         """Host-side variant of :meth:`ensure`: takes an iterable of expert
         ids and skips the device->host readback entirely (the prefill
         chunker already holds them as numpy). ``staged`` may carry futures
         from :meth:`stage_ids`; they are consumed — serially, in the same
-        order the demand path would install them — or waited out."""
+        order the demand path would install them — or waited out.
+        ``learn`` marks a token-level call whose routes may update the
+        pin table — the prefill chunker never passes it."""
         if self.warm:
             return
         # Ascending expert id = ascending file offset per shard, so misses
         # are read in on-disk order (set iteration order scrambles it).
-        needed = sorted(set(int(e) for e in ids))
+        id_list = [int(e) for e in ids]
+        needed = sorted(set(id_list))
+        if self.pin_n and learn:
+            # Token-level call: count routes and refresh the pinned set.
+            # Host-path (prefill chunk) calls never teach — their routing
+            # profile was measured not to transfer to decode.
+            np.add.at(self.freq, id_list, 1)
+            top = np.argpartition(self.freq, -self.pin_n)[-self.pin_n :]
+            self.pins = frozenset(int(t) for t in top if self.freq[t] > 0)
         protected = frozenset(needed)
         pool = _io_pool()
         queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
@@ -527,6 +577,7 @@ class ExpertCache:
                 future.cancel()
             if futures:
                 wait(futures)
+
         # No mx.eval here: installs are already-materialized host arrays, and
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the

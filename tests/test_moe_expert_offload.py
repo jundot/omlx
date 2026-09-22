@@ -40,6 +40,13 @@ if HAS_MLX:
 E, D, INTER, K, GROUP = 32, 64, 32, 2, 32
 
 
+@pytest.fixture(autouse=True)
+def _no_pinning(monkeypatch):
+    """Pinning perturbs victim choice; tests that assert exact LRU victims
+    run with it off. Pin-specific tests re-set the env before wrapping."""
+    monkeypatch.setenv("OMLX_MOE_OFFLOAD_PIN", "0")
+
+
 def _make_glu(seed=0, e=E, d=D, inter=INTER, group=GROUP):
     mx.random.seed(seed)
     glu = SwitchGLU(d, inter, e)
@@ -694,6 +701,25 @@ class TestParallelFetch:
         assert serial.free == parallel.free
         assert (serial.hits, serial.misses) == (parallel.hits, parallel.misses)
         assert serial.misses > serial.capacity
+
+    def test_pinning_protects_hot_experts(self, tmp_path, monkeypatch):
+        """Hot-set pinning: decode-shaped calls teach a route counter; the
+        top ``pin_n`` experts are refused as eviction victims. Prefill-size
+        calls (> capacity unique ids) must not teach."""
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PIN", "0.5")
+        glu = _make_glu(seed=12)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        _, cache = self._wrap(tmp_path, glu, "1", monkeypatch)
+        assert cache.pin_n == 4
+        for _ in range(6):
+            cache.ensure(mx.array([0, 1, 2, 3]))
+        assert set(cache.pins) == {0, 1, 2, 3}
+        for e in range(4, 12):
+            cache.ensure(mx.array([e]))
+        assert set(cache.slot_of) == {0, 1, 2, 3, 8, 9, 10, 11}
+        # The host path (prefill chunker) teaches nothing: pins unchanged.
+        cache.ensure_ids([4, 5, 6, 7])
+        assert set(cache.pins) == {0, 1, 2, 3}
 
     @pytest.mark.parametrize("workers", ["0", "-4", "abc", "1", None])
     def test_io_workers_env_degenerate_values(self, tmp_path, monkeypatch, workers):
