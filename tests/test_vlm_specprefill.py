@@ -224,9 +224,7 @@ class _RecordingQwenVLM:
         return positions.reshape(1, -1)
 
     def __init__(self, cache):
-        self.layers = [
-            SimpleNamespace(self_attn=SimpleNamespace(rotary_emb=object()))
-        ]
+        self.layers = [SimpleNamespace(self_attn=SimpleNamespace(rotary_emb=object()))]
         self._cache = cache
         self.seen_positions = []
 
@@ -239,9 +237,9 @@ class _RecordingQwenVLM:
             # contiguous run from the cache offset. Reproduced here so a
             # forward that is handed no positions records what the real model
             # would have used, rather than a None the assertions cannot read.
-            position_ids = mx.arange(
-                cache[0].offset, cache[0].offset + length
-            ).reshape(1, -1)
+            position_ids = mx.arange(cache[0].offset, cache[0].offset + length).reshape(
+                1, -1
+            )
         self.seen_positions.append(position_ids)
         for layer in cache:
             layer.offset += length
@@ -391,9 +389,7 @@ class TestSparsePrefillKeepsTheRopeWrapperPath:
 
         class _RopeModel:
             def __init__(self, cache):
-                self.layers = [
-                    SimpleNamespace(self_attn=SimpleNamespace(rope=_Rope()))
-                ]
+                self.layers = [SimpleNamespace(self_attn=SimpleNamespace(rope=_Rope()))]
                 self._cache = cache
 
             def __call__(self, input_ids, cache=None, **kwargs):
@@ -480,7 +476,9 @@ class TestDecodeAdjustmentLifetime:
             def __call__(self, input_ids, cache=None, position_ids=None):
                 if len(self.seen_positions) == 1:
                     raise RuntimeError("out of memory")
-                return super().__call__(input_ids, cache=cache, position_ids=position_ids)
+                return super().__call__(
+                    input_ids, cache=cache, position_ids=position_ids
+                )
 
         cache = [_FakeCacheLayer(offset=12288)]
         model = _FailsOnSecondChunk(cache)
@@ -513,7 +511,9 @@ class TestSparseDeltaDoesNotSurviveARequeue:
         model.layers = []
         tokenizer = MagicMock()
         tokenizer.eos_token_id = 2
-        scheduler = Scheduler(model=model, tokenizer=tokenizer, config=SchedulerConfig())
+        scheduler = Scheduler(
+            model=model, tokenizer=tokenizer, config=SchedulerConfig()
+        )
 
         request = MagicMock()
         request.request_id = "r1"
