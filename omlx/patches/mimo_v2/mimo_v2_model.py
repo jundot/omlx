@@ -415,16 +415,33 @@ class Model(nn.Module):
             wk = sk[: -len("_scale_inv")]
             weights[wk] = dequant_block(weights[wk], weights.pop(sk))
 
+        n_exp = self.args.n_routed_experts
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
             for proj in ("gate_proj", "down_proj", "up_proj"):
                 expert0 = f"{prefix}.experts.0.{proj}.weight"
                 if expert0 not in weights:
                     continue
-                weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
+                dst = f"{prefix}.switch_mlp.{proj}"
+                # MXFP4-stored experts (MiMo V2.6) ship a bare `weight_scale`
+                # (E8M0 block scale, group_size 32) next to a uint8-packed
+                # weight. MLX's mxfp4 QuantizedSwitchLinear wants the identical
+                # bytes viewed as uint32 plus the untouched scales, so this is a
+                # re-view and a rename - no arithmetic, no precision loss.
+                if f"{expert0}_scale" in weights:
+                    ws, ss = [], []
+                    for e in range(n_exp):
+                        w = weights.pop(f"{prefix}.experts.{e}.{proj}.weight")
+                        s = weights.pop(f"{prefix}.experts.{e}.{proj}.weight_scale")
+                        ws.append(w.view(mx.uint32) if w.dtype == mx.uint8 else w)
+                        ss.append(s)
+                    weights[f"{dst}.weight"] = mx.stack(ws)
+                    weights[f"{dst}.scales"] = mx.stack(ss)
+                    continue
+                weights[f"{dst}.weight"] = mx.stack(
                     [
                         weights.pop(f"{prefix}.experts.{e}.{proj}.weight")
-                        for e in range(self.args.n_routed_experts)
+                        for e in range(n_exp)
                     ]
                 )
 
