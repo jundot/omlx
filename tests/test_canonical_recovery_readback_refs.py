@@ -42,9 +42,7 @@ class _Model:
 def _cache_data(num_tokens: int):
     keys = mx.arange(num_tokens, dtype=mx.float32).reshape(1, 1, num_tokens, 1)
     values = (keys + 100).astype(mx.float32)
-    return [
-        {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
-    ]
+    return [{"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}]
 
 
 @pytest.fixture
@@ -86,7 +84,9 @@ def _ref_counts(prefix_cache, block_ids):
 
 def _publish(prefix_cache, tokens):
     """Write a canonical prefix the way the recovery publish does."""
-    table = prefix_cache.store_cache("canonical-recovery:s1", tokens, _cache_data(len(tokens)))
+    table = prefix_cache.store_cache(
+        "canonical-recovery:s1", tokens, _cache_data(len(tokens))
+    )
     assert table is not None and table.block_ids, "the publish itself failed"
     prefix_cache.clear_request_entry("canonical-recovery:s1")
     return table
@@ -98,7 +98,9 @@ def test_readback_returns_every_reference_it_took(scheduler, prefix_cache):
     before = _ref_counts(prefix_cache, table.block_ids)
 
     job = CanonicalRecoveryJob(
-        session_key="s1", tokens=list(tokens), target_tokens=len(tokens),
+        session_key="s1",
+        tokens=list(tokens),
+        target_tokens=len(tokens),
         block_size=BLOCK,
     )
     restorable = scheduler._canonical_recovery_readback_tokens(job, tokens)
@@ -116,7 +118,9 @@ def test_repeated_readbacks_do_not_accumulate(scheduler, prefix_cache):
     before = _ref_counts(prefix_cache, table.block_ids)
 
     job = CanonicalRecoveryJob(
-        session_key="s1", tokens=list(tokens), target_tokens=len(tokens),
+        session_key="s1",
+        tokens=list(tokens),
+        target_tokens=len(tokens),
         block_size=BLOCK,
     )
     for _ in range(5):
@@ -129,7 +133,9 @@ def test_the_probe_leaves_no_block_table_behind(scheduler, prefix_cache):
     tokens = list(range(8))
     _publish(prefix_cache, tokens)
     job = CanonicalRecoveryJob(
-        session_key="s1", tokens=list(tokens), target_tokens=len(tokens),
+        session_key="s1",
+        tokens=list(tokens),
+        target_tokens=len(tokens),
         block_size=BLOCK,
     )
     scheduler._canonical_recovery_readback_tokens(job, tokens)
