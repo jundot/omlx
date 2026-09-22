@@ -944,14 +944,7 @@ class TestPagedCacheManager:
 
     @staticmethod
     def _register_tail(manager, parent_hash, tokens, hot=True):
-        from omlx.cache.paged_cache import tail_extra_keys
-
-        tail_hash = compute_block_hash(
-            parent_hash,
-            tokens,
-            extra_keys=tail_extra_keys(None),
-            model_name="test-model",
-        )
+        tail_hash = compute_block_hash(parent_hash, tokens, model_name="test-model")
         if hot:
             block = manager.allocate_block()
             block.block_hash = tail_hash

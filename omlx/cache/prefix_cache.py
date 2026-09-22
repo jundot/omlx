@@ -35,7 +35,6 @@ from .paged_cache import (
     PagedCacheManager,
     compute_block_hash,
     resolve_block_extra_keys,
-    tail_extra_keys,
 )
 from .paged_ssd_cache import (
     _PM_BOUNDARY_SUB_CLASSES,
@@ -267,9 +266,8 @@ class BlockAwarePrefixCache(CacheManager):
         # rewrite saved). Each hash is inspected at most once per run.
         self._backfill_checked_hashes: set[bytes] = set()
 
-        # Tail blocks stored this session. A superseded tail in the rotating
-        # tip lineage is deleted instead of stripped: a stripped tail would
-        # only be walked back over on restore.
+        # Tails stored this session. A superseded tail is deleted, not
+        # stripped: a stripped tail is only walked back over on restore.
         self._tail_hashes: set[bytes] = set()
 
         self._seed_tail_index(paged_ssd_cache_manager)
@@ -519,12 +517,7 @@ class BlockAwarePrefixCache(CacheManager):
             self._seed_tail_index(paged_ssd_cache_manager)
 
     def _seed_tail_index(self, paged_ssd_cache_manager: Any) -> None:
-        """Rebuild the parent-keyed tail index from the manager's SSD scan.
-
-        Tails persisted by earlier runs cannot be found through the block
-        grid, so they are re-registered here. The scheduler attaches the
-        manager after construction, so this runs from both entry points.
-        """
+        """Rebuild the tail index from the SSD scan (runs from init and the setter)."""
         seed_tails = getattr(paged_ssd_cache_manager, "iter_tail_blocks", None)
         if not callable(seed_tails):
             return
@@ -817,10 +810,7 @@ class BlockAwarePrefixCache(CacheManager):
                 trailing partial block and isolates the terminal hash from
                 ordinary prefix matching.
             _store_tail_terminal: Persist the trailing partial block as a tail
-                block. ``tokens`` must end on a tail snapshot in
-                ``boundary_snapshots`` (or the live state must sit exactly at
-                ``len(tokens)``), and the tail stays reachable through
-                general prefix matching via its parent block.
+                block; ``tokens`` must end on a snapshot in ``boundary_snapshots``.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -873,10 +863,8 @@ class BlockAwarePrefixCache(CacheManager):
         if not block_table:
             block_table = self.paged_cache.create_block_table(request_id)
 
-        # A tail block acquired by fetch_cache ends off the block grid. Drop
-        # it from this table so the new blocks start on the grid. The tail
-        # stays cached (ref released, hash kept) for other requests until
-        # it is evicted or superseded through the tip lineage below.
+        # A fetched tail ends off the block grid: drop it from this table so
+        # new blocks start on the grid. It stays cached for other requests.
         superseded_tail_hash: bytes | None = None
         if block_table.block_ids:
             last_block = self.paged_cache.allocated_blocks.get(
@@ -1097,8 +1085,6 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_key_token_start=extra_key_token_start,
                     extra_key_ranges=extra_key_ranges,
                 )
-                if is_tail_terminal:
-                    block_extra_keys = tail_extra_keys(block_extra_keys)
 
             # Check if this block already exists (deduplication)
             if (
@@ -1923,11 +1909,9 @@ class BlockAwarePrefixCache(CacheManager):
         return 0
 
     def _discard_tail_block(self, block_hash: bytes) -> bool:
-        """Drop a superseded tail block from every tier when no request holds it.
+        """Drop a superseded tail from every tier when no request holds it.
 
-        The hash leaves the hot map under the paged-cache lock before the
-        payload is deleted, so a concurrent fetch cannot acquire a block
-        whose data is about to disappear.
+        The hash leaves the hot map under the lock before the payload goes.
         """
         with self.paged_cache._lock:
             block = self.paged_cache.cached_block_hash_to_block.get_block(block_hash)

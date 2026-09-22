@@ -239,18 +239,10 @@ class BaseEngine(ABC):
         chat_template_kwargs: Optional[Dict[str, Any]],
         is_partial: Optional[bool],
     ) -> tuple[Optional[str], bool]:
-        """Chat template generation prompt: ``(suffix, persists)``.
+        """Return ``(suffix, persists)`` for the template's generation prompt.
 
-        ``suffix`` is the text the template appends after the last message,
-        or None. ``persists`` is True when an assistant turn followed by a
-        new user turn still renders with that suffix in front of the reply
-        (Llama, Gemma 3), so cache state captured past it stays reusable in
-        the next turn. Reasoning templates render the region differently
-        (Qwen strips the think block from earlier turns), so the prefix
-        cache ends its tail block in front of it and ignores later
-        snapshots. Both come from short probes; the scheduler still verifies
-        the suffix against the real token prompt. Results are memoized per
-        template kwargs.
+        ``persists`` is True when an assistant turn followed by a user turn still
+        renders that suffix, so cache state past it stays reusable. Memoized.
         """
         render = getattr(self, "_apply_chat_template", None)
         if is_partial or not callable(render):

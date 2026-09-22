@@ -76,20 +76,9 @@ def resolve_block_extra_keys(
     return None
 
 
-# Hash-domain salt for tail blocks: a short terminal block that ends off the
-# block grid. Kept apart from full blocks and from the specprefill exact
-# terminal so a tail can never be mistaken for either.
-TAIL_TERMINAL_KEY = "omlx-tail-v1"
-
-# Bounds for the parent-keyed tail index. Entries are advisory and verified
-# against the hash map or the SSD tier on every lookup.
+# Tail index bounds. Entries are advisory and verified on every lookup.
 _TAIL_INDEX_PER_PARENT = 8
 _TAIL_INDEX_MAX_PARENTS = 4096
-
-
-def tail_extra_keys(extra_keys: Optional[Tuple[Any, ...]]) -> Tuple[Any, ...]:
-    """Append the tail salt to a block's resolved extra keys."""
-    return (extra_keys or ()) + (TAIL_TERMINAL_KEY,)
 
 
 def compute_block_hash(
@@ -587,10 +576,8 @@ class PagedCacheManager(CacheManager):
         self.on_block_hash_dropped: Callable[[BlockHash], None] | None = None
         self.on_hash_map_cleared: Callable[[], None] | None = None
 
-        # Tail blocks by chain parent (None for a chain root). A tail holds
-        # fewer than block_size tokens, so the grid walk in
-        # get_computed_blocks cannot derive its hash; the parent lookup
-        # supplies the candidate lengths and hashes instead.
+        # Tail blocks by chain parent (None for a root). A tail is shorter
+        # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
 
         logger.info(
@@ -1105,10 +1092,8 @@ class PagedCacheManager(CacheManager):
                 num_cached_tokens += self.block_size
                 self.stats.hits += 1
 
-            # The grid walk stops at the last matched full block. A tail
-            # hanging off that block (or off the chain root) can still cover
-            # a prefix of the tokens that follow, whether the walk ended on a
-            # miss or because the prompt ends mid-block.
+            # A tail under the last matched block (or the root) may still
+            # cover the tokens that follow the grid walk.
             if num_cached_tokens < len(token_ids):
                 tail_block = self._match_tail_block(
                     token_ids,
@@ -1230,10 +1215,9 @@ class PagedCacheManager(CacheManager):
         extra_key_token_start: Optional[int] = None,
         extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
     ) -> Optional[CacheBlock]:
-        """Find a tail block whose tokens prefix ``token_ids[start:]``.
+        """Find the longest tail block that prefixes ``token_ids[start:]``.
 
-        Longer tails are tried first. Entries that no tier holds any more
-        are dropped on the spot. Called with ``self._lock`` held.
+        Stale entries are dropped on the way. Called with ``self._lock`` held.
         """
         tails = self._tail_index.get(parent_hash)
         if not tails:
@@ -1246,13 +1230,11 @@ class PagedCacheManager(CacheManager):
             expected = compute_block_hash(
                 parent_hash,
                 token_ids[start:end],
-                extra_keys=tail_extra_keys(
-                    resolve_block_extra_keys(
-                        end,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                    )
+                extra_keys=resolve_block_extra_keys(
+                    end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
                 ),
                 model_name=self.model_name,
             )

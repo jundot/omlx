@@ -1011,8 +1011,7 @@ class PagedSSDBlockMetadata:
     cache_signature: str = ""
     layer_cache_types: list[str] | None = None
     layer_meta_states: list[tuple] | None = None
-    # Chain parent and tail marker. A tail block holds fewer than block_size
-    # tokens and is found through its parent, not through the block grid.
+    # Chain parent and tail marker; a tail is found through its parent.
     parent_hash: bytes | None = None
     tail_terminal: bool = False
 
@@ -3204,8 +3203,7 @@ class PagedSSDCacheManager(CacheManager):
                 non-sliceable prefix-cache placeholder into a valid boundary
                 snapshot; normal deduplicated saves must leave it False.
             parent_hash: Chain hash of the preceding block, if any.
-            tail_terminal: True for a short terminal block that ends off the
-                block grid. Such blocks are re-indexed by parent at startup.
+            tail_terminal: True for a short terminal block, re-indexed by parent.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -4206,11 +4204,7 @@ class PagedSSDCacheManager(CacheManager):
         return False
 
     def iter_tail_blocks(self) -> list[tuple[bytes | None, bytes, int]]:
-        """Return (parent_hash, block_hash, token_count) for indexed tail blocks.
-
-        Used once at startup to rebuild the parent-keyed tail index; tails
-        cannot be found through the block grid like full blocks.
-        """
+        """Return (parent_hash, block_hash, token_count) for indexed tail blocks."""
         return [
             (meta.parent_hash, meta.block_hash, meta.token_count)
             for meta in self._index.get_all_metadata()

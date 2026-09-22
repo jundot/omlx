@@ -1927,9 +1927,9 @@ class TestArraysCacheLastBlockOnly:
     def test_store_cache_tail_terminal_stores_partial_block(self, mx):
         """Tail mode keeps the trailing partial block as a short terminal block.
 
-        The tail carries the boundary snapshot taken at its end (7), hashes in
-        its own domain, and is indexed under its parent block."""
-        from omlx.cache.paged_cache import compute_block_hash, tail_extra_keys
+        The tail carries the snapshot taken at its end (7) and is indexed under
+        its parent block."""
+        from omlx.cache.paged_cache import compute_block_hash
 
         cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
         tokens = list(range(7))
@@ -1954,12 +1954,6 @@ class TestArraysCacheLastBlockOnly:
         tail = paged_cache.allocated_blocks[result.block_ids[-1]]
         assert tail.token_count == 3
         assert tail.block_hash == compute_block_hash(
-            full.block_hash,
-            [4, 5, 6],
-            extra_keys=tail_extra_keys(None),
-            model_name="test-model",
-        )
-        assert tail.block_hash != compute_block_hash(
             full.block_hash, [4, 5, 6], model_name="test-model"
         )
 
@@ -1990,7 +1984,7 @@ class TestArraysCacheLastBlockOnly:
         The fetched tail is released from the table before the new blocks
         are laid out, so the next full block chains to the last full block
         and the old tail stays cached for other requests."""
-        from omlx.cache.paged_cache import compute_block_hash, tail_extra_keys
+        from omlx.cache.paged_cache import compute_block_hash
 
         cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
         first = cache.store_cache(
@@ -2032,10 +2026,7 @@ class TestArraysCacheLastBlockOnly:
             blocks[0].block_hash, [4, 5, 6, 7], model_name="test-model"
         )
         assert blocks[2].block_hash == compute_block_hash(
-            blocks[1].block_hash,
-            [8, 9, 10],
-            extra_keys=tail_extra_keys(None),
-            model_name="test-model",
+            blocks[1].block_hash, [8, 9, 10], model_name="test-model"
         )
         old_tail = paged_cache.cached_block_hash_to_block.get_block(old_tail_hash)
         assert old_tail is not None and old_tail.ref_count == 0

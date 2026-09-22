@@ -512,8 +512,7 @@ class _PrefillState:
     sm: Any = None
     per_row_lps: Any = None
     qwen4_gathered_core: bool | None = None
-    # Token count where the prefill stops for its tail snapshot, and whether
-    # the prefill end may capture one (see _prefill_tail_plan).
+    # Tail snapshot plan, see _prefill_tail_plan.
     tail_at: int | None = None
     end_tail: bool = False
 
@@ -1245,8 +1244,7 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
 )
 
 
-# The one snapshot source allowed off the block grid: the prefill tail ends
-# where the reusable part of the prompt ends and becomes a short terminal block.
+# The one snapshot source allowed off the block grid.
 _TAIL_SNAPSHOT_SOURCE = "prefill_tail"
 
 
@@ -1711,8 +1709,7 @@ class _BoundarySnapshotProvider:
         self._valid_tcs = set(valid_tcs)
         self._in_memory = in_memory_snapshots
         self._paged_ssd_manager = paged_ssd_manager
-        # Set when the stored sequence ends on a tail snapshot instead of a
-        # block boundary; store_cache then persists the short terminal block.
+        # Set when the stored sequence ends on a tail snapshot, not a boundary.
         self.tail_terminal_token_count = tail_terminal_token_count
 
     def __contains__(self, tc: int) -> bool:
@@ -6287,12 +6284,7 @@ class Scheduler:
         )
 
     def _resolve_generation_prompt_start(self, request: "Request") -> None:
-        """Locate the chat template's generation prompt inside the token prompt.
-
-        The rendered suffix is tokenized on its own and accepted only when it
-        matches the prompt's last tokens exactly. The prefill tail then ends
-        in front of it, which is the part the next turn renders again.
-        """
+        """Locate the generation prompt; accept it only if its tokens end the prompt."""
         suffix = getattr(request, "generation_prompt_text", None)
         token_ids = getattr(request, "prompt_token_ids", None)
         if not suffix or not token_ids:
@@ -6322,15 +6314,10 @@ class Scheduler:
         n_tokens: int,
         boundary_enabled: bool,
     ) -> tuple[int | None, bool]:
-        """Where this prefill captures its tail snapshot.
+        """Return ``(stop_at, end_tail)`` for this prefill's tail snapshot.
 
-        Returns ``(stop_at, end_tail)``. ``stop_at`` is the generation prompt
-        start when it lies strictly inside the tokens being prefilled, so the
-        tail excludes the template suffix the next turn renders differently.
-        ``end_tail`` allows a tail at the prefill end, which only pays off
-        when no generation prompt marker exists (raw prompts) or the marker
-        is the prefill end itself. A prompt cached past its marker gets no
-        new tail: the reusable part is stored already.
+        The tail ends at the generation prompt when it lies inside the prefill,
+        at the prefill end for raw prompts, and nowhere once the marker is cached.
         """
         if not boundary_enabled:
             return None, False
@@ -6350,13 +6337,7 @@ class Scheduler:
         prompt_cache: list[Any],
         total_tokens: int,
     ) -> None:
-        """Capture the prefill state at a token count that is not a boundary.
-
-        The tail is stored as a short terminal block so the next request
-        reuses the prompt up to here instead of re-prefilling up to
-        block_size - 1 tokens. Aligned counts are covered by the regular
-        boundary emission.
-        """
+        """Capture the prefill state off the block grid as a tail snapshot."""
         block_size = self.config.paged_cache_block_size
         if block_size <= 0 or total_tokens <= 0 or total_tokens % block_size == 0:
             return
@@ -7496,12 +7477,8 @@ class Scheduler:
             miss("invalid_block_size", len(snapshots))
             return None
 
-        # Aligned snapshots become full blocks. The newest tail snapshot
-        # competes for the terminal position and is stored as a short
-        # terminal block when it reaches furthest. When the template does
-        # not keep the generation prompt in the next turn's history, state
-        # past the prompt marker can never match again, so the selection
-        # stops at the marker.
+        # The newest tail competes with aligned snapshots for the terminal slot.
+        # Unless the template keeps the generation prompt, stop at the marker.
         limit = total_tokens
         request = self.requests.get(request_id)
         marker = getattr(request, "generation_prompt_start", 0) or 0
@@ -7510,10 +7487,10 @@ class Scheduler:
         ):
             limit = marker
         valid_counts = sorted(
-            tc for tc in snapshots.keys() if 0 < tc <= limit and tc % block_size == 0
+            tc for tc in snapshots if 0 < tc <= limit and tc % block_size == 0
         )
         tail_counts = [
-            tc for tc in snapshots.keys() if 0 < tc <= limit and tc % block_size != 0
+            tc for tc in snapshots if 0 < tc <= limit and tc % block_size != 0
         ]
         if not valid_counts and not tail_counts:
             miss("no_aligned_snapshots", len(snapshots))
@@ -7861,9 +7838,7 @@ class Scheduler:
     ) -> None:
         """Preserve a verified terminal boundary after the generator drops its UID.
 
-        Only an aligned end qualifies: reasoning templates render the reply
-        differently in the next turn, so an unaligned end is not reusable.
-        A prefill tail below this end does not block the capture.
+        Only an aligned end qualifies; a prefill tail below it does not block it.
         """
         if getattr(request, "skip_cache_store", False):
             return
