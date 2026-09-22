@@ -357,14 +357,25 @@ class ExpertCache:
                 out.append((name, 2, self.disk.plan(name, "biases", e)))
         return out
 
-    def _reserve(self) -> int:
-        """Claim a slot, evicting the LRU expert if none is free."""
+    def _reserve(self, protected: frozenset | None = None) -> int:
+        """Claim a slot, evicting the LRU expert if none is free.
+
+        ``protected`` holds the current call's needed experts: evicting one
+        of those would refetch it later in the same call, so pick the LRU
+        resident outside the set. Cannot deadlock — callers keep
+        ``len(needed) <= capacity``, so a non-protected resident always
+        exists when a miss needs a slot.
+        """
         if self.free:
-            slot = self.free.pop()
-        else:
-            old_e = next(iter(self.slot_of))  # LRU victim
-            slot = self.slot_of.pop(old_e)
-            self.map[old_e] = -1
+            return self.free.pop()
+        old_e = next(iter(self.slot_of))  # LRU victim
+        if protected:
+            for cand in self.slot_of:
+                if cand not in protected:
+                    old_e = cand
+                    break
+        slot = self.slot_of.pop(old_e)
+        self.map[old_e] = -1
         return slot
 
     def _write(self, slot: int, payload: list) -> None:
@@ -372,13 +383,15 @@ class ExpertCache:
         for name, field, plan, raw in payload:
             self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
 
-    def _install(self, e: int, payload: list | None = None) -> int:
+    def _install(
+        self, e: int, payload: list | None = None, protected: frozenset | None = None
+    ) -> int:
         if payload is None:
             payload = [
                 (n, f, pl, CheckpointExpertStore.read(pl))
                 for n, f, pl in self._plans(e)
             ]
-        slot = self._reserve()
+        slot = self._reserve(protected)
         try:
             self._write(slot, payload)
         except BaseException:
@@ -414,6 +427,7 @@ class ExpertCache:
         # Ascending expert id = ascending file offset per shard, so misses
         # are read in on-disk order (set iteration order scrambles it).
         needed = sorted(set(int(e) for e in idx.reshape(-1).tolist()))
+        protected = frozenset(needed)
         pool = _io_pool()
         queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
         window = _io_batch()
@@ -451,13 +465,14 @@ class ExpertCache:
                     prefetch(done + window)
                 group = pending.get(e)
                 if group is None:
-                    self._install(e)
+                    self._install(e, protected=protected)
                     continue
                 # Count the current payload in the window until its writes finish.
                 prefetch(done + window)
                 self._install(
                     e,
                     [(name, field, plan, f.result()) for name, field, plan, f in group],
+                    protected=protected,
                 )
                 del pending[e], group
                 done += 1
