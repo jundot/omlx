@@ -1039,6 +1039,7 @@
   "settings.language.es": "Español",
   "settings.language.fr": "Français",
   "settings.language.pt-BR": "Português (Brasil)",
+  "settings.language.cs": "Čeština",
   "settings.save.button": "Enregistrer les paramètres",
   "settings.save.saving": "Enregistrement en cours...",
   "settings.models.section_label": "Paramètres du modèle",
