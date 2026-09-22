@@ -873,6 +873,98 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     )
 
 
+def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
+    """The native glm_dsa_q8_vup_flat kernel is dtype-strict: it computes at
+    x.dtype and requires the projection's affine scales/biases to share that
+    dtype. The PR's kernel-boundary cast makes the native sparse-MLA return an
+    fp16 output, but oQ2e checkpoints ship fp32 scales — so passing the fp16
+    output straight through raised a dtype mismatch (the same attention call
+    completed on the parent commit, which never reached this kernel). The
+    wrapper must preserve the projection's fp32 dtype contract: return None on
+    a mismatch (fall through to the tolerant mx.quantized_matmul that promotes
+    through the fp32 scales) rather than crash or silently downcast the
+    checkpoint's scales. Runs the real native kernel — no stubbing."""
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat
+
+    if not fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+
+    from mlx_lm.models.mla import QuantizedMultiLinear
+
+    x = mx.random.normal((1, 64, 32, 512), dtype=mx.float16)
+    mx.eval(x)
+
+    # oQ2e layout: fp8 affine group64 with fp32 scales/biases.
+    proj = QuantizedMultiLinear(512, 256, 64, group_size=64, bits=8, mode="affine")
+    assert proj.scales.dtype == mx.float32
+    # Must NOT raise the native dtype-mismatch; returns None to fall back.
+    assert q8_vup_flat(x, proj, key_length=32768) is None
+    # The fallback projection preserves the fp32 contract (promotes to fp32).
+    out = proj(x)
+    mx.eval(out)
+    assert out.dtype == mx.float32
+
+    # A checkpoint that genuinely stores fp16 scales still runs the fused
+    # kernel (the gate must not disable it wholesale).
+    proj16 = QuantizedMultiLinear(
+        512, 256, 64, group_size=64, bits=8, mode="affine"
+    )
+    proj16.scales = proj16.scales.astype(mx.float16)
+    proj16.biases = proj16.biases.astype(mx.float16)
+    mx.eval(proj16.scales, proj16.biases)
+    fused = q8_vup_flat(x, proj16, key_length=32768)
+    mx.eval(fused)
+    assert fused is not None and fused.dtype == mx.float16
+    # Fused result matches the tolerant quantized-matmul reference layout.
+    ref = proj16(x).transpose(0, 2, 1, 3).reshape(1, 32, -1)
+    mx.eval(ref)
+    assert float(mx.max(mx.abs(fused - ref.astype(mx.float16))).item()) <= 0.125
+
+
+def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatch):
+    """Reviewer repro: at 32K with native kernels enabled, the fp16 output the
+    native sparse-MLA kernel returns reached q8_vup_flat against the
+    checkpoint's fp32 quantization scales and raised a dtype mismatch; the same
+    attention call completed on the parent commit. Drives the real crash
+    sequence — native sparse-MLA (fp16 out) feeding the real q8_vup_flat at
+    key_length=32768 with a real fp8/affine/fp32-scale unembed_out — end to
+    end through both native kernels, q8_vup_flat NOT stubbed, and asserts it
+    completes with the fp32 residual contract preserved."""
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat, sparse_mla_attention
+
+    if not fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+
+    from mlx_lm.models.mla import QuantizedMultiLinear
+
+    B, H, L, Kv, topk = 1, 64, 32, 32768, 2048
+    mx.random.seed(0)
+    q = mx.random.normal((B, H, L, 512), dtype=mx.float16)
+    q_pe = mx.zeros((B, H, L, 64), dtype=mx.float16)
+    kv = mx.random.normal((B, 1, Kv, 512), dtype=mx.float16)
+    k_pe = mx.zeros((B, 1, Kv, 64), dtype=mx.float16)
+    idx = mx.broadcast_to(
+        mx.arange(topk, dtype=mx.uint32)[None, None, None, :], (B, 1, L, topk)
+    )
+    mx.eval(q, q_pe, kv, k_pe, idx)
+
+    out = sparse_mla_attention(q, q_pe, kv, k_pe, idx, 1.0 / (256**0.5))
+    mx.eval(out)
+    assert out.dtype == mx.float16, "native sparse-MLA must return fp16"
+
+    proj = QuantizedMultiLinear(512, 256, 64, group_size=64, bits=8, mode="affine")
+    assert proj.scales.dtype == mx.float32
+    # The exact call that used to raise must now fall back, not crash.
+    assert q8_vup_flat(out, proj, key_length=Kv) is None
+    residual = proj(out)
+    mx.eval(residual)
+    assert residual.shape == (B, H, L, 256) and residual.dtype == mx.float32, (
+        "v-up fallback must preserve the fp32 residual contract"
+    )
+
+
 def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
     """The CPU enqueues a whole 2048-token prefill chunk in ~1s while the
     GPU needs ~10x longer; with the layer loop fully lazy every intermediate

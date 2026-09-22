@@ -510,6 +510,21 @@ def q8_vup_flat(
     scales = unembed_out["scales"]
     if weight.shape != (64, 256, 128) or scales.shape != (64, 256, 8):
         return None
+    # The fused kernel is dtype-strict: it computes at x.dtype and requires
+    # the projection's affine scales/biases to share that dtype. oQ2e
+    # checkpoints ship fp32 scales, so the fp16 output the native sparse-MLA
+    # kernel now returns (the kernel-boundary cast in the glm5_next vendor
+    # tree) would raise a dtype mismatch here. Return None to fall through to
+    # the tolerant mx.quantized_matmul path in language.py, which promotes
+    # through the fp32 scales exactly as the pre-boundary-cast code did —
+    # preserving the projection's fp32 dtype contract instead of crashing or
+    # silently downcasting the checkpoint's scales.
+    if (
+        x.dtype not in (mx.float16, mx.bfloat16)
+        or scales.dtype != x.dtype
+        or biases.dtype != x.dtype
+    ):
+        return None
     return glm_fast.glm_dsa_q8_vup_flat(
         x,
         weight,

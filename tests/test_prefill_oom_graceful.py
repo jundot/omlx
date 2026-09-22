@@ -1712,6 +1712,52 @@ def test_glm5_next_prefill_profile_registered():
     assert sparse <= gathered_bound * 2
 
 
+def test_glm5_next_profile_prices_exact_block_expansion_for_small_chunks():
+    """Reviewer: between index_topk (2048) and the native sparse-MLA threshold
+    (4096) the core runs exact-block SDPA over the full head-expanded K/V, so
+    the transient is linear in kv_len and independent of query_tokens — a
+    32-token chunk over 3,072 KV tokens measured ~577 MiB of extra GPU peak
+    against a ~73 MiB gathered-static estimate. The profile must charge that
+    expansion (fp32-promoted projection output cast to the kernel width), price
+    it linearly in kv_len, and stay monotonic across the regime."""
+    profile = make_prefill_memory_profile(_glm5_next_config(), compute_dtype_size=2)
+    MiB = 1 << 20
+
+    # Small chunk (32 query tokens): the charge is dominated by the full K/V
+    # expansion (2 tensors x kv_len x 64 heads x (256+256) width x (fp16 +
+    # fp32 promotion)), NOT by query_tokens. At kv_len=3072 that expansion is
+    # 3072*64*512*6 = 576 MiB; the profile must be at least that.
+    expansion_3072 = 3072 * 64 * (256 + 256) * (2 + 4)
+    est_32_3072 = profile.estimate_prefill_transient_bytes(32, 3072)
+    assert expansion_3072 == pytest.approx(576 * MiB, rel=0.01)
+    assert est_32_3072 >= expansion_3072, (
+        "exact-block regime must charge the full head-expanded K/V, not the "
+        f"gathered bound ({est_32_3072 / MiB:.1f} MiB < {expansion_3072 / MiB:.1f})"
+    )
+
+    # Linear in kv_len: doubling kv_len (within the regime) adds the
+    # expansion for the extra tokens; the price grows, never shrinks.
+    est_prev = 0
+    for kv_len in (2049, 2560, 3072, 3584, 4095):
+        est = profile.estimate_prefill_transient_bytes(32, kv_len)
+        assert est > est_prev, f"price must grow with kv_len (got {kv_len})"
+        est_prev = est
+
+    # Independent of query_tokens below the expansion: a 32-token and a
+    # 256-token chunk over the same kv_len are charged within one chunk's
+    # per-query terms of each other — the expansion term (linear in kv_len)
+    # dominates both.
+    est_big = profile.estimate_prefill_transient_bytes(256, 3072)
+    assert est_big >= expansion_3072
+
+    # Above the native sparse-MLA threshold the gathered tile bounds the price
+    # again — it collapses back below the exact-block expansion.
+    native = profile.estimate_prefill_transient_bytes(32, 4096)
+    assert native < est_prev, (
+        "Kv>=4096 native route must price below the exact-block expansion"
+    )
+
+
 def test_glm5_next_flat_overhead_guard_admits_full_chunk_at_1948_numbers():
     """Regression for the 2026-09-21 19:48 abort: GLM-5.3 at 60% expert
     residency, current=80.67GB, speed_priority pinned by the benchmark.
