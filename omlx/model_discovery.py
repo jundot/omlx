@@ -87,7 +87,11 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 # Remove a family once mlx-vlm provides its multimodal implementation.
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "mimo_v2",
+    "mimo_v2_flash",
 }
+
+_MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
+_MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
@@ -686,10 +690,18 @@ def detect_model_type(model_path: Path) -> ModelType:
         )
 
     if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        has_mimo_vision = (
+            normalized_type in {"mimo_v2", "mimo_v2_flash"}
+            and (model_path / _MIMO_VISION_SIDECAR).is_file()
+            and (model_path / _MIMO_OMNIMODAL_CONFIG).is_file()
+        )
+        if has_mimo_vision:
+            logger.info("%s detected with MiMo omnimodal vision sidecar", model_type)
+            return "vlm"
         if _has_vision_subconfig(config):
             logger.warning(
-                "%s carries multimodal configuration, but the available mlx-lm "
-                "implementation is text-only; using the LLM engine",
+                "%s carries multimodal configuration, but no supported vision "
+                "sidecar is present; using the LLM engine",
                 model_type,
             )
         return "llm"

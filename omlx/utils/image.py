@@ -320,6 +320,16 @@ def extract_images_from_messages(
                 if text:
                     text_parts.append(text)
 
+            elif part_type == "image":
+                # Internal video expansion passes sampled frames in memory.
+                image = (
+                    part.get("image")
+                    if isinstance(part, dict)
+                    else getattr(part, "image", None)
+                )
+                if isinstance(image, Image.Image):
+                    images.append(image.convert("RGB"))
+
             elif part_type in ("image_url", "input_image"):
                 # OpenAI chat format: {"type":"image_url","image_url":{"url":"..."}}
                 # Responses-style format: {"type":"input_image","image_url":"..."}

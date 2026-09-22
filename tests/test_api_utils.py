@@ -3136,11 +3136,17 @@ class TestExtractMultimodalContent:
         assert parts[0]["input_audio"]["format"] == "wav"
 
     @pytest.mark.parametrize("part_type", ["video_url", "input_video"])
-    def test_video_input_is_rejected(self, part_type):
-        with pytest.raises(InvalidRequestError, match="Video input is not supported"):
-            _extract_multimodal_content_list(
-                [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
-            )
+    def test_video_input_is_preserved(self, part_type):
+        parts = _extract_multimodal_content_list(
+            [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
+        )
+
+        assert parts == [
+            {
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,AA=="},
+            }
+        ]
 
 
 # =============================================================================

@@ -1478,6 +1478,33 @@ class TestPrepareVisionInputs:
         assert isinstance(call_audio[0], np.ndarray)
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.load_audio")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_audio_uses_processor_sample_rate(
+        self, mock_vlm_act, mock_prepare, mock_load_audio
+    ):
+        """Audio is decoded at the processor's declared sample rate."""
+        np = pytest.importorskip("numpy")
+        engine = self._setup_engine_for_vision(model_type="mimo_v2_flash")
+        engine._processor.feature_extractor = SimpleNamespace(sampling_rate=24000)
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_load_audio.return_value = np.zeros((24,), dtype=np.float32)
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        audio_stream = io.BytesIO(b"not-a-real-wav")
+
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Describe this recording"}],
+            [],
+            audio=[audio_stream],
+        )
+
+        mock_load_audio.assert_called_once_with(audio_stream, 24000)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_audio_none_not_passed(self, mock_vlm_act, mock_prepare):
@@ -1940,6 +1967,67 @@ class TestFormatMessagesForVLMTemplate:
         # get_message_json() converts "input_audio" to "audio" type markers
         assert "audio" in types
         assert image_ranges == []
+
+    def test_format_mimo_audio_preserves_native_audio_marker(self):
+        """MiMo bypasses mlx-vlm's unsupported-model formatter for audio."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Transcribe this."},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "abc", "format": "wav"},
+                    },
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0, num_audios=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Transcribe this."},
+                    {"type": "audio"},
+                ],
+            }
+        ]
+        assert image_ranges == []
+
+    def test_format_mimo_preserves_mixed_media_order(self):
+        """MiMo keeps image and audio markers in the user's original order."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Compare these."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png"}},
+                    {"type": "text", "text": "Then transcribe this."},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "abc", "format": "wav"},
+                    },
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1, num_audios=1
+        )
+
+        assert formatted[0]["content"] == [
+            {"type": "text", "text": "Compare these."},
+            {"type": "image"},
+            {"type": "text", "text": "Then transcribe this."},
+            {"type": "audio"},
+        ]
+        assert image_ranges == [(0, 1)]
 
     def test_audio_parts_capped_by_num_audios(self):
         """Only load up to num_audios audio parts even if more are in message."""
