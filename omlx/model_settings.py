@@ -38,8 +38,10 @@ MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 # Model families whose loader keeps the speculative draft head resident while
 # the backbone streams, so Lightning MTP can coexist with expert offload.
 # DeepSeek V4.1 folds DSpark into the shared loop and preserves ``mtp.*``
-# weights; every other family still strips the draft head under offload.
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41",)
+# weights; GLM-5.3 (glm5_next) keeps the nextn head's experts unwrapped
+# while backbone experts stream (see deepseek_v4/moe_offload.py). Every
+# other family still strips the draft head under offload.
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:

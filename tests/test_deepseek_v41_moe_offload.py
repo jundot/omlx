@@ -146,13 +146,16 @@ def test_speculative_offload_conflict(key):
 
 def test_lightning_mtp_offload_conflict_is_family_aware():
     # Lightning MTP + offload is rejected for families whose loader cannot
-    # keep the draft head resident, allowed for DeepSeek V4.1, and deferred
-    # (not rejected) when the family is unknown so the settings dataclass
-    # round-trips before the load path resolves the checkpoint type.
+    # keep the draft head resident, allowed for DeepSeek V4.1 and GLM-5.3
+    # (glm5_next), and deferred (not rejected) when the family is unknown so
+    # the settings dataclass round-trips before the load path resolves the
+    # checkpoint type.
     from omlx.model_settings import validate_moe_expert_offload
 
     settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
     validate_moe_expert_offload(settings, model_type="deepseek_v41")
+    validate_moe_expert_offload(settings, model_type="glm5_next")
+    validate_moe_expert_offload(settings, model_type="glm5-next")
     validate_moe_expert_offload(settings, model_type=None)
     with pytest.raises(ValueError, match="MoE expert offload cannot"):
         validate_moe_expert_offload(settings, model_type="qwen3_5")
@@ -874,9 +877,13 @@ def test_admin_validate_offload_mtp_family_gate(tmp_path, monkeypatch):
         lambda *_a, **_k: (True, ""),
     )
     settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
-    # V4.1: allowed, no HTTPException.
+    # V4.1 and GLM-5.3 (glm5_next): allowed, no HTTPException.
     _validate_model_settings(
         SimpleNamespace(model_path=str(tmp_path), config_model_type="deepseek-v41"),
+        settings,
+    )
+    _validate_model_settings(
+        SimpleNamespace(model_path=str(tmp_path), config_model_type="glm5-next"),
         settings,
     )
     # Any other lightning family: rejected at save time.
