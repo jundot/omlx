@@ -5,7 +5,9 @@ import contextlib
 import json
 import os
 import signal
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 from types import SimpleNamespace
@@ -1640,6 +1642,64 @@ def test_install_thinking_budget_support_appends_processor_per_request():
         calls and server._make_logits_processors is FakeServer._make_logits_processors
     )
     assert server.ResponseGenerator._tokenize is FakeResponseGenerator._tokenize
+
+
+def test_install_thinking_budget_support_does_not_need_the_http_stack():
+    """CUDA worker venvs ship without FastAPI (#3519), so the rank's budget hook
+    must not import it. Run in a fresh interpreter where the HTTP stack cannot be
+    imported, because this test process already has FastAPI loaded."""
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+
+        HTTP_STACK = {"fastapi", "starlette", "sse_starlette", "uvicorn"}
+
+
+        class NoHttpStack(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name.partition(".")[0] in HTTP_STACK:
+                    raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+                return None
+
+
+        sys.meta_path.insert(0, NoHttpStack())
+
+        from omlx.cluster import inference_worker
+
+
+        class Tokenizer:
+            think_end_id = 55
+            think_start_id = 54
+            unk_token_id = 0
+
+
+        class ResponseGenerator:
+            def _tokenize(self, tokenizer, request, args):
+                return [54], [[54]], ["assistant"], "reasoning"
+
+
+        class Server:
+            ResponseGenerator = ResponseGenerator
+
+            @staticmethod
+            def _make_logits_processors(args):
+                return []
+
+
+        with inference_worker._install_thinking_budget_support(Server(), Tokenizer()):
+            pass
+        loaded = sorted(m for m in sys.modules if m.partition(".")[0] in HTTP_STACK)
+        assert not loaded, loaded
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
 
 
 def test_thinking_close_pattern_and_utf8_piece_match_scheduler_rules():
