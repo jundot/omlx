@@ -249,6 +249,48 @@ class TestVLMToolForwarding:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
+    async def test_chat_forwards_generation_prompt_text(self):
+        """The template's generation prompt suffix reaches the core request."""
+        executor = ThreadPoolExecutor(max_workers=1)
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            generate=AsyncMock(return_value=self._output()),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        def fake_template(msgs, *args, **kwargs):
+            # A Gemma-style template keeps the generation prompt in history.
+            if any(m["role"] == "assistant" for m in msgs):
+                return "PROMPT<start_of_turn>model\nreply<end_of_turn>"
+            if kwargs.get("add_generation_prompt") is False:
+                return "PROMPT"
+            return "PROMPT<start_of_turn>model\n"
+
+        engine._apply_chat_template = fake_template
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                await engine.chat([{"role": "user", "content": "hi"}])
+                assert (
+                    core.generate.call_args.kwargs["generation_prompt_text"]
+                    == "<start_of_turn>model\n"
+                )
+                assert (
+                    core.generate.call_args.kwargs["generation_prompt_persists"] is True
+                )
+                await engine.chat([{"role": "user", "content": "hi"}], is_partial=True)
+                assert "generation_prompt_text" not in core.generate.call_args.kwargs
+        finally:
+            executor.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
     async def test_stream_chat_forwards_tools_to_core_request(self):
         executor = ThreadPoolExecutor(max_workers=1)
 

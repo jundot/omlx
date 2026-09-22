@@ -79,7 +79,11 @@ def compact_pooling_cache_snapshot(
                 pooled = state[2]
                 pooled_length = int(pooled.shape[1])
                 expected_end = token_count // ratio
-                expected_start = max(0, token_count - block_size) // ratio
+                # The delta covers this block only, so start at the previous
+                # block boundary. A tail snapshot ends mid-block, where
+                # token_count - block_size would reach into the prior block.
+                prev_boundary = ((token_count - 1) // block_size) * block_size
+                expected_start = prev_boundary // ratio
             except (AttributeError, TypeError, ValueError, IndexError):
                 continue
 

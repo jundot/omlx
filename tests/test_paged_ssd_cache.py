@@ -762,6 +762,70 @@ class TestPagedSSDCacheManagerWithMLX:
             assert keys.shape == (1, 8, 64, 64)
             assert values.shape == (1, 8, 64, 64)
 
+    def test_save_block_persists_tail_metadata_and_reindexes(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Tail blocks keep their parent and marker across a rescan."""
+        import hashlib
+        import time as time_mod
+
+        from omlx.cache.paged_ssd_cache import PagedSSDBlockMetadata
+
+        mx = mock_mlx
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        parent_hash = hashlib.sha256(b"parent").digest()
+        tail_hash = hashlib.sha256(b"tail").digest()
+        full_hash = hashlib.sha256(b"full").digest()
+        try:
+            assert manager.save_block(
+                block_hash=tail_hash,
+                cache_data=[(mx.zeros((1, 2, 3, 8)), mx.zeros((1, 2, 3, 8)))],
+                token_count=3,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                parent_hash=parent_hash,
+                tail_terminal=True,
+            )
+            assert manager.save_block(
+                block_hash=full_hash,
+                cache_data=[(mx.zeros((1, 2, 4, 8)), mx.zeros((1, 2, 4, 8)))],
+                token_count=4,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                parent_hash=parent_hash,
+            )
+            for _ in range(50):
+                with manager._pending_write_hashes_lock:
+                    if not manager._pending_write_hashes:
+                        break
+                time_mod.sleep(0.1)
+        finally:
+            manager.close()
+
+        reopened = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        try:
+            meta = reopened.get_block_metadata(tail_hash)
+            assert meta is not None
+            assert meta.parent_hash == parent_hash
+            assert meta.tail_terminal is True
+            assert meta.token_count == 3
+            full_meta = reopened.get_block_metadata(full_hash)
+            assert full_meta.parent_hash == parent_hash
+            assert full_meta.tail_terminal is False
+            assert reopened.iter_tail_blocks() == [(parent_hash, tail_hash, 3)]
+
+            round_trip = PagedSSDBlockMetadata.from_dict(meta.to_dict())
+            assert round_trip.parent_hash == parent_hash
+            assert round_trip.tail_terminal is True
+        finally:
+            reopened.close()
+
     def test_load_block_with_metadata(self, tmp_path: Path, mock_mlx):
         """Test loading block with metadata."""
         mx = mock_mlx

@@ -683,6 +683,8 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        generation_prompt_text: Optional[str] = None,
+        generation_prompt_persists: bool = False,
         skip_cache_store: bool = False,
         preserve_reasoning: bool = False,
         benchmark_trace: bool = False,
@@ -745,6 +747,9 @@ class EngineCore:
             request._specprefill_threshold = specprefill_threshold
         if specprefill_system_end is not None and specprefill_system_end > 0:
             request.specprefill_system_end = specprefill_system_end
+        if generation_prompt_text:
+            request.generation_prompt_text = generation_prompt_text
+            request.generation_prompt_persists = bool(generation_prompt_persists)
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)

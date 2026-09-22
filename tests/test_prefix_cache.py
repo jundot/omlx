@@ -1882,6 +1882,216 @@ class TestArraysCacheLastBlockOnly:
         assert saved_conv_state.shape == conv_state.shape
         assert saved_ssm_state.shape == ssm_state.shape
 
+    def _tail_fixture(self, mx):
+        """Hybrid KVCache + ArraysCache prefix cache with a mocked SSD tier."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+        mock_ssd.has_block.return_value = False
+        mock_ssd.iter_tail_blocks.return_value = []
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        config = ModelCacheConfig.from_type_list(
+            ["KVCache", "ArraysCache"], model_name="test-model"
+        )
+        return cache, paged_cache, mock_ssd, config
+
+    @staticmethod
+    def _hybrid_state(mx, seq_len, fill):
+        return [
+            {
+                "state": (
+                    mx.full((1, 2, seq_len, 8), fill),
+                    mx.full((1, 2, seq_len, 8), fill),
+                ),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            },
+            {
+                "state": (mx.full((1, 3, 8), fill), mx.full((1, 2, 4, 8), fill)),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            },
+        ]
+
+    def test_store_cache_tail_terminal_stores_partial_block(self, mx):
+        """Tail mode keeps the trailing partial block as a short terminal block.
+
+        The tail carries the boundary snapshot taken at its end (7), hashes in
+        its own domain, and is indexed under its parent block."""
+        from omlx.cache.paged_cache import compute_block_hash, tail_extra_keys
+
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        tokens = list(range(7))
+        snapshots = {
+            4: self._hybrid_state(mx, 4, 4.0),
+            7: self._hybrid_state(mx, 7, 7.0),
+        }
+
+        result = cache.store_cache(
+            "req-tail",
+            tokens,
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+
+        assert result is not None
+        assert len(result.block_ids) == 2
+        assert result.num_tokens == 7
+        full = paged_cache.allocated_blocks[result.block_ids[0]]
+        tail = paged_cache.allocated_blocks[result.block_ids[-1]]
+        assert tail.token_count == 3
+        assert tail.block_hash == compute_block_hash(
+            full.block_hash,
+            [4, 5, 6],
+            extra_keys=tail_extra_keys(None),
+            model_name="test-model",
+        )
+        assert tail.block_hash != compute_block_hash(
+            full.block_hash, [4, 5, 6], model_name="test-model"
+        )
+
+        assert mock_ssd.save_block.call_count == 2
+        full_call = mock_ssd.save_block.call_args_list[0].kwargs
+        tail_call = mock_ssd.save_block.call_args_list[1].kwargs
+        assert full_call["tail_terminal"] is False
+        assert full_call["parent_hash"] is None
+        assert tail_call["tail_terminal"] is True
+        assert tail_call["parent_hash"] == full.block_hash
+        assert tail_call["token_count"] == 3
+        kv_slice, arrays_state = tail_call["cache_data"]
+        assert kv_slice[0].shape[2] == 3
+        assert arrays_state[1].shape == (1, 2, 4, 8)
+        assert float(arrays_state[1][0, 0, 0, 0]) == 7.0
+
+        assert paged_cache._tail_index[full.block_hash][tail.block_hash] == 3
+        stats = cache.get_stats()
+        assert stats.tail_blocks_stored == 1
+        assert stats.partial_block_skips == 0
+        assert stats.last_partial_tokens_skipped == 0
+        # The prefix index covers the full block only.
+        assert [entry[0] for entry in cache._prefix_index.values()] == [4]
+
+    def test_store_cache_pops_fetched_tail_and_extends_on_grid(self, mx):
+        """A request that reused a tail stores its own blocks on the grid.
+
+        The fetched tail is released from the table before the new blocks
+        are laid out, so the next full block chains to the last full block
+        and the old tail stays cached for other requests."""
+        from omlx.cache.paged_cache import compute_block_hash, tail_extra_keys
+
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        first = cache.store_cache(
+            "req-a",
+            list(range(7)),
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots={
+                4: self._hybrid_state(mx, 4, 4.0),
+                7: self._hybrid_state(mx, 7, 7.0),
+            },
+            _store_tail_terminal=True,
+        )
+        old_tail_hash = paged_cache.allocated_blocks[first.block_ids[-1]].block_hash
+        paged_cache.release_for_eviction(first.block_ids)
+
+        longer = list(range(11))
+        table, remaining = cache.fetch_cache("req-b", longer)
+        assert table is not None and table.num_tokens == 7
+        assert remaining == [7, 8, 9, 10]
+        assert cache.get_stats().tail_block_hits == 1
+
+        second = cache.store_cache(
+            "req-b",
+            longer,
+            self._hybrid_state(mx, 11, 11.0),
+            model_cache_config=config,
+            boundary_snapshots={
+                8: self._hybrid_state(mx, 8, 8.0),
+                11: self._hybrid_state(mx, 11, 11.0),
+            },
+            _store_tail_terminal=True,
+        )
+
+        assert second is not None and second.num_tokens == 11
+        blocks = [paged_cache.allocated_blocks[b] for b in second.block_ids]
+        assert [b.token_count for b in blocks] == [4, 4, 3]
+        assert blocks[1].block_hash == compute_block_hash(
+            blocks[0].block_hash, [4, 5, 6, 7], model_name="test-model"
+        )
+        assert blocks[2].block_hash == compute_block_hash(
+            blocks[1].block_hash,
+            [8, 9, 10],
+            extra_keys=tail_extra_keys(None),
+            model_name="test-model",
+        )
+        old_tail = paged_cache.cached_block_hash_to_block.get_block(old_tail_hash)
+        assert old_tail is not None and old_tail.ref_count == 0
+        assert old_tail.block_id not in second.block_ids
+        assert old_tail_hash in paged_cache._tail_index[blocks[0].block_hash]
+        assert blocks[2].block_hash in paged_cache._tail_index[blocks[1].block_hash]
+
+    def test_store_cache_tail_dedup_reuses_existing_block(self, mx):
+        """An identical tail under the same parent is reused, not re-saved."""
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        snapshots = {
+            4: self._hybrid_state(mx, 4, 4.0),
+            7: self._hybrid_state(mx, 7, 7.0),
+        }
+        first = cache.store_cache(
+            "req-a",
+            list(range(7)),
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+        second = cache.store_cache(
+            "req-c",
+            list(range(7)),
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+
+        assert second.block_ids == first.block_ids
+        assert mock_ssd.save_block.call_count == 2
+        tail = paged_cache.allocated_blocks[second.block_ids[-1]]
+        assert tail.ref_count == 2
+        assert cache.get_stats().tail_blocks_stored == 1
+
+    def test_attaching_ssd_manager_seeds_tail_index(self):
+        """Tails from earlier runs are indexed when the SSD tier is attached later."""
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1), paged_cache_manager=paged_cache
+        )
+        assert paged_cache._tail_index == {}
+
+        mock_ssd = MagicMock()
+        mock_ssd.iter_tail_blocks.return_value = [(b"parent", b"tail", 3)]
+        cache.set_paged_ssd_cache_manager(mock_ssd)
+
+        assert paged_cache._tail_index[b"parent"][b"tail"] == 3
+
     def test_store_cache_all_partial_creates_no_blocks(self, mx):
         """Tokens fewer than block_size should create no blocks."""
         block_size = 4

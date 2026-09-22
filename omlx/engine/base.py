@@ -16,6 +16,7 @@ import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
 
+logger = logging.getLogger(__name__)
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
 
 _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 4.0
@@ -232,6 +233,76 @@ class BaseEngine(ABC):
         """
 
         return False
+
+    def _generation_prompt_text(
+        self,
+        chat_template_kwargs: Optional[Dict[str, Any]],
+        is_partial: Optional[bool],
+    ) -> tuple[Optional[str], bool]:
+        """Chat template generation prompt: ``(suffix, persists)``.
+
+        ``suffix`` is the text the template appends after the last message,
+        or None. ``persists`` is True when an assistant turn followed by a
+        new user turn still renders with that suffix in front of the reply
+        (Llama, Gemma 3), so cache state captured past it stays reusable in
+        the next turn. Reasoning templates render the region differently
+        (Qwen strips the think block from earlier turns), so the prefix
+        cache ends its tail block in front of it and ignores later
+        snapshots. Both come from short probes; the scheduler still verifies
+        the suffix against the real token prompt. Results are memoized per
+        template kwargs.
+        """
+        render = getattr(self, "_apply_chat_template", None)
+        if is_partial or not callable(render):
+            return None, False
+        key = repr(sorted((chat_template_kwargs or {}).items(), key=repr))
+        cache = self.__dict__.setdefault("_generation_prompt_cache", {})
+        if key in cache:
+            return cache[key]
+        suffix: Optional[str] = None
+        persists = False
+        try:
+            probe = [{"role": "user", "content": "probe"}]
+            with_prompt = render(
+                [dict(m) for m in probe],
+                None,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=False,
+            )
+            without = render(
+                [dict(m) for m in probe],
+                None,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=False,
+                add_generation_prompt=False,
+            )
+            if (
+                isinstance(with_prompt, str)
+                and isinstance(without, str)
+                and len(without) < len(with_prompt)
+                and with_prompt.startswith(without)
+            ):
+                suffix = with_prompt[len(without) :]
+                # The reply must sit before a later user turn: templates
+                # keep reasoning only on the final assistant turn.
+                history = render(
+                    [dict(m) for m in probe]
+                    + [
+                        {"role": "assistant", "content": "reply"},
+                        {"role": "user", "content": "next"},
+                    ],
+                    None,
+                    chat_template_kwargs=chat_template_kwargs,
+                    is_partial=False,
+                    add_generation_prompt=False,
+                )
+                persists = isinstance(history, str) and history.startswith(with_prompt)
+        except Exception as e:
+            logger.debug(f"Generation prompt suffix calc failed: {e}")
+        if len(cache) >= 16:
+            cache.clear()
+        cache[key] = (suffix, persists)
+        return suffix, persists
 
     @property
     @abstractmethod

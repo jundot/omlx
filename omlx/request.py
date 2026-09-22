@@ -220,6 +220,16 @@ class Request:
     specprefill_position_offset: int = 0  # RoPE offset = M - N
     specprefill_system_end: int = 0  # Token index where system prompt ends
 
+    # Chat template generation prompt (e.g. "<|im_start|>assistant\n") rendered
+    # after the last message. The next turn renders that region differently,
+    # so the prefill tail snapshot is taken in front of it.
+    generation_prompt_text: Optional[str] = None
+    generation_prompt_start: int = 0  # Token index where the generation prompt starts
+    # True when the history rendering of an assistant turn starts with the
+    # generation prompt (Llama, Gemma 3), so cache state captured past it
+    # stays reusable. Reasoning templates strip that region instead.
+    generation_prompt_persists: bool = False
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter
