@@ -2,7 +2,7 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 2..9).
+"""Fused GDN prework for Qwen3.5/3.6 verify and selected decode paths.
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
@@ -19,13 +19,17 @@ multiply's rounding — the composed chain's two casts.
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
-Only the target-verify arm routes here; decode (S=1) and prefill keep the
-stock path.
+The opt-in ``OMLX_QWEN35_FP16_GDN_DECODE=1`` route also reuses this kernel
+for ordinary FP16 B1/T1 decode with the Qwen3.5/3.6 35B-A3B geometry. Gates,
+recurrence, final norm and projections remain unchanged. Other Qwen3.5
+decode shapes and prefill keep the stock path. Qwen4 has its separate
+BF16 decode prework and norm-gate kernels below.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 import mlx.core as mx
@@ -39,6 +43,7 @@ _KERNEL = None
 _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
+_QWEN35_FP16_DECODE_ENGAGED_LOGGED = False
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -592,6 +597,45 @@ def _qwen4_decode_dynamic_eligible(
     )
 
 
+def _qwen35_fp16_decode_eligible(module, inputs, mask, cache) -> bool:
+    """Limit ordinary FP16 decode to the validated 35B-A3B geometry."""
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet
+
+    if (
+        type(module) is not Qwen3_5GatedDeltaNet
+        or module.training
+        or not isinstance(inputs, mx.array)
+        or inputs.shape != (1, 1, 2048)
+        or inputs.dtype != mx.float16
+        or mx.default_device() != mx.gpu
+        or mask is not None
+        or type(cache) is not ArraysCache
+        or len(cache.cache) != 2
+        or cache.is_speculating
+        or cache.lengths is not None
+        or cache.left_padding is not None
+        or module.hidden_size != 2048
+        or module.num_k_heads != 16
+        or module.num_v_heads != 32
+        or module.head_k_dim != 128
+        or module.head_v_dim != 128
+        or module.conv_kernel_size != 4
+        or module.conv1d.weight.shape != (8192, 4, 1)
+        or module.conv1d.weight.dtype != mx.float16
+        or getattr(module.conv1d, "bias", None) is not None
+    ):
+        return False
+    return (
+        isinstance(cache[0], mx.array)
+        and cache[0].shape == (1, 3, 8192)
+        and cache[0].dtype == mx.float16
+        and isinstance(cache[1], mx.array)
+        and cache[1].shape == (1, 32, 128, 128)
+        and cache[1].dtype == mx.float32
+    )
+
+
 def _qwen4_l2_norm_sites():
     """Return the (verifier, layer) normalize functions of the loaded qwen4_exp.
 
@@ -628,8 +672,63 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls = q35.Qwen3_5GatedDeltaNet
     original = cls.__call__
     original_verify = Qwen3_5BatchInvariantForward._gated_delta
+    # Read once at installation, rather than per layer and token. The
+    # existing Qwen4 and speculative routes do not depend on this flag.
+    fp16_decode = os.environ.get("OMLX_QWEN35_FP16_GDN_DECODE", "0") == "1"
+    if fp16_decode:
+        q_scale_fp16 = mx.array(128**-1, dtype=mx.float16)
+        k_scale_fp16 = mx.array(128**-0.5, dtype=mx.float16)
 
-    def decode(self, inputs, mask=None, cache=None):
+    def decode(self, inputs, mask=None, cache=None, **kwargs):
+        # Runtime extensions (for example capture/verification keywords)
+        # must keep their original implementation and cache semantics.
+        if kwargs:
+            return original(self, inputs, mask=mask, cache=cache, **kwargs)
+        if fp16_decode and _qwen35_fp16_decode_eligible(self, inputs, mask, cache):
+            mixed_qkv = self.in_proj_qkv(inputs)
+            # Custom projection precision must not reach a kernel whose
+            # convolution state and weights have the FP16 ABI.
+            if mixed_qkv.dtype != mx.float16 or mixed_qkv.shape != (1, 1, 8192):
+                return original(self, inputs, mask=mask, cache=cache)
+            z = self.in_proj_z(inputs).reshape(1, 1, 32, 128)
+            b, a = self._project_gates(inputs)
+            q, k, v, conv_state = gdn_prework_fused(
+                mixed_qkv,
+                cache[0],
+                self.conv1d.weight,
+                q_scale_fp16,
+                k_scale_fp16,
+                16,
+                32,
+                128,
+                128,
+            )
+            # An ordinary ArraysCache has no speculative history to record.
+            # Compute both next states first, then commit them together;
+            # never retry stock code against a partially advanced cache.
+            out, state = q35.gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state=cache[1],
+                use_kernel=True,
+            )
+            out = self.norm(out, z)
+            result = self.out_proj(out.reshape(1, 1, -1))
+            cache[0], cache[1] = conv_state, state
+            cache.advance(1)
+            q35._qwen3_5_advance_left_padding_info(cache, 1)
+            q35._qwen3_5_advance_lengths_info(cache, 1)
+            global _QWEN35_FP16_DECODE_ENGAGED_LOGGED
+            if not _QWEN35_FP16_DECODE_ENGAGED_LOGGED:
+                _QWEN35_FP16_DECODE_ENGAGED_LOGGED = True
+                logger.info("Qwen3.5 FP16 B1/T1 fused GDN prework engaged")
+            return result
+
         if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
             return original(self, inputs, mask=mask, cache=cache)
         mixed_qkv, z, b, a = _target_verify_linears(

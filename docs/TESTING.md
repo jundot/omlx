@@ -10,6 +10,13 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 
 CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
 
+The opt-in Qwen3.5/3.6 FP16 decode prework route has numerical, cache-state and
+fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
+`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
+speculative routes remain intact. See
+[FP16 decode prework](experimental/qwen35_fp16_decode.md) for the flag, geometry
+limits and real-model benchmark requirements.
+
 Cluster process-group tests use the `mock_cluster_ssh` fixture; remote teardown and serve-marker tests retain their own transport assertions. Mock-model engine tests skip explicit GC, while `test_engine_teardown.py` and `test_per_engine_threads.py` retain teardown and reclamation coverage. GLM5 execution tests reuse the eight-layer KDA/DSA fixture with dense and MoE layers; checkpoint-key tests retain the 45-layer configuration. The SDPA memory test retains the 8K/32K length ratio, head dimension 256, and 6:1 GQA ratio with fewer heads. DeepSeek V4.1 direct and converted engine checks run sequentially in one isolated subprocess with separate checkpoint directories.
 
 # Cache cleanup logging tests
