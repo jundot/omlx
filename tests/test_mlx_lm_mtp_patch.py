@@ -327,6 +327,109 @@ class TestQwen35Model:
         assert seen["n_confirmed"] == 3
 
 
+class TestQwen35MtpPipelineStages:
+    """#3518: the MTP forward replaces Qwen3_5TextModel.__call__ even with MTP
+    off, so it must honour planned pipeline stages like MLX-LM's own forward."""
+
+    ARGS = {
+        "model_type": "qwen3_5",
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "vocab_size": 256,
+        "linear_num_value_heads": 4,
+        "linear_num_key_heads": 2,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "head_dim": 16,
+        # Layers 3 and 7 use full attention; the rest are linear attention.
+        "full_attention_interval": 4,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+        },
+    }
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        from omlx.patches.mlx_lm_mtp import qwen35_model
+
+        if not qwen35_model.apply():
+            pytest.skip("qwen35_model patch refused to apply (likely mlx_lm absent)")
+
+    def _build(self):
+        from mlx_lm.models import qwen3_5
+
+        mx.random.seed(7)
+        model = qwen3_5.TextModel(qwen3_5.TextModelArgs(**self.ARGS))
+        mx.eval(model.parameters())
+        return model
+
+    def test_planned_stages_match_the_unsplit_forward(self, monkeypatch):
+        from omlx.cluster.planner import (
+            PipelineAssignment,
+            install_unequal_pipeline_plan,
+        )
+
+        def assignment(rank, start, end):
+            return PipelineAssignment(
+                node_id=f"node-{rank}",
+                rank=rank,
+                start_layer=start,
+                end_layer=end,
+                layer_weight_bytes=1,
+                fixed_weight_bytes=1,
+                reserve_bytes=0,
+                capacity_bytes=1,
+            )
+
+        class Group:
+            def __init__(self, rank):
+                self._rank = rank
+
+            def rank(self):
+                return self._rank
+
+            def size(self):
+                return 2
+
+        tokens = mx.array([[5, 17, 42, 9, 128, 3]])
+        unsplit = self._build()
+        expected = unsplit.model(tokens, unsplit.make_cache())
+
+        # Rank 1 runs layers 0-6 and sends; rank 0 runs only full-attention
+        # layer 7, so its ssm_idx is None.
+        plan = [assignment(1, 0, 7), assignment(0, 7, 8)]
+        stages = {}
+        with install_unequal_pipeline_plan(plan):
+            for rank in (1, 0):
+                stage = self._build()
+                stage.model.pipeline(Group(rank))
+                stages[rank] = stage
+        assert len(stages[1].model.pipeline_layers) == 7
+        assert stages[0].model.ssm_idx is None
+
+        sent = []
+
+        def send(x, dst, **kwargs):
+            sent.append((x, dst))
+            return x
+
+        monkeypatch.setattr(mx.distributed, "send", send)
+        monkeypatch.setattr(
+            mx.distributed, "recv_like", lambda x, src, **kw: sent[-1][0]
+        )
+        monkeypatch.setattr(mx.distributed, "all_gather", lambda x, **kwargs: x)
+
+        stages[1].model(tokens, stages[1].make_cache())
+        assert [dst for _, dst in sent] == [0]
+        received = stages[0].model(tokens, stages[0].make_cache())
+        assert mx.allclose(received, expected, atol=1e-5, rtol=1e-5).item()
+
+
 class TestQwen35MtpNormShift:
     """MTP-head RMSNorm +1 shift follows the checkpoint layout, not the tensor.
 
