@@ -1692,6 +1692,190 @@ class TestStepBurst:
         finally:
             engine.close()
 
+    @pytest.mark.parametrize("first_tokens", [[11], [11, 12, 13]])
+    def test_first_generated_chunk_ends_burst(
+        self, mock_model, mock_tokenizer, first_tokens
+    ):
+        """Release ordinary and multi-token first chunks before further decode."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        first = SchedulerOutput(
+            has_work=True,
+            outputs=[
+                RequestOutput(
+                    request_id="a",
+                    new_token_ids=first_tokens,
+                    completion_tokens=len(first_tokens),
+                )
+            ],
+        )
+        later = SchedulerOutput(
+            has_work=True,
+            outputs=[
+                RequestOutput(
+                    request_id="a",
+                    new_token_ids=[14],
+                    completion_tokens=len(first_tokens) + 1,
+                )
+            ],
+        )
+        try:
+            engine.scheduler.step = MagicMock(side_effect=[first, later, later, later])
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == [first]
+            assert engine.scheduler.step.call_count == 1
+        finally:
+            engine.close()
+
+    def test_prefill_without_tokens_can_continue_to_first_chunk(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prefill-only steps must not count as the first generated chunk."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        prefill = SchedulerOutput(has_work=True)
+        first = SchedulerOutput(
+            has_work=True,
+            outputs=[
+                RequestOutput(request_id="a", new_token_ids=[11], completion_tokens=1)
+            ],
+        )
+        try:
+            engine.scheduler.step = MagicMock(
+                side_effect=[
+                    prefill,
+                    first,
+                    SchedulerOutput(has_work=True),
+                    SchedulerOutput(has_work=True),
+                ]
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == [prefill, first]
+            assert engine.scheduler.step.call_count == 2
+        finally:
+            engine.close()
+
+    def test_new_request_first_chunk_preserves_other_outputs(
+        self, mock_model, mock_tokenizer
+    ):
+        """A late joiner ends the burst without dropping the existing row."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        steps = [
+            SchedulerOutput(
+                has_work=True,
+                outputs=[
+                    RequestOutput(
+                        request_id="a", new_token_ids=[count], completion_tokens=count
+                    )
+                ],
+            )
+            for count in (9, 10, 11)
+        ]
+        steps[1].outputs.append(
+            RequestOutput(request_id="b", new_token_ids=[21], completion_tokens=1)
+        )
+        steps[2].outputs.append(
+            RequestOutput(request_id="b", new_token_ids=[22], completion_tokens=2)
+        )
+        try:
+            engine.scheduler.running = {"a": object(), "b": object()}
+            engine.scheduler.step = MagicMock(side_effect=steps + [steps[-1]])
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == steps[:2]
+            assert engine.scheduler.step.call_count == 2
+            engine.scheduler.has_requests.return_value = False
+            assert engine._step_burst() == steps[2:]
+        finally:
+            engine.close()
+
+    def test_later_chunks_retain_burst_and_token_order(
+        self, mock_model, mock_tokenizer
+    ):
+        """Only the first chunk yields early; later chunks still reach the cap."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        steps = [
+            SchedulerOutput(
+                has_work=True,
+                outputs=[
+                    RequestOutput(
+                        request_id="a", new_token_ids=[count], completion_tokens=count
+                    )
+                ],
+            )
+            for count in range(2, 7)
+        ]
+        try:
+            engine.scheduler.step = MagicMock(side_effect=steps)
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == steps[:4]
+            assert engine.scheduler.step.call_count == 4
+        finally:
+            engine.close()
+
+    def test_empty_token_output_does_not_end_burst(self, mock_model, mock_tokenizer):
+        """A terminal/control output with zero tokens is not a first chunk."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(
+                    has_work=True,
+                    outputs=[RequestOutput(request_id="a", finished=True)],
+                )
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert len(engine._step_burst()) == 4
+            assert engine.scheduler.step.call_count == 4
+        finally:
+            engine.close()
+
+    @pytest.mark.asyncio
+    async def test_first_chunk_reaches_collector_before_next_decode(
+        self, mock_model, mock_tokenizer
+    ):
+        """Exercise the executor/event-loop boundary, not just burst contents."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        collector = RequestOutputCollector()
+        engine._output_collectors["a"] = collector
+        finished = engine._finished_events["a"] = asyncio.Event()
+        first = RequestOutput(
+            request_id="a", new_token_ids=[11], new_text="one", completion_tokens=1
+        )
+        last = RequestOutput(
+            request_id="a",
+            new_token_ids=[12],
+            new_text=" two",
+            completion_tokens=2,
+            finished=True,
+            finish_reason="length",
+        )
+        steps = [first, last]
+        first_delivered_before_next_step = []
+
+        def step():
+            output = steps.pop(0)
+            if output is last:
+                first_delivered_before_next_step.append(collector.output is first)
+            return SchedulerOutput(has_work=True, outputs=[output])
+
+        try:
+            engine.scheduler.step = MagicMock(side_effect=step)
+            engine.scheduler.has_requests = lambda: bool(steps)
+            await engine.start()
+            await asyncio.wait_for(finished.wait(), timeout=2.0)
+
+            assert first_delivered_before_next_step == [True]
+            combined = collector.get_nowait()
+            assert combined.new_token_ids == [11, 12]
+            assert combined.new_text == "one two"
+            assert combined.finished
+            assert engine.scheduler.step.call_count == 2
+        finally:
+            await engine.stop()
+            engine.close()
+
     def test_breaks_when_no_requests(self, mock_model, mock_tokenizer):
         """Burst stops once the scheduler runs dry (e.g. only request finished)."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
