@@ -1780,6 +1780,54 @@ def test_glm5_next_flat_overhead_guard_admits_full_chunk_at_1948_numbers():
     assert n == 2047
 
 
+def test_glm5_next_guard_rejects_exact_block_chunk_when_headroom_unavailable():
+    """Reviewer #3808: in the exact-block regime (index_topk < kv_len < 4096)
+    the core expands the full head-width K/V, so the required headroom is
+    driven by kv_len and is essentially independent of the chunk size —
+    shrinking the chunk cannot rescue the admission. At 3,072 cached KV tokens
+    with a 32-token chunk the expansion measured ~577 MiB of extra GPU peak
+    against a ~73 MiB gathered-static estimate; when the resident footprint
+    leaves less than that under the safety cap the guard must REJECT the chunk
+    rather than admit a doomed prefill. The same footprint admits the native
+    sparse-MLA route (kv_len>=4096), which tiles the gather and stays within
+    its estimate."""
+    monitor = _glm5_next_monitor()
+    assert monitor.uses_flat_overhead_accounting() is True
+    hard = int(123.5 * _GB)
+    current = int(110.6 * _GB)
+    # Reclaim cannot help: the head-expanded K/V is live working set, not
+    # reclaimable pool churn, so the guard's reclaim-and-recheck stays put.
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=monitor, reclaim_to=current, min_chunk=32
+    )
+    ns._fake_current = current
+
+    # The exact-block expansion is what tips the admission over the cap: the
+    # charged transient carries at least the full head-expanded K/V, and it is
+    # far above the native sparse-MLA bound for the same 32-token chunk.
+    expansion = 3072 * 64 * (256 + 256) * (2 + 4)
+    exact_bound = ns._admission_transient_bound(32, 3072)
+    native_bound = ns._admission_transient_bound(32, 8192)
+    assert exact_bound >= expansion
+    assert exact_bound > native_bound * 4
+
+    # Exact-block regime: reject, not admit.
+    with pytest.raises(PrefillMemoryExceededError) as exc:
+        _guard_call(ns, 32, kv_len=3072)
+    assert "too large for available memory" in str(exc.value)
+    assert exc.value.estimated_bytes > exc.value.limit_bytes
+
+    # Shrinking is futile — a bigger chunk that stays inside the exact-block
+    # regime (3072 + 512 < 4096) shrinks to the 32-token floor and still
+    # breaches, because the expansion scales with kv_len, not the chunk.
+    with pytest.raises(PrefillMemoryExceededError):
+        _guard_call(ns, 512, kv_len=3072)
+
+    # Contrast: the native sparse-MLA route tiles the gather, its bound
+    # collapses, and the identical footprint admits the chunk.
+    assert _guard_call(ns, 32, kv_len=8192) == 32
+
+
 def test_glm5_next_flat_overhead_charges_pool_once_and_releases_on_reclaim():
     """The flat-overhead path never re-charges retained pool bytes (they are
     already in the current footprint reading); only pool bytes a reclaim
