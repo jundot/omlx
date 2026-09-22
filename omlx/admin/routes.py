@@ -4628,6 +4628,7 @@ def _global_settings_response(global_settings):
             "temperature": global_settings.sampling.temperature,
             "top_p": global_settings.sampling.top_p,
             "top_k": global_settings.sampling.top_k,
+            "top_logprobs_k": global_settings.sampling.top_logprobs_k,
             "repetition_penalty": global_settings.sampling.repetition_penalty,
         },
         "auth": {
