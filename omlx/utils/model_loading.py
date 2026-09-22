@@ -173,6 +173,21 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 variant = _VLM_TEXT_PREFIX + key
             if variant not in quant and variant not in extras:
                 extras[variant] = val
+            # Mirror the glm5_next sanitize() renames for per-tensor quant
+            # overrides: nn.quantize matches the runtime module paths, so an
+            # unmapped key would fall back to the global bit recipe.
+            for cand in (key, variant):
+                fg = None
+                if ".hc_attn_" in cand:
+                    fg = cand.replace(".hc_attn_", ".attn_hc.")
+                elif ".hc_ffn_" in cand:
+                    fg = cand.replace(".hc_ffn_", ".ffn_hc.")
+                elif ".self_attn." in cand:
+                    head, tail = cand.split(".self_attn.", 1)
+                    if tail.split(".", 1)[0] in ("f_a_proj", "f_b_proj", "A_log", "dt_bias"):
+                        fg = f"{head}.self_attn.forget_gate.{tail}"
+                if fg and fg not in quant and fg not in extras:
+                    extras[fg] = val
             # Laguna router overrides: published checkpoints key the
             # per-layer quantization spec by ``mlp.gate``, but the model's
             # actual module-tree path is ``mlp.gate.proj`` (the router is
