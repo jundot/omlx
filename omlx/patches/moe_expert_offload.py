@@ -431,10 +431,35 @@ class ExpertCache:
             return
         self.ensure_ids(int(e) for e in idx.reshape(-1).tolist())
 
-    def ensure_ids(self, ids) -> None:
+    def stage_ids(self, ids) -> dict:
+        """Speculatively read non-resident experts' bytes on the IO pool.
+
+        Returns ``{e: [(name, field, plan, future)]}`` for a later
+        :meth:`ensure_ids` call to consume. Bytes only — no cache state is
+        touched, so a stale or unused stash is always safe to drop (the
+        caller waits the futures out in ``ensure_ids``'s finally).
+        ``slot_of`` is unchanged between the stage call and the consuming
+        ensure, so ``e not in slot_of`` is an exact miss prediction.
+        """
+        staged: dict[int, list] = {}
+        pool = _io_pool()
+        if pool is None or self.warm:
+            return staged
+        for e in set(int(i) for i in ids):
+            if e in self.slot_of:
+                continue
+            staged[e] = [
+                (name, field, plan, pool.submit(CheckpointExpertStore.read, plan))
+                for name, field, plan in self._plans(e)
+            ]
+        return staged
+
+    def ensure_ids(self, ids, staged: dict | None = None) -> None:
         """Host-side variant of :meth:`ensure`: takes an iterable of expert
         ids and skips the device->host readback entirely (the prefill
-        chunker already holds them as numpy)."""
+        chunker already holds them as numpy). ``staged`` may carry futures
+        from :meth:`stage_ids`; they are consumed — serially, in the same
+        order the demand path would install them — or waited out."""
         if self.warm:
             return
         # Ascending expert id = ascending file offset per shard, so misses
@@ -452,6 +477,8 @@ class ExpertCache:
             while sent < min(upto, len(queue)):
                 e = queue[sent]
                 sent += 1
+                if staged is not None and e in staged:
+                    continue  # bytes already in flight via stage_ids
                 pending[e] = []
                 for name, field, plan in self._plans(e):
                     pending[e].append(
@@ -476,7 +503,9 @@ class ExpertCache:
                 # Refill an exhausted window before falling back to a serial read.
                 if sent < len(queue) and queue[sent] == e:
                     prefetch(done + window)
-                group = pending.get(e)
+                group = pending.pop(e, None)
+                if group is None and staged:
+                    group = staged.pop(e, None)
                 if group is None:
                     self._install(e, protected=protected)
                     continue
@@ -487,11 +516,13 @@ class ExpertCache:
                     [(name, field, plan, f.result()) for name, field, plan, f in group],
                     protected=protected,
                 )
-                del pending[e], group
                 done += 1
         finally:
             # Finish reads before the store's shard descriptors can be released.
             futures = [f for group in pending.values() for _, _, _, f in group]
+            if staged:
+                futures += [f for group in staged.values() for _, _, _, f in group]
+                staged.clear()
             for future in futures:
                 future.cancel()
             if futures:
@@ -578,10 +609,20 @@ class OffloadSwitchGLU(nn.Module):
         run_starts = np.flatnonzero(np.diff(sorted_ids)) + 1
         run_starts = np.concatenate(([0], run_starts))
         cuts = run_starts[:: c.capacity].tolist() + [len(ids)]
+        spans = list(zip(cuts[:-1], cuts[1:]))
         outs = []
-        for start, end in zip(cuts[:-1], cuts[1:]):
+        staged = None
+        for i, (start, end) in enumerate(spans):
             chunk_ids = sorted_ids[start:end]
-            c.ensure_ids(np.unique(chunk_ids))
+            c.ensure_ids(np.unique(chunk_ids), staged=staged)
+            staged = None
+            # Stage the next chunk's missing experts now: the reads overlap
+            # this chunk's qmm + mx.eval instead of starting after them.
+            # Bytes only — slot installs still happen inside ensure_ids,
+            # after the eval, so an in-flight gather never sees torn slots.
+            if i + 1 < len(spans):
+                ns, ne = spans[i + 1]
+                staged = c.stage_ids(np.unique(sorted_ids[ns:ne]))
             n_routes = end - start
             padded_routes = n_routes
             # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
