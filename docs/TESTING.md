@@ -134,3 +134,79 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+## Prism runtime optimizations
+
+Run `python -m pytest tests/test_prism_runtime.py tests/test_prism_decode.py
+tests/test_active_models_visibility.py tests/test_model_loading.py
+tests/test_vlm_engine.py tests/test_vlm_cache_boundaries.py`.
+
+The pinned mlx-vlm loader owns schema-2 Prism model loading and processors.
+oMLX applies its runtime changes after native VLM loading; there is no duplicate
+checkpoint loader or copied Hadamard implementation. Tiny native checkpoints
+verify unchanged stored weights, default logits, FP16 activation/KV boundaries,
+FP32 recurrent state, tied embeddings and isolation from other model types.
+Decoder tests compare logits and used cache contents with upstream across
+single-row decode, padding, multiple rows, prefill and capture options.
+
+For a real-checkpoint check, serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`
+through the VLM engine with a separate base path and port. Check text, vision,
+reordered image reuse, concurrent requests and at least 192 generated tokens.
+Repeat a prompt longer than the scheduler's 4096-token Prism block floor and
+verify the answer and nonzero prefix reuse. Repeat with
+`OMLX_PRISM_FP16_ACTIVATIONS=1`. The opt-in activation mode must use
+`:prism_fp16_v2` in the scheduler cache namespace while retaining the public
+model ID in dashboard progress. It must not reuse FP32 states or the older
+custom-loader adapter's `:prism_fp16_v1` states. Assess FP16 task outputs
+separately; it changes rounding and is not a bit-exact precision mode.
+
+The following bounded synthetic reproduction isolates singleton cache copying.
+Set `MODEL_DIR` to the local checkpoint and run in fresh processes with
+`BASELINE=1` and `BASELINE=0`, keeping precision, GPU load and weights identical.
+It substitutes zero attention KV at 16K tokens, so it measures allocation and
+decode throughput rather than semantic quality or cold-prefill performance.
+
+```python
+import os, time
+import mlx.core as mx
+from mlx_lm.generate import BatchGenerator
+from mlx_vlm.utils import load
+from mlx_vlm.models.qwen3_5.language import Qwen3_5Model
+from omlx.models.vlm import VLMModelAdapter
+from omlx.patches.prism_hadamard import apply_runtime_patches
+
+mx.set_memory_limit(25 * 1024**3)
+mx.set_cache_limit(128 * 1024**2)
+model, _ = load(os.environ["MODEL_DIR"])
+apply_runtime_patches(model)
+lm = model.language_model
+if os.environ.get("BASELINE") == "1":
+    lm.model.__class__ = Qwen3_5Model
+cache = lm.make_cache()
+mx.eval(lm(mx.array([[100]]), cache=cache).logits)
+for entry in cache:
+    if hasattr(entry, "keys") and entry.keys is not None:
+        shape = list(entry.keys.shape)
+        shape[2] = 16384
+        entry.keys = mx.zeros(shape, dtype=entry.keys.dtype)
+        entry.values = mx.zeros(shape, dtype=entry.values.dtype)
+        entry.offset = 16000
+mx.eval([entry.state for entry in cache])
+batch = BatchGenerator(VLMModelAdapter(model), max_tokens=40, stop_tokens=[],
+                       prefill_batch_size=1, completion_batch_size=1)
+try:
+    batch.insert([[100]], caches=[cache])
+    for _ in range(4):
+        list(batch.next_generated())
+    start = time.monotonic()
+    tokens = [r.token for _ in range(32) for r in batch.next_generated()]
+    print(len(tokens) / (time.monotonic() - start), "tokens/sec")
+    print(tokens)
+finally:
+    batch.close()
+```
+
+Run interleaved baseline/patched repetitions and check identical generated token
+IDs. Do not infer a universal speedup or a long-context quality result from this
+synthetic cache experiment. The bounded FP32 attention fallback is already on
+main and remains covered by `tests/test_sdpa256_attention.py`.

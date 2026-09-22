@@ -320,6 +320,17 @@ Models are auto-detected by type. You can also download models directly from the
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
 
+Prism Hadamard Qwen3.5 packs, including Ternary Bonsai 2, use mlx-vlm's native
+loader. oMLX preserves spare attention-cache capacity during unpadded single-row
+decoding, avoiding a full-prefix copy per token. Other batch and capture modes
+retain upstream handling.
+
+`OMLX_PRISM_FP16_ACTIVATIONS=1` optionally keeps these packs' activation streams
+and attention caches in FP16. Checkpoint weights, FP32 recurrent state and native
+Hadamard transforms remain intact, but activation rounding changes. The option
+defaults off and uses a separate prefix-cache namespace. See
+[Prism runtime testing](docs/TESTING.md#prism-runtime-optimizations).
+
 ## CLI Configuration
 
 ```bash

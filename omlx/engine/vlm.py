@@ -2005,6 +2005,10 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         **load_kwargs,
                     )
+                    if model_type == "prism_hadamard_qwen35":
+                        from ..patches.prism_hadamard import apply_runtime_patches
+
+                        apply_runtime_patches(loaded[0])
                     return loaded
 
         loop = asyncio.get_running_loop()
@@ -2208,6 +2212,10 @@ class VLMBatchedEngine(BaseEngine):
             scheduler_config.paged_ssd_cache_dir = str(
                 Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
             )
+
+        signature = getattr(self._vlm_model, "_omlx_prism_activation_signature", None)
+        if isinstance(signature, str) and signature:
+            scheduler_config.model_name = self._model_name + ":" + signature
 
         engine_config = EngineConfig(
             model_name=self._model_name,
