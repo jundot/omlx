@@ -112,6 +112,7 @@ class CheckpointExpertStore:
 
     def __init__(self, model_path: str | Path):
         self._specs: dict[str, tuple[Path, str, tuple[int, ...], int]] = {}
+        self._slabs: dict[str, int] = {}
         self._fds: dict[Path, int] = {}
         model_path = Path(model_path)
         for shard in sorted(model_path.glob("*.safetensors")):
@@ -167,8 +168,12 @@ class CheckpointExpertStore:
 
     def plan_expert(self, name: str, expert: int) -> _ReadPlan:
         """Plan one expert's slab of a stacked ``[num_experts, ...]`` tensor."""
+        slab = self._slabs.get(name)
+        if slab is None:
+            _, _, shape, _ = self._specs[name]
+            slab = int(np.prod(shape[1:]))
+            self._slabs[name] = slab
         _, _, shape, _ = self._specs[name]
-        slab = int(np.prod(shape[1:]))
         return self._plan(name, expert * slab, slab, shape[1:])
 
     def plan_tensor(self, name: str) -> _ReadPlan:
@@ -424,9 +429,17 @@ class ExpertCache:
         """
         if self.warm:  # nothing can miss; skip it
             return
+        self.ensure_ids(int(e) for e in idx.reshape(-1).tolist())
+
+    def ensure_ids(self, ids) -> None:
+        """Host-side variant of :meth:`ensure`: takes an iterable of expert
+        ids and skips the device->host readback entirely (the prefill
+        chunker already holds them as numpy)."""
+        if self.warm:
+            return
         # Ascending expert id = ascending file offset per shard, so misses
         # are read in on-disk order (set iteration order scrambles it).
-        needed = sorted(set(int(e) for e in idx.reshape(-1).tolist()))
+        needed = sorted(set(int(e) for e in ids))
         protected = frozenset(needed)
         pool = _io_pool()
         queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
@@ -568,7 +581,7 @@ class OffloadSwitchGLU(nn.Module):
         outs = []
         for start, end in zip(cuts[:-1], cuts[1:]):
             chunk_ids = sorted_ids[start:end]
-            c.ensure(mx.array(np.unique(chunk_ids), dtype=mx.int32))
+            c.ensure_ids(np.unique(chunk_ids))
             n_routes = end - start
             padded_routes = n_routes
             # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
