@@ -354,6 +354,71 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_mimo_v2_mxfp4_quant(cfg: dict) -> dict:
+    """Map MiMo V2.6 mixed FP8/MXFP4 checkpoints to MLX runtime formats.
+
+    Xiaomi's MiMo V2.6 release stores dense/attention projections as E4M3 with
+    float32 ``weight_scale_inv`` on a 128x128 block grid, which the vendored
+    ``sanitize`` dequantizes to bfloat16. Routed expert projections are instead
+    packed MXFP4 with E8M0 ``weight_scale`` tensors; those already match MLX's
+    native MXFP4 representation after a byte reinterpret, so ``sanitize`` stacks
+    them into the ``switch_mlp`` paths as ``weight``/``scales`` sidecars.
+
+    The checkpoint reports ``quant_method: "fp8"`` with ``store_dtype: "mxfp4"``,
+    which matches no mlx-lm dispatch branch, so nothing declared a runtime
+    quantization and the experts were constructed as plain ``SwitchLinear`` --
+    rejecting the generated ``scales`` with "Received 141 parameters not in
+    model" (47 MoE layers x 3 projections). Per-module overrides on the runtime
+    ``SwitchGLU`` paths make ``nn.quantize`` build ``QuantizedSwitchLinear`` for
+    exactly those layers.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if cfg.get("model_type") != "mimo_v2":
+        return cfg
+    if isinstance(cfg.get("quantization"), dict):
+        return cfg
+    qc = cfg.get("quantization_config")
+    if not isinstance(qc, dict) or qc.get("quant_method") != "fp8":
+        return cfg
+    if qc.get("store_dtype") != "mxfp4":
+        return cfg
+
+    group_size = int(qc.get("mxfp4_block_size", 32))
+
+    # ``mlx_lm.utils._quantize`` reads the top-level ``group_size``/``bits``
+    # before consulting per-module overrides, so the global keys must exist
+    # (omitting them raises KeyError: 'group_size'). Nothing is narrowed by
+    # them: MiMo's dense projections arrive dequantized to bfloat16, and the
+    # per-layer class_predicate in mlx-lm requires ``f"{p}.scales" in weights``,
+    # which only the MXFP4 expert stacks satisfy.
+    quantization: dict[str, Any] = {
+        "group_size": group_size,
+        "bits": 4,
+        "mode": "mxfp4",
+    }
+    expert_quantization = {
+        "group_size": group_size,
+        "bits": 4,
+        "mode": "mxfp4",
+    }
+
+    # MiMo V2.6 omits ``first_k_dense_replace``; the release puts a dense MLP on
+    # layer 0 and routed experts on layers 1..47, so defaulting the key to 0
+    # would declare a spec for a layer that has no switch_mlp. Fall back to 1
+    # when the key is absent, matching the checkpoint's actual topology.
+    first_sparse = cfg.get("first_k_dense_replace")
+    first_sparse_layer = 1 if first_sparse is None else int(first_sparse)
+    num_hidden_layers = int(cfg.get("num_hidden_layers", 0))
+    for layer_idx in range(first_sparse_layer, num_hidden_layers):
+        base = f"model.layers.{layer_idx}.mlp.switch_mlp"
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            quantization[f"{base}.{projection}"] = dict(expert_quantization)
+
+    cfg["quantization"] = quantization
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -374,6 +439,7 @@ def _patch_mlx_lm_load_config() -> None:
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
+        normalize_mimo_v2_mxfp4_quant(cfg)
         return cfg
 
     _lu.load_config = _patched
