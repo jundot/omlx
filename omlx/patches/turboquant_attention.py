@@ -513,6 +513,58 @@ def _patch_vlm_target_verify_attention() -> None:
     q35_lang._omlx_tq_target_verify_patched = True
 
 
+def _patch_dequant_probe() -> None:
+    """DEBUG forensics for whole-cache TurboQuant dequantizes.
+
+    Any dequantize over a state longer than 64k rows is an O(context)
+    event (~1.6GB of fp16 K+V per 767k-token QSA layer at production
+    geometry) — the class that aborted the 750k ladder runs at decode
+    start. One line per event, tagged with the calling frame; the omlx
+    batch class inherits this method, so the wrap covers both shapes.
+    """
+    from mlx_vlm.turboquant import TurboQuantKVCache
+
+    if getattr(TurboQuantKVCache, "_omlx_dequant_probe", False):
+        return
+
+    original = TurboQuantKVCache.dequantize
+
+    def probed(self, *args, **kwargs):
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                import traceback
+
+                state = kwargs.get("keys_state")
+                if state is None and args:
+                    state = args[0]
+                if state is None:
+                    state = getattr(self, "keys", None)
+                state = getattr(state, "_state", state)
+                norms = getattr(state, "norms", None)
+                rows = (
+                    int(norms.shape[2])
+                    if norms is not None and norms.ndim > 2
+                    else 0
+                )
+                if rows > 65536:
+                    caller = traceback.extract_stack(limit=3)[-2]
+                    logger.debug(
+                        "[tq-dequant] whole-cache dequantize rows=%d on %s "
+                        "from %s:%d in %s",
+                        rows,
+                        type(self).__name__,
+                        caller.filename.rsplit("/", 1)[-1],
+                        caller.lineno,
+                        caller.name,
+                    )
+            except Exception:
+                pass
+        return original(self, *args, **kwargs)
+
+    TurboQuantKVCache.dequantize = probed
+    TurboQuantKVCache._omlx_dequant_probe = True
+
+
 def apply_turboquant_attention_patch() -> bool:
     """Monkey-patch mlx-lm's scaled_dot_product_attention for TurboQuant."""
     global _PATCHED
@@ -528,6 +580,11 @@ def apply_turboquant_attention_patch() -> bool:
         _patch_update_eval_policy()
     except Exception:
         logger.debug("TurboQuant update eval-policy patch skipped", exc_info=True)
+
+    try:
+        _patch_dequant_probe()
+    except Exception:
+        logger.debug("TurboQuant dequant probe skipped", exc_info=True)
 
     try:
         _patch_vlm_target_verify_attention()

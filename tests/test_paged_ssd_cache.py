@@ -4647,3 +4647,107 @@ class TestTurboquantBitsSignature:
             assert payload["turboquant_kv_bits"] == 6.0
         finally:
             mgr.close()
+
+
+class TestYarnCacheSignature:
+    """YaRN target must key block compatibility: scaled rotary writes
+    differently rotated KV/indexer content at an identical layer layout,
+    so yarn-on and yarn-off blocks must never restore into each other."""
+
+    LAYERS = ["KVCache", "KVCache"]
+
+    def _manager(
+        self,
+        tmp_path: Path,
+        yarn: int | None = None,
+        subdir: str = "ssd_cache",
+    ) -> PagedSSDCacheManager:
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / subdir,
+            max_size_bytes=1 << 30,
+            expected_model_name="test-model",
+            expected_num_layers=2,
+            expected_block_size=2048,
+        )
+        manager.set_expected_layer_signature(self.LAYERS, yarn_context_length=yarn)
+        return manager
+
+    def _sig(self, yarn: int | None = None) -> str:
+        return _cache_compat_signature(
+            model_name="test-model",
+            num_layers=2,
+            block_size=2048,
+            layer_cache_types=self.LAYERS,
+            yarn_context_length=yarn,
+            payload_layout="embedded",
+        )
+
+    def test_signature_unchanged_when_yarn_off(self, tmp_path: Path):
+        manager = self._manager(tmp_path)
+        sig = manager.cache_signature_for(
+            model_name="test-model",
+            num_layers=2,
+            block_size=2048,
+            layer_cache_types=self.LAYERS,
+        )
+        assert "yarn_context_length" not in json.loads(sig)
+
+    def test_yarn_blocks_are_incompatible_both_ways(self, tmp_path: Path):
+        yarn_mgr = self._manager(tmp_path, yarn=524288, subdir="yarn")
+        plain_mgr = self._manager(tmp_path, subdir="plain")
+        yarn_sig = self._sig(524288)
+        plain_sig = self._sig()
+
+        assert json.loads(yarn_sig)["yarn_context_length"] == 524288
+        assert yarn_mgr.is_signature_compatible(yarn_sig)
+        assert not yarn_mgr.is_signature_compatible(plain_sig)
+        assert "YaRN" in yarn_mgr.signature_mismatch_reason(plain_sig)
+        assert plain_mgr.is_signature_compatible(plain_sig)
+        assert not plain_mgr.is_signature_compatible(yarn_sig)
+        # A different target is likewise incompatible with both.
+        assert not yarn_mgr.is_signature_compatible(self._sig(1048576))
+
+    def test_target_change_flags_signature_update(self, tmp_path: Path):
+        manager = self._manager(tmp_path, yarn=524288)
+        assert (
+            manager.set_expected_layer_signature(
+                self.LAYERS, yarn_context_length=1048576
+            )
+            is True
+        )
+        assert (
+            manager.set_expected_layer_signature(
+                self.LAYERS, yarn_context_length=1048576
+            )
+            is False
+        )
+
+    def test_sweep_drops_other_target_blocks(self, tmp_path: Path):
+        manager = self._manager(tmp_path, yarn=524288)
+        now = time.time()
+
+        def meta(h: bytes, sig: str) -> PagedSSDBlockMetadata:
+            return PagedSSDBlockMetadata(
+                block_hash=h,
+                file_path=Path("/tmp/never-touched.safetensors"),
+                file_size=1024,
+                token_count=2048,
+                created_at=now,
+                last_access=now,
+                num_layers=2,
+                model_name="test-model",
+                block_size=2048,
+                layer_cache_types=list(self.LAYERS),
+                cache_signature=sig,
+            )
+
+        manager._index.add(meta(b"11" * 10, self._sig(524288)))
+        manager._index.add(meta(b"22" * 10, self._sig(1048576)))
+        manager._index.add(meta(b"33" * 10, self._sig()))
+
+        dropped = manager.invalidate_stale_layer_signature()
+
+        assert dropped == 2
+        assert manager._index.get(b"11" * 10) is not None
+        assert manager._index.get(b"22" * 10) is None
+        assert manager._index.get(b"33" * 10) is None

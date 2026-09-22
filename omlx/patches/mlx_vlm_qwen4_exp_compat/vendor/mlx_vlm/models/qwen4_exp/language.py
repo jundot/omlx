@@ -26,6 +26,7 @@ from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
 from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+from mlx_vlm.turboquant import TurboQuantKVCache, TurboQuantMSEState
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
@@ -38,6 +39,9 @@ from .config import ModelConfig, TextConfig
 from .qsa_fast import (
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
+    contiguous_causal_gathered_qsa_decode_tq,
+    contiguous_causal_gathered_qsa_tq,
+    native_qsa_tq_available,
     pool_completed_index_keys,
 )
 from . import hc_fused
@@ -96,6 +100,62 @@ def _rank_two_text_position_ids(
     )
 
 
+def _gathered_batch_row_ok(cache) -> bool:
+    """True for a single-row pad-free batch the gathered arms can index.
+
+    The gathered decode/verify arms address packed rows LOGICALLY (the
+    singleton convention). A left-padded or multi-row batch would diverge
+    physical rows from that contract, so those stay on the official masked
+    path; the scheduler's serialization gate keeps B=1 the batched norm.
+    """
+    inner = getattr(cache, "kv_cache", None)
+    if inner is None or getattr(inner, "_batch_size", 1) != 1:
+        return False
+    pads = getattr(inner, "left_padding", None)
+    return pads is not None and int(pads.max().item()) == 0
+
+
+_GATHERED_ARM_LOG_ONCE: set = set()
+
+
+def _log_gathered_arm(kind: str, cache) -> None:
+    """One INFO line per (arm, cache type) the first time it engages."""
+    key = ("engaged", kind, type(cache).__name__)
+    if key not in _GATHERED_ARM_LOG_ONCE:
+        _GATHERED_ARM_LOG_ONCE.add(key)
+        logger.info(
+            "[qsa-gathered] %s arm engaged on %s", kind, type(cache).__name__
+        )
+
+
+def _log_gathered_decline(cache, verify: bool, mask) -> None:
+    """One DEBUG line per (cache type, mask kind, verify, scale bucket).
+
+    The official path takes over with O(context)-per-token masked decode
+    and — for verify-shaped calls on TQ caches — potentially O(context)
+    transients; a standing decline must surface once per context scale
+    instead of per layer per step. The 64k bucket keeps warmup-scale
+    declines from muting the production-scale ones (v13 forensics).
+    """
+    mask_kind = mask if isinstance(mask, str) else type(mask).__name__
+    offset = cache.offset
+    try:
+        offset_value = int(offset) if isinstance(offset, int) else int(offset)
+    except (TypeError, ValueError):
+        offset_value = -1
+    key = ("declined", verify, type(cache).__name__, mask_kind, offset_value >> 16)
+    if key not in _GATHERED_ARM_LOG_ONCE:
+        _GATHERED_ARM_LOG_ONCE.add(key)
+        logger.debug(
+            "[qsa-gathered] declined (verify=%s cache=%s mask=%s offset=%s@%d)",
+            verify,
+            type(cache).__name__,
+            mask_kind,
+            type(offset).__name__,
+            offset_value,
+        )
+
+
 def _gathered_min_query_tokens() -> int:
     """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
     raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
@@ -105,6 +165,41 @@ def _gathered_min_query_tokens() -> int:
         except ValueError:
             pass
     return 16
+
+
+def _tq_gathered_prefill_min_context() -> int:
+    """Context floor above which the hybrid gathered prefill arm wins.
+
+    The portable union-gather path only beats the TQ-patched tiled mask
+    SDPA once the mask arm's O(context) per-chunk dequant dominates;
+    measured crossover on M5 is ≈16k context tokens.
+    """
+    raw = os.environ.get("OMLX_QWEN4_TQ_PREFILL_MIN_CONTEXT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 16384
+
+
+def _tq_gathered_prefill_max_context() -> int:
+    """Ceiling of the band where the PORTABLE hybrid gathered arm wins.
+
+    The portable arm materializes and sorts its per-chunk selection
+    (O(chunk × budget) rows), which collapses to seconds-per-chunk past
+    ~100k context (the 750k ladder stall); above the ceiling the
+    TQ-patched mask path takes over with its tiled in-kernel dequant —
+    unless the native packed-row kernel is available, which runs at the
+    dense arm's rate at any context and lifts the ceiling. 0 disables.
+    """
+    raw = os.environ.get("OMLX_QWEN4_TQ_PREFILL_MAX_CONTEXT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 65536
 
 
 def _split_text_mrope_positions(
@@ -627,6 +722,219 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
         return super().nbytes + self.indexer_nbytes
 
 
+class TurboQuantQSAKVCache(_QSAIndexerCache, TurboQuantKVCache):
+    """TurboQuant-packed attention K/V with the dense QSA indexer sidecar.
+
+    Storage follows the aux-state pattern (cf. mlx-serve's SSMCacheEntry):
+    attention K/V live as TurboQuant MSE states — quantized on write, read
+    natively by the fused TQ attention kernels, and dequantized ONLY for
+    the budget-bounded rows the QSA gather selects — while the indexer's
+    raw keys, positions and pooled block bank stay dense exactly as in
+    QSAKVCache. Block selection therefore never reads quantized state:
+    KV compression cannot perturb which blocks QSA picks.
+
+    Batching: ``to_batch``/``merge`` build BatchTurboQuantQSAKVCache —
+    rows stay packed; the inner TQ batch drives the quantized attention.
+    """
+
+    preserve_auxiliary_kv_state = True
+    # QSA-scale growth; the TQ default (256) reallocs O(T^2/step) at 1M.
+    cache_step = 8192
+    # QSA decode always takes the chunked-with-mask route (the sparse
+    # indexer mask rules out the fused kernels), and the inherited
+    # decode_key_chunk_size (1<<30) runs the WHOLE context as one chunk:
+    # the weighted-sum value expansion allocates an (B, heads, 1, T, D)
+    # fp32 intermediate — 18.9 GB at 767k tokens, the v9 ladder's
+    # decode-start abort (+19 GB in 2.7 s after a flat packed insert).
+    # 32k caps the intermediate near 0.8 GB.
+    decode_key_chunk_size = 32768
+    _omlx_mtp_verify_attention_cache = True
+    _omlx_mtp_batched_head_cache = True
+
+    def __init__(self, bits: float = 4.0, seed: int = 0):
+        TurboQuantKVCache.__init__(self, bits=bits, seed=seed)
+        self._init_indexer_cache()
+
+    @classmethod
+    def from_qsa_cache(cls, cache: "QSAKVCache", bits: float, seed: int = 0):
+        hybrid = cls(bits=bits, seed=seed)
+        state = cache.state
+        keys, values = state[0], state[1]
+        if keys is not None:
+            hybrid.update_and_fetch(keys, values)
+        index_keys = state[2] if len(state) > 2 else None
+        index_positions = state[3] if len(state) > 3 else None
+        if index_keys is not None:
+            hybrid._restore_indexer_state(index_keys, index_positions)
+        return hybrid
+
+    # ---- serialization state: 4-tuple over the TQ 2-tuple `state` --------
+    #
+    # The inherited `state` (key_state, value_state) STAYS the runtime
+    # contract every TurboQuant mechanism reads and writes (update_and_fetch,
+    # decode_attention, dequantize). `full_state` adds the dense indexer
+    # sidecar for store/restore paths, mirroring QSAKVCache.state's
+    # 4-tuple convention.
+
+    @property
+    def full_state(self):
+        ks, vs = TurboQuantKVCache.state.fget(self)
+        return ks, vs, self.index_keys, self.index_position_ids
+
+    @full_state.setter
+    def full_state(self, value):
+        value = tuple(value)
+        if len(value) != 4:
+            raise ValueError(
+                "TurboQuantQSAKVCache.full_state must be a 4-tuple "
+                "(key_state, value_state, index_keys, index_position_ids)"
+            )
+        ks, vs, index_keys, index_position_ids = value
+        TurboQuantKVCache.state.fset(self, (ks, vs))
+        if ks is not None and self.key_codec is None:
+            # Restore contract: codecs are data-oblivious, rebuild them from
+            # (head_dim, bits, seed) exactly like the SSD cache path does.
+            from omlx.turboquant_kv import _rebuild_codecs
+
+            _rebuild_codecs(self, ks, vs)
+        self._restore_indexer_state(index_keys, index_position_ids)
+
+    def gather_dequantized_rows(self, selected_tokens: mx.array):
+        """Dequantize ONLY the selected token rows (budget-bounded gather).
+
+        ``selected_tokens`` are chronological row indices into the packed
+        states; take-then-dequantize keeps the cost at O(budget), never
+        O(context) — the failure mode that killed mlx-serve's TurboQuant.
+        """
+        ks, vs = TurboQuantKVCache.state.fget(self)
+        if not isinstance(ks, TurboQuantMSEState) or not isinstance(
+            vs, TurboQuantMSEState
+        ):
+            raise TypeError(
+                "TurboQuant QSA gather requires MSE codec states, got "
+                f"{type(ks).__name__}/{type(vs).__name__}"
+            )
+        rows = selected_tokens.reshape(-1)
+        gk = TurboQuantMSEState(
+            mx.take(ks.norms, rows, axis=2),
+            mx.take(ks.indices, rows, axis=2),
+        )
+        gv = TurboQuantMSEState(
+            mx.take(vs.norms, rows, axis=2),
+            mx.take(vs.indices, rows, axis=2),
+        )
+        return self.key_codec.dequantize(gk), self.value_codec.dequantize(gv)
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        TurboQuantKVCache.trim(self, n)
+        self._trim_indexer(self.offset)
+        return n
+
+    def filter(self, batch_indices):
+        try:
+            n = len(batch_indices)
+        except TypeError:
+            n = int(getattr(batch_indices, "shape", (0,))[0] or 0)
+        if n == 0:
+            self.keys = None
+            self.values = None
+            self.offset = 0
+            self._cached_state = None
+            self._cached_state_offset = -1
+            self._init_indexer_cache()
+            return
+        if n == 1:
+            return
+        raise NotImplementedError(
+            "TurboQuantQSAKVCache.filter supports singleton pass-through "
+            "only; convert via to_batch before keeping multiple rows."
+        )
+
+    def _to_dense_singleton(self) -> QSAKVCache:
+        """Dequantize into the dense QSA path (multi-row batch fallback)."""
+        dense = QSAKVCache()
+        if self.keys is not None:
+            dk, dv = self.dequantize()
+            dense.state = (
+                dk.astype(mx.bfloat16),
+                dv.astype(mx.bfloat16),
+                self.index_keys,
+                self.index_position_ids,
+            )
+        elif self.index_keys is not None:
+            dense._restore_indexer_state(self.index_keys, self.index_position_ids)
+        return dense
+
+    def to_batch(self, left_padding):
+        """Join a batch staying packed; no dense dequantize fallback."""
+        from omlx.turboquant_kv import _pad_state_left
+
+        batch = BatchTurboQuantQSAKVCache(
+            left_padding, bits=self.bits, seed=self.seed
+        )
+        inner = batch.kv_cache
+        padding = mx.array(left_padding)
+        if self.empty() and self.index_keys is None:
+            return batch
+        if padding.size != 1:
+            raise ValueError(
+                "A warm TQ-QSA cache can only seed one batch row, got "
+                f"left_padding={padding.tolist()}"
+            )
+        pad = int(padding.item())
+        if not self.empty():
+            ks, vs = TurboQuantKVCache.state.fget(self)
+            total = int(self.offset)
+            if pad:
+                ks = _pad_state_left(ks, pad)
+                vs = _pad_state_left(vs, pad)
+            inner.key_codec = self.key_codec
+            inner.value_codec = self.value_codec
+            inner.keys = ks
+            inner.values = vs
+            # B=1 bookkeeping: logical offset and written physical end, the
+            # convention BatchTurboQuantKVCache.merge leaves behind.
+            inner.offset = inner.offset + pad + total
+            inner._phys_end = pad + total
+            if pad:
+                # Physical pad columns precede the logical cursor: switch to
+                # the array-offset bookkeeping where appends write at
+                # _phys_end instead of the int cursor.
+                inner._ensure_array_offset()
+            inner._cached_state = None
+            inner._cached_state_offset = -1
+        if self.index_keys is not None:
+            index_keys = self.index_keys[:, : self.offset]
+            positions = self.index_position_ids[..., : self.offset]
+            if pad:
+                index_keys = mx.pad(index_keys, [(0, 0), (pad, 0), (0, 0)])
+                positions = mx.pad(
+                    positions,
+                    (
+                        [(0, 0), (0, 0), (pad, 0)]
+                        if positions.ndim == 3
+                        else [(0, 0), (pad, 0)]
+                    ),
+                )
+            batch.index_keys = index_keys
+            batch.index_position_ids = positions
+            batch.index_offset = index_keys.shape[1]
+        return batch
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchTurboQuantQSAKVCache.merge(caches)
+
+    @property
+    def nbytes(self):
+        from mlx_vlm.turboquant import _state_nbytes
+
+        ks, vs = TurboQuantKVCache.state.fget(self)
+        kv = 0 if ks is None else _state_nbytes(ks) + _state_nbytes(vs)
+        return kv + self.indexer_nbytes
+
+
 class BatchQSAKVCache:
     """Batch KV cache that keeps QSA raw keys and text/MRoPE positions aligned."""
 
@@ -677,6 +985,61 @@ class BatchQSAKVCache:
         self.index_offset = self.index_keys.shape[1]
         return self.index_keys, self.index_position_ids
 
+    def _invalidate_pooled_index(self):
+        self._pooled_index_keys = None
+        self._pooled_index_offset = 0
+
+    def pooled_indexer_keys(
+        self,
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+    ) -> mx.array:
+        """Incremental block bank over the batch sidecar (gathered arms).
+
+        Mirrors the singleton bank without its capacity machinery: batch
+        sidecars are exact-width, so suffixes concatenate. Rolls (MTP
+        rejects) and trims shrink ``index_offset``; the cursor guard then
+        forces a full re-pool, so a rolled sidecar can never be served
+        from a stale bank.
+        """
+        if self.index_keys is None or self.index_position_ids is None:
+            raise ValueError("QSA pooled keys require raw indexer state")
+        complete_blocks = self.index_offset // compress_ratio
+        if (
+            getattr(self, "_pooled_index_ratio", None) != compress_ratio
+            or getattr(self, "_pooled_index_tag", None) is not cache_tag
+            or getattr(self, "_pooled_index_offset", 0) > complete_blocks
+        ):
+            self._invalidate_pooled_index()
+            self._pooled_index_ratio = compress_ratio
+            self._pooled_index_tag = cache_tag
+        start_block = self._pooled_index_offset
+        if start_block < complete_blocks:
+            new_pooled = pool_completed_index_keys(
+                self.index_keys,
+                self.index_position_ids,
+                compress_ratio=compress_ratio,
+                index_key_norm=index_key_norm,
+                apply_index_rope=apply_index_rope,
+                start_block=start_block,
+                stop_block=complete_blocks,
+            )
+            self._pooled_index_keys = (
+                new_pooled
+                if self._pooled_index_keys is None
+                else mx.concatenate([self._pooled_index_keys, new_pooled], axis=1)
+            )
+            self._pooled_index_offset = complete_blocks
+        if self._pooled_index_keys is None:
+            return mx.zeros(
+                (self.index_keys.shape[0], 0, self.index_keys.shape[-1]),
+                dtype=self.index_keys.dtype,
+            )
+        return self._pooled_index_keys
+
     def prepare(self, **kwargs):
         self.kv_cache.prepare(**kwargs)
 
@@ -712,6 +1075,7 @@ class BatchQSAKVCache:
             self.index_keys = self.index_keys[:, min_left:]
             self.index_position_ids = self.index_position_ids[..., min_left:]
             self.index_offset -= min_left
+        self._invalidate_pooled_index()
 
     @staticmethod
     def _pad_index(cache, target, sample_keys, sample_positions):
@@ -823,6 +1187,7 @@ class BatchQSAKVCache:
         self.index_keys = index_keys
         self.index_position_ids = index_position_ids
         self.index_offset = target
+        self._invalidate_pooled_index()
 
     def extract(self, idx):
         cache = QSAKVCache()
@@ -978,6 +1343,335 @@ class BatchQSAKVCache:
         if self.index_keys is not None:
             extra = self.index_keys.nbytes + self.index_position_ids.nbytes
         return self.kv_cache.nbytes + extra
+
+
+class BatchTurboQuantQSAKVCache(BatchQSAKVCache):
+    """Batched TurboQuant-packed KV with the dense QSA indexer sidecar.
+
+    Composes :class:`BatchTurboQuantKVCache` for the packed K/V (batch
+    quantization ops, per-request offsets, left-padding masks) and
+    inherits every sidecar alignment mechanism from
+    :class:`BatchQSAKVCache` (pad/roll, filter, extend, trim).  ``_cache``
+    exposes the inner TQ batch to omlx's patched SDPA, whose proxy unwrap
+    routes attention to the quantized kernels — batched rows never
+    materialize a dense dequantized cache.
+    """
+
+    def __init__(self, left_padding, bits: float = 4.0, seed: int = 0):
+        # Deliberately not BatchQSAKVCache.__init__: the inner cache is the
+        # TQ batch, not a dense BatchKVCache.
+        from omlx.turboquant_kv import BatchTurboQuantKVCache
+
+        self.kv_cache = BatchTurboQuantKVCache(left_padding, bits=bits, seed=seed)
+        # The patched SDPA unwraps `_cache` to this inner batch, whose
+        # masked decode would inherit the 1<<30 chunk default; carry the
+        # hybrid's bound (see TurboQuantQSAKVCache.decode_key_chunk_size).
+        self.kv_cache.decode_key_chunk_size = (
+            TurboQuantQSAKVCache.decode_key_chunk_size
+        )
+        self.index_keys = None
+        self.index_position_ids = None
+        self.index_offset = 0
+
+    @property
+    def _cache(self):
+        # Proxy-unwrap hook for omlx/patches/turboquant_attention.py.
+        return self.kv_cache
+
+    @property
+    def state(self):
+        # The native packed-row glue reads states/codecs through the
+        # singleton attribute surface; the inner B=1 batch exposes the
+        # same (1, H, T, W) shapes.
+        return self.kv_cache.state
+
+    @property
+    def key_codec(self):
+        return self.kv_cache.key_codec
+
+    @property
+    def value_codec(self):
+        return self.kv_cache.value_codec
+
+    def gather_dequantized_rows(self, selected_tokens: mx.array):
+        """Row-local dequantize for the gathered arms (B=1, pad-free)."""
+        ks, vs = self.kv_cache.state
+        ks = getattr(ks, "_state", ks)
+        vs = getattr(vs, "_state", vs)
+        if not isinstance(ks, TurboQuantMSEState) or not isinstance(
+            vs, TurboQuantMSEState
+        ):
+            raise TypeError(
+                "TurboQuant QSA batch gather requires MSE codec states, got "
+                f"{type(ks).__name__}/{type(vs).__name__}"
+            )
+        rows = selected_tokens.reshape(-1)
+        gk = TurboQuantMSEState(
+            mx.take(ks.norms, rows, axis=2),
+            mx.take(ks.indices, rows, axis=2),
+        )
+        gv = TurboQuantMSEState(
+            mx.take(vs.norms, rows, axis=2),
+            mx.take(vs.indices, rows, axis=2),
+        )
+        return (
+            self.kv_cache.key_codec.dequantize(gk),
+            self.kv_cache.value_codec.dequantize(gv),
+        )
+
+    def extract(self, idx):
+        base = self.kv_cache.extract(idx)
+        cache = TurboQuantQSAKVCache(bits=base.bits, seed=base.seed)
+        cache.key_codec = base.key_codec
+        cache.value_codec = base.value_codec
+        if base.keys is not None:
+            TurboQuantKVCache.state.fset(cache, (base.keys, base.values))
+            cache.offset = base.offset
+        if self.index_keys is not None:
+            padding = int(self.left_padding[idx].item())
+            index_keys = mx.contiguous(
+                self.index_keys[idx : idx + 1, padding : self.index_offset]
+            )
+            if self.index_position_ids.ndim == 3:
+                index_position_ids = mx.contiguous(
+                    self.index_position_ids[
+                        :, idx : idx + 1, padding : self.index_offset
+                    ]
+                )
+            else:
+                index_position_ids = mx.contiguous(
+                    self.index_position_ids[idx : idx + 1, padding : self.index_offset]
+                )
+            cache._restore_indexer_state(index_keys, index_position_ids)
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        rows = []
+        for cache in caches:
+            if isinstance(cache, cls):
+                batch_size = (
+                    int(cache.offset.shape[0])
+                    if isinstance(cache.offset, mx.array)
+                    else 1
+                )
+                if cache.kv_cache.keys is None:
+                    if cache.index_keys is not None:
+                        raise ValueError(
+                            "Cannot merge a TQ-QSA batch with indexer state "
+                            "but no KV state"
+                        )
+                    rows.extend(
+                        TurboQuantQSAKVCache(
+                            bits=cache.kv_cache.bits, seed=cache.kv_cache.seed
+                        )
+                        for _ in range(batch_size)
+                    )
+                else:
+                    rows.extend(cache.extract(idx) for idx in range(batch_size))
+            elif isinstance(cache, TurboQuantQSAKVCache):
+                rows.append(cache)
+            else:
+                raise TypeError(f"Cannot merge TQ-QSA cache with {type(cache)}")
+
+        if len(rows) > 1 and not cls._batch_rows_enabled():
+            # Multi-row packed batches are gated (see _batch_rows_enabled);
+            # concurrent joins take the proven dense BatchQSA path.
+            cls._warn_dense_batch("merge")
+            return BatchQSAKVCache.merge(
+                [row._to_dense_singleton() for row in rows]
+            )
+
+        bits = rows[0].bits if rows else 4.0
+        seed = rows[0].seed if rows else 0
+        out = cls([0] * len(rows), bits=bits, seed=seed)
+        if not rows:
+            return out
+
+        lengths = []
+        for row in rows:
+            kv_length = int(row.offset)
+            if row.keys is None and kv_length:
+                raise ValueError(
+                    "TQ-QSA cache has a non-zero offset without KV state"
+                )
+            if (row.index_keys is None) != (row.index_position_ids is None):
+                raise ValueError("QSA raw keys and positions must be merged together")
+            index_length = 0 if row.index_keys is None else row.index_keys.shape[1]
+            if row.index_position_ids is not None and (
+                row.index_position_ids.ndim not in {2, 3}
+                or row.index_position_ids.shape[-1] != index_length
+            ):
+                raise ValueError("QSA raw keys and positions are misaligned")
+            if index_length != kv_length:
+                raise ValueError(
+                    "TQ-QSA merge requires aligned KV and indexer lengths, got "
+                    f"kv={kv_length} and indexer={index_length}"
+                )
+            lengths.append(index_length)
+
+        from omlx.turboquant_kv import BatchTurboQuantKVCache
+
+        # Packed padding/concat, codec sharing and (bits, seed) homogeneity
+        # are the TQ batch merge's job; hybrid rows are TurboQuantKVCache.
+        out.kv_cache = BatchTurboQuantKVCache.merge(rows)
+        out.kv_cache.decode_key_chunk_size = (
+            TurboQuantQSAKVCache.decode_key_chunk_size
+        )
+        sample = next((row for row in rows if row.index_keys is not None), None)
+        if sample is None:
+            return out
+        widest_positions = sample.index_position_ids
+        for row in rows:
+            pos = row.index_position_ids
+            if pos is not None and pos.ndim > widest_positions.ndim:
+                widest_positions = pos
+        target = out.kv_cache._phys_end
+        if target != max(lengths):
+            raise ValueError(
+                "TQ-QSA merge produced different KV and indexer widths, got "
+                f"kv={target} and indexer={max(lengths)}"
+            )
+        padded_rows = [
+            cls._pad_index(row, target, sample.index_keys, widest_positions)
+            for row in rows
+        ]
+        out.index_keys = mx.concatenate([row[0] for row in padded_rows], axis=0)
+        position_axis = 1 if widest_positions.ndim == 3 else 0
+        out.index_position_ids = mx.concatenate(
+            [row[1] for row in padded_rows], axis=position_axis
+        )
+        out.index_offset = target
+        return out
+
+    # ---- Multi-row policy: dense fallback until packed B>1 is proven ----
+
+    _omlx_tq_qsa_dense_batch_warned = False
+
+    @staticmethod
+    def _batch_rows_enabled() -> bool:
+        """Packed multi-row batching gate.
+
+        Packed B>1 batches interacted badly with the Lightning-MTP
+        late-join handoff in field testing (mask/key width mismatch after
+        a two-sequence join, then array-offset trim crashes during
+        recovery), so concurrent joins dequantize into the proven dense
+        BatchQSA path. OMLX_TQ_QSA_BATCH_ROWS=1 re-enables packed rows
+        for debugging that path.
+        """
+        return os.environ.get("OMLX_TQ_QSA_BATCH_ROWS", "") == "1"
+
+    @classmethod
+    def _warn_dense_batch(cls, op: str) -> None:
+        if not cls._omlx_tq_qsa_dense_batch_warned:
+            cls._omlx_tq_qsa_dense_batch_warned = True
+            logger.info(
+                "TurboQuant QSA %s joined multiple rows: dequantizing to "
+                "the dense BatchQSAKVCache path (packed multi-row batching "
+                "is gated behind OMLX_TQ_QSA_BATCH_ROWS=1)",
+                op,
+            )
+
+    @staticmethod
+    def _rows_of(cache) -> int:
+        off = getattr(cache, "offset", 0)
+        return int(off.shape[0]) if isinstance(off, mx.array) else 1
+
+    def _batch_size(self) -> int:
+        return self._rows_of(self)
+
+    def _to_dense_rows(self):
+        return [
+            self.extract(idx)._to_dense_singleton()
+            for idx in range(self._batch_size())
+        ]
+
+    @staticmethod
+    def _dense_rows_of(other):
+        if isinstance(other, BatchTurboQuantQSAKVCache):
+            return other._to_dense_rows()
+        if isinstance(other, TurboQuantQSAKVCache):
+            return [other._to_dense_singleton()]
+        if isinstance(other, BatchQSAKVCache):
+            return [
+                other.extract(i)
+                for i in range(BatchTurboQuantQSAKVCache._rows_of(other))
+            ]
+        return [other]
+
+    @staticmethod
+    def _roll_packed_state(state, padding):
+        """dynamic_roll every packed field along the token axis.
+
+        Quantization is row-local and rollback is a pure per-row
+        permutation, so rolling the packed fields is exactly equivalent
+        to the inner TQ batch's dequantize → roll → requantize — at
+        O(packed) cost instead of a multi-GB fp32 spike per rollback
+        event on long contexts.
+        """
+        shift = padding[:, None]
+        rolled = [dynamic_roll(field, shift, axis=2) for field in state]
+        mx.eval(*rolled)
+        return type(state)(*rolled)
+
+    def finalize(self):
+        inner = self.kv_cache
+        right_padding = getattr(inner, "_right_padding", None)
+        if right_padding is None:
+            inner.finalize()
+            return
+        if inner.keys is not None:
+            inner.keys = self._roll_packed_state(inner.keys, right_padding)
+            inner.values = self._roll_packed_state(inner.values, right_padding)
+            inner._cached_state = None
+            inner._cached_state_offset = -1
+        inner.offset -= (
+            right_padding
+            if isinstance(inner.offset, mx.array)
+            else right_padding[0].item()
+        )
+        inner.left_padding += right_padding
+        inner._right_padding = None
+        if self.index_keys is not None:
+            self.index_keys = dynamic_roll(self.index_keys, right_padding, axis=1)
+            if self.index_position_ids.ndim == 3:
+                self.index_position_ids = dynamic_roll(
+                    self.index_position_ids, right_padding[None], axis=2
+                )
+            else:
+                self.index_position_ids = dynamic_roll(
+                    self.index_position_ids, right_padding, axis=1
+                )
+
+    def trim(self, n):
+        # The inner TQ trim can hand back a size-1 array offset; normalize
+        # so the sidecar bookkeeping below stays in Python ints.
+        trimmed = int(self.kv_cache.trim(n))
+        self.index_offset = max(0, self.index_offset - trimmed)
+        if trimmed and self.index_keys is not None:
+            self.index_keys = self.index_keys[:, : self.index_offset]
+            self.index_position_ids = self.index_position_ids[
+                ..., : self.index_offset
+            ]
+        return trimmed
+
+    def extend(self, other):
+        combined = self._batch_size() + self._rows_of(other)
+        if combined > 1 and not self._batch_rows_enabled():
+            # Joining rows means a multi-row batch: take the dense path
+            # (the packed B>1 gate above). The swapped-in dense inner
+            # cache also flips the patched SDPA back to dense kernels via
+            # the _cache proxy.
+            self._warn_dense_batch("extend")
+            dense = BatchQSAKVCache.merge(
+                self._to_dense_rows() + self._dense_rows_of(other)
+            )
+            self.kv_cache = dense.kv_cache
+            self.index_keys = dense.index_keys
+            self.index_position_ids = dense.index_position_ids
+            self.index_offset = dense.index_offset
+            return
+        BatchQSAKVCache.extend(self, other)
 
 
 class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
@@ -1351,6 +2045,25 @@ class Qwen4ExpQSAIndexer(nn.Module):
 class Qwen4ExpAttention(Qwen3_5Attention):
     def __init__(self, config: TextConfig):
         super().__init__(config)
+        # Qwen's long-context recipe (up to 1M tokens) is static YaRN in
+        # rope_parameters; the pinned mlx-vlm rotary ignores the rope type,
+        # so correct the frequency table here. The operator setting
+        # yarn_context_length (bound via configure_yarn_runtime before
+        # construction) overrides the checkpoint recipe. The indexer below
+        # shares this instance, and Qwen4ExpMTPModule builds its layer
+        # through this same class, so one hook covers main attention, QSA
+        # retrieval and MTP.
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.yarn_rope import (
+            maybe_apply_yarn,
+            resolve_rope_parameters,
+        )
+
+        maybe_apply_yarn(
+            self.rotary_emb,
+            resolve_rope_parameters(
+                config.rope_parameters, config.max_position_embeddings
+            ),
+        )
         self.q_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)
@@ -1384,19 +2097,33 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             # _gathered_min_query_tokens.
             and x.shape[1] >= _gathered_min_query_tokens()
             and causal_mask
-            and type(cache) is QSAKVCache
+            and type(cache) in (QSAKVCache, TurboQuantQSAKVCache)
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
             and self._batch_one_text_position_ids(position_ids, x.shape[1])
         ):
             return False
-        return bool(
+        prospective = cache.offset + x.shape[1]
+        if not prospective > self.indexer.token_budget:
             # Below the QSA budget the official path attends the complete
             # prefix directly and is faster than building gathered blocks.
             # Switch only after sparse selection can reduce actual work.
-            cache.offset + x.shape[1] > self.indexer.token_budget
-        )
+            return False
+        if isinstance(cache, TurboQuantQSAKVCache):
+            # The portable gathered TQ arm only beats the tiled mask SDPA
+            # inside a measured band: below the floor the mask kernel has
+            # less work than the per-query gather; above the ceiling the
+            # portable materialization collapses — but the native packed-row
+            # kernel (when built, at an instantiated bit width) runs at the
+            # dense arm's rate at any context.
+            if prospective <= _tq_gathered_prefill_min_context():
+                return False
+            ceiling = _tq_gathered_prefill_max_context()
+            if ceiling and prospective > ceiling:
+                return native_qsa_tq_available(cache.bits)
+            return True
+        return True
 
     def _gathered_text_decode_eligible(
         self,
@@ -1419,7 +2146,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             x.ndim == 3
             and x.shape[:2] == (1, 1)
             and causal_mask
-            and type(cache) is QSAKVCache
+            and (
+                type(cache) in (QSAKVCache, TurboQuantQSAKVCache)
+                or (
+                    type(cache) is BatchTurboQuantQSAKVCache
+                    and _gathered_batch_row_ok(cache)
+                )
+            )
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
@@ -1468,7 +2201,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and x.shape[0] == 1
             and x.shape[1] > 1
             and causal_mask
-            and type(cache) is QSAKVCache
+            and (
+                type(cache) in (QSAKVCache, TurboQuantQSAKVCache)
+                or (
+                    type(cache) is BatchTurboQuantQSAKVCache
+                    and _gathered_batch_row_ok(cache)
+                )
+            )
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and _rank_two_text_position_ids(position_ids, x.shape[1])
@@ -1492,6 +2231,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         target_verify: bool = False,
     ) -> mx.array:
         """Project once, append both caches, and attend only to selected K/V."""
+        _log_gathered_arm("verify" if target_verify else "prefill", cache)
 
         batch, length, _ = x.shape
         q_proj_output, keys, values = (
@@ -1556,23 +2296,41 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             text_position_ids,
         ).transpose(0, 2, 1, 3)
 
-        output = contiguous_causal_gathered_qsa(
-            queries,
-            keys,
-            values,
-            index_queries,
-            raw_index_keys,
-            full_position_ids,
-            num_query_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            indexer_head_dim=self.indexer.head_dim,
-            compress_ratio=self.indexer.compress_ratio,
-            token_budget=self.indexer.token_budget,
-            index_key_norm=self.indexer.k_layernorm,
-            apply_index_rope=self.indexer._apply_rope,
-            pooled_index_keys=pooled_index_keys,
-        )
+        if isinstance(cache, (TurboQuantQSAKVCache, BatchTurboQuantQSAKVCache)):
+            output = contiguous_causal_gathered_qsa_tq(
+                queries,
+                cache,
+                index_queries,
+                raw_index_keys,
+                full_position_ids,
+                num_query_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                indexer_head_dim=self.indexer.head_dim,
+                compress_ratio=self.indexer.compress_ratio,
+                token_budget=self.indexer.token_budget,
+                index_key_norm=self.indexer.k_layernorm,
+                apply_index_rope=self.indexer._apply_rope,
+                pooled_index_keys=pooled_index_keys,
+            )
+        else:
+            output = contiguous_causal_gathered_qsa(
+                queries,
+                keys,
+                values,
+                index_queries,
+                raw_index_keys,
+                full_position_ids,
+                num_query_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                indexer_head_dim=self.indexer.head_dim,
+                compress_ratio=self.indexer.compress_ratio,
+                token_budget=self.indexer.token_budget,
+                index_key_norm=self.indexer.k_layernorm,
+                apply_index_rope=self.indexer._apply_rope,
+                pooled_index_keys=pooled_index_keys,
+            )
         output = output.reshape(batch, length, -1)
         return (
             _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
@@ -1587,6 +2345,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         """Append one token and attend only to QSA-selected cached K/V rows."""
+        _log_gathered_arm("decode", cache)
 
         batch, length, _ = x.shape
         q_proj_output, new_keys, new_values = (
@@ -1650,19 +2409,33 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             text_position_ids,
         ).transpose(0, 2, 1, 3)
 
-        output = contiguous_causal_gathered_qsa_decode(
-            queries,
-            keys,
-            values,
-            index_queries,
-            pooled_index_keys,
-            num_query_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            indexer_head_dim=self.indexer.head_dim,
-            compress_ratio=self.indexer.compress_ratio,
-            token_budget=self.indexer.token_budget,
-        )
+        if isinstance(cache, (TurboQuantQSAKVCache, BatchTurboQuantQSAKVCache)):
+            output = contiguous_causal_gathered_qsa_decode_tq(
+                queries,
+                cache,
+                index_queries,
+                pooled_index_keys,
+                num_query_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                indexer_head_dim=self.indexer.head_dim,
+                compress_ratio=self.indexer.compress_ratio,
+                token_budget=self.indexer.token_budget,
+            )
+        else:
+            output = contiguous_causal_gathered_qsa_decode(
+                queries,
+                keys,
+                values,
+                index_queries,
+                pooled_index_keys,
+                num_query_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                indexer_head_dim=self.indexer.head_dim,
+                compress_ratio=self.indexer.compress_ratio,
+                token_budget=self.indexer.token_budget,
+            )
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
 
@@ -1711,6 +2484,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
+        if x.shape[1] <= 16 and type(cache) in (
+            TurboQuantQSAKVCache,
+            BatchTurboQuantQSAKVCache,
+        ):
+            _log_gathered_decline(cache, target_verify, mask)
         qsa_mask = self.indexer(
             x,
             cache,

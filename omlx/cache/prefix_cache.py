@@ -847,7 +847,11 @@ class BlockAwarePrefixCache(CacheManager):
                         "class_name", layer_state.get("cache_type", "KVCache")
                     )
                     if layer_state.get("class_name", "")
-                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
+                    in (
+                        "TurboQuantKVCache",
+                        "BatchTurboQuantKVCache",
+                        "TurboQuantQSAKVCache",
+                    )
                     else layer_state.get("cache_type", "KVCache")
                 )
                 for layer_state in cache_data
@@ -1567,7 +1571,11 @@ class BlockAwarePrefixCache(CacheManager):
                         "class_name", layer_state.get("cache_type", "KVCache")
                     )
                     if layer_state.get("class_name", "")
-                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
+                    in (
+                        "TurboQuantKVCache",
+                        "BatchTurboQuantKVCache",
+                        "TurboQuantQSAKVCache",
+                    )
                     else layer_state.get("cache_type", "KVCache")
                 )
                 for layer_state in cache_data
@@ -2310,6 +2318,37 @@ class BlockAwarePrefixCache(CacheManager):
                             (ks, vs),
                         )
                     )
+                elif cache_type_name == "TurboQuantQSAKVCache":
+                    # TurboQuant QSA hybrid: packed K/V states plus the dense
+                    # indexer sidecar, each sliced along its token axis.
+                    from ..turboquant_kv import _slice_state_range, _state_length
+
+                    state = layer_state["state"]
+                    if not isinstance(state, (list, tuple)) or len(state) < 4:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    k_state, v_state = state[0], state[1]
+                    idx_keys, idx_pos = state[2], state[3]
+                    if hasattr(k_state, "_state"):
+                        k_state = k_state._state
+                    if hasattr(v_state, "_state"):
+                        v_state = v_state._state
+                    if idx_keys is None or idx_pos is None:
+                        # Misaligned sidecar: store the placeholder so the
+                        # chain rejects on restore instead of persisting a
+                        # half-state.
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    seq_len = min(_state_length(k_state), int(idx_keys.shape[1]))
+                    actual_end = min(end_idx, seq_len)
+                    if start_idx >= actual_end:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    ks = _slice_state_range(k_state, start_idx, actual_end)
+                    vs = _slice_state_range(v_state, start_idx, actual_end)
+                    ik = self._clone_tensor(idx_keys[:, start_idx:actual_end])
+                    ip = self._clone_tensor(idx_pos[..., start_idx:actual_end])
+                    block_slices.append(("__turboquant_qsa_v1__", (ks, vs, ik, ip)))
                 elif handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
                     state = layer_state["state"]
@@ -4072,6 +4111,84 @@ class BlockAwarePrefixCache(CacheManager):
                 # reverse mixing direction (dense-typed chain with
                 # TQ-tagged blocks appended later) is routed here by payload
                 # scan for the same reason.
+                if cache_type_name == "TurboQuantQSAKVCache" or (
+                    handler.supports_block_slicing
+                    and self._layer_has_tq_qsa_payload(all_block_data, layer_idx)
+                ):
+                    # === TurboQuant QSA hybrid: homogeneous chains only ===
+                    # Packed K/V + dense indexer sidecar per block. Mixed or
+                    # multi-parameter chains reject the hit (re-prefill)
+                    # rather than risk misaligned aux state.
+                    parts = []
+                    params_seen = None
+                    rejected = False
+                    for block_idx, block_data in enumerate(all_block_data):
+                        if layer_idx >= len(block_data):
+                            continue
+                        bd = block_data[layer_idx]
+                        if not (
+                            isinstance(bd, tuple)
+                            and len(bd) == 2
+                            and isinstance(bd[0], str)
+                            and bd[0] == "__turboquant_qsa_v1__"
+                        ):
+                            logger.info(
+                                f"TQ-QSA layer {layer_idx}: block {block_idx} "
+                                "is not a hybrid payload; rejecting cache hit."
+                            )
+                            rejected = True
+                            break
+                        params = self._tq_block_params(
+                            all_block_meta_states,
+                            first_block_meta_states,
+                            block_idx,
+                            layer_idx,
+                        )
+                        if params is None:
+                            logger.warning(
+                                f"TQ-QSA layer {layer_idx}: block {block_idx} "
+                                "has no (bits, seed) metadata; rejecting hit."
+                            )
+                            rejected = True
+                            break
+                        if params_seen is None:
+                            params_seen = params
+                        elif params_seen != params:
+                            logger.info(
+                                f"TQ-QSA layer {layer_idx}: mixed (bits, seed) "
+                                "across blocks; rejecting cache hit."
+                            )
+                            rejected = True
+                            break
+                        parts.append(bd[1])
+                    if rejected or not parts:
+                        return None
+                    try:
+                        from mlx_vlm.models.qwen4_exp.language import (
+                            TurboQuantQSAKVCache,
+                        )
+
+                        from ..turboquant_kv import (
+                            _concat_qsa_index_positions,
+                            _concat_state_token_axis,
+                        )
+
+                        cat_ks = _concat_state_token_axis([p[0] for p in parts])
+                        cat_vs = _concat_state_token_axis([p[1] for p in parts])
+                        cat_ik = mx.concatenate([p[2] for p in parts], axis=1)
+                        cat_ip = _concat_qsa_index_positions([p[3] for p in parts])
+                        hybrid = TurboQuantQSAKVCache(
+                            bits=params_seen[0], seed=params_seen[1]
+                        )
+                        hybrid.full_state = (cat_ks, cat_vs, cat_ik, cat_ip)
+                        reconstructed_caches.append(hybrid)
+                    except Exception as e:
+                        logger.error(
+                            f"TQ-QSA layer {layer_idx}: reconstruction "
+                            f"failed: {e}"
+                        )
+                        return None
+                    continue
                 if cache_type_name in (
                     "TurboQuantKVCache",
                     "BatchTurboQuantKVCache",
@@ -4525,6 +4642,30 @@ class BlockAwarePrefixCache(CacheManager):
                 return True
         return False
 
+    @staticmethod
+    def _layer_has_tq_qsa_payload(
+        all_block_data: list[list[Any]],
+        layer_idx: int,
+    ) -> bool:
+        """True if any block's payload for this layer is TurboQuant-QSA tagged.
+
+        Hybrid chains (qwen4_exp under TurboQuant) store packed K/V plus the
+        dense indexer sidecar; like the TQ scanner, this lets the payload
+        shape override stale chain-level type metadata.
+        """
+        for block_data in all_block_data:
+            if layer_idx >= len(block_data):
+                continue
+            bd = block_data[layer_idx]
+            if (
+                isinstance(bd, tuple)
+                and len(bd) == 2
+                and isinstance(bd[0], str)
+                and bd[0] == "__turboquant_qsa_v1__"
+            ):
+                return True
+        return False
+
     def _tq_block_params(
         self,
         all_block_meta_states: list[Any],
@@ -4815,6 +4956,7 @@ class BlockAwarePrefixCache(CacheManager):
             "BatchKVCache",
             "TurboQuantKVCache",
             "BatchTurboQuantKVCache",
+            "TurboQuantQSAKVCache",
             "MiniMaxM3KVCache",
         }
         non_sliceable_types = {

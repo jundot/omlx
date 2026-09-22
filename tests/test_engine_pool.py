@@ -1651,6 +1651,34 @@ class TestEnginePoolAsync:
             "model-a", a
         ) == pool._engine_runtime_signature("model-a", b)
 
+    def test_qwen4_yarn_target_rides_max_context_window(
+        self, pool_with_mock_engines
+    ):
+        """On Qwen4-Exp the context-window override above the native horizon
+        IS the rope target: crossing or moving it must split the engine.
+        Below native — and on every other model type — it is gate-only and
+        must not."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        entry = next(iter(pool._entries.values()))
+        model_id = entry.model_id
+        entry.config_model_type = "qwen4_exp"
+        entry.model_context_length = 262144
+
+        sig = lambda s: pool._engine_runtime_signature(model_id, s)  # noqa: E731
+        off = ModelSettings()
+        clamp = ModelSettings(max_context_window=131072)
+        on = ModelSettings(max_context_window=524288)
+        moved = ModelSettings(max_context_window=1048576)
+
+        assert sig(off) == sig(clamp)
+        assert sig(off) != sig(on)
+        assert sig(on) != sig(moved)
+
+        entry.config_model_type = "llama"
+        assert sig(off) == sig(clamp) == sig(on) == sig(moved)
+
     def test_runtime_signature_ignores_request_only_profile_fields(
         self, pool_with_mock_engines
     ):

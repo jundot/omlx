@@ -427,6 +427,106 @@ final class ModelSettingsScreenVM {
             .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
     }
 
+    /// Native (checkpoint) context window; nil until the server reports it.
+    var nativeContextLength: Int? {
+        guard let native = model?.modelContextLength, native > 0 else { return nil }
+        return native
+    }
+
+    /// Derived YaRN rope state for the Context Window row. YaRN is *not*
+    /// a setting of its own: on a YaRN-capable checkpoint the server scales
+    /// rope by `max_context_window ÷ native` whenever that override exceeds
+    /// the native window, and serves the checkpoint rope unscaled otherwise.
+    /// Trusts the per-model `yarn_rope_supported` flag; servers predating
+    /// the flag omit it, so fall back to the Qwen4-Exp config-type check.
+    /// nil means the row has nothing to say (incompatible or no native).
+    var yarnScaling: YarnScaling? {
+        guard model?.yarnRopeSupported ?? isQwen4Exp,
+              let native = nativeContextLength else { return nil }
+        let raw = contextLength.trimmingCharacters(in: .whitespaces)
+        guard !raw.isEmpty, let target = Int(raw), target > native else {
+            return .off(native: native)
+        }
+        let factor = Double(target) / Double(native)
+        return factor > Self.yarnCeilingFactor
+            ? .overCeiling(factor: factor, target: target, native: native)
+            : .scaled(factor: factor, target: target, native: native)
+    }
+
+    /// Qwen's published YaRN recipe ceiling: 4× the native window (1M tokens
+    /// over the native 262144). The server logs past this, it does not clamp.
+    static let yarnCeilingFactor = 4.0
+
+    /// Sublabel for the Context Window row. Plain text everywhere else; on a
+    /// YaRN-capable checkpoint it also warns that this field now doubles as
+    /// the rope-scaling knob.
+    var contextWindowSublabel: String {
+        guard let native = nativeContextLength, yarnScaling != nil else {
+            return String(localized: "settings.basic.context_window.sub",
+                          defaultValue: "Maximum tokens per request",
+                          comment: "Sublabel for the context window field")
+        }
+        return String(localized: "settings.basic.context_window.yarn.sub",
+                      defaultValue: "Above the native \(Self.grouped(native)) tokens, YaRN rope scaling engages automatically (up to 4×).",
+                      comment: "Sublabel on the Context Window row for checkpoints that derive YaRN rope scaling from this field; placeholder is the grouped native context length")
+    }
+
+    /// Read-only one-line YaRN readout under the Context Window row.
+    /// Deliberately terse — "YaRN scale factor = 2 (524,288 / 262,144)";
+    /// the recipe constants live in yarn_rope.py for anyone who cares.
+    var yarnScalingSummary: String {
+        switch yarnScaling {
+        case .none:
+            return ""
+        case .off:
+            return String(localized: "settings.basic.context_window.yarn.off",
+                          defaultValue: "YaRN scale factor = off",
+                          comment: "Read-only YaRN state when the context window does not exceed the native window")
+        case .scaled(let factor, let target, let native):
+            return String(localized: "settings.basic.context_window.yarn.factor",
+                          defaultValue: "YaRN scale factor = \(Self.factor(factor)) (\(Self.grouped(target)) / \(Self.grouped(native)))",
+                          comment: "Read-only YaRN factor derived from the context window override; placeholders are the factor, the target window, and the native window")
+        case .overCeiling(let factor, let target, let native):
+            return String(localized: "settings.basic.context_window.yarn.over_ceiling",
+                          defaultValue: "YaRN scale factor = \(Self.factor(factor)) (\(Self.grouped(target)) / \(Self.grouped(native))) — over 4× cap",
+                          comment: "Read-only YaRN factor when the context window asks for more than Qwen's published 4x recipe ceiling")
+        }
+    }
+
+    /// Grouped integer for display ("524,288" in en).
+    static func grouped(_ value: Int) -> String {
+        value.formatted(.number)
+    }
+
+    /// Trimmed factor for display ("2", "1.5", "2.25").
+    static func factor(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0...2)))
+    }
+
+    /// Derived YaRN rope state; see `yarnScaling`.
+    enum YarnScaling: Equatable, Sendable {
+        /// Context window at or below native: checkpoint rope, unscaled.
+        case off(native: Int)
+        /// Override above native, inside Qwen's published 4× recipe.
+        case scaled(factor: Double, target: Int, native: Int)
+        /// Override beyond the 4× recipe ceiling (server warns, still serves).
+        case overCeiling(factor: Double, target: Int, native: Int)
+
+        /// True when rope scaling is actually engaged (override above native).
+        var isScaled: Bool {
+            switch self {
+            case .off: return false
+            case .scaled, .overCeiling: return true
+            }
+        }
+
+        /// True when the override asks for more than the 4× recipe ceiling.
+        var isOverCeiling: Bool {
+            if case .overCeiling = self { return true }
+            return false
+        }
+    }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:

@@ -1328,3 +1328,32 @@ def test_generation_scope_uses_uids_after_realignment(monkeypatch):
     monkeypatch.setattr(prompt_priming, "decode_scope", capture_scope)
     with pytest.raises(ScopeReachedError):
         GenerationBatch.next(batch)
+
+
+def test_prime_window_config_precedence(monkeypatch):
+    """env > per-model config > unlimited (0).
+
+    The config setter is what the model loader persists from
+    ModelSettings.mtp_prime_window; the env stays an explicit override.
+    Unbounded priming on a 750k prompt pushed MTP activation past the
+    memory guard (the ladder's decode-start abort), so the per-model
+    bound must survive reboots without launchctl.
+    """
+    monkeypatch.delenv("OMLX_MTP_PRIME_WINDOW", raising=False)
+    prompt_priming.set_prime_window_config(0)
+    assert prompt_priming.prime_window() == 0
+    prompt_priming.set_prime_window_config(65536)
+    assert prompt_priming.prime_window() == 65536
+    monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4096")
+    assert prompt_priming.prime_window() == 4096
+    monkeypatch.delenv("OMLX_MTP_PRIME_WINDOW")
+    assert prompt_priming.prime_window() == 65536
+    prompt_priming.set_prime_window_config(-5)
+    assert prompt_priming.prime_window() == 0
+
+
+def test_model_settings_carry_mtp_prime_window():
+    from omlx.model_settings import ModelSettings
+
+    assert ModelSettings().mtp_prime_window == 0
+    assert ModelSettings(mtp_prime_window=65536).mtp_prime_window == 65536

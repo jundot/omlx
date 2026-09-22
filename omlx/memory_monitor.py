@@ -1570,8 +1570,18 @@ def estimate_qwen4_exp_kv_bytes_per_token(
     config: Any,
     cache_list: Any,
     dtype_size: float,
+    tq_bits: float | None = None,
+    tq_skip_last: bool = True,
 ) -> float | None:
-    """Price Qwen4 QSA K/V plus its raw index keys and MRoPE positions."""
+    """Price Qwen4 QSA K/V plus its raw index keys and MRoPE positions.
+
+    With ``tq_bits`` set, every QSA layer except the (skip-last) final one
+    prices as TurboQuantQSAKVCache: packed KV at ``bits/8`` bytes per
+    element plus fp16 per-token norms, while the dense indexer sidecar
+    (raw index keys + MRoPE coordinates) is unchanged. The probed
+    ``cache_list`` holds fresh dense caches, so the conversion is modeled
+    here rather than observed.
+    """
     if not str(_cfg_get(config, "model_type", "")).startswith("qwen4_exp"):
         return None
     if cache_list is None:
@@ -1600,12 +1610,23 @@ def estimate_qwen4_exp_kv_bytes_per_token(
     # QSA keeps ordinary K/V, one raw index-key vector, and up to three int64
     # MRoPE coordinates for every cached token. Text-only positions use one
     # coordinate, but charging all three keeps image requests conservative.
-    per_layer = (
-        2 * num_kv_heads * head_dim * float(dtype_size)
-        + indexer_head_dim * float(dtype_size)
-        + 3 * 8
+    aux_per_layer = indexer_head_dim * float(dtype_size) + 3 * 8
+    dense_kv_per_layer = 2 * num_kv_heads * head_dim * float(dtype_size)
+
+    hybrid_layers = 0
+    if tq_bits is not None and float(tq_bits) > 0:
+        hybrid_layers = qsa_layers - (1 if tq_skip_last and qsa_layers > 1 else 0)
+    dense_layers = qsa_layers - hybrid_layers
+
+    # Packed KV: bits/8 bytes per element plus one fp16 norm per token per
+    # K/V vector (2 bytes each). Priced only when layers actually convert.
+    tq_kv_per_layer = 0.0
+    if hybrid_layers:
+        tq_kv_per_layer = 2 * num_kv_heads * (head_dim * float(tq_bits) / 8.0 + 2.0)
+    return float(
+        dense_layers * (dense_kv_per_layer + aux_per_layer)
+        + hybrid_layers * (tq_kv_per_layer + aux_per_layer)
     )
-    return float(qsa_layers * per_layer)
 
 
 def estimate_mla_kv_bytes_per_token(

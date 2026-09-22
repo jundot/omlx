@@ -1120,3 +1120,72 @@ def test_qwen4_image_request_preflight_stays_dense():
     ):
         rejection = scheduler._preflight_memory_check(request)
     assert rejection is not None
+
+
+def test_estimate_cached_prefix_tokens_uses_shared_prefix_matcher():
+    """The preflight probe counts shared-prefix tokens via the same
+    hash-chain matcher admission uses, without block-table side effects."""
+    scheduler = _make_scheduler()
+    blocks = {
+        7: SimpleNamespace(token_count=2048),
+        8: SimpleNamespace(token_count=2048),
+        9: SimpleNamespace(token_count=1024),
+    }
+    paged = SimpleNamespace(
+        find_shared_prefix=lambda tokens, **kw: ([7, 8, 9], [None] * 3, []),
+        allocated_blocks=blocks,
+    )
+    scheduler.block_aware_cache = SimpleNamespace(paged_cache=paged)
+    assert scheduler.estimate_cached_prefix_tokens([1] * 6000) == 5120
+    # No cache / probe failure degrades to 0 (conservative full pricing).
+    scheduler.block_aware_cache = None
+    assert scheduler.estimate_cached_prefix_tokens([1] * 6000) == 0
+
+
+def test_route_preflight_prices_warm_prefix_as_cached(monkeypatch):
+    """A warm resend must not be priced as a cold full prompt.
+
+    The 900k agentic control (identical resend, ~870k of 888k tokens
+    already stored) was rejected at the HTTP front door: preflight
+    charged the full-prompt KV+SDPA (30.2GB) against the 109.25GB
+    ceiling at 83.5GB current, while the cold variant that genuinely
+    needed those 30GB had been admitted minutes earlier at a lower
+    footprint. Given the token ids, preflight probes the shared prefix
+    and charges only the suffix as new work.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**12
+    monkeypatch.setattr(
+        scheduler, "estimate_cached_prefix_tokens", lambda ids: 63_488
+    )
+    seen = {}
+
+    def fake_kv(new_tokens, chunk_tokens=0):
+        seen["new_tokens"] = new_tokens
+        return 10
+
+    scheduler.memory_monitor.estimate_resident_kv_bytes = fake_kv
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=65_536,
+            prompt_token_ids=list(range(65_536)),
+        )
+        assert seen["new_tokens"] == 65_536 - 63_488
+        # The eviction pre-check shares the probe: a warm request must not
+        # trigger idle-model eviction either.
+        assert (
+            scheduler.preflight_eviction_request(
+                num_prompt_tokens=65_536,
+                prompt_token_ids=list(range(65_536)),
+            )
+            is None
+        )
+        assert seen["new_tokens"] == 65_536 - 63_488
+        # Legacy count-only callers keep the conservative full pricing.
+        scheduler.preflight_or_raise(num_prompt_tokens=65_536)
+        assert seen["new_tokens"] == 65_536

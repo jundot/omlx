@@ -183,6 +183,27 @@ struct Qwen4QSASparseGQAParams {
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
 };
 
+struct Qwen4QSATQParams {
+  int B; ///< Batch size (the current native ABI fixes this to one)
+  int q_heads; ///< Main-attention query heads
+  int kv_heads; ///< Main-attention key/value heads
+  int qL; ///< Query rows in this prefill tile
+  int kL; ///< Logical cached key/value rows
+  int topk; ///< Fixed-width selected four-token block list per query
+  int gqa_factor; ///< Query heads sharing one key/value head
+  int q_offset; ///< Absolute position of query row zero
+
+  float scale; ///< Attention scale
+
+  int64_t Q_strides[3]; ///< Pre-rotated query strides (B, H, L, D = 1)
+  int64_t Topk_strides[3]; ///< Selected-token strides (B, 1, L, topk = 1)
+  int64_t O_strides[3]; ///< Rotated-space output strides (B, H, L, D = 1)
+  int64_t KNorm_strides[2]; ///< Key norm strides (B, H); token stride is 1
+  int64_t KPacked_strides[3]; ///< Packed key strides (B, H, T); word stride 1
+  int64_t VNorm_strides[2]; ///< Value norm strides (B, H); token stride is 1
+  int64_t VPacked_strides[3]; ///< Packed value strides (B, H, T); word stride 1
+};
+
 struct AttnChunkReduceParams {
   int C; ///< Number of key chunks
   int H; ///< Heads

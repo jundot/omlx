@@ -1116,6 +1116,7 @@
   "modal.model_settings.turboquant_kv": "Cache KV TurboQuant",
   "modal.model_settings.turboquant_kv_hint": "Comprimir o cache KV usando quantização vetorial. Menos bits = mais compressão, mais bits = melhor qualidade. Suporta de 2 a 8 bits.",
   "modal.model_settings.turboquant_kv_bits_label": "Bits por canal",
+  "modal.model_settings.yarn_factor_label": "YaRN factor",
   "modal.model_settings.k2_ane": "Processamento de prompts K2 com ANE",
   "modal.model_settings.k2_ane_hint": "Usa ANE para prompts K2 BF16, incluindo MoVA. A decodificação permanece na GPU. Usa interfaces privadas da Apple; as saídas podem variar.",
   "modal.model_settings.k2_ane_shared": "MLP compartilhado na ANE",

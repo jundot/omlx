@@ -490,6 +490,16 @@ def maybe_apply_pre_load_patches(
 
     set_mtp_active(False)
 
+    # Per-model Lightning MTP priming bound (head-cache memory cost);
+    # set on every load so unloads/reloads cannot leak a prior model's
+    # window. Env OMLX_MTP_PRIME_WINDOW still overrides inside
+    # prompt_priming.prime_window().
+    from ..patches.mlx_lm_mtp import prompt_priming as _prompt_priming
+
+    _prompt_priming.set_prime_window_config(
+        getattr(model_settings, "mtp_prime_window", 0) or 0
+    )
+
     _patch_mlx_lm_load_config()
 
     # Machine-conditioned, model-independent: reroute sorted gather_qmm
@@ -747,6 +757,20 @@ def maybe_apply_pre_load_patches(
             )
             set_mtp_active(False)
             mtp_active = False
+        # Single knob: a per-model context-window override above the native
+        # horizon auto-enables YaRN (factor = override / native, derived at
+        # construction). At or below native it is a plain admission clamp.
+        yarn_target = None
+        if model_settings is not None:
+            window = getattr(model_settings, "max_context_window", None)
+            text_cfg = config.get("text_config")
+            native = (
+                text_cfg.get("max_position_embeddings")
+                if isinstance(text_cfg, dict)
+                else None
+            ) or config.get("max_position_embeddings")
+            if isinstance(window, int) and native and window > int(native):
+                yarn_target = window
         configure_qwen4_exp_runtime(
             model_name,
             mode=(
@@ -756,6 +780,7 @@ def maybe_apply_pre_load_patches(
                 else "resident" if model_settings is not None else None
             ),
             mtp_enabled=mtp_active,
+            yarn_context_length=yarn_target,
         )
 
     if for_vlm and model_type == "glm5_next":

@@ -74,6 +74,25 @@ def priming_enabled() -> bool:
     )
 
 
+_PRIME_WINDOW_CONFIG = 0
+
+
+def set_prime_window_config(window: int) -> None:
+    """Persist the per-model bound (ModelSettings.mtp_prime_window).
+
+    Called by the model loader on every load; the env var remains an
+    explicit override. Unbounded priming on huge prompts pushes the
+    head-cache activation seam and its prefix-snapshot publish past
+    the memory guard (the 750k ladder's decode-start abort), so the
+    bound must survive reboots without launchctl session env.
+    """
+    global _PRIME_WINDOW_CONFIG
+    try:
+        _PRIME_WINDOW_CONFIG = max(0, int(window))
+    except (TypeError, ValueError):
+        _PRIME_WINDOW_CONFIG = 0
+
+
 def prime_window() -> int:
     """Max tokens to fold into one prime context; 0 = unlimited.
 
@@ -83,11 +102,17 @@ def prime_window() -> int:
     that is only the boundary remainder, not the full prompt — so a
     long-context request with a small remainder still primes. A remainder
     larger than the window runs unprimed.
+
+    Precedence: OMLX_MTP_PRIME_WINDOW env (explicit override) > the
+    configured per-model bound > unlimited.
     """
-    try:
-        return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
-    except ValueError:
-        return 0
+    raw = os.environ.get("OMLX_MTP_PRIME_WINDOW", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return _PRIME_WINDOW_CONFIG
 
 
 @contextmanager

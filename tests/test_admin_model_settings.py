@@ -543,3 +543,48 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert pool._engine_runtime_signature(
         "m", depth_3_off
     ) == pool._engine_runtime_signature("m", depth_8_off)
+
+
+
+@pytest.mark.asyncio
+async def test_max_context_window_above_native_is_capped_for_qwen4_exp():
+    """On Qwen4-Exp the window override IS the rope target above native, so
+    it is capped at Qwen's published 4x recipe maximum."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    entry.model_context_length = 262144
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(max_context_window=1048576),
+    )
+    assert settings.max_context_window == 1048576
+
+    with pytest.raises(admin_routes.HTTPException) as excinfo:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(max_context_window=1048577),
+        )
+    assert excinfo.value.status_code == 400
+    assert "4x the native" in excinfo.value.detail
+    assert settings.max_context_window == 1048576
+
+
+@pytest.mark.asyncio
+async def test_max_context_window_uncapped_for_other_models():
+    """Other families keep the historical gate-only semantics: no rope
+    scaling rides the value, so no recipe cap applies."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "llama"
+    entry.model_context_length = 131072
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(max_context_window=10_000_000),
+    )
+    assert settings.max_context_window == 10_000_000

@@ -2276,6 +2276,7 @@ def _model_options(model_info: dict, settings) -> dict:
         ],
         "reasoning_effort_default": "high" if is_k2 else "low",
         "reasoning_effort_custom": not is_k2,
+        "yarn_rope_supported": model_type == "qwen4_exp",
         "ane_prefill_backend": ane_backend,
         "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
@@ -3582,6 +3583,26 @@ def _validate_model_settings(entry, settings):
                 status_code=400,
                 detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
             )
+    # Qwen4-Exp YaRN rides the context-window override: a value above the
+    # native horizon auto-enables static YaRN (factor = value / native) at
+    # load. Cap at Qwen's published recipe maximum so the derived factor
+    # stays inside validated territory.
+    context_window = settings.get("max_context_window")
+    if context_window is not None:
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        if config_type.lower().replace("-", "_") == "qwen4_exp":
+            native = getattr(entry, "model_context_length", None)
+            if native and context_window > native * 4:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Max Context Window cannot exceed 4x the native "
+                        f"context ({native * 4} tokens) on Qwen4-Exp — "
+                        "Qwen's published YaRN recipe maximum. Values above "
+                        "the native horizon auto-enable YaRN rope scaling "
+                        "(factor = value / native)."
+                    ),
+                )
     if any(key.startswith("qwen35_ane_prefill_") for key in settings):
         try:
             validate_ane_prefill(settings, entry.config_model_type)

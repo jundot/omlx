@@ -515,6 +515,10 @@ class _PrefillState:
     # Tail snapshot plan, see _prefill_tail_plan.
     tail_at: int | None = None
     end_tail: bool = False
+    # Incremental TurboQuant fold bookkeeping (see _tq_incremental_convert):
+    # next processed-token threshold and the indexer reservation horizon.
+    tq_next_convert_at: int | None = None
+    tq_reserve_target: int = 0
 
 
 @dataclass
@@ -1226,6 +1230,8 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "TurboQuantQSAKVCache",
+        "BatchTurboQuantQSAKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
         # Both QSA handlers support block slicing, so their growing KV and
@@ -1240,6 +1246,8 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
     {
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "TurboQuantQSAKVCache",
+        "BatchTurboQuantQSAKVCache",
     }
 )
 
@@ -1253,10 +1261,77 @@ def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
 
 
 def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
-    """Cache layer counted by TurboQuant's skip-last full-attention rule."""
-    return isinstance(
-        cache_obj, (_MLXKVCache, _vlm_cache.KVCache)
-    ) or _is_turboquant_kv_cache(cache_obj)
+    """Cache layers counted by TurboQuant's skip-last full-attention rule.
+
+    Includes the qwen4_exp QSA caches: dense QSAKVCache layers are skip-last
+    candidates and TurboQuantQSAKVCache layers are converted hybrids.
+    """
+    return (
+        isinstance(cache_obj, (_MLXKVCache, _vlm_cache.KVCache))
+        or _is_turboquant_kv_cache(cache_obj)
+        or type(cache_obj).__name__ in ("QSAKVCache", "TurboQuantQSAKVCache")
+    )
+
+
+def _tq_qsa_enabled() -> bool:
+    """Kill switch for TurboQuant conversion of qwen4_exp QSA caches.
+
+    Read at call time; ``OMLX_TQ_QSA=0`` keeps QSA layers dense (historical
+    behavior) without touching any other TurboQuant model path.
+    """
+    return os.environ.get("OMLX_TQ_QSA", "1") != "0"
+
+
+def _tq_prefill_convert_interval() -> int:
+    """Token interval for OPT-IN mid-prefill TurboQuant folds.
+
+    Default 0 = off: the established TurboQuant contract keeps prefill
+    fp16-exact and converts once at the end. A mid-prefill fold trades
+    that exactness for packed residency (27.9 → 11.1 KB/token) — the
+    300k needle showed content WRITTEN under a packed prefill loses
+    verbatim recall — so the primary trigger is the pressure fold
+    (_tq_pressure_fold_due), which fires only when staying dense would
+    breach the memory guard. This interval is an experimental cap for
+    forcing earlier folds.
+    """
+    raw = os.environ.get("OMLX_TQ_PREFILL_CONVERT_INTERVAL", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 0
+
+
+def _tq_fold_margin_bytes() -> int:
+    """Headroom kept below the hard watermark before the pressure fold."""
+    raw = os.environ.get("OMLX_TQ_FOLD_MARGIN_GB", "").strip()
+    if raw:
+        try:
+            return max(0, int(float(raw) * 1024**3))
+        except ValueError:
+            pass
+    return 4 * 1024**3
+
+
+def _prefill_pool_trim_tokens() -> int:
+    """Chunked-prefill Metal pool trim cadence in tokens; 0 disables.
+
+    The periodic 512-step clear never fires inside a ~440-chunk million-
+    token prefill, so the pool ratchets until the enforcer's soft tier
+    and the tail rides at ~100GB — the 1M rung's pre-chunk guard
+    rejected at 901k tokens, 0.24GB over the cap, with a ~20GB pool
+    that the next enforcer poll drained. Trimming at a token cadence
+    keeps the pool near its working set without per-step clears (the
+    #978/#1040 refcount-burst class the periodic gating mitigates).
+    """
+    raw = os.environ.get("OMLX_PREFILL_POOL_TRIM_TOKENS", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 131_072
 
 
 class _BoundaryStoreUnavailable(Exception):
@@ -1377,10 +1452,25 @@ def _collect_cache_storage_arrays(cache_obj: Any) -> list[mx.array]:
         for item in array_cache:
             arrays.extend(_collect_cache_storage_arrays(item))
 
-    for attr in ("keys", "values", "left_padding", "lengths"):
+    for attr in (
+        "keys",
+        "values",
+        "left_padding",
+        "lengths",
+        # QSA hybrid: packed K/V states are NamedTuples of arrays and the
+        # dense indexer sidecar lives on its own attributes. Skipping them
+        # would leave exactly the lazily quantized buffers unevaluated
+        # that the _tq_incremental_convert fold must materialize before
+        # the next chunk graph references them (#3305-class fence hang).
+        "index_keys",
+        "index_position_ids",
+    ):
         value = getattr(cache_obj, attr, None)
+        value = getattr(value, "_state", value)  # unwrap quantized proxies
         if isinstance(value, mx.array):
             arrays.append(value)
+        elif isinstance(value, tuple):
+            arrays.extend(item for item in value if isinstance(item, mx.array))
 
     return arrays
 
@@ -1875,6 +1965,10 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
+        # Qwen4-Exp YaRN rope target (set by the engine from model_settings).
+        # Participates in the SSD cache compatibility signature: scaled
+        # rotary writes different KV content at identical layer layout.
+        self._yarn_context_length: int | None = None
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -3375,6 +3469,13 @@ class Scheduler:
             return False
 
         def _ok(c: Any) -> bool:
+            name = type(c).__name__
+            if name == "TurboQuantQSAKVCache":
+                return True
+            if name == "QSAKVCache":
+                # Convertible via the hybrid (the indexer sidecar stays
+                # dense); the kill switch keeps the whole model fp16 instead.
+                return _tq_qsa_enabled()
             if isinstance(c, (KVCache, _vlm_cache.KVCache)):
                 return True
             if isinstance(c, (ArraysCache, _vlm_cache.ArraysCache)):
@@ -3444,6 +3545,17 @@ class Scheduler:
                     continue
                 prompt_cache[i] = TurboQuantKVCache(bits=bits)
                 converted += 1
+            elif type(cache_obj).__name__ == "QSAKVCache" and _tq_qsa_enabled():
+                if i == last_kv_idx:
+                    continue
+                hybrid_cls = getattr(
+                    importlib.import_module(type(cache_obj).__module__),
+                    "TurboQuantQSAKVCache",
+                    None,
+                )
+                if hybrid_cls is not None:
+                    prompt_cache[i] = hybrid_cls(bits=bits)
+                    converted += 1
             elif isinstance(cache_obj, (CacheList, _vlm_cache.CacheList)):
                 new_caches = []
                 for c in cache_obj.caches:
@@ -3463,11 +3575,14 @@ class Scheduler:
     def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
         """Convert populated KVCache data to TurboQuantKVCache via from_cache().
 
-        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
-        cache): the completed full-precision KV is quantized once, so prefill
-        hidden states stay exact and quantization error only enters at
-        decode-time reads. This is the key difference from #717/#771, which
-        quantized on the fly during prefill and corrupted hidden states.
+        Called AFTER fp16 prefill completes, at interval crossings DURING
+        chunked prefill (see _tq_prefill_convert_interval), or on an
+        SSD-restored fp16 cache. #717/#771 quantized mid-CHUNK and corrupted
+        hidden states; interval conversion runs strictly between chunks —
+        chunk math stays exact, and only later chunks' attention reads the
+        packed prefix (for qwen4_exp through the gathered TQ arm, whose
+        block selection stays exact on the dense indexer sidecar).
+        Idempotent: already-packed layers match no conversion branch.
         """
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
@@ -3486,6 +3601,23 @@ class Scheduler:
                     continue
                 prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
                 converted += 1
+            elif type(cache_obj).__name__ == "QSAKVCache" and _tq_qsa_enabled():
+                if i == last_kv_idx:
+                    continue
+                hybrid_cls = getattr(
+                    importlib.import_module(type(cache_obj).__module__),
+                    "TurboQuantQSAKVCache",
+                    None,
+                )
+                if hybrid_cls is None:
+                    logger.info(
+                        "TurboQuant QSA conversion unavailable; layer %d "
+                        "stays dense",
+                        i,
+                    )
+                    continue
+                prompt_cache[i] = hybrid_cls.from_qsa_cache(cache_obj, bits=bits)
+                converted += 1
             elif isinstance(cache_obj, (CacheList, _vlm_cache.CacheList)):
                 new_caches = []
                 for c in cache_obj.caches:
@@ -3501,6 +3633,159 @@ class Scheduler:
                 f"TurboQuant: converted {converted}/{len(prompt_cache)} "
                 f"cache layers to {bits}-bit{skip_msg}"
             )
+
+    def _tq_convertible_qsa_layers(self, prompt_cache: list[Any]) -> int:
+        """Count the dense QSA layers a fold would actually pack.
+
+        Mirrors _apply_turboquant_kv_convert's skip-last selection: the
+        final KV-family layer stays dense by design, so an "any
+        QSAKVCache" due-check gate stays open forever after the real
+        fold — the 1M run re-reclaimed and re-ran the no-op conversion
+        on every chunk (~0.6s apart) for the rest of prefill. Zero means
+        the pressure fold has nothing left to do.
+        """
+        kv_indices = [
+            i
+            for i, c in enumerate(prompt_cache)
+            if _is_turboquant_kv_family_cache(c)
+        ]
+        skip_last = (
+            getattr(self, "_turboquant_skip_last", True) and len(kv_indices) > 1
+        )
+        last_kv_idx = kv_indices[-1] if skip_last else -1
+        return sum(
+            1
+            for i, c in enumerate(prompt_cache)
+            if type(c).__name__ == "QSAKVCache" and i != last_kv_idx
+        )
+
+    def _tq_pressure_fold_due(
+        self, prompt_cache: list[Any], remaining_tokens: int
+    ) -> bool:
+        """True when staying dense to the end of prefill would breach guard.
+
+        The primary fold trigger: the established contract keeps prefill
+        fp16-exact, and the 300k needle showed content written under a
+        packed prefill loses verbatim recall — so fold only when the
+        projected end-of-prefill footprint (current usage + remaining ×
+        dense bytes/token, or × packed bytes/token once a first fold has
+        converted the layers) would breach the hard watermark
+        even after reclaiming the Metal pool. QSA family only: standard
+        TurboQuant models keep convert-at-end unconditionally, and the
+        estimator prices qwen4_exp caches.
+        """
+        if remaining_tokens <= 0:
+            return False
+        hard = getattr(self, "_memory_hard_limit_bytes", 0) or 0
+        per_token = getattr(self, "_tq_dense_kv_bytes_per_token", None)
+        if hard <= 0 or not per_token:
+            return False
+        if not self._tq_convertible_qsa_layers(prompt_cache):
+            return False
+        if any(_is_turboquant_kv_cache(c) for c in prompt_cache):
+            # Post-fold the remaining tokens append to packed states (the
+            # skip-last dense remainder is a small constant); the dense
+            # rate would keep the fold "due" on every subsequent chunk.
+            per_token = (
+                getattr(self, "_tq_packed_kv_bytes_per_token", None) or per_token
+            )
+        ceiling = hard - _tq_fold_margin_bytes()
+        if self._current_usage_bytes() + remaining_tokens * per_token <= ceiling:
+            return False
+        # The pool is reclaimable; hidden-state drift is not. Drain first
+        # and fold only if the projection still breaches.
+        try:
+            current = self._reclaim_prefill_headroom()
+        except Exception:
+            current = self._current_usage_bytes()
+        projected = current + remaining_tokens * per_token
+        if projected > ceiling:
+            # Stash for the conversion site: the INFO belongs where the
+            # fold actually packs layers. Re-fires after the first fold
+            # are pool-growth reclaim events (projection re-breaches as
+            # the pool re-inflates; the conversion is a no-op) and stay
+            # at DEBUG — the 1M rung saw four such cycles in ten minutes.
+            self._tq_fold_projection = (projected, ceiling, remaining_tokens)
+            logger.debug(
+                "TurboQuant pressure fold due: projected end-of-prefill "
+                "%.1fGB exceeds guard %.1fGB (remaining %d tokens)",
+                projected / 1024**3,
+                ceiling / 1024**3,
+                remaining_tokens,
+            )
+            return True
+        return False
+
+    def _tq_incremental_convert(
+        self,
+        prompt_cache: list[Any],
+        processed_tokens: int,
+        next_at: int,
+        reserve_target: int,
+        remaining_tokens: int = 0,
+    ) -> int:
+        """Fold the dense prefix into TurboQuant when due.
+
+        Triggers: the pressure fold (primary — the projected dense
+        footprint breaches the guard) and the opt-in token interval.
+        Called between prefill chunks (after the chunk's boundary
+        snapshot, before its memory check) by both prefill loops.
+        Returns the next interval threshold. Idempotent: once the layers
+        are packed, later triggers are no-ops. Conversion replaces the
+        QSA caches and with them the sidecar capacity reservation, so
+        the known horizon is re-armed to keep indexer growth one-shot.
+        """
+        due = False
+        via_pressure = False
+        interval = _tq_prefill_convert_interval()
+        if interval and processed_tokens >= next_at:
+            next_at += interval
+            due = True
+        elif self._tq_pressure_fold_due(prompt_cache, remaining_tokens):
+            due = True
+            via_pressure = True
+        if not due:
+            return next_at
+        if self._turboquant_kv_bits is None:
+            return next_at
+        if not self._turboquant_eligible(prompt_cache):
+            return next_at
+        packed_before = sum(1 for c in prompt_cache if _is_turboquant_kv_cache(c))
+        self._apply_turboquant_kv_convert(prompt_cache)
+        packed_after = sum(1 for c in prompt_cache if _is_turboquant_kv_cache(c))
+        if packed_after > packed_before:
+            projection = getattr(self, "_tq_fold_projection", None)
+            if via_pressure and projection is not None:
+                self._tq_fold_projection = None
+                logger.info(
+                    "TurboQuant pressure fold: projected dense end-of-prefill "
+                    "%.1fGB exceeds guard %.1fGB (remaining %d tokens)",
+                    projection[0] / 1024**3,
+                    projection[1] / 1024**3,
+                    projection[2],
+                )
+            self._reserve_qsa_index_capacity(prompt_cache, reserve_target)
+            # The packed states must be concrete before the next chunk graph
+            # references them: lazy buffers produced off-stream bridge via a
+            # cross-stream fence whose producer is only committed at end of
+            # eval, and the Qwen ANE prefill primitive waits mid-eval on an
+            # engine-stream buffer that fence can never satisfy (#3305 class
+            # hang — observed live on the 750k ladder: fold, one or two
+            # chunks, then the engine idles at 0.2% CPU).
+            stream = getattr(self, "_stream", None)
+            if stream is None:
+                _materialize_cache_storage(prompt_cache)
+            else:
+                with mx.stream(stream):
+                    _materialize_cache_storage(prompt_cache)
+            logger.info(
+                "TurboQuant: incremental prefill conversion at %d tokens "
+                "(%d packed layers, horizon %d)",
+                processed_tokens,
+                packed_after,
+                reserve_target,
+            )
+        return next_at
 
     def _qwen4_prefill_accounting_enabled(self) -> bool:
         monitor = getattr(self, "memory_monitor", None)
@@ -3697,8 +3982,12 @@ class Scheduler:
 
         # The full prompt length is known here; hand it to the QSA indexer so
         # its arrays are sized once instead of doubling mid-prefill.
-        self._reserve_qsa_index_capacity(
-            prompt_cache, _cache_base_sizes(prompt_cache) + n_tokens
+        qsa_index_reserve = _cache_base_sizes(prompt_cache) + n_tokens
+        self._reserve_qsa_index_capacity(prompt_cache, qsa_index_reserve)
+        tq_next_convert_at = (
+            _tq_prefill_convert_interval()
+            if self._turboquant_kv_bits is not None
+            else 0
         )
 
         Scheduler._announce_first_prefill_chunk(self, input_arr, base_size, boundary_enabled, block_size, embeds_array)
@@ -3888,6 +4177,18 @@ class Scheduler:
                         request, prompt_cache, total_tokens
                     )
 
+            # TurboQuant fold check (pressure-first; see
+            # _tq_incremental_convert): between chunks, after this chunk's
+            # boundary snapshot, before the memory check below so the
+            # guard sees the packed footprint.
+            tq_next_convert_at = self._tq_incremental_convert(
+                prompt_cache,
+                processed_tokens,
+                tq_next_convert_at,
+                qsa_index_reserve,
+                qsa_index_reserve - base_size - processed_tokens,
+            )
+
             # Memory monitoring — use max(active, phys_footprint) so MLX
             # cache pool and IOAccelerator-backed allocations that don't
             # show in mx.get_active_memory() still trigger the guard.
@@ -4041,15 +4342,17 @@ class Scheduler:
         request._prefill_saved_rope_deltas = None
 
         # Quantize the completed fp16 KV cache to TurboQuant for decode.
-        # Done here (after the prefill loop, after boundary snapshots are
-        # captured fp16) so prefill hidden states stay exact and the paged-SSD
-        # format is unchanged. _merge_caches() then builds a
-        # BatchTurboQuantKVCache when this request is inserted. Gated to dense
-        # KVCache models — chunked/rotating caches stay fp16.
+        # Long prompts already folded mid-prefill at interval crossings
+        # (_tq_incremental_convert); this final pass is the idempotent
+        # backstop for the tail below the interval. _merge_caches() then
+        # builds the batched TQ cache when this request is inserted. Gated
+        # to dense KVCache models — chunked/rotating caches stay fp16.
         if self._turboquant_kv_bits is not None and self._turboquant_eligible(
             prompt_cache
         ):
+            self._log_mem_trace("convert_pre", request.request_id)
             self._apply_turboquant_kv_convert(prompt_cache)
+            self._log_mem_trace("convert_post", request.request_id)
 
         if getattr(request, "cached_tokens", 0) > 0:
             with mx.stream(self._stream):
@@ -4309,6 +4612,14 @@ class Scheduler:
         )
         raise _PrefillEvictionNeeded(eviction_request)
 
+    @staticmethod
+    def _pool_trim_due(tokens_processed: int, chunk: int, cadence: int) -> bool:
+        """True when this chunk crossed a pool-trim cadence boundary."""
+        return (
+            cadence > 0
+            and tokens_processed // cadence > (tokens_processed - chunk) // cadence
+        )
+
     def _guard_prefill_chunk(
         self,
         n_tokens: int,
@@ -4355,6 +4666,21 @@ class Scheduler:
         min_transient = self._admission_transient_bound(
             min_chunk, kv_len, gathered_core=gathered_core
         )
+        # Metal's footprint drain lags the clear (the enforcer grants its
+        # reclaim the same grace): re-poll while the number still falls
+        # before rejecting a close-margin chunk — the 1M rung rejected at
+        # 901k tokens 0.24GB over the cap milliseconds after a reclaim
+        # whose pool the enforcer's next poll showed 20GB lower.
+        if current + min_transient > cap:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                time.sleep(0.15)
+                drained = self._current_usage_bytes()
+                if drained >= current:
+                    break
+                current = drained
+                if current + min_transient <= cap:
+                    break
         if current + min_transient > cap:
             maybe_raise_eviction = getattr(
                 self, "_raise_prefill_eviction_if_available", None
@@ -5553,12 +5879,18 @@ class Scheduler:
             Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None)
             # Known horizon: size the QSA indexer once instead of doubling
             # mid-prefill (see _reserve_qsa_index_capacity).
-            self._reserve_qsa_index_capacity(
-                state.cache,
+            state.tq_reserve_target = (
                 _cache_base_sizes(state.cache)
                 + int(state.tokens_remaining.shape[1])
-                + len(state.last_token),
+                + len(state.last_token)
             )
+            self._reserve_qsa_index_capacity(state.cache, state.tq_reserve_target)
+            if state.tq_next_convert_at is None:
+                state.tq_next_convert_at = (
+                    _tq_prefill_convert_interval()
+                    if self._turboquant_kv_bits is not None
+                    else 0
+                )
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
@@ -5666,6 +5998,15 @@ class Scheduler:
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
 
+        # Long prefills ratchet the Metal pool past what the periodic clear
+        # ever sees (512 steps > the whole chunk count); trim it at token
+        # cadence so the pre-chunk guard's close-margin tail rejections
+        # (1M rung at 901k) stop firing on pool slack alone.
+        if Scheduler._pool_trim_due(
+            state.tokens_processed, n, _prefill_pool_trim_tokens()
+        ) and mx.get_cache_memory() > 2 * 1024**3:
+            self._reclaim_prefill_headroom()
+
         # Boundary snapshot
         if state.boundary_enabled:
             total_tokens = state.base_size + state.tokens_processed
@@ -5683,6 +6024,17 @@ class Scheduler:
                 self._emit_prefill_tail_snapshot(
                     state.request, state.cache, total_tokens
                 )
+
+        # TurboQuant fold check (mirrors the external prefill loop):
+        # between chunks, after the boundary snapshot, before the memory
+        # check below.
+        state.tq_next_convert_at = self._tq_incremental_convert(
+            state.cache,
+            state.tokens_processed,
+            state.tq_next_convert_at or 0,
+            state.tq_reserve_target,
+            state.tq_reserve_target - state.base_size - state.tokens_processed,
+        )
 
         # Progress callback so the admin UI prefilling list advances during
         # chunked prefill. _do_external_prefill calls _on_prompt_progress
@@ -5898,6 +6250,7 @@ class Scheduler:
         # ops; keep them on the engine stream so the next decode step's eval
         # graph stays single-stream (#2235, see _remove_uid_from_active_batch).
         with mx.stream(self._stream):
+            self._log_mem_trace("insert_pre", request.request_id)
             uids = self.batch_generator.insert(
                 [state.last_token],
                 max_tokens=[request.sampling_params.max_tokens],
@@ -5907,6 +6260,7 @@ class Scheduler:
                 logits_processors=[per_row_lps],
                 stop_sequences=[state.sm],
             )
+        self._log_mem_trace("insert_post", request.request_id)
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
@@ -8383,7 +8737,13 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    if handler is not None:
+                    if hasattr(layer_cache, "full_state"):
+                        # TurboQuant QSA hybrid: serialize the packed KV plus
+                        # the dense indexer sidecar (4-tuple); the runtime
+                        # `state` stays the TQ 2-tuple the kernels read.
+                        state = layer_cache.full_state
+                        meta = getattr(layer_cache, "meta_state", ())
+                    elif handler is not None:
                         state = handler.serialize_state(layer_cache)
                         meta = handler.serialize_meta_state(layer_cache)
                     else:
@@ -10573,6 +10933,35 @@ class Scheduler:
             f"{advice}."
         )
 
+    def estimate_cached_prefix_tokens(self, token_ids: Any) -> int:
+        """Best-effort shared-prefix token count for route preflight.
+
+        Uses the admission path's hash-chain matcher (find_shared_prefix)
+        without fetch_cache's block-table side effects, so the front door
+        can charge only the uncached suffix of a warm resend as new work.
+        Hot blocks' bytes are already inside ``current``, so counting them
+        as cached only over-estimates the peak (the safe direction); cold
+        blocks restore into the same KV bytes the estimate charges either
+        way. Any probe failure returns 0 — conservative whole-prompt
+        pricing, the pre-probe behavior.
+        """
+        cache = getattr(self, "block_aware_cache", None)
+        paged = getattr(cache, "paged_cache", None)
+        if paged is None or not token_ids:
+            return 0
+        try:
+            shared_ids, _, _ = paged.find_shared_prefix(list(token_ids))
+        except Exception as exc:
+            logger.debug("preflight prefix probe failed: %s", exc)
+            return 0
+        if not shared_ids:
+            return 0
+        allocated = getattr(paged, "allocated_blocks", {}) or {}
+        return sum(
+            int(getattr(allocated.get(block_id), "token_count", 0) or 0)
+            for block_id in shared_ids
+        )
+
     def preflight_or_raise(
         self,
         *,
@@ -10580,6 +10969,7 @@ class Scheduler:
         cached_tokens: int = 0,
         request_id: str | None = None,
         text_only: bool = False,
+        prompt_token_ids: Any = None,
     ) -> None:
         """Pre-StreamingResponse prefill memory check.
 
@@ -10599,6 +10989,8 @@ class Scheduler:
             return
         if self.memory_monitor is None:
             return
+        if not cached_tokens and prompt_token_ids is not None:
+            cached_tokens = self.estimate_cached_prefix_tokens(prompt_token_ids)
 
         current = self._current_usage_bytes(refresh_mlx_active=False)
         est = self._admission_estimate(
@@ -10667,6 +11059,7 @@ class Scheduler:
         cached_tokens: int = 0,
         request_id: str | None = None,
         text_only: bool = False,
+        prompt_token_ids: Any = None,
     ) -> PrefillEvictionRequest | None:
         """Return an idle-model eviction request for route-level preflight.
 
@@ -10682,6 +11075,8 @@ class Scheduler:
             return None
         if self.memory_monitor is None:
             return None
+        if not cached_tokens and prompt_token_ids is not None:
+            cached_tokens = self.estimate_cached_prefix_tokens(prompt_token_ids)
 
         current = self._current_usage_bytes(refresh_mlx_active=False)
         request_id = request_id or "preflight"
@@ -10785,6 +11180,68 @@ class Scheduler:
             limit_bytes=int(cap),
         )
 
+    def _tq_qsa_serialized_decode(self) -> bool:
+        """True while TQ-QSA decode must stay one request at a time.
+
+        Interim mitigation, not the goal: packed multi-row batching is
+        gated inside BatchTurboQuantQSAKVCache (the Lightning-MTP
+        late-join handoff misaligns mask/key widths on packed B>1), and
+        the dense-dequantize fallback would multiply memory at long
+        contexts — strictly worse than waiting. So while another request
+        is admitted, new admissions defer and decode stays serialized
+        and packed. OMLX_TQ_QSA_BATCH_ROWS=1 restores concurrent packed
+        rows for debugging the multi-row path.
+        """
+        if os.environ.get("OMLX_TQ_QSA_BATCH_ROWS", "") == "1":
+            return False
+        family = getattr(self, "_tq_qsa_family", None)
+        if family is None:
+            family = False
+            if self._turboquant_kv_bits is not None and _tq_qsa_enabled():
+                try:
+                    family = any(
+                        type(c).__name__ == "QSAKVCache"
+                        for c in make_prompt_cache(self.model)
+                    )
+                except Exception:
+                    # Probe again on the next admission instead of caching
+                    # a transient failure (mid-load model) forever.
+                    logger.warning(
+                        "TQ-QSA serialization probe failed; will retry",
+                        exc_info=True,
+                    )
+                    return False
+            self._tq_qsa_family = family
+            logger.info(
+                "TQ-QSA decode serialization %s (bits=%s, qsa_family=%s)",
+                "enabled" if family else "disabled",
+                self._turboquant_kv_bits,
+                family,
+            )
+        return family
+
+    def _log_mem_trace(self, label: str, request_id: str = "") -> None:
+        """DEBUG footprint probe around the prefill→decode transition.
+
+        The convert/insert window is where the phase-1 dequantize fallback
+        spiked (750k ladder: 117.6 GB abort after a full packed prefill);
+        these traces make the transition observable at log_level=debug.
+        TurboQuant engines only — the spike class is TQ-specific.
+        """
+        if self._turboquant_kv_bits is None:
+            return
+        try:
+            phys = get_phys_footprint() / 1024**3
+        except Exception:
+            phys = float("nan")
+        logger.debug(
+            "[memtrace:%s] rid=%s phys=%.2fGB mx_active=%.2fGB",
+            label,
+            request_id or "-",
+            phys,
+            mx.get_active_memory() / 1024**3,
+        )
+
     def _schedule_waiting(
         self,
     ) -> tuple[list["Request"], list[RequestOutput]]:
@@ -10820,6 +11277,22 @@ class Scheduler:
             # continue. First request always passes (no admitted work yet)
             # so admission can recover by completing the current generation.
             admitted = self._num_admitted_requests()
+            # TQ-QSA decode serialization (interim): packed rows do not
+            # join a live generation batch and the dense fallback would
+            # dequantize every active long context, so new admissions
+            # defer until the engine drains. request_id_to_uid covers
+            # MTP-owned requests, which leave the running/prefilling
+            # lists at insert. See _tq_qsa_serialized_decode.
+            if (
+                admitted or self.request_id_to_uid
+            ) and self._tq_qsa_serialized_decode():
+                logger.debug(
+                    "Admission deferred: TQ-QSA decode serialization "
+                    "(%d admitted, %d generating)",
+                    admitted,
+                    len(self.request_id_to_uid),
+                )
+                break
             if self._admission_paused and admitted:
                 logger.debug(
                     "Admission paused by memory pressure, %d admitted",
@@ -11530,6 +12003,7 @@ class Scheduler:
             # step's eval graph stays single-stream (#2235, see
             # _remove_uid_from_active_batch).
             with mx.stream(self._stream):
+                self._log_mem_trace("insert_pre", request.request_id)
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
@@ -11539,6 +12013,7 @@ class Scheduler:
                     logits_processors=[per_row_lps],
                     stop_sequences=[sm],
                 )
+            self._log_mem_trace("insert_post", request.request_id)
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
@@ -13601,7 +14076,34 @@ class Scheduler:
                     config,
                     cache_list_for_tq,
                     base_dtype_size,
+                    tq_bits=(
+                        self._turboquant_kv_bits
+                        if self._turboquant_kv_bits is not None
+                        and _tq_qsa_enabled()
+                        else None
+                    ),
+                    tq_skip_last=self._turboquant_skip_last,
                 )
+                if self._turboquant_kv_bits is not None:
+                    # Dense-rate twin for the pressure-fold projection:
+                    # what the remaining tokens would cost staying fp16
+                    # (None for non-qwen4_exp models — the family gate).
+                    self._tq_dense_kv_bytes_per_token = (
+                        estimate_qwen4_exp_kv_bytes_per_token(
+                            config,
+                            cache_list_for_tq,
+                            base_dtype_size,
+                            tq_bits=None,
+                            tq_skip_last=self._turboquant_skip_last,
+                        )
+                    )
+                    # Packed-rate twin for the post-fold projection: the
+                    # converted-cache rate this estimator already computed
+                    # above (None when the QSA kill switch is off — folds
+                    # cannot happen then anyway).
+                    self._tq_packed_kv_bytes_per_token = (
+                        kv_bytes_per_token if _tq_qsa_enabled() else None
+                    )
             if (
                 kv_bytes_per_token is None
                 and estimate_mla_kv_bytes_per_token is not None
@@ -13763,7 +14265,14 @@ class Scheduler:
         last_kv_idx = kv_indices[-1] if skip_last else -1
         for idx in kv_indices:
             if idx != last_kv_idx and idx < len(layer_cache_types):
-                layer_cache_types[idx] = "TurboQuantKVCache"
+                # QSA layers convert to the hybrid; plain KVCache layers to
+                # the TQ cache. Restored blocks reconstruct by class name,
+                # so the prediction must match the conversion's output.
+                layer_cache_types[idx] = (
+                    "TurboQuantQSAKVCache"
+                    if layer_cache_types[idx] == "QSAKVCache"
+                    else "TurboQuantKVCache"
+                )
 
         # The depth is keyed off the same eligibility gate the request path
         # uses, not the rewritten names: models whose convertible caches sit
@@ -13796,6 +14305,7 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
+                    yarn_context_length=self._yarn_context_length,
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)

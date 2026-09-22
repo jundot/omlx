@@ -159,6 +159,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         block_aware_cache=object() if snapshots_enabled else None,
         _stream=mx.default_stream(mx.gpu),
         _prefill_tail_plan=lambda *a: (None, False),
+        _turboquant_kv_bits=None,
     )
     state = Scheduler._begin_prefill(
         ns,

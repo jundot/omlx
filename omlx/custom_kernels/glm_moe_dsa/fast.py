@@ -104,6 +104,7 @@ NATIVE_SYMBOLS = (
     "qwen4_qsa_indexer_scores",
     "qwen4_qsa_topk_indices",
     "qwen4_qsa_sparse_gqa_attention",
+    "qwen4_qsa_sparse_gqa_attention_tq",
     "dsa_topk_indices",
     "dspark_fp32_topk_indices",
     "dspark_exact_mxfp8_qmv_pair",
@@ -342,6 +343,53 @@ def qwen4_qsa_sparse_gqa_attention(
         queries,
         keys,
         values,
+        selected_blocks,
+        scale,
+        q_offset,
+        key_tile,
+        dimension_tile,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_sparse_gqa_attention_tq(
+    queries: mx.array,
+    key_norms: mx.array,
+    key_packed: mx.array,
+    value_norms: mx.array,
+    value_packed: mx.array,
+    codebook_k: mx.array,
+    codebook_v: mx.array,
+    selected_blocks: mx.array,
+    scale: float,
+    q_offset: int,
+    *,
+    key_tile: int = 64,
+    dimension_tile: int = 64,
+    stream=None,
+) -> mx.array:
+    """Exact Qwen4 main GQA over TurboQuant MSE packed K/V.
+
+    Packed-state counterpart of ``qwen4_qsa_sparse_gqa_attention`` with the
+    same narrow ABI (batch-one 24q/2kv/D256, 512 chronological uint32 block
+    IDs, causal tail in-kernel, FP32 online softmax). Per-side bit widths
+    are inferred from the codebook sizes (2^bits entries, bits in
+    {2, 3, 4, 6, 8}) and cross-checked against the packed row widths.
+    Queries must be pre-rotated into the key codec's frame; the fp32 output
+    stays in the value codec's rotated frame — the caller applies the
+    inverse rotation.
+    """
+
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_sparse_gqa_attention_tq"):
+        raise RuntimeError("Qwen4 QSA sparse GQA TQ kernel is unavailable")
+    return _ext.qwen4_qsa_sparse_gqa_attention_tq(
+        queries,
+        key_norms,
+        key_packed,
+        value_norms,
+        value_packed,
+        codebook_k,
+        codebook_v,
         selected_blocks,
         scale,
         q_offset,

@@ -1116,6 +1116,7 @@
   "modal.model_settings.turboquant_kv": "TurboQuant KV-кэш",
   "modal.model_settings.turboquant_kv_hint": "Сжимайте KV-кэш с помощью векторного квантования. Меньшее число бит = сильнее сжатие, большее = лучше качество. Поддерживает от 2 до 8 бит.",
   "modal.model_settings.turboquant_kv_bits_label": "Битов на канал",
+  "modal.model_settings.yarn_factor_label": "YaRN factor",
   "modal.model_settings.k2_ane": "Обработка запросов K2 на ANE",
   "modal.model_settings.k2_ane_hint": "Использует ANE для обработки запросов K2, включая MoVA. Декодирование остаётся на GPU. Используются закрытые интерфейсы Apple; результаты могут отличаться.",
   "modal.model_settings.k2_ane_shared": "Общий MLP на ANE",

@@ -1116,6 +1116,7 @@
   "modal.model_settings.turboquant_kv": "TurboQuant KV Cache",
   "modal.model_settings.turboquant_kv_hint": "Compress KV cache using vector quantization. Reduces memory ~60-75% with near-lossless quality for long context.",
   "modal.model_settings.turboquant_kv_bits_label": "Bits per channel",
+  "modal.model_settings.yarn_factor_label": "YaRN factor",
   "modal.model_settings.k2_ane": "K2 ANE 프롬프트 처리",
   "modal.model_settings.k2_ane_hint": "MoVA를 포함한 K2 프롬프트 처리에 ANE를 사용합니다. 디코딩은 GPU에서 실행됩니다. Apple 비공개 인터페이스를 사용하며 출력이 달라질 수 있습니다.",
   "modal.model_settings.k2_ane_shared": "ANE의 공유 MLP 비율",
