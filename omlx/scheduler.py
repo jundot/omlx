@@ -4160,10 +4160,11 @@ class Scheduler:
         predicted term, and the abort cap itself keeps a margin below the
         ceiling.
 
-        Never use this for chunk *sizing* — the throttle and the guard's
-        shrink arithmetic stay on ``_predicted_chunk_transient``; a flat
-        size-invariant bound would zero out their proportional response.
+        Chunk sizing uses ``_predicted_chunk_transient`` after the guard
+        verifies this floor can fit. Shrinking cannot reduce the observed
+        size-invariant bound.
         """
+
         bound = self._predicted_chunk_transient(
             n_tokens, kv_len, gathered_core=gathered_core
         )
@@ -4436,24 +4437,15 @@ class Scheduler:
                 limit_bytes=int(cap),
             )
 
-        # The floor fits — pick the largest chunk that still fits under the cap.
-        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
-        if qwen4_flat_overhead:
-            n_fit = Scheduler._largest_fitting_prefill_chunk(
-                self,
-                n_tokens,
-                min_chunk,
-                cap - current,
-                kv_len,
-                gathered_core=gathered_core,
-            )
-        else:
-            per_token = self._predicted_chunk_transient(
-                n_tokens, kv_len, gathered_core=gathered_core
-            ) / n_tokens
-            safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
-            # Never enlarge a short boundary or tail slice past its end.
-            n_fit = min(n_tokens, max(min_chunk, safe_n))
+        # The floor fits — size against the actual candidate prediction.
+        n_fit = Scheduler._largest_fitting_prefill_chunk(
+            self,
+            n_tokens,
+            min_chunk,
+            cap - current,
+            kv_len,
+            gathered_core=gathered_core,
+        )
         # Same quantization as the adaptive throttle: an off-grid size here
         # would reintroduce the near-miss buffers _snap_chunk_size exists to
         # avoid.
@@ -4481,12 +4473,30 @@ class Scheduler:
         *,
         gathered_core: bool,
     ) -> int:
-        """Binary-search Qwen4's nonlinear static-plus-flat prediction."""
-        low, high = 1, max(1, requested // min_chunk)
-        best = min_chunk
+        """Size against the candidate's prediction, including fixed costs.
+
+        Generic models also include size-independent reclaimed pool bytes.
+        Scaling a larger chunk's prediction proportionally discounts that
+        charge and can return a chunk whose predicted peak exceeds headroom.
+        The floor remains the caller's fallback when no candidate fits; the
+        pre-chunk guard must reject that case before submitting work.
+        """
+        if (
+            self._predicted_chunk_transient(
+                requested, kv_len, gathered_core=gathered_core
+            )
+            <= headroom
+        ):
+            # Reclaim may have made the original (possibly off-grid) slice
+            # fit. Do not shrink it or enlarge a tail to the configured floor.
+            return requested
+        step = max(1, self._prefill_min_chunk_tokens) if _chunk_snap_enabled() else 1
+        low = max(1, (min_chunk + step - 1) // step)
+        high = requested // step
+        best = min(requested, min_chunk)
         while low <= high:
             units = (low + high) // 2
-            candidate = min(requested, units * min_chunk)
+            candidate = units * step
             predicted = self._predicted_chunk_transient(
                 candidate, kv_len, gathered_core=gathered_core
             )
@@ -4583,7 +4593,6 @@ class Scheduler:
 
         current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
-        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
         # measurement so it tracks growth with kv_len instead of lagging behind
@@ -4640,17 +4649,14 @@ class Scheduler:
                 # cleanly instead of crawling at floor-size chunks.
                 return requested
             headroom = max(target - current, 0)
-            if qwen4_flat_overhead:
-                n_fit = Scheduler._largest_fitting_prefill_chunk(
-                    self,
-                    requested,
-                    min_chunk,
-                    headroom,
-                    kv_len,
-                    gathered_core=gathered_core,
-                )
-            else:
-                n_fit = int(headroom / per_token)
+            n_fit = Scheduler._largest_fitting_prefill_chunk(
+                self,
+                requested,
+                min_chunk,
+                headroom,
+                kv_len,
+                gathered_core=gathered_core,
+            )
 
         n = max(min_chunk, min(requested, n_fit))
 

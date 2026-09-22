@@ -816,6 +816,115 @@ def test_adaptive_throttle_charges_recently_reclaimed_footprint():
     assert _call(ns, 2048, kv_len=147_680) < 2048
 
 
+@pytest.mark.parametrize("gathered_core", [False, True])
+@pytest.mark.parametrize("path", ["adaptive", "guard", "adaptive_then_guard"])
+def test_generic_chunk_sizing_preserves_fixed_reclaim_charge(path, gathered_core):
+    """Shrinking token-scaled work must not discount released pool bytes."""
+    mib = 1024**2
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    current = cap - 1000 * mib
+    ns = _throttle_ctx(
+        current=current,
+        hard=hard,
+        monitor=_monitor(head_dim=128),
+        min_chunk=32,
+    )
+    ns._fake_current = current
+    ns._prefill_transient_tracker.record_reclaim(960 * mib)
+
+    chosen = 512
+    if path != "guard":
+        chosen = _call(ns, chosen, kv_len=90000, gathered_core=gathered_core)
+    if path != "adaptive":
+        chosen = _guard_call(ns, chosen, kv_len=90000, gathered_core=gathered_core)
+
+    # Use the unchanged production admission predictor for each legal width.
+    # The full requested width cannot fit; the floor and smaller widths can.
+    fitting = [
+        n
+        for n in range(32, 513, 32)
+        if ns._admission_transient_bound(n, 90000, gathered_core=gathered_core)
+        <= cap - current
+    ]
+    assert fitting and max(fitting) < 512
+    assert chosen == max(fitting)
+    assert (
+        current
+        + ns._admission_transient_bound(chosen, 90000, gathered_core=gathered_core)
+        <= cap
+    )
+
+
+@pytest.mark.parametrize("gathered_core", [False, True])
+def test_generic_reclaim_that_cannot_fit_still_aborts(gathered_core):
+    """Searching smaller chunks cannot evade a size-independent charge."""
+    mib = 1024**2
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    current = cap - 1000 * mib
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=_monitor(head_dim=128), min_chunk=32
+    )
+    ns._fake_current = current
+    ns._prefill_transient_tracker.record_reclaim(1001 * mib)
+
+    chosen = _call(ns, 512, kv_len=90000, gathered_core=gathered_core)
+    assert chosen == 32
+    with pytest.raises(PrefillMemoryExceededError):
+        _guard_call(ns, chosen, kv_len=90000, gathered_core=gathered_core)
+
+
+@pytest.mark.parametrize("path", ["adaptive", "guard"])
+@pytest.mark.parametrize("snap", ["0", "1"])
+@pytest.mark.parametrize("budget_tokens", [32, 63, 64, 511, 512, 513])
+def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
+    monkeypatch, path, snap, budget_tokens
+):
+    """A linear predictor keeps its previous sizes, including the opt-out."""
+    monkeypatch.setenv("OMLX_CHUNK_SNAP", snap)
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    # A 10-byte observation produces an exactly representable 13-byte
+    # prediction after safety, making cap equality independent of rounding.
+    current = cap - budget_tokens * 13
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=10, min_chunk=32)
+    ns._fake_current = current
+    call = _call if path == "adaptive" else _guard_call
+    chosen = call(ns, 512)
+
+    expected = min(512, budget_tokens)
+    if snap == "1":
+        expected = expected // 32 * 32
+    assert chosen == expected
+    assert current + ns._admission_transient_bound(chosen, 0) <= cap
+
+
+@pytest.mark.parametrize(
+    ("requested", "reclaim_mib"),
+    [(1, 100), (16, 100), (31, 100), (500, 2000), (513, 2000)],
+)
+def test_generic_guard_keeps_requested_width_after_reclaim(requested, reclaim_mib):
+    """Successful reclaim preserves a fitting tail or off-grid full slice."""
+    mib = 1024**2
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    ns = _throttle_ctx(
+        current=cap,
+        hard=hard,
+        samples_bpt=2 * mib,
+        min_chunk=32,
+        reclaim_to=cap - reclaim_mib * mib,
+    )
+    ns._fake_current = cap
+
+    chosen = _guard_call(ns, requested)
+
+    assert ns._fake_current == cap - reclaim_mib * mib
+    assert chosen == requested
+    assert ns._fake_current + ns._admission_transient_bound(chosen, 0) <= cap
+
+
 def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
     """A conservative raw-last sample may already cover pool reallocation."""
     raw_prediction = 11.83 * _GB
@@ -1504,6 +1613,81 @@ def test_qwen4_local_reclaim_updates_next_guard_prediction(route):
     assert ns._predicted_chunk_transient(
         512, 180_000, gathered_core=route
     ) == pytest.approx(before + charge)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_generic_prefill_loop_submits_chunks_with_fixed_reclaim_charge(
+    chunked, monkeypatch
+):
+    """Both loops submit only widths which fit the unchanged predictor."""
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+        )
+    )
+    sched_mod.mx.eval(model.parameters())
+    ns = Scheduler(
+        model,
+        SimpleNamespace(eos_token_id=2, encode=lambda s: [1]),
+        SchedulerConfig(prefill_step_size=512, paged_cache_block_size=0),
+    )
+    # Use full-size generic metadata and controlled readings while executing
+    # a tiny model, so this tests submission without approaching a real OOM.
+    ns.memory_monitor = _monitor(head_dim=128)
+    ns._memory_hard_limit_bytes = 20 * _GB
+    ns._memory_limit_bytes = int(20 * _GB * 0.85)
+    ns._memory_abort_limit_bytes = 20 * _GB
+    ns._prefill_min_chunk_tokens = 32
+    ns._prefill_speed_priority = False
+    ns._prefill_abort_margin = Scheduler._PREFILL_ABORT_MARGIN
+    ns._prefill_headroom_safety = Scheduler._PREFILL_HEADROOM_SAFETY
+    cap = ns._prefill_abort_cap()
+    current = cap - 1000 * 1024**2
+    ns._prefill_transient_tracker.record_reclaim(960 * 1024**2)
+    monkeypatch.setattr(sched_mod, "get_phys_footprint", lambda: current)
+    submitted = []
+
+    def forward(tokens, *args, **kwargs):
+        width = tokens.shape[1]
+        assert current + ns._admission_transient_bound(width, sum(submitted)) <= cap
+        submitted.append(width)
+        return model(tokens, *args, **kwargs)
+
+    ns.model = forward
+    prompt = [10] * 1025
+    req = Request(
+        request_id="reclaim-loop", prompt=prompt, sampling_params=SamplingParams()
+    )
+    req.prompt_token_ids = prompt
+    req.num_prompt_tokens = len(prompt)
+    cache = make_prompt_cache(model)
+    if chunked:
+        state = _PrefillState(
+            request=req,
+            cache=cache,
+            tokens_remaining=sched_mod.mx.array(prompt[:-1])[None],
+            last_token=prompt[-1:],
+            tokens_processed=0,
+            base_size=0,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=len(prompt),
+        )
+        while not ns._step_prefill_chunk(state):
+            pass
+    else:
+        ns._do_external_prefill(req, prompt, cache)
+
+    assert submitted == [192, 192, 192, 192, 192, 64]
+    assert all(layer.offset == len(prompt) - 1 for layer in cache)
 
 
 @pytest.mark.parametrize("chunked", [False, True])
