@@ -95,11 +95,11 @@ def _sparse_request_on(tokens: list[int], rid: str, scheduler):
 def _target_for(prompt_len: int) -> int:
     """What `note_canonical_recovery_candidate` will set `target_tokens` to.
 
-    Last whole block, plus the one token the prefill path holds back for the
-    generation kickoff — so the boundary below it can be published.
+    The last whole block, exactly. Only whole blocks are publishable, and the
+    recovery state prefills every token it is given, so there is nothing to
+    compensate for.
     """
-    boundary = (prompt_len // BLOCK) * BLOCK
-    return min(prompt_len, boundary + 1)
+    return (prompt_len // BLOCK) * BLOCK
 
 
 @contextmanager
@@ -230,9 +230,9 @@ class TestB2RapidTurnsCoalesce:
             assert job.target_tokens == _target_for(prompt_len)
             assert job.tokens == list(range(_target_for(prompt_len)))
 
-        # 38,000 tokens over 4,096-token blocks: nine whole blocks, plus the
-        # held-back token.
-        assert first.target_tokens == 9 * BLOCK + 1 == 36865
+        # 38,000 tokens over 4,096-token blocks: nine whole blocks, and the
+        # 1,616-token remainder is not publishable state.
+        assert first.target_tokens == 9 * BLOCK == 36864
 
     def test_the_committed_prefix_survives_every_extension(self):
         scheduler = _make_scheduler()
@@ -280,7 +280,7 @@ class TestB2RapidTurnsCoalesce:
         assert counts.extend_refusals == 0
         assert counts.superseded_jobs == 0
         assert counts.cancelled_jobs == 0
-        assert job.target_tokens == 9 * BLOCK + 1
+        assert job.target_tokens == 9 * BLOCK
         assert job.committed_tokens == 9 * BLOCK
 
     def test_a_longer_turn_after_the_no_op_still_extends_the_same_job(self):
@@ -300,7 +300,7 @@ class TestB2RapidTurnsCoalesce:
         assert scheduler._canonical_recovery_job is job
         assert counts.target_extensions == 1
         assert counts.jobs_created == 0
-        assert job.target_tokens == _target_for(43000) == 10 * BLOCK + 1
+        assert job.target_tokens == _target_for(43000) == 10 * BLOCK
 
 
 def _common_prefix(blocks: int = 8) -> list[int]:

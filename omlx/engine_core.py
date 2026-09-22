@@ -812,7 +812,9 @@ class EngineCore:
                     f"Abort of partial insert for {request_id} failed: {abort_exc}"
                 )
             with contextlib.suppress(Exception):
-                self.scheduler.note_admitted_request(request_id)
+                # Never admitted, so nothing else will ever retire the arrival
+                # marker this method published before the hand-off.
+                self.scheduler.note_request_departed(request_id)
             self._cleanup_request(request_id)
             raise
         self._wake_engine_loop()

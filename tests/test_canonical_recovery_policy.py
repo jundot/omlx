@@ -333,16 +333,20 @@ class TestPublication:
         assert job.publishable_boundary() == 0
 
 
-class TestHeldBackToken:
-    """The prefill keeps the last token back, and the target has to allow for it.
+class TestPublicationFloorsToABlock:
+    """Only whole blocks are publishable, and a token short costs the block.
 
-    ``_step_prefill_chunk`` stops one token short of the range it was given,
-    because that token is the generation kickoff. A job whose target is
-    exactly a block boundary therefore tops out at ``boundary - 1`` and
-    publishes the block below it. On a two-block session that is the
-    difference between recovering all of it and recovering half: the job
-    reached its target on every idle window, committed the same 4,096 of
-    8,192 each time, and re-read the same tokens for the rest of the session.
+    This is why the recovery state is built with ``hold_back_last=False``.
+    A foreground prefill stops one token short of the range it was given,
+    because that token is the generation kickoff; a job whose target is a
+    block boundary would then top out at ``boundary - 1`` and publish the
+    block below it. On a two-block session that is the difference between
+    recovering all of it and recovering half: the job reached its target on
+    every idle window, committed the same 4,096 of 8,192 each time, and
+    re-read the same tokens for the rest of the session.
+
+    ``tests/test_canonical_recovery_exact_block.py`` pins the fix at the seam
+    where the state is built. These two pin the arithmetic it turns on.
     """
 
     def _job(self, target, block=4096):
@@ -351,13 +355,13 @@ class TestHeldBackToken:
             block_size=block,
         )
 
-    def test_a_target_on_the_boundary_loses_the_block_below_it(self):
+    def test_a_token_short_of_the_boundary_loses_the_block(self):
         job = self._job(8192)
-        job.processed_tokens = 8191          # what the prefill actually reaches
+        job.processed_tokens = 8191
         assert job.publishable_boundary() == 4096
 
-    def test_a_target_one_past_the_boundary_publishes_it(self):
-        job = self._job(8193)
+    def test_reaching_the_boundary_publishes_it(self):
+        job = self._job(8192)
         job.processed_tokens = 8192
         assert job.publishable_boundary() == 8192
 
@@ -390,11 +394,13 @@ class TestSingleFlightGrowth:
 
 
 class TestTargetCompletion:
-    """The prefill path holds the last token back for the generation kickoff.
+    """``reached_target`` is set by the chunk loop, not inferred from a count.
 
-    A job whose completion is decided by ``processed_tokens >= target_tokens``
-    therefore never completes: it tops out one token short, stays "live", and
-    keeps the engine loop awake on an idle server forever.
+    A recovery state now consumes every token it is given, so
+    ``processed_tokens >= target_tokens`` does fire — but a job that stops
+    short for any other reason (a yield, a throttle, a chunk that failed)
+    must not be reported live forever, because a live job keeps the engine
+    loop awake on an idle server. The explicit flag is what covers that.
     """
 
     def _job(self):

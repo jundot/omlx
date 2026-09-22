@@ -387,22 +387,34 @@ class TestChunkYields:
     Dropping on the first throttle reading cost the recovery job a
     12,288-token prefix to a transient memory sample. Retrying forever is the
     opposite failure: nothing the recovery job does satisfies the throttle, so
-    the job stays live, `has_requests()` stays true, and an idle engine spins
-    holding the job's whole prefill state resident.
+    the job stays live, `has_requests()` stays true, and an idle engine spins.
+
+    What a pause keeps is the job: its committed prefix, its published blocks
+    and its lineage. What it no longer keeps is the live prefill state. That
+    state is a materialised KV cache, and both of these pauses are pauses of
+    unknown length -- the throttle one especially, since it is raised because
+    the runtime is short of the very memory the state is holding. So the state
+    goes back on the yield and the next slice rebuilds it from what was
+    published; see `tests/test_canonical_recovery_state_retirement.py`.
     """
 
     def _drive_to_the_limit(self, scheduler, job, state, error_factory):
         for turn in range(1, MAX_CONSECUTIVE_YIELDS + 1):
+            # Each turn starts where a real slice would: with a state, freshly
+            # rebuilt from the published prefix after the previous yield gave
+            # the last one back.
+            job.prefill_state = state
             with patch.object(
                 scheduler, "_step_prefill_chunk", side_effect=error_factory()
             ):
                 # (a) every one of them returns rather than raising.
                 assert scheduler._canonical_recovery_step() is False
+            # (f) the pause does not hold the dense state across itself.
+            assert job.prefill_state is None
             if turn < MAX_CONSECUTIVE_YIELDS:
                 # (b) intact, mid-pause.
                 assert scheduler._canonical_recovery_job is job
                 assert job.consecutive_yields == turn
-                assert job.prefill_state is state
                 # (e) a job that is only pausing is still work.
                 assert scheduler.has_requests() is True
 
@@ -416,7 +428,10 @@ class TestChunkYields:
 
         with _cleanup_spy(scheduler) as spy:
             self._drive_to_the_limit(scheduler, job, state, _eviction_needed)
-            # (d) the give-up drops through the ordinary drop path.
+            # (d) the give-up drops through the ordinary drop path. The yields
+            # before it already released the same footprint for the state they
+            # were retiring, so this asserts the calls happened, not that the
+            # drop is the only thing that could have made them.
             _assert_cleanup_fired(spy)
 
         # (b) dropped, after exactly MAX_CONSECUTIVE_YIELDS.
@@ -453,23 +468,29 @@ class TestChunkYields:
 
     def test_a_single_yield_does_not_drop_or_publish(self):
         """The one-shot case, stated on its own so the limit test is not the
-        only evidence that a yield is survivable."""
+        only evidence that a yield is survivable.
+
+        The state is given back and the job is not. Those are different
+        things, and the difference is the whole contract: `cancelled` stays
+        false, the job stays installed, the committed prefix stays committed,
+        and the loop stays awake to run the next slice.
+        """
         scheduler = _make_scheduler()
         job = _queued(scheduler)
         job.note_published(512)
         state = _live_state(job, processed=100)
         job.prefill_state = state
 
-        with _cleanup_spy(scheduler) as spy:
-            with patch.object(
-                scheduler, "_step_prefill_chunk", side_effect=_eviction_needed()
-            ):
-                assert scheduler._canonical_recovery_step() is False
-            _assert_cleanup_not_fired(spy)
+        with _cleanup_spy(scheduler), patch.object(
+            scheduler, "_step_prefill_chunk", side_effect=_eviction_needed()
+        ):
+            assert scheduler._canonical_recovery_step() is False
 
         assert scheduler._canonical_recovery_job is job
-        assert job.prefill_state is state
+        assert not job.cancelled
+        assert job.prefill_state is None
         assert job.committed_tokens == 512
+        assert job.published_boundaries == [512]
         assert scheduler.has_requests() is True
 
 

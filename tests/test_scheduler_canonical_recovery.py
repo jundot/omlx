@@ -78,10 +78,10 @@ class TestCandidateAdmission:
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         assert scheduler._canonical_recovery_job is not None
-        # 1000 tokens, 256-token blocks: only whole blocks are publishable,
-        # and the target carries one token past the last boundary so the
-        # prefill's held-back final token does not cost the job that block.
-        assert scheduler._canonical_recovery_job.target_tokens == 769
+        # 1000 tokens, 256-token blocks: only whole blocks are publishable, so
+        # the target is the last whole block and the 232-token remainder is
+        # left to the next turn.
+        assert scheduler._canonical_recovery_job.target_tokens == 768
 
     def test_a_dense_request_queues_nothing(self):
         """A dense request already stored its own checkpoint. There is no debt."""
@@ -115,7 +115,7 @@ class TestCandidateAdmission:
         first.committed_tokens = 512
         scheduler.note_canonical_recovery_candidate(_sparse_request(2000, rid="r2", scheduler=scheduler))
         assert scheduler._canonical_recovery_job is first
-        assert scheduler._canonical_recovery_job.target_tokens == 1793
+        assert scheduler._canonical_recovery_job.target_tokens == 1792
         assert scheduler._canonical_recovery_job.committed_tokens == 512
 
     def test_a_rewritten_prefix_replaces_the_job(self):
@@ -141,7 +141,12 @@ class TestSafetyReviewConditions:
         assert not scheduler._canonical_recovery_runnable()
 
     def test_an_inbound_request_makes_the_canonical_recovery_unrunnable(self):
-        """Arrival visibility: a request exists before its admission runs."""
+        """Arrival visibility: a request exists before its admission runs.
+
+        Admission does not withdraw it. The marker is retired when the request
+        departs, because between admission and the first prefill chunk's
+        forward it is the only signal a *peer* engine has.
+        """
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         scheduler._consecutive_idle_steps = 5
@@ -149,17 +154,19 @@ class TestSafetyReviewConditions:
         scheduler.note_inbound_request("incoming")
         assert not scheduler._canonical_recovery_runnable()
         scheduler.note_admitted_request("incoming")
+        assert not scheduler._canonical_recovery_runnable()
+        scheduler.note_request_departed("incoming")
         assert scheduler._canonical_recovery_runnable()
 
     def test_a_stale_inbound_marker_expires(self):
-        """Liveness: an inbound request that is never admitted must not block
-        the recovery job for the life of the process."""
+        """Liveness: an arrival that never departs must not block the recovery
+        job for the life of the process."""
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
         scheduler._consecutive_idle_steps = 5
         scheduler.note_inbound_request("lost")
         assert not scheduler._canonical_recovery_runnable()
-        scheduler._canonical_recovery_inbound["lost"] -= scheduler._canonical_recovery_inbound_ttl_s + 1
+        scheduler._canonical_recovery_inbound_ttl_s = 0.0
         assert scheduler._canonical_recovery_runnable()
         assert scheduler._canonical_recovery_inbound_count() == 0
 
@@ -522,7 +529,7 @@ class TestJobSurvivesATurnWithNothingNew:
         job = scheduler._canonical_recovery_job
         scheduler.note_canonical_recovery_candidate(_sparse_request(1400, scheduler=scheduler))
         assert scheduler._canonical_recovery_job is job
-        assert scheduler._canonical_recovery_job.target_tokens == 1281
+        assert scheduler._canonical_recovery_job.target_tokens == 1280
 
     def test_a_rewritten_history_still_replaces_the_job(self):
         """The no-op path must not swallow a prompt that is not an append."""

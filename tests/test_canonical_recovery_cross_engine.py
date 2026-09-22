@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from omlx.decode_activity import get_decode_activity
+from omlx.foreground_arrivals import get_foreground_arrivals
 from omlx.prefill_progress import PrefillProgressTracker, get_prefill_tracker
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -70,9 +71,11 @@ def _clean_registries():
     entry behind would decide the next one."""
     get_decode_activity().clear()
     get_prefill_tracker()._progress.clear()
+    get_foreground_arrivals().clear()
     yield
     get_decode_activity().clear()
     get_prefill_tracker()._progress.clear()
+    get_foreground_arrivals().clear()
 
 
 def _idle(scheduler: Scheduler) -> None:
@@ -163,6 +166,118 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
 
         get_prefill_tracker().remove("other-request")
         assert scheduler.has_requests()
+
+
+class TestAnotherEnginesArrivalWithdrawsTheChunk:
+    """The half neither progress registry covers.
+
+    Both of the registries above are progress signals: an entry exists once
+    work is running. Between the transport accepting a request and that
+    request's first forward, every progress signal in the process reads idle —
+    and that is precisely the window in which recovery decides to start
+    something it cannot interrupt.
+
+    The two sub-windows are separate, and a fix for one does not close the
+    other. Before admission nothing anywhere knows the request exists. After
+    admission the *admitting* engine's own ``waiting``/``running`` lists know,
+    and no peer does, because the prefill tracker is written after the first
+    chunk's forward rather than before it.
+    """
+
+    def test_an_arrival_at_a_peer_that_is_not_yet_admitted_withdraws_the_chunk(self):
+        """Window one: accepted by the transport, not yet handed to an engine."""
+        engine_a = _make_scheduler()
+        engine_b = _make_scheduler()
+        engine_a.note_canonical_recovery_candidate(
+            _sparse_request(1000, scheduler=engine_a)
+        )
+        _idle(engine_a)
+        assert engine_a._canonical_recovery_runnable()
+
+        # The request reaches engine B. B has not admitted it, so B's own
+        # lists are empty too — nothing in this process is running yet.
+        engine_b.note_inbound_request("fg-on-b")
+        assert not engine_b._canonical_recovery_local_requests()
+        assert not engine_a._canonical_recovery_runnable()
+
+    def test_an_arrival_admitted_at_a_peer_still_withdraws_the_chunk(self):
+        """Window two: admitted at B, first prefill chunk not yet forwarded.
+
+        B knows through its own lists. A has nothing to read: the tracker
+        entry does not exist until the chunk has already run, which is one
+        chunk too late for a slice A cannot interrupt.
+        """
+        engine_a = _make_scheduler()
+        engine_b = _make_scheduler()
+        engine_a.note_canonical_recovery_candidate(
+            _sparse_request(1000, scheduler=engine_a)
+        )
+        _idle(engine_a)
+
+        engine_b.note_inbound_request("fg-on-b")
+        engine_b.note_admitted_request("fg-on-b")
+        assert get_prefill_tracker().any_active() is False
+        assert not engine_a._canonical_recovery_runnable()
+
+    def test_the_chunk_returns_once_the_peers_request_departs(self):
+        engine_a = _make_scheduler()
+        engine_b = _make_scheduler()
+        engine_a.note_canonical_recovery_candidate(
+            _sparse_request(1000, scheduler=engine_a)
+        )
+        _idle(engine_a)
+
+        engine_b.note_inbound_request("fg-on-b")
+        engine_b.note_admitted_request("fg-on-b")
+        assert not engine_a._canonical_recovery_runnable()
+
+        engine_b.note_request_departed("fg-on-b")
+        assert engine_a._canonical_recovery_runnable()
+
+    def test_a_recovery_job_is_not_an_arrival(self):
+        """Recovery must not stand down for recovery through this signal.
+
+        The synthetic request is built inside the scheduler and never passes
+        through the transport, so it never reaches the registry at all —
+        by construction rather than by an exclusion rule that could drift.
+        """
+        engine_a = _make_scheduler()
+        engine_b = _make_scheduler()
+        for engine in (engine_a, engine_b):
+            engine.note_canonical_recovery_candidate(
+                _sparse_request(1000, scheduler=engine)
+            )
+            _idle(engine)
+
+        engine_b._canonical_recovery_begin_state = MagicMock(return_value=None)
+        assert get_foreground_arrivals().count() == 0
+        assert engine_a._canonical_recovery_runnable()
+
+    def test_recovery_still_excludes_recovery_through_the_claim(self):
+        """Mutual exclusion between jobs is the budget's claim, and the
+        arrival signal must not be doing that work by accident."""
+        engine_a = _make_scheduler()
+        engine_b = _make_scheduler()
+        # One budget object for the process, as `EnginePool` arranges.
+        engine_b._canonical_recovery_budget = engine_a._canonical_recovery_budget
+        for engine in (engine_a, engine_b):
+            engine.note_canonical_recovery_candidate(
+                _sparse_request(1000, scheduler=engine)
+            )
+            _idle(engine)
+        assert engine_a._canonical_recovery_runnable()
+
+        assert engine_b._canonical_recovery_budget.try_claim(
+            engine_b._canonical_recovery_owner_key
+        )
+        try:
+            assert engine_a._canonical_recovery_claim_blocked()
+            assert not engine_a._canonical_recovery_runnable()
+        finally:
+            engine_b._canonical_recovery_budget.release_claim(
+                engine_b._canonical_recovery_owner_key
+            )
+        assert engine_a._canonical_recovery_runnable()
 
 
 class TestAnyActive:

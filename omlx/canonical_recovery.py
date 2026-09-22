@@ -291,6 +291,11 @@ class CanonicalRecoveryCounters:
     chunks: int = 0
     yielded_steps: int = 0
     service_s: float = 0.0
+    # Times a live dense state was given back while its job stayed alive.
+    # Separate from `yielded_steps`, which counts slices not taken: a job can
+    # yield many times holding the same state, and the memory question is
+    # about the state, not about the slices.
+    states_retired: int = 0
 
 
 @dataclass
@@ -362,6 +367,31 @@ class CanonicalRecoveryJob:
         if boundary > self.committed_tokens:
             self.committed_tokens = boundary
             self.published_boundaries.append(boundary)
+
+    def note_ground_lost(self, restorable: int) -> None:
+        """Lower the watermark to what the serving cache can still produce.
+
+        ``committed_tokens`` otherwise only rises, and it is a claim about the
+        cache rather than a record of this job's own work: blocks backing an
+        already-published prefix can be evicted, and under `hot_cache_only` an
+        evicted block is dropped rather than demoted, so the ground a boundary
+        was verified against can disappear afterwards.
+
+        A claim the cache can no longer honour is worse than no claim.
+        ``publishable_boundary`` refuses anything at or below the watermark, so
+        a stale-high one makes the job decline to republish exactly the range
+        that went missing. Walking it back lets the job re-read and republish
+        that range instead. The serving cache stays authoritative; this is the
+        job accepting its answer.
+        """
+        restorable = max(0, restorable)
+        if restorable >= self.committed_tokens:
+            return
+        self.committed_tokens = restorable
+        self.published_boundaries = [
+            boundary for boundary in self.published_boundaries
+            if boundary <= restorable
+        ]
 
     @property
     def done(self) -> bool:

@@ -306,7 +306,11 @@ class TestForegroundPriorityIsEngineGlobal:
         assert scheduler._canonical_recovery_runnable()
         scheduler.note_inbound_request("inbound-1")
         assert not scheduler._canonical_recovery_runnable()
+        # Admission is not the withdrawal: a peer engine cannot see this
+        # request's prefill until its first chunk has already run.
         scheduler.note_admitted_request("inbound-1")
+        assert not scheduler._canonical_recovery_runnable()
+        scheduler.note_request_departed("inbound-1")
         assert scheduler._canonical_recovery_runnable()
 
     def test_foreground_work_resets_the_idle_run(self):
