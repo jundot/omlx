@@ -2490,6 +2490,30 @@ class TestEffectiveMaxSize:
         assert effective == 50 * 1024**3
         assert "Failed to check disk usage" in caplog.text
 
+    def test_hot_cache_only_missing_dir_no_warning(
+        self, tmp_path: Path, caplog
+    ):
+        """Hot-cache-only mode skips directory init, so the SSD dir legitimately
+        does not exist; disk-usage polling must not warn or even query it
+        (regression: repeated "Failed to check disk usage" warnings for the
+        deepseek_v41_ced_v1 subdirectory under hot_cache_only)."""
+        missing_dir = tmp_path / "deepseek_v41_ced_v1"
+        manager = PagedSSDCacheManager(
+            cache_dir=missing_dir,
+            max_size_bytes=200 * 1024**3,
+            hot_cache_max_bytes=1024**2,
+            hot_cache_only=True,
+        )
+        assert not missing_dir.exists()
+        with (
+            patch("shutil.disk_usage") as disk_usage,
+            caplog.at_level(logging.WARNING),
+        ):
+            effective = manager._get_effective_max_size()
+        disk_usage.assert_not_called()
+        assert effective == 200 * 1024**3
+        assert "Failed to check disk usage" not in caplog.text
+
     def test_disk_pressure_warning(self, tmp_path: Path, caplog):
         """Warn when effective max drops below 10% of configured max."""
         manager = PagedSSDCacheManager(

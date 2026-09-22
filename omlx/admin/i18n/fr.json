@@ -1165,6 +1165,8 @@
   "modal.model_settings.moe_expert_offload_hint": "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",
   "modal.model_settings.moe_expert_offload_speculative_hint": "Cannot be combined with Lightning MTP, VLM MTP, or DFlash.",
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
+  "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
+  "modal.model_settings.moe_expert_offload_resident_range_error": "Enter a number from 5 to 95.",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",
   "modal.model_settings.mtp_conflict": "Disable DFlash and TurboQuant KV first — they patch the same path MTP relies on.",
@@ -1308,10 +1310,6 @@
   "modal.model_settings.model_type_audio_tts": "Audio TTS",
   "modal.model_settings.model_type_embedding": "Embedding",
   "modal.model_settings.model_type_reranker": "Reranker",
-  "modal.model_settings.moe_expert_offload_resident_12_5": "12.5% resident",
-  "modal.model_settings.moe_expert_offload_resident_25": "25% resident",
-  "modal.model_settings.moe_expert_offload_resident_50": "50% resident",
-  "modal.model_settings.moe_expert_offload_resident_75": "75% resident",
   "modal.model_settings.profiles.no_presets": "No presets available",
   "modal.model_settings.reasoning_parser_none": "None",
   "modal.model_settings.specprefill_draft_model_hint": "Small model sharing tokenizer with target (e.g. Qwen3.5-0.8B for 35B)",
@@ -1975,5 +1973,12 @@
   "usage.delayed": "L'historique peut être incomplet : le stockage est retardé ou le tampon en attente a débordé.",
   "usage.loading": "Chargement de l'utilisation…",
   "usage.disabled": "L'historique d'utilisation est désactivé. Activez-le dans Paramètres → Historique d'utilisation.",
-  "usage.open_settings": "Ouvrir les paramètres"
+  "usage.open_settings": "Ouvrir les paramètres",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Annuler"
 }

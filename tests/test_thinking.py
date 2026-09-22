@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for thinking/reasoning content parser."""
 
+import pytest
+
 from omlx.api.thinking import ThinkingParser, extract_thinking
 
 
@@ -427,3 +429,26 @@ class TestCleanOutputTextBackwardCompat:
         from omlx.api.utils import clean_output_text
         result = clean_output_text("<|im_end|>Hello<|endoftext|>")
         assert result == "Hello"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("<think>unfinished", ("unfinished", "")),
+        ("<think>unfinished</thi", ("unfinished</thi", "")),
+        ("<think>done</think>answer", ("done", "answer")),
+        ("<think>first</think>answer<think>second", ("first\nsecond", "answer")),
+        ("plain answer", ("", "plain answer")),
+    ],
+)
+def test_extract_truncated_thinking_preserves_channels(text, expected):
+    assert extract_thinking(text, truncated=True) == expected
+
+
+@pytest.mark.parametrize("prompt_opened", [False, True])
+def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
+    parser = ThinkingParser(start_in_thinking=prompt_opened)
+    prefix = "" if prompt_opened else "<think>"
+    assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
+    assert parser.finish(truncated=True) == ("</thi", "")
+    assert parser.finish(truncated=True) == ("", "")

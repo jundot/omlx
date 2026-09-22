@@ -442,7 +442,7 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     html = _model_settings_template()
     section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
     assert "modelSettings.moe_expert_offload_enabled" in section
-    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert "modelSettings.moe_expert_offload_resident_percent" in section
     assert ":disabled" in section
     for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
         assert f"modelSettings.{key}" in section

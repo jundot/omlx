@@ -42,6 +42,12 @@ def uses_native_reasoning_content(
         return True
     if engine_model_type in _NATIVE_REASONING_MODEL_TYPES:
         return True
+    # The DeepSeek V4 family DSML encoders render history reasoning_content
+    # into <think> blocks themselves; inlining it into content would render
+    # a second, empty <think></think> ahead of it.
+    for model_type in (config_model_type, engine_model_type):
+        if model_type and model_type.startswith("deepseek_v4"):
+            return True
 
     lowered = (model_name or "").lower()
     return "minimax" in lowered and "m3" in lowered

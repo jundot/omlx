@@ -14,6 +14,8 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+import weakref
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -634,6 +636,38 @@ class TestEngineCoreGetStats:
 
 class TestEngineCoreClose:
     """Tests for EngineCore.close()."""
+
+    def test_close_releases_vlm_drafter_target_with_retained_scheduler(
+        self, mock_model, mock_tokenizer
+    ):
+        from omlx.speculative.vlm_mtp import VLMMTPDrafter
+
+        class Target:
+            def project(self, hidden):
+                return hidden
+
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler = engine.scheduler
+        target = Target()
+        target_ref = weakref.ref(target)
+        drafter = VLMMTPDrafter(
+            SimpleNamespace(_greedy_argmax_fn=target.project), "mtp", "/draft"
+        )
+        drafter_ref = weakref.ref(drafter)
+        scheduler.set_vlm_mtp_drafter(drafter)
+        del target, drafter
+
+        try:
+            scheduler.reset()
+            assert target_ref() is not None
+            assert drafter_ref() is not None
+            engine.close()
+            assert engine.scheduler is None
+            assert target_ref() is None
+            assert drafter_ref() is None
+        finally:
+            scheduler.set_vlm_mtp_drafter(None)
+            engine.close()
 
     def test_close_releases_model(self, mock_model, mock_tokenizer):
         """Test close() releases model ownership."""

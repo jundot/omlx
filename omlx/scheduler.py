@@ -2014,6 +2014,7 @@ class Scheduler:
         )
         self._decode_time_owed_s: float = 0.0
         self._prefill_hold_until: float = 0.0
+        self._admit_prefill_next: bool = False
         # Measured throughputs feeding the adaptive fairness constants.
         # Best-observed prefill tok/s sizes the contended chunk (stall-time
         # target): contended chunks only measure SLOWER, so a running max
@@ -2808,7 +2809,11 @@ class Scheduler:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            is_qwen35 = model_type.startswith("qwen3_5")
+            # Ternary Bonsai 2 packs run the Qwen3.5 GDN stack under their own type.
+            is_qwen35 = (
+                model_type.startswith("qwen3_5")
+                or model_type == "prism_hadamard_qwen35"
+            )
             is_qwen4 = model_type.startswith("qwen4_exp")
             if is_qwen4:
                 from .custom_kernels.glm_moe_dsa import fast
@@ -5893,10 +5898,8 @@ class Scheduler:
     ) -> None:
         """Advance in-flight prefills until decode fairness requires a yield.
 
-        Called at the start of each step() before _schedule_waiting(). Each
-        request advances by at most one chunk. Deferred requests precede
-        already-advanced requests in the next round. Completed prefills are
-        inserted into BatchGenerator and moved to self.running.
+        Each request advances by at most one chunk per call. Deferred requests precede already-advanced requests in the next round.
+        Completed prefills are inserted into BatchGenerator and moved to self.running.
 
         Args:
             scheduled: The step's running list of newly-scheduled requests;
@@ -12720,21 +12723,28 @@ class Scheduler:
             self._check_memory_pressure()
 
         try:
-            # Advance in-flight chunked prefills (one chunk per request).
-            # Must run before _schedule_waiting() so that completing prefills
-            # are inserted into BatchGenerator before the decode step.
+            # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.
+            admit_first = False
+            prefill_gate_open = self._prefill_gate_open() if self.prefilling else True
+            if (
+                self._decode_fairness
+                and self.prefilling
+                and self.waiting
+                and self._decode_contention()
+                and prefill_gate_open
+            ):
+                admit_first = self._admit_prefill_next
+                self._admit_prefill_next = not admit_first
+            if admit_first:
+                scheduled, rejected = self._schedule_waiting()
+
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
-            prefill_gate_open = True
-            if self.prefilling:
-                prefill_gate_open = self._prefill_gate_open()
-                if prefill_gate_open:
-                    self._advance_chunked_prefills(
-                        chunked_scheduled, chunked_rejected
-                    )
+            if self.prefilling and prefill_gate_open:
+                self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
 
-            # Schedule waiting requests
-            scheduled, rejected = self._schedule_waiting()
+            if not admit_first:
+                scheduled, rejected = self._schedule_waiting()
             # Merge chunked-prefill completions into the scheduled list.
             if chunked_scheduled:
                 scheduled = chunked_scheduled + scheduled
@@ -13024,6 +13034,7 @@ class Scheduler:
             get_decode_activity().remove(self._decode_activity_key)
         self._decode_time_owed_s = 0.0
         self._prefill_hold_until = 0.0
+        self._admit_prefill_next = False
         # A store_cache worker may still be loading request-local boundary
         # snapshots or publishing blocks. reset() clears both namespaces, so
         # use the same bounded teardown barrier as shutdown() before aborting
@@ -13140,6 +13151,8 @@ class Scheduler:
         self.block_aware_cache = None
         self.memory_monitor = None
         self._boundary_snapshot_store = None
+        # The drafter can retain the target through bound projection methods.
+        self._vlm_mtp_drafter = None
 
         # Force garbage collection of any lingering cache objects
         import gc

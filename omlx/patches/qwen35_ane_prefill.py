@@ -36,6 +36,9 @@ _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionar
 # all slices into one multi-procedure program per ANE instance and bypass this
 # fallback-only budget.
 _ANE_RESIDENT_PROGRAM_LIMIT = 120
+# Shared shape limits for compilation validation and scheduler guidance.
+_ANE_MIN_SEQUENCE_LENGTH = 1024
+_ANE_SEQUENCE_LENGTH_ALIGNMENT = 64
 # First retry cap for split procedure banks after a monolithic bank fails to
 # load. Program-create maps a bank's whole weight blob into the owning ANE's
 # ~4 GiB device address window, so single-die chips reject two monolithic
@@ -320,9 +323,13 @@ def configure_qwen35_ane_prefill_scheduler(
     sequence_length: int,
 ) -> bool:
     """Keep normal wide prompt chunks; projection backends tile internally."""
-    if sequence_length < 1024 or sequence_length % 64:
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
         raise ValueError(
-            "ANE prefill sequence_length must be a multiple of 64 >= 1024"
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
         )
     config = getattr(scheduler, "config", None)
     if config is None:
@@ -337,15 +344,36 @@ def configure_qwen35_ane_prefill_scheduler(
         # configured step or the qwen35 floor.
         delivered_cap = min(delivered_cap, block_size) if delivered_cap else block_size
     if delivered_cap and sequence_length > delivered_cap:
-        logger.warning(
-            "Qwen ANE prefill sequence_length=%d exceeds the delivered prefill "
-            "chunk width (~%d tokens). Chunks narrower than the compiled shape "
-            "cannot tile onto it, so the ANE will compile but never execute. "
-            "Set sequence_length=%d or smaller.",
-            sequence_length,
-            delivered_cap,
-            delivered_cap,
-        )
+        # Round down so the recommended shape passes alignment validation.
+        usable = (
+            delivered_cap // _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        ) * _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        if usable < _ANE_MIN_SEQUENCE_LENGTH:
+            usable = 0
+        if usable:
+            logger.warning(
+                "Qwen ANE prefill sequence_length=%d exceeds the delivered "
+                "prefill chunk width (~%d tokens). Chunks narrower than the "
+                "compiled shape require eligible tail padding to execute on "
+                "ANE. Set sequence_length=%d or a smaller valid shape to "
+                "use unpadded tiles.",
+                sequence_length,
+                delivered_cap,
+                usable,
+            )
+        else:
+            logger.warning(
+                "Qwen ANE prefill chunk width (~%d tokens) is below the "
+                "minimum ANE sequence length (%d). These chunks require "
+                "eligible tail padding to execute on ANE; changing "
+                "sequence_length alone cannot provide an unpadded tile. "
+                "For unpadded tiles, raise the effective prefill chunk width "
+                "to at least %d (capped by the paged cache block size with "
+                "block-aware caching).",
+                delivered_cap,
+                _ANE_MIN_SEQUENCE_LENGTH,
+                _ANE_MIN_SEQUENCE_LENGTH,
+            )
     logger.info(
         "Qwen ANE prefill preserving scheduler chunks; projection tile=%d "
         "(step=%d, floor=%d)",
@@ -3096,8 +3124,14 @@ def enable_qwen35_ane_prefill(
     Returns the number of marked dense Qwen MLP modules. A return value of zero
     is a safe no-op for other model families and unsupported runtimes.
     """
-    if sequence_length < 1024 or sequence_length % 64:
-        raise ValueError("ANE prefill sequence_length must be a multiple of 64 >= 1024")
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
+        raise ValueError(
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
+        )
     if not 0.05 <= fraction <= 0.90:
         raise ValueError("ANE prefill fraction must be between 0.05 and 0.90")
     if max_layers < 1:

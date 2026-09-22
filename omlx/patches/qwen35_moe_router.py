@@ -23,6 +23,7 @@ the composed chain, whose cost amortizes over the chunk.
 from __future__ import annotations
 
 import logging
+from functools import wraps
 
 import mlx.core as mx
 
@@ -142,6 +143,33 @@ def router_eligible(x, num_experts: int) -> bool:
     )
 
 
+def _ensure_vlm_verify_patch() -> None:
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
+    original = Qwen3_5BatchInvariantForward._feed_forward
+    if getattr(original, "_omlx_router_fused", False):
+        return
+
+    @wraps(original)
+    def verify(self, feed_forward, x):
+        if not (
+            isinstance(feed_forward, Qwen3_5MoeSparseMoeBlock)
+            and x.ndim == 3
+            and router_eligible(x, feed_forward.num_experts)
+        ):
+            return original(self, feed_forward, x)
+        gates = mx.softmax(self._linear(feed_forward.gate, x), axis=-1, precise=True)
+        indices, scores = fused_router_topk(gates, feed_forward.top_k)
+        shared = self._feed_forward(feed_forward.shared_expert, x)
+        shared = mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x)) * shared
+        routed = self._switch_glu(feed_forward.switch_mlp, x, indices)
+        return (routed * scores[..., None]).sum(axis=-2) + shared
+
+    verify._omlx_router_fused = True
+    Qwen3_5BatchInvariantForward._feed_forward = verify
+
+
 def apply_qwen35_moe_router_patch() -> bool:
     """Route short-row MoE gating through the fused top-k launch.
 
@@ -152,6 +180,7 @@ def apply_qwen35_moe_router_patch() -> bool:
     global _ENGAGED_LOGGED
     if not mx.metal.is_available():
         return False
+    _ensure_vlm_verify_patch()
     try:
         from mlx_lm.models import qwen3_next as q3n
     except ImportError:

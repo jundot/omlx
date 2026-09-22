@@ -4366,7 +4366,9 @@ async def create_chat_completion(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -5498,7 +5500,9 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5583,7 +5587,10 @@ async def stream_chat_completion(
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -6097,7 +6104,9 @@ async def stream_anthropic_messages(
         await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta, content_delta = thinking_parser.finish(
+        truncated=last_output is not None and last_output.finish_reason == "length"
+    )
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -6178,7 +6187,10 @@ async def stream_anthropic_messages(
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -6686,7 +6698,9 @@ async def create_anthropic_message(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -7239,7 +7253,9 @@ async def create_response(
 
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
 
             # Parse tool calls
             if output.tool_calls:
@@ -7717,7 +7733,9 @@ async def stream_responses_api(
 
     # Flush remaining content from parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -7777,7 +7795,10 @@ async def stream_responses_api(
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -7812,7 +7833,10 @@ async def stream_responses_api(
             )
     else:
         # No tools — use raw accumulated text minus thinking.
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     recovered_thinking = (

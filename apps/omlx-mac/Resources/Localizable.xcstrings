@@ -1,6 +1,70 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "settings.button.reset_defaults" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset Defaults"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값으로 초기화"
+          }
+        }
+      }
+    },
+    "settings.reset_defaults.help" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Restore default values. Paths and API keys are kept. Click Apply to save."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값을 불러옵니다. 경로와 API 키는 유지됩니다. Apply를 눌러 저장하세요."
+          }
+        }
+      }
+    },
+    "settings.reset_defaults.title" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings Reset"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 초기화"
+          }
+        }
+      }
+    },
+    "settings.reset_defaults.message" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings have been reset to defaults. Click Apply to save the changes."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정값을 초기화했습니다. Apply를 눌러야 저장됩니다."
+          }
+        }
+      }
+    },
     "app.command.close_window" : {
       "comment" : "App menu command that hides all windows and drops the Dock icon",
       "extractionState" : "manual",

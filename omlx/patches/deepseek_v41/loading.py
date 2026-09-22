@@ -77,7 +77,7 @@ def load(
     if source_checkpoint:
         if raw.get("model_type") != "deepseek_v41":
             raise ValueError("Expected a DeepSeek V4.1 checkpoint")
-        format_spec = {"engram_tables": source_engram_tables(mapping)}
+        format_spec = {"engram_tables": source_engram_tables(mapping, raw)}
     config = ModelConfig.from_dict(raw)
     if source_checkpoint and preserve_mtp is None:
         from ..mlx_lm_mtp import is_mtp_active

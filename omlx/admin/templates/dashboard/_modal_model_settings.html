@@ -1184,13 +1184,19 @@
                                         </div>
                                         <div x-show="modelSettings.moe_expert_offload_enabled" x-transition class="pt-1">
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.moe_expert_offload_fraction_label') }}</label>
-                                            <select x-model.number="modelSettings.moe_expert_offload_resident_fraction"
-                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="0.125">{{ t('modal.model_settings.moe_expert_offload_resident_12_5') }}</option>
-                                                <option value="0.25">{{ t('modal.model_settings.moe_expert_offload_resident_25') }}</option>
-                                                <option value="0.5">{{ t('modal.model_settings.moe_expert_offload_resident_50') }}</option>
-                                                <option value="0.75">{{ t('modal.model_settings.moe_expert_offload_resident_75') }}</option>
-                                            </select>
+                                            <div class="flex items-center gap-2">
+                                                <input type="number" min="5" max="95" step="any" inputmode="decimal"
+                                                       aria-label="{{ t('modal.model_settings.moe_expert_offload_fraction_label') }}"
+                                                       :aria-invalid="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched"
+                                                       x-model.number="modelSettings.moe_expert_offload_resident_percent"
+                                                       @input="onMoeExpertOffloadResidentPercent()"
+                                                       @blur="onMoeExpertOffloadResidentBlur()"
+                                                       :class="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched ? 'border-red-200 focus:ring-red-500' : 'border-neutral-200 focus:ring-neutral-900'"
+                                                       class="w-24 px-4 py-2.5 border rounded-xl text-sm focus:ring-2 focus:border-transparent transition-all bg-white">
+                                                <span class="text-sm font-medium text-neutral-500">%</span>
+                                                <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_resident_range') }}</span>
+                                            </div>
+                                            <p x-show="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched" x-cloak class="mt-1.5 text-xs text-red-600">{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}</p>
                                         </div>
                                     </div>
                                 </template>

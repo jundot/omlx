@@ -108,6 +108,26 @@ def test_qwen4_exp_config_normalizes_reference_layer_type():
     assert config.text_config.rope_parameters["type"] == "default"
 
 
+def test_qwen4_exp_model_file_checkpoints_resolve_to_vendored_module(tmp_path):
+    """mlx-vlm 0.7.x short-circuits ``config['model_file']`` to an imported
+    ``custom_model`` module that lacks ``ModelConfig``; qwen4_exp checkpoints
+    ship ``qwen4_exp.py`` (``ModelArgs``-style only), so resolution must keep
+    landing on the vendored registry entry (regression: "module
+    'custom_model' has no attribute 'ModelConfig'").
+    """
+    assert compat.apply_mlx_vlm_qwen4_exp_compat_patch() in {True, False}
+    from mlx_vlm.models import qwen4_exp
+    from mlx_vlm.utils import get_model_and_args
+
+    (tmp_path / "qwen4_exp.py").write_text("class Model:\n    pass\n")
+    config = {"model_type": "qwen4_exp", "model_file": "qwen4_exp.py"}
+
+    module, model_type = get_model_and_args(config, model_path=tmp_path)
+
+    assert model_type == "qwen4_exp"
+    assert module is qwen4_exp
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()

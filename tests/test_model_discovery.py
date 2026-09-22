@@ -378,6 +378,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    @pytest.mark.parametrize("architecture", ["HfMoondream", "Moondream"])
+    def test_detect_moondream_as_vlm(self, tmp_path, architecture):
+        """Moondream configs carry no vision sub-config; the architecture decides."""
+        config = {
+            "model_type": "moondream1",
+            "architectures": [architecture],
+            "config": {},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_muse_glimmer_as_vlm(self, tmp_path):
         """Meta Muse Glimmer 30B is served by mlx-vlm."""
         config = {
@@ -1947,18 +1958,19 @@ class TestHfCacheDiscovery:
             ),
             # The bf16 source layout (the repo's own test fixture) loads too.
             ({"model_type": "deepseek_v41"}, True),
-            # Unknown conversion version, or an affine conversion without the
-            # oMLX spec: the V4.1 loader has no path for these.
+            # An unknown conversion version stays hidden.
             (
                 {"model_type": "deepseek_v41", "omlx_deepseek_v41": {"version": 2}},
                 False,
             ),
+            # Community mlx_lm affine conversions declare their format in a
+            # top-level quantization dict instead of the oMLX spec.
             (
                 {
                     "model_type": "deepseek_v41",
                     "quantization": {"bits": 2, "group_size": 64, "mode": "affine"},
                 },
-                False,
+                True,
             ),
             (
                 {
@@ -1966,8 +1978,66 @@ class TestHfCacheDiscovery:
                     "quantization_config": {"quant_method": "fp8"},
                     "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
                 },
+                True,
+            ),
+            # A quantization declaration the V4.1 loader cannot read is refused
+            # by this gate. (The generic MLX heuristics below can still admit a
+            # real mlx_lm shard by metadata or repo name, so the gate is not the
+            # only place loadability is decided.)
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"quant_method": "fp8"},
+                },
                 False,
             ),
+            # The loader needs a group size as well as a width.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 2, "mode": "affine"},
+                },
+                False,
+            ),
+            # A per-module override the loader would reject counts too.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {
+                        "bits": 2,
+                        "group_size": 64,
+                        "mode": "affine",
+                        "language_model.layers.0.attn.wq_a": {"mode": "mxfp4"},
+                    },
+                },
+                False,
+            ),
+            # The loader reads the affine mode only, so a declared mxfp4/mxfp8
+            # source — and a width that is not an integer — is refused here
+            # rather than being admitted and then raising "Unsupported source
+            # quantization mode" at load time.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 4, "group_size": 64, "mode": "mxfp4"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": True, "group_size": 64, "mode": "affine"},
+                },
+                False,
+            ),
+            ({"model_type": "deepseek_v41", "quantization": "mlx"}, False),
             (
                 {"model_type": "deepseek_v4", "omlx_deepseek_v41": {"version": 1}},
                 False,

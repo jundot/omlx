@@ -1819,6 +1819,8 @@ class TestClaudeCodeIntegration:
             "claude",
             "--disallowedTools",
             "LSP",
+            "--settings",
+            '{"useAutoModeDuringPlan":false}',
             "--resume",
             "abc123",
         ]
@@ -1846,7 +1848,15 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "--disallowedTools", "LSP", "-r", "xyz"]
+        assert captured["argv"] == [
+            "claude",
+            "--disallowedTools",
+            "LSP",
+            "--settings",
+            '{"useAutoModeDuringPlan":false}',
+            "-r",
+            "xyz",
+        ]
 
     def test_launch_denies_lsp_by_default(self):
         """LSP's schema joins the tools array mid-session and re-prefills the
@@ -1867,7 +1877,13 @@ class TestClaudeCodeIntegration:
         ):
             cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
 
-        assert captured["argv"] == ["claude", "--disallowedTools", "LSP"]
+        assert captured["argv"] == [
+            "claude",
+            "--disallowedTools",
+            "LSP",
+            "--settings",
+            '{"useAutoModeDuringPlan":false}',
+        ]
 
     def test_launch_respects_user_disallowed_tools(self):
         """A caller-supplied --disallowedTools takes over: don't inject ours
@@ -1894,7 +1910,39 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "--disallowedTools", "Bash"]
+        assert captured["argv"] == [
+            "claude",
+            "--settings",
+            '{"useAutoModeDuringPlan":false}',
+            "--disallowedTools",
+            "Bash",
+        ]
+
+    @pytest.mark.parametrize(
+        "settings_args",
+        [
+            ("--settings", '{"useAutoModeDuringPlan":true}'),
+            ("--settings", "/tmp/custom-claude-settings.json"),
+            ('--settings={"useAutoModeDuringPlan":true}',),
+        ],
+    )
+    def test_launch_preserves_explicit_settings(self, settings_args):
+        with (
+            patch("omlx.integrations.claude.os.execvpe") as execute,
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            ClaudeCodeIntegration().launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", extra_args=settings_args)
+            )
+
+        assert execute.call_args.args[1] == [
+            "claude",
+            "--disallowedTools",
+            "LSP",
+            *settings_args,
+        ]
 
 
 class TestCopilotIntegration:

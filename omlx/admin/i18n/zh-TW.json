@@ -1165,6 +1165,8 @@
   "modal.model_settings.moe_expert_offload_hint": "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",
   "modal.model_settings.moe_expert_offload_speculative_hint": "Cannot be combined with Lightning MTP, VLM MTP, or DFlash.",
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
+  "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
+  "modal.model_settings.moe_expert_offload_resident_range_error": "請輸入 5 到 95 之間的數值。",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "使用模型內建的 MTP 頭，每步產生多個 token。解碼速度最快可達約 1.5 倍。（Qwen 3.5/3.6、DeepSeek-V4、GLM-5.2）",
   "modal.model_settings.mtp_conflict": "請先停用 DFlash 和 TurboQuant KV — 它們修補了 MTP 依賴的相同路徑。",
@@ -1308,10 +1310,6 @@
   "modal.model_settings.model_type_audio_tts": "Audio TTS",
   "modal.model_settings.model_type_embedding": "Embedding",
   "modal.model_settings.model_type_reranker": "Reranker",
-  "modal.model_settings.moe_expert_offload_resident_12_5": "12.5% resident",
-  "modal.model_settings.moe_expert_offload_resident_25": "25% resident",
-  "modal.model_settings.moe_expert_offload_resident_50": "50% resident",
-  "modal.model_settings.moe_expert_offload_resident_75": "75% resident",
   "modal.model_settings.profiles.no_presets": "No presets available",
   "modal.model_settings.reasoning_parser_none": "None",
   "modal.model_settings.specprefill_draft_model_hint": "Small model sharing tokenizer with target (e.g. Qwen3.5-0.8B for 35B)",
@@ -1975,5 +1973,12 @@
   "usage.delayed": "歷史記錄可能不完整：儲存延遲或待處理緩衝區已溢位。",
   "usage.loading": "正在載入使用量…",
   "usage.disabled": "使用歷史已關閉。請在設定 → 使用歷史中開啟。",
-  "usage.open_settings": "開啟設定"
+  "usage.open_settings": "開啟設定",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "取消"
 }

@@ -25,7 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .convert import repack_weight
+from .convert import repack_weight, source_quantization_spec
 from .quantization import QuantizedProjection
 from .residency import (
     checkpoint_signature,
@@ -81,6 +81,7 @@ class ExpertOffloadPlan:
         self.path = Path(path)
         self.mapping = mapping
         self.converted = raw.get("omlx_deepseek_v41")
+        self.config = raw
         self.count = config.n_routed_experts
         self.floor = config.n_activated_experts
         self.capacity = min(self.count, max(self.floor, round(self.count * fraction)))
@@ -191,6 +192,37 @@ class ExpertOffloadPlan:
                         raise ValueError(f"Invalid expert scales: {name}")
                     current = {"bits": bits, "mode": f"mxfp{bits}"}
                     size += math.prod(expected) + logical[0] * logical[1] // 32
+                elif dtype == "U32":
+                    # mlx_lm affine packing: the declared format fixes the
+                    # logical width, and the shapes below must agree with it.
+                    current = source_quantization_spec(self.config, name)
+                    if current is None:
+                        raise ValueError(
+                            f"Expert is declared dense but stored packed: {name}"
+                        )
+                    bits, group = current["bits"], current["group_size"]
+                    expected = (logical[0], logical[1] * bits // 32)
+                    entries = {
+                        "weight": entry,
+                        "scales": self._entry(name + ".scales"),
+                        "biases": self._entry(name + ".biases"),
+                    }
+                    for field, item in entries.items():
+                        want = (
+                            expected
+                            if field == "weight"
+                            else (logical[0], logical[1] // group)
+                        )
+                        allowed = {"U32"} if field == "weight" else set(_FLOAT_BYTES)
+                        if item["dtype"] not in allowed or tuple(item["shape"]) != want:
+                            raise ValueError(f"Invalid expert tensor: {name}.{field}")
+                    if entries["scales"]["dtype"] != entries["biases"]["dtype"]:
+                        raise ValueError(f"Affine metadata dtypes differ: {name}")
+                    # Count every field: expert_bytes sizes the INFLIGHT window.
+                    size += sum(
+                        item["data_offsets"][1] - item["data_offsets"][0]
+                        for item in entries.values()
+                    )
                 elif dtype in _FLOAT_BYTES:
                     expected, current = logical, None
                     if name + ".scale" in self.mapping:
@@ -275,6 +307,10 @@ class ExpertOffloadPlan:
                 for field in _fields(self.layers[prefix][proj])
             ]
         name = f"{prefix.removeprefix('language_model.')}.{expert}.{proj}"
+        spec = self.layers[prefix][proj]
+        if spec and spec["mode"] == "affine":
+            # Affine source: mlx_lm stores plural metadata beside the weight.
+            return [self.slab(name + "." + field) for field in _fields(spec)]
         slabs = [self.slab(name + ".weight")]
         if name + ".scale" in self.mapping:
             slabs.append(self.slab(name + ".scale"))
@@ -282,7 +318,9 @@ class ExpertOffloadPlan:
 
     def decode(self, slabs, raws):
         """Projection arrays from the slabs' bytes, keyed by field."""
-        if self.converted is not None:
+        if self.converted is not None or slabs[0].dtype == "U32":
+            # The packed weight stays uint32: QuantizedProjection drives the
+            # quantized matmul, so dequantizing here would defeat the point.
             return {
                 slab.key.rsplit(".", 1)[1]: _to_array(slab, raw)
                 for slab, raw in zip(slabs, raws)

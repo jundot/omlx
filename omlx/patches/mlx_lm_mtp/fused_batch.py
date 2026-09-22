@@ -216,8 +216,10 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
             ),
             commit_cache=(
                 (
-                    lambda accepted, i=row_index: (
-                        cache if whole_batch else [c.extract(i) for c in cache]
+                    lambda accepted, i=row_index, s=state: (
+                        cache
+                        if whole_batch and not s.boundary_emit_pending
+                        else [c.extract(i) for c in cache]
                     )
                 )
                 if vector_rollback
@@ -247,7 +249,8 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         for (index, row, _), (_, finish) in zip(rows, deferred):
             bg._set_singleton_mrope_delta(row)
             finish(commit_ms)
-            if not whole_batch:
+            # Boundary forwards advance private row caches that must be merged back.
+            if not whole_batch or row.prompt_cache is not cache:
                 replacements[index] = row.prompt_cache
                 batch._token_context[index] = row._token_context[0]
         if whole_batch:
@@ -255,4 +258,4 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     if draft_jobs is not None:
         batched_head.draft(batch, draft_jobs)
     bg._clear_rollback(cache)
-    return vector_rollback and whole_batch
+    return vector_rollback and whole_batch and not replacements

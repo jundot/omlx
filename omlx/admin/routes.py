@@ -4500,6 +4500,24 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    return _global_settings_response(global_settings)
+
+
+@router.get("/api/global-settings/defaults")
+async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
+    """Return factory defaults without reading overrides or changing saved settings."""
+    from ..settings import GlobalSettings
+
+    current = _get_global_settings()
+    if current is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    defaults = GlobalSettings(base_path=current.base_path)
+    response = _global_settings_response(defaults)
+    response["cache"]["ssd_cache_max_size"] = defaults.cache.ssd_cache_max_size
+    return response
+
+
+def _global_settings_response(global_settings):
     # Get system memory info for auto calculation
     memory_info = get_system_memory_info()
 
@@ -4569,12 +4587,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
-            # Resolve "auto" to actual value (10% of SSD capacity)
-            "ssd_cache_max_size": _format_cache_size(
-                global_settings.cache.get_ssd_cache_max_size_bytes(
-                    global_settings.base_path
-                )
-            ),
+            "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
@@ -5083,6 +5096,9 @@ async def update_global_settings(
     requested_storage = request.gdn_snapshot_storage
     if requested_storage is not None:
         requested_storage = requested_storage.strip().lower()
+        requested_storage = {"ssd": "ssd_sidecar", "hot": "embedded"}.get(
+            requested_storage, requested_storage
+        )
         if requested_storage not in {"auto", "ssd", "ssd_sidecar", "hot", "embedded"}:
             raise HTTPException(
                 status_code=400,
@@ -5160,46 +5176,80 @@ async def update_global_settings(
             ),
         )
     # Apply cache settings
+    # The dashboard sends all cache fields. Unchanged values must not unload engines.
     cache_changed = False
     if request.cache_enabled is not None:
-        global_settings.cache.enabled = request.cache_enabled
-        cache_changed = True
+        if request.cache_enabled != global_settings.cache.enabled:
+            global_settings.cache.enabled = request.cache_enabled
+            cache_changed = True
     if request.ssd_cache_dir is not None:
-        global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
-        cache_changed = True
+        requested_cache_dir = (
+            Path(request.ssd_cache_dir).expanduser().resolve()
+            if request.ssd_cache_dir
+            else (global_settings.base_path / "cache").resolve()
+        )
+        if requested_cache_dir != global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        ).resolve():
+            global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
+            cache_changed = True
     if request.ssd_cache_max_size is not None:
-        global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
-        cache_changed = True
+        if request.ssd_cache_max_size != global_settings.cache.ssd_cache_max_size:
+            global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
+            cache_changed = True
     if request.hot_cache_only is not None:
-        global_settings.cache.hot_cache_only = request.hot_cache_only
-        cache_changed = True
+        if request.hot_cache_only != global_settings.cache.hot_cache_only:
+            global_settings.cache.hot_cache_only = request.hot_cache_only
+            cache_changed = True
     if request.hot_cache_write_through is not None:
-        global_settings.cache.hot_cache_write_through = (
+        if (
             request.hot_cache_write_through
-        )
-        cache_changed = True
+            != global_settings.cache.hot_cache_write_through
+        ):
+            global_settings.cache.hot_cache_write_through = (
+                request.hot_cache_write_through
+            )
+            cache_changed = True
     if requested_storage is not None:
-        global_settings.cache.set_gdn_snapshot_storage(requested_storage)
-        cache_changed = True
+        if requested_storage != global_settings.cache.get_gdn_snapshot_storage():
+            global_settings.cache.set_gdn_snapshot_storage(requested_storage)
+            cache_changed = True
     elif request.gdn_ssd_split_enabled is not None:
-        global_settings.cache.gdn_ssd_split_enabled = request.gdn_ssd_split_enabled
-        cache_changed = True
+        if (
+            request.gdn_ssd_split_enabled
+            != global_settings.cache.gdn_ssd_split_enabled
+        ):
+            global_settings.cache.gdn_ssd_split_enabled = (
+                request.gdn_ssd_split_enabled
+            )
+            cache_changed = True
     if request.gdn_ssd_pending_max_size is not None:
-        global_settings.cache.gdn_ssd_pending_max_size = (
+        if (
             request.gdn_ssd_pending_max_size
-        )
-        cache_changed = True
+            != global_settings.cache.gdn_ssd_pending_max_size
+        ):
+            global_settings.cache.gdn_ssd_pending_max_size = (
+                request.gdn_ssd_pending_max_size
+            )
+            cache_changed = True
     if request.gdn_sidecar_precision is not None:
-        global_settings.cache.gdn_sidecar_state_dtype = (
-            request.gdn_sidecar_precision.lower()
-        )
-        cache_changed = True
+        new_sidecar_dtype = request.gdn_sidecar_precision.lower()
+        if new_sidecar_dtype != global_settings.cache.gdn_sidecar_state_dtype:
+            global_settings.cache.gdn_sidecar_state_dtype = new_sidecar_dtype
+            cache_changed = True
     if request.hot_cache_max_size is not None:
-        global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
-        cache_changed = True
+        if request.hot_cache_max_size != global_settings.cache.hot_cache_max_size:
+            global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
+            cache_changed = True
     if request.initial_cache_blocks is not None:
-        global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
-        cache_changed = True
+        if (
+            request.initial_cache_blocks
+            != global_settings.cache.initial_cache_blocks
+        ):
+            global_settings.cache.initial_cache_blocks = (
+                request.initial_cache_blocks
+            )
+            cache_changed = True
     # No cache_changed: reloading models cannot re-arm the native gate, which
     # reads the env var once at the first ANE compile of the process. The env
     # update covers a process that has not compiled yet; otherwise restart.

@@ -8,6 +8,9 @@
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
+    // The API accepts fractions outside the UI range.
+    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 5;
+    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 95;
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -923,7 +926,72 @@
                 }
             },
 
+            loadingGlobalSettings: false,
+            resettingGlobalSettings: false,
+            showGlobalResetNotice: false,
+            globalResetSnapshot: null,
+            globalDefaultsPending: false,
+
+            async resetGlobalSettingsDefaults() {
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
+                this.resettingGlobalSettings = true;
+                this.saveSuccess = false;
+                this.saveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings/defaults');
+                    if (!response.ok) throw new Error('Failed to load defaults');
+                    const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
+                    const s = this.globalSettings;
+                    for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
+                        'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
+                        for (const key of Object.keys(s[section])) {
+                            if (['base_path', 'model_dirs', 'model_dir', 'effective_model_dirs',
+                                'ssd_cache_dir', 'config_path', 'hf_cache_path', 'ca_bundle',
+                                'api_key', 'api_key_set', 'sub_keys', 'endpoint',
+                                'distributed_inference_active'].includes(key)) continue;
+                            if (Object.hasOwn(defaults[section], key)) {
+                                s[section][key] = defaults[section][key];
+                            }
+                        }
+                    }
+                    this.idleTimeoutValue = s.idle_timeout.idle_timeout_seconds == null
+                        ? '' : String(s.idle_timeout.idle_timeout_seconds);
+                    this.cachePercent = this.parseCacheToPercent(
+                        s.cache.ssd_cache_max_size, s.system.ssd_total_bytes);
+                    this.hotCachePercent = this.parseHotCacheToPercent(
+                        s.cache.hot_cache_max_size, s.system.total_memory_bytes);
+                    s.ui.language = defaults.ui.language;
+                    this.globalDefaultsPending = true;
+                    this.showGlobalResetNotice = true;
+                } catch (err) {
+                    this.saveError = window.t('settings.global.reset_failed');
+                } finally {
+                    this.resettingGlobalSettings = false;
+                }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
+            },
+
             async loadGlobalSettings() {
+                this.loadingGlobalSettings = true;
                 try {
                     const response = await fetch('/admin/api/global-settings');
                     if (response.ok) {
@@ -982,8 +1050,6 @@
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
                         );
-                        // Sync the cache string value from percent
-                        this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
                         this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
@@ -998,6 +1064,8 @@
                     }
                 } catch (err) {
                     console.error('Failed to load global settings:', err);
+                } finally {
+                    this.loadingGlobalSettings = false;
                 }
             },
 
@@ -1031,6 +1099,7 @@
             },
 
             async saveGlobalSettings() {
+                if (this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -1085,6 +1154,7 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            ...(this.globalDefaultsPending ? { ui_language: s.ui.language } : {}),
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
@@ -1146,6 +1216,10 @@
                         await this.loadStats();
                         await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
+                        if (this.globalDefaultsPending) {
+                            this.globalDefaultsPending = false;
+                            window.location.reload();
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1823,6 +1897,8 @@
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
+                    moe_expert_offload_resident_touched: false,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -1881,6 +1957,40 @@
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
                 };
+            },
+
+            moeExpertOffloadResidentInvalid() {
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                return (
+                    !Number.isFinite(percent)
+                    || percent < MOE_EXPERT_OFFLOAD_MIN_PERCENT
+                    || percent > MOE_EXPERT_OFFLOAD_MAX_PERCENT
+                );
+            },
+
+            onMoeExpertOffloadResidentBlur() {
+                // Preserve untouched API values outside the UI range.
+                if (!this.modelSettings.moe_expert_offload_resident_touched) return;
+                if (this.moeExpertOffloadResidentInvalid()) {
+                    const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                    this.modelSettings.moe_expert_offload_resident_percent = Math.min(
+                        MOE_EXPERT_OFFLOAD_MAX_PERCENT,
+                        Math.max(
+                            MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                            Number.isFinite(percent) ? percent : MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                        ),
+                    );
+                }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            onMoeExpertOffloadResidentPercent() {
+                // Defer clamping until blur so partial input remains editable.
+                this.modelSettings.moe_expert_offload_resident_touched = true;
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                if (!this.moeExpertOffloadResidentInvalid()) {
+                    this.modelSettings.moe_expert_offload_resident_fraction = Number((percent / 100).toPrecision(15));
+                }
             },
 
             _resetPresetApplicableFields() {

@@ -666,6 +666,20 @@ class TestUsesNativeReasoningContent:
     def test_plain_model_is_not_native(self):
         assert not uses_native_reasoning_content("llama-3")
 
+    def test_detects_deepseek_v4_family(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="deepseek_v41",
+        )
+        assert uses_native_reasoning_content(
+            "any-name",
+            engine_model_type="deepseek_v4",
+        )
+        assert not uses_native_reasoning_content(
+            "any-name",
+            config_model_type="deepseek_v3",
+        )
+
 
 class TestConvertAnthropicToInternal:
     """Tests for convert_anthropic_to_internal function."""

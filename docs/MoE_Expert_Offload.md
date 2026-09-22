@@ -26,7 +26,7 @@ larger than physical memory load at all.
 ## Enabling it
 
 Per model, in the admin dashboard: **Model Settings → MoE Expert Offload**,
-with a resident-fraction selector (12.5% – 75%). Or via the settings API:
+with a resident-fraction field accepting 5% to 95%, including fractional percentages such as 12.5%. The API accepts any fraction in (0, 1]. Values outside the UI range are preserved until the field is edited. The following example uses the settings API.
 
 ```json
 {"moe_expert_offload_enabled": true, "moe_expert_offload_resident_fraction": 0.25}
@@ -34,6 +34,13 @@ with a resident-fraction selector (12.5% – 75%). Or via the settings API:
 
 Toggling triggers an engine reload (it is a load-time transform). The env
 kill switch `OMLX_MOE_EXPERT_OFFLOAD=0` disables it regardless of settings.
+
+Two env vars tune the reader, and neither changes what is computed:
+
+| variable | default | effect |
+|---|---|---|
+| `OMLX_MOE_OFFLOAD_IO_WORKERS` | 12 | threads reading missing experts. `1` or less (or an unparseable value) keeps the serial path and starts no threads |
+| `OMLX_MOE_OFFLOAD_IO_BATCH` | `4 x workers` | experts whose reads may be in flight at once — the bound on the host memory the pipeline holds ahead of the slot writes |
 
 ## Performance
 
@@ -73,20 +80,26 @@ remaining follow-up is decode prefetch (layer L+1's fetches during layer
 L's compute), which has measured LRU→optimal headroom of +17pp hit rate at
 low residency.
 
+A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` schedules missing experts before the serial install loop. Slot writes, LRU updates, and hit/miss counters stay on the calling thread.
+
 ## Supported models
 
-The experimental toggle is available for `deepseek_v41`, `qwen4_exp`,
-`gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout passes
-validation. Dense Gemma models and other model types do not show the toggle.
-The settings API and model loader use the same eligibility check.
+The experimental toggle is available for `deepseek_v41`, `deepseek_v4`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, `glm_moe_dsa`, and `glm5_next` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
+
+Qwen3.5/3.6 supports stacked expert projections under `language_model.model.layers.*.mlp.switch_mlp` and `model.layers.*.mlp.switch_mlp`. The offload adapter resolves the original checkpoint path after the loader normalizes the text-only naming layout.
 
 The common adapter supports stacked `[num_experts, ...]` quantized
 `SwitchGLU` projections and the per-expert layout used by OLMoE conversions.
+Both are read from either an MXFP checkpoint or a community `mlx_lm` affine
+conversion, whose projections carry a U32 weight with float scales and biases
+and declare their format in the checkpoint's own `quantization` dict.
 All backbone layers must have the expected tensor names, shapes, storage
 dtypes, and quantization metadata. Fused or renamed projections, missing
 experts, unquantized weights, and per-expert linear bias are rejected.
-DeepSeek V4.1 has a separate adapter described below. DeepSeek V4 and
-GLM-5.3 are outside the current support list.
+DeepSeek V4.1, the GLM-5.x flagship (`glm_moe_dsa`), and the DeepSeek V4 /
+GLM-5.3-Flash block (`deepseek_v4`, `glm5_next`) have their own adapters,
+described below. Their eligibility validation checks the stacked
+`ffn.switch_mlp` / `mlp.switch_mlp` slabs the adapters read positionally.
 
 When offload wraps layers, the Qwen gate/up fusion is skipped automatically:
 fusion rewrites stock expert weights in RAM, which cannot apply to experts
@@ -122,12 +135,14 @@ where the kernel path is identical, rounding-bounded where it is not.
 
 ## DeepSeek V4.1
 
-DeepSeek V4.1 uses its own expert adapter and loader. Both the original
-checkpoint and oMLX converted MXFP/oQ checkpoints are supported. Expert
-weights stay in the existing safetensors files. The resident fraction applies
-to the routed experts in each backbone layer, with capacity floored at the
-number selected by one token. Shared experts, attention, and other backbone
-weights remain resident.
+DeepSeek V4.1 uses its own expert adapter and loader. The original checkpoint,
+oMLX converted MXFP/oQ checkpoints, and community `mlx_lm` affine conversions
+are supported. Expert weights stay in the existing safetensors files; an
+affine source reports its format in the checkpoint's `quantization` dict and
+counts its packed weight plus BF16 scales and biases toward the resident set.
+The resident fraction applies to the routed experts in each backbone layer,
+with capacity floored at the number selected by one token. Shared experts,
+attention, and other backbone weights remain resident.
 
 Non-resident experts are read with positional `pread` calls on a small
 reader pool of their own, not through the Engram row-gather mapping: an
@@ -221,9 +236,77 @@ validation reject conflicting combinations. V4.1 offload skips retained
 DSpark tensors even when the checkpoint includes them; the checkpoint is
 not modified. Disable offload and reload to use MTP again.
 
-GLM-5.3-Flash and the custom DeepSeek V4 expert kernels are not supported by
-this adapter. Unmatched modules remain resident, and unsupported custom
-model families receive no offload admission discount.
+GLM-5.3-Flash (`glm5_next`) and the custom DeepSeek V4 expert kernels are not
+supported by this adapter. Unmatched modules remain resident, and unsupported
+custom model families receive no offload admission discount.
+
+## GLM-5.x flagship (glm_moe_dsa)
+
+GLM-5.2 and GLM-5.3 (`model_type: glm_moe_dsa`: 78 layers, the first 3 dense,
+256 routed experts, top-8, one shared expert) run their routed experts
+through oMLX's own GLM SwitchGLU, which fuses the gate and up projections at
+load and, on sorted calls, returns the routes already weighted and summed by
+the native `glm_moe_weighted_sum` kernel. The adapter in
+`omlx/patches/glm_moe_dsa/moe_offload.py` keeps that module and its kernels:
+each projection's parameters are replaced by resident slots before lazy
+weights materialize, expert ids are translated to slot ids, and the module's
+own forward runs unchanged on them. Every kernel decision inside it is a
+function of the routes and the slot tensors' shapes, and every use of an
+index is a gather, so a route computes the same numbers against its slot as
+against its expert; the test suite asserts bit-exact output against the
+resident module for decode, for sorted prefill through the native weighted
+sum, and for sorted calls that fit the cache, and a rounding-scale bound for
+over-capacity prefill, which is chunked on expert boundaries like the other
+adapters. A miss reads the expert's split `gate_proj`, `up_proj` and
+`down_proj` slabs from the checkpoint, stacked or one tensor per expert (the
+layout the loader stacks at load), and writes the two halves of the fused
+row in place.
+
+Sizing, from the shard headers of `mlx-community/GLM-5.2-4bit` (409 GiB
+estimated, about 5.2 GiB of routed experts per layer, 20 MiB per expert):
+
+| resident fraction | experts per layer | admission estimate |
+|---:|---:|---:|
+| 12.5% | 32 | 76.8 GiB |
+| 20% | 51 | 105.0 GiB |
+| 25% | 64 | 124.3 GiB |
+
+On a 128 GB machine (about 107 GiB working-set limit) 20% is the largest
+residency admission accepts; the routing floor is 8.
+
+Measured on an M5 Max 128 GB (internal SSD), `mlx-community/GLM-5.2-4bit`
+loaded through the engine's own sequence, a 36-token chat prompt, 24 greedy
+tokens, single runs:
+
+| residency | experts per layer | footprint | load | cold TTFT | decode | decode hit rate | misses per token |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20% | 51 | 86.6 GiB | 3.3 s | 20.4 s | 1.8 tok/s | 0.63 | 213 |
+| 12.5% | 32 | 58.4 GiB | 2.6 s | 18.8 s | 1.5 tok/s | 0.52 | 275 |
+
+Decode is bound by expert reads: a miss is a 20 MiB expert, and 213 of them
+per token is 4.2 GiB, which the positional reads move at about 8 GiB/s. The
+same 20% configuration fetching through the common store's memmap path
+measured 646 s to first token and 0.09 tok/s, because a slab faulted in
+16 KiB pages on the compute thread reads at 0.4 GB/s; that is why this
+adapter reads misses through the store's positional reads on the shared
+reader pool, as the V4.1 adapter does. Continuations were coherent and identical between the cold and warm
+runs at each residency; between residencies the two texts forked at one
+marginal token (a capitalization), which is the documented behavior of
+over-capacity prefill under a different chunking.
+
+`omlx serve` end to end on the same machine (balanced memory guard, which
+puts the dynamic ceiling at 102.5 GB): the checkpoint is discovered from the
+HF cache; at 20% the request is refused with 507 because the 105.0 GB
+estimate does not fit that ceiling (the aggressive tier, or raising
+`iogpu.wired_limit_mb`, would admit it); at 12.5% it is admitted at a
+76.9 GB estimate (57.6 GB actual), the engine loads in 3.7 s with 75 layers
+wrapped and gate/up fusion skipped, and two 24-token chat completions took
+35.7 s and 34.0 s including prefill.
+
+Set `moe_expert_offload_enabled: true` and
+`moe_expert_offload_resident_fraction` in the model's experimental settings.
+Lightning MTP, VLM MTP, and DFlash must be disabled. Loaded-model memory
+accounting includes the expert savings.
 
 ## Qwen3.8-Flash-Next
 

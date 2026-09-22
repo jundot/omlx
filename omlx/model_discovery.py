@@ -166,6 +166,8 @@ VLM_ARCHITECTURES = {
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
+    "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }
 
 # Known embedding model types from mlx-embeddings
@@ -1414,22 +1416,39 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
 
 
 def _is_deepseek_v41_loadable_config(config) -> bool:
-    """True for DeepSeek V4.1 checkpoints the V4.1 loader reads unconverted.
+    """Recognize official, oMLX-converted, and declared affine V4.1 checkpoints.
 
-    The loader gates source checkpoints on the model type alone (the FP8/FP4
-    release, or bf16), and reads oMLX conversions by their
-    ``omlx_deepseek_v41`` spec (e.g. ``Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp``).
-    Shards exported before #3583 declare no ``format: mlx`` metadata and the
-    repo names carry no MLX token, so the generic heuristics skip them.
-    MLX affine conversions without the spec (a top-level ``quantization``
-    dict) are not accepted: the loader has no path for them.
+    This also admits checkpoints without MLX shard metadata or repo names.
+    False leaves generic discovery heuristics in control; it does not reject loading.
     """
     if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
         return False
     spec = config.get("omlx_deepseek_v41")
     if isinstance(spec, dict):
         return spec.get("version") == 1
-    return spec is None and "quantization" not in config
+    if spec is not None:
+        return False
+    quantization = config.get("quantization")
+    if quantization is None:
+        return True
+    if not isinstance(quantization, dict):
+        return False
+    bits = quantization.get("bits")
+    group_size = quantization.get("group_size")
+    if quantization.get("mode", "affine") != "affine":
+        return False
+    if not _declared_int(bits) or not _declared_int(group_size):
+        return False
+    # `source_quantization_spec` rejects a non-affine per-module override too.
+    return not any(
+        isinstance(entry, dict) and entry.get("mode", "affine") != "affine"
+        for entry in quantization.values()
+    )
+
+
+def _declared_int(value) -> bool:
+    """JSON booleans are ints in Python; a declared width/group is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:

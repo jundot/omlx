@@ -1400,6 +1400,65 @@ class TestEnginePoolAsync:
         )
 
     @pytest.mark.asyncio
+    async def test_bundled_dflash_profile_switch_reloads_engine(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        model_path = small_mock_model_dir / "model-a"
+        (model_path / "config.json").write_text(json.dumps({"model_type": "mimo_v2"}))
+        draft_path = model_path / "dflash"
+        draft_path.mkdir()
+        (draft_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["DFlashDraftModel"],
+                    "dflash_config": {
+                        "attention_value_scale": 0.612,
+                        "attention_sink_bias": True,
+                    },
+                }
+            )
+        )
+        (draft_path / "model.safetensors").touch()
+        (draft_path / "mask_embedding.pt").touch()
+        plain = ModelSettings()
+        bundled = ModelSettings(dflash_enabled=True)
+        tuned = ModelSettings(dflash_enabled=True, dflash_block_size=8)
+        explicit = ModelSettings(
+            dflash_enabled=True,
+            dflash_draft_model=str(draft_path),
+            dflash_block_size=8,
+        )
+        engines = [MagicMock() for _ in range(4)]
+        for engine in engines:
+            engine.start = AsyncMock()
+            engine.stop = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine_pool.BatchedEngine", side_effect=[engines[0], engines[3]]
+            ),
+            patch("omlx.engine.dflash.DFlashEngine", side_effect=engines[1:3]) as load,
+        ):
+            for settings, expected in zip(
+                [plain, bundled, tuned, explicit, plain],
+                [engines[0], engines[1], engines[2], engines[2], engines[3]],
+                strict=True,
+            ):
+                assert (
+                    await pool.get_engine("model-a", runtime_settings=settings)
+                    is expected
+                )
+
+        assert load.call_count == 2
+        assert load.call_args.kwargs["draft_model_path"] == str(draft_path)
+        for engine in engines[:3]:
+            engine.stop.assert_awaited_once()
+        engines[3].stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_runtime_settings_reload_rejected_while_leased(
         self, pool_with_mock_engines
     ):

@@ -913,14 +913,16 @@ class EnginePool:
             add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
             add("specprefill_threshold", data.get("specprefill_threshold"))
 
-        dflash_active = (
-            bool(data.get("dflash_enabled", False))
-            and has_value("dflash_draft_model")
-            and not is_diffusion
-        )
+        dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
+        dflash_draft = data.get("dflash_draft_model")
+        if dflash_enabled and not dflash_draft and entry is not None:
+            from .patches.dflash_mimo_v2 import resolve_bundled_mimo_draft
+
+            dflash_draft = resolve_bundled_mimo_draft(entry.model_path, dflash_draft)
+        dflash_active = dflash_enabled and bool(dflash_draft)
         add("dflash_enabled", dflash_active)
         if dflash_active:
-            add("dflash_draft_model", data.get("dflash_draft_model"))
+            add("dflash_draft_model", dflash_draft)
             add(
                 "dflash_draft_quant_enabled",
                 bool(data.get("dflash_draft_quant_enabled", False)),
@@ -2980,6 +2982,15 @@ class EnginePool:
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
+                if dflash_enabled and not dflash_draft:
+                    from .patches.dflash_mimo_v2 import (
+                        resolve_bundled_mimo_draft,
+                    )
+
+                    dflash_draft = resolve_bundled_mimo_draft(
+                        entry.model_path,
+                        dflash_draft,
+                    )
                 if (
                     dflash_enabled
                     and dflash_draft
