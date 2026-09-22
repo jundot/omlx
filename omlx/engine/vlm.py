@@ -2221,6 +2221,27 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         if (
+            self._adapter.model_type in {"mimo_v2", "mimo_v2_flash"}
+            and getattr(self._adapter, "mtp", None) is not None
+            and getattr(
+                self._adapter._language_model, "_omlx_mtp_decode_enabled", False
+            )
+            and scheduler_config.paged_cache_block_size
+            < scheduler_config.prefill_step_size
+        ):
+            # MiMo's hybrid KV/ArraysCache prefill is otherwise split at the
+            # default 256-token cache boundary.  The final short tail reaches
+            # BatchGenerator instead of the native-MTP handoff, so multimodal
+            # requests silently decode without the checkpoint's attached MTP.
+            logger.info(
+                "Aligning MiMo VLM-MTP cache block_size=%s to prefill_step=%s",
+                scheduler_config.paged_cache_block_size,
+                scheduler_config.prefill_step_size,
+            )
+            scheduler_config.paged_cache_block_size = (
+                scheduler_config.prefill_step_size
+            )
+        if (
             self._adapter.model_type == "deepseek_v41"
             and self._adapter.config.ced_prefill
             and scheduler_config.paged_ssd_cache_dir
