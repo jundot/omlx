@@ -1232,6 +1232,30 @@ class TestProcessChatMessages:
         assert call_kwargs["tools"] == [{"converted": True}]
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.expand_video_parts")
+    def test_mimo_video_uses_on_disk_model_type_when_loaded_config_omits_it(
+        self, mock_expand_video, mock_extract, tmp_path
+    ):
+        """MiMo video expansion must not depend on the runtime config retaining model_type."""
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "mimo_v2_flash"}', encoding="utf-8"
+        )
+        messages = [{"role": "user", "content": "video"}]
+        expanded = [{"role": "user", "content": "frames"}]
+        mock_expand_video.return_value = expanded
+        mock_extract.return_value = (expanded, [], [])
+
+        engine = _make_loaded_engine(model_type=None, model_name=str(tmp_path))
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
+
+        engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        mock_expand_video.assert_called_once_with(messages)
+        mock_extract.assert_called_once_with(expanded)
+
+    @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_image_path_calls_prepare_vision(self, mock_extract):
         """Messages with images → _prepare_vision_inputs() called."""
         from PIL import Image
@@ -1503,6 +1527,41 @@ class TestPrepareVisionInputs:
         )
 
         mock_load_audio.assert_called_once_with(audio_stream, 24000)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_mimo_audio_codes_enter_multimodal_embedding_path(
+        self, mock_vlm_act, mock_prepare, tmp_path
+    ):
+        """MiMo's discrete audio codes must not fall through as text-only input."""
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "mimo_v2_flash"}', encoding="utf-8"
+        )
+        engine = self._setup_engine_for_vision(model_type=None)
+        engine._model_name = str(tmp_path)
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        audio_codes = mx.zeros((2, 4, 20), dtype=mx.int32)
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+            "audio_codes": audio_codes,
+        }
+        embeddings = mx.zeros((1, 3, 4))
+        engine._vlm_model.get_input_embeddings.return_value = SimpleNamespace(
+            inputs_embeds=embeddings,
+            to_dict=lambda: {"inputs_embeds": embeddings},
+        )
+
+        result = engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Describe this recording"}],
+            [],
+            audio=[("fake_audio_array", 24000)],
+        )
+
+        call_kwargs = engine._vlm_model.get_input_embeddings.call_args.kwargs
+        assert call_kwargs["audio_codes"] is audio_codes
+        assert result[1] is embeddings
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")

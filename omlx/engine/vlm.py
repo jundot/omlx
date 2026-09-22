@@ -3361,7 +3361,7 @@ class VLMBatchedEngine(BaseEngine):
         num_images = len(images)
         num_audios = len(audio) if audio else 0
 
-        model_type = self.model_type or ""
+        model_type = self.model_type or _read_config_model_type(self._model_name) or ""
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -3643,8 +3643,11 @@ class VLMBatchedEngine(BaseEngine):
             and v is not None
         }
 
-        # Check for any multimodal inputs: images or audio
-        has_audio = "input_features" in extra_model_inputs
+        # Check for any multimodal inputs. Most processors expose audio as
+        # ``input_features``; MiMo's tokenizer produces discrete ``audio_codes``.
+        has_audio = any(
+            key in extra_model_inputs for key in ("input_features", "audio_codes")
+        )
         has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
 
         if has_multimodal:
@@ -4621,7 +4624,8 @@ class VLMBatchedEngine(BaseEngine):
         # MiMo consumes video as a bounded, chronological sequence of frames
         # through the same vision tower used for still images.
         media_messages = messages
-        if self.model_type in {"mimo_v2", "mimo_v2_flash"}:
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
             media_messages = expand_video_parts(messages)
 
         text_messages, images, audio = extract_images_from_messages(media_messages)
