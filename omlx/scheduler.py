@@ -65,6 +65,7 @@ from .canonical_recovery import (
     CanonicalRecoveryCounters,
     CanonicalRecoveryJob,
     canonical_recovery_is_runnable,
+    adopted_frontier,
     canonical_recovery_slice_cap,
     safe_publish_boundary,
 )
@@ -1710,6 +1711,11 @@ class SchedulerConfig:
     # which is what made the worst foreground wait a whole cache block.
     canonical_state_recovery_slice_tokens: int = 0
 
+    # Blocks of published canonical prefix a foreground request adopts at a
+    # time. Deliberately not the publication grain: recovery still publishes
+    # every safe block, and only the restore may lag. 1 adopts all of it.
+    canonical_state_adoption_grain_blocks: int = 1
+
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
     model_path: str = ""  # Filesystem path to the model (e.g., "/cache/models--Org--Name/snapshots/abc123")
@@ -2153,6 +2159,10 @@ class Scheduler:
         # load would set it for this engine too.
         self._canonical_recovery_slice_tokens = int(
             getattr(self.config, "canonical_state_recovery_slice_tokens", 0) or 0
+        )
+        # Per-model and snapshotted for the same reason as the slice.
+        self._canonical_adoption_grain_blocks = max(
+            1, int(getattr(self.config, "canonical_state_adoption_grain_blocks", 1) or 1)
         )
         # The budget is adopted when the pool supplied one and created
         # privately when it did not. A bare Scheduler — tests, embedded use —
@@ -9062,6 +9072,7 @@ class Scheduler:
                     0, block_table.num_tokens - last_token_count
                 )
                 self.paged_cache_manager.free_block(last_block_id)
+            block_table = self._cap_foreground_adoption(request, block_table)
             if block_table and 0 < block_table.num_tokens < minimum_prefix:
                 logger.info(
                     "Request %s: cached prefix %d precedes complete image prefix %d",
@@ -9256,6 +9267,87 @@ class Scheduler:
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
+
+    def _cap_foreground_adoption(self, request: Request, block_table: Any) -> Any:
+        """Cut the published prefix *block_table* matched down to the adopted one.
+
+        ``fetch_cache`` returns the published frontier: the durable canonical
+        prefix the cache can restore. A foreground request adopts it in steps
+        of ``canonical_state_adoption_grain_blocks`` (see ``adopted_frontier``)
+        so that a SpecPrefill draft scoring window starting at the restored
+        prefix moves once per step instead of once per published block. Whole
+        trailing blocks are dropped and their references released exactly as
+        the GDN split tail-pop above does, so what remains is an ordinary
+        shorter hit, still validated by ``reconstruct_cache``, which may trim
+        it lower but never higher.
+
+        The lag exists only to keep that window still, so a request
+        SpecPrefill would not score at the full published prefix adopts all
+        of it, and so does the recovery job's own restore. With the default
+        grain of 1 this returns before looking at anything. Any failure
+        leaves the fetched table as it was: the ordinary restore is the
+        proven path, and adoption only ever restores less of it.
+        """
+        grain = getattr(self, "_canonical_adoption_grain_blocks", 1)
+        if (
+            grain <= 1
+            or block_table is None
+            or not block_table.block_ids
+            or self.paged_cache_manager is None
+            or request.is_canonical_recovery
+        ):
+            return block_table
+        try:
+            published = block_table.num_tokens
+            adopted = adopted_frontier(
+                published_tokens=published,
+                block_size=self.config.paged_cache_block_size,
+                grain_blocks=grain,
+            )
+            if adopted >= published:
+                return block_table
+            prompt = request.prompt_token_ids or []
+            if published >= len(prompt) or self._specprefill_scoring_plan(
+                request, prompt[published:], published
+            ) is None:
+                return block_table
+            # Plan the drop before touching a reference, so a failure part-way
+            # through cannot leave a half-trimmed table.
+            drop: list[tuple[int, int]] = []
+            kept = published
+            for block_id in reversed(block_table.block_ids):
+                if kept <= adopted:
+                    break
+                block = self.paged_cache_manager.allocated_blocks.get(block_id)
+                tokens = (
+                    block.token_count
+                    if block is not None and block.token_count > 0
+                    else self.config.paged_cache_block_size
+                )
+                drop.append((block_id, tokens))
+                kept -= tokens
+        except Exception:
+            logger.warning(
+                "Canonical adoption for %s failed closed; restoring the full prefix",
+                request.request_id,
+                exc_info=True,
+            )
+            return block_table
+        for block_id, tokens in drop:
+            block_table.block_ids.pop()
+            block_table.num_tokens = max(0, block_table.num_tokens - tokens)
+            self.paged_cache_manager.free_block(block_id)
+        logger.info(
+            "Canonical adoption for %s: published=%d adopted=%d grain=%d",
+            request.request_id,
+            published,
+            block_table.num_tokens,
+            grain,
+        )
+        if block_table.num_tokens <= 0:
+            self.paged_cache_manager.delete_block_table(request.request_id)
+            return None
+        return block_table
 
     def add_request(self, request: Request) -> None:
         """
@@ -9856,32 +9948,10 @@ class Scheduler:
         was already scored in a previous turn, the draft cache is restored
         and only the new suffix is prefilled through the draft model.
         """
-        if self._specprefill_draft_model is None:
-            return
-
-        specprefill_enabled = getattr(request, "_specprefill_enabled", False)
-        if not specprefill_enabled:
-            return
-
-        if request.vlm_inputs_embeds is not None:
-            return
-
         remaining = request.remaining_tokens or request.prompt_token_ids
-        if remaining is None:
-            return
-
-        from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
-        from .specprefill.policy import plan_specprefill_scoring
-
         # Apply deterministic admission before the draft workflow.
-        plan = plan_specprefill_scoring(
-            remaining_tokens=remaining,
-            system_prompt_end=request.specprefill_system_end,
-            cached_tokens=request.cached_tokens,
-            requested_threshold=getattr(request, "_specprefill_threshold", None),
-            requested_keep_pct=getattr(request, "_specprefill_keep_pct", None),
-            default_threshold=DEFAULT_THRESHOLD,
-            default_keep_pct=DEFAULT_KEEP_RATE,
+        plan = self._specprefill_scoring_plan(
+            request, remaining, request.cached_tokens
         )
         if plan is None:
             return
@@ -9899,6 +9969,37 @@ class Scheduler:
             extract_cache_states=self._extract_cache_states,
             sync_and_clear_cache=lambda: Scheduler._clear_cache(self),
             log=logger,
+        )
+
+    def _specprefill_scoring_plan(
+        self, request: Request, remaining: Any, cached_tokens: int
+    ) -> Any:
+        """SpecPrefill admission for *request* with *cached_tokens* restored.
+
+        One place for it, because it is asked twice: by the scoring itself,
+        and earlier, by canonical adoption, which may lag the restored prefix
+        only for a request this would admit at the full published prefix.
+        """
+        if self._specprefill_draft_model is None:
+            return None
+        if not getattr(request, "_specprefill_enabled", False):
+            return None
+        if request.vlm_inputs_embeds is not None:
+            return None
+        if remaining is None:
+            return None
+
+        from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
+        from .specprefill.policy import plan_specprefill_scoring
+
+        return plan_specprefill_scoring(
+            remaining_tokens=remaining,
+            system_prompt_end=request.specprefill_system_end,
+            cached_tokens=cached_tokens,
+            requested_threshold=getattr(request, "_specprefill_threshold", None),
+            requested_keep_pct=getattr(request, "_specprefill_keep_pct", None),
+            default_threshold=DEFAULT_THRESHOLD,
+            default_keep_pct=DEFAULT_KEEP_RATE,
         )
 
     def _cleanup_specprefill(self, request_id: str) -> None:

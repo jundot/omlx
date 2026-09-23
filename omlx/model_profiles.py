@@ -94,6 +94,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_threshold",
     "canonical_state_recovery_enabled",
     "canonical_state_recovery_slice_tokens",
+    "canonical_state_adoption_grain_blocks",
     "index_cache_freq",
 )
 

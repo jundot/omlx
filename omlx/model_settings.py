@@ -271,6 +271,13 @@ class ModelSettings:
             leaves it at the ordinary prefill step size. Not the publication
             grain — recovery publishes only at cache block boundaries either
             way. This is the slice a foreground request can arrive behind.
+        canonical_state_adoption_grain_blocks: Cache blocks of published
+            canonical prefix a foreground request adopts at a time; 1 (the
+            default) adopts all of it, as without this setting. Larger values
+            let the restored prefix lag the published one by less than one
+            step, so a SpecPrefill draft scoring window that starts there moves
+            less often. Publication is not affected, and the lag applies only
+            to a request SpecPrefill would score at the full published prefix.
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_enabled: Enable draft model quantization.
@@ -427,6 +434,9 @@ class ModelSettings:
     # Not the publication grain: recovery still publishes only at cache block
     # boundaries. This is the slice a foreground request can arrive behind.
     canonical_state_recovery_slice_tokens: int = 0
+    # Blocks of published canonical prefix a foreground request adopts at a
+    # time; 1 = all of it. A policy knob, not a tuned constant.
+    canonical_state_adoption_grain_blocks: int = 1
 
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
@@ -557,6 +567,8 @@ class ModelSettings:
         validate_moe_expert_offload(self.to_dict())
         if self.canonical_state_recovery_slice_tokens < 0:
             raise ValueError("canonical_state_recovery_slice_tokens must not be negative")
+        if self.canonical_state_adoption_grain_blocks < 1:
+            raise ValueError("canonical_state_adoption_grain_blocks must be at least 1")
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

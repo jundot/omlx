@@ -74,6 +74,34 @@ def safe_publish_boundary(*, tokens_committed: int, block_size: int) -> int:
     return (tokens_committed // block_size) * block_size
 
 
+def adopted_frontier(*, published_tokens: int, block_size: int, grain_blocks: int) -> int:
+    """The part of the published canonical prefix a foreground request adopts.
+
+    Two frontiers, two decisions. The *published* frontier is the durable,
+    restorable canonical prefix the cache holds; recovery advances it at
+    every safe boundary, because its live state is retired whenever
+    foreground work arrives and anything past the last publication is lost
+    with it. The *adopted* frontier is the part of it a foreground request
+    actually restores. Adopting is a separate trade: a request running
+    SpecPrefill starts its draft scoring window at the restored prefix, so
+    each newly adopted block can move that window and cost a draft rescore.
+    Adopting in steps of *grain_blocks* blocks lets the published frontier
+    advance every block while the adopted one moves once per step.
+
+    A pure function of the published prefix: never above it, never falling
+    while it grows, falling only when it falls (eviction, ground loss, a
+    rewritten history), and the same after a restart, since nothing is
+    remembered between requests. A grain of 1 adopts the whole published
+    prefix, which is the behaviour without this policy.
+    """
+    if published_tokens <= 0 or block_size <= 0:
+        return 0
+    if grain_blocks <= 1:
+        return published_tokens
+    step = grain_blocks * block_size
+    return (published_tokens // step) * step
+
+
 @dataclass
 class CanonicalRecoveryBudget:
     """A replenishing bounded share of wall time, aggregated over the process.
@@ -503,8 +531,9 @@ def apply_canonical_recovery_settings(
 ) -> None:
     """Carry a model's canonical-recovery knobs onto a shared ``SchedulerConfig``.
 
-    Two of them, and neither is a ceiling: a model chooses whether to recover
-    and how large a slice it does it in. How much of the accelerator recovery
+    Three of them, and none is a ceiling: a model chooses whether to recover,
+    how large a slice it does it in, and in what steps its foreground requests
+    adopt what recovery published. How much of the accelerator recovery
     may have is one server-level number, because every engine in the pool
     shares one accelerator and this config object is rewritten per load.
 
@@ -517,6 +546,9 @@ def apply_canonical_recovery_settings(
     )
     scheduler_config.canonical_state_recovery_slice_tokens = int(
         getattr(model_settings, "canonical_state_recovery_slice_tokens", 0) or 0
+    )
+    scheduler_config.canonical_state_adoption_grain_blocks = max(
+        1, int(getattr(model_settings, "canonical_state_adoption_grain_blocks", 1) or 1)
     )
     # Recovery takes two independent grants and neither implies the other: a
     # model opts in here, and the server separately grants a process-wide

@@ -978,6 +978,10 @@ class EnginePool:
                 "canonical_state_recovery_slice_tokens",
                 data.get("canonical_state_recovery_slice_tokens", 0),
             )
+            add(
+                "canonical_state_adoption_grain_blocks",
+                data.get("canonical_state_adoption_grain_blocks", 1),
+            )
 
         dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
         dflash_draft = data.get("dflash_draft_model")
