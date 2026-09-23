@@ -68,6 +68,16 @@ def apply() -> bool:
         logger.debug(f"mlx_vlm.gemma4 not importable for MTP runtime: {e}")
         return False
 
+    from mlx_vlm.models.gemma4 import Model
+
+    original_sanitize = Model.sanitize
+
+    def sanitize(self, weights):
+        head = {k: v for k, v in weights.items() if k.startswith("language_model.mtp.")}
+        backbone = {k: v for k, v in weights.items() if k not in head}
+        return {**original_sanitize(self, backbone), **head}
+
+    Model.sanitize = sanitize
     _patch_text_config(g4_config)
     # Gemma4 unified reuses Gemma4's LanguageModel but declares its own
     # TextConfig subclass. Retain the embedded assistant config there too so

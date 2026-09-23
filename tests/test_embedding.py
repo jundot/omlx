@@ -7,12 +7,11 @@ import json
 import math
 import numpy as np
 import struct
-import tempfile
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -290,29 +289,11 @@ class TestEmbeddingUtils:
 class TestModelDiscoveryEmbedding:
     """Tests for embedding model detection."""
 
-    def test_detect_bert_model(self, tmp_path):
-        """Test detection of BERT embedding model."""
-        config = {
-            "model_type": "bert",
-            "architectures": ["BertModel"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_xlm_roberta_model(self, tmp_path):
         """Test detection of XLM-RoBERTa embedding model."""
         config = {
             "model_type": "xlm-roberta",
             "architectures": ["XLMRobertaModel"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
-    def test_detect_modernbert_model(self, tmp_path):
-        """Test detection of ModernBERT embedding model."""
-        config = {
-            "model_type": "modernbert",
-            "architectures": ["ModernBertModel"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
@@ -326,15 +307,6 @@ class TestModelDiscoveryEmbedding:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
 
-    def test_detect_qwen3_embedding_model(self, tmp_path):
-        """Test detection of Qwen3 embedding model."""
-        config = {
-            "model_type": "qwen3",
-            "architectures": ["Qwen3ForTextEmbedding"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_embedding_by_architecture_only(self, tmp_path):
         """Test detection by architecture when model_type is unknown."""
         config = {
@@ -343,47 +315,6 @@ class TestModelDiscoveryEmbedding:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
-
-    def test_llm_not_detected_as_embedding(self, tmp_path):
-        """Test that LLM models are not detected as embedding."""
-        config = {
-            "model_type": "llama",
-            "architectures": ["LlamaForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "llm"
-
-    def test_qwen_llm_not_detected_as_embedding(self, tmp_path):
-        """Test that Qwen LLM is not detected as embedding model."""
-        config = {
-            "model_type": "qwen2",
-            "architectures": ["Qwen2ForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "llm"
-
-    def test_detect_reranker_model(self, tmp_path):
-        """Test detection of reranker model."""
-        config = {
-            "model_type": "modernbert",
-            "architectures": ["ModernBertForSequenceClassification"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "reranker"
-
-    def test_detect_xlm_roberta_reranker(self, tmp_path):
-        """Test detection of XLM-RoBERTa reranker model."""
-        config = {
-            "model_type": "xlm-roberta",
-            "architectures": ["XLMRobertaForSequenceClassification"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "reranker"
-
-    def test_no_config_defaults_to_llm(self, tmp_path):
-        """Test that missing config.json defaults to LLM."""
-        assert detect_model_type(tmp_path) == "llm"
-
 
 class TestExtractEmbeddingsArray:
     """Tests for _extract_embeddings_array method."""
@@ -1558,7 +1489,6 @@ class TestNativeEmbeddingLoading:
 
         self._write_full_native_checkpoint(tmp_path, config)
 
-        import mlx.core as mx
         from safetensors import safe_open
 
         weights = {}

@@ -45,7 +45,7 @@ final class OMLXClient: ObservableObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil) {
+    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil, session: URLSession? = nil) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
@@ -56,7 +56,7 @@ final class OMLXClient: ObservableObject {
         cfg.httpCookieAcceptPolicy = .always
         cfg.timeoutIntervalForRequest = 15
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: cfg)
+        self.session = session ?? URLSession(configuration: cfg)
 
         let enc = JSONEncoder()
         enc.keyEncodingStrategy = .convertToSnakeCase
@@ -77,6 +77,10 @@ final class OMLXClient: ObservableObject {
 
     func getGlobalSettings() async throws -> GlobalSettingsDTO {
         try await get("/admin/api/global-settings")
+    }
+
+    func getGlobalSettingsDefaults() async throws -> GlobalSettingsDTO {
+        try await get("/admin/api/global-settings/defaults")
     }
 
     func updateGlobalSettings(_ patch: GlobalSettingsPatch) async throws -> UpdateGlobalSettingsResponse {
@@ -153,6 +157,24 @@ final class OMLXClient: ObservableObject {
     @discardableResult
     func updateModelSettings(id: String, patch: ModelSettingsPatch) async throws -> SimpleStatusResponse {
         try await put(AdminAPI.modelSettings(id), body: patch)
+    }
+
+    func resetModelSettings(id: String) async throws -> SettingsApplyResultDTO {
+        try await postEmpty(AdminAPI.modelSettingsReset(id))
+    }
+
+    /// Server-side lookup of the best omlx.ai benchmarks for this device
+    /// and model (proxied like the preset refresh).
+    func listOptimalCandidates(id: String) async throws -> OptimalCandidatesDTO {
+        try await get(AdminAPI.modelSettingsOptimal(id))
+    }
+
+    func applyOptimalCandidate(id: String, benchmarkId: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsOptimal(id), body: ApplyOptimalRequest(benchmarkId: benchmarkId))
+    }
+
+    func applyRecipe(id: String, recipe: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsRecipe(id), body: ApplyRecipeRequest(recipe: recipe))
     }
 
     func listModelProfiles(id: String) async throws -> ProfileListResponse {

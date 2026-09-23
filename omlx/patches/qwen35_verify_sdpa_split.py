@@ -16,7 +16,7 @@ covering rows [c0, c1) against ``keys[: kv_len - (L - c1)]`` with
 ``mask="causal"``. (Same construction as mlx-serve's ``splitCausalSdpa``,
 measured +4..9% decode there with speculation on.)
 
-The seam is ``_target_verify_left_padded_attention``: it runs FIRST in the
+The seam is ``_qwen3_5_left_padded_attention``: it runs FIRST in the
 target-verify branch and its non-None result skips the row loop, while a
 None keeps every existing path unchanged. This patch wraps it to claim the
 batch-1 / dense-cache / head_dim-256 shape and delegate everything else
@@ -118,7 +118,7 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
     except ImportError:
         return False
 
-    original = getattr(q35_lang, "_target_verify_left_padded_attention", None)
+    original = getattr(q35_lang, "_qwen3_5_left_padded_attention", None)
     if original is None:
         logger.debug("verify-split: target-verify seam not found; patch skipped")
         return False
@@ -152,7 +152,7 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
             queries, keys, values, cache=cache, scale=scale, mask=mask
         )
 
-    q35_lang._target_verify_left_padded_attention = patched_target_verify_attention
+    q35_lang._qwen3_5_left_padded_attention = patched_target_verify_attention
     _PATCHED = True
     logger.info("Qwen3.5/3.6 verify-width causal vector attention patch applied")
     return True

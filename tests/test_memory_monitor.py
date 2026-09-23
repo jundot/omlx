@@ -551,13 +551,15 @@ class TestCollectKvLayerSpecs:
     """collect_kv_layer_specs classifies make_cache() results into the
     full / rotating / arrays layer groups admission math prices."""
 
-    def test_mixed_hybrid_model(self):
-        from mlx_lm.models.cache import (
-            ArraysCache,
-            CacheList,
-            KVCache,
-            RotatingKVCache,
-        )
+    @pytest.mark.parametrize("module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"])
+    def test_mixed_hybrid_model(self, module):
+        from importlib import import_module
+
+        cache_module = import_module(module)
+        ArraysCache = cache_module.ArraysCache
+        CacheList = cache_module.CacheList
+        KVCache = cache_module.KVCache
+        RotatingKVCache = cache_module.RotatingKVCache
 
         from omlx.memory_monitor import collect_kv_layer_specs
 
@@ -576,6 +578,16 @@ class TestCollectKvLayerSpecs:
         assert full == 3, "CacheList-wrapped KVCache must be counted"
         assert specs == [(1, 512), (4, 1024)]
         assert arrays == 2
+
+    def test_text_only_rank_without_vlm(self, monkeypatch):
+        import sys
+
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        from omlx.memory_monitor import collect_kv_layer_specs
+
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", None)
+        assert collect_kv_layer_specs([CacheList(KVCache())]) == (1, [], 0)
 
     def test_duck_typed_rotating_subclass_counts(self):
         from omlx.memory_monitor import collect_kv_layer_specs

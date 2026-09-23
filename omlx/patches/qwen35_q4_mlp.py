@@ -41,20 +41,15 @@ _Q8_MIN_TOKENS = 16384
 
 
 def register_qwen35_lm_gdn_prefill_backend(
-    backend: Callable[
-        [Any, mx.array, bool],
-        tuple[mx.array, mx.array, mx.array, mx.array] | None,
-    ]
-    | None,
+    backend: (
+        Callable[
+            [Any, mx.array, bool],
+            tuple[mx.array, mx.array, mx.array, mx.array] | None,
+        ]
+        | None
+    ),
 ) -> None:
-    """Register a first-refusal projection backend for mlx-lm GDN prefill.
-
-    mlx-vlm funnels these projections through ``_target_verify_linears``;
-    mlx-lm calls them directly inside ``GatedDeltaNet.__call__``.  Keeping the
-    hook in this outer q4 wrapper lets later accelerators intercept the active
-    mlx-lm path without replacing the recurrent GDN implementation or the MTP
-    compatibility signature.
-    """
+    """Register the shared mlx-lm and mlx-vlm GDN prefill projection backend."""
 
     global _LM_GDN_PREFILL_BACKEND
     _LM_GDN_PREFILL_BACKEND = backend
@@ -363,88 +358,151 @@ def apply_qwen35_q4_mlp_patch() -> bool:
     return patched
 
 
-def apply_qwen35_q4_prefill_linear_patch() -> bool:
-    """Patch Qwen3.5 VLM helper linears for exact q4 prefill matmuls."""
+def apply_qwen35_vlm_gdn_projection_hook():
+    """Keep ANE GDN projections on the cache-owned recurrent update path."""
+    from mlx_vlm.models.qwen3_5 import language
 
-    global _LINEAR_PATCHED
-    if _LINEAR_PATCHED:
-        return True
-    if os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0":
-        return False
-    if not _has_native_qmm():
-        logger.debug("Qwen prefill linear native qmm unavailable; patch skipped")
-        return False
+    cls = language.Qwen3_5GatedDeltaNet
+    if getattr(cls.__call__, "_omlx_gdn_projection_hook", False):
+        return
+    original = cls.__call__
 
-    try:
-        module = importlib.import_module("mlx_vlm.models.qwen3_5.language")
-    except Exception:
-        return False
+    def __call__(self, inputs, mask=None, cache=None):
+        projections = (
+            _LM_GDN_PREFILL_BACKEND(self, inputs, False)
+            if _LM_GDN_PREFILL_BACKEND is not None
+            else None
+        )
+        if projections is None:
+            return original(self, inputs, mask=mask, cache=cache)
+        B, S, _ = inputs.shape
+        mixed_qkv, z, b, a = projections
+        z = z.reshape(B, S, -1, self.head_v_dim)
 
-    if getattr(module, "_omlx_q4_prefill_linear_patched", False):
-        _LINEAR_PATCHED = True
-        return True
+        if cache is not None and cache[0] is not None:
+            conv_state = cache[0]
+            if conv_state.shape[0] != B:
+                conv_state = mx.zeros(
+                    (B, self.conv_kernel_size - 1, self.conv_dim),
+                    dtype=inputs.dtype,
+                )
+        else:
+            conv_state = mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim),
+                dtype=inputs.dtype,
+            )
 
-    orig_linear = getattr(module, "_target_verify_linear", None)
-    orig_linears = getattr(module, "_target_verify_linears", None)
-    if orig_linear is None or orig_linears is None:
-        return False
+        if mask is not None:
+            if mask.shape[0] != B:
+                mask = None
+            else:
+                mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
+        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+        if cache is not None:
+            cache.update_window(
+                0, conv_input, self.conv_kernel_size - 1, lengths=cache.lengths
+            )
+        if (
+            S == 1
+            and conv_input.shape[1] == self.conv_kernel_size
+            and self.conv1d.weight.dtype in (mx.bfloat16, mx.float16)
+        ):
+            conv_out = nn.silu(self._causal_conv1d_decode(conv_input))
+        else:
+            conv_out = nn.silu(self.conv1d(conv_input))
 
-    variant = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8"))
-    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
-    q8_min_tokens = int(
-        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
-    )
+        q, k, v = [
+            t.reshape(B, S, h, d)
+            for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+            )
+        ]
 
-    def should_route(linear: Any, x: mx.array, target_verify: bool) -> bool:
-        # Shape gates first, env kill-switch last: the runtime toggle only
-        # matters on the (rare) routed side, while decode pays this per call.
-        return (
-            not target_verify
-            and x.ndim == 3
-            and _can_route_affine_linear(linear, x, min_tokens, q8_min_tokens)
-            and os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") != "0"
+        q, k = self._normalize_qk(q, k)
+
+        out, _ = language.gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            mask=mask,
+            use_kernel=not self.training,
+            cache=cache,
         )
 
-    def patched_linear(linear, x: mx.array, target_verify: bool):
-        if should_route(linear, x, target_verify):
-            return _backend_or_qmm(linear, x, variant)
-        return orig_linear(linear, x, target_verify)
+        if cache is not None:
+            if hasattr(cache, "advance"):
+                cache.advance(S)
+                language._qwen3_5_advance_left_padding_info(cache, S)
+                language._qwen3_5_advance_lengths_info(cache, S)
 
-    def patched_linears(linears, x: mx.array, target_verify: bool):
-        if (
-            x.ndim != 3
-            or x.shape[-2] < min_tokens
-            or target_verify
-            or os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0"
+        out = self.norm(out, z)
+        return self.out_proj(out.reshape(B, S, -1))
+
+    __call__._omlx_gdn_projection_hook = True
+    cls.__call__ = __call__
+
+
+class _VLMQuantizedPrefillLinear(nn.QuantizedLinear):
+    # Every decode step calls this wrapper once per projection, so the routing
+    # thresholds are read from the environment when the patch installs.
+    _route_min_tokens = 2048
+    _route_q8_min_tokens = _Q8_MIN_TOKENS
+    _route_variant = 8
+
+    def __call__(self, x):
+        if x.ndim == 3 and _can_route_affine_linear(
+            self, x, self._route_min_tokens, self._route_q8_min_tokens
         ):
-            return orig_linears(linears, x, target_verify)
+            return _backend_or_qmm(self, x, self._route_variant)
+        return super().__call__(x)
 
-        routes = [should_route(linear, x, target_verify) for linear in linears]
-        if not any(routes):
-            return orig_linears(linears, x, target_verify)
 
-        outputs = []
-        for linear, route in zip(linears, routes, strict=False):
-            if route:
-                outputs.append(_linear_qmm(linear, x, variant))
-            else:
-                outputs.append(linear(x))
-        return tuple(outputs)
-
-    module._target_verify_linear = patched_linear
-    module._target_verify_linears = patched_linears
-    module._omlx_q4_prefill_linear_patched = True
-    module._omlx_q4_prefill_linear_original = orig_linear
-    module._omlx_q4_prefill_linears_original = orig_linears
-    _LINEAR_PATCHED = True
-    logger.info(
-        "Qwen quantized prefill linear patch applied "
-        "(variant=%d, min_tokens=%d, q8_min_tokens=%d)",
-        variant,
-        min_tokens,
-        q8_min_tokens,
+def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
+    """Route the loaded Qwen projections without replacing their forward graph."""
+    if os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0" or not _has_native_qmm():
+        return False
+    _VLMQuantizedPrefillLinear._route_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048")
     )
-    return True
+    _VLMQuantizedPrefillLinear._route_q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+    _VLMQuantizedPrefillLinear._route_variant = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8")
+    )
+    installed = False
+    projection_names = {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_a",
+        "in_proj_b",
+        "out_proj",
+    }
+    for _, module in model.named_modules():
+        if not type(module).__module__.startswith(
+            (
+                "mlx_vlm.models.qwen3_5.",
+                "mlx_vlm.models.qwen3_5_moe.",
+                "mlx_vlm.models.qwen4_exp.",
+            )
+        ):
+            continue
+        for name in projection_names:
+            linear = getattr(module, name, None)
+            if type(linear) is nn.QuantizedLinear:
+                linear.__class__ = _VLMQuantizedPrefillLinear
+                installed = True
+    return installed
 
 
 def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:

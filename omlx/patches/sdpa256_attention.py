@@ -6,12 +6,10 @@ but deliberately keeps the faster unfused path as the default on pre-NAX GPUs.
 That default materializes the full ``[n_q, query_len, kv_len]`` score matrix and
 can still exceed oMLX's memory-guard ceiling.
 
-When the unfused transient fits, this patch preserves MLX's default routing. If
-it does not fit (or no guard ceiling is available), it calls MLX 0.32.2 with
-``force_fused=True``. This replaces oMLX's old pure-array tiled implementation:
-the bounded route is now an upstream native fused kernel instead of the slow
-sequential tile loop. On NAX, MLX's default already selects its fast split-D
-head-dim-256 kernel for causal prefills with at least 1024 queries.
+When the unfused transient fits, this patch preserves MLX's default routing.
+Otherwise, it uses ``force_fused=True`` for FP16/BF16 inputs and array tiling for FP32.
+The native FP32 full-attention kernel exceeds 32 KiB of threadgroup memory.
+On NAX, MLX's default selects its fast split-D head-dim-256 kernel for causal prefills with at least 1024 queries.
 
 ``OMLX_SDPA256_TILED=1/0`` remains accepted for compatibility and now forces or
 disables the bounded route. Metal uses the native fused kernel; CUDA retains
@@ -198,6 +196,7 @@ def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
 
 def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
     """Portable bounded fallback for shapes without a native fused kernel."""
+    output_dtype = mx.result_type(queries.dtype, keys.dtype, values.dtype)
     batch, n_q, q_len, head_dim = queries.shape
     _, n_kv, k_len, _ = keys.shape
     value_dim = values.shape[-1]
@@ -256,7 +255,7 @@ def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
             m = new_max
             mx.eval(m, denom, acc)
 
-        out_tile = (acc / denom).astype(queries.dtype)
+        out_tile = (acc / denom).astype(output_dtype)
         mx.eval(out_tile)
         out_q_tiles.append(out_tile)
 
@@ -288,6 +287,9 @@ def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
     global _NATIVE_FORCE_FUSED
 
     if isinstance(mask, mx.array):
+        return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
+    # MLX promotes Q/K/V together; any FP32 input selects the 53,760-byte kernel.
+    if mx.result_type(queries.dtype, keys.dtype, values.dtype) == mx.float32:
         return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
     native_shape = values.shape[-1] == HEAD_DIM and not (
         isinstance(mask, str)

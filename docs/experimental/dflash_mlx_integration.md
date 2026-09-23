@@ -55,6 +55,7 @@ DFlashEngine is a `BaseEngine` implementation that:
 |------|------|
 | `omlx/engine/dflash.py` | DFlashEngine class — BaseEngine impl, event consumer, fallback routing |
 | `omlx/patches/dflash_laguna.py` | Laguna target adapter, gated drafter, fused-QKV loader, and mixed-cache rollback |
+| `omlx/patches/dflash_mimo_v2.py` | MiMo V2 target adapter, trained-mask loader, draft attention, and mixed-cache rollback |
 | `omlx/engine/__init__.py` | DFlashEngine export (required dependency) |
 | `omlx/engine_pool.py` | DFlash routing: checks `dflash_enabled` before engine type switch |
 | `omlx/model_settings.py` | Per-model settings: `dflash_enabled`, `dflash_draft_model`, `dflash_draft_quant_bits` |
@@ -94,6 +95,7 @@ DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOp
 | poolside/Laguna-XS-2.1-NVFP4-mlx | poolside/Laguna-XS-2.1-DFlash-NVFP4 |
 | poolside/Laguna-S-2.1 | poolside/Laguna-S-2.1-DFlash |
 | poolside/Laguna-S-2.1-NVFP4-mlx | poolside/Laguna-S-2.1-DFlash-NVFP4 |
+| Vontra/MiMo-V2.6-Flash-RL-MLX-4bit-MTP | Bundled `dflash/` checkpoint |
 | meta-models/Muse-Glimmer-30B | meta-models/Muse-Glimmer-30B-assistant |
 
 Other model families (Llama, Gemma3, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
@@ -135,6 +137,9 @@ Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also 
 | `dflash_ssd_cache` | bool | Enable DFlash L2 snapshot spill |
 
 Configured via web admin UI → Model Settings → Experimental Features → DFlash.
+MiMo V2.6 repositories can bundle their trained drafter under `dflash/`. When
+that directory contains the drafter weights and `mask_embedding.pt`, enabling
+DFlash finds it automatically; an explicitly configured draft path still wins.
 
 ---
 

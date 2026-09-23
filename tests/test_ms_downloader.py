@@ -2,8 +2,7 @@
 """Tests for the ModelScope model downloader."""
 
 import asyncio
-import time
-from pathlib import Path
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +21,15 @@ from omlx.admin.ms_downloader import (
     _get_ms_endpoint,
     _parse_ms_model_entry,
 )
+
+
+async def _wait_for(predicate, timeout: float = 5.0) -> None:
+    """Wait for a background download action to become observable."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("Timed out waiting for download state")
+        await asyncio.sleep(0.01)
 
 
 # =============================================================================
@@ -231,7 +239,7 @@ class TestMSDownloader:
             mock_get_api.return_value = mock_api
 
             await downloader.start_download("qwen/Qwen2.5-7B-Instruct-MLX")
-            await asyncio.sleep(0.5)
+            await _wait_for(lambda: mock_download.called)
 
             assert mock_download.called
             call_kwargs = mock_download.call_args[1]
@@ -245,27 +253,41 @@ class TestMSDownloader:
 
     @pytest.mark.asyncio
     async def test_cancel_download(self, downloader):
-        with patch(
-            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
-        ), patch(
-            "omlx.admin.ms_downloader._get_ms_api"
-        ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def download(**kwargs):
+            started.set()
+            try:
+                if not release.wait(timeout=5.0):
+                    raise TimeoutError("Download was not released")
+            finally:
+                finished.set()
+
+        with (
+            patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True),
+            patch("omlx.admin.ms_downloader._get_ms_api") as mock_get_api,
+            patch(
+                "omlx.admin.ms_downloader.ms_snapshot_download",
+                side_effect=download,
+            ),
         ):
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
             mock_get_api.return_value = mock_api
 
-            task = await downloader.start_download("owner/model")
-            # Allow task to start
-            await asyncio.sleep(0.1)
-
-            result = await downloader.cancel_download(task.task_id)
-            assert result is True
-            assert task.status == DownloadStatus.CANCELLED
-
-            await downloader.shutdown()
+            try:
+                task = await downloader.start_download("owner/model")
+                await _wait_for(started.is_set)
+                result = await downloader.cancel_download(task.task_id)
+                assert result is True
+                assert task.status == DownloadStatus.CANCELLED
+            finally:
+                release.set()
+                await downloader.shutdown()
+                if started.is_set():
+                    await _wait_for(finished.is_set)
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_task(self, downloader):

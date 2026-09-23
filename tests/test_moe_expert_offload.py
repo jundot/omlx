@@ -11,6 +11,8 @@ output magnitude ~5), so those cases assert a rounding-scale tolerance —
 head-room for kernel choice, not for wrong experts, which show as O(1).
 """
 
+import threading
+
 import pytest
 
 try:
@@ -28,6 +30,8 @@ if HAS_MLX:
     from omlx.patches.moe_expert_offload import (
         CheckpointExpertStore,
         OffloadSwitchGLU,
+        _io_pool,
+        _shutdown_io_pool,
         apply_moe_expert_offload,
         moe_offload_stats,
     )
@@ -223,14 +227,14 @@ class TestApplyAndForward:
         apply_moe_expert_offload(model, tmp_path, 0.25)
         glu = model.layers[0].experts.switch_glu
         fetched = []
-        inner = glu.cache.disk.fetch
+        inner = glu.cache.disk.plan
 
         def spy(proj, field, e):
             if proj == "gate_proj" and field == "weight":
                 fetched.append(e)
             return inner(proj, field, e)
 
-        glu.cache.disk.fetch = spy
+        glu.cache.disk.plan = spy
         # 2 x 60 tokens x k=2 = 240 routes: sorted kernel, ~all 32 experts
         x, i = mx.random.normal((2, 60, D)), _ri(2, 60, K)
         distinct = set(i.reshape(-1).tolist())
@@ -260,6 +264,65 @@ class TestApplyAndForward:
         got_below = model(*below)
         mx.eval(got_below)
         assert bool(mx.array_equal(ref_below, got_below))
+
+    def test_prefill_padding_preserves_small_chunk_kernel(self, tmp_path):
+        glu = _make_glu(seed=42, d=128, inter=128)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        x = mx.random.normal((2, 31, 128)).astype(mx.bfloat16)
+        # Each eight-expert chunk has 31 routes; padding to 32 would select QMM.
+        indices = mx.array(
+            [group * 8 + route % 8 for group in range(4) for route in range(31)]
+        ).reshape(2, 31, 2)
+        expected = glu(x, indices)
+        mx.eval(expected)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        actual = model.layers[0].experts.switch_glu(x, indices)
+        mx.eval(actual)
+        assert mx.array_equal(actual, expected).item()
+
+    def test_padded_prefill_on_concurrent_streams(self, tmp_path, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from omlx.patches import moe_expert_offload as offload
+
+        glu = _make_glu(seed=42)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        models = [_MiniMoE([glu]), _MiniMoE([glu])]
+        x = mx.random.normal((2, 257, D))
+        indices = _ri(2, 257, K)
+        expected = x + glu(x, indices).sum(axis=-2)
+        mx.eval(x, indices, expected)
+        for model in models:
+            apply_moe_expert_offload(model, tmp_path, 0.25)
+            offload.materialize_offload_state(model)
+
+        def unexpected_clear(*args, **kwargs):
+            pytest.fail("Offloaded forward must not clear the global Metal pool")
+
+        monkeypatch.setattr(offload, "_sync_and_clear_cache", unexpected_clear)
+        monkeypatch.setattr(mx, "clear_cache", unexpected_clear)
+        barrier = threading.Barrier(2)
+
+        def run(model):
+            stream = mx.new_stream(mx.gpu)
+            try:
+                with mx.stream(stream):
+                    for _ in range(4):
+                        barrier.wait(timeout=20)
+                        actual = model(x, indices)
+                        mx.eval(actual)
+                        assert mx.allclose(
+                            actual, expected, rtol=1e-4, atol=1e-5
+                        ).item()
+                return str(stream)
+            finally:
+                mx.synchronize(stream)
+                mx.clear_streams()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            streams = list(pool.map(run, models))
+        assert len(set(streams)) == 2
 
     def test_batch_invariance(self, tmp_path):
         model, _ = self._wrapped_model(tmp_path, n_layers=1)
@@ -561,6 +624,228 @@ class TestApplyAndForward:
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
         # OffloadSwitchGLU is not `type(...) is SwitchGLU`; nothing to rewrap
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
+
+
+class TestParallelFetch:
+    """Misses are read off the calling thread; the cache state is not.
+
+    The pool only produces bytes: slots, LRU order, eviction victims and the
+    counters are still mutated serially on the calling thread, so a parallel
+    run must be indistinguishable from a serial one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_pool(self):
+        _shutdown_io_pool()
+        yield
+        _shutdown_io_pool()
+
+    def _wrap(self, tmp_path, glu, workers, monkeypatch, fraction=0.25):
+        if workers is None:
+            monkeypatch.delenv("OMLX_MOE_OFFLOAD_IO_WORKERS", raising=False)
+        else:
+            monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", workers)
+        _shutdown_io_pool()
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, fraction) == 1
+        return model, model.layers[0].experts.switch_glu.cache
+
+    def test_parallel_fetch_matches_serial_slots(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=3)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(21)
+        calls = [(mx.random.normal((2, 3, D)), _ri(2, 3, K)) for _ in range(5)]
+
+        def run(workers):
+            model, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            outs = [model(x, i) for x, i in calls]
+            mx.eval(*outs)
+            return cache, outs
+
+        serial, out_serial = run("1")
+        parallel, out_parallel = run("16")
+
+        assert parallel.misses > parallel.capacity  # the pool actually ran
+        assert bool(mx.array_equal(serial.map, parallel.map))
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for a, b in zip(serial.resident[proj], parallel.resident[proj]):
+                assert (a is None) == (b is None)
+                if a is not None:
+                    assert bool(mx.array_equal(a, b))
+        for a, b in zip(out_serial, out_parallel):
+            assert bool(mx.array_equal(a, b))
+
+    def test_ensure_preserves_lru_order_and_counters(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=4)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(11)
+        # 12 indices per call over 8 slots: every call evicts, repeatedly
+        seq = [_ri(6, K) for _ in range(12)]
+
+        def run(workers):
+            _, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            assert cache.capacity == 8
+            for i in seq:
+                cache.ensure(i)
+            return cache
+
+        serial, parallel = run("1"), run("12")
+        assert list(serial.slot_of.items()) == list(parallel.slot_of.items())
+        assert serial.free == parallel.free
+        assert (serial.hits, serial.misses) == (parallel.hits, parallel.misses)
+        assert serial.misses > serial.capacity
+
+    @pytest.mark.parametrize("workers", ["0", "-4", "abc", "1", None])
+    def test_io_workers_env_degenerate_values(self, tmp_path, monkeypatch, workers):
+        glu = _make_glu(seed=5)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        ref = glu(x, i)
+        mx.eval(ref)
+        model, _ = self._wrap(tmp_path, glu, workers, monkeypatch)
+        got = model.layers[0].experts.switch_glu(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+        assert (_io_pool() is None) is (workers is not None)
+
+    @pytest.mark.parametrize("workers", ["1", "4"])
+    @pytest.mark.parametrize("full", [False, True])
+    def test_read_failure_preserves_cache_for_retry(
+        self, tmp_path, monkeypatch, workers, full
+    ):
+        glu = _make_glu(seed=8)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        _, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+        if full:
+            cache.ensure(mx.arange(cache.capacity))
+        before = list(cache.slot_of.items()), list(cache.free), cache.map.tolist()
+        expert = cache.capacity
+        plan = cache.disk.plan("gate_proj", "weight", expert)
+        read = CheckpointExpertStore.read
+
+        def fail_read(current):
+            if current == plan:
+                raise OSError("injected read failure")
+            return read(current)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CheckpointExpertStore, "read", staticmethod(fail_read))
+            with pytest.raises(OSError, match="injected read failure"):
+                cache.ensure(mx.array([expert]))
+        assert (list(cache.slot_of.items()), cache.free, cache.map.tolist()) == before
+        cache.ensure(mx.array([expert]))
+        slot = cache.slot_of[expert]
+        for name in cache.projs:
+            for field, actual in zip(
+                ("weight", "scales", "biases"), cache.resident[name]
+            ):
+                assert bool(
+                    mx.array_equal(actual[slot], getattr(glu, name)[field][expert])
+                )
+
+    def test_partial_write_failure_releases_slot(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=9)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        cache.ensure(mx.arange(cache.capacity))
+        victim = next(iter(cache.slot_of))
+        expert = cache.capacity
+        plan = cache.disk.plan("gate_proj", "scales", expert)
+        convert = CheckpointExpertStore.to_mx
+
+        def fail_convert(current, raw):
+            if current == plan:
+                raise ValueError("injected conversion failure")
+            return convert(current, raw)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CheckpointExpertStore, "to_mx", staticmethod(fail_convert))
+            with pytest.raises(ValueError, match="injected conversion failure"):
+                cache.ensure(mx.array([expert]))
+        assert expert not in cache.slot_of and victim not in cache.slot_of
+        assert cache.map[expert].item() == cache.map[victim].item() == -1
+        assert len(cache.free) == 1
+        cache.ensure(mx.array([expert, victim]))
+        for e in (expert, victim):
+            slot = cache.slot_of[e]
+            assert bool(
+                mx.array_equal(
+                    cache.resident["gate_proj"][0][slot], glu.gate_proj.weight[e]
+                )
+            )
+
+    def test_single_expert_window_keeps_reads_on_pool(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=10)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "1")
+        _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        read = CheckpointExpertStore.read
+        threads = []
+
+        def record(current):
+            threads.append(threading.current_thread())
+            return read(current)
+
+        monkeypatch.setattr(CheckpointExpertStore, "read", staticmethod(record))
+        cache.ensure(mx.arange(4))
+        assert len(threads) == 4 * 9
+        assert all(t is not threading.current_thread() for t in threads)
+
+    def test_store_reads_are_thread_safe(self, tmp_path):
+        glu = _make_glu(seed=6)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        store = CheckpointExpertStore(tmp_path)
+        name = "layers.0.experts.switch_glu.gate_proj.weight"
+        raws = {}
+
+        def read(e):
+            raws[e] = CheckpointExpertStore.read(store.plan_expert(name, e))
+
+        threads = [threading.Thread(target=read, args=(e,)) for e in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(raws) == 8
+        for e, raw in raws.items():  # mx stays on this thread
+            got = CheckpointExpertStore.to_mx(store.plan_expert(name, e), raw)
+            assert bool(mx.array_equal(got, glu.gate_proj["weight"][e]))
+
+    def test_prefetch_batching_bounds_inflight(self, tmp_path, monkeypatch):
+        """The pipeline may not hold more than a batch of experts' payloads:
+        that bound is the only thing standing between reading ahead and
+        buffering a whole layer's expert table in host memory."""
+        glu = _make_glu(seed=7)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "4")
+        real_read, real_to_mx = CheckpointExpertStore.read, CheckpointExpertStore.to_mx
+        lock = threading.Lock()
+        live = {"now": 0, "peak": 0}
+
+        def counting_read(plan):  # a payload exists from here ...
+            raw = real_read(plan)
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            return raw
+
+        def counting_to_mx(plan, raw):  # ... until it becomes an array
+            with lock:
+                live["now"] -= 1
+            return real_to_mx(plan, raw)
+
+        monkeypatch.setattr(CheckpointExpertStore, "read", staticmethod(counting_read))
+        monkeypatch.setattr(
+            CheckpointExpertStore, "to_mx", staticmethod(counting_to_mx)
+        )
+        _, cache = self._wrap(tmp_path, glu, "8", monkeypatch)
+        assert _io_pool() is not None
+        mx.random.seed(5)
+        for _ in range(6):
+            cache.ensure(_ri(8, K))
+        assert cache.misses > cache.capacity
+        assert live["peak"] <= 4 * 9  # batch x tensors per expert
+        assert live["now"] == 0  # nothing left holding bytes
 
 
 @pytest.mark.slow

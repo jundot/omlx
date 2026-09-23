@@ -25,6 +25,7 @@ from .control_plane import RankControlPlane
 from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
+    decode_worker_stage_links,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
@@ -43,6 +44,7 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
+from .rdma.stage_transport import install_stage_links
 from .runtime_optimizations import install_runtime_optimizations
 from .telemetry import install_server_telemetry
 
@@ -1406,13 +1408,22 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
-            with install_runtime_optimizations(
-                provider.model,
-                group,
-                execution,
-                batchable=provider.is_batchable,
-                pipeline_parallel=tensor_parallel_size == 1,
-            ) as optimizations:
+            # Installed first so the runtime optimizations wrap the RDMA-aware send.
+            with (
+                install_stage_links(
+                    mx,
+                    group,
+                    decode_worker_stage_links(args.plan),
+                    rank=rank,
+                ) as stage_links,
+                install_runtime_optimizations(
+                    provider.model,
+                    group,
+                    execution,
+                    batchable=provider.is_batchable,
+                    pipeline_parallel=tensor_parallel_size == 1,
+                ) as optimizations,
+            ):
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1430,6 +1441,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
+                    stage_links=stage_links,
                     output_protocol=protocol or None,
                 )
                 _emit_event(
@@ -1448,6 +1460,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         "capacity_bytes": assignment.capacity_bytes,
                         "reserve_bytes": assignment.reserve_bytes,
                         "headroom_bytes": assignment.headroom_bytes,
+                        "stage_links": stage_links,
                     }
                 )
                 if rank == 0:

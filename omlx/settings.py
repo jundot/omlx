@@ -130,6 +130,30 @@ def get_ssd_capacity(path: str | Path) -> int:
         return 500 * 1024**3
 
 
+def get_auto_ssd_cache_size(cache_dir: Path) -> int:
+    """Estimate the automatic budget before the runtime cache index is loaded."""
+    check_path = cache_dir
+    while not check_path.exists() and check_path.parent != check_path:
+        check_path = check_path.parent
+    free_bytes = shutil.disk_usage(check_path).free
+    cache_bytes = 0
+    roots = [cache_dir / prefix for prefix in "0123456789abcdef"]
+    roots.append(cache_dir / "_gdn_sidecars")
+    for root in roots:
+        if root.is_symlink():
+            continue
+        for directory, _, names in os.walk(root, followlinks=False):
+            for name in names:
+                path = Path(directory) / name
+                if path.suffix != ".safetensors" or path.is_symlink():
+                    continue
+                try:
+                    cache_bytes += path.stat().st_size
+                except FileNotFoundError:
+                    pass  # A runtime writer can evict files during the scan.
+    return (free_bytes + cache_bytes) // 2
+
+
 # Burst Decode UI modes -> (decode_burst_max_steps, decode_burst_budget_single_s).
 # These mirror the OMLX_DECODE_BURST_* env vars read by EngineConfig
 # (engine_core.py). "off" fully disables bursting via max_steps=1; the on-levels
@@ -344,7 +368,7 @@ class CacheSettings:
     enabled: bool = True
     hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
-    ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
+    ssd_cache_max_size: str = "auto"  # "auto" reserves half of available cache space
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     # When True (and the hot cache is enabled), every saved block is kept in
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
@@ -419,11 +443,11 @@ class CacheSettings:
             base_path: Base oMLX directory.
 
         Returns:
-            Max SSD cache size in bytes (10% of SSD if "auto").
+            Max SSD cache size in bytes (half of free space plus existing cache for "auto").
         """
         if self.ssd_cache_max_size.lower() == "auto":
             cache_dir = self.get_ssd_cache_dir(base_path)
-            return int(get_ssd_capacity(cache_dir) * 0.1)
+            return get_auto_ssd_cache_size(cache_dir)
         return parse_size(self.ssd_cache_max_size)
 
     def get_hot_cache_max_size_bytes(self) -> int:
@@ -615,6 +639,7 @@ class AuthSettings:
     api_key: str | None = None
     secret_key: str | None = None
     skip_api_key_verification: bool = False
+    allow_unauthenticated_inference: bool = False
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -623,6 +648,7 @@ class AuthSettings:
             "api_key": self.api_key,
             "secret_key": self.secret_key,
             "skip_api_key_verification": self.skip_api_key_verification,
+            "allow_unauthenticated_inference": self.allow_unauthenticated_inference,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
         }
 
@@ -633,6 +659,9 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
+            allow_unauthenticated_inference=data.get(
+                "allow_unauthenticated_inference", False
+            ),
             sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
@@ -815,15 +844,24 @@ class UISettings:
     """Admin UI settings."""
 
     language: str = "en"
+    # Admin dashboard block layout. None means the built-in default layout.
+    dashboard_layout: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"language": self.language}
+        return {
+            "language": self.language,
+            "dashboard_layout": self.dashboard_layout,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UISettings:
         """Create from dictionary."""
-        return cls(language=data.get("language", "en"))
+        layout = data.get("dashboard_layout")
+        return cls(
+            language=data.get("language", "en"),
+            dashboard_layout=layout if isinstance(layout, dict) else None,
+        )
 
 
 @dataclass
@@ -1442,7 +1480,6 @@ class GlobalSettings:
         """Save current settings to the settings file."""
         self.ensure_directories()
 
-        settings_file = self.base_path / "settings.json"
         data = {
             "version": SETTINGS_VERSION,
             "server": self.server.to_dict(),
@@ -1464,6 +1501,21 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        self._save_data(data)
+
+    def ensure_inference_auth_setting(self) -> None:
+        """Add the manual opt-in default without persisting runtime overrides."""
+        path = self.base_path / "settings.json"
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        auth = data.setdefault("auth", {})
+        if "allow_unauthenticated_inference" in auth:
+            return
+        auth["allow_unauthenticated_inference"] = False
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        self._save_data(data)
+
+    def _save_data(self, data: dict[str, Any]) -> None:
+        settings_file = self.base_path / "settings.json"
         # Write to a temp file and rename so a crash or a concurrent
         # writer can never leave a torn settings.json (same pattern as
         # ModelSettingsManager._save). The rename also carries the temp
@@ -1550,6 +1602,9 @@ class GlobalSettings:
             List of validation error messages (empty if valid).
         """
         errors = []
+
+        if type(self.auth.allow_unauthenticated_inference) is not bool:
+            errors.append("auth.allow_unauthenticated_inference must be a boolean")
 
         # Server validation
         if not 1 <= self.server.port <= 65535:
@@ -1826,6 +1881,7 @@ class GlobalSettings:
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
                 self.base_path
             ),
+            paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),

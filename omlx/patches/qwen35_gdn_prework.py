@@ -2,7 +2,7 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 3..9).
+"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 2..9).
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
@@ -17,8 +17,8 @@ donor kernel: the in-kernel sigmoid uses MLX's own unary formula
 inputs; the RMS applies the ones-weight rounding then the separate scalar
 multiply's rounding — the composed chain's two casts.
 
-S >= 3 is a HARD gate: the next conv state is copied from qkv rows only,
-which is wrong when a state row would still come from the OLD conv state.
+For S=2, the next conv state retains one row from the old conv state.
+Longer verify windows fill the entire next state from the new qkv rows.
 Only the target-verify arm routes here; decode (S=1) and prefill keep the
 stock path.
 """
@@ -26,6 +26,7 @@ stock path.
 from __future__ import annotations
 
 import logging
+import sys
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -38,10 +39,12 @@ _KERNEL = None
 _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
+_VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
     uint lane = thread_position_in_threadgroup.x;
-    uint row = threadgroup_position_in_grid.y;
+    uint batch_idx = threadgroup_position_in_grid.y / uint(S);
+    uint row = threadgroup_position_in_grid.y % uint(S);
     uint logical_head = threadgroup_position_in_grid.z;
     constexpr uint q_heads = uint(HK);
     constexpr uint k_head_base = uint(HK);
@@ -55,47 +58,89 @@ _SOURCE = """
                                : 2 * uint(HK) * uint(DK) + head * uint(DV));
     T activated[4];
     float sumsq = 0.0f;
+    T l2acc = T(0);
     for (uint i = 0; i < 4; ++i) {
         uint channel = channel_base + lane * 4 + i;
         float acc = 0.0f;
         for (uint tap = 0; tap < 4; ++tap) {
             uint input_row = row + tap;
             const T xv = input_row < uint(NKEEP)
-                ? conv_state[input_row * uint(C) + channel]
-                : qkv[(input_row - uint(NKEEP)) * uint(C) + channel];
+                ? conv_state[(batch_idx * uint(NKEEP) + input_row) * uint(C) + channel]
+                : qkv[(batch_idx * uint(S) + input_row - uint(NKEEP)) * uint(C) + channel];
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
         T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
         const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
         activated[i] = act;
-        float value = float(act);
-        sumsq += value * value;
+        if (L2) {
+            const T sqv = T(float(act) * float(act));
+            l2acc = T(float(l2acc) + float(sqv));
+        } else {
+            float value = float(act);
+            sumsq += value * value;
+        }
     }
     if (is_q || is_k) {
-        sumsq = simd_sum(sumsq);
-        float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
-        const T scale = is_q ? q_scale : k_scale;
-        uint out_base = (row * uint(HK) + head) * uint(DK) + lane * 4;
-        for (uint i = 0; i < 4; ++i) {
-            const T rms = T(1) * T(float(activated[i]) * inv);
-            const T value = scale * rms;
-        if (is_q) {
-            q_out[out_base + i] = value;
+        uint out_base = ((batch_idx * uint(S) + row) * uint(HK) + head) * uint(DK) + lane * 4;
+        if (L2) {
+            // Stock Qwen4 L2 chain: x * rsqrt(sum(square(x), -1) + 1e-6),
+            // with dk^-0.5 applied to q only.  mx.square rounds per
+            // element; mx.sum accumulates each lane's four contiguous
+            // bf16 values sequentially, reduces with an fp32 xor tree and
+            // rounds once.  Mirror every rounding site exactly.
+            float tv = float(l2acc);
+            tv += simd_shuffle_xor(tv, short(16));
+            tv += simd_shuffle_xor(tv, short(8));
+            tv += simd_shuffle_xor(tv, short(4));
+            tv += simd_shuffle_xor(tv, short(2));
+            tv += simd_shuffle_xor(tv, short(1));
+            const T eps = T(float(T(tv)) + float(T(1e-6f)));
+            const T inv = T(metal::precise::rsqrt(float(eps)));
+            for (uint i = 0; i < 4; ++i) {
+                const T l2 = T(float(activated[i]) * float(inv));
+                const T value = is_q ? T(float(l2) * float(q_scale)) : l2;
+                if (is_q) {
+                    q_out[out_base + i] = value;
+                } else {
+                    k_out[out_base + i] = value;
+                }
+            }
         } else {
-            k_out[out_base + i] = value;
-        }
+            sumsq = simd_sum(sumsq);
+            float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+            const T scale = is_q ? q_scale : k_scale;
+            for (uint i = 0; i < 4; ++i) {
+                const T rms = T(1) * T(float(activated[i]) * inv);
+                const T value = scale * rms;
+                if (is_q) {
+                    q_out[out_base + i] = value;
+                } else {
+                    k_out[out_base + i] = value;
+                }
+            }
         }
     } else {
-        uint out_base = (row * uint(HV) + head) * uint(DV) + lane * 4;
+        uint out_base = ((batch_idx * uint(S) + row) * uint(HV) + head) * uint(DV) + lane * 4;
         for (uint i = 0; i < 4; ++i) {
             v_out[out_base + i] = activated[i];
         }
     }
+    if (S < NKEEP && row == 0) {
+        for (uint old_row = 0; old_row < uint(NKEEP - S); ++old_row) {
+            uint dst = (batch_idx * uint(NKEEP) + old_row) * uint(C)
+                       + channel_base + lane * 4;
+            uint src = (batch_idx * uint(NKEEP) + old_row + uint(S)) * uint(C)
+                       + channel_base + lane * 4;
+            for (uint i = 0; i < 4; ++i) {
+                conv_out[dst + i] = conv_state[src + i];
+            }
+        }
+    }
     if (row + uint(NKEEP) >= uint(S)) {
         uint state_row = row + uint(NKEEP) - uint(S);
-        uint raw_base = row * uint(C) + channel_base + lane * 4;
-        uint state_base = state_row * uint(C) + channel_base + lane * 4;
+        uint raw_base = (batch_idx * uint(S) + row) * uint(C) + channel_base + lane * 4;
+        uint state_base = (batch_idx * uint(NKEEP) + state_row) * uint(C) + channel_base + lane * 4;
         for (uint i = 0; i < 4; ++i) {
             conv_out[state_base + i] = qkv[raw_base + i];
         }
@@ -262,8 +307,15 @@ def _kernel():
     return _KERNEL
 
 
-def gdn_prework_fused(qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, dk, dv):
-    """One fused dispatch. qkv [1,S,C], conv_state [1,3,C], conv_w [C,4,1]."""
+def gdn_prework_fused(
+    qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, dk, dv, l2=False
+):
+    """One fused dispatch. qkv [B,S,C], conv_state [B,3,C], conv_w [C,4,1].
+
+    l2=True selects the Qwen4 L2 q/k normalization (q_scale carries the
+    dk^-0.5 query scale); otherwise the Qwen3.5 RMS scaling is used.
+    """
+    batch_size = qkv.shape[0]
     s_len = qkv.shape[1]
     c_dim = qkv.shape[2]
     outs = _kernel()(
@@ -277,14 +329,15 @@ def gdn_prework_fused(qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, dk, dv)
             ("NKEEP", 3),
             ("C", c_dim),
             ("S", s_len),
+            ("L2", 1 if l2 else 0),
         ],
-        grid=(32, s_len, 2 * hk + hv),
+        grid=(32, batch_size * s_len, 2 * hk + hv),
         threadgroup=(32, 1, 1),
         output_shapes=[
-            (1, s_len, hk, dk),
-            (1, s_len, hk, dk),
-            (1, s_len, hv, dv),
-            (1, 3, c_dim),
+            (batch_size, s_len, hk, dk),
+            (batch_size, s_len, hk, dk),
+            (batch_size, s_len, hv, dv),
+            (batch_size, 3, c_dim),
         ],
         output_dtypes=[qkv.dtype] * 4,
     )
@@ -449,8 +502,10 @@ def _qwen4_decode_static_eligible(module) -> bool:
     ):
         return False
 
+    # The q4 prefill routing reclasses these projections to a QuantizedLinear
+    # subclass; the fused decode reads their packed storage, not their forward.
     def canonical_projection(linear, rows, signatures):
-        if type(linear) is not nn.QuantizedLinear or linear.mode != "affine":
+        if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
             return False
         signature = (linear.bits, linear.group_size)
         if signature not in signatures:
@@ -489,7 +544,7 @@ def _qwen4_decode_static_eligible(module) -> bool:
 
     out = module.out_proj
     return (
-        type(out) is nn.QuantizedLinear
+        isinstance(out, nn.QuantizedLinear)
         and out.bits == 5
         and out.group_size == 128
         and out.mode == "affine"
@@ -537,290 +592,217 @@ def _qwen4_decode_dynamic_eligible(
     )
 
 
-def apply_qwen35_gdn_prework_patch() -> bool:
-    """Route the batch-1 target-verify GDN prework through the fused kernel.
+def _qwen4_l2_norm_sites():
+    """Return the (verifier, layer) normalize functions of the loaded qwen4_exp.
 
-    Wraps ``Qwen3_5GatedDeltaNet.__call__``: the fused arm re-implements the
-    verify forward using the module's own weights and the SAME module-level
-    helpers (recurrence, sink capture, cache advance); every other shape
-    falls through to the original untouched. Any failure inside the fused
-    arm falls back to the original call for that layer permanently.
+    Looked up in sys.modules only: importing qwen4_exp here would pin the
+    upstream copy before the compat vendor registers its own.
     """
+    q4_lang = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+    if q4_lang is None:
+        return None
+    verifier_cls = getattr(q4_lang, "_Qwen4Verifier", None) or getattr(
+        q4_lang, "Qwen4ExpBatchInvariantForward", None
+    )
+    gdn_cls = getattr(q4_lang, "Qwen4ExpGatedDeltaNet", None)
+    if verifier_cls is None or gdn_cls is None:
+        return None
+    return (
+        verifier_cls._normalize_gated_delta_qk,
+        getattr(gdn_cls, "_normalize_qk", None),
+    )
+
+
+def apply_qwen35_gdn_prework_patch() -> bool:
+    """Install fused prework at ordinary decode and speculative entry points."""
     global _PATCHED
     if _PATCHED:
         return True
     if not mx.metal.is_available():
         return False
 
-    try:
-        from mlx_vlm.models.qwen3_5 import language as q35
-    except ImportError:
-        return False
-
-    needed = (
-        "Qwen3_5GatedDeltaNet",
-        "_target_verify_linears",
-        "_target_verify_linear",
-        "_gated_delta_update_verify_decode",
-        "_qwen3_5_advance_left_padding_info",
-        "_qwen3_5_advance_lengths_info",
-    )
-    if not all(hasattr(q35, n) for n in needed):
-        logger.debug("gdn prework: upstream seams missing; patch skipped")
-        return False
+    from mlx_vlm.models.qwen3_5 import language as q35
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.speculative.ops.linear import _target_verify_linears
 
     cls = q35.Qwen3_5GatedDeltaNet
-    if getattr(cls, "_omlx_gdn_prework_patched", False):
-        _PATCHED = True
-        return True
+    original = cls.__call__
+    original_verify = Qwen3_5BatchInvariantForward._gated_delta
 
-    orig_call = cls.__call__
-    disabled = {"flag": False}
-    qwen4_decode_disabled = {"flag": False}
+    def decode(self, inputs, mask=None, cache=None):
+        if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
+            return original(self, inputs, mask=mask, cache=cache)
+        mixed_qkv, z, b, a = _target_verify_linears(
+            (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a), inputs
+        )
+        inv = self.head_k_dim**-0.5
+        q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
+            mixed_qkv,
+            cache[0],
+            self.conv1d.weight,
+            mx.array(inv * inv, dtype=mx.bfloat16),
+            mx.array(inv, dtype=mx.bfloat16),
+            b,
+            a,
+            self.A_log,
+            self.dt_bias,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        )
+        out, state = _qwen4_decode_recurrence(q, k, v, g, beta, cache[1])
+        flat = qwen4_decode_norm_gate_fused(
+            out,
+            z,
+            self.norm.weight,
+            hv=self.num_v_heads,
+            dv=self.head_v_dim,
+            eps=self.norm.eps,
+        )
+        result = self.out_proj(flat)
+        cache[0], cache[1] = conv_state, state
+        if hasattr(cache, "advance"):
+            cache.advance(1)
+            q35._qwen3_5_advance_left_padding_info(cache, 1)
+            q35._qwen3_5_advance_lengths_info(cache, 1)
+        global _QWEN4_DECODE_ENGAGED_LOGGED
+        if not _QWEN4_DECODE_ENGAGED_LOGGED:
+            _QWEN4_DECODE_ENGAGED_LOGGED = True
+            logger.info("Qwen4 fused B1/T1 GDN decode prework and norm-gate engaged")
+        return result
 
-    def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
-        if gdn_sink is None or cache is None:
-            return False
-        if inputs.shape[0] != 1 or not (3 <= s_len <= 9):
-            return False
-        if mask is not None:
-            return False
-        if inputs.dtype != mx.bfloat16:
-            return False
-        if getattr(self, "conv_kernel_size", 0) != 4:
-            return False
-        if self.head_k_dim != 128 or self.head_v_dim != 128:
-            return False
-        if getattr(cache, "lengths", None) is not None:
-            return False
-        conv_state = cache[0]
-        if conv_state is None or conv_state.shape[0] != 1:
-            return False
-        if conv_state.dtype != mx.bfloat16:
-            return False
-        if self.conv1d.weight.dtype != mx.bfloat16:
-            return False
-        return getattr(self.conv1d, "bias", None) is None
-
-    def patched_call(self, inputs, mask=None, cache=None, gdn_sink=None,
-                     target_verify=False):
-        S = inputs.shape[1]
-        if (
-            not qwen4_decode_disabled["flag"]
-            and _qwen4_decode_dynamic_eligible(
-                self,
-                inputs,
-                mask,
-                cache,
-                gdn_sink,
-                target_verify,
+    def verify(verifier, layer, inputs, mask, cache):
+        length = inputs.shape[1]
+        # The fused prework emits either the stock Qwen3.5 RMS scaling or
+        # the stock Qwen4 L2 scaling (L2 kernel variant), bit-exact to the
+        # normalize implementation each verifier class installs.
+        compatible_norm = (
+            type(verifier)._normalize_gated_delta_qk
+            is Qwen3_5BatchInvariantForward._normalize_gated_delta_qk
+        )
+        l2_norm = False
+        if not compatible_norm:
+            sites = _qwen4_l2_norm_sites()
+            l2_norm = (
+                sites is not None
+                and type(verifier)._normalize_gated_delta_qk is sites[0]
+                and sites[1] is not None
+                and getattr(type(layer), "_normalize_qk", None) is sites[1]
             )
+        if not (
+            (compatible_norm or l2_norm)
+            and cache is not None
+            and cache.is_speculating
+            and 2 <= length <= 9
+            and mask is None
+            and inputs.dtype == mx.bfloat16
+            and layer.conv_kernel_size == 4
+            and layer.head_k_dim == 128
+            and layer.head_v_dim == 128
+            and cache.lengths is None
+            and cache[0] is not None
+            and cache[0].shape[0] == inputs.shape[0]
+            and cache[0].dtype == mx.bfloat16
+            and layer.conv1d.weight.dtype == mx.bfloat16
+            and getattr(layer.conv1d, "bias", None) is None
         ):
-            conv_state = cache[0]
-            recurrent_state = cache[1]
-            try:
-                mixed_qkv, z, b, a = q35._target_verify_linears(
-                    (
-                        self.in_proj_qkv,
-                        self.in_proj_z,
-                        self.in_proj_b,
-                        self.in_proj_a,
-                    ),
-                    inputs,
-                    False,
-                )
-                inv_scale = self.head_k_dim**-0.5
-                q_scale = getattr(self, "_omlx_qwen4_decode_q_scale", None)
-                k_scale = getattr(self, "_omlx_qwen4_decode_k_scale", None)
-                if q_scale is None or k_scale is None:
-                    q_scale = mx.array(
-                        inv_scale * inv_scale,
-                        dtype=mx.bfloat16,
+            global _VERIFY_REJECT_DIAG
+            # Only T>=2 verify calls can engage; skip S=1 decode probes.
+            if cache is not None and length >= 2 and _VERIFY_REJECT_DIAG < 3:
+                _VERIFY_REJECT_DIAG += 1
+                failed = [
+                    name
+                    for name, ok in (
+                        ("norm", compatible_norm or l2_norm),
+                        ("speculating", cache.is_speculating),
+                        ("length", 2 <= length <= 9),
+                        ("mask", mask is None),
+                        ("inputs_bf16", inputs.dtype == mx.bfloat16),
+                        ("conv_kernel", layer.conv_kernel_size == 4),
+                        ("dk128", layer.head_k_dim == 128),
+                        ("dv128", layer.head_v_dim == 128),
+                        ("lengths", cache.lengths is None),
+                        (
+                            "c0",
+                            cache[0] is not None
+                            and cache[0].shape[0] == inputs.shape[0]
+                            and cache[0].dtype == mx.bfloat16,
+                        ),
+                        (
+                            "conv_w",
+                            layer.conv1d.weight.dtype == mx.bfloat16
+                            and getattr(layer.conv1d, "bias", None) is None,
+                        ),
                     )
-                    k_scale = mx.array(inv_scale, dtype=mx.bfloat16)
-                    self._omlx_qwen4_decode_q_scale = q_scale
-                    self._omlx_qwen4_decode_k_scale = k_scale
-
-                q, k, v, next_conv_state, g, beta = (
-                    qwen4_decode_prework_fused(
-                        mixed_qkv,
-                        conv_state,
-                        self.conv1d.weight,
-                        q_scale,
-                        k_scale,
-                        b,
-                        a,
-                        self.A_log,
-                        self.dt_bias,
-                        self.num_k_heads,
-                        self.num_v_heads,
-                        self.head_k_dim,
-                        self.head_v_dim,
-                    )
-                )
-                out, next_recurrent_state = _qwen4_decode_recurrence(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    recurrent_state,
-                )
-                flat = qwen4_decode_norm_gate_fused(
-                    out,
-                    z,
-                    self.norm.weight,
-                    hv=self.num_v_heads,
-                    dv=self.head_v_dim,
-                    eps=self.norm.eps,
-                )
-                result = q35._target_verify_linear(
-                    self.out_proj,
-                    flat,
-                    False,
-                )
-
-                # Commit cache ownership only after every fallible graph
-                # construction step succeeded.  This mirrors the verify
-                # route below and keeps a fallback from applying the token
-                # twice after a late error.
-                cache[0] = next_conv_state
-                cache[1] = next_recurrent_state
-                if hasattr(cache, "advance"):
-                    cache.advance(1)
-                    q35._qwen3_5_advance_left_padding_info(cache, 1)
-                    q35._qwen3_5_advance_lengths_info(cache, 1)
-
-                global _QWEN4_DECODE_ENGAGED_LOGGED
-                if not _QWEN4_DECODE_ENGAGED_LOGGED:
-                    _QWEN4_DECODE_ENGAGED_LOGGED = True
-                    logger.info(
-                        "Qwen4 fused B1/T1 GDN decode prework and norm-gate "
-                        "engaged"
-                    )
-                return result
-            except Exception:
-                cache[0] = conv_state
-                cache[1] = recurrent_state
-                qwen4_decode_disabled["flag"] = True
-                logger.warning(
-                    "Qwen4 fused GDN decode arm failed; reverting to stock "
-                    "for the rest of the process",
-                    exc_info=True,
-                )
-
-        if disabled["flag"] or not _eligible(self, inputs, mask, cache, gdn_sink, S):
-            return orig_call(self, inputs, mask=mask, cache=cache,
-                             gdn_sink=gdn_sink, target_verify=target_verify)
-        # Captured before the try block (and before any fallible op) so the
-        # except branch always has the pre-mutation state to restore, even
-        # if the failure happens before this point is normally reached.
-        conv_state = cache[0]
-        recurrent_state = cache[1]
-        sink_len = len(gdn_sink) if gdn_sink is not None else 0
-        try:
-            B = 1
-            mixed_qkv, z, b, a = q35._target_verify_linears(
-                (self.in_proj_qkv, self.in_proj_z, self.in_proj_b,
-                 self.in_proj_a),
-                inputs,
-                True,
-            )
-            z = z.reshape(B, S, -1, self.head_v_dim)
-
-            if not hasattr(self, "_omlx_gdn_scales"):
-                inv = self.head_k_dim ** -0.5
-                self._omlx_gdn_scales = (
-                    mx.array(inv * inv, dtype=mx.bfloat16),
-                    mx.array(inv, dtype=mx.bfloat16),
-                )
-            q_scale, k_scale = self._omlx_gdn_scales
-
-            q, k, v, new_conv_state = gdn_prework_fused(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight,
-                q_scale,
-                k_scale,
-                self.num_k_heads,
-                self.num_v_heads,
-                self.head_k_dim,
-                self.head_v_dim,
-            )
-            cache[0] = new_conv_state
-
-            state = recurrent_state
-            if state is not None and state.shape[0] != B:
-                state = None
-            initial_state = state
-            out, state, intermediate_states = (
-                q35._gated_delta_update_verify_decode(
-                    q, k, v, a, b, self.A_log, self.dt_bias, state, None,
-                    use_kernel=not self.training,
-                )
-            )
-            # The rollback capture wants the conv INPUT window; build it
-            # lazily — it is only evaluated on a partial accept.
-            conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-            gdn_sink.append(
-                (
-                    q, k, v, a, b, self.A_log, self.dt_bias, initial_state,
-                    None, conv_input, self.conv_kernel_size,
-                    intermediate_states,
-                )
-            )
-
-            cache[1] = state
-
-            global _ENGAGED_LOGGED
-            if not _ENGAGED_LOGGED:
-                _ENGAGED_LOGGED = True
+                    if not ok
+                ]
                 logger.info(
-                    "[gdn-prework] fused verify prework engaged (S=%d)", S
+                    "[gdn-prework] verify gate reject: %s (verifier=%s S=%d l2=%s)",
+                    failed,
+                    type(verifier).__name__,
+                    length,
+                    l2_norm,
                 )
-
-            out = self.norm(out, z)
-            result = q35._target_verify_linear(
-                self.out_proj, out.reshape(B, S, -1), True
+            return original_verify(verifier, layer, inputs, mask, cache)
+        mixed_qkv, z, b, a = verifier._linears(
+            (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a),
+            inputs,
+        )
+        inv = layer.head_k_dim**-0.5
+        if l2_norm:
+            q_scale = mx.array(inv, dtype=mx.bfloat16)
+            k_scale = mx.array(1.0, dtype=mx.bfloat16)
+        else:
+            q_scale = mx.array(inv * inv, dtype=mx.bfloat16)
+            k_scale = mx.array(inv, dtype=mx.bfloat16)
+        q, k, v, conv_state = gdn_prework_fused(
+            mixed_qkv,
+            cache[0],
+            layer.conv1d.weight,
+            q_scale,
+            k_scale,
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_k_dim,
+            layer.head_v_dim,
+            l2=l2_norm,
+        )
+        conv_input = mx.concatenate([cache[0], mixed_qkv], axis=1)
+        cache.record_speculative_window(0, conv_input, layer.conv_kernel_size - 1)
+        cache[0] = conv_state
+        out, _ = q35.gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            layer.A_log,
+            layer.dt_bias,
+            cache=cache,
+            use_kernel=not layer.training,
+        )
+        if hasattr(cache, "advance"):
+            cache.advance(length)
+            q35._qwen3_5_advance_left_padding_info(cache, length)
+            q35._qwen3_5_advance_lengths_info(cache, length)
+        out = layer.norm(out, z.reshape(inputs.shape[0], length, -1, layer.head_v_dim))
+        result = verifier._linear(
+            layer.out_proj, out.reshape(inputs.shape[0], length, -1)
+        )
+        global _ENGAGED_LOGGED
+        if not _ENGAGED_LOGGED:
+            _ENGAGED_LOGGED = True
+            logger.info(
+                "[gdn-prework] fused verify prework engaged (S=%d, l2=%s)",
+                length,
+                l2_norm,
             )
-            # Deferred to the very end, after every fallible step has
-            # succeeded: advancing here and then hitting an exception below
-            # would double-advance once the except branch below falls back
-            # to orig_call, which advances the cache itself.
-            if hasattr(cache, "advance"):
-                cache.advance(S)
-                q35._qwen3_5_advance_left_padding_info(cache, S)
-                q35._qwen3_5_advance_lengths_info(cache, S)
-            return result
-        except Exception:
-            disabled["flag"] = True
-            # cache[0] may already hold the fused kernel's post-update conv
-            # state (set above, before the delta update that can raise);
-            # orig_call's stock path recomputes conv from scratch and
-            # expects the pre-call state, so restore it before falling back
-            # -- otherwise it silently double-applies the conv step.
-            cache[0] = conv_state
-            # A late failure can also happen after the recurrent delta state
-            # has been committed to cache[1]. The stock fallback consumes the
-            # same tokens again, so it must start from the original recurrent
-            # state as well or silently double-apply the delta update.
-            cache[1] = recurrent_state
-            # A failure after the sink append (norm/out_proj) would leave
-            # the fused entry in place while orig_call appends the stock
-            # one -- two entries for one layer call shifts every later
-            # layer's rollback capture. Drop anything this call appended.
-            if gdn_sink is not None:
-                del gdn_sink[sink_len:]
-            logger.warning(
-                "gdn prework fused arm failed; reverting to stock for the "
-                "rest of the process",
-                exc_info=True,
-            )
-            return orig_call(self, inputs, mask=mask, cache=cache,
-                             gdn_sink=gdn_sink, target_verify=target_verify)
+        return result
 
-    cls.__call__ = patched_call
+    cls.__call__ = decode
     cls._omlx_gdn_prework_patched = True
+    Qwen3_5BatchInvariantForward._gated_delta = verify
     _PATCHED = True
-    logger.info("Qwen3.5/3.6 fused GDN verify prework patch applied")
+    logger.info("Qwen fused GDN prework patch applied")
     return True

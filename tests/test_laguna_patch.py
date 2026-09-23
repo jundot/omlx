@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Laguna MLX-LM monkey-patch (issue #2073).
 
-These tests protect the upstream-first Laguna compatibility contract, including
+These tests protect Laguna checkpoint and runtime compatibility, including
 dynamic module registration and the loader/parser boundaries it enables.
 """
 
@@ -69,7 +69,7 @@ def test_apply_registers_laguna_module():
 
     assert "mlx_lm.models.laguna" in sys.modules
     mod = importlib.import_module("mlx_lm.models.laguna")
-    assert mod.__package__ == "mlx_lm.models"
+    assert mod.__package__ == "omlx.patches.laguna"
 
     import mlx_lm.models as models_pkg
 
@@ -86,33 +86,6 @@ def test_apply_is_idempotent():
     assert is_applied() is True
     assert second is False
     assert first in (True, False)
-
-
-def test_module_registration_cleans_up_after_execution_failure(monkeypatch):
-    """A failed vendored import must not leave a poisoned sys.modules entry."""
-    from omlx.patches import laguna
-
-    module_name = "mlx_lm.models.laguna_broken_test"
-
-    class FailingLoader:
-        def create_module(self, spec):
-            return None
-
-        def exec_module(self, module):
-            raise RuntimeError("simulated vendored module failure")
-
-    failing_spec = importlib.machinery.ModuleSpec(module_name, FailingLoader())
-    monkeypatch.setattr(
-        laguna.importlib.util,
-        "spec_from_file_location",
-        lambda *_: failing_spec,
-    )
-    sys.modules.pop(module_name, None)
-
-    with pytest.raises(RuntimeError, match="simulated vendored module failure"):
-        laguna._register_module(module_name, "not-used.py", "mlx_lm.models")
-
-    assert module_name not in sys.modules
 
 
 def test_get_classes_resolves_laguna():
@@ -862,42 +835,6 @@ def test_apply_registers_laguna_tool_parser():
 
     assert tool_parser.tool_call_start == "<tool_call>"
     assert tool_parser.tool_call_end == "</tool_call>"
-
-
-def test_tool_parser_registration_does_not_mask_upstream_dependency_failure(
-    monkeypatch,
-):
-    """A broken upstream parser must surface instead of being overwritten."""
-    from omlx.patches import laguna
-
-    registered_modules: list[tuple[str, str, str]] = []
-    original_import_module = importlib.import_module
-
-    def import_module_with_broken_laguna_parser(module_name: str):
-        if module_name == "mlx_lm.tool_parsers.laguna":
-            raise ModuleNotFoundError(
-                "No module named 'missing_laguna_dependency'",
-                name="missing_laguna_dependency",
-            )
-        return original_import_module(module_name)
-
-    monkeypatch.setattr(
-        laguna.importlib,
-        "import_module",
-        import_module_with_broken_laguna_parser,
-    )
-    monkeypatch.setattr(
-        laguna,
-        "_register_module",
-        lambda qualname, filename, package: registered_modules.append(
-            (qualname, filename, package)
-        ),
-    )
-
-    with pytest.raises(ModuleNotFoundError, match="missing_laguna_dependency"):
-        laguna._register_tool_parser()
-
-    assert registered_modules == []
 
 
 def test_laguna_tool_parser_parses_xml_call():

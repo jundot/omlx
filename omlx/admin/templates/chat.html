@@ -1212,9 +1212,9 @@
             <div x-show="messages.length === 0" class="h-full flex items-center justify-center" x-cloak>
                 <div class="text-center max-w-lg px-4">
                     <div class="flex items-center justify-center gap-3 mb-4">
-                        <img x-show="activeTheme === 'light'" src="/admin/static/logo-light.svg" alt="oMLX"
+                        <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX"
                             class="w-[60px] h-[60px]">
-                        <img x-show="activeTheme === 'dark'" src="/admin/static/logo-dark.svg" alt="oMLX"
+                        <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX"
                             class="w-[60px] h-[60px]" x-cloak>
                         <h1 class="text-2xl font-bold">{{ t('chat.welcome_heading') }}</h1>
                     </div>
@@ -2209,13 +2209,13 @@
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
-                        <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                            @focus="_thinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
+                        <input type="number"
+                            :value="modelSettings.thinking_budget_tokens ?? ''"
                             @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
                             @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
                             @input="onThinkingBudgetTokensInput($event)"
                             @change="clampThinkingBudgetTokens()"
-                            placeholder="4001" min="1" step="1000"
+                            placeholder="4096" min="0" step="1024"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
                             style="color: var(--text-primary);">
                     </div>
@@ -2589,8 +2589,6 @@
             _thinkingDomSeq: 0,
             _adminModelsList: null,
             _adminModelsListPromise: null,
-            _thinkingBudgetBeforeInput: null,
-            _thinkingBudgetStepping: false,
             chatSessions: {},
             messages: [],
             inputMessage: '',
@@ -2771,29 +2769,18 @@
                 } else {
                     this.modelSettings.thinking_budget_tokens = v - step;
                 }
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
                 this.onModelSettingsChange();
             },
 
             onThinkingBudgetTokensInput(event) {
-                if (this._thinkingBudgetStepping) return;
                 const el = event.target;
-                const raw = Number(el.value);
-                const prev = Number(this._thinkingBudgetBeforeInput);
-                if (Number.isFinite(prev) && Number.isFinite(raw) && raw !== prev) {
-                    const delta = raw - prev;
-                    // Native spinners use (min + n*step); 4096 is off-grid when min=1, step=100/1024
-                    if (delta !== 0 && Math.abs(delta) < 1024) {
-                        this._thinkingBudgetStepping = true;
-                        this.modelSettings.thinking_budget_tokens = prev;
-                        this.stepThinkingBudgetTokens(delta > 0 ? 1 : -1);
-                        el.value = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetStepping = false;
-                        return;
-                    }
+                if (el.value === '') {
+                    this.modelSettings.thinking_budget_tokens = null;
+                    this.onModelSettingsChange();
+                    return;
                 }
-                this._thinkingBudgetBeforeInput = raw;
+                const raw = Number(el.value);
+                if (!Number.isFinite(raw)) return;
                 this.modelSettings.thinking_budget_tokens = raw;
                 this.onModelSettingsChange();
             },
@@ -2803,7 +2790,6 @@
                 this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
                     this.modelSettings.thinking_budget_tokens
                 );
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
             },
 
             setThinkingMode(mode) {
@@ -2816,13 +2802,14 @@
             },
 
             captureSessionModelSettings() {
-                if (this.modelSettings.thinking_budget_enabled) {
-                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
-                        this.modelSettings.thinking_budget_tokens
+                const modelSettings = this.cloneData(this.modelSettings);
+                if (modelSettings.thinking_budget_enabled) {
+                    modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                        modelSettings.thinking_budget_tokens
                     );
                 }
                 return {
-                    modelSettings: this.cloneData(this.modelSettings),
+                    modelSettings,
                     speculativeEngine: this.speculativeEngine,
                     speculativeDraftModel: this.speculativeDraftModel,
                 };

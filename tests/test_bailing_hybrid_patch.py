@@ -351,7 +351,7 @@ def test_external_prefill_upgrades_legacy_one_slot_cache():
     mx.eval(prefix_logits)
 
     legacy_cache = ArraysCache(size=1)
-    legacy_cache[0] = tuple(source_cache[0].state)
+    legacy_cache[0] = tuple(source_cache[0].cache)
     cache = [legacy_cache, source_cache[1]]
     request = Request(
         request_id="ling-legacy-prefill",
@@ -375,8 +375,8 @@ def test_external_prefill_upgrades_legacy_one_slot_cache():
 
     assert prefilled_cache is cache
     assert last_token == [4]
-    assert len(legacy_cache.state) == 4
-    assert all(state is not None for state in legacy_cache.state)
+    assert len(legacy_cache.cache) == 4
+    assert all(state is not None for state in legacy_cache.cache)
 
 
 def test_scheduler_rejects_legacy_zero_slot_cache():

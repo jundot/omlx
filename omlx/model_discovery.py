@@ -87,7 +87,11 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 # Remove a family once mlx-vlm provides its multimodal implementation.
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "mimo_v2",
+    "mimo_v2_flash",
 }
+
+_MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
+_MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
@@ -166,6 +170,8 @@ VLM_ARCHITECTURES = {
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
+    "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }
 
 # Known embedding model types from mlx-embeddings
@@ -554,14 +560,15 @@ def _has_vision_subconfig(config: dict) -> bool:
     """
     Return True if ``config`` carries evidence of a vision sub-config.
 
-    Three keys cover the conventions in the wild:
+    Vision configuration conventions:
 
+    - ``vision_n_layers`` - DeepSeek V4 uses a positive layer count.
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
       ``llava_qwen2``.
 
-    All three are non-empty checks: text-only quants of VLM families can
+    The nested configurations use non-empty checks: text-only quants of VLM families can
     leave an empty ``vision_config: {}`` stub behind after stripping the
     vision tower (#2385), and key presence alone would misclassify them
     as VLM.
@@ -570,7 +577,11 @@ def _has_vision_subconfig(config: dict) -> bool:
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        bool(config.get("vision_config"))
+        (
+            config.get("model_type") == "deepseek_v4"
+            and (config.get("vision_n_layers") or 0) > 0
+        )
+        or bool(config.get("vision_config"))
         or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )
@@ -679,10 +690,18 @@ def detect_model_type(model_path: Path) -> ModelType:
         )
 
     if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        has_mimo_vision = (
+            normalized_type in {"mimo_v2", "mimo_v2_flash"}
+            and (model_path / _MIMO_VISION_SIDECAR).is_file()
+            and (model_path / _MIMO_OMNIMODAL_CONFIG).is_file()
+        )
+        if has_mimo_vision:
+            logger.info("%s detected with MiMo omnimodal vision sidecar", model_type)
+            return "vlm"
         if _has_vision_subconfig(config):
             logger.warning(
-                "%s carries multimodal configuration, but the available mlx-lm "
-                "implementation is text-only; using the LLM engine",
+                "%s carries multimodal configuration, but no supported vision "
+                "sidecar is present; using the LLM engine",
                 model_type,
             )
         return "llm"
@@ -1409,22 +1428,39 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
 
 
 def _is_deepseek_v41_loadable_config(config) -> bool:
-    """True for DeepSeek V4.1 checkpoints the V4.1 loader reads unconverted.
+    """Recognize official, oMLX-converted, and declared affine V4.1 checkpoints.
 
-    The loader gates source checkpoints on the model type alone (the FP8/FP4
-    release, or bf16), and reads oMLX conversions by their
-    ``omlx_deepseek_v41`` spec (e.g. ``Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp``).
-    Shards exported before #3583 declare no ``format: mlx`` metadata and the
-    repo names carry no MLX token, so the generic heuristics skip them.
-    MLX affine conversions without the spec (a top-level ``quantization``
-    dict) are not accepted: the loader has no path for them.
+    This also admits checkpoints without MLX shard metadata or repo names.
+    False leaves generic discovery heuristics in control; it does not reject loading.
     """
     if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
         return False
     spec = config.get("omlx_deepseek_v41")
     if isinstance(spec, dict):
         return spec.get("version") == 1
-    return spec is None and "quantization" not in config
+    if spec is not None:
+        return False
+    quantization = config.get("quantization")
+    if quantization is None:
+        return True
+    if not isinstance(quantization, dict):
+        return False
+    bits = quantization.get("bits")
+    group_size = quantization.get("group_size")
+    if quantization.get("mode", "affine") != "affine":
+        return False
+    if not _declared_int(bits) or not _declared_int(group_size):
+        return False
+    # `source_quantization_spec` rejects a non-affine per-module override too.
+    return not any(
+        isinstance(entry, dict) and entry.get("mode", "affine") != "affine"
+        for entry in quantization.values()
+    )
+
+
+def _declared_int(value) -> bool:
+    """JSON booleans are ints in Python; a declared width/group is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
