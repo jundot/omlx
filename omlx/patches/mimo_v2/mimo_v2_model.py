@@ -54,14 +54,17 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool
     topk_method: str
     partial_rotary_factor: float
-    attention_bias: bool
     layernorm_epsilon: float
     max_position_embeddings: int
     routed_scaling_factor: Optional[float] = None
     attention_value_scale: Optional[float] = None
     rope_scaling: Optional[Dict[str, Any]] = None
+    attention_bias: bool = False
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 0
+    omlx_mtp_sidecar: Optional[str] = None
+    n_shared_experts: Optional[int] = None
+    scoring_func: str = "sigmoid"
 
     def __post_init__(self):
         n = self.num_hidden_layers
@@ -488,6 +491,9 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        if hasattr(self.model, "mtp") and self.args.omlx_mtp_sidecar:
+            weights = {**weights, **mx.load(self.args.omlx_mtp_sidecar)}
+
         skip_prefixes = (
             "visual.",
             "audio_encoder.",
@@ -540,22 +546,40 @@ class Model(nn.Module):
 
         for layer_idx in range(int(self.args.num_nextn_predict_layers or 0)):
             prefix = f"model.mtp.layers.{layer_idx}.self_attn"
-            qkv_key = f"{prefix}.qkv_proj.weight"
+            qkv_prefix = f"{prefix}.qkv_proj"
+            qkv_key = f"{qkv_prefix}.weight"
             scale_key = f"{qkv_key}_scale_inv"
-            if qkv_key not in weights or scale_key not in weights:
+            if qkv_key in weights and scale_key in weights:
+                q, k, v = split_fused_qkv(
+                    weights.pop(qkv_key),
+                    weights.pop(scale_key),
+                    tp=TP,
+                    n_h=self.args.swa_num_attention_heads,
+                    n_kv=self.args.swa_num_key_value_heads,
+                    hd=self.args.swa_head_dim,
+                    vhd=self.args.swa_v_head_dim,
+                )
+                weights[f"{prefix}.q_proj.weight"] = q
+                weights[f"{prefix}.k_proj.weight"] = k
+                weights[f"{prefix}.v_proj.weight"] = v
                 continue
-            q, k, v = split_fused_qkv(
-                weights.pop(qkv_key),
-                weights.pop(scale_key),
-                tp=TP,
-                n_h=self.args.swa_num_attention_heads,
-                n_kv=self.args.swa_num_key_value_heads,
-                hd=self.args.swa_head_dim,
-                vhd=self.args.swa_v_head_dim,
-            )
-            weights[f"{prefix}.q_proj.weight"] = q
-            weights[f"{prefix}.k_proj.weight"] = k
-            weights[f"{prefix}.v_proj.weight"] = v
+
+            # The official MLX MTP sidecar stores an already-quantized fused
+            # projection. Its packed weight, scales, and biases all retain the
+            # output-row axis, so split each at the Q/K boundaries.
+            if qkv_key not in weights or f"{qkv_prefix}.scales" not in weights:
+                continue
+            q_rows = self.args.swa_num_attention_heads * self.args.swa_head_dim
+            k_rows = self.args.swa_num_key_value_heads * self.args.swa_head_dim
+            boundaries = [q_rows, q_rows + k_rows]
+            for suffix in ("weight", "scales", "biases"):
+                fused_key = f"{qkv_prefix}.{suffix}"
+                if fused_key not in weights:
+                    continue
+                q, k, v = mx.split(weights.pop(fused_key), boundaries, axis=0)
+                weights[f"{prefix}.q_proj.{suffix}"] = q
+                weights[f"{prefix}.k_proj.{suffix}"] = k
+                weights[f"{prefix}.v_proj.{suffix}"] = v
 
         scale_keys = [k for k in weights if k.endswith("weight_scale_inv")]
         for sk in scale_keys:

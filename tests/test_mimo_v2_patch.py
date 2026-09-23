@@ -227,6 +227,52 @@ def test_sanitize_handles_fused_fp8_and_text_only_weights():
     )
 
 
+def test_sanitize_loads_and_splits_quantized_mtp_sidecar(monkeypatch):
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    sidecar_path = "/models/mimo/mtp/model_mtp.safetensors"
+    config = _minimal_config(
+        num_nextn_predict_layers=1,
+        omlx_mtp_sidecar=sidecar_path,
+    )
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
+
+    prefix = "model.mtp.layers.0.self_attn.qkv_proj"
+    sidecar = {
+        f"{prefix}.weight": mx.ones((240, 16), dtype=mx.uint32),
+        f"{prefix}.scales": mx.ones((240, 2)),
+        f"{prefix}.biases": mx.ones((240, 2)),
+    }
+    loaded = []
+
+    def fake_load(path):
+        loaded.append(path)
+        return sidecar
+
+    monkeypatch.setattr(mimo_v2.mx, "load", fake_load)
+    sanitized = model.sanitize({})
+
+    assert loaded == [sidecar_path]
+    for suffix, width in (("weight", 16), ("scales", 2), ("biases", 2)):
+        assert sanitized[f"model.mtp.layers.0.self_attn.q_proj.{suffix}"].shape == (
+            128,
+            width,
+        )
+        assert sanitized[f"model.mtp.layers.0.self_attn.k_proj.{suffix}"].shape == (
+            64,
+            width,
+        )
+        assert sanitized[f"model.mtp.layers.0.self_attn.v_proj.{suffix}"].shape == (
+            48,
+            width,
+        )
+
+
 def test_native_mtp_heads_forward_and_adapter_contract():
     mimo_v2 = _load_patch_module()
     from omlx.patches.mimo_v2.omnimodal import MiMoLanguageAdapter
@@ -307,6 +353,40 @@ def test_pre_load_dispatch_calls_mimo_patch(tmp_path, monkeypatch, model_type):
     maybe_apply_pre_load_patches(str(tmp_path))
 
     assert calls == [True]
+
+
+def test_mtp_sidecar_counts_as_checkpoint_weights(tmp_path):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    from omlx.utils.model_loading import _checkpoint_has_mtp_weights
+
+    sidecar = tmp_path / "mtp" / "model_mtp.safetensors"
+    sidecar.parent.mkdir()
+    save_file({"model.mtp.layers.0.weight": np.ones((1,), dtype=np.float32)}, sidecar)
+
+    assert _checkpoint_has_mtp_weights(tmp_path) is True
+
+
+def test_load_text_model_injects_mtp_sidecar(tmp_path, monkeypatch):
+    import omlx.utils.model_loading as ml
+
+    sidecar = tmp_path / "mtp" / "model_mtp.safetensors"
+    sidecar.parent.mkdir()
+    sidecar.touch()
+    captured = {}
+    monkeypatch.setattr(ml, "maybe_apply_pre_load_patches", lambda *_a, **_k: None)
+
+    def fake_load(model_name, **kwargs):
+        captured["model_name"] = model_name
+        captured.update(kwargs)
+        return object(), object()
+
+    monkeypatch.setattr(ml, "lm_load_compat", fake_load)
+    ml.load_text_model(str(tmp_path))
+
+    assert captured["model_name"] == str(tmp_path)
+    assert captured["model_config"] == {"omlx_mtp_sidecar": str(sidecar)}
 
 
 def test_multimodal_mimo_is_explicitly_routed_to_text_engine(tmp_path, caplog):

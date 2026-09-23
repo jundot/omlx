@@ -1155,12 +1155,15 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     LLM, and vision is silently dropped (issue #1426).
 
     Reads ``model.safetensors.index.json`` when present (no shard I/O).
-    Falls back to the first safetensors shard's metadata header. Returns
-    False when neither resolves — callers treat that as "no MTP weights"
-    (the conservative choice: skip MTPModule attachment).
+    Falls back to safetensors metadata headers, including MiMo's separate
+    ``mtp/model_mtp.safetensors`` sidecar. Returns False when neither resolves
+    — callers treat that as "no MTP weights" (the conservative choice: skip
+    MTPModule attachment).
     """
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
-    return _checkpoint_weight_prefix(model_path, prefixes) is not None
+    if _checkpoint_weight_prefix(model_path, prefixes) is not None:
+        return True
+    return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
@@ -1202,9 +1205,15 @@ def load_text_model(
         if model_settings is not None
         else False
     )
+    model_config = None
+    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
+    if mtp_sidecar.is_file():
+        model_config = {"omlx_mtp_sidecar": str(mtp_sidecar)}
+        logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
     return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,
+        model_config=model_config,
         trust_remote_code=trust_remote_code,
     )
 
