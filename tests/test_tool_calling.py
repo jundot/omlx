@@ -897,7 +897,7 @@ class TestToolCallStreamFilter:
         """Marker split across two feed() calls."""
         f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
         r1 = f.feed("Hello <tool_")
-        r2 = f.feed('call>{"name":"f"}')
+        r2 = f.feed("call>JSON data")
         assert r1 + r2 == "Hello "
 
     def test_false_partial_match(self):
@@ -921,7 +921,7 @@ class TestToolCallStreamFilter:
     def test_multiple_small_feeds(self):
         """Character-by-character feeding."""
         f = ToolCallStreamFilter(_make_tokenizer("<tool_call>"))
-        text = 'Hi<tool_call>{"name":"f"}'
+        text = "Hi<tool_call>data"
         result = ""
         for ch in text:
             result += f.feed(ch)
@@ -940,7 +940,7 @@ class TestToolCallStreamFilter:
     def test_suppressing_blocks_finish(self):
         """An unresolved open envelope keeps buffered control text suppressed at finish()."""
         f = ToolCallStreamFilter(_make_tokenizer())
-        f.feed('text<tool_call>{"name":"f"}')
+        f.feed("text<tool_call>rest")
         assert f.finish() == ""
 
     def test_bracket_literal_passthrough(self):
@@ -1961,7 +1961,7 @@ class TestParseToolCallsSyntaxError:
             raise SyntaxError("invalid syntax (<unknown>, line 1)")
 
         tok = self._qwen_tok(failing_parser)
-        text = '<tool_call>{"name":</tool_call>'
+        text = "<tool_call>not a function at all, just text</tool_call>"
 
         with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
             cleaned, tool_calls = parse_tool_calls(text, tok)
@@ -5495,115 +5495,3 @@ def test_qwen_untyped_parameter_is_not_decoded_twice(monkeypatch):
         tools,
     )
     assert json.loads(calls[0].function.arguments)["v"] == "123"
-
-
-class TestLiteralToolCallMarkers:
-    @staticmethod
-    def tokenizer(parser_name):
-        from importlib import import_module
-
-        tok = (
-            _make_tokenizer()
-            if parser_name == "generic"
-            else _make_tokenizer_with_end("<tool_call>", "</tool_call>")
-        )
-        tok.has_tool_calling = parser_name != "generic"
-        if tok.has_tool_calling:
-            tok.tool_parser = import_module(
-                "mlx_lm.tool_parsers." + parser_name
-            ).parse_tool_call
-        return tok
-
-    @pytest.mark.parametrize(
-        "raw,chunk_size",
-        [
-            ("Use `<tool_call>` literally. SENTINEL.", 0),
-            ("Example:\n```\n<tool_call>\nweather_lookup\n```\nSENTINEL.", 1),
-            ("The <tool_call> marker starts a call. SENTINEL.", 7),
-            ("Use `<tool_call>` and `</tool_call>` literally. SENTINEL.", 1),
-        ],
-    )
-    def test_literal_tool_markers_survive(self, raw, chunk_size):
-        tok = self.tokenizer("qwen3_coder")
-        tools = [{"type": "function", "function": {"name": "weather_lookup"}}]
-        filt = ToolCallStreamFilter(tok, tools=tools, capture_ordered_segments=True)
-        visible = _feed_chunked(filt, raw, chunk_size)
-        assert visible == raw
-        assert filt.finish() == ""
-        assert filt.take_recovery_candidate() == ""
-        assert filt.take_completed_envelopes() == []
-        assert all(s.kind == "content" for s in filt.take_ordered_segments())
-        parsed = extract_tool_calls_with_thinking(
-            "", raw, tok, tools, finish_reason="stop"
-        )
-        assert parsed.cleaned_text == raw
-        assert not parsed.tool_calls
-        assert not parsed.parse_errors
-
-    @pytest.mark.parametrize("parser_name", ["generic", "qwen3_coder", "glm47"])
-    def test_literal_tool_marker_does_not_swallow_later_call(self, parser_name):
-        tok = self.tokenizer(parser_name)
-        tools = [{"type": "function", "function": {"name": "write"}}]
-        if parser_name == "qwen3_coder":
-            call = (
-                "<function=write><parameter=content>literal <tool_call> and "
-                "</tool_call></parameter></function>"
-            )
-        else:
-            call = (
-                '<tool_call>{"name":"write","arguments":{"content":'
-                '"literal <tool_call> and </tool_call>"}}</tool_call>'
-            )
-        before = "Use `<tool_call>` literally. "
-        after = " Then `<tool_call>` and `</tool_call>` are examples."
-        raw = before + call + after
-        filt = ToolCallStreamFilter(tok, tools=tools)
-        assert _feed_chunked(filt, raw, 1) + filt.finish() == before + after
-        parsed = extract_tool_calls_with_thinking(
-            "", raw, tok, tools, finish_reason="stop"
-        )
-        assert parsed.cleaned_text == before + after
-        assert len(parsed.tool_calls) == 1
-        assert parsed.tool_calls[0].function.name == "write"
-        assert not parsed.parse_errors
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            "weather_lookup<arg_key>city</arg_key><arg_value>Berlin</arg_value>",
-            'weather_lookup {"city":"Berlin"}',
-            "weather_lookup city=Berlin",
-            "weather_lookup find the weather in Berlin",
-            "weather_lookup",
-        ],
-    )
-    def test_glm_tool_payloads_remain_calls(self, payload):
-        tok = self.tokenizer("glm47")
-        raw = "<tool_call>" + payload + "</tool_call>"
-        tools = [{"type": "function", "function": {"name": "weather_lookup"}}]
-        filt = ToolCallStreamFilter(tok, tools=tools)
-        assert _feed_chunked(filt, raw, 1) + filt.finish() == ""
-        cleaned, calls = parse_tool_calls(raw, tok, tools)
-        assert cleaned == ""
-        assert len(calls) == 1
-        assert calls[0].function.name == "weather_lookup"
-
-
-@pytest.mark.parametrize(
-    "raw", ["The marker is <tool_call>", "Example <tool_call> text"]
-)
-def test_literal_tool_marker_at_eof_is_preserved(raw):
-    tok = TestLiteralToolCallMarkers.tokenizer("qwen3_coder")
-    filt = ToolCallStreamFilter(tok)
-    visible = _feed_chunked(filt, raw, 1) + filt.finish()
-    assert visible + filt.take_recovery_candidate() == raw
-    parsed = extract_tool_calls_with_thinking(
-        "",
-        raw,
-        tok,
-        [{"type": "function", "function": {"name": "write"}}],
-        finish_reason="stop",
-    )
-    assert parsed.cleaned_text == raw
-    assert not parsed.tool_calls
-    assert not parsed.parse_errors

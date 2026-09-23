@@ -481,6 +481,8 @@
   "settings.resource.hot_cache_disabled": "0",
   "settings.resource.hot_cache_disabled_label": "= deshabilitado.",
   "settings.resource.cold_cache_limit": "Límite de Caché Fría (Caché SSD)",
+  "settings.resource.cold_cache_auto": "Automático",
+  "settings.resource.cold_cache_auto_description": "El límite actual es el 50% de la suma del espacio libre y la caché SSD existente. Edita el valor en GB para fijar el límite.",
   "settings.resource.cold_cache_description": "Almacenamiento SSD persistente para bloques de KV eviccados.",
   "settings.resource.prefill_memory_guard": "Guardia de Memoria",
   "settings.resource.prefill_memory_guard_description": "Estima la memoria antes del prefill y difiere la planificación bajo presión de memoria para evitar fallos de asignación de Metal.",

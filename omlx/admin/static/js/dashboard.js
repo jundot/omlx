@@ -5924,7 +5924,10 @@
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
                 const val = this.globalSettings.cache?.ssd_cache_max_size;
-                if (val && val !== 'auto') {
+                if (val === 'auto') {
+                    return Math.round((this.globalSettings.cache.ssd_cache_auto_size_bytes || 0) / 1024 ** 3);
+                }
+                if (val) {
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }

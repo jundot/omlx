@@ -363,7 +363,7 @@ private struct CacheSection: View {
                               defaultValue: "SSD Cache Size",
                               comment: "Row label for the SSD cache size field"),
                 sublabel: String(localized: "performance.cache.ssd_size.sub",
-                                 defaultValue: "Cold-spillover ceiling. \"auto\" = 10% of SSD capacity.",
+                                 defaultValue: "Cold-spillover ceiling. \"auto\" = 50% of the sum of free space and existing SSD cache.",
                                  comment: "Sublabel describing accepted SSD cache size values")
             ) {
                 TextInput(

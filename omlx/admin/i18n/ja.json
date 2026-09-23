@@ -481,6 +481,8 @@
   "settings.resource.hot_cache_disabled": "0",
   "settings.resource.hot_cache_disabled_label": "= 無効。",
   "settings.resource.cold_cache_limit": "コールドキャッシュ上限（SSDキャッシュ）",
+  "settings.resource.cold_cache_auto": "自動",
+  "settings.resource.cold_cache_auto_description": "現在の上限は、空き容量と既存の SSD キャッシュの合計の 50% です。GB 値を編集すると固定上限に切り替わります。",
   "settings.resource.cold_cache_description": "退去されたKVキャッシュブロックの永続SSDストレージ。",
   "settings.resource.prefill_memory_guard": "メモリガード",
   "settings.resource.prefill_memory_guard_description": "プリフィル前にメモリを推定し、メモリ圧力時にスケジューリングを遅延してMetal割り当てエラーを防止します。",

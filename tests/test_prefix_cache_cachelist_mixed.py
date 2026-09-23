@@ -944,3 +944,35 @@ def test_glm_pm_uncompacted_and_mixed_pooling_chains(tmp_path):
     pool_r = result[0].caches[1]
     assert pool_r.pooled.shape[1] == num_blocks
     assert mx.max(pool_r.pooled[0, num_blocks - 1, :]).item() == float(num_blocks)
+
+
+def test_compact_pooling_cache_snapshot_tail_starts_at_previous_boundary():
+    """The pooled delta of a snapshot covers its own block only.
+
+    A tail snapshot ends mid-block; its delta must start at the previous
+    block boundary, not block_size tokens behind the end."""
+    from omlx.cache.pooling_delta import compact_pooling_cache_snapshot
+
+    ratio = 2
+
+    def extracted(token_count):
+        pooled = mx.arange(token_count // ratio, dtype=mx.float32).reshape(1, -1, 1)
+        return [
+            {
+                "class_name": "CacheList",
+                "state": [(), (mx.zeros((1, 1, 1)), mx.zeros((1, 1, 1)), pooled)],
+                "sub_class_names": ["KVCache", "PoolingCache"],
+                "meta_state": (["KVCache", "PoolingCache"], [(), ratio]),
+            }
+        ]
+
+    aligned = compact_pooling_cache_snapshot(extracted(8), 8, BLOCK_SIZE)
+    assert aligned[0]["pooling_delta_ranges"] == {"1": [2, 4]}
+
+    tail = compact_pooling_cache_snapshot(extracted(6), 6, BLOCK_SIZE)
+    assert tail[0]["pooling_delta_ranges"] == {"1": [2, 3]}
+    assert tail[0]["state"][1][2].shape[1] == 1
+    assert float(tail[0]["state"][1][2][0, 0, 0]) == 2.0
+
+    root_tail = compact_pooling_cache_snapshot(extracted(3), 3, BLOCK_SIZE)
+    assert root_tail[0]["pooling_delta_ranges"] == {"1": [0, 1]}

@@ -1353,6 +1353,10 @@ async def _apply_cache_settings_runtime(
         global_settings.cache.initial_cache_blocks
     )
 
+    pool._scheduler_config.paged_ssd_cache_auto_size = (
+        ssd_cache_max_size or global_settings.cache.ssd_cache_max_size
+    ).lower() == "auto"
+
     # Update scheduler config based on cache settings
     if enabled is False or (enabled is None and not global_settings.cache.enabled):
         pool._scheduler_config.paged_ssd_cache_dir = None
@@ -4518,6 +4522,8 @@ async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
 
 
 def _global_settings_response(global_settings):
+    from ..settings import get_auto_ssd_cache_size
+
     # Get system memory info for auto calculation
     memory_info = get_system_memory_info()
 
@@ -4588,6 +4594,7 @@ def _global_settings_response(global_settings):
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
             "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
+            "ssd_cache_auto_size_bytes": get_auto_ssd_cache_size(Path(cache_dir)),
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
@@ -6057,8 +6064,14 @@ def _build_runtime_cache_observability(
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
     cache_cfg = global_settings.cache
+    engine_pool = _get_engine_pool()
+    auto_size = cache_cfg.ssd_cache_max_size.lower() == "auto"
     try:
-        cfg_disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        cfg_disk_max = (
+            0
+            if auto_size and engine_pool is not None
+            else cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        )
     except (ValueError, OSError, TypeError) as exc:
         logger.warning("Could not read SSD cache max size from config: %s", exc)
         cfg_disk_max = 0
@@ -6077,7 +6090,6 @@ def _build_runtime_cache_observability(
         "hot_cache_entries": 0,
     }
 
-    engine_pool = _get_engine_pool()
     if engine_pool is None:
         return payload
 
@@ -6332,6 +6344,11 @@ def _build_runtime_cache_observability(
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
+    if auto_size and not payload["models"] and engine_pool is not None:
+        try:
+            disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        except (ValueError, OSError, TypeError) as exc:
+            logger.warning("Could not read automatic SSD cache limit: %s", exc)
     payload["disk_max_bytes"] = disk_max
 
     # Fallback: if no loaded models contributed stats, scan the cache

@@ -865,10 +865,7 @@ class MemoryMonitor:
         )
 
     def uses_flat_overhead_accounting(self) -> bool:
-        """True when the profile prices token-scaled work statically, so
-        measured pool overhead is charged once as flat overhead instead of
-        re-charged through the token-linear EWMA (Qwen4 QSA, GLM-5.x DSA).
-        """
+        """Use static token costs and charge released pool overhead once."""
         return isinstance(
             self._prefill_memory_profile,
             (_Qwen4ExpPrefillMemoryProfile, _GLM5NextPrefillMemoryProfile),
@@ -1365,47 +1362,18 @@ class _Qwen4ExpPrefillMemoryProfile:
         return indexer + core
 
 
-# The vendored glm5_next runtime switches the selection-active core route at
-# ``Kv >= 4096`` (native gathered sparse-MLA) and uses exact-block SDPA
-# below it (``exact_block_token_attention`` over the full head-expanded K/V).
-# The profile must mirror that threshold: below it the transient is linear in
-# kv_len (full expansion), above it bounded by the gathered-topk tile.
+# Match the sparse-MLA threshold in Glm5NextSparseAttention.__call__.
 _GLM5_NEXT_SPARSE_MLA_MIN_KV = 4096
 
-# The quantized embed_q / unembed_out promote through the checkpoint's fp32
-# affine scales, so the head-expanded K/V lands as an fp32 projection output
-# that is then cast down to the fp16/bf16 width the native kernel consumes.
-# Measured on a 128GB host: the exact-block expansion peaks at
-# ``2 * kv_len * heads * head_width * (dtype_size + 4)`` (576 MiB at
-# kv_len=3072, 64 heads, width 256 — matching the reviewer's 577 MiB).
+# FP32 projection outputs can coexist with their FP16/BF16 kernel inputs.
 _GLM5_NEXT_EXACT_BLOCK_PROMOTION_DTYPE_SIZE = 4
 
 
 @dataclass(frozen=True)
 class _GLM5NextPrefillMemoryProfile:
-    """Prefill estimator for GLM-5.x (glm5_next): GDN + DSA sparse MLA.
+    """Estimate GLM-5.x prefill memory for GDN and sparse MLA.
 
-    The runtime model (vendored mlx_vlm glm5_next) alternates GDN linear
-    attention (fixed recurrent state, no per-token scores) with DSA sparse
-    attention: an indexer scores ``kv_len / index_kpool`` pooled keys and
-    the core attends the gathered latent — but only once the context exceeds
-    ``index_topk`` (``bypass_short`` returns None below that, so short
-    contexts run dense SDPA over the full KV). ``head_dim`` is 0 in config
-    by design (NoPE MLA); the head width lives in ``qk_nope_head_dim`` and
-    the resident KV is one ``kv_lora_rank`` latent per token per sparse
-    layer plus the kpool-pooled indexer keys.
-
-    Between ``index_topk`` and ``_GLM5_NEXT_SPARSE_MLA_MIN_KV`` the indexer
-    selects but the native sparse-MLA kernel is not yet eligible, so the core
-    runs exact-block SDPA over the full head-expanded K/V — a transient that
-    grows linearly with ``kv_len`` (not with ``query_tokens``), charged at the
-    fp32-promoted expansion width. Above that threshold the gathered-topk tile
-    bounds it again.
-
-    Layers run sequentially and the allocator reuses their buffers, so the
-    transient is priced at the larger of the two layer types (same
-    convention as the DeepSeek V4 profile); retained pool churn is absorbed
-    by the flat-overhead accounting, not by a token-linear EWMA.
+    Charge the larger layer transient; the scheduler accounts for pool overhead.
     """
 
     sparse_layers: int
@@ -1430,10 +1398,8 @@ class _GLM5NextPrefillMemoryProfile:
     ) -> int:
         if num_tokens <= 0 or self.sparse_layers <= 0:
             return 0
-        # Sparse layers store the latent (the value cache is zero-width by
-        # design) and one pooled indexer key per index_kpool tokens. GDN
-        # layers hold a fixed recurrent state, measured separately by the
-        # monitor's fixed-state probe.
+        # Store one latent and pooled indexer keys; the value cache has zero width.
+        # The monitor measures fixed GDN state separately.
         per_token = self.kv_lora_rank + self.index_head_dim // max(
             self.index_kpool, 1
         )
@@ -1451,10 +1417,8 @@ class _GLM5NextPrefillMemoryProfile:
         moe = query_tokens * self.moe_top_k * self.hidden_size * self.dtype_size * 2
 
         if kv_len <= self.index_topk:
-            # Indexer bypasses selection: dense SDPA over the full context.
-            # Charge the unfused fp32 score matrix plus the per-layer K/V
-            # expansion from the latent (embed_q / unembed_out), capped by
-            # any bounded tiled route that covers this head width.
+            # Short contexts use dense SDPA with expanded K/V.
+            # Use tiled score storage when a bounded route is available.
             core = estimate_unfused_sdpa_call_bytes(
                 self.num_attention_heads,
                 query_tokens,
@@ -1500,14 +1464,8 @@ class _GLM5NextPrefillMemoryProfile:
                 query_tokens * self.num_attention_heads * self.kv_lora_rank * self.dtype_size
             )
             if kv_len < _GLM5_NEXT_SPARSE_MLA_MIN_KV:
-                # Below the native sparse-MLA threshold the core runs
-                # exact-block SDPA over the full head-expanded K/V: the
-                # quantized embed_q / unembed_out expand every cached token to
-                # head width (linear in kv_len, independent of query_tokens),
-                # landing as an fp32 projection output cast to the kernel
-                # width. The gathered-topk bound underprices this regime by
-                # ~8x (measured 576 MiB vs a 73 MiB gathered charge at
-                # kv_len=3072, 32-token chunk, 64 heads).
+                # Exact-block attention expands all cached K/V, regardless of query length.
+                # Include both FP32 projection outputs and their kernel input casts.
                 core = (
                     kv_len
                     * self.num_attention_heads
@@ -1515,9 +1473,7 @@ class _GLM5NextPrefillMemoryProfile:
                     * (self.dtype_size + _GLM5_NEXT_EXACT_BLOCK_PROMOTION_DTYPE_SIZE)
                 )
             else:
-                # Native gathered sparse-MLA: the core gathers index_topk
-                # latents (conservative full-gather bound; the native kernel
-                # tiles this below the charge).
+                # A full latent gather bounds the tiled sparse-MLA allocation.
                 core = (
                     query_tokens
                     * min(self.index_topk, kv_len)

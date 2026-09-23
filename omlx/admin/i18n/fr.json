@@ -481,6 +481,8 @@
   "settings.resource.hot_cache_disabled": "0",
   "settings.resource.hot_cache_disabled_label": "= désactivé.",
   "settings.resource.cold_cache_limit": "Limite du cache froid (Cache SSD)",
+  "settings.resource.cold_cache_auto": "Automatique",
+  "settings.resource.cold_cache_auto_description": "La limite actuelle est de 50 % de la somme de l’espace libre et du cache SSD existant. Modifiez la valeur en Go pour fixer la limite.",
   "settings.resource.cold_cache_description": "Stockage SSD persistant pour les blocs de cache KV évincés.",
   "settings.resource.prefill_memory_guard": "Protection mémoire",
   "settings.resource.prefill_memory_guard_description": "Estimez la mémoire avant le pré-remplissage et reportez la planification sous pression mémoire pour éviter les défaillances d'allocation Metal.",

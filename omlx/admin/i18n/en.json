@@ -481,6 +481,8 @@
   "settings.resource.hot_cache_disabled": "0",
   "settings.resource.hot_cache_disabled_label": "= disabled.",
   "settings.resource.cold_cache_limit": "Cold Cache Limit (SSD Cache)",
+  "settings.resource.cold_cache_auto": "Auto",
+  "settings.resource.cold_cache_auto_description": "Current limit is 50% of the sum of free disk space and existing SSD cache. Edit the GB value to set a fixed limit.",
   "settings.resource.cold_cache_description": "Persistent SSD storage for evicted KV cache blocks.",
   "settings.resource.prefill_memory_guard": "Memory guard",
   "settings.resource.prefill_memory_guard_description": "Pause prefill scheduling and evict LRU models when memory pressure approaches the ceiling derived from the reserve level on the right.",

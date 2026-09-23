@@ -481,6 +481,8 @@
   "settings.resource.hot_cache_disabled": "0",
   "settings.resource.hot_cache_disabled_label": "= отключено.",
   "settings.resource.cold_cache_limit": "Лимит холодного кэша (SSD-кэш)",
+  "settings.resource.cold_cache_auto": "Авто",
+  "settings.resource.cold_cache_auto_description": "Текущий лимит составляет 50% суммы свободного места и существующего SSD-кэша. Измените значение в ГБ, чтобы задать фиксированный лимит.",
   "settings.resource.cold_cache_description": "Постоянное SSD-хранилище для вытесненных блоков KV-кэша.",
   "settings.resource.prefill_memory_guard": "Защита памяти",
   "settings.resource.prefill_memory_guard_description": "Приостанавливает планирование prefill и выгружает LRU-модели, когда давление памяти приближается к лимиту, рассчитанному по выбранному справа уровню резерва.",

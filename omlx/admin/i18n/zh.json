@@ -481,6 +481,8 @@
   "settings.resource.hot_cache_disabled": "0",
   "settings.resource.hot_cache_disabled_label": "= 已禁用。",
   "settings.resource.cold_cache_limit": "冷缓存限制（SSD 缓存）",
+  "settings.resource.cold_cache_auto": "自动",
+  "settings.resource.cold_cache_auto_description": "当前上限为可用空间与现有 SSD 缓存之和的 50%。编辑 GB 值可设置固定上限。",
   "settings.resource.cold_cache_description": "被驱逐的 KV 缓存块的持久 SSD 存储。",
   "settings.resource.prefill_memory_guard": "内存防护",
   "settings.resource.prefill_memory_guard_description": "当内存压力接近右侧预留级别得出的上限时，暂停预填充调度并驱逐 LRU 模型。",

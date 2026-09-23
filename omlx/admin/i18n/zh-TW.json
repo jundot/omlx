@@ -481,6 +481,8 @@
   "settings.resource.hot_cache_disabled": "0",
   "settings.resource.hot_cache_disabled_label": "= 已停用。",
   "settings.resource.cold_cache_limit": "冷快取限制（SSD 快取）",
+  "settings.resource.cold_cache_auto": "自動",
+  "settings.resource.cold_cache_auto_description": "目前上限為可用空間與現有 SSD 快取總和的 50%。編輯 GB 值可設定固定上限。",
   "settings.resource.cold_cache_description": "已驅逐的 KV Cache 區塊的持久化 SSD 儲存空間。",
   "settings.resource.prefill_memory_guard": "記憶體守衛",
   "settings.resource.prefill_memory_guard_description": "當記憶體壓力接近右側保留層級得出的上限時，暫停預填充排程並驅逐 LRU 模型。",
