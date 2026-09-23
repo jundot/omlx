@@ -25,6 +25,7 @@ PR_HEAD_SHA = "96dd6fc2e0d2a1c43fcbd5b3c4be7dee640ad304"
 PR_URL = "https://github.com/ml-explore/mlx-lm/pull/1219"
 
 _MODULE_NAME = "mlx_lm.models.mimo_v2"
+_FLASH_MODULE_NAME = "mlx_lm.models.mimo_v2_flash"
 _APPLIED = False
 
 
@@ -34,20 +35,26 @@ def _register_module() -> None:
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not create spec for {_MODULE_NAME} from {file_path}")
 
-    previous = sys.modules.get(_MODULE_NAME)
+    previous = {
+        name: sys.modules.get(name) for name in (_MODULE_NAME, _FLASH_MODULE_NAME)
+    }
     module = importlib.util.module_from_spec(spec)
     module.__package__ = "mlx_lm.models"
     sys.modules[_MODULE_NAME] = module
+    sys.modules[_FLASH_MODULE_NAME] = module
     try:
         spec.loader.exec_module(module)
         models_pkg = importlib.import_module("mlx_lm.models")
         models_pkg.mimo_v2 = module
+        models_pkg.mimo_v2_flash = module
     except BaseException:
-        if sys.modules.get(_MODULE_NAME) is module:
-            if previous is None:
-                sys.modules.pop(_MODULE_NAME)
+        for name, old_module in previous.items():
+            if sys.modules.get(name) is not module:
+                continue
+            if old_module is None:
+                sys.modules.pop(name)
             else:
-                sys.modules[_MODULE_NAME] = previous
+                sys.modules[name] = old_module
         raise
 
     logger.info("Registered %s from %s", _MODULE_NAME, file_path.name)
@@ -58,8 +65,14 @@ def apply_mimo_v2_patch() -> bool:
     global _APPLIED
     file_path = (Path(__file__).parent / "mimo_v2_model.py").resolve()
     current = sys.modules.get(_MODULE_NAME)
+    flash_current = sys.modules.get(_FLASH_MODULE_NAME)
     current_path = getattr(current, "__file__", None)
-    if _APPLIED and current_path and Path(current_path).resolve() == file_path:
+    if (
+        _APPLIED
+        and current is flash_current
+        and current_path
+        and Path(current_path).resolve() == file_path
+    ):
         return False
 
     try:

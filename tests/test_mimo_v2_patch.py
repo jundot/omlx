@@ -62,10 +62,12 @@ def test_apply_registers_mimo_v2_module():
 
     assert module.__package__ == "mlx_lm.models"
     assert sys.modules["mlx_lm.models.mimo_v2"] is module
+    assert sys.modules["mlx_lm.models.mimo_v2_flash"] is module
 
     import mlx_lm.models as models_pkg
 
     assert models_pkg.mimo_v2 is module
+    assert models_pkg.mimo_v2_flash is module
 
 
 def test_apply_is_idempotent():
@@ -95,14 +97,17 @@ def test_apply_replaces_upstream_module(monkeypatch):
     assert registered is not upstream
     assert registered.__file__.endswith("omlx/patches/mimo_v2/mimo_v2_model.py")
     assert models_pkg.mimo_v2 is registered
+    assert sys.modules["mlx_lm.models.mimo_v2_flash"] is registered
+    assert models_pkg.mimo_v2_flash is registered
 
 
-def test_get_classes_resolves_mimo_v2():
+@pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+def test_get_classes_resolves_mimo_v2(model_type):
     _load_patch_module()
 
     from mlx_lm.utils import _get_classes
 
-    model_cls, args_cls = _get_classes(_minimal_config())
+    model_cls, args_cls = _get_classes(_minimal_config(model_type=model_type))
 
     assert model_cls.__name__ == "Model"
     assert args_cls.__name__ == "ModelArgs"
@@ -286,13 +291,16 @@ def test_native_mtp_heads_forward_and_adapter_contract():
     assert adapter_hidden.shape == (1, 1, 128)
 
 
-def test_pre_load_dispatch_calls_mimo_patch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+def test_pre_load_dispatch_calls_mimo_patch(tmp_path, monkeypatch, model_type):
     calls = []
     monkeypatch.setattr(
         "omlx.patches.mimo_v2.apply_mimo_v2_patch",
         lambda: calls.append(True) or True,
     )
-    (tmp_path / "config.json").write_text(json.dumps(_minimal_config()))
+    (tmp_path / "config.json").write_text(
+        json.dumps(_minimal_config(model_type=model_type))
+    )
 
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 

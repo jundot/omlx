@@ -585,11 +585,11 @@ def maybe_apply_pre_load_patches(
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
 
-    if model_type == "mimo_v2":
+    if model_type in {"mimo_v2", "mimo_v2_flash"}:
         from ..patches.mimo_v2 import apply_mimo_v2_patch
 
         if apply_mimo_v2_patch():
-            logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
+            logger.info("MiMo V2 text pre-load patch applied for %s", model_name)
 
     if model_type == "bailing_hybrid":
         from ..patches.bailing_hybrid import apply_bailing_hybrid_patch
@@ -1167,10 +1167,10 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
-    fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
-    only). The model also has to declare MTP heads in the config; otherwise
-    the patch is a no-op.
+    fork PR 15), MiMo V2/2.6 Flash, GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids
+    (nemotron_h) and Gemma 4 merged-assistant checkpoints (gemma4 and
+    gemma4_unified, VLM path only). The model also has to declare MTP heads in
+    the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -1180,6 +1180,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+        or model_type in ("mimo_v2", "mimo_v2_flash")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
         or model_type == "glm5_next"
