@@ -1212,6 +1212,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
+        or model_type == "mimo_v2"
     )
 
 

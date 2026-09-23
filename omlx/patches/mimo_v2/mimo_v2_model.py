@@ -61,6 +61,10 @@ class ModelArgs(BaseModelArgs):
     attention_value_scale: Optional[float] = None
     rope_scaling: Optional[Dict[str, Any]] = None
     tie_word_embeddings: bool = False
+    # Native MTP (multi-token prediction) draft depth. Declared so the HF
+    # config passthrough lands here; the MTP patch reads it defensively and
+    # attaches ``Model.mtp`` when > 0 and MTP is active.
+    num_nextn_predict_layers: int = 0
 
     def __post_init__(self):
         n = self.num_hidden_layers
@@ -291,7 +295,14 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
-    ) -> mx.array:
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
+    ):
+        # ``n_confirmed`` is part of the omlx MTP patched-backbone
+        # interface (GatedDeltaNet confirmed/draft split). MiMo is pure
+        # softmax attention; rejected drafts roll back the rotating KV
+        # cache via the generic undo stash, so the arg is accepted and
+        # ignored here.
         h = (
             input_embeddings
             if input_embeddings is not None
@@ -337,7 +348,10 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(h)
+        normed = self.norm(h)
+        if return_hidden:
+            return normed, h
+        return normed
 
 
 class Model(nn.Module):
@@ -354,11 +368,27 @@ class Model(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        result = self.model(
+            inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+            n_confirmed=n_confirmed,
+        )
+        if return_hidden:
+            out, hidden = result
+        else:
+            out = result
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        if return_hidden:
+            return out, hidden
+        return out
 
     def sanitize(self, weights):
         skip_prefixes = (
