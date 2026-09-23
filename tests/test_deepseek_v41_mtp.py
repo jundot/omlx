@@ -51,7 +51,7 @@ def test_verify_rollback_restores_all_csa2_slots(prefix, accepted, ratio, monkey
     for actual, wanted in zip(cache, expected):
         assert actual.size() == wanted.size() == prefix + accepted + 1
         np.testing.assert_array_equal(actual.left_padding, wanted.left_padding)
-        for a, b in zip(actual.state, wanted.state):
+        for a, b in zip(actual.cache, wanted.cache):
             np.testing.assert_allclose(a, b, atol=1e-6, rtol=1e-5)
     following = mx.array([[25]])
     a = model(following, cache=cache)
@@ -82,7 +82,7 @@ def test_rollback_restores_engram_history():
     model(mx.array([[8, 9]]), cache=expected)
     np.testing.assert_array_equal(cache[0][6], expected[0][6])
     for a, b in zip(cache, expected):
-        for x, y in zip(a.state, b.state):
+        for x, y in zip(a.cache, b.cache):
             np.testing.assert_allclose(x, y, atol=1e-5)
 
 

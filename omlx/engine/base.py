@@ -16,6 +16,7 @@ import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
 
+logger = logging.getLogger(__name__)
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
 
 _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 4.0
@@ -136,6 +137,19 @@ async def _run_scheduler_preflight_with_cleanup_retry(
             await asyncio.sleep(_PREFLIGHT_CLEANUP_POLL_INTERVAL_S)
             continue
 
+        # An idle scheduler has no step boundary to refresh its executor-owned
+        # MLX active-memory sample. If that stale sample is the only reason the
+        # first estimate requested eviction, re-measure once before evicting.
+        if (
+            getattr(eviction_request, "stale_usage", False) is True
+            and executor is not None
+        ):
+            refresh_usage = getattr(scheduler, "refresh_route_preflight_usage", None)
+            if callable(refresh_usage):
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(executor, refresh_usage)
+                continue
+
         # Dropping the last Request/KV references and clearing MLX's pool do
         # not make macOS phys_footprint settle atomically. Once a transient
         # rejection has observed pending cleanup, keep re-measuring for the
@@ -232,6 +246,68 @@ class BaseEngine(ABC):
         """
 
         return False
+
+    def _generation_prompt_text(
+        self,
+        chat_template_kwargs: Optional[Dict[str, Any]],
+        is_partial: Optional[bool],
+    ) -> tuple[Optional[str], bool]:
+        """Return ``(suffix, persists)`` for the template's generation prompt.
+
+        ``persists`` is True when an assistant turn followed by a user turn still
+        renders that suffix, so cache state past it stays reusable. Memoized.
+        """
+        render = getattr(self, "_apply_chat_template", None)
+        if is_partial or not callable(render):
+            return None, False
+        key = repr(sorted((chat_template_kwargs or {}).items(), key=repr))
+        cache = self.__dict__.setdefault("_generation_prompt_cache", {})
+        if key in cache:
+            return cache[key]
+        suffix: Optional[str] = None
+        persists = False
+        try:
+            probe = [{"role": "user", "content": "probe"}]
+            with_prompt = render(
+                [dict(m) for m in probe],
+                None,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=False,
+            )
+            without = render(
+                [dict(m) for m in probe],
+                None,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=False,
+                add_generation_prompt=False,
+            )
+            if (
+                isinstance(with_prompt, str)
+                and isinstance(without, str)
+                and len(without) < len(with_prompt)
+                and with_prompt.startswith(without)
+            ):
+                suffix = with_prompt[len(without) :]
+                # The reply must sit before a later user turn: templates
+                # keep reasoning only on the final assistant turn.
+                history = render(
+                    [dict(m) for m in probe]
+                    + [
+                        {"role": "assistant", "content": "reply"},
+                        {"role": "user", "content": "next"},
+                    ],
+                    None,
+                    chat_template_kwargs=chat_template_kwargs,
+                    is_partial=False,
+                    add_generation_prompt=False,
+                )
+                persists = isinstance(history, str) and history.startswith(with_prompt)
+        except Exception as e:
+            logger.debug(f"Generation prompt suffix calc failed: {e}")
+        if len(cache) >= 16:
+            cache.clear()
+        cache[key] = (suffix, persists)
+        return suffix, persists
 
     @property
     @abstractmethod

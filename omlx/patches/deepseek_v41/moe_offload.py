@@ -25,7 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .convert import repack_weight
+from .convert import repack_weight, source_quantization_spec
 from .quantization import QuantizedProjection
 from .residency import (
     checkpoint_signature,
@@ -75,15 +75,17 @@ def _to_array(slab, raw):
 class ExpertOffloadPlan:
     """Validate every routed tensor before promising any memory savings."""
 
-    def __init__(self, path, raw, mapping, config, fraction):
+    def __init__(self, path, raw, mapping, config, fraction, mtp_resident=False):
         if not 0 < fraction <= 1:
             raise ValueError("MoE resident fraction must be in (0, 1]")
         self.path = Path(path)
         self.mapping = mapping
         self.converted = raw.get("omlx_deepseek_v41")
+        self.config = raw
         self.count = config.n_routed_experts
         self.floor = config.n_activated_experts
         self.capacity = min(self.count, max(self.floor, round(self.count * fraction)))
+        self.mtp_resident = bool(mtp_resident)
         self.layers = {}
         self.layer_bytes = {}
         self.excluded_keys = set()
@@ -97,7 +99,11 @@ class ExpertOffloadPlan:
         if self.converted is not None:
             for key in mapping:
                 if key.startswith("language_model.mtp."):
-                    entry = self._entry(key)
+                    # _entry excludes the tensor from loading; resident draft weights must stay included.
+                    if self.mtp_resident:
+                        entry = self._header(self.mapping[key])[key]
+                    else:
+                        entry = self._entry(key)
                     self.draft_bytes += (
                         entry["data_offsets"][1] - entry["data_offsets"][0]
                     )
@@ -191,6 +197,37 @@ class ExpertOffloadPlan:
                         raise ValueError(f"Invalid expert scales: {name}")
                     current = {"bits": bits, "mode": f"mxfp{bits}"}
                     size += math.prod(expected) + logical[0] * logical[1] // 32
+                elif dtype == "U32":
+                    # mlx_lm affine packing: the declared format fixes the
+                    # logical width, and the shapes below must agree with it.
+                    current = source_quantization_spec(self.config, name)
+                    if current is None:
+                        raise ValueError(
+                            f"Expert is declared dense but stored packed: {name}"
+                        )
+                    bits, group = current["bits"], current["group_size"]
+                    expected = (logical[0], logical[1] * bits // 32)
+                    entries = {
+                        "weight": entry,
+                        "scales": self._entry(name + ".scales"),
+                        "biases": self._entry(name + ".biases"),
+                    }
+                    for field, item in entries.items():
+                        want = (
+                            expected
+                            if field == "weight"
+                            else (logical[0], logical[1] // group)
+                        )
+                        allowed = {"U32"} if field == "weight" else set(_FLOAT_BYTES)
+                        if item["dtype"] not in allowed or tuple(item["shape"]) != want:
+                            raise ValueError(f"Invalid expert tensor: {name}.{field}")
+                    if entries["scales"]["dtype"] != entries["biases"]["dtype"]:
+                        raise ValueError(f"Affine metadata dtypes differ: {name}")
+                    # Count every field: expert_bytes sizes the INFLIGHT window.
+                    size += sum(
+                        item["data_offsets"][1] - item["data_offsets"][0]
+                        for item in entries.values()
+                    )
                 elif dtype in _FLOAT_BYTES:
                     expected, current = logical, None
                     if name + ".scale" in self.mapping:
@@ -275,6 +312,10 @@ class ExpertOffloadPlan:
                 for field in _fields(self.layers[prefix][proj])
             ]
         name = f"{prefix.removeprefix('language_model.')}.{expert}.{proj}"
+        spec = self.layers[prefix][proj]
+        if spec and spec["mode"] == "affine":
+            # Affine source: mlx_lm stores plural metadata beside the weight.
+            return [self.slab(name + "." + field) for field in _fields(spec)]
         slabs = [self.slab(name + ".weight")]
         if name + ".scale" in self.mapping:
             slabs.append(self.slab(name + ".scale"))
@@ -282,7 +323,9 @@ class ExpertOffloadPlan:
 
     def decode(self, slabs, raws):
         """Projection arrays from the slabs' bytes, keyed by field."""
-        if self.converted is not None:
+        if self.converted is not None or slabs[0].dtype == "U32":
+            # The packed weight stays uint32: QuantizedProjection drives the
+            # quantized matmul, so dequantizing here would defeat the point.
             return {
                 slab.key.rsplit(".", 1)[1]: _to_array(slab, raw)
                 for slab, raw in zip(slabs, raws)
@@ -500,7 +543,7 @@ class OffloadedExpert(nn.Module):
         return outputs
 
 
-def _plan(path, fraction):
+def _plan(path, fraction, mtp_resident=False):
     from .config import ModelConfig
 
     path = Path(path)
@@ -508,18 +551,29 @@ def _plan(path, fraction):
     mapping = json.loads((path / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
-    return ExpertOffloadPlan(path, raw, mapping, ModelConfig.from_dict(raw), fraction)
+    return ExpertOffloadPlan(
+        path,
+        raw,
+        mapping,
+        ModelConfig.from_dict(raw),
+        fraction,
+        mtp_resident=mtp_resident,
+    )
 
 
-def estimate_expert_savings(path, fraction):
-    return _estimate_expert_savings(str(path), fraction, checkpoint_signature(path))
+def estimate_expert_savings(path, fraction, *, mtp_resident=False):
+    return _estimate_expert_savings(
+        str(path), fraction, checkpoint_signature(path), bool(mtp_resident)
+    )
 
 
 @lru_cache(maxsize=32)
-def _estimate_expert_savings(path, fraction, signature):
-    plan = _plan(path, fraction)
+def _estimate_expert_savings(path, fraction, signature, mtp_resident):
+    plan = _plan(path, fraction, mtp_resident)
     # Keep the existing residency estimator's 5% nonexpert safety allowance.
-    return plan.full_bytes - plan.resident_bytes + plan.draft_bytes
+    # The draft head only counts as savings when offload strips it.
+    draft = 0 if plan.mtp_resident else plan.draft_bytes
+    return plan.full_bytes - plan.resident_bytes + draft
 
 
 def _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes):
@@ -530,7 +584,8 @@ def _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes):
     has no residency estimate and discounts the savings from the discovery
     size (shard file sizes with a 5% allowance) instead.
     """
-    saved = plan.full_bytes - plan.resident_bytes_at(capacity) + plan.draft_bytes
+    draft = 0 if plan.mtp_resident else plan.draft_bytes
+    saved = plan.full_bytes - plan.resident_bytes_at(capacity) + draft
     if estimate.supported:
         base = estimate.mmap_bytes if engram_ssd_offload else estimate.resident_bytes
         return max(0, base - int(saved * 1.05))
@@ -543,23 +598,29 @@ def _file_bytes(path):
     return lambda: estimate_model_size(Path(path))
 
 
-def admission_bytes(path, fraction, *, engram_ssd_offload=True):
+def admission_bytes(path, fraction, *, engram_ssd_offload=True, mtp_resident=False):
     """The engine pool's admission estimate for expert offload at ``fraction``."""
     return _admission_bytes(
-        str(path), float(fraction), bool(engram_ssd_offload), checkpoint_signature(path)
+        str(path),
+        float(fraction),
+        bool(engram_ssd_offload),
+        checkpoint_signature(path),
+        bool(mtp_resident),
     )
 
 
 @lru_cache(maxsize=32)
-def _admission_bytes(path, fraction, engram_ssd_offload, signature):
-    plan = _plan(path, fraction)
+def _admission_bytes(path, fraction, engram_ssd_offload, signature, mtp_resident):
+    plan = _plan(path, fraction, mtp_resident)
     estimate = deepseek_v41_residency_estimate(path)
     return _admission(
         plan, plan.capacity, estimate, engram_ssd_offload, _file_bytes(path)
     )
 
 
-def fit_resident_fraction(path, budget_bytes, *, engram_ssd_offload=True):
+def fit_resident_fraction(
+    path, budget_bytes, *, engram_ssd_offload=True, mtp_resident=False
+):
     """Largest resident fraction whose admission estimate fits ``budget_bytes``.
 
     Returns ``None`` when even the routing floor does not fit. The result is
@@ -571,12 +632,15 @@ def fit_resident_fraction(path, budget_bytes, *, engram_ssd_offload=True):
         int(budget_bytes),
         bool(engram_ssd_offload),
         checkpoint_signature(path),
+        bool(mtp_resident),
     )
 
 
 @lru_cache(maxsize=32)
-def _fit_resident_fraction(path, budget_bytes, engram_ssd_offload, signature):
-    plan = _plan(path, 1.0)
+def _fit_resident_fraction(
+    path, budget_bytes, engram_ssd_offload, signature, mtp_resident
+):
+    plan = _plan(path, 1.0, mtp_resident)
     estimate = deepseek_v41_residency_estimate(path)
     file_bytes = _file_bytes(path)
     for capacity in range(plan.count, plan.floor - 1, -1):

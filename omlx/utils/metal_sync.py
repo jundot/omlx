@@ -21,6 +21,8 @@ from contextlib import suppress
 import mlx.core as mx
 from mlx_lm.generate import generation_stream
 
+from .fatal import exit_if_gpu_submissions_ignored
+
 # Module-level alias so callers can fall back to mlx-lm's default stream
 # when no per-engine stream is provided.
 _default_generation_stream = generation_stream
@@ -72,7 +74,11 @@ def _sync_and_clear_cache(stream=None):
         target = stream if stream is not None else _default_generation_stream
         try:
             mx.synchronize(target)
-        except RuntimeError:
-            pass
-        mx.synchronize()  # default stream
-        mx.clear_cache()
+        except RuntimeError as exc:
+            exit_if_gpu_submissions_ignored(exc)
+        try:
+            mx.synchronize()  # default stream
+            mx.clear_cache()
+        except RuntimeError as exc:
+            exit_if_gpu_submissions_ignored(exc)
+            raise

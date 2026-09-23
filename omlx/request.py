@@ -220,6 +220,11 @@ class Request:
     specprefill_position_offset: int = 0  # RoPE offset = M - N
     specprefill_system_end: int = 0  # Token index where system prompt ends
 
+    # Chat template suffix after the last message; the tail snapshot ends before it.
+    generation_prompt_text: Optional[str] = None
+    generation_prompt_start: int = 0  # Token index where the generation prompt starts
+    generation_prompt_persists: bool = False  # History keeps the generation prompt
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter

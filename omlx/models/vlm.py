@@ -26,6 +26,7 @@ import os
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_vlm.models.cache import RotatingKVCache
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,44 @@ _STEP_TEXT_POSITIONS_DISABLED = os.environ.get(
 _STEP_TEXT_POSITIONS_MIN_CONTEXT = int(
     os.environ.get("OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT", "32768")
 )
+
+
+class PrefillReadyRotatingKVCache(RotatingKVCache):
+    """Preserve short restored buffers while using the VLM cache API."""
+
+    def size(self):
+        if self.keys is None:
+            return 0
+        return min(super().size(), self.keys.shape[2])
+
+
+def restore_bonsai_quantized_modules(model: nn.Module) -> int:
+    """Keep oMLX's quantized module and kernel paths after VLM loading."""
+    from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
+
+    restored = 0
+    replacements = {
+        OneBitLinear: nn.QuantizedLinear,
+        OneBitEmbedding: nn.QuantizedEmbedding,
+    }
+    for _, module in model.named_modules():
+        replacement = replacements.get(type(module))
+        if replacement is not None:
+            if restored == 0:
+                from ..patches.bonsai_qmv import (
+                    apply_bonsai_construct_patch,
+                    apply_bonsai_qmv_patch,
+                )
+                from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
+
+                apply_bonsai_t5_load_patch()
+                apply_bonsai_construct_patch()
+                apply_bonsai_qmv_patch()
+            # Both classes store the same packed tensors and quantization fields.
+            # Rebinding preserves loaded weights, frozen parameters, and aliases.
+            module.__class__ = replacement
+            restored += 1
+    return restored
 
 
 class VLMModelAdapter(nn.Module):
@@ -208,6 +247,76 @@ class VLMModelAdapter(nn.Module):
             return self._language_model.make_cache()
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
+
+    def restore_cache(self, caches):
+        """Bind the stable SSD tensor format to the active model's cache classes."""
+        from mlx_lm.models import cache as lm_cache
+        from mlx_vlm.models.cache import PoolingCache
+
+        from ..cache._rotating_subclass import (
+            PrefillReadyRotatingKVCache as LMRestoredRotatingKVCache,
+        )
+
+        def restore(source, target):
+            if hasattr(source, "_inner"):
+                source = source._inner
+            children = getattr(target, "caches", None)
+            if children is not None:
+                return type(target)(
+                    *(
+                        restore(old, new)
+                        for old, new in zip(source.caches, children, strict=True)
+                    )
+                )
+            restored_rotating = (
+                type(source) is LMRestoredRotatingKVCache
+                and type(target) is RotatingKVCache
+            )
+            if restored_rotating:
+                target = PrefillReadyRotatingKVCache(source.max_size, source.keep)
+            if not restored_rotating and (
+                type(source) is type(target)
+                or type(source).__name__ != type(target).__name__
+            ):
+                return source
+            if type(source) is lm_cache.ArraysCache:
+                target.cache = list(source.cache)
+                target.left_padding = source.left_padding
+                target.lengths = source.lengths
+            elif type(source) in (
+                lm_cache.KVCache,
+                lm_cache.RotatingKVCache,
+                lm_cache.ChunkedKVCache,
+                LMRestoredRotatingKVCache,
+            ):
+                target.keys, target.values = source.keys, source.values
+                target.offset = source.offset
+                if isinstance(source, lm_cache.RotatingKVCache):
+                    target.keep, target.max_size = source.keep, source.max_size
+                    target._idx = source._idx
+                elif type(source) is lm_cache.ChunkedKVCache:
+                    target.chunk_size = source.chunk_size
+                    target.start_position = source.start_position
+            elif type(target) is PoolingCache:
+                state = source.state
+                if len(state) == 5:
+                    # SSD reconstruction uses the oMLX text cache layout.
+                    if any(value is not None for value in state[3:]):
+                        raise ValueError(
+                            "Cannot restore text pooling overlap into VLM cache"
+                        )
+                    state = state[:3]
+                target.meta_state = source.meta_state
+                target.state = state
+            else:
+                target.meta_state = source.meta_state
+                target.state = source.state
+            return target
+
+        return [
+            restore(old, new)
+            for old, new in zip(caches, self.make_cache(), strict=True)
+        ]
 
     def set_pending_embeddings(
         self,
@@ -421,6 +530,22 @@ class VLMModelAdapter(nn.Module):
     def has_pending_embeddings(self) -> bool:
         """Check if there are pending embeddings for prefill."""
         return self._pending_embeds is not None
+
+    def minimum_prefill_prefix(self, tokens: list[int]) -> int:
+        """Return the prefix that must run together before reusable boundaries."""
+        if self.model_type != "deepseek_v4":
+            return 0
+        config = self._language_model.config
+        if not config.vision_n_layers:
+            return 0
+        return next(
+            (
+                i + 1
+                for i in range(len(tokens) - 1, -1, -1)
+                if tokens[i] >= config.vocab_size
+            ),
+            0,
+        )
 
     def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
         """Forward the prompt loop's next-chunk notice to a language model that gathers ahead."""

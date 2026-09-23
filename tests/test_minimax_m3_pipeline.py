@@ -179,21 +179,16 @@ def test_an_even_split_across_four_ranks_covers_every_layer():
     assert covered == set(range(4))
 
 
-def test_a_split_that_does_not_divide_evenly_is_an_upstream_limitation():
-    """Documents a constraint in mlx-lm's PipelineMixin, not in this patch.
-
-    ``start_idx`` is computed from the *adjusted* per-rank count, so when
-    ``layers % ranks != 0`` the first rank's range runs past the end: 4 layers
-    across 3 ranks gives rank 0 ``start_idx=4``. The planner should keep stage
-    counts to a divisor of the layer count until that is fixed upstream.
-    """
-
-    model = _model()
-    model.model.pipeline(_Group(0, 3))
-    assert model.model.start_idx >= len(model.model.layers), (
-        "if this now passes, mlx-lm fixed uneven splits and the planner may "
-        "stop restricting stage counts to divisors of the layer count"
-    )
+def test_uneven_split_covers_each_layer_once():
+    covered = set()
+    for rank in range(3):
+        model = _rank_of(CONFIG, rank, 3)
+        stage = set(
+            range(model.model.start_idx, model.model.start_idx + model.model.num_layers)
+        )
+        assert not covered & stage
+        covered |= stage
+    assert covered == set(range(4))
 
 
 # --- Single-node serving must be untouched ---------------------------------

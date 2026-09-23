@@ -95,6 +95,8 @@ class PrefixCacheStats(BaseCacheStats):
     exact_prefix_tokens_restored: int = 0
     exact_prefix_stores: int = 0
     exact_prefix_store_failures: int = 0
+    tail_blocks_stored: int = 0
+    tail_block_hits: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -125,6 +127,8 @@ class PrefixCacheStats(BaseCacheStats):
         self.exact_prefix_tokens_restored = 0
         self.exact_prefix_stores = 0
         self.exact_prefix_store_failures = 0
+        self.tail_blocks_stored = 0
+        self.tail_block_hits = 0
         self._total_queries = 0
 
 

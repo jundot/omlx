@@ -1064,41 +1064,6 @@ class TestGrammarProcessorAdvance:
 
 
 # =========================================================================
-# _apply_batched_grammar (scheduler _step integration)
-# =========================================================================
-
-class TestApplyBatchedGrammar:
-    """Tests for the batched grammar path in _step."""
-
-    @pytest.fixture()
-    def setup(self):
-        xgr = pytest.importorskip("xgrammar")
-        vocab = [f"<tok_{i}>" for i in range(256)]
-        vocab[ord("a")] = "a"
-        vocab[ord("b")] = "b"
-        vocab[ord("{")] = "{"
-        vocab[ord("}")] = "}"
-        ti = xgr.TokenizerInfo(vocab)
-        comp = xgr.GrammarCompiler(ti)
-        return comp, len(vocab)
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_batched_grammar_masks_logits(self, setup):
-        """Batched grammar correctly masks logits for multiple requests."""
-        pass
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_non_grammar_processors_still_run(self, setup):
-        """ThinkingBudgetProcessor and other processors still run per-request."""
-        pass
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_terminated_processors_skipped(self, setup):
-        """Terminated grammar processors don't participate in batch fill."""
-        pass
-
-
-# =========================================================================
 # _get_model_vocab_size
 # =========================================================================
 

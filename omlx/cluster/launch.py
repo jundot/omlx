@@ -25,7 +25,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -2583,6 +2583,8 @@ class DistributedJobStatus:
     stderr_tail: tuple[str, ...]
     failure_reason: str | None = None
     ranks: tuple[dict[str, Any], ...] = ()
+    # What the pre-launch RDMA check decided for this launch, and why.
+    stage_links: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2596,7 +2598,50 @@ class DistributedJobStatus:
             "stderr_tail": list(self.stderr_tail),
             "failure_reason": self.failure_reason,
             "ranks": [dict(rank) for rank in self.ranks],
+            "stage_links": self.stage_links,
         }
+
+
+def _attach_rdma_stage_links(
+    deployment: ClusterDeployment,
+) -> tuple[ClusterDeployment, dict[str, Any]]:
+    """Re-verify RDMA stage links for one launch; any error keeps MLX's transport."""
+    try:
+        from .rdma.launch_links import attach_stage_links
+
+        return attach_stage_links(deployment)
+    except Exception as exc:
+        logger.warning(
+            "RDMA stage-link check failed; launching over MLX's transport",
+            exc_info=True,
+        )
+        _release_rdma_stage_links(deployment.deployment_id)
+        report = {
+            "active": False,
+            "reason": f"RDMA stage-link check failed: {exc}",
+            "edges": [],
+        }
+        return replace(deployment, stage_links=()), report
+
+
+def _effective_rdma_report(
+    report: dict[str, Any] | None, ranks: tuple[dict[str, Any], ...]
+) -> dict[str, Any] | None:
+    """The pre-launch RDMA report, corrected by the ranks' own vote."""
+    if not report:
+        return report
+    from .rdma.launch_links import effective_report
+
+    return effective_report(report, ranks)
+
+
+def _release_rdma_stage_links(deployment_id: str) -> None:
+    """Free the RDMA links a finished launch held."""
+    # Nothing can have been claimed if the RDMA module does not import.
+    with suppress(ImportError):
+        from .rdma.launch_links import release_links
+
+        release_links(deployment_id)
 
 
 class DistributedJobSupervisor:
@@ -2612,10 +2657,15 @@ class DistributedJobSupervisor:
         load_timeout: float = 1800.0,
         stop_timeout: float = 10.0,
         preflight: bool = True,
+        attach_stage_links: Callable[
+            [ClusterDeployment], tuple[ClusterDeployment, dict[str, Any]]
+        ] = _attach_rdma_stage_links,
     ) -> None:
         if load_timeout <= 0 or stop_timeout <= 0:
             raise ValueError("supervisor timeouts must be positive")
         self.deployment = deployment
+        self._attach_stage_links = attach_stage_links
+        self.stage_link_report: dict[str, Any] | None = None
         self.python_executable = _validate_python_executable(python_executable)
         self.cwd = cwd
         self.state_dir = state_dir
@@ -2684,19 +2734,28 @@ class DistributedJobSupervisor:
         # Mint a fresh launch-scoped secret so an unauthenticated peer on the
         # fabric cannot join rank control by reading the signed plan.
         self.control_token = secrets.token_hex(32)
-        argv = build_mlx_launch_argv(
-            self.deployment,
-            hostfile=hostfile,
-            api_port=self.port,
-            collective_port=self.collective_port,
-            python_executable=self.python_executable,
-            cwd=self.cwd,
-            state_dir=self.state_dir,
-            control_host=control_host,
-            control_port=self.control_port,
-            control_token=self.control_token,
-            load_timeout=self.load_timeout,
+        # Stage links are re-verified for every launch, never reused from a stored plan.
+        self.deployment, self.stage_link_report = self._attach_stage_links(
+            self.deployment
         )
+        try:
+            argv = build_mlx_launch_argv(
+                self.deployment,
+                hostfile=hostfile,
+                api_port=self.port,
+                collective_port=self.collective_port,
+                python_executable=self.python_executable,
+                cwd=self.cwd,
+                state_dir=self.state_dir,
+                control_host=control_host,
+                control_port=self.control_port,
+                control_token=self.control_token,
+                load_timeout=self.load_timeout,
+            )
+        except Exception:
+            # No rank exists yet, so the links this launch claimed are free again.
+            _release_rdma_stage_links(self.deployment.deployment_id)
+            raise
         self._phase = "loading"
         try:
             environment = os.environ.copy()
@@ -3065,6 +3124,8 @@ class DistributedJobSupervisor:
         self.failure_event = None
         self._phase = "stopped"
         self._remove_launch_manifest()
+        # Every rank is proven gone, so its RDMA link may carry the next launch.
+        _release_rdma_stage_links(self.deployment.deployment_id)
         with suppress(Exception):
             _set_serve_release(self.deployment, self.state_dir, None)
         if self._temporary is not None:
@@ -3311,6 +3372,13 @@ class DistributedJobSupervisor:
             ranks=tuple(
                 dict(self.rank_ready_events[rank])
                 for rank in sorted(self.rank_ready_events)
+            ),
+            stage_links=_effective_rdma_report(
+                self.stage_link_report,
+                tuple(
+                    self.rank_ready_events[rank]
+                    for rank in sorted(self.rank_ready_events)
+                ),
             ),
         )
 

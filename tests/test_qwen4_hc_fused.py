@@ -289,7 +289,6 @@ def test_lazy_compilation_failure_returns_canonical_output(
 
     monkeypatch.setattr(hc_fused, "_KERNELS", {})
     monkeypatch.setattr(hc_fused, "_VALIDATED", set())
-    monkeypatch.setattr(hc_fused, "_RUNTIME_FAILED", False)
     monkeypatch.setattr(hc_fused, "_FAILURE_LOGGED", False)
     monkeypatch.setattr(
         hc_fused,
@@ -305,9 +304,8 @@ def test_lazy_compilation_failure_returns_canonical_output(
         mx.eval(actual)
         repeated = module(x)
         mx.eval(repeated)
-    assert hc_fused._RUNTIME_FAILED
     assert not hc_fused._VALIDATED
-    assert not hc_fused.enabled()
+    assert hc_fused.enabled()
     if not use_combine:
         actual, expected, repeated = [actual], [expected], [repeated]
     for value, reference, again in zip(actual, expected, repeated):
@@ -413,3 +411,63 @@ def test_module_routes_prefill_rows_through_the_prefill_path(monkeypatch):
     assert module(x) == "prefill"
     assert calls == [(1, 64, WIDTH)]
     assert module(x, target_verify=True) != "prefill"
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("path", ["prefill", "decode"])
+def test_transient_failure_preserves_other_models_and_recovers(monkeypatch, path):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    failed = _module(4, hidden=64)
+    other = _module(8, hidden=64)
+    decode = mx.ones((1, 4, HC * 64), dtype=mx.bfloat16)
+    inputs = mx.ones((1, 32 if path == "prefill" else 4, HC * 64), dtype=mx.bfloat16)
+    expected = failed._forward(inputs)
+    mx.eval(expected)
+    hook = "_tail" if path == "prefill" else "_kernel_norm"
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            hc_fused, hook, Mock(side_effect=RuntimeError("transient failure"))
+        )
+        actual = failed(inputs)
+        mx.eval(actual)
+    for value, reference in zip(actual, expected):
+        assert mx.array_equal(value, reference).item()
+
+    assert hc_fused.compatible(other, decode)
+    assert hc_fused.compatible(failed, decode)
+    if path == "prefill":
+        assert hc_fused.prefill_compatible(failed, inputs)
+    monkeypatch.setattr(
+        failed, "_forward", Mock(side_effect=AssertionError("Unexpected fallback"))
+    )
+    monkeypatch.setattr(
+        other, "_forward", Mock(side_effect=AssertionError("Unexpected fallback"))
+    )
+    mx.eval(failed(inputs))
+    mx.eval(other(decode, target_verify=True))
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("batch,length", [(1, 3), (2, 2), (2, 8)])
+def test_fused_rows_match_independent_singletons(bits, batch, length):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(3770 + bits)
+    module = _module(bits)
+    x = mx.random.normal((batch, length, WIDTH)).astype(mx.bfloat16)
+    actual, _, actual_injection = hc_fused.fused_forward(module, x)
+    singletons = [
+        hc_fused.fused_forward(module, row.reshape(1, 1, WIDTH))
+        for row in x.reshape(-1, WIDTH)
+    ]
+    expected = mx.concatenate([row[0] for row in singletons], axis=1).reshape(
+        batch, length, HIDDEN
+    )
+    expected_injection = mx.concatenate([row[2] for row in singletons], axis=1).reshape(
+        batch, length, HC
+    )
+    mx.eval(actual, expected, actual_injection, expected_injection)
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(actual_injection, expected_injection).item()

@@ -8,6 +8,9 @@
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
+    // The API accepts fractions outside the UI range.
+    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 5;
+    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 95;
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -105,6 +108,11 @@
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
     function dashboard() {
+        // GridStack instance and helpers stay outside the reactive Alpine state.
+        let dashGrid = null;
+        let dashObserver = null;
+        let dashRefitFrame = null;
+        let dashRefitTimer = null;
         return {
             // Theme
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
@@ -159,7 +167,7 @@
                     web_search_content_truncate: true,
                     web_search_content_max_chars: 20000,
                 },
-                ui: { language: 'en' },
+                ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -251,6 +259,7 @@
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
@@ -359,6 +368,14 @@
             },
 
             statsScope: 'session',
+            // Dashboard block layout (see dashboard_layout.js)
+            dashLayout: null,
+            dashDraft: null,
+            dashEditing: false,
+            dashSaving: false,
+            dashSaveError: '',
+            dashPlacedIds: [],
+            dashEditAvailable: true,
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
@@ -741,6 +758,7 @@
                 if (value === 'status') {
                     await this.loadStats();
                     this.startStatsRefresh();
+                    this.$nextTick(() => this.ensureDashboardGrid());
                 } else {
                     this.stopStatsRefresh();
                 }
@@ -830,6 +848,38 @@
                 this.syncTabStateToUrl();
             },
 
+            handleMainTabKeydown(event) {
+                if (!event.target.matches('[role="tab"]')
+                    || event.altKey || event.ctrlKey || event.metaKey) return;
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'))
+                    .filter(tab => !tab.disabled && tab.getClientRects().length);
+                const index = tabs.indexOf(event.target);
+                if (index < 0) return;
+                event.preventDefault();
+                let next;
+                if (event.key === 'Home') next = 0;
+                else if (event.key === 'End') next = tabs.length - 1;
+                else next = (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                this.modelsDropdown = this.settingsDropdown = this.benchDropdown = false;
+                tabs[next].focus();
+                tabs[next].click();
+            },
+
+            trapDialogFocus(event) {
+                const dialog = event.currentTarget;
+                const controls = Array.from(dialog.querySelectorAll(
+                    'a[href], button, input, select, textarea, [tabindex]'
+                )).filter(el => el.tabIndex >= 0 && !el.matches(':disabled')
+                    && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                const index = controls.indexOf(document.activeElement);
+                if (!controls.length || (event.shiftKey ? index <= 0 : index === controls.length - 1)) {
+                    event.preventDefault();
+                    const target = event.shiftKey ? controls.at(-1) : controls[0];
+                    (target || dialog.querySelector('[autofocus]')).focus();
+                }
+            },
+
             setSettingsTab(tab) {
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
@@ -876,7 +926,72 @@
                 }
             },
 
+            loadingGlobalSettings: false,
+            resettingGlobalSettings: false,
+            showGlobalResetNotice: false,
+            globalResetSnapshot: null,
+            globalDefaultsPending: false,
+
+            async resetGlobalSettingsDefaults() {
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
+                this.resettingGlobalSettings = true;
+                this.saveSuccess = false;
+                this.saveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings/defaults');
+                    if (!response.ok) throw new Error('Failed to load defaults');
+                    const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
+                    const s = this.globalSettings;
+                    for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
+                        'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
+                        for (const key of Object.keys(s[section])) {
+                            if (['base_path', 'model_dirs', 'model_dir', 'effective_model_dirs',
+                                'ssd_cache_dir', 'config_path', 'hf_cache_path', 'ca_bundle',
+                                'api_key', 'api_key_set', 'sub_keys', 'endpoint',
+                                'distributed_inference_active'].includes(key)) continue;
+                            if (Object.hasOwn(defaults[section], key)) {
+                                s[section][key] = defaults[section][key];
+                            }
+                        }
+                    }
+                    this.idleTimeoutValue = s.idle_timeout.idle_timeout_seconds == null
+                        ? '' : String(s.idle_timeout.idle_timeout_seconds);
+                    this.cachePercent = this.parseCacheToPercent(
+                        s.cache.ssd_cache_max_size, s.system.ssd_total_bytes);
+                    this.hotCachePercent = this.parseHotCacheToPercent(
+                        s.cache.hot_cache_max_size, s.system.total_memory_bytes);
+                    s.ui.language = defaults.ui.language;
+                    this.globalDefaultsPending = true;
+                    this.showGlobalResetNotice = true;
+                } catch (err) {
+                    this.saveError = window.t('settings.global.reset_failed');
+                } finally {
+                    this.resettingGlobalSettings = false;
+                }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
+            },
+
             async loadGlobalSettings() {
+                this.loadingGlobalSettings = true;
                 try {
                     const response = await fetch('/admin/api/global-settings');
                     if (response.ok) {
@@ -905,7 +1020,12 @@
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
-                        this.globalSettings.ui = data.ui || { language: 'en' };
+                        this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
+                        const layoutLib = this._dashLayoutLib();
+                        this.dashLayout = layoutLib
+                            ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
+                            : null;
+                        if (dashGrid && !this.dashEditing) this.applyDashboardLayout(this.dashLayout);
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -930,8 +1050,6 @@
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
                         );
-                        // Sync the cache string value from percent
-                        this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
                         this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
@@ -946,6 +1064,8 @@
                     }
                 } catch (err) {
                     console.error('Failed to load global settings:', err);
+                } finally {
+                    this.loadingGlobalSettings = false;
                 }
             },
 
@@ -979,6 +1099,7 @@
             },
 
             async saveGlobalSettings() {
+                if (this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -1033,6 +1154,7 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            ...(this.globalDefaultsPending ? { ui_language: s.ui.language } : {}),
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
@@ -1094,6 +1216,10 @@
                         await this.loadStats();
                         await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
+                        if (this.globalDefaultsPending) {
+                            this.globalDefaultsPending = false;
+                            window.location.reload();
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1544,6 +1670,12 @@
 
             showTip(el, text) {
                 if (!text) return;
+                // A tooltip must share the dialog's top layer to remain visible.
+                const tooltip = this.$refs.floatingTooltip;
+                const container = el.closest('dialog') || this.$root;
+                if (tooltip.parentElement !== container) {
+                    Alpine.mutateDom(() => container.appendChild(tooltip));
+                }
                 const rect = el.getBoundingClientRect();
                 this.tip = {
                     visible: true,
@@ -1765,6 +1897,9 @@
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
+                    moe_expert_offload_resident_touched: false,
+                    moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -1823,6 +1958,40 @@
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
                 };
+            },
+
+            moeExpertOffloadResidentInvalid() {
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                return (
+                    !Number.isFinite(percent)
+                    || percent < MOE_EXPERT_OFFLOAD_MIN_PERCENT
+                    || percent > MOE_EXPERT_OFFLOAD_MAX_PERCENT
+                );
+            },
+
+            onMoeExpertOffloadResidentBlur() {
+                // Preserve untouched API values outside the UI range.
+                if (!this.modelSettings.moe_expert_offload_resident_touched) return;
+                if (this.moeExpertOffloadResidentInvalid()) {
+                    const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                    this.modelSettings.moe_expert_offload_resident_percent = Math.min(
+                        MOE_EXPERT_OFFLOAD_MAX_PERCENT,
+                        Math.max(
+                            MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                            Number.isFinite(percent) ? percent : MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                        ),
+                    );
+                }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            onMoeExpertOffloadResidentPercent() {
+                // Defer clamping until blur so partial input remains editable.
+                this.modelSettings.moe_expert_offload_resident_touched = true;
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                if (!this.moeExpertOffloadResidentInvalid()) {
+                    this.modelSettings.moe_expert_offload_resident_fraction = Number((percent / 100).toPrecision(15));
+                }
             },
 
             _resetPresetApplicableFields() {
@@ -2937,6 +3106,162 @@
                 }
             },
 
+            // Snapshot actions in the settings modal header. All three go
+            // through server endpoints that decode, validate and persist, so
+            // the form is rebuilt from the returned settings.
+            openSettingsApply(mode) {
+                this.settingsApply = {
+                    open: true,
+                    mode,
+                    phase: mode === 'recipe' ? 'input' : (mode === 'reset' ? 'confirm' : 'loading'),
+                    recipeText: '',
+                    result: null,
+                    candidates: null,
+                    error: '',
+                };
+                if (mode === 'optimal') this.loadOptimalCandidates();
+            },
+
+            closeSettingsApply() {
+                if (this.settingsApply.phase === 'loading') return;
+                this.settingsApply.open = false;
+            },
+
+            async _settingsActionRequest(method, path, body) {
+                if (!this.selectedModel) return null;
+                const url = `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings/${path}`;
+                const init = { method };
+                if (body !== undefined) {
+                    init.headers = { 'Content-Type': 'application/json' };
+                    init.body = JSON.stringify(body);
+                }
+                this.settingsApply.phase = 'loading';
+                this.settingsApply.error = '';
+                try {
+                    const response = await fetch(url, init);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return null;
+                    }
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.phase = 'error';
+                        return null;
+                    }
+                    return data;
+                } catch (err) {
+                    console.error('Settings snapshot request failed:', err);
+                    this.settingsApply.error = window.t('js.error.settings_apply_failed');
+                    this.settingsApply.phase = 'error';
+                    return null;
+                }
+            },
+
+            async loadOptimalCandidates() {
+                const data = await this._settingsActionRequest('GET', 'optimal');
+                if (!data) return;
+                this.settingsApply.result = data;
+                if (!data.found) {
+                    this.settingsApply.phase = 'none';
+                    return;
+                }
+                this.settingsApply.candidates = data;
+                this.settingsApply.phase = 'choose';
+            },
+
+            async applyOptimalCandidate(benchmarkId) {
+                const data = await this._settingsActionRequest('POST', 'optimal', { benchmark_id: benchmarkId });
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            async runSettingsApply() {
+                const mode = this.settingsApply.mode;
+                const data = mode === 'recipe'
+                    ? await this._settingsActionRequest('POST', 'recipe', { recipe: this.settingsApply.recipeText.trim() })
+                    : await this._settingsActionRequest('POST', 'reset');
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            settingsApplyTitle() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.apply_title_recipe');
+                return window.t('modal.model_settings.actions.apply_title_optimal');
+            },
+
+            settingsApplyLoadingText() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.loading_reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.loading_recipe');
+                return this.settingsApply.candidates
+                    ? window.t('modal.model_settings.actions.loading_apply')
+                    : window.t('modal.model_settings.actions.loading_optimal');
+            },
+
+            settingsApplyDoneText() {
+                const mode = this.settingsApply.mode;
+                const result = this.settingsApply.result;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.done_reset');
+                if (result && result.changed === false) return window.t('modal.model_settings.actions.no_change');
+                return mode === 'recipe'
+                    ? window.t('modal.model_settings.actions.done_recipe')
+                    : window.t('modal.model_settings.actions.done_optimal');
+            },
+
+            settingsApplyGroups() {
+                const c = this.settingsApply.candidates;
+                if (!c) return [];
+                return [
+                    { key: 'pp', label: window.t('modal.model_settings.actions.group_pp'), items: c.by_pp || [] },
+                    { key: 'tg', label: window.t('modal.model_settings.actions.group_tg'), items: c.by_tg || [] },
+                ].filter(g => g.items.length);
+            },
+
+            settingsApplyJson() {
+                const result = this.settingsApply.result;
+                return result && result.applied ? JSON.stringify(result.applied, null, 2) : '';
+            },
+
+            settingsApplyStats(item) {
+                if (!item || item.pp_tps == null) return '';
+                const parts = [`PP ${Number(item.pp_tps).toFixed(1)} tok/s`];
+                if (item.tg_tps != null) parts.push(`TG ${Number(item.tg_tps).toFixed(1)} tok/s`);
+                if (item.memory_gb != null) parts.push(`${item.memory_gb} GB`);
+                if (item.quantization) parts.push(item.quantization);
+                if (item.omlx_version) parts.push(`oMLX ${item.omlx_version}`);
+                if (item.created_at) parts.push(String(item.created_at).slice(0, 10));
+                return parts.join(' · ');
+            },
+
+            async _applySettingsResponse(data) {
+                if (data.settings && this.selectedModel) {
+                    this.modelSettings = this.buildModelSettingsState(this.selectedModel, data.settings);
+                    this.activeProfileName = data.settings.active_profile_name || null;
+                    if (!this.modelSettings.is_diffusion_model) this.computeDrift();
+                }
+                await this.loadModels();
+                if (this.selectedModel) {
+                    const fresh = (this.models || []).find(m => m.id === this.selectedModel.id);
+                    if (fresh) this.selectedModel = fresh;
+                }
+                if (data.requires_reload) {
+                    if (data.auto_reloaded) {
+                        alert(window.t('js.info.model_settings_auto_reloaded'));
+                    } else if (data.auto_unloaded) {
+                        alert(window.t('js.info.model_settings_auto_unloaded'));
+                    } else {
+                        alert(window.t('js.info.model_type_reload_required'));
+                    }
+                }
+            },
+
             async loadGenerationDefaults() {
                 if (!this.selectedModel) return;
                 this.loadingGenDefaults = true;
@@ -3244,6 +3569,219 @@
                 }
             },
 
+            // ---- Dashboard block layout ----
+            _dashLayoutLib() {
+                return typeof DashboardLayout !== 'undefined' ? DashboardLayout : null;
+            },
+            get dashboardWidthClass() {
+                const lib = this._dashLayoutLib();
+                const width = this.dashEditing && this.dashDraft ? this.dashDraft.width : this.dashLayout?.width;
+                return lib ? lib.widthClass(width) : 'max-w-7xl';
+            },
+            get dashWidthOptions() {
+                const lib = this._dashLayoutLib();
+                if (!lib) return [];
+                return lib.WIDTH_IDS.map(id => ({ id, label: window.t(`status.layout.width_${id}`) }));
+            },
+            get dashTrayEmpty() {
+                const lib = this._dashLayoutLib();
+                return !!lib && this.dashPlacedIds.length >= lib.BLOCK_IDS.length;
+            },
+            dashPlaced(id) {
+                return this.dashPlacedIds.includes(id);
+            },
+            _dashBlockEl(id) {
+                return this.$refs.dashGrid?.querySelector(`.dash-block[data-block="${id}"]`) || null;
+            },
+            // Creates the grid the first time the status tab is visible; GridStack
+            // needs a measurable width. Later calls only refit block heights.
+            ensureDashboardGrid() {
+                const lib = this._dashLayoutLib();
+                if (!lib || typeof GridStack === 'undefined' || this.mainTab !== 'status') return;
+                if (dashGrid) {
+                    this.refitDashboardBlocks();
+                    return;
+                }
+                const el = this.$refs.dashGrid;
+                if (!el || !el.offsetWidth) return;
+                dashGrid = GridStack.init({
+                    column: lib.COLUMNS,
+                    cellHeight: 8,
+                    margin: 12,
+                    sizeToContent: true,
+                    float: false,
+                    animate: true,
+                    minRow: 1,
+                    disableDrag: true,
+                    disableResize: true,
+                    acceptWidgets: '.dash-tray-pill',
+                    draggable: { handle: '.dash-block-handle', appendTo: 'body' },
+                    resizable: { handles: 'e, w, se' },
+                    columnOpts: {
+                        columnMax: lib.COLUMNS,
+                        breakpointForWindow: true,
+                        breakpoints: [{ w: 752, c: 1, layout: 'list' }],
+                    },
+                }, el);
+                dashGrid.on('dropped', (event, previous, node) => this._onDashTrayDrop(node));
+                dashGrid.on('dragstop resizestop', () => this.refitDashboardBlocks());
+                GridStack.setupDragIn('.dash-tray-pill', { appendTo: 'body', helper: 'clone' });
+                if (typeof ResizeObserver !== 'undefined') {
+                    dashObserver = new ResizeObserver(() => this.refitDashboardBlocks());
+                    el.querySelectorAll('.dash-block-body').forEach(body => dashObserver.observe(body));
+                }
+                const narrow = window.matchMedia('(max-width: 751.98px)');
+                const syncNarrow = () => {
+                    this.dashEditAvailable = !narrow.matches;
+                    if (narrow.matches && this.dashEditing) this.cancelDashboardEdit();
+                };
+                narrow.addEventListener('change', syncNarrow);
+                syncNarrow();
+                this.applyDashboardLayout(this.dashLayout || lib.defaultLayout());
+            },
+            // Block heights follow their content (stats polling, x-show toggles).
+            // GridStack measures the item's current box, which is still mid-transition
+            // right after a move or resize, so run a second pass once it settles.
+            refitDashboardBlocks() {
+                if (!dashGrid || this.mainTab !== 'status') return;
+                const run = () => {
+                    if (!dashGrid || !this.$refs.dashGrid?.offsetWidth) return;
+                    dashGrid.getGridItems().forEach(item => dashGrid.resizeToContent(item));
+                };
+                if (!dashRefitFrame) {
+                    dashRefitFrame = requestAnimationFrame(() => {
+                        dashRefitFrame = null;
+                        run();
+                    });
+                }
+                clearTimeout(dashRefitTimer);
+                dashRefitTimer = setTimeout(run, 400);
+            },
+            _dashPark(el) {
+                dashGrid.removeWidget(el, false, false);
+                el.classList.add('dash-block-parked');
+            },
+            _dashPlace(id, pos) {
+                const lib = this._dashLayoutLib();
+                const el = this._dashBlockEl(id);
+                if (!el || el.gridstackNode) return null;
+                el.classList.remove('dash-block-parked');
+                dashGrid.makeWidget(el, { id, x: pos.x, y: pos.y, w: pos.w, h: 1, minW: lib.MIN_W });
+                dashGrid.resizeToContent(el);
+                if (!this.dashPlacedIds.includes(id)) this.dashPlacedIds = [...this.dashPlacedIds, id];
+                return el;
+            },
+            applyDashboardLayout(layout) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib) return;
+                layout = lib.normalizeLayout(layout);
+                // No transition while rebuilding: the first content measurement of a
+                // freshly placed item must see its final box, not an animating one.
+                dashGrid.setAnimation(false);
+                dashGrid.getGridItems().forEach(item => this._dashPark(item));
+                this.dashPlacedIds = [];
+                // Heights come from content, so saved y values only encode order. Pack
+                // each block under the tallest block already occupying its columns;
+                // a later block inserted at an occupied row would push earlier ones down.
+                const bottoms = new Array(lib.COLUMNS).fill(0);
+                [...layout.blocks]
+                    .sort((a, b) => a.y - b.y || a.x - b.x)
+                    .forEach(block => {
+                        const y = Math.max(...bottoms.slice(block.x, block.x + block.w));
+                        const el = this._dashPlace(block.id, { x: block.x, y, w: block.w });
+                        const h = el?.gridstackNode?.h || 1;
+                        for (let c = block.x; c < block.x + block.w; c++) bottoms[c] = y + h;
+                    });
+                dashGrid.setAnimation(true);
+                this.refitDashboardBlocks();
+            },
+            collectDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                const blocks = dashGrid.save(false).map(n => ({ id: n.id, x: n.x, y: n.y, w: n.w }));
+                return lib.normalizeLayout({ version: 1, width: this.dashDraft?.width, blocks });
+            },
+            _onDashTrayDrop(node) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib || !node?.el) return;
+                const id = node.el.dataset.block;
+                const pos = { x: node.x, y: node.y, w: node.w };
+                // The dropped element is GridStack's clone of the tray pill.
+                dashGrid.removeWidget(node.el, true, false);
+                if (!lib.BLOCK_IDS.includes(id) || !this.dashEditing) return;
+                this._dashPlace(id, pos);
+                this.refitDashboardBlocks();
+            },
+            dashRemoveBlock(id) {
+                const el = this._dashBlockEl(id);
+                if (!dashGrid || !this.dashEditing || !el?.gridstackNode) return;
+                this._dashPark(el);
+                this.dashPlacedIds = this.dashPlacedIds.filter(placed => placed !== id);
+                dashGrid.compact();
+            },
+            _dashAfterLayoutChange() {
+                this.$nextTick(() => {
+                    dashGrid?.onResize();
+                    this.refitDashboardBlocks();
+                });
+            },
+            startDashboardEdit() {
+                if (!dashGrid || !this.dashLayout || !this.dashEditAvailable || this.dashEditing) return;
+                this.dashDraft = { width: this.dashLayout.width };
+                this.dashSaveError = '';
+                this.dashEditing = true;
+                dashGrid.enable();
+                this._dashAfterLayoutChange();
+            },
+            cancelDashboardEdit() {
+                if (!this.dashEditing) return;
+                this.dashEditing = false;
+                this.dashDraft = null;
+                this.dashSaveError = '';
+                if (dashGrid) {
+                    dashGrid.disable();
+                    this.applyDashboardLayout(this.dashLayout);
+                }
+                this._dashAfterLayoutChange();
+            },
+            resetDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib) return;
+                this.dashDraft.width = 'default';
+                this.applyDashboardLayout(lib.defaultLayout());
+                this._dashAfterLayoutChange();
+            },
+            setDashboardWidth(width) {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib || !lib.WIDTH_IDS.includes(width)) return;
+                this.dashDraft.width = width;
+                this._dashAfterLayoutChange();
+            },
+            async saveDashboardLayout() {
+                if (!dashGrid || !this.dashEditing || this.dashSaving) return;
+                const layout = this.collectDashboardLayout();
+                this.dashSaving = true;
+                this.dashSaveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_dashboard_layout: layout }),
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    this.dashLayout = layout;
+                    this.globalSettings.ui.dashboard_layout = layout;
+                    this.dashEditing = false;
+                    this.dashDraft = null;
+                    dashGrid.disable();
+                    this._dashAfterLayoutChange();
+                } catch (err) {
+                    console.error('Failed to save dashboard layout:', err);
+                    this.dashSaveError = window.t('status.layout.save_failed');
+                } finally {
+                    this.dashSaving = false;
+                }
+            },
+
             _launchCmd(tool) {
                 const raw = this.stats.cli_prefix || 'omlx';
                 const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
@@ -3281,6 +3819,11 @@
 
             get piCommand() {
                 return this._launchCmd('pi');
+            },
+
+            get markitdownOcrModelMissing() {
+                const id = this.globalSettings.integrations.markitdown_pdf_processing_engine;
+                return id !== 'markitdown' && !(this.models || []).some(model => model.id === id);
             },
 
             get markitdownOcrModels() {
@@ -5382,7 +5925,10 @@
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
                 const val = this.globalSettings.cache?.ssd_cache_max_size;
-                if (val && val !== 'auto') {
+                if (val === 'auto') {
+                    return Math.round((this.globalSettings.cache.ssd_cache_auto_size_bytes || 0) / 1024 ** 3);
+                }
+                if (val) {
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }

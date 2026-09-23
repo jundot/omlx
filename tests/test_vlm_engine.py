@@ -79,6 +79,24 @@ def _make_engine(**overrides):
     return engine
 
 
+@pytest.mark.asyncio
+async def test_start_rejects_unsupported_mtp_offload_before_loading(tmp_path):
+    from omlx.model_settings import ModelSettings
+
+    (tmp_path / "config.json").write_text('{"model_type": "qwen3_5_moe"}')
+    engine = _make_engine(
+        model_name=str(tmp_path),
+        model_settings=ModelSettings(moe_expert_offload_enabled=True, mtp_enabled=True),
+    )
+    with patch(
+        "omlx.utils.model_loading.maybe_load_custom_quantization",
+        side_effect=AssertionError("Unsupported settings reached the model loader"),
+    ) as load:
+        with pytest.raises(ValueError, match="MoE expert offload cannot"):
+            await engine.start()
+        load.assert_not_called()
+
+
 def _make_loaded_engine(model_type=None, tokenizer=None, **overrides):
     """Create a VLMBatchedEngine with mocked internals (no actual model load)."""
     engine = _make_engine(**overrides)
@@ -249,6 +267,48 @@ class TestVLMToolForwarding:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
+    async def test_chat_forwards_generation_prompt_text(self):
+        """The template's generation prompt suffix reaches the core request."""
+        executor = ThreadPoolExecutor(max_workers=1)
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            generate=AsyncMock(return_value=self._output()),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        def fake_template(msgs, *args, **kwargs):
+            # A Gemma-style template keeps the generation prompt in history.
+            if any(m["role"] == "assistant" for m in msgs):
+                return "PROMPT<start_of_turn>model\nreply<end_of_turn>"
+            if kwargs.get("add_generation_prompt") is False:
+                return "PROMPT"
+            return "PROMPT<start_of_turn>model\n"
+
+        engine._apply_chat_template = fake_template
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                await engine.chat([{"role": "user", "content": "hi"}])
+                assert (
+                    core.generate.call_args.kwargs["generation_prompt_text"]
+                    == "<start_of_turn>model\n"
+                )
+                assert (
+                    core.generate.call_args.kwargs["generation_prompt_persists"] is True
+                )
+                await engine.chat([{"role": "user", "content": "hi"}], is_partial=True)
+                assert "generation_prompt_text" not in core.generate.call_args.kwargs
+        finally:
+            executor.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
     async def test_stream_chat_forwards_tools_to_core_request(self):
         executor = ThreadPoolExecutor(max_workers=1)
 
@@ -282,6 +342,19 @@ class TestVLMToolForwarding:
 
 class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.parametrize("default_mode, expected", [(None, "block"), ("ar", None)])
+    def test_detects_model_owned_diffusion_generator(self, default_mode, expected):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._vlm_model = SimpleNamespace(
+            config=SimpleNamespace(
+                canvas_length=256, default_generation_mode=default_mode
+            ),
+            language_model=SimpleNamespace(generate=lambda *args, **kwargs: None),
+        )
+
+        assert engine._detect_diffusion_family() == expected
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(
@@ -756,7 +829,7 @@ class TestInjectToolCalling:
         with patch.dict(
             "sys.modules",
             {
-                "mlx_vlm.tool_parsers": None,
+                "mlx_vlm.tools.registry": None,
                 "mlx_lm": None,
                 "mlx_lm.tokenizer_utils": None,
             },
@@ -1118,6 +1191,48 @@ class TestProcessChatMessages:
     """Tests for VLMBatchedEngine._process_chat_messages()."""
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_mimo_audio_stays_in_its_original_turn(self, mock_extract):
+        engine = _make_loaded_engine(model_type="mimo_v2")
+        audio_part = {
+            "type": "input_audio",
+            "input_audio": {"data": "abc", "format": "wav"},
+        }
+        messages = [
+            {"role": "user", "content": "Earlier text"},
+            {"role": "assistant", "content": "Earlier answer"},
+            {
+                "role": "user",
+                "content": [audio_part, {"type": "text", "text": "First recording"}],
+            },
+            {"role": "assistant", "content": "First transcript"},
+            {
+                "role": "user",
+                "content": [audio_part, {"type": "text", "text": "Second recording"}],
+            },
+        ]
+        stripped = [dict(message) for message in messages]
+        stripped[2]["content"] = "First recording"
+        stripped[4]["content"] = "Second recording"
+        mock_extract.return_value = (stripped, [], [object(), object()])
+        formatted = []
+
+        def prepare(message_values, images, audio, **kwargs):
+            values, _ = engine._format_messages_for_vlm_template(
+                message_values, num_images=len(images), num_audios=len(audio)
+            )
+            formatted.extend(values)
+            return [1], None, None, None, 0, []
+
+        engine._prepare_vision_inputs = prepare
+        engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        assert formatted[0]["content"] == "Earlier text"
+        assert formatted[2]["content"].count("<|audio_pad|>") == 1
+        assert formatted[2]["content"].endswith("First recording")
+        assert formatted[4]["content"].count("<|audio_pad|>") == 1
+        assert formatted[4]["content"].endswith("Second recording")
+
+    @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_text_only_uses_vlm_prepare_path(self, mock_extract):
         """Text-only turns on a VLM model still use _prepare_vision_inputs()."""
         text_msgs = [{"role": "user", "content": "Hello"}]
@@ -1175,6 +1290,62 @@ class TestProcessChatMessages:
         mock_convert.assert_called_once_with(tools)
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] == [{"converted": True}]
+
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.expand_video_parts")
+    def test_mimo_video_uses_on_disk_model_type_when_loaded_config_omits_it(
+        self, mock_expand_video, mock_extract, tmp_path
+    ):
+        """MiMo video expansion must not depend on the runtime config retaining model_type."""
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "mimo_v2_flash"}', encoding="utf-8"
+        )
+        messages = [{"role": "user", "content": "video"}]
+        expanded = [{"role": "user", "content": "frames"}]
+        mock_expand_video.return_value = expanded
+        mock_extract.return_value = (expanded, [], [])
+
+        engine = _make_loaded_engine(model_type=None, model_name=str(tmp_path))
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
+
+        engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        mock_expand_video.assert_called_once_with(messages)
+        mock_extract.assert_called_once_with(expanded)
+
+    @pytest.mark.asyncio
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.expand_video_parts")
+    async def test_mimo_video_preflight_expands_frames_before_validation(
+        self, mock_expand_video, mock_extract
+    ):
+        from PIL import Image
+
+        messages = [{"role": "user", "content": "video"}]
+        expanded = [{"role": "user", "content": "sampled frames"}]
+        text_messages = [{"role": "user", "content": "describe"}]
+        mock_expand_video.return_value = expanded
+        mock_extract.return_value = (text_messages, [Image.new("RGB", (4, 4))], [])
+
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        engine._apply_chat_template = MagicMock(return_value="prompt")
+        engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+        engine._processor = _QWEN_PROC
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+
+        await engine.preflight_chat(messages)
+
+        mock_expand_video.assert_called_once_with(messages)
+        mock_extract.assert_called_once_with(expanded)
+
+        mock_expand_video.reset_mock()
+        mock_extract.reset_mock()
+        assert engine.count_chat_tokens(messages) == 1
+        mock_expand_video.assert_called_once_with(messages)
+        mock_extract.assert_called_once_with(expanded)
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_image_path_calls_prepare_vision(self, mock_extract):
@@ -1423,6 +1594,72 @@ class TestPrepareVisionInputs:
         assert isinstance(call_audio[0], np.ndarray)
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.load_audio")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_audio_uses_processor_sample_rate(
+        self, mock_vlm_act, mock_prepare, mock_load_audio
+    ):
+        """Audio is decoded at the processor's declared sample rate."""
+        np = pytest.importorskip("numpy")
+        engine = self._setup_engine_for_vision(model_type="mimo_v2_flash")
+        engine._processor.feature_extractor = SimpleNamespace(sampling_rate=24000)
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_load_audio.return_value = np.zeros((24,), dtype=np.float32)
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        audio_stream = io.BytesIO(b"not-a-real-wav")
+
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Describe this recording"}],
+            [],
+            audio=[audio_stream],
+        )
+
+        mock_load_audio.assert_called_once_with(audio_stream, 24000)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_mimo_audio_codes_enter_multimodal_embedding_path(
+        self, mock_vlm_act, mock_prepare, tmp_path
+    ):
+        """MiMo's discrete audio codes must not fall through as text-only input."""
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "mimo_v2_flash"}', encoding="utf-8"
+        )
+        engine = self._setup_engine_for_vision(model_type=None)
+        engine._model_name = str(tmp_path)
+        engine._vlm_model.config.audio_token_id = 99
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        audio_codes = mx.zeros((2, 4, 20), dtype=mx.int32)
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 99, 99]]),
+            "pixel_values": None,
+            "audio_codes": audio_codes,
+        }
+        embeddings = mx.zeros((1, 3, 4))
+        engine._vlm_model.get_input_embeddings.return_value = SimpleNamespace(
+            inputs_embeds=embeddings,
+            to_dict=lambda: {"inputs_embeds": embeddings},
+        )
+
+        result = engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Describe this recording"}],
+            [],
+            audio=[("fake_audio_array", 24000)],
+        )
+
+        call_kwargs = engine._vlm_model.get_input_embeddings.call_args.kwargs
+        assert call_kwargs["audio_codes"] is audio_codes
+        assert result[1] is embeddings
+        assert result[3] is not None
+        assert result[4] == 1
+        assert result[5] == [(1, result[3])]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_audio_none_not_passed(self, mock_vlm_act, mock_prepare):
@@ -1467,7 +1704,6 @@ class TestPrepareVisionInputs:
 
         call_kwargs = mock_prepare.call_args[1]
         assert call_kwargs.get("audio") is None
-
 
     # --- per-image vision feature cache -------------------------------
 
@@ -1885,6 +2121,129 @@ class TestFormatMessagesForVLMTemplate:
         # get_message_json() converts "input_audio" to "audio" type markers
         assert "audio" in types
         assert image_ranges == []
+
+    def test_format_mimo_audio_renders_native_audio_marker_as_text(self):
+        """MiMo renders markers before templates that may drop media dicts."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Transcribe this."},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "abc", "format": "wav"},
+                    },
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0, num_audios=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": (
+                    "Transcribe this."
+                    "<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>"
+                ),
+            }
+        ]
+        assert image_ranges == []
+
+    def test_format_mimo_image_marker_survives_string_only_templates(self):
+        """MiMo image markers must not depend on templates rendering media dicts."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                    {"type": "text", "text": "Describe this."},
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": (
+                    "<|vision_start|><|image_pad|><|vision_end|>"
+                    "Describe this."
+                ),
+            }
+        ]
+        assert image_ranges == [(0, 1)]
+
+    def test_format_mimo_image_after_text_only_history(self):
+        """Prior text-only turns must not invoke mlx-vlm's unsupported MiMo formatter."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {"role": "system", "content": "Help the user."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png"}},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted == [
+            {"role": "system", "content": "Help the user."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {
+                "role": "user",
+                "content": "Describe this.<|vision_start|><|image_pad|><|vision_end|>",
+            },
+        ]
+        assert image_ranges == [(3, 1)]
+
+    def test_format_mimo_preserves_mixed_media_order(self):
+        """MiMo keeps image and audio markers in the user's original order."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Compare these."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png"}},
+                    {"type": "text", "text": "Then transcribe this."},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "abc", "format": "wav"},
+                    },
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1, num_audios=1
+        )
+
+        assert formatted[0]["content"] == (
+            "Compare these."
+            "<|vision_start|><|image_pad|><|vision_end|>"
+            "Then transcribe this."
+            "<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>"
+        )
+        assert image_ranges == [(0, 1)]
 
     def test_audio_parts_capped_by_num_audios(self):
         """Only load up to num_audios audio parts even if more are in message."""
@@ -2316,9 +2675,10 @@ class TestSplitVisionFeatures:
         for f in result:
             assert f.shape == (1, 10, 64)
 
-    def test_qwen_flat_split(self):
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
+    def test_qwen_flat_split(self, model_type):
         """Qwen flat (total_tokens, dim) features are split using grid_thw."""
-        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine = _make_loaded_engine(model_type=model_type)
         # Mock spatial_merge_size on vision_tower
         engine._vlm_model.vision_tower = MagicMock()
         engine._vlm_model.vision_tower.spatial_merge_size = 2
@@ -2743,6 +3103,21 @@ class TestCaptureVLMPositionState:
     """
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_returned_position_state_overrides_previous_request(self):
+        pid = mx.arange(6).reshape(1, 6)
+        rd = mx.array([[-12]])
+        lm = SimpleNamespace(
+            _position_ids=mx.zeros((1, 3)), _rope_deltas=mx.zeros((1, 1))
+        )
+        extra = {"position_ids": pid, "rope_deltas": rd}
+
+        with patch.object(vlm_module.mx, "eval", wraps=mx.eval) as eval_mock:
+            vlm_module._capture_vlm_position_state(lm, extra)
+
+        assert extra["_captured_rope_deltas"] is rd
+        assert [id(a) for a in eval_mock.call_args.args] == [id(pid), id(rd)]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_captures_and_materializes_lazy_mrope_state(self):
         pid = mx.arange(6).reshape(1, 6) + 1
         rd = mx.zeros((1, 1)) - 3
@@ -2802,3 +3177,23 @@ async def test_preflight_uses_processed_image_dimensions(
             ] == expected_tokens + 1
     finally:
         image_module.clear_image_decode_cache()
+
+
+def test_deepseek_v4_packed_vision_features_round_trip():
+    engine = _make_loaded_engine(model_type="deepseek_v4")
+    engine._vlm_model.config.vision_downsample_ratio = 2
+    first = mx.arange(16).reshape(2, 8)
+    second = mx.arange(24).reshape(3, 8) + 100
+    engine._vlm_model.encode_images.return_value = [first, second]
+    metadata = {
+        "image_grid_hw": mx.array([[2, 4], [2, 6]]),
+        "image_permutations": mx.array([1, 0, 2, 0, 1]),
+    }
+    pixels = mx.zeros((20, 12))
+    packed = engine._compute_vision_features(pixels, metadata)
+    restored = engine._split_vision_features(packed, 2, metadata)
+    engine._vlm_model.encode_images.assert_called_once_with(pixels, **metadata)
+    assert mx.array_equal(restored[0], first)
+    assert mx.array_equal(restored[1], second)
+    with pytest.raises(ValueError, match="image grids"):
+        engine._split_vision_features(packed[:4], 2, metadata)

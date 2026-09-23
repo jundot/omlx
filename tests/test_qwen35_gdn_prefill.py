@@ -233,3 +233,35 @@ def test_blocked_seq_float32_default_fits_threadgroup_memory():
     ).item()
     assert y_err < 1e-6
     assert s_rel < 1e-6
+
+
+def test_prefill_patch_preserves_cache_owned_kernel_dispatch(monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import gated_delta, language
+
+    import omlx.custom_kernels.qwen35_prefill as kernels
+    import omlx.patches.qwen35_gdn_chunked as patch
+
+    monkeypatch.setattr(gated_delta, "gated_delta_update", gated_delta.gated_delta_update)
+    monkeypatch.setattr(language, "gated_delta_update", language.gated_delta_update)
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+    initial = mx.zeros((1, 1, 32, 32))
+    final = mx.ones_like(initial)
+    calls = []
+
+    def blocked(q, k, v, g, beta, state):
+        calls.append(state)
+        return v, final
+
+    monkeypatch.setattr(kernels, "gated_delta_blocked_seq", blocked)
+    assert patch.apply_qwen35_gdn_prefill_patch()
+    cache = ArraysCache(2)
+    cache[1] = initial
+    q = mx.zeros((1, 64, 1, 32))
+    a = mx.zeros((1, 64, 1))
+    output, state = gated_delta.gated_delta_update(
+        q, q, q, a, a, mx.zeros((1,)), mx.zeros((1,)), cache=cache
+    )
+    assert len(calls) == 1 and calls[0] is initial
+    assert output is q
+    assert state is final and cache[1] is final

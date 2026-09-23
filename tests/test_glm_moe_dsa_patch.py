@@ -1034,8 +1034,8 @@ def test_glm_patch_forward_sparse_path_and_cache_state():
     assert mx.all(mx.isfinite(logits)).item()
 
     mx.eval([c.state for c in cache])
-    full_state = cache[0].state
-    shared_state = cache[1].state
+    full_state = [c.keys_and_values() for c in cache[0].caches]
+    shared_state = [c.keys_and_values() for c in cache[1].caches]
     assert len(full_state) == 2
     assert len(shared_state) == 1
     assert full_state[1][1].shape[-1] == 0
@@ -1255,6 +1255,7 @@ def _decode_only_batch_generator(stream) -> SimpleNamespace:
         def next(self):
             return ["generation"]
 
+    from mlx_lm.generate import BatchCounters
     from omlx.patches.glm_moe_dsa.generate_patch import _AdaptivePrefillConfig
 
     return SimpleNamespace(
@@ -1262,8 +1263,7 @@ def _decode_only_batch_generator(stream) -> SimpleNamespace:
             step_size=8192, after=0, min_remaining=0
         ),
         _generation_batch=_GenerationBatch(),
-        _gen_tokens_counter=0,
-        _steps_counter=511,
+        _counters=BatchCounters(generation_steps=511),
         completion_batch_size=1,
         _stream=stream,
     )
@@ -1300,7 +1300,7 @@ def test_glm_adaptive_decode_periodic_clear_drains_generator_stream():
 
     assert generation_responses == ["generation"]
     assert prompt_responses == []
-    assert bg._steps_counter == 512
+    assert bg._counters.generation_steps == 512
     assert streams, "periodic decode clear did not drain any stream"
     assert streams == [engine_stream], (
         "periodic decode clear released Metal buffers without draining the "
@@ -1315,7 +1315,7 @@ def test_glm_adaptive_decode_clears_only_on_the_512_step_cadence():
     from omlx.patches.glm_moe_dsa import generate_patch as patch_mod
 
     bg = _decode_only_batch_generator(mx.new_thread_local_stream(mx.default_device()))
-    bg._steps_counter = 0
+    bg._counters.generation_steps = 0
 
     streams: list = []
     with (
@@ -1328,7 +1328,7 @@ def test_glm_adaptive_decode_clears_only_on_the_512_step_cadence():
     ):
         gen.BatchGenerator._next(bg)
 
-    assert bg._steps_counter == 1
+    assert bg._counters.generation_steps == 1
     assert streams == []
 
 

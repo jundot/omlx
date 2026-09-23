@@ -14,6 +14,7 @@ from .type_handlers import (
     CacheListHandler,
     CacheType,
     CacheTypeHandler,
+    ChunkedKVCacheHandler,
     DefaultCacheHandler,
     KVCacheHandler,
     MiniMaxM3BatchKVCacheHandler,
@@ -47,6 +48,7 @@ class CacheTypeRegistry:
     # Mapping from mlx-lm class names to cache types
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
+        "ChunkedKVCache": CacheType.CHUNKED_KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
         # mlx-vlm MTP wraps target RotatingKVCache layers with rollback slack
         # during speculative decode. The live tensor/state representation is
@@ -264,6 +266,7 @@ class CacheTypeRegistry:
 def _initialize_default_handlers() -> None:
     """Initialize default handlers on module load."""
     CacheTypeRegistry.register(KVCacheHandler())
+    CacheTypeRegistry.register(ChunkedKVCacheHandler())
     CacheTypeRegistry.register(RotatingKVCacheHandler())
     CacheTypeRegistry.register(ArraysCacheHandler())
     CacheTypeRegistry.register(CacheListHandler())

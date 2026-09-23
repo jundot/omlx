@@ -423,10 +423,8 @@ final class WelcomeViewModel: ObservableObject {
 
 struct WelcomeView: View {
     @ObservedObject var vm: WelcomeViewModel
-    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
         ZStack {
             WelcomeBackdrop()
                 .ignoresSafeArea()
@@ -446,7 +444,7 @@ struct WelcomeView: View {
                 WelcomeFooter(vm: vm)
             }
         }
-        .environment(\.omlxTheme, theme)
+        .omlxThemed()
         .frame(width: 680, height: 620)
     }
 }

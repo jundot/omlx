@@ -125,9 +125,11 @@ class BaseBenchmark(ABC):
         pattern_letters = "".join(valid_letters)
 
         # 1. Look for "answer is X", "answer: X", "answer X" patterns — use LAST match
+        # response_upper is upper-cased, so the lower-case cue needs IGNORECASE.
         answer_patterns = re.findall(
             r"(?:answer\s*(?:is|:)\s*)([" + pattern_letters + r"])\b",
             response_upper,
+            re.IGNORECASE,
         )
         if answer_patterns:
             return answer_patterns[-1]

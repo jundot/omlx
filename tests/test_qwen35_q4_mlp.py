@@ -432,13 +432,19 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
         return orig_qmm(*args, **kwargs)
 
     monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
-    assert apply_qwen35_q4_prefill_linear_patch() is True
-    out0, out1 = qwen35_lang._target_verify_linears((supported, unsupported), x, False)
+    module = qwen35_lang.Qwen3_5Attention.__new__(qwen35_lang.Qwen3_5Attention)
+    nn.Module.__init__(module)
+    module.q_proj = supported
+    module.k_proj = unsupported
+    reference = supported(x)
+    assert apply_qwen35_q4_prefill_linear_patch(module) is True
+    out0, out1 = supported(x), unsupported(x)
+    assert mx.allclose(out0, reference, atol=0.03, rtol=0.03).item()
     mx.eval(out0, out1)
     assert calls["count"] == 1
 
     calls["count"] = 0
-    decode = qwen35_lang._target_verify_linear(supported, x[:, :1, :], False)
+    decode = supported(x[:, :1, :])
     mx.eval(decode)
     assert calls["count"] == 0
 

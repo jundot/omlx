@@ -133,6 +133,26 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    @pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+    def test_detect_mimo_omnimodal_sidecar_as_vlm(self, tmp_path, model_type):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": model_type, "vision_model_type": "mimovl"})
+        )
+        sidecar_dir = tmp_path / "omnimodal"
+        sidecar_dir.mkdir()
+        (sidecar_dir / "config.json").write_text("{}")
+        (sidecar_dir / "vision_encoder.safetensors").write_bytes(b"sidecar")
+
+        assert detect_model_type(tmp_path) == "vlm"
+
+    @pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+    def test_detect_mimo_without_complete_sidecar_as_llm(self, tmp_path, model_type):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": model_type, "vision_config": {"depth": 28}})
+        )
+
+        assert detect_model_type(tmp_path) == "llm"
+
     def test_detect_embedding_model_by_type(self, tmp_path):
         """Test detection of embedding model by model_type."""
         config = {
@@ -374,6 +394,17 @@ class TestDetectModelType:
             "vision_config": {"patch_size": 40},
             "audio_config": {"n_mel_bins": 80},
             "text_config": {"hidden_size": 4096},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    @pytest.mark.parametrize("architecture", ["HfMoondream", "Moondream"])
+    def test_detect_moondream_as_vlm(self, tmp_path, architecture):
+        """Moondream configs carry no vision sub-config; the architecture decides."""
+        config = {
+            "model_type": "moondream1",
+            "architectures": [architecture],
+            "config": {},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
@@ -1947,18 +1978,19 @@ class TestHfCacheDiscovery:
             ),
             # The bf16 source layout (the repo's own test fixture) loads too.
             ({"model_type": "deepseek_v41"}, True),
-            # Unknown conversion version, or an affine conversion without the
-            # oMLX spec: the V4.1 loader has no path for these.
+            # An unknown conversion version stays hidden.
             (
                 {"model_type": "deepseek_v41", "omlx_deepseek_v41": {"version": 2}},
                 False,
             ),
+            # Community mlx_lm affine conversions declare their format in a
+            # top-level quantization dict instead of the oMLX spec.
             (
                 {
                     "model_type": "deepseek_v41",
                     "quantization": {"bits": 2, "group_size": 64, "mode": "affine"},
                 },
-                False,
+                True,
             ),
             (
                 {
@@ -1966,8 +1998,66 @@ class TestHfCacheDiscovery:
                     "quantization_config": {"quant_method": "fp8"},
                     "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
                 },
+                True,
+            ),
+            # A quantization declaration the V4.1 loader cannot read is refused
+            # by this gate. (The generic MLX heuristics below can still admit a
+            # real mlx_lm shard by metadata or repo name, so the gate is not the
+            # only place loadability is decided.)
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"quant_method": "fp8"},
+                },
                 False,
             ),
+            # The loader needs a group size as well as a width.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 2, "mode": "affine"},
+                },
+                False,
+            ),
+            # A per-module override the loader would reject counts too.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {
+                        "bits": 2,
+                        "group_size": 64,
+                        "mode": "affine",
+                        "language_model.layers.0.attn.wq_a": {"mode": "mxfp4"},
+                    },
+                },
+                False,
+            ),
+            # The loader reads the affine mode only, so a declared mxfp4/mxfp8
+            # source — and a width that is not an integer — is refused here
+            # rather than being admitted and then raising "Unsupported source
+            # quantization mode" at load time.
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 4, "group_size": 64, "mode": "mxfp4"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                },
+                False,
+            ),
+            (
+                {
+                    "model_type": "deepseek_v41",
+                    "quantization": {"bits": True, "group_size": 64, "mode": "affine"},
+                },
+                False,
+            ),
+            ({"model_type": "deepseek_v41", "quantization": "mlx"}, False),
             (
                 {"model_type": "deepseek_v4", "omlx_deepseek_v41": {"version": 1}},
                 False,
@@ -2181,3 +2271,17 @@ class TestTextOnlySizeEstimation:
 
         models = discover_models(tmp_path)
         assert models["plain-llm"].text_only_size == 0
+
+
+@pytest.mark.parametrize(
+    "vision_layers, expected", [(32, "vlm"), (0, "llm"), (None, "llm")]
+)
+def test_deepseek_v4_flat_vision_config(tmp_path, vision_layers, expected):
+    config = {
+        "model_type": "deepseek_v4",
+        "architectures": ["DeepseekV4ForCausalLM"],
+    }
+    if vision_layers is not None:
+        config["vision_n_layers"] = vision_layers
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert detect_model_type(tmp_path) == expected

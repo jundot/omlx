@@ -1,29 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Muse Glimmer (Meta) compatibility layer for the pinned mlx-vlm.
+"""Register oMLX Muse Glimmer ahead of upstream model discovery.
 
-The `muse_glimmer` model package comes from mlx-vlm PR #1838 (plus the
-quantization fix from PR #1839), both newer than oMLX's mlx-vlm pin
-(`78b96eb`). This vendors the PR-head model package plus the shared
-`activations` module it imports that does not exist at the pin, and wires
-the discovery surface oMLX needs:
-
-- installs the vendored package onto the real `mlx_vlm.models` namespace
-  (`__path__` append) so `get_model_and_args` can import it; relative
-  imports (`..base`, `..cache`) resolve against the real pinned mlx-vlm.
-  If a future pin bump ships the module upstream, the real one wins
-  automatically (the vendor path is searched last).
-- registers `muse_glimmer` in `prompt_utils.MODEL_CONFIG` with
-  LIST_WITH_IMAGE_FIRST semantics (the exact one-line registration PR
-  #1838 makes upstream). Without it, `apply_chat_template` silently
-  drops every image part.
-- the vendored torch-free `MuseGlimmerProcessor` registers itself with
-  `AutoProcessor` at import time (the reference processors only exist in
-  transformers 5.15+, above oMLX's pin).
-
-oMLX deltas against the PR head are marked with `oMLX:` comments in the
-vendored files; see `vendor/mlx_vlm/models/muse_glimmer/README.md` for
-the pin-bump checklist.
-"""
+Retain its attention optimizations, image-first prompts, and processor."""
 
 from __future__ import annotations
 
@@ -81,7 +59,7 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:

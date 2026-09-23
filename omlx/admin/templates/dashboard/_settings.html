@@ -1,4 +1,4 @@
-            <div x-show="mainTab === 'settings'" x-cloak>
+            <div x-show="mainTab === 'settings'" x-cloak role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
             <!-- Tab Navigation -->
             <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
                 <button
@@ -34,12 +34,21 @@
             <div x-show="activeTab === 'global'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Header -->
-                    <div class="mb-8">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.global.section_label') }}</h2>
-                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.global.heading') }}</h3>
-                        <p class="text-sm text-neutral-500 mt-2">
-                            {{ t('settings.global.restart_notice') }} <span class="px-1 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
-                        </p>
+                    <div class="mb-8 flex items-start justify-between gap-4">
+                        <div>
+                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.global.section_label') }}</h2>
+                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.global.heading') }}</h3>
+                            <p class="text-sm text-neutral-500 mt-2">
+                                {{ t('settings.global.restart_notice') }} <span class="px-1 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
+                            </p>
+                        </div>
+                        <button type="button" @click="resetGlobalSettingsDefaults()"
+                                :disabled="saving || loadingGlobalSettings || resettingGlobalSettings"
+                                title="{{ t('settings.global.reset_hint') }}"
+                                aria-label="{{ t('settings.global.reset_defaults') }}"
+                                class="p-2 rounded-lg text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 transition-colors disabled:opacity-50">
+                            <i data-lucide="rotate-ccw" class="w-5 h-5" aria-hidden="true"></i>
+                        </button>
                     </div>
 
                     <!-- Settings Sections -->
@@ -57,7 +66,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <label class="text-sm text-neutral-700">{{ t('settings.language.label') }}</label>
                                     <select x-model="globalSettings.ui.language"
-                                            @change="saveLanguage(globalSettings.ui.language)"
+                                            @change="if (!globalDefaultsPending) saveLanguage(globalSettings.ui.language)"
                                             class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="en">{{ t('settings.language.en') }}</option>
                                         <option value="zh">{{ t('settings.language.zh') }}</option>
@@ -216,6 +225,7 @@
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4"
+                                     x-effect="if (showGlobalResetNotice) _mode = null"
                                      x-data="{
                                          _mode: (globalSettings.server.host === '127.0.0.1' || globalSettings.server.host === '0.0.0.0') ? null : 'custom',
                                          get hostMode() {
@@ -466,10 +476,15 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.cold_cache_limit') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
                                             {{ t('settings.resource.cold_cache_description') }}
+                                            <span x-show="globalSettings.cache.ssd_cache_max_size === 'auto'">{{ t('settings.resource.cold_cache_auto_description') }}</span>
                                         </p>
                                     </div>
                                     <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <input type="range" min="0" max="100" step="1"
+                                        <button type="button" @click="globalSettings.cache.ssd_cache_max_size = 'auto'"
+                                                :aria-pressed="globalSettings.cache.ssd_cache_max_size === 'auto'"
+                                                class="text-sm underline">{{ t('settings.resource.cold_cache_auto') }}</button>
+                                        <input type="range" min="1" max="100" step="1"
+                                               x-show="globalSettings.cache.ssd_cache_max_size !== 'auto'"
                                                x-model.number="cachePercent"
                                                @input="updateCacheFromSlider()"
                                                class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
@@ -477,7 +492,7 @@
                                                       [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
                                                       [&::-webkit-slider-thumb]:shadow-sm">
                                         <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
-                                            <span x-text="cachePercent + '%'"></span>
+                                            <span x-text="globalSettings.cache.ssd_cache_max_size === 'auto' ? window.t('settings.resource.cold_cache_auto') : cachePercent + '%'"></span>
                                             <span class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
                                                    type="number"
                                                    :value="cacheSizeGB"
@@ -572,7 +587,7 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.idle_timeout_desc') }}</p>
                                     </div>
                                     <select x-model="idleTimeoutValue"
-                                            @change="globalSettings.idle_timeout.idle_timeout_seconds = idleTimeoutValue === '' ? null : Number(idleTimeoutValue); saveGlobalSettings()"
+                                            @change="globalSettings.idle_timeout.idle_timeout_seconds = idleTimeoutValue === '' ? null : Number(idleTimeoutValue); if (!globalDefaultsPending) saveGlobalSettings()"
                                             class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="">{{ t('settings.model.idle_timeout_none') }}</option>
                                         <option value="900">{{ t('settings.model.idle_timeout_15m') }}</option>
@@ -1102,7 +1117,7 @@
                             </button>
                             <button
                                 @click="saveGlobalSettings"
-                                :disabled="saving"
+                                :disabled="saving || resettingGlobalSettings"
                                 class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
                                        rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2
                                        focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
@@ -1201,7 +1216,11 @@
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.pdf_processing_engine') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.pdf_processing_engine_hint') }}</p>
-                                        <p x-show="globalSettings.integrations.markitdown_pdf_processing_engine === 'markitdown'"
+                                        <p x-show="markitdownOcrModelMissing"
+                                           class="text-xs text-amber-600 mt-1">
+                                            {{ t('settings.integrations.markitdown.pdf_processing_missing_model') }}
+                                        </p>
+                                        <p x-show="globalSettings.integrations.markitdown_pdf_processing_engine === 'markitdown' || markitdownOcrModelMissing"
                                            class="text-xs text-amber-600 mt-1">
                                             {{ t('settings.integrations.markitdown.pdf_processing_markitdown_warning') }}
                                         </p>
@@ -1210,6 +1229,10 @@
                                             @change="saveIntegrationSettings()"
                                             class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="markitdown">{{ t('settings.integrations.markitdown.section_label') }}</option>
+                                        <template x-if="markitdownOcrModelMissing">
+                                            <option :value="globalSettings.integrations.markitdown_pdf_processing_engine"
+                                                    x-text="globalSettings.integrations.markitdown_pdf_processing_engine"></option>
+                                        </template>
                                         <template x-for="model in markitdownOcrModels" :key="model.id">
                                             <option :value="model.id" x-text="model.id"></option>
                                         </template>
@@ -1742,3 +1765,22 @@
                 </div>
             </div>
             </div>
+
+            <dialog x-effect="showGlobalResetNotice ? $el.showModal() : $el.close()" x-cloak
+                    class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"
+                    aria-modal="true" aria-labelledby="global-reset-title" aria-describedby="global-reset-message"
+                    @keydown.tab="trapDialogFocus($event)" @cancel.prevent="cancelGlobalSettingsReset()">
+                <div class="fixed inset-0 bg-black/50" @click="cancelGlobalSettingsReset()"></div>
+                <div class="flex min-h-full items-center justify-center p-4">
+                    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" @click.stop>
+                        <h4 id="global-reset-title" class="text-lg font-bold text-neutral-900 mb-3">{{ t('settings.global.reset_title') }}</h4>
+                        <p id="global-reset-message" class="text-sm text-neutral-600">{{ t('settings.global.reset_message') }}</p>
+                        <div class="flex justify-end gap-3 mt-6">
+                            <button type="button" autofocus @click="cancelGlobalSettingsReset()"
+                                    class="px-5 py-2.5 text-sm font-medium text-neutral-600 rounded-full hover:bg-neutral-100">{{ t('settings.global.reset_cancel') }}</button>
+                            <button type="button" @click="confirmGlobalSettingsReset()"
+                                    class="px-5 py-2.5 text-sm font-medium text-white bg-neutral-900 rounded-full hover:bg-neutral-700">{{ t('settings.global.reset_ok') }}</button>
+                        </div>
+                    </div>
+                </div>
+            </dialog>

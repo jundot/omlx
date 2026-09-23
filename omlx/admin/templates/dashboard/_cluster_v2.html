@@ -4,7 +4,7 @@
      States: empty / discovering / device_card / pairing / checks / plan /
      active / error. Feedback is toasts and banners, never modals. -->
 <div x-data="clusterV2Wizard()"
-     x-show="mainTab === 'cluster'" x-cloak
+     x-show="mainTab === 'cluster'" x-cloak role="tabpanel" id="panel-cluster" aria-labelledby="tab-cluster"
      data-cluster-v2-wizard>
     <div class="animate-fade-in-up">
 
@@ -1465,6 +1465,52 @@
                         <div x-show="cudaFabricError" class="text-[11px] text-red-700 mt-2" x-text="cudaFabricError"></div>
                     </div>
                     <div x-show="cudaJoin.error" class="mt-3 text-xs text-red-600" x-text="cudaJoin.error"></div>
+                </div>
+
+                <div class="rounded-2xl border border-neutral-200 bg-white p-5"
+                     x-show="rdmaLinks.data && rdmaLinks.data.daemon.reachable" x-cloak
+                     data-cluster-v2-rdma-links>
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.rdma.title') }}</div>
+                            <h3 class="text-sm font-semibold text-neutral-900 mt-1">{{ t('cluster.v2.rdma.heading') }}</h3>
+                            <p class="text-xs text-neutral-500 mt-1 leading-relaxed">{{ t('cluster.v2.rdma.blurb') }}</p>
+                        </div>
+                        <button type="button" @click="refreshRdmaLinks()"
+                                :disabled="rdmaLinks.loading"
+                                class="shrink-0 rounded-lg border border-neutral-300 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
+                                x-text="rdmaLinks.loading ? window.t('cluster.v2.rdma.refreshing') : window.t('cluster.v2.rdma.refresh')"></button>
+                    </div>
+                    <div class="mt-3 text-[11px] text-neutral-500"
+                         x-text="rdmaLinks.data ? rdmaLinks.data.daemon.reason : ''"></div>
+                    <div x-show="rdmaLinks.data && !rdmaLinks.data.helper.available" x-cloak
+                         class="mt-1 text-[11px] text-amber-700"
+                         x-text="rdmaLinks.data ? rdmaLinks.data.helper.reason : ''"></div>
+                    <div class="mt-3 space-y-2" data-cluster-v2-rdma-link-list>
+                        <template x-for="link in (rdmaLinks.data ? rdmaLinks.data.links : [])" :key="'rdma-' + link.name">
+                            <div class="flex items-center justify-between gap-3 rounded-xl border border-neutral-200 px-3 py-2">
+                                <div class="min-w-0">
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs font-semibold text-neutral-900" x-text="link.name"></span>
+                                        <span class="text-[11px] text-neutral-500" x-text="link.peer_node_id || link.peer_host || ''"></span>
+                                        <span class="text-[10px] font-bold uppercase tracking-wider"
+                                              :class="link.verified ? 'text-green-700' : (link.up ? 'text-amber-700' : 'text-red-700')"
+                                              x-text="link.verified ? window.t('cluster.v2.rdma.verified') : (link.up ? window.t('cluster.v2.rdma.unverified') : window.t('cluster.v2.rdma.down'))"></span>
+                                    </div>
+                                    <div class="text-[11px] text-neutral-500 mt-0.5 truncate" x-text="rdmaLinkDetail(link)"></div>
+                                    <div x-show="link.in_use_by" class="text-[11px] text-blue-700 mt-0.5"
+                                         x-text="window.t('cluster.v2.rdma.in_use').replace('{deployment}', link.in_use_by || '')"></div>
+                                </div>
+                                <button type="button" @click="verifyRdmaLink(link.name)"
+                                        :disabled="!!rdmaLinks.verifying || !link.usable || !!link.in_use_by || link.verifying"
+                                        class="shrink-0 rounded-lg border border-neutral-300 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
+                                        x-text="rdmaLinks.verifying === link.name ? window.t('cluster.v2.rdma.verifying') : window.t('cluster.v2.rdma.verify')"></button>
+                            </div>
+                        </template>
+                        <div x-show="rdmaLinks.data && rdmaLinks.data.links.length === 0" x-cloak
+                             class="text-[11px] text-neutral-500">{{ t('cluster.v2.rdma.none') }}</div>
+                    </div>
+                    <div x-show="rdmaLinks.error" x-cloak class="mt-3 text-xs text-red-600" x-text="rdmaLinks.error"></div>
                 </div>
 
                 <div class="rounded-2xl border border-neutral-200 bg-white p-5"

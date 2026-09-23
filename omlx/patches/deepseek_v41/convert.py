@@ -19,9 +19,103 @@ import numpy as np
 from .sharding import ShardWriter
 from .storage import TensorFile, decode_array
 
+_FLOAT_DTYPES = frozenset({"BF16", "F16", "F32"})
 
-def repack_weight(raw, dtype, scale, scale_dtype, force_dense=False):
-    """Losslessly repack E4M3/E2M1 bytes and E8M0 scales for MLX QMM."""
+
+def source_quantization_spec(config, path):
+    """Resolve affine defaults and per-module overrides; False means dense.
+
+    Callers validate tensor shapes against the logical module dimensions.
+    """
+    for section in (config.get("quantization"), config.get("quantization_config")):
+        if not isinstance(section, dict):
+            continue
+        spec = {
+            key: value
+            for key, value in section.items()
+            if not isinstance(value, (dict, bool))
+        }
+        entry = None
+        for candidate in (path, "language_model." + path, "model." + path):
+            if candidate in section:
+                entry = section[candidate]
+                break
+        if entry is False:
+            return None
+        if isinstance(entry, dict):
+            spec.update(entry)
+        bits, mode = spec.get("bits"), spec.get("mode", "affine")
+        group_size = spec.get("group_size")
+        if not isinstance(bits, int) or isinstance(bits, bool):
+            raise ValueError(f"Source quantization declares no bit width: {path}")
+        if mode != "affine":
+            raise ValueError(f"Unsupported source quantization mode: {path}")
+        if not isinstance(group_size, int) or isinstance(group_size, bool):
+            raise ValueError(f"Affine source declares no group size: {path}")
+        # mlx_lm affine conversions use float activations, without FP8 rounding.
+        return {
+            "bits": bits,
+            "group_size": group_size,
+            "mode": mode,
+            "quantize_input": False,
+        }
+    return None
+
+
+def _repack_affine(raw, scale, scale_dtype, bias, bias_dtype, spec, force_dense):
+    """Repack an mlx_lm affine projection: packed U32 plus float metadata."""
+    if scale is None or bias is None:
+        raise ValueError("Affine weights require both scales and biases")
+    if scale_dtype not in _FLOAT_DTYPES or bias_dtype != scale_dtype:
+        raise ValueError("Affine scales and biases must share a float dtype")
+    bits, group_size = spec["bits"], spec["group_size"]
+    if raw.ndim != 2 or raw.dtype != np.dtype("<u4"):
+        raise ValueError("Packed affine matrix must be rank two with U32 elements")
+    width = raw.shape[-1] * 32 // bits
+    if width % group_size:
+        raise ValueError("Packed row width is not a multiple of the group size")
+    expected = (raw.shape[0], width // group_size)
+    if scale.shape != expected or bias.shape != expected:
+        raise ValueError("Unexpected affine metadata shape")
+    weight = mx.array(raw.view(np.uint8).copy().view("<u4"))
+    if force_dense:
+        value = mx.dequantize(
+            weight,
+            decode_array(scale, scale_dtype),
+            decode_array(bias, bias_dtype),
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+        )
+        return {"weight": value.astype(mx.bfloat16)}, None
+    return (
+        {
+            "weight": weight,
+            "scales": decode_array(scale, scale_dtype),
+            "biases": decode_array(bias, bias_dtype),
+        },
+        spec,
+    )
+
+
+def repack_weight(
+    raw,
+    dtype,
+    scale,
+    scale_dtype,
+    force_dense=False,
+    *,
+    bias=None,
+    bias_dtype=None,
+    spec=None,
+):
+    """Losslessly repack E4M3/E2M1 bytes, E8M0 scales, or affine metadata."""
+    if dtype == "U32":
+        if spec is None:
+            raise ValueError("Packed weight without a declared quantization spec")
+        return _repack_affine(
+            raw, scale, scale_dtype, bias, bias_dtype, spec, force_dense
+        )
     if dtype.startswith("F8_E4M3") or dtype in ("I8", "U8"):
         if scale is None or not scale_dtype.startswith("F8_E8M0"):
             raise ValueError("Quantized weights require published E8M0 scales")
@@ -54,18 +148,32 @@ def mapped(key):
     return "language_model." + key
 
 
-def source_engram_tables(mapping):
+def source_engram_tables(mapping, config):
     tables = {}
     for key, filename in mapping.items():
         if ".engram.embed." not in key or not key.endswith(".weight"):
             continue
         prefix = key.rsplit(".", 1)[0]
         scale_key = prefix + ".scale"
+        if scale_key not in mapping:
+            scale_key = prefix + ".scales"
+        bias_key = prefix + ".biases" if prefix + ".biases" in mapping else None
+        spec = source_quantization_spec(config, prefix) if bias_key else None
+        if bias_key:
+            if spec is None:
+                raise ValueError(
+                    f"Packed Engram table without a declared quantization: {prefix}"
+                )
+            if mapping[bias_key] != mapping[scale_key]:
+                raise ValueError(f"Engram metadata must share one shard: {prefix}")
         tables[mapped(prefix)] = {
             "weight_key": key,
             "weight_file": filename,
             "scale_key": scale_key if scale_key in mapping else None,
             "scale_file": mapping.get(scale_key),
+            "bias_key": bias_key,
+            "bits": spec["bits"] if spec else None,
+            "group_size": spec["group_size"] if spec else None,
         }
     return tables
 
@@ -83,7 +191,12 @@ def strip_draft_config(config):
 def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
     """Repack one projection at a time for either direct loading or export."""
     source = Path(source)
-    readers, consumed = {}, set()
+    # Sorted mlx_lm indexes put biases before weights.
+    # Claim metadata first so only its weight emits it.
+    readers, consumed = (
+        {},
+        {key for key in mapping if key.endswith((".scales", ".biases", ".scale"))},
+    )
 
     def read(key):
         filename = mapping[key]
@@ -92,13 +205,30 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
         return readers[filename].read(key)
 
     def matrix(key, force_dense=False):
-        raw, dtype = read(key)
-        scale_key = key.removesuffix(".weight") + ".scale"
-        scale, sd = read(scale_key) if scale_key in mapping else (None, None)
+        # Affine sources use scales/biases; official MXFP sources use scale.
+        prefix = key.removesuffix(".weight")
+        fields = {}
+        for field in ("weight", "scales", "biases", "scale"):
+            sibling = prefix + "." + field
+            if sibling in mapping:
+                fields[field] = read(sibling)
+                consumed.add(sibling)
         consumed.add(key)
-        if scale_key in mapping:
-            consumed.add(scale_key)
-        return repack_weight(raw, dtype, scale, sd, force_dense)
+        raw, dtype = fields["weight"]
+        spec = source_quantization_spec(config, prefix) if dtype == "U32" else None
+        scale, scale_dtype = fields.get("scales") or fields.get("scale") or (None, None)
+        bias, bias_dtype = fields.get("biases") or (None, None)
+        # QuantizedProjection cannot retain a linear bias, so keep that module dense.
+        return repack_weight(
+            raw,
+            dtype,
+            scale,
+            scale_dtype,
+            force_dense or prefix + ".bias" in mapping,
+            bias=bias,
+            bias_dtype=bias_dtype,
+            spec=spec,
+        )
 
     def release_readers():
         # Every tensor read owns its bytes. Drop source mappings before yielding
@@ -107,10 +237,12 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
             reader.close()
         readers.clear()
 
-    for table in source_engram_tables(mapping).values():
+    for table in source_engram_tables(mapping, config).values():
         consumed.add(table["weight_key"])
         if table["scale_key"]:
             consumed.add(table["scale_key"])
+        if table["bias_key"]:
+            consumed.add(table["bias_key"])
     try:
         for key in mapping:
             if key in consumed or (key.startswith("mtp.") and not preserve_mtp):
@@ -159,8 +291,6 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
                     {prefix: spec} if spec else {},
                 )
                 del values
-            elif key.endswith(".scale"):
-                continue
             else:
                 raw, dtype = read(key)
                 value = decode_array(raw, dtype)
@@ -192,7 +322,7 @@ def convert(source, destination, *, preserve_mtp=False):
     ]
     destination.mkdir(parents=True)
     (destination / "engram").mkdir()
-    tables = source_engram_tables(mapping)
+    tables = source_engram_tables(mapping, config)
     for table in tables.values():
         for label in ("weight_file", "scale_file"):
             filename = table.get(label)

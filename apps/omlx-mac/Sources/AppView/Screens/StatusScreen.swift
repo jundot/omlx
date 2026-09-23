@@ -2,9 +2,9 @@
 //   • ServerHeroCard (the same card the Server screen mounts; defined in
 //     ServerScreen.swift)
 //   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
+//   • Active Now — active_models slice from /api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
 //   • Updates — release check status + auto-check/auto-notify prefs
-//   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
 
@@ -62,12 +62,12 @@ struct StatusScreen: View {
                                   comment: "Header label above average serving speed metrics"))
             AverageSpeedTilesRow(stats: vm.stats)
 
-            UsageHistoryView()
-
             SectionHeader(String(localized: "status.section.active_now",
                                   defaultValue: "Active Now",
                                   comment: "Section header for the currently active models list"))
             ActiveNowList(models: vm.stats?.activeModels.models ?? [])
+
+            UsageHistoryView()
 
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
