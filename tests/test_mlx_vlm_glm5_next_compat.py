@@ -787,12 +787,7 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
 
 
 def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkeypatch):
-    """oQ quantized scales promote every projection output to fp32, and the
-    native DSA kernels accept fp16/bf16 only — fp32 inputs silently rejected
-    both routes, so every sparse layer fell back to unfused dense attention
-    and materialized [heads, L, Kv] scores (the ~28GB/chunk peak at 32K
-    context that never appears on dense models). The attention boundary must
-    hand the native kernels fp16/bf16 tensors."""
+    """FP32 projections must produce FP16 inputs at native attention boundaries."""
     import mlx_vlm.models.glm5_next.language as lang
 
     text = lang.TextConfig(
@@ -874,16 +869,7 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
 
 
 def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
-    """The native glm_dsa_q8_vup_flat kernel is dtype-strict: it computes at
-    x.dtype and requires the projection's affine scales/biases to share that
-    dtype. The PR's kernel-boundary cast makes the native sparse-MLA return an
-    fp16 output, but oQ2e checkpoints ship fp32 scales — so passing the fp16
-    output straight through raised a dtype mismatch (the same attention call
-    completed on the parent commit, which never reached this kernel). The
-    wrapper must preserve the projection's fp32 dtype contract: return None on
-    a mismatch (fall through to the tolerant mx.quantized_matmul that promotes
-    through the fp32 scales) rather than crash or silently downcast the
-    checkpoint's scales. Runs the real native kernel — no stubbing."""
+    """Use fused v-up only for matching dtypes and preserve FP32 scales otherwise."""
     from omlx.custom_kernels.glm_moe_dsa import fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat
 
@@ -895,7 +881,7 @@ def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
     x = mx.random.normal((1, 64, 32, 512), dtype=mx.float16)
     mx.eval(x)
 
-    # oQ2e layout: fp8 affine group64 with fp32 scales/biases.
+    # Use 8-bit affine weights with FP32 scales and biases.
     proj = QuantizedMultiLinear(512, 256, 64, group_size=64, bits=8, mode="affine")
     assert proj.scales.dtype == mx.float32
     # Must NOT raise the native dtype-mismatch; returns None to fall back.
@@ -905,8 +891,7 @@ def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
     mx.eval(out)
     assert out.dtype == mx.float32
 
-    # A checkpoint that genuinely stores fp16 scales still runs the fused
-    # kernel (the gate must not disable it wholesale).
+    # Matching FP16 scales must still use the fused kernel.
     proj16 = QuantizedMultiLinear(
         512, 256, 64, group_size=64, bits=8, mode="affine"
     )
@@ -923,14 +908,7 @@ def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
 
 
 def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatch):
-    """Reviewer repro: at 32K with native kernels enabled, the fp16 output the
-    native sparse-MLA kernel returns reached q8_vup_flat against the
-    checkpoint's fp32 quantization scales and raised a dtype mismatch; the same
-    attention call completed on the parent commit. Drives the real crash
-    sequence — native sparse-MLA (fp16 out) feeding the real q8_vup_flat at
-    key_length=32768 with a real fp8/affine/fp32-scale unembed_out — end to
-    end through both native kernels, q8_vup_flat NOT stubbed, and asserts it
-    completes with the fp32 residual contract preserved."""
+    """Verify native sparse MLA output can feed an FP32-scale projection at 32K."""
     from omlx.custom_kernels.glm_moe_dsa import fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat, sparse_mla_attention
 
@@ -966,13 +944,7 @@ def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatc
 
 
 def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
-    """The CPU enqueues a whole 2048-token prefill chunk in ~1s while the
-    GPU needs ~10x longer; with the layer loop fully lazy every intermediate
-    (fp32 hyper-connection stream, MoE gathers, GDN scans, expanded heads)
-    stays pinned until the final logits eval, spiking the footprint by ~30GB
-    per chunk. The model loop must eval the running stream during prefill so
-    the allocator releases intermediates as the GPU progresses; decode stays
-    lazy for latency."""
+    """Prefill releases layer intermediates and cached buffers; decode stays lazy."""
     import mlx_vlm.models.glm5_next.language as lang
 
     text = _tiny_config().text_config
@@ -1001,10 +973,7 @@ def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
         f"prefill width must eval the stream per layer, got {len(calls)} eval calls"
         f" for {text.num_hidden_layers} layers"
     )
-    # The allocator caches freed buffers per size class; per-layer sizes
-    # differ (expert route counts, 2047/2048 chunk widths), so the pool
-    # grows monotonically through a chunk unless it is cleared at the same
-    # eval boundaries.
+    # Layer-specific buffer sizes can accumulate in the allocator pool.
     assert len(clears) >= text.num_hidden_layers, (
         f"prefill must clear the allocator pool per layer, got {len(clears)}"
         f" clears for {text.num_hidden_layers} layers"
@@ -1022,11 +991,7 @@ def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
 
 
 def test_patch_overrides_site_packages_glm5_next_copy():
-    """Upstream mlx-vlm ships glm5_next since PR 2030 merged, and model
-    discovery imports it before the compat patch runs. A plain import then
-    returns the cached site-packages module and the vendor tree — which
-    carries the fp16 native-boundary and prefill eval fixes — is silently
-    ignored. apply() must purge the cached package so the vendor copy wins."""
+    """The vendor module must replace an already imported upstream module."""
     import sys
     from pathlib import Path
 

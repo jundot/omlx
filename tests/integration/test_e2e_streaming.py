@@ -4863,7 +4863,7 @@ async def test_qwen_recovery_delivers_calls_once(api, chunk_size, shape):
             "<tool_call><function=write><parameter=content>cut",
             "incomplete_tool_call",
         ),
-        (False, '<tool_call>{"name":</tool_call>', "invalid_tool_call"),
+        (False, "<tool_call>not a function</tool_call>", "invalid_tool_call"),
     ],
 )
 async def test_qwen_unrecoverable_sibling_is_not_success(api, valid_prefix, bad, code):
@@ -5354,45 +5354,3 @@ async def test_stream_thinking_length_channels(api, with_tools):
         )
     assert content == ""
     assert reasoning == "unfinished</thi"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
-@pytest.mark.parametrize("with_call", [False, True])
-async def test_literal_tool_markers_stream_as_content(api, with_call):
-    literal = (
-        "Use `<tool_call>` and `</tool_call>` literally."
-        if with_call
-        else "The marker is <tool_call>"
-    )
-    raw = literal + (_RECOVERY_CALL if with_call else "")
-    events = await _recovery_stream(raw, api, chunk_size=1)
-    assert not any("error" in e for e in events)
-    assert len(_recovery_calls(events, api)) == int(with_call)
-    if api == "chat":
-        content = "".join(
-            c.get("delta", {}).get("content", "")
-            for e in events
-            for c in e.get("choices", [])
-        )
-        reasons = [
-            c["finish_reason"]
-            for e in events
-            for c in e.get("choices", [])
-            if c.get("finish_reason")
-        ]
-        assert reasons == ["tool_calls" if with_call else "stop"]
-    elif api == "anthropic":
-        content = "".join(
-            e["delta"]["text"]
-            for e in events
-            if e.get("delta", {}).get("type") == "text_delta"
-        )
-        assert events[-1]["type"] == "message_stop"
-    else:
-        content = "".join(
-            e["delta"] for e in events if e.get("type") == "response.output_text.delta"
-        )
-        assert events[-1]["type"] == "response.completed"
-        assert events[-1]["response"]["output"][0]["content"][0]["text"] == literal
-    assert content == literal

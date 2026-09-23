@@ -613,12 +613,8 @@ class Glm5NextSparseAttention(nn.Module):
                 return self._gathered_attention(q, kv_latent, topk_indices)
             else:
                 q_latent = self.embed_q(q)
-                # The native DSA kernels accept fp16/bf16 only. Quantized
-                # projections promote through fp32 scales, so fp32 activations
-                # silently rejected every native route and each sparse layer
-                # fell back to unfused dense attention — materializing
-                # [heads, L, Kv] scores linear in context. Cast at the kernel
-                # boundary; the fp32 residual stream stays.
+                # Native DSA requires FP16/BF16 inputs; quantized projections can yield FP32.
+                # Cast at the kernel boundary and preserve the residual stream dtype.
                 native_dtype = (
                     mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
                 )
@@ -901,17 +897,8 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
-        # Prefill backpressure: the CPU enqueues a whole 2048-token chunk in
-        # ~1s while the GPU needs ~10x longer to run it. Fully lazy, every
-        # intermediate (fp32 hyper-connection stream, MoE gathers, GDN scans,
-        # expanded attention heads) stays pinned until the final logits eval
-        # and the footprint spikes ~30GB per chunk. Evaling the stream after
-        # each layer lets the allocator release intermediates as the GPU
-        # progresses; the pool must also be cleared there, because per-layer
-        # sizes differ (expert route counts, 2047/2048 chunk widths) and the
-        # allocator caches one buffer per size class otherwise — the freed
-        # buffers stay resident as IOAccelerator memory through the whole
-        # chunk. Decode stays lazy for latency.
+        # Evaluate each layer and release cached buffers to bound prefill memory.
+        # Keep decode lazy; the MTP replacement loop must use the same policy.
         prefill = h.shape[1] >= 256
 
         for layer, c in zip(self.layers, cache):

@@ -1014,6 +1014,7 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.ssd_cache_max_size = "auto"
         mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         shared_ssd_stats = {
@@ -1088,6 +1089,7 @@ class TestRuntimeCacheObservability:
         with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
             payload = admin_routes._build_runtime_cache_observability(mock_settings)
 
+        mock_settings.cache.get_ssd_cache_max_size_bytes.assert_not_called()
         assert payload["total_num_files"] == 10
         assert payload["total_size_bytes"] == 12288
         assert payload["effective_block_sizes"] == [1024, 2048]

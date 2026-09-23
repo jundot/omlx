@@ -378,6 +378,24 @@ async def verify_api_key(
     return True
 
 
+def allows_unauthenticated_inference() -> bool:
+    settings = _server_state.global_settings
+    return (
+        settings is not None
+        and settings.auth.allow_unauthenticated_inference is True
+    )
+
+
+async def verify_inference_api_key(
+    request: FastAPIRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> bool:
+    """Allow the manual inference opt-in without changing management auth."""
+    if allows_unauthenticated_inference():
+        return True
+    return await verify_api_key(request, credentials)
+
+
 def distributed_inference_enabled() -> bool:
     """Whether the experimental distributed surface is exposed this run."""
 
@@ -709,14 +727,14 @@ from .api.mcp_routes import router as mcp_router
 from .api.mcp_routes import set_mcp_manager_getter
 
 set_mcp_manager_getter(get_mcp_manager)
-app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
+app.include_router(mcp_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include web search routes (chat UI built-in web_search / fetch_url tools)
 from .api.websearch_routes import router as websearch_router
 from .api.websearch_routes import set_global_settings_getter as _set_websearch_settings
 
 _set_websearch_settings(lambda: _server_state.global_settings)
-app.include_router(websearch_router, dependencies=[Depends(verify_api_key)])
+app.include_router(websearch_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -727,9 +745,9 @@ try:
     from .api.audio_routes import realtime_router as audio_realtime_router
     from .api.audio_routes import router as audio_router
 
-    app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(audio_router, dependencies=[Depends(verify_inference_api_key)])
     # The realtime WebSocket router authenticates in-band (first message):
-    # verify_api_key is an HTTP-only dependency and browsers cannot set an
+    # HTTP auth dependencies cannot resolve WebSocket scopes, and browsers cannot set an
     # Authorization header on WebSocket connections.
     app.include_router(audio_realtime_router)
     del _
@@ -2114,12 +2132,23 @@ def init_server(
         if auth_error:
             raise ValueError(auth_error)
 
+    if global_settings is not None:
+        global_settings.ensure_inference_auth_setting()
+
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
     _server_state.bind_host = (
         global_settings.server.host if global_settings is not None else None
     )
+    if allows_unauthenticated_inference():
+        logger.warning(
+            "Unauthenticated inference is enabled on %s. Anyone who can connect "
+            "can use inference, stored Responses, audio, MCP tools, and web "
+            "search/fetch. Management endpoints still require authentication "
+            "on non-loopback binds.",
+            _server_state.bind_host,
+        )
     from .cluster.exposure import distributed_inference_enabled as is_enabled
 
     _server_state.distributed_inference_enabled = is_enabled(global_settings)
@@ -3231,7 +3260,7 @@ async def _create_markitdown_chat_completion(
 
 
 @app.get("/v1/models")
-async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
     favorite_ids: set[str] = set()
@@ -3436,7 +3465,7 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 async def create_embeddings(
     request: EmbeddingRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create embeddings for input text(s).
@@ -3583,7 +3612,7 @@ def normalize_documents(documents: list[str] | list[dict]) -> list[str]:
 @app.post("/v1/rerank")
 async def create_rerank(
     request: RerankRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ) -> RerankResponse:
     """
     Rerank documents by relevance to a query.
@@ -3689,7 +3718,7 @@ async def create_rerank(
 async def create_completion(
     request: CompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -3898,7 +3927,7 @@ async def create_completion(
 async def create_chat_completion(
     request: ChatCompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a chat completion.
@@ -6351,7 +6380,7 @@ async def stream_anthropic_messages(
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a message using Anthropic Messages API format.
@@ -6760,7 +6789,7 @@ async def create_anthropic_message(
 @app.post("/v1/messages/count_tokens")
 async def count_anthropic_tokens(
     request: TokenCountRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Count tokens in a message request.
@@ -6887,7 +6916,7 @@ def _store_response_state(
 async def create_response(
     request: ResponsesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -8159,7 +8188,7 @@ async def stream_responses_api(
 @app.get("/v1/responses/{response_id}")
 async def get_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Retrieve a stored response."""
     data = _server_state.responses_store.get(response_id)
@@ -8171,7 +8200,7 @@ async def get_response(
 @app.delete("/v1/responses/{response_id}")
 async def delete_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Delete a stored response."""
     if not _server_state.responses_store.delete(response_id):

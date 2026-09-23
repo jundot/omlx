@@ -41,12 +41,7 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
         apply_pooling_cache_support()
         _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
-        # Upstream mlx-vlm ships glm5_next since PR 2030 merged, and model
-        # discovery imports it before this patch runs. A plain import would
-        # then return the cached site-packages module and silently ignore the
-        # vendor tree — every vendor fix (fp16 native boundary, prefill eval
-        # backpressure) becomes dead code. Purge the cached package first so
-        # the re-import resolves from the vendor path.
+        # Discovery may import upstream first; reload from the vendor path.
         for name in [
             n
             for n in list(sys.modules)
