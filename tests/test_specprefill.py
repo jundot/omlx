@@ -1627,6 +1627,7 @@ class TestUndoLookahead:
             RotatingKVCache,
         )
 
+        from omlx.cache.type_handlers import SizedArraysCache
         from omlx.patches.specprefill import (
             _cache_leaves,
             _hold_leaf_state,
@@ -1637,6 +1638,11 @@ class TestUndoLookahead:
         recurrent = ArraysCache(2)
         recurrent[0] = mx.ones((1, 3))
         recurrent[1] = mx.ones((1, 3)) * 2
+        # What reconstruct_cache hands back for a restored recurrent layer:
+        # the state lives on the wrapped object, not the wrapper.
+        restored = SizedArraysCache(ArraysCache(2), token_count=12)
+        restored[0] = mx.ones((1, 3)) * 3
+        restored[1] = mx.ones((1, 3)) * 4
         window = RotatingKVCache(max_size=8)
         # 12 prompt tokens, the window already wrapped. The last one goes in
         # alone, as _prefill_draft feeds it, which leaves the buffer in the
@@ -1648,10 +1654,15 @@ class TestUndoLookahead:
         nested_kv.update_and_fetch(self._kv(12, 3), self._kv(12, 4))
         plain_kv = KVCache()
         plain_kv.update_and_fetch(self._kv(12, 5), self._kv(12, 6))
-        cache = [CacheList(recurrent, window), CacheList(nested_kv), plain_kv]
+        cache = [
+            CacheList(recurrent, window),
+            CacheList(nested_kv),
+            plain_kv,
+            restored,
+        ]
 
         leaves = _cache_leaves(cache)
-        assert leaves == [recurrent, window, nested_kv, plain_kv]
+        assert leaves == [recurrent, window, nested_kv, plain_kv, restored]
         before = [self._snapshot(leaf) for leaf in leaves]
         held = [
             None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf)
@@ -1661,6 +1672,7 @@ class TestUndoLookahead:
         # Three lookahead steps, written the way decode writes them.
         for step in range(3):
             recurrent[0] = recurrent[0] + 1
+            restored[0] = restored[0] + 1
             for leaf in (window, nested_kv, plain_kv):
                 leaf.update_and_fetch(self._kv(1, 10 + step), self._kv(1, 20 + step))
 
@@ -1669,4 +1681,5 @@ class TestUndoLookahead:
         assert [self._snapshot(leaf) for leaf in leaves] == before
         # Restored in place: the composite still holds the same objects.
         assert cache[0].caches[1] is window
+        assert restored[0].tolist() == [[3.0, 3.0, 3.0]]
         assert window._idx == before[1][1]["_idx"]

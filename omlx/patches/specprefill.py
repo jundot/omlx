@@ -479,18 +479,55 @@ def _is_sliceable_kv(leaf: Any) -> bool:
     return hasattr(leaf, "keys") and not _cache_entry_is_bounded(leaf)
 
 
-def _hold_leaf_state(leaf: Any) -> dict[str, Any]:
+class _HeldObject:
+    """An object nested in a cache leaf, with its attributes as they were."""
+
+    __slots__ = ("obj", "attrs")
+
+    def __init__(self, obj: Any, attrs: dict[str, Any]) -> None:
+        self.obj = obj
+        self.attrs = attrs
+
+
+def _hold_value(value: Any, seen: set[int]) -> Any:
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_hold_value(v, seen) for v in value)
+    if isinstance(value, dict):
+        return {k: _hold_value(v, seen) for k, v in value.items()}
+    # Each nested object once: a reference cycle, or two paths to the same
+    # object, keep the reference rather than recursing again.
+    if hasattr(value, "__dict__") and not callable(value) and id(value) not in seen:
+        return _HeldObject(value, _hold_leaf_state(value, seen))
+    return value
+
+
+def _restore_value(held: Any) -> Any:
+    if isinstance(held, _HeldObject):
+        vars(held.obj).update(
+            {k: _restore_value(v) for k, v in held.attrs.items()}
+        )
+        return held.obj
+    if isinstance(held, (list, tuple)):
+        return type(held)(_restore_value(v) for v in held)
+    if isinstance(held, dict):
+        return {k: _restore_value(v) for k, v in held.items()}
+    return held
+
+
+def _hold_leaf_state(leaf: Any, seen: set[int] | None = None) -> dict[str, Any]:
     """Copy of *leaf*'s attributes that survives later in-place updates.
 
     Containers are rebuilt and arrays copied: ArraysCache writes into its
     ``cache`` list, and RotatingKVCache slice-assigns into ``keys``, which
-    rebinds the array a held reference points at.
+    rebinds the array a held reference points at. Nested objects are held
+    the same way and restored in place, because a wrapper such as
+    SizedArraysCache keeps the state on the object it wraps.
     """
-    from mlx.utils import tree_map
-
-    return tree_map(
-        lambda v: mx.array(v) if isinstance(v, mx.array) else v, dict(vars(leaf))
-    )
+    seen = set() if seen is None else seen
+    seen.add(id(leaf))
+    return {k: _hold_value(v, seen) for k, v in vars(leaf).items()}
 
 
 def _undo_lookahead(
@@ -504,7 +541,7 @@ def _undo_lookahead(
     """
     for leaf, held in zip(leaves, held_states):
         if held is not None:
-            vars(leaf).update(held)
+            vars(leaf).update({k: _restore_value(v) for k, v in held.items()})
         elif getattr(leaf, "offset", 0) > pre_lookahead_offset:
             if leaf.keys is not None:
                 leaf.keys = leaf.keys[..., :pre_lookahead_offset, :]
