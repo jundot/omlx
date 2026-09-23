@@ -1060,3 +1060,253 @@ class TestMemoryGuard:
             "moe_offload_cache",
             False,
         )
+
+
+class TestAutoResidency:
+    """Automatic fraction resolution, cache resizing, and the governor."""
+
+    def _fixture(self, tmp_path):
+        glu = _make_glu()
+        _save_checkpoint(
+            tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu")
+        )
+        return glu
+
+    def _reset_governor(self):
+        import omlx.patches.moe_expert_offload as off
+
+        off._GOV_STATE.update(
+            band_until=0.0,
+            band=None,
+            last_action=0.0,
+            misses=0,
+            ram=0,
+        )
+        return off
+
+    def _fake_free(self, monkeypatch, free_fraction, ram=64 * 1024**3):
+        from types import SimpleNamespace
+
+        import omlx.utils.psutil_compat as pc
+
+        monkeypatch.setattr(pc, "get_total_memory", lambda: ram)
+        monkeypatch.setattr(
+            pc,
+            "virtual_memory",
+            lambda: SimpleNamespace(available=int(free_fraction * ram)),
+        )
+
+    def test_resolve_explicit_passthrough(self, tmp_path):
+        from omlx.patches.moe_expert_offload import resolve_moe_offload_fraction
+
+        self._fixture(tmp_path)
+        assert resolve_moe_offload_fraction(tmp_path, 0.5) == 0.5
+
+    def test_resolve_auto_full_budget_gives_full_residency(
+        self, tmp_path, monkeypatch
+    ):
+        import omlx.patches.moe_expert_offload as off
+
+        self._fixture(tmp_path)
+        full = sum(f.stat().st_size for f in tmp_path.glob("*.safetensors"))
+        monkeypatch.setattr(off, "_moe_offload_memory_limit", lambda: full)
+        assert off.resolve_moe_offload_fraction(tmp_path, None) == 1.0
+        # 0 is the same automatic sentinel.
+        assert off.resolve_moe_offload_fraction(tmp_path, 0.0) == 1.0
+
+    def test_resolve_auto_lands_under_budget(self, tmp_path, monkeypatch):
+        import omlx.patches.moe_expert_offload as off
+
+        self._fixture(tmp_path)
+        full = sum(f.stat().st_size for f in tmp_path.glob("*.safetensors"))
+        # The fixture is all experts: budget = half the checkpoint -> ~0.5.
+        limit = full // 2
+        monkeypatch.setattr(off, "_moe_offload_memory_limit", lambda: limit)
+        f = off.resolve_moe_offload_fraction(tmp_path, None)
+        assert 0 < f < 1
+        # Resolved fraction, floor and rounding must not blow the budget by
+        # more than a slot (32 experts -> one slot ~1/32 of expert bytes).
+        est = off.moe_offload_resident_estimate(tmp_path, f)
+        assert est <= limit + full // E + 1
+
+    def test_resolve_auto_uninspectable_returns_none(self, tmp_path):
+        from omlx.patches.moe_expert_offload import resolve_moe_offload_fraction
+
+        assert resolve_moe_offload_fraction(tmp_path, None) is None
+
+    def test_apply_auto_resolves_and_enables_dynamic(
+        self, tmp_path, monkeypatch
+    ):
+        import omlx.patches.moe_expert_offload as off
+
+        glu = self._fixture(tmp_path)
+        full = sum(f.stat().st_size for f in tmp_path.glob("*.safetensors"))
+        monkeypatch.setattr(off, "_moe_offload_memory_limit", lambda: full // 2)
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, None) == 1
+        cache = model.layers[0].experts.switch_glu.cache
+        assert cache.dynamic is True
+        # The ceiling is the static-budget fit (~half of 32 experts; the
+        # binary search lands on a slot-quantized plateau); the start may
+        # be lower when free memory is tight at load.
+        assert 8 <= cache.capacity <= cache.max_capacity <= 16
+
+    def test_apply_explicit_fraction_stays_fixed(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OMLX_MOE_OFFLOAD_DYNAMIC", raising=False)
+        glu = self._fixture(tmp_path)
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        cache = model.layers[0].experts.switch_glu.cache
+        assert cache.dynamic is False
+        assert cache.capacity == 8
+        assert cache.max_capacity == 8  # explicit pin caps the ceiling too
+
+    def test_validate_accepts_null_and_zero(self):
+        from omlx.model_settings import validate_moe_expert_offload
+
+        validate_moe_expert_offload({"moe_expert_offload_resident_fraction": None})
+        validate_moe_expert_offload({"moe_expert_offload_resident_fraction": 0.0})
+        with pytest.raises(ValueError, match="resident_fraction"):
+            validate_moe_expert_offload(
+                {"moe_expert_offload_resident_fraction": 1.5}
+            )
+        with pytest.raises(ValueError, match="resident_fraction"):
+            validate_moe_expert_offload(
+                {"moe_expert_offload_resident_fraction": "half"}
+            )
+
+    def _dynamic_cache(self, tmp_path, monkeypatch, fraction=0.25, glu=None):
+        glu = glu if glu is not None else self._fixture(tmp_path)
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, fraction) == 1
+        cache = model.layers[0].experts.switch_glu.cache
+        cache.dynamic = True
+        cache.min_capacity = 4
+        cache.max_capacity = E
+        return model, cache
+
+    def test_resize_shrink_keeps_newest_and_frees_slots(
+        self, tmp_path, monkeypatch
+    ):
+        model, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        cache.ensure_ids(list(range(8)))  # LRU order: 0 oldest ... 7 newest
+        assert cache.resize(4) is True
+        assert cache.capacity == 4
+        assert set(cache.slot_of) == {4, 5, 6, 7}
+        assert cache.free == []
+        for name in cache.projs:
+            for t in cache.resident[name]:
+                if t is not None:
+                    assert t.shape[0] == 4
+        # Surviving experts hit; evicted ones miss and refetch cleanly.
+        base = cache.misses
+        cache.ensure_ids([7])
+        assert cache.misses == base
+        cache.ensure_ids([0])
+        assert cache.misses == base + 1
+
+    def test_resize_shrink_stays_bit_exact(self, tmp_path, monkeypatch):
+        glu = self._fixture(tmp_path)
+        mx.random.seed(7)
+        x, indices = mx.random.normal((1, 1, D)), mx.array([[4, 5]])
+        model = _MiniMoE([glu])
+        ref = model(x, indices)
+        mx.eval(ref)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        cache = model.layers[0].experts.switch_glu.cache
+        cache.dynamic, cache.min_capacity, cache.max_capacity = True, 4, E
+        out0 = model(x, indices)  # warm the slots
+        mx.eval(out0, cache.map)
+        assert cache.resize(4) is True
+        out = model(x, indices)
+        mx.eval(out)
+        assert bool(mx.array_equal(out, ref))
+
+    def test_resize_grow_adds_capacity(self, tmp_path, monkeypatch):
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        cache.ensure_ids(list(range(6)))
+        assert cache.resize(20) is True
+        assert cache.capacity == 20
+        assert set(cache.slot_of) == set(range(6))
+        assert sorted(cache.free) == list(range(6, 20))
+        for name in cache.projs:
+            for t in cache.resident[name]:
+                if t is not None:
+                    assert t.shape[0] == 20
+
+    def test_resize_clamps_to_bounds(self, tmp_path, monkeypatch):
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        assert cache.resize(1) is True
+        assert cache.capacity == cache.min_capacity
+        assert cache.resize(1000) is True
+        assert cache.capacity == cache.max_capacity == E
+        assert cache.resize(E) is False  # no-op reports no change
+
+    def test_governor_shrinks_to_floor_under_pressure(
+        self, tmp_path, monkeypatch
+    ):
+        off = self._reset_governor()
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        self._fake_free(monkeypatch, 0.05)  # below the 8% desperate band
+        off._governor_tick(cache)
+        assert cache.capacity == cache.min_capacity
+
+    def test_governor_shrinks_proportionally_in_target_band(
+        self, tmp_path, monkeypatch
+    ):
+        off = self._reset_governor()
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        # 0.02 RAM per slot -> the 0.03 RAM deficit costs exactly 2 slots.
+        ram = 64 * 1024**3
+        cache.slot_bytes = int(0.02 * ram)
+        self._fake_free(monkeypatch, 0.12, ram=ram)  # 12% < 15% target
+        off._governor_tick(cache)
+        assert cache.capacity == 6
+
+    def test_governor_grows_when_free_and_hungry(self, tmp_path, monkeypatch):
+        off = self._reset_governor()
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        cache.misses = 10  # decode traffic since the last look
+        self._fake_free(monkeypatch, 0.60)  # spendable spare >> slots
+        off._governor_tick(cache)
+        assert cache.capacity == E  # grew to the fitted ceiling
+
+    def test_governor_idle_without_hunger(self, tmp_path, monkeypatch):
+        off = self._reset_governor()
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        self._fake_free(monkeypatch, 0.60)
+        off._governor_tick(cache)  # no new misses -> stable
+        assert cache.capacity == 8
+
+    def test_governor_cooldown_blocks_flapping(self, tmp_path, monkeypatch):
+        off = self._reset_governor()
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        self._fake_free(monkeypatch, 0.12)
+        off._governor_tick(cache)
+        first = cache.capacity
+        off._GOV_STATE["band_until"] = 0.0  # force a fresh evaluation
+        off._governor_tick(cache)
+        assert cache.capacity == first  # cooldown: no second action
+
+    def test_governor_desperate_skips_cooldown(self, tmp_path, monkeypatch):
+        off = self._reset_governor()
+        _, cache = self._dynamic_cache(tmp_path, monkeypatch)
+        ram = 64 * 1024**3
+        cache.slot_bytes = int(0.02 * ram)
+        self._fake_free(monkeypatch, 0.12, ram=ram)
+        off._governor_tick(cache)
+        assert cache.capacity == 6
+        off._GOV_STATE["band_until"] = 0.0
+        self._fake_free(monkeypatch, 0.05, ram=ram)  # desperate: no cooldown
+        off._governor_tick(cache)
+        assert cache.capacity == cache.min_capacity
+
+    def test_governor_ignores_fixed_caches(self, tmp_path, monkeypatch):
+        off = self._reset_governor()
+        glu = self._fixture(tmp_path)
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        cache = model.layers[0].experts.switch_glu.cache
+        self._fake_free(monkeypatch, 0.05)
+        off._governor_tick(cache)
+        assert cache.capacity == 8  # explicit fraction: untouched

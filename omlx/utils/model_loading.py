@@ -484,7 +484,7 @@ def maybe_apply_pre_load_patches(
         validate_moe_expert_offload(
             {
                 "moe_expert_offload_resident_fraction": getattr(
-                    model_settings, "moe_expert_offload_resident_fraction", 0.25
+                    model_settings, "moe_expert_offload_resident_fraction", None
                 ),
                 **{
                     key: getattr(model_settings, key, False)
@@ -513,13 +513,13 @@ def maybe_apply_pre_load_patches(
 
         refusal = moe_offload_memory_check(
             model_name,
-            float(
-                getattr(
-                    model_settings, "moe_expert_offload_resident_fraction", 0.25
-                )
-                or 0.25
+            getattr(
+                model_settings, "moe_expert_offload_resident_fraction", None
             ),
             mtp_resident=bool(getattr(model_settings, "mtp_enabled", False)),
+            engram_ssd_offload=bool(
+                getattr(model_settings, "deepseek_v41_engram_ssd_offload", False)
+            ),
         )
         if refusal:
             raise ValueError(refusal)

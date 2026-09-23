@@ -1955,11 +1955,40 @@ class VLMBatchedEngine(BaseEngine):
                 model_type = _read_config_model_type(self._model_name)
                 if model_type == "deepseek_v41":
                     from ..patches.deepseek_v41.loading import load
+                    from ..patches.moe_expert_offload import (
+                        resolve_moe_offload_fraction,
+                        _moe_offload_memory_limit,
+                    )
 
                     return load(
                         self._model_name,
                         moe_expert_offload_resident_fraction=(
-                            self._model_settings.moe_expert_offload_resident_fraction
+                            # Automatic (None/0) resolves against the memory
+                            # budget; uninspectable falls back to the floor.
+                            (
+                                resolve_moe_offload_fraction(
+                                    self._model_name,
+                                    self._model_settings.moe_expert_offload_resident_fraction,
+                                    mtp_resident=bool(
+                                        getattr(
+                                            self._model_settings,
+                                            "mtp_enabled",
+                                            False,
+                                        )
+                                    ),
+                                    engram_ssd_offload=bool(
+                                        getattr(
+                                            self._model_settings,
+                                            "deepseek_v41_engram_ssd_offload",
+                                            False,
+                                        )
+                                    ),
+                                    # The v41 adapter has no governor —
+                                    # fit the full budget at load.
+                                    budget_bytes=_moe_offload_memory_limit(),
+                                )
+                                or 0.0
+                            )
                             if getattr(
                                 self._model_settings,
                                 "moe_expert_offload_enabled",
@@ -2056,12 +2085,10 @@ class VLMBatchedEngine(BaseEngine):
                 materialize_offload_state,
             )
 
-            fraction = float(
-                getattr(
-                    self._model_settings,
-                    "moe_expert_offload_resident_fraction",
-                    0.25,
-                )
+            fraction = getattr(
+                self._model_settings,
+                "moe_expert_offload_resident_fraction",
+                None,
             )
             # glm5_next Lightning MTP: the draft head's experts stay resident
             # while the backbone streams (run_in_executor takes no kwargs,

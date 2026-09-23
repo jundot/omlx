@@ -918,7 +918,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
     settings["moe_expert_offload_enabled"] = False
-    settings["moe_expert_offload_resident_fraction"] = 0.25
+    settings["moe_expert_offload_resident_fraction"] = None
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -995,7 +995,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
     settings.moe_expert_offload_enabled = False
-    settings.moe_expert_offload_resident_fraction = 0.25
+    settings.moe_expert_offload_resident_fraction = None
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -3038,10 +3038,9 @@ async def update_model_settings(
             request.moe_expert_offload_enabled or False
         )
     if "moe_expert_offload_resident_fraction" in sent:
+        # null or 0 = automatic sizing; an explicit value pins residency.
         current_settings.moe_expert_offload_resident_fraction = (
-            0.25
-            if request.moe_expert_offload_resident_fraction is None
-            else request.moe_expert_offload_resident_fraction
+            request.moe_expert_offload_resident_fraction or None
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
@@ -3560,11 +3559,11 @@ def _validate_model_settings(entry, settings):
 
             refusal = moe_offload_memory_check(
                 entry.model_path,
-                float(
-                    settings.get("moe_expert_offload_resident_fraction")
-                    or 0.25
-                ),
+                settings.get("moe_expert_offload_resident_fraction"),
                 mtp_resident=bool(settings.get("mtp_enabled")),
+                engram_ssd_offload=bool(
+                    settings.get("deepseek_v41_engram_ssd_offload")
+                ),
             )
             if refusal:
                 raise ValueError(refusal)
@@ -3959,8 +3958,11 @@ def _feature_problem(
 
         return moe_offload_memory_check(
             entry.model_path,
-            float(snapshot.get("moe_expert_offload_resident_fraction") or 0.25),
+            snapshot.get("moe_expert_offload_resident_fraction"),
             mtp_resident=bool(snapshot.get("mtp_enabled")),
+            engram_ssd_offload=bool(
+                snapshot.get("deepseek_v41_engram_ssd_offload")
+            ),
         )
     return None
 

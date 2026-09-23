@@ -52,10 +52,10 @@ class TestModelSettings:
         assert restored.is_favorite is True
 
     def test_moe_expert_offload_defaults(self):
-        """Expert offload is opt-in, at 25% residency."""
+        """Expert offload is opt-in; residency is automatic (null) by default."""
         settings = ModelSettings()
         assert settings.moe_expert_offload_enabled is False
-        assert settings.moe_expert_offload_resident_fraction == 0.25
+        assert settings.moe_expert_offload_resident_fraction is None
 
     def test_moe_expert_offload_roundtrip(self):
         """Both offload fields survive to_dict -> from_dict."""
@@ -70,9 +70,13 @@ class TestModelSettings:
         assert restored.moe_expert_offload_resident_fraction == 0.5
 
     def test_moe_expert_offload_fraction_out_of_range_rejected(self):
-        """Residency outside (0, 1] fails at construction, not at load."""
+        """Residency outside [0, 1] fails at construction; 0 means automatic."""
+        assert (
+            ModelSettings(moe_expert_offload_resident_fraction=0.0).moe_expert_offload_resident_fraction
+            == 0.0
+        )
         with pytest.raises(ValueError, match="resident_fraction"):
-            ModelSettings(moe_expert_offload_resident_fraction=0.0)
+            ModelSettings(moe_expert_offload_resident_fraction=-0.1)
         with pytest.raises(ValueError, match="resident_fraction"):
             ModelSettings(moe_expert_offload_resident_fraction=1.5)
 

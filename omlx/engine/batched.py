@@ -346,12 +346,10 @@ class BatchedEngine(BaseEngine):
                 materialize_offload_state,
             )
 
-            fraction = float(
-                getattr(
-                    self._model_settings,
-                    "moe_expert_offload_resident_fraction",
-                    0.25,
-                )
+            fraction = getattr(
+                self._model_settings,
+                "moe_expert_offload_resident_fraction",
+                None,
             )
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
