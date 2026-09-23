@@ -332,8 +332,19 @@ def test_last_reachable_boundary_is_none_when_suffix_fits_one_chunk():
     assert draft_workflow._last_reachable_boundary(14336, 16368, 1024, 1024) == 15360
 
 
-def test_last_reachable_boundary_accepts_an_aligned_total():
-    assert draft_workflow._last_reachable_boundary(0, 16384, 2048, 1024) == 16384
+def test_an_aligned_total_publishes_the_boundary_below_it():
+    """A boundary at the prompt end is unusable when the same prompt returns.
+
+    The draft lookup asks for all but the last token, so it can never match
+    a block ending at n_to_score. 16384 in 2048-token chunks reports 2048,
+    ..., 14336, then 16383 and 16384; the last aligned position below the end
+    is 14336, a full chunk back rather than one block back, because the
+    prefill never stands anywhere in between.
+    """
+    assert draft_workflow._last_reachable_boundary(0, 16384, 2048, 1024) == 14336
+    assert draft_workflow._last_reachable_boundary(0, 8192, 2048, 256) == 6144
+    # Chunking finer than a block makes the block below the end reachable.
+    assert draft_workflow._last_reachable_boundary(0, 8192, 256, 256) == 7936
 
 
 def test_boundary_snapshot_is_captured_once_and_passed_to_store():
@@ -343,7 +354,7 @@ def test_boundary_snapshot_is_captured_once_and_passed_to_store():
     state extraction per block and showed up directly as scoring wall time.
     """
     request, plan = _request_and_plan()
-    block_table = SimpleNamespace(num_tokens=3)
+    block_table = SimpleNamespace(num_tokens=4)
     recurrent, sliceable = _RecurrentLayer(), KVCache()
     reconstructed_cache = [recurrent, sliceable]
     draft_cache = _DraftCache(block_table, reconstructed_cache, block_size=4)
@@ -355,9 +366,10 @@ def test_boundary_snapshot_is_captured_once_and_passed_to_store():
 
     def score_tokens(model: Any, tokens: list[int], **kwargs: Any) -> tuple[Any, Any]:
         report = kwargs["progress_callback"]
-        # cached_len 3, n_to_score 16, step 4: reported positions are
-        # 3, 7, 11, 15 (chunks), then 18-1 clipped, then 16.
-        for processed in (3, 7, 7, 11, 11, 15, 15, 16):
+        # cached_len 4, n_to_score 16, step 4: reported positions are
+        # 4, 8, 12 (chunks), 15 (the clipped last chunk), then 16. The
+        # target is 12: 16 is aligned but is the prompt end.
+        for processed in (4, 8, 8, 12, 12, 15, 15, 16):
             report(processed, plan.n_to_score, "scoring")
         report(plan.n_to_score, plan.n_to_score, "lookahead")
         return mx.zeros(plan.n_to_score), reconstructed_cache
@@ -379,8 +391,8 @@ def test_boundary_snapshot_is_captured_once_and_passed_to_store():
 
     passed = draft_cache.store_boundary_snapshots[-1]
     assert passed is not None
-    assert list(passed) == [16]
-    assert passed[16] == [{"state": "recurrent"}, None]
+    assert list(passed) == [12]
+    assert passed[12] == [{"state": "recurrent"}, None]
 
 
 def test_boundary_capture_ignores_unreported_positions():
@@ -398,7 +410,8 @@ def test_boundary_capture_ignores_unreported_positions():
 
     def score_tokens(model: Any, tokens: list[int], **kwargs: Any) -> tuple[Any, Any]:
         report = kwargs["progress_callback"]
-        for processed in (4, 8, 12):  # aligned, but never the chosen target
+        # Starting at 4 the target is 12; these are aligned but stop short.
+        for processed in (4, 8):
             report(processed, plan.n_to_score, "scoring")
         return mx.zeros(plan.n_to_score), reconstructed_cache
 
@@ -486,8 +499,9 @@ def test_boundary_prediction_matches_the_real_loop_everywhere():
         for block in range(2, 20):
             for n in range(2, 200):
                 reported, _ = _replay_prefill(n, step)
-                aligned = [p for p in reported if p and p % block == 0]
+                aligned = [p for p in reported if 0 < p < n and p % block == 0]
                 predicted = draft_workflow._last_reachable_boundary(0, n, step, block)
+                assert predicted != n, (n, step, block)
                 if aligned:
                     assert predicted == max(aligned), (n, step, block, predicted)
                 else:
@@ -500,7 +514,7 @@ def test_boundary_prediction_survives_a_nonzero_cached_length():
             for extra in (1, 7, 64, 3073):
                 n = cached + extra
                 reported, _ = _replay_prefill(extra, step)
-                aligned = [cached + p for p in reported if cached + p > cached]
+                aligned = [cached + p for p in reported if cached < cached + p < n]
                 aligned = [p for p in aligned if p % 1024 == 0]
                 predicted = draft_workflow._last_reachable_boundary(
                     cached, n, step, 1024
@@ -630,3 +644,188 @@ def test_restored_cache_is_released_before_the_clear():
     ), "something still names the restored draft cache at the clear point"
     # The hit is still reported and the store still happens.
     assert draft_cache.stores, "a cache hit must not skip the store"
+
+
+class TestRepeatedBlockAlignedPrompt:
+    """A block-aligned prompt scored twice restores a snapshot below its end.
+
+    Real pieces throughout: a tiny random-weight Qwen3.5 (GDN recurrent and
+    attention layers), BlockAwarePrefixCache over a PagedSSDCacheManager on
+    disk, and the scheduler's own state extraction. The second request is
+    served by a fresh prefix-cache instance, so the restore comes from disk.
+    """
+
+    BLOCK = 16
+    STEP = 32
+    N = 128  # block-aligned
+
+    @staticmethod
+    def _model():
+        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+        args = TextModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 256,
+                "linear_num_value_heads": 2,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 3,
+                "full_attention_interval": 2,
+                "tie_word_embeddings": True,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 32,
+                "rope_theta": 1000.0,
+                "partial_rotary_factor": 0.5,
+                "max_position_embeddings": 1024,
+            }
+        )
+        mx.random.seed(0)
+        model = TextModel(args)
+        mx.eval(model.parameters())
+        return model
+
+    def _prefix_cache(self, model, cache_dir):
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+        from omlx.cache.paged_cache import PagedCacheManager
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+        from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+        types = ModelCacheConfig.from_cache_list(
+            make_prompt_cache(model), model_name="tiny-draft"
+        ).get_type_names()
+        paged = PagedCacheManager(
+            block_size=self.BLOCK, max_blocks=256, model_name="tiny-draft"
+        )
+        ssd = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=256 * 1024**2,
+            expected_model_name="tiny-draft",
+            expected_num_layers=len(model.layers),
+            expected_block_size=self.BLOCK,
+            expected_layer_cache_types=types,
+        )
+        paged.set_paged_ssd_cache_manager(ssd)
+        prefix = BlockAwarePrefixCache(
+            model=model, paged_cache_manager=paged, paged_ssd_cache_manager=ssd
+        )
+        return prefix, ssd
+
+    def _score(self, model, tokens, prefix_cache):
+        from omlx.scheduler import Scheduler
+
+        request = Request(
+            request_id=f"r-{id(prefix_cache)}",
+            prompt=list(tokens),
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(tokens)
+        request.num_prompt_tokens = len(tokens)
+        request.remaining_tokens = request.prompt_token_ids
+        request.specprefill_system_end = 0
+        request.cached_tokens = 0
+        plan = plan_specprefill_scoring(
+            remaining_tokens=request.remaining_tokens,
+            system_prompt_end=0,
+            cached_tokens=0,
+            requested_threshold=None,
+            requested_keep_pct=None,
+            default_threshold=8,
+            default_keep_pct=0.25,
+        )
+        assert plan is not None and plan.n_to_score == len(tokens)
+
+        import omlx.patches.specprefill as sp
+
+        real_score_tokens = sp.score_tokens
+        seen: dict[str, Any] = {}
+
+        def score_tokens(m, toks, **kwargs):
+            existing = kwargs.get("existing_cache")
+            seen["restored"] = (
+                0 if existing is None else sp._logical_cache_offset(m, existing)
+            )
+            kwargs["temp"] = 0.0
+            importance, cache = real_score_tokens(m, toks, **kwargs)
+            seen["importance"] = importance
+            seen["cache"] = cache
+            return importance, cache
+
+        extract_self = SimpleNamespace(model_name="tiny-draft")
+        with patch.object(sp, "score_tokens", side_effect=score_tokens):
+            draft_workflow.run_specprefill_draft_scoring(
+                request=request,
+                plan=plan,
+                draft_model=model,
+                draft_prefix_cache=prefix_cache,
+                model_id="m",
+                prefill_step_size=self.STEP,
+                stream=mx.default_stream(mx.default_device()),
+                extract_cache_states=lambda cache: Scheduler._extract_cache_states(
+                    extract_self, cache
+                ),
+                sync_and_clear_cache=lambda: None,
+                log=_Logger(),
+            )
+        assert request.specprefill_indices is not None
+        seen["selection"] = request.specprefill_indices.tolist()
+        return seen
+
+    @staticmethod
+    def _prompt_state(model, tokens, step):
+        from mlx_lm.models.cache import make_prompt_cache
+
+        from omlx.patches.specprefill import _prefill_draft
+
+        cache = make_prompt_cache(model)
+        _prefill_draft(model, tokens, cache, step_size=step)
+        return cache
+
+    @staticmethod
+    def _assert_same_state(got, want):
+        for g, w in zip(got, want):
+            if hasattr(w, "keys"):
+                assert g.offset == w.offset
+                assert mx.array_equal(
+                    g.keys[..., : g.offset, :], w.keys[..., : w.offset, :]
+                ).item()
+            else:
+                for a, b in zip(g.cache, w.cache):
+                    assert mx.array_equal(a, b).item()
+
+    def test_second_request_restores_below_the_end_and_scores_like_cold(
+        self, tmp_path
+    ):
+        model = self._model()
+        tokens = [(i * 37 + 11) % 256 for i in range(self.N)]
+
+        cold = self._score(model, tokens, None)
+
+        writer, writer_ssd = self._prefix_cache(model, tmp_path)
+        first = self._score(model, tokens, writer)
+        writer_ssd.close()
+        assert first["restored"] == 0
+
+        reader, reader_ssd = self._prefix_cache(model, tmp_path)
+        second = self._score(model, tokens, reader)
+        reader_ssd.close()
+
+        # _prefill_draft reports 32, 64, 96, 127, 128 on the first request,
+        # so the last aligned boundary below 128 is 96. The N-1 lookup
+        # matches seven blocks (112) and walks back to that snapshot.
+        assert second["restored"] == 96
+        # Restored at a point the cold prefill also stands on, the suffix
+        # runs the same chunks, so the result is exact, not merely close.
+        assert mx.array_equal(cold["importance"], second["importance"]).item()
+        assert second["selection"] == cold["selection"]
+        self._assert_same_state(
+            second["cache"], self._prompt_state(model, tokens, self.STEP)
+        )

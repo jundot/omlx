@@ -63,7 +63,7 @@ _SLICEABLE_CACHE_TYPES = frozenset(
 def _last_reachable_boundary(
     cached_len: int, n_to_score: int, step: int, block_size: int
 ) -> int | None:
-    """Largest block boundary the draft prefill will actually report.
+    """Largest block boundary below ``n_to_score`` the draft prefill reports.
 
     State for a boundary exists only while the prefill stands on it, so the
     one worth publishing has to be known before scoring starts. This walks
@@ -72,8 +72,13 @@ def _last_reachable_boundary(
     logits, so the positions are not simply multiples of ``step``. That
     schedule is pinned by ``test_prefill_draft_schedule_is_exactly_this``.
 
-    ``None`` when no reported position is block-aligned and past
-    ``cached_len``: nothing new to publish.
+    ``n_to_score`` itself is reported too, after that final call, but it is
+    never the answer. The draft lookup asks for all but the last token, so a
+    boundary at the prompt end can serve only a longer prompt, never this
+    prompt scored again; the boundary below it serves both.
+
+    ``None`` when no reported position is block-aligned, past ``cached_len``
+    and below ``n_to_score``: nothing new to publish.
     """
     if block_size <= 0 or step <= 0:
         return None
@@ -82,13 +87,12 @@ def _last_reachable_boundary(
         return None
     best: int | None = None
     processed = 0
+    # Every position this loop reaches is at most n_to_score - 1.
     while m - processed > 1:
         processed += min(step, m - processed - 1)
         position = cached_len + processed
         if position > cached_len and position % block_size == 0:
             best = position
-    if n_to_score > cached_len and n_to_score % block_size == 0:
-        best = n_to_score
     return best
 
 
