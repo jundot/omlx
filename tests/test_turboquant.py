@@ -1371,6 +1371,17 @@ def test_batch_tq_state_restore_resets_phys_end():
     )
 
 
+def test_turboquant_safe_kernel_patch():
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+    import mlx_vlm.turboquant as _tq
+
+    apply_turboquant_attention_patch()
+    # At dim > 256, the kernel hook must return None to protect against 1024 > 640 threadgroup overflow
+    assert _tq._fused_mse_decode_kernel(4, 4, 512) is None
+    # At dim <= 256, the kernel hook passes through
+    assert _tq._fused_mse_decode_kernel(4, 4, 256) is not None
+
+
 @pytest.mark.parametrize("retained", [[2, 2, 2], [1, 2, 2], [1, 2, 3]])
 def test_batch_tq_speculative_commit_matches_dense(retained):
     from mlx_vlm.speculative.cache_state import start_speculative_cache

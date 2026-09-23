@@ -293,6 +293,9 @@ def test_should_route_gate():
     # wrong head_dim
     qh, kh, _ = _qkv(2048, 16384, head_dim=128)
     assert sdpa256._should_route(qh, kh, None, "causal", None) is False
+    # 512 head_dim (e.g. Gemma 4 full-attention)
+    q512, k512, _ = _qkv(2048, 16384, head_dim=512)
+    assert sdpa256._should_route(q512, k512, None, "causal", None) is True
     # Boolean/additive masks and attention sinks remain memory-bounded.
     bool_mask = mx.ones((1, 1, 1, 16384), dtype=mx.bool_)
     additive_mask = mx.zeros((1, 1, 1, 16384), dtype=mx.float16)

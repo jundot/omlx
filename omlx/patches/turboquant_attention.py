@@ -274,14 +274,23 @@ def _fused_multirow_mse_attention(
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
-    out = pass2(
-        inputs=[out_acc, out_sums, out_maxs],
-        template=[("Dim", D), ("Blocks", num_blocks)],
-        grid=(n_rows * 1024, 1, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(n_rows, D)],
-        output_dtypes=[mx.float32],
-    )[0]
+    try:
+        out = pass2(
+            inputs=[out_acc, out_sums, out_maxs],
+            template=[("Dim", D), ("Blocks", num_blocks)],
+            grid=(n_rows * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(n_rows, D)],
+            output_dtypes=[mx.float32],
+        )[0]
+    except (ValueError, RuntimeError) as e:
+        err_msg = str(e)
+        if (
+            "Thread group size" not in err_msg
+            and "threads per threadgroup" not in err_msg
+        ):
+            raise
+        return None
 
     out_rotated = out.reshape(B, n_kv_heads, n_repeats, L, D)
     output = value_codec._rotate_inverse(out_rotated)
@@ -535,6 +544,18 @@ def apply_turboquant_attention_patch() -> bool:
         logger.debug(
             "TurboQuant VLM target-verify attention patch skipped", exc_info=True
         )
+
+    try:
+        import mlx_vlm.turboquant as _tq
+        _orig_kernel = getattr(_tq, "_fused_mse_decode_kernel", None)
+        if _orig_kernel is not None:
+            def _safe_fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
+                if dim > 256:
+                    return None
+                return _orig_kernel(key_bits, val_bits, dim)
+            _tq._fused_mse_decode_kernel = _safe_fused_mse_decode_kernel
+    except Exception:
+        logger.debug("TurboQuant safe decode kernel patch skipped", exc_info=True)
 
     original_sdpa = mlx_base.scaled_dot_product_attention
 
