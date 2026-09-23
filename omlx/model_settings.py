@@ -36,7 +36,7 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 # These families keep the MTP head resident while backbone experts stream.
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41",)
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:

@@ -441,7 +441,12 @@ class EnginePool:
                     )
             elif qwen4_estimate is None:
                 base = estimate_offload_admission_bytes(
-                    entry.model_path, base, fraction
+                    entry.model_path,
+                    base,
+                    fraction,
+                    mtp_resident=bool(
+                        getattr(runtime_settings, "mtp_enabled", False)
+                    ),
                 )
         return base + extra
 

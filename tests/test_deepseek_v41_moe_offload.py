@@ -149,6 +149,8 @@ def test_lightning_mtp_offload_conflict_is_family_aware():
 
     settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
     validate_moe_expert_offload(settings, model_type="deepseek_v41")
+    validate_moe_expert_offload(settings, model_type="glm5_next")
+    validate_moe_expert_offload(settings, model_type="glm5-next")
     validate_moe_expert_offload(settings, model_type=None)
     with pytest.raises(ValueError, match="MoE expert offload cannot"):
         validate_moe_expert_offload(settings, model_type="qwen3_5")
@@ -865,6 +867,10 @@ def test_admin_validate_offload_mtp_family_gate(tmp_path, monkeypatch):
     # V4.1: allowed, no HTTPException.
     _validate_model_settings(
         SimpleNamespace(model_path=str(tmp_path), config_model_type="deepseek-v41"),
+        settings,
+    )
+    _validate_model_settings(
+        SimpleNamespace(model_path=str(tmp_path), config_model_type="glm5-next"),
         settings,
     )
     # Any other lightning family: rejected at save time.
