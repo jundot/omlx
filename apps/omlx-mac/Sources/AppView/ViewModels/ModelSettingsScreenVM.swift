@@ -249,7 +249,7 @@ final class ModelSettingsScreenVM {
     // Capability comes from the server (moe_expert_offload_supported).
     var moeExpertOffloadEnabled: Bool = false
     var moeExpertOffloadSupported: Bool = false
-    var moeExpertOffloadResidentFraction: String = "0.25"
+    var moeExpertOffloadResidentFraction: String = "0"
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -415,15 +415,20 @@ final class ModelSettingsScreenVM {
 
     var thinkingForced: Bool { model?.thinkingForced == true }
 
-    /// Resident-fraction choices for the MoE offload picker, matching the
-    /// webui's 12.5/25/50/75% select. A custom server-side value is
-    /// surfaced as an extra leading option instead of silently rounding.
+    /// Resident-fraction choices for the MoE offload picker: "Automatic"
+    /// (value 0 — the server sizes residency from the memory budget and
+    /// re-tunes it at runtime) plus the 12.5/25/50/75% presets. A custom
+    /// server-side value is surfaced as an extra option instead of
+    /// silently rounding.
     static func moeOffloadFractionOptions(current: String) -> [(String, String)] {
         let presets = [0.125, 0.25, 0.5, 0.75]
-        var options = presets.map {
+        var options = [("0", String(localized: "settings.advanced.moe_offload.fraction.auto",
+                                    defaultValue: "Automatic",
+                                    comment: "MoE offload resident-fraction picker option that lets the server size residency"))]
+        options += presets.map {
             (String($0), $0.formatted(.percent.precision(.fractionLength(0...1))))
         }
-        if let v = Double(current), !presets.contains(v) {
+        if let v = Double(current), v != 0, !presets.contains(v) {
             options.insert(
                 (current, v.formatted(.percent.precision(.fractionLength(0...2)))),
                 at: 0
@@ -606,7 +611,7 @@ final class ModelSettingsScreenVM {
                 self.moeExpertOffloadEnabled = s?.moeExpertOffloadEnabled ?? false
                 self.moeExpertOffloadResidentFraction =
                     s?.moeExpertOffloadResidentFraction.map { Self.formatPct($0) }
-                    ?? "0.25"
+                    ?? "0"
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -762,10 +767,12 @@ final class ModelSettingsScreenVM {
             patch.moeExpertOffloadEnabled = moeExpertOffloadEnabled
         case .moeExpertOffloadResidentFraction:
             guard moeExpertOffloadSupported, moeExpertOffloadEnabled else { return }
-            guard let v = Double(moeExpertOffloadResidentFraction), v > 0, v <= 1 else {
+            // 0 is the automatic sentinel — the server sizes residency
+            // from the memory budget.
+            guard let v = Double(moeExpertOffloadResidentFraction), v >= 0, v <= 1 else {
                 lastError = String(
                     localized: "settings.advanced.moe_offload.fraction.error",
-                    defaultValue: "Resident fraction must be between 0 and 1.",
+                    defaultValue: "Resident fraction must be between 0 (automatic) and 1.",
                     comment: "Validation error when the MoE offload resident fraction is out of range")
                 return
             }

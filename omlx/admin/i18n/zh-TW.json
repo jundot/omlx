@@ -1170,6 +1170,7 @@
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "請輸入 5 到 95 之間的數值。",
+  "modal.model_settings.moe_expert_offload_resident_auto": "自動（依可用記憶體調整）",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "使用模型內建的 MTP 頭，每步產生多個 token。解碼速度最快可達約 1.5 倍。（Qwen 3.5/3.6、DeepSeek-V4、GLM-5.2）",
   "modal.model_settings.mtp_conflict": "請先停用 DFlash 和 TurboQuant KV — 它們修補了 MTP 依賴的相同路徑。",

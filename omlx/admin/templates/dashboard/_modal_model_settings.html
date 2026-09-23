@@ -1186,6 +1186,13 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.moe_expert_offload_enabled" x-transition class="pt-1">
+                                            <label class="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2 cursor-pointer">
+                                                <input type="checkbox" x-model="modelSettings.moe_expert_offload_resident_auto"
+                                                       class="w-4 h-4 rounded border-neutral-300 text-black focus:ring-black">
+                                                {{ t('modal.model_settings.moe_expert_offload_resident_auto') }}
+                                            </label>
+                                            <template x-if="!modelSettings.moe_expert_offload_resident_auto">
+                                            <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.moe_expert_offload_fraction_label') }}</label>
                                             <div class="flex items-center gap-2">
                                                 <input type="number" min="5" max="95" step="any" inputmode="decimal"
@@ -1200,6 +1207,8 @@
                                                 <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_resident_range') }}</span>
                                             </div>
                                             <p x-show="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched" x-cloak class="mt-1.5 text-xs text-red-600">{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}</p>
+                                            </div>
+                                            </template>
                                         </div>
                                     </div>
                                 </template>

@@ -253,7 +253,9 @@
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
-                moe_expert_offload_resident_fraction: 0.25,
+                moe_expert_offload_resident_fraction: null,
+                moe_expert_offload_resident_auto: true,
+                moe_expert_offload_resident_percent: 25,
                 qwen35_oq_a8_enabled: false,
                 qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
@@ -1896,7 +1898,8 @@
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
-                    moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? null,
+                    moe_expert_offload_resident_auto: s.moe_expert_offload_resident_fraction == null,
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
@@ -1961,6 +1964,7 @@
             },
 
             moeExpertOffloadResidentInvalid() {
+                if (this.modelSettings.moe_expert_offload_resident_auto) return false;
                 const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
                 return (
                     !Number.isFinite(percent)
@@ -2915,7 +2919,9 @@
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
-                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
+                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_auto
+                                    ? null
+                                    : (this.modelSettings.moe_expert_offload_resident_fraction ?? null),
                                 qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
                                 qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,

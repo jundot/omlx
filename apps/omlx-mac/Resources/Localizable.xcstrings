@@ -20794,6 +20794,18 @@
         }
       }
     },
+    "settings.advanced.moe_offload.fraction.auto" : {
+      "comment" : "MoE offload resident-fraction picker option that lets the server size residency",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatic"
+          }
+        }
+      }
+    },
     "settings.advanced.moe_offload.fraction.error" : {
       "comment" : "Validation error when the MoE offload resident fraction is out of range",
       "extractionState" : "extracted_with_value",
@@ -20801,7 +20813,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Resident fraction must be between 0 and 1."
+            "value" : "Resident fraction must be between 0 (automatic) and 1."
           }
         },
         "ru" : {
