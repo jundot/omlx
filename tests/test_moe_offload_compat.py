@@ -89,6 +89,53 @@ def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_exp
     assert moe_offload_compatibility(tmp_path) == (True, "")
 
 
+def _mimo_checkpoint(path):
+    """mimo_v2_flash: n_routed_experts (no num_experts), mxfp4 experts, and
+    a dense layer 0 via moe_layer_freq — whose scales are deliberately
+    written F16 (affine dtype) to prove the gate never inspects it."""
+    text = dict(
+        num_hidden_layers=2,
+        n_routed_experts=16,
+        num_experts_per_tok=2,
+        hidden_size=64,
+        moe_intermediate_size=64,
+        moe_layer_freq=[0, 1],
+    )
+    raw = {
+        "model_type": "mimo_v2_flash",
+        "text_config": text,
+        "quantization": {"bits": 4, "group_size": 32, "mode": "mxfp4"},
+    }
+    (path / "config.json").write_text(json.dumps(raw))
+    tensors = {}
+    for layer, scales_dtype in ((0, mx.float16), (1, mx.uint8)):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            key = f"model.layers.{layer}.mlp.switch_mlp.{proj}"
+            tensors[key + ".weight"] = mx.zeros((16, 64, 8), mx.uint32)
+            tensors[key + ".scales"] = mx.zeros((16, 64, 2), scales_dtype)
+    mx.save_safetensors(str(path / "model.safetensors"), tensors)
+    return tensors
+
+
+def test_mimo_v2_flash_supported_and_dense_layer_skipped(tmp_path, monkeypatch):
+    _mimo_checkpoint(tmp_path)
+    monkeypatch.setattr(mx, "load", lambda *a, **kw: pytest.fail("Loaded tensor data"))
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+
+
+def test_mimo_v2_flash_dense_layer_flag_matters(tmp_path):
+    """With moe_layer_freq all-1 the gate inspects layer 0 — and its F16
+    scales fail the mxfp4 U8 requirement, so eligibility must flip."""
+    _mimo_checkpoint(tmp_path)
+    path = tmp_path / "config.json"
+    raw = json.loads(path.read_text())
+    raw["text_config"]["moe_layer_freq"] = [1, 1]
+    path.write_text(json.dumps(raw))
+    ok, reason = moe_offload_compatibility(tmp_path)
+    assert ok is False
+    assert "dtype" in reason or "shape" in reason
+
+
 @pytest.mark.parametrize(
     "change", ["missing_expert", "wrong_shape", "wrong_dtype", "bias"]
 )
