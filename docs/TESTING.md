@@ -160,53 +160,41 @@ model ID in dashboard progress. It must not reuse FP32 states or the older
 custom-loader adapter's `:prism_fp16_v1` states. Assess FP16 task outputs
 separately; it changes rounding and is not a bit-exact precision mode.
 
-The following bounded synthetic reproduction isolates singleton cache copying.
-Set `MODEL_DIR` to the local checkpoint and run in fresh processes with
-`BASELINE=1` and `BASELINE=0`, keeping precision, GPU load and weights identical.
-It substitutes zero attention KV at 16K tokens, so it measures allocation and
-decode throughput rather than semantic quality or cold-prefill performance.
+For performance measurements, exercise the actual serving transition. oMLX
+already keeps regular `KVCache` for standalone requests; a direct
+`BatchGenerator` with a synthetic one-row cache does not represent that path.
 
-```python
-import os, time
-import mlx.core as mx
-from mlx_lm.generate import BatchGenerator
-from mlx_vlm.utils import load
-from mlx_vlm.models.qwen3_5.language import Qwen3_5Model
-from omlx.models.vlm import VLMModelAdapter
-from omlx.patches.prism_hadamard import apply_runtime_patches
+1. Start isolated oMLX servers from main and the candidate, with identical
+   native builds, dependencies, checkpoint, settings and FP32 activations.
+   Leave `OMLX_PRISM_FP16_ACTIVATIONS` unset. Use concurrency two and stock
+   balanced decode bursting, with thinking/speculation and KV quantization off.
+2. Warm a real prompt of roughly 8K tokens through HTTP. Measure a standalone
+   256-token reply as a control. Then start another 256-token reply and submit
+   a 32-token reply after receiving its first content chunk. Both requests use
+   the same messages and deterministic sampling settings.
+3. Observe two-row decoding followed by one unpadded `BatchKVCache`. Reject
+   trials that never batch or whose measured tail still includes multiple rows.
+   Inspect the backing allocation as well as the used prefix: main tightens it
+   every token, whereas the candidate preserves spare capacity. The standalone
+   control must retain regular `KVCache` in both implementations.
+4. Run fresh-process A/B/B/A phases, discarding a warmup for each case and
+   retaining repeated samples. Compare output token IDs, prefix reuse, HTTP
+   first-content/complete latency and a fixed tail window using the engine's
+   producer timestamps. Report memory separately and avoid extrapolating the
+   affected tail to all requests or to cold prefill.
 
-mx.set_memory_limit(25 * 1024**3)
-mx.set_cache_limit(128 * 1024**2)
-model, _ = load(os.environ["MODEL_DIR"])
-apply_runtime_patches(model)
-lm = model.language_model
-if os.environ.get("BASELINE") == "1":
-    lm.model.__class__ = Qwen3_5Model
-cache = lm.make_cache()
-mx.eval(lm(mx.array([[100]]), cache=cache).logits)
-for entry in cache:
-    if hasattr(entry, "keys") and entry.keys is not None:
-        shape = list(entry.keys.shape)
-        shape[2] = 16384
-        entry.keys = mx.zeros(shape, dtype=entry.keys.dtype)
-        entry.values = mx.zeros(shape, dtype=entry.values.dtype)
-        entry.offset = 16000
-mx.eval([entry.state for entry in cache])
-batch = BatchGenerator(VLMModelAdapter(model), max_tokens=40, stop_tokens=[],
-                       prefill_batch_size=1, completion_batch_size=1)
-try:
-    batch.insert([[100]], caches=[cache])
-    for _ in range(4):
-        list(batch.next_generated())
-    start = time.monotonic()
-    tokens = [r.token for _ in range(32) for r in batch.next_generated()]
-    print(len(tokens) / (time.monotonic() - start), "tokens/sec")
-    print(tokens)
-finally:
-    batch.close()
-```
+[Recorded HTTP benchmark and exact reproduction harness](https://gist.github.com/samfenwick/476245f50cb037b9eb798acaa146d554)
+compare main `8288884d` and runtime head `3be7a24e` on M1 Max / 64 GB, with four
+retained samples per arm/scenario. The 8,386-token prompt reuses 8,379 tokens.
+After the batch shrinks, the 128-token tail improves from 12.86 to 19.18
+tokens/sec; the complete overlapping reply takes 22.37 versus 16.81 seconds.
+Standalone tail throughput is 18.55 versus 18.51 tokens/sec. All retained output
+token IDs and text match. Peak MLX allocation is 21.06 GiB in both arms, including
+load and warmup; this is not a measured peak-memory reduction or a broad quality
+evaluation. The optional FP16 activation path is outside this comparison.
 
-Run interleaved baseline/patched repetitions and check identical generated token
-IDs. Do not infer a universal speedup or a long-context quality result from this
-synthetic cache experiment. The bounded FP32 attention fallback is already on
-main and remains covered by `tests/test_sdpa256_attention.py`.
+The cache ownership behavior originates in mlx-vlm's Qwen3.5 singleton path.
+An upstream dependency fix can replace the scoped runtime patch; these results
+quantify its present serving impact rather than deciding that maintenance
+boundary. The FP32 attention fallback already on main remains covered by
+`tests/test_sdpa256_attention.py`.
