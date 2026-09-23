@@ -684,6 +684,7 @@ class TestAuthSettings:
             "api_key": "my-key",
             "secret_key": None,
             "skip_api_key_verification": False,
+            "allow_unauthenticated_inference": False,
             "sub_keys": [],
         }
 
@@ -3168,3 +3169,56 @@ class TestDashboardLayoutRoute:
 
         with pytest.raises(pydantic.ValidationError):
             DashboardLayoutRequest.model_validate(self._layout(width="huge"))
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_unauthenticated_inference_requires_boolean(tmp_path, value):
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.auth = AuthSettings.from_dict({"allow_unauthenticated_inference": value})
+    assert (
+        "auth.allow_unauthenticated_inference must be a boolean" in settings.validate()
+    )
+
+
+def test_inference_auth_default_preserves_saved_data(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    data = {"auth": {"api_key": "saved-key"}, "custom": {"keep": True}}
+    path.write_text(json.dumps(data))
+    monkeypatch.setenv("OMLX_API_KEY", "runtime-key")
+    settings = GlobalSettings.load(base_path=tmp_path)
+    settings.ensure_inference_auth_setting()
+    data["auth"]["allow_unauthenticated_inference"] = False
+    assert json.loads(path.read_text()) == data
+    data["auth"]["allow_unauthenticated_inference"] = True
+    path.write_text(json.dumps(data))
+    before = path.read_bytes()
+    settings = GlobalSettings.load(base_path=tmp_path)
+    settings.ensure_inference_auth_setting()
+    assert path.read_bytes() == before
+    assert settings.auth.allow_unauthenticated_inference is True
+    settings.save_cli_overrides(Namespace(port=8123))
+    saved = json.loads(path.read_text())
+    assert saved["auth"]["allow_unauthenticated_inference"] is True
+    assert saved["auth"]["api_key"] == "saved-key"
+
+
+def test_inference_auth_default_creates_settings_file(tmp_path):
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.ensure_inference_auth_setting()
+    assert json.loads((tmp_path / "settings.json").read_text()) == {
+        "auth": {"allow_unauthenticated_inference": False}
+    }
+
+
+@pytest.mark.parametrize("api_key,skip", [(None, False), ("admin-key", True)])
+def test_inference_opt_in_keeps_network_management_requirements(
+    tmp_path, api_key, skip
+):
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.server.host = "0.0.0.0"
+    settings.auth = AuthSettings(
+        api_key=api_key,
+        skip_api_key_verification=skip,
+        allow_unauthenticated_inference=True,
+    )
+    assert any("non-loopback" in error for error in settings.validate())

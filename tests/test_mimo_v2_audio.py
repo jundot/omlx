@@ -12,9 +12,43 @@ from omlx.patches.mimo_v2.audio import (
     MiMoAudioProcessor,
     _load_codebook_weights,
     _LocalTransformer,
+    audio_cache_key_ranges,
     group_audio_codes,
     mel_spectrogram,
 )
+
+
+def test_audio_cache_keys_preserve_prefixes_before_changed_media():
+    ids = [1, 2, 99, 99, 3, 4, 5, 99, 99, 6]
+    codes = mx.zeros((4, 4, 20), dtype=mx.int32)
+    original = audio_cache_key_ranges(
+        ids, codes, 99, [(0, "first-image"), (6, "second-image")]
+    )
+    changed_codes = mx.concatenate([codes[:2], mx.ones_like(codes[2:])])
+    changed_audio = audio_cache_key_ranges(
+        ids, changed_codes, 99, [(0, "first-image"), (6, "second-image")]
+    )
+    changed_first_audio = audio_cache_key_ranges(
+        ids,
+        mx.concatenate([mx.ones_like(codes[:2]), codes[2:]]),
+        99,
+        [(0, "first-image"), (6, "second-image")],
+    )
+    changed_image = audio_cache_key_ranges(
+        ids, codes, 99, [(0, "first-image"), (6, "different-image")]
+    )
+
+    assert [start for start, _ in original] == [0, 2, 6, 7]
+    assert original[0] == (0, "first-image")
+    assert original[:3] == changed_audio[:3]
+    assert original[3][1] != changed_audio[3][1]
+    assert original[0] == changed_first_audio[0]
+    assert all(a[1] != b[1] for a, b in zip(original[1:], changed_first_audio[1:]))
+    assert original[:2] == changed_image[:2]
+    assert all(a[1] != b[1] for a, b in zip(original[2:], changed_image[2:]))
+    assert original == audio_cache_key_ranges(
+        ids, codes, 99, [(0, "first-image"), (6, "second-image")]
+    )
 
 
 def test_mel_spectrogram_matches_torchaudio_power_default(monkeypatch):

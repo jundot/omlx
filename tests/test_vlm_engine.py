@@ -79,6 +79,24 @@ def _make_engine(**overrides):
     return engine
 
 
+@pytest.mark.asyncio
+async def test_start_rejects_unsupported_mtp_offload_before_loading(tmp_path):
+    from omlx.model_settings import ModelSettings
+
+    (tmp_path / "config.json").write_text('{"model_type": "qwen3_5_moe"}')
+    engine = _make_engine(
+        model_name=str(tmp_path),
+        model_settings=ModelSettings(moe_expert_offload_enabled=True, mtp_enabled=True),
+    )
+    with patch(
+        "omlx.utils.model_loading.maybe_load_custom_quantization",
+        side_effect=AssertionError("Unsupported settings reached the model loader"),
+    ) as load:
+        with pytest.raises(ValueError, match="MoE expert offload cannot"):
+            await engine.start()
+        load.assert_not_called()
+
+
 def _make_loaded_engine(model_type=None, tokenizer=None, **overrides):
     """Create a VLMBatchedEngine with mocked internals (no actual model load)."""
     engine = _make_engine(**overrides)
@@ -1173,6 +1191,48 @@ class TestProcessChatMessages:
     """Tests for VLMBatchedEngine._process_chat_messages()."""
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_mimo_audio_stays_in_its_original_turn(self, mock_extract):
+        engine = _make_loaded_engine(model_type="mimo_v2")
+        audio_part = {
+            "type": "input_audio",
+            "input_audio": {"data": "abc", "format": "wav"},
+        }
+        messages = [
+            {"role": "user", "content": "Earlier text"},
+            {"role": "assistant", "content": "Earlier answer"},
+            {
+                "role": "user",
+                "content": [audio_part, {"type": "text", "text": "First recording"}],
+            },
+            {"role": "assistant", "content": "First transcript"},
+            {
+                "role": "user",
+                "content": [audio_part, {"type": "text", "text": "Second recording"}],
+            },
+        ]
+        stripped = [dict(message) for message in messages]
+        stripped[2]["content"] = "First recording"
+        stripped[4]["content"] = "Second recording"
+        mock_extract.return_value = (stripped, [], [object(), object()])
+        formatted = []
+
+        def prepare(message_values, images, audio, **kwargs):
+            values, _ = engine._format_messages_for_vlm_template(
+                message_values, num_images=len(images), num_audios=len(audio)
+            )
+            formatted.extend(values)
+            return [1], None, None, None, 0, []
+
+        engine._prepare_vision_inputs = prepare
+        engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        assert formatted[0]["content"] == "Earlier text"
+        assert formatted[2]["content"].count("<|audio_pad|>") == 1
+        assert formatted[2]["content"].endswith("First recording")
+        assert formatted[4]["content"].count("<|audio_pad|>") == 1
+        assert formatted[4]["content"].endswith("Second recording")
+
+    @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_text_only_uses_vlm_prepare_path(self, mock_extract):
         """Text-only turns on a VLM model still use _prepare_vision_inputs()."""
         text_msgs = [{"role": "user", "content": "Hello"}]
@@ -1572,10 +1632,11 @@ class TestPrepareVisionInputs:
         )
         engine = self._setup_engine_for_vision(model_type=None)
         engine._model_name = str(tmp_path)
+        engine._vlm_model.config.audio_token_id = 99
         mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
         audio_codes = mx.zeros((2, 4, 20), dtype=mx.int32)
         mock_prepare.return_value = {
-            "input_ids": mx.array([[1, 2, 3]]),
+            "input_ids": mx.array([[1, 99, 99]]),
             "pixel_values": None,
             "audio_codes": audio_codes,
         }
@@ -1594,6 +1655,9 @@ class TestPrepareVisionInputs:
         call_kwargs = engine._vlm_model.get_input_embeddings.call_args.kwargs
         assert call_kwargs["audio_codes"] is audio_codes
         assert result[1] is embeddings
+        assert result[3] is not None
+        assert result[4] == 1
+        assert result[5] == [(1, result[3])]
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
@@ -1640,7 +1704,6 @@ class TestPrepareVisionInputs:
 
         call_kwargs = mock_prepare.call_args[1]
         assert call_kwargs.get("audio") is None
-
 
     # --- per-image vision feature cache -------------------------------
 

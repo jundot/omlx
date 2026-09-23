@@ -1166,6 +1166,7 @@
   "modal.model_settings.moe_expert_offload": "MoE Expert Offload",
   "modal.model_settings.moe_expert_offload_hint": "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",
   "modal.model_settings.moe_expert_offload_speculative_hint": "Lightning MTP, VLM MTP, DFlash와 동시에 사용할 수 없습니다.",
+  "modal.model_settings.moe_expert_offload_speculative_hint_v41": "Lightning MTP와 함께 사용할 수 있습니다: 드래프트 헤드는 메모리에 상주하고 백본 익스퍼트는 SSD에서 스트리밍됩니다. VLM MTP 또는 DFlash와는 사용할 수 없습니다.",
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "Enter a number from 5 to 95.",

@@ -780,8 +780,8 @@
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.moe_expert_offload_enabled && ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled)) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
-                                                :disabled="modelSettings.moe_expert_offload_enabled || (!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled"
+                                                @click="if ((!modelSettings.moe_expert_offload_enabled || modelSettings.moe_offload_allows_mtp) && ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled)) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
+                                                :disabled="(modelSettings.moe_expert_offload_enabled && !modelSettings.moe_offload_allows_mtp) || (!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled"
                                                 :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
                                                             ? (modelSettings.mtp_compatibility_reason || 'Unsupported model')
                                                             : (modelSettings.dflash_enabled
@@ -791,7 +791,7 @@
                                                                     : ''))"
                                                 :class="[
                                                     modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    (modelSettings.moe_expert_offload_enabled || (!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
+                                                    ((modelSettings.moe_expert_offload_enabled && !modelSettings.moe_offload_allows_mtp) || (!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.mtp_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -1171,12 +1171,15 @@
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.moe_expert_offload') }}</span>
                                                 <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.moe_expert_offload_hint') }}</p>
-                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.moe_expert_offload_speculative_hint') }}</p>
+                                                <p class="text-xs text-neutral-500 mt-0.5"
+                                                   x-text="selectedModel?.moe_offload_allows_mtp
+                                                        ? t('modal.model_settings.moe_expert_offload_speculative_hint_v41')
+                                                        : t('modal.model_settings.moe_expert_offload_speculative_hint')"></p>
                                             </div>
                                             <button type="button"
                                                     @click="modelSettings.moe_expert_offload_enabled = !modelSettings.moe_expert_offload_enabled"
-                                                    :disabled="modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled"
-                                                    :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
+                                                    :disabled="(modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled"
+                                                    :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', ((modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
                                                     class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="modelSettings.moe_expert_offload_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>

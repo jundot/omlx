@@ -89,6 +89,19 @@ def test_get_classes_resolves_mimo_v2():
     assert args_cls.__name__ == "ModelArgs"
 
 
+def test_router_preserves_fp32_score_difference():
+    module = _load_patch_module()
+    args = module.ModelArgs.from_dict(_minimal_config(hidden_size=2))
+    gate = module.MoEGate(args)
+    gate.weight = mx.array([[1.0, 0.0], [1.0, 1.0]], dtype=mx.bfloat16)
+    gate.e_score_correction_bias = mx.zeros((2,))
+    hidden = mx.array([[[1.0, 1.0 / 256]]], dtype=mx.bfloat16)
+
+    experts, _ = gate(hidden)
+
+    assert experts.item() == 1
+
+
 def test_mixed_cache_forward_and_continuous_batching():
     mimo_v2 = _load_patch_module()
     from mlx_lm.generate import BatchGenerator
@@ -209,7 +222,7 @@ def test_multimodal_mimo_is_explicitly_routed_to_text_engine(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         assert detect_model_type(tmp_path) == "llm"
 
-    assert "text-only" in caplog.text
+    assert "no supported vision sidecar" in caplog.text
 
 
 def test_oq_uses_mlx_lm_sanitizer_for_multimodal_mimo(monkeypatch):
@@ -340,3 +353,68 @@ def test_measure_sensitivity_routes_genuine_vlm_to_mlx_vlm(monkeypatch):
     assert vlm_calls == [True]
     assert lm_calls == []
     assert result == {"model.layers.0": 1.0}
+
+
+def test_official_mxfp4_checkpoint_loads_without_requantizing(tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import load_model
+
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    module = _load_patch_module()
+    config = _minimal_config()
+    model = module.Model(module.ModelArgs.from_dict(config))
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+        class_predicate=lambda path, layer: ".switch_mlp." in path
+        and hasattr(layer, "to_quantized"),
+    )
+    weights = {}
+    for name, value in tree_flatten(model.parameters()):
+        if ".switch_mlp." not in name:
+            weights[name] = value
+            continue
+        prefix, projection = name.split(".switch_mlp.")
+        projection, suffix = projection.rsplit(".", 1)
+        for expert, tensor in enumerate(value):
+            key = f"{prefix}.experts.{expert}.{projection}.weight"
+            if suffix == "scales":
+                weights[key + "_scale"] = tensor
+            else:
+                weights[key] = tensor.view(mx.uint8)
+    mx.eval(weights)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    config["quantization_config"] = {"quant_method": "fp8", "store_dtype": "mxfp4"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    maybe_apply_pre_load_patches(str(tmp_path))
+
+    loaded, loaded_config = load_model(tmp_path)
+    ids = mx.array([[1, 2, 3]])
+    expected, actual = model(ids), loaded(ids)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(expected, actual).item()
+    assert loaded_config["quantization"]["mode"] == "mxfp4"
+    original = model.layers[1].mlp.switch_mlp.gate_proj
+    restored = loaded.layers[1].mlp.switch_mlp.gate_proj
+    assert mx.array_equal(original.weight, restored.weight).item()
+    assert mx.array_equal(original.scales, restored.scales).item()
+
+    from omlx.oq import quantize_oq_streaming
+
+    output = tmp_path / "oq"
+    quantize_oq_streaming(
+        str(tmp_path),
+        str(output),
+        4,
+        sensitivity_map_override={i: 1.0 for i in range(4)},
+    )
+    converted, _ = load_model(output)
+    expert = converted.layers[1].mlp.switch_mlp.gate_proj
+    assert mx.array_equal(original.weight, expert.weight).item()
+    assert mx.array_equal(original.scales, expert.scales).item()
+    assert mx.isfinite(converted(ids)).all().item()

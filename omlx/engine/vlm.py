@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import functools
 import importlib
 import inspect
 import json
@@ -1926,6 +1927,8 @@ class VLMBatchedEngine(BaseEngine):
                 model_settings=self._model_settings,
                 for_vlm=True,
             )
+        except ValueError:
+            raise
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
 
@@ -2083,9 +2086,17 @@ class VLMBatchedEngine(BaseEngine):
                     0.25,
                 )
             )
+            # glm5_next Lightning MTP: the draft head's experts stay resident
+            # while the backbone streams (run_in_executor takes no kwargs,
+            # so bind with partial).
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
-                apply_moe_expert_offload,
+                functools.partial(
+                    apply_moe_expert_offload,
+                    mtp_resident=bool(
+                        getattr(self._model_settings, "mtp_enabled", False)
+                    ),
+                ),
                 self._vlm_model,
                 self._model_name,
                 fraction,
@@ -3408,10 +3419,9 @@ class VLMBatchedEngine(BaseEngine):
             - token_ids: List of token IDs for BatchGenerator
             - inputs_embeds: Merged vision+text embeddings (or None if text-only)
             - extra_kwargs: Model-specific kwargs for language model
-            - image_hash: SHA256 hash of images for prefix cache
-            - image_cache_key_start: Token index where image-aware cache keying begins
-            - image_cache_key_ranges: Per-image-turn cache key boundaries with
-              cumulative image hashes
+            - image_hash: Image/audio identity for prefix cache
+            - image_cache_key_start: Token index where media-aware keying begins
+            - image_cache_key_ranges: Media boundaries with cumulative hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
@@ -3867,6 +3877,22 @@ class VLMBatchedEngine(BaseEngine):
             _capture_vlm_position_state(
                 getattr(self._vlm_model, "language_model", None), extra_kwargs
             )
+
+            if model_type in {"mimo_v2", "mimo_v2_flash"} and has_audio:
+                from ..patches.mimo_v2.audio import audio_cache_key_ranges
+
+                # Keep vision-feature identities independent of audio inputs.
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                image_cache_key_ranges = audio_cache_key_ranges(
+                    token_ids,
+                    extra_model_inputs["audio_codes"],
+                    self._vlm_model.config.audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
 
             return (
                 token_ids,
@@ -4699,9 +4725,12 @@ class VLMBatchedEngine(BaseEngine):
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
         # on the first image-bearing turn and invalidates early prefix blocks.
-        vlm_messages = (
-            self._apply_ocr_prompt(media_messages) if images else text_messages
-        )
+        if images:
+            vlm_messages = self._apply_ocr_prompt(media_messages)
+        elif audio and model_type in {"mimo_v2", "mimo_v2_flash"}:
+            vlm_messages = media_messages
+        else:
+            vlm_messages = text_messages
         template_tools = convert_tools_for_template(tools) if tools else None
         (
             token_ids,

@@ -309,3 +309,41 @@ def test_image_feature_merge_is_batch_ordered_and_strict():
         MiMoOmnimodalModel._merge_image_features(
             input_ids, text, features[:2], image_token_id=99
         )
+
+
+def test_export_sidecars_keeps_original_media_weights_and_audio_tokenizer(tmp_path):
+    from omlx.patches.mimo_v2.omnimodal import export_sidecars
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    config = _tiny_config(depth=1, fullatt_block_indexes=[], vit_window_attn_types=[-1])
+    vision = VisionModel(config)
+    weights = {}
+    for key, value in tree_flatten(vision.parameters()):
+        if key == "patch_embed.proj.weight":
+            value = value.transpose(0, 4, 1, 2, 3)
+        weights[f"visual.{key}"] = value
+    audio_key = "speech_embeddings.0.weight"
+    weights[audio_key] = mx.ones((8, 4), dtype=mx.bfloat16)
+    weights["model.layers.0.weight"] = mx.zeros((4, 4))
+    mx.save_safetensors(str(source / "model.safetensors"), weights)
+    audio_root = source / "audio_tokenizer"
+    audio_root.mkdir()
+    (audio_root / "model.safetensors").write_bytes(b"audio tokenizer")
+    (audio_root / "config.json").write_text("{}")
+
+    export_sidecars(source, output, {"vision_config": config.__dict__})
+
+    exported = mx.load(str(output / "omnimodal/vision_encoder.safetensors"))
+    restored = VisionModel(config)
+    restored.load_weights(list(restored.sanitize(exported).items()), strict=True)
+    for key, value in exported.items():
+        assert mx.array_equal(value, weights[key]).item()
+    audio = mx.load(str(output / "omnimodal/audio_encoder.safetensors"))
+    assert list(audio) == [audio_key]
+    assert mx.array_equal(audio[audio_key], weights[audio_key]).item()
+    assert (
+        output / "audio_tokenizer/model.safetensors"
+    ).read_bytes() == b"audio tokenizer"
+    assert has_vision_sidecar(output)

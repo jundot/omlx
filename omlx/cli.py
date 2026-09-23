@@ -82,6 +82,82 @@ def _has_cli_overrides(args) -> bool:
     return bool(getattr(args, "no_cache", False))
 
 
+def _migrate_saved_network_auth(settings, args) -> None:
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from .utils.network import is_valid_bind_host, network_auth_error
+
+    if getattr(args, "host", None) is not None or os.environ.get("OMLX_HOST"):
+        return
+    path = settings.base_path / "settings.json"
+    if not path.exists():
+        return
+    host = settings.server.host
+    if not isinstance(host, str) or not all(
+        is_valid_bind_host(part.strip()) for part in host.split(",")
+    ):
+        return
+    if not network_auth_error(
+        host, settings.auth.api_key, settings.auth.skip_api_key_verification
+    ):
+        return
+
+    settings.server.host = "127.0.0.1"
+    if settings.validate():
+        settings.server.host = host
+        return
+
+    message = (
+        f"The saved server address ({host}) was changed to 127.0.0.1 because "
+        "API key authentication is required for access from other devices. "
+        "The server is now limited to this Mac. Your other settings and models "
+        "have been preserved. To allow access from other devices, set an API "
+        "key and enable authentication in Settings, then change the server address."
+    )
+    notice_path = os.environ.get("OMLX_STARTUP_NOTICE_PATH")
+    if not notice_path:
+        warning = message.replace("was changed", "will be changed").replace(
+            "is now limited", "will be limited"
+        )
+        print(f"Warning: {warning}", flush=True)
+        try:
+            input("Press Enter to continue, or Ctrl+C to cancel. ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nStartup canceled. Settings have not been changed.", flush=True)
+            raise SystemExit(1) from None
+
+    # Preserve unknown settings and avoid persisting environment overrides.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("server", {})["host"] = settings.server.host
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(data, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    if notice_path:
+        print(f"Warning: {message}", flush=True)
+
+        notice = Path(notice_path)
+        temporary = notice.with_suffix(".tmp")
+        try:
+            temporary.write_text(message, encoding="utf-8")
+            os.replace(temporary, notice)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
@@ -185,6 +261,11 @@ def serve_command(args):
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
+    try:
+        _migrate_saved_network_auth(settings, args)
+    except (OSError, ValueError) as error:
+        print(f"Configuration error: {error}")
+        sys.exit(1)
     errors = settings.validate()
     if errors:
         for error in errors:

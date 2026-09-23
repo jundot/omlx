@@ -250,6 +250,10 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     return quant_method == "fp8" and (
         _is_deepseek_v4_config(config)
         or config.get("model_type") == "bailing_hybrid"
+        or (
+            config.get("model_type") == "mimo_v2"
+            and quantization_config.get("store_dtype") == "mxfp4"
+        )
     )
 
 
@@ -4642,6 +4646,11 @@ class _LazyTensorIndex:
         config: dict | None = None,
     ):
         self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
+        self._mimo_mxfp4 = bool(
+            config
+            and config.get("model_type") == "mimo_v2"
+            and (config.get("quantization_config") or {}).get("store_dtype") == "mxfp4"
+        )
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
@@ -4774,7 +4783,10 @@ class _LazyTensorIndex:
                 if (
                     wk in self._index
                     and wk not in seen
-                    and self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                    and (
+                        self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                        or (self._mimo_mxfp4 and self._index[wk][5] == "U8")
+                    )
                 ):
                     self._fp8_pairs[wk] = k
                     seen.add(wk)
@@ -4801,6 +4813,10 @@ class _LazyTensorIndex:
         if len(w_shape) != 2 or len(s_shape) != 2:
             return None
         rows, cols = w_shape
+        if self._mimo_mxfp4 and sk.endswith(".weight_scale") and w_dtype == "U8":
+            if s_dtype != "U8" or cols % 16 or tuple(s_shape) != (rows, cols // 16):
+                raise ValueError(f"Invalid MiMo MXFP4 weight/scale pair: {wk}")
+            return {"kind": "mxfp4", "bits": 4, "group_size": 32, "mode": "mxfp4"}
         # MiniMax MXFP8 checkpoints store E8M0 exponent bytes under the
         # ``weight_scale_inv`` suffix even though the model sanitizer passes
         # them directly to MLX as ``.scales``. Enable this only from an
@@ -5986,6 +6002,11 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    mimo_multimodal = (
+        normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
+        and _has_vision_subconfig(config)
+        and not text_only
+    )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -6013,6 +6034,7 @@ def quantize_oq_streaming(
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
         and _has_vision_subconfig(config)
         and not text_only
+        and not mimo_multimodal
     ):
         logger.warning(
             "oQ only supports the %s text backbone; enabling text-only output",
@@ -6827,6 +6849,11 @@ def quantize_oq_streaming(
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
     _copy_model_sidecars(source, output, text_only=text_only)
+
+    if mimo_multimodal:
+        from .patches.mimo_v2.omnimodal import export_sidecars
+
+        export_sidecars(source, output, config)
 
     cb("saving", 100.0, "Quantized model saved")
     logger.info(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,13 +18,58 @@ from .vision import VisionConfig, VisionModel
 
 VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
 AUDIO_SIDECAR = Path("omnimodal/audio_encoder.safetensors")
-AUDIO_TOKENIZER = Path("omnimodal/audio_tokenizer")
+AUDIO_TOKENIZER = Path("audio_tokenizer")
 OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 
 
 def has_vision_sidecar(model_path: str | Path) -> bool:
     root = Path(model_path)
     return (root / VISION_SIDECAR).is_file() and (root / OMNIMODAL_CONFIG).is_file()
+
+
+def export_sidecars(source: Path, output: Path, config: dict) -> None:
+    """Preserve MiMo media weights outside the quantized text checkpoint."""
+    import safetensors
+
+    destination = output / "omnimodal"
+    destination.mkdir(parents=True, exist_ok=True)
+    if has_vision_sidecar(source):
+        for relative in (VISION_SIDECAR, AUDIO_SIDECAR, OMNIMODAL_CONFIG):
+            if (source / relative).is_file():
+                shutil.copy2(source / relative, output / relative)
+    else:
+        vision, audio = {}, {}
+        for shard in sorted(source.glob("*.safetensors")):
+            with safetensors.safe_open(str(shard), framework="np") as handle:
+                keys = [
+                    key
+                    for key in handle.keys()  # noqa: SIM118
+                    if key.startswith(
+                        ("visual.", "audio_encoder.", "speech_embeddings.")
+                    )
+                ]
+            if not keys:
+                continue
+            weights = mx.load(str(shard))
+            for key in keys:
+                target = vision if key.startswith("visual.") else audio
+                target[key] = weights[key]
+            mx.eval(vision, audio)
+        if not vision:
+            raise ValueError("MiMo multimodal export requires vision weights")
+        mx.save_safetensors(str(output / VISION_SIDECAR), vision)
+        if audio:
+            mx.save_safetensors(str(output / AUDIO_SIDECAR), audio)
+        (output / OMNIMODAL_CONFIG).write_text(
+            json.dumps({"vision_config": config["vision_config"]}, indent=2)
+        )
+    if (output / AUDIO_SIDECAR).is_file():
+        tokenizer_root = source / AUDIO_TOKENIZER
+        if not (tokenizer_root / "model.safetensors").is_file():
+            raise FileNotFoundError(
+                f"MiMo audio tokenizer not found below {tokenizer_root}"
+            )
+        shutil.copytree(tokenizer_root, output / AUDIO_TOKENIZER)
 
 
 class MiMoLanguageAdapter(nn.Module):

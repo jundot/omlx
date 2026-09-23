@@ -328,6 +328,78 @@ def test_admission_estimate_counts_dsv4_experts(tmp_path):
     )
 
 
+class _MTPHead(nn.Module):
+    """glm5_next's ``mtp.<i>.block.mlp.switch_mlp`` subtree shape: the
+    draft head is a plain decoder layer, so its routed experts live under
+    an ``mtp.`` path the offload wrap must be able to skip."""
+
+    def __init__(self, glu):
+        super().__init__()
+        self.block = _FFN(glu)
+
+
+def test_mtp_resident_keeps_draft_head_unwrapped(tmp_path, reference):
+    # MTP armed: the head's experts stay fully resident (unwrapped) so
+    # every draft step runs from RAM while the backbone streams. MTP off:
+    # today's behavior — the head wraps like any other layer.
+    backbone = _copy(reference)
+    head = _make_glu(seed=7)
+    tensors = _tensors(backbone)
+    tensors.update(_tensors(head, prefix="mtp.0.block.switch_mlp"))
+    _write(tmp_path, tensors)
+
+    model = _Model([backbone])
+    model.mtp = [_MTPHead(head)]
+    n = dsv4.apply_deepseek_v4_moe_expert_offload(
+        model, tmp_path, 0.5, mtp_resident=True
+    )
+    assert n == 1
+    assert isinstance(model.model.layers[0].ffn.switch_mlp, dsv4.OffloadedSwitchGLU)
+    assert isinstance(model.mtp[0].block.switch_mlp, SwitchGLU)
+    assert not isinstance(
+        model.mtp[0].block.switch_mlp, dsv4.OffloadedSwitchGLU
+    )
+
+    off = _Model([_copy(reference)])
+    off.mtp = [_MTPHead(_copy(head))]
+    n = dsv4.apply_deepseek_v4_moe_expert_offload(off, tmp_path, 0.5)
+    assert n == 2
+    assert isinstance(
+        off.mtp[0].block.switch_mlp, dsv4.OffloadedSwitchGLU
+    )
+
+
+def test_admission_estimate_excludes_resident_draft_head(tmp_path):
+    # The estimate must not promise savings on the draft head's slab while
+    # the adapter keeps it resident, or admission overcommits and the load
+    # OOMs. Checkpoint form: the real glm5_next layout stores the head as
+    # ``language_model.mtp.<i>.*`` in its own shard.
+    glu = _make_glu()
+    tensors = _tensors(glu)
+    head_prefix = "language_model.mtp.0.block.mlp.switch_mlp"
+    tensors.update(_tensors(_make_glu(seed=7), prefix=head_prefix))
+    _write(tmp_path, tensors)
+    backbone_bytes = sum(
+        v.size * v.dtype.size
+        for k, v in tensors.items()
+        if ".switch_mlp." in k and ".mtp." not in k
+    )
+    head_bytes = sum(
+        v.size * v.dtype.size
+        for k, v in tensors.items()
+        if ".switch_mlp." in k and ".mtp." in k
+    )
+    assert head_bytes > 0
+    full = 10**9
+    assert estimate_offload_admission_bytes(
+        tmp_path, full, 0.25, mtp_resident=True
+    ) == full - int(backbone_bytes * 0.75)
+    # Default (MTP off): the head's experts stream like any other layer.
+    assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full - int(
+        (backbone_bytes + head_bytes) * 0.75
+    )
+
+
 @pytest.mark.parametrize("workers", ["1", "4"])
 def test_wrap_and_release_return_descriptors_to_baseline(
     tmp_path, reference, monkeypatch, workers

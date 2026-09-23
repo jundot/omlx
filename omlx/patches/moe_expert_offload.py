@@ -769,7 +769,11 @@ def _resolve_store_view(
 
 
 def apply_moe_expert_offload(
-    model, model_path: str | Path, resident_fraction: float = 0.25
+    model,
+    model_path: str | Path,
+    resident_fraction: float = 0.25,
+    *,
+    mtp_resident: bool = False,
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
@@ -777,6 +781,11 @@ def apply_moe_expert_offload(
     ``OMLX_MOE_EXPERT_OFFLOAD=0``, the model has no stock SwitchGLU, or the
     checkpoint does not cover them). Must run before lazy weights are
     materialized for the memory saving to exist.
+
+    ``mtp_resident`` keeps the embedded MTP draft head's experts resident
+    (glm5_next Lightning MTP + offload; see
+    ``omlx.patches.deepseek_v4.moe_offload``). Other families reject the
+    combination at validation, so only this adapter's path consumes it.
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return 0
@@ -806,7 +815,7 @@ def apply_moe_expert_offload(
     from .deepseek_v4.moe_offload import apply_deepseek_v4_moe_expert_offload
 
     wrapped += apply_deepseek_v4_moe_expert_offload(
-        model, model_dir, resident_fraction
+        model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
@@ -854,7 +863,11 @@ def apply_moe_expert_offload(
 
 
 def estimate_offload_admission_bytes(
-    model_path: str | Path, full_size: int, resident_fraction: float = 0.25
+    model_path: str | Path,
+    full_size: int,
+    resident_fraction: float = 0.25,
+    *,
+    mtp_resident: bool = False,
 ) -> int:
     """Admission-time size estimate with offload active.
 
@@ -904,6 +917,14 @@ def estimate_offload_admission_bytes(
                 header = json.loads(f.read(header_len))
             for name, spec in header.items():
                 if name == "__metadata__":
+                    continue
+                if mtp_resident and (
+                    name.startswith("mtp.") or ".mtp." in name
+                ):
+                    # The draft head stays resident (glm5_next Lightning MTP
+                    # + offload): its slab must not be discounted here, or
+                    # admission overcommits by exactly the bytes the adapter
+                    # refuses to offload.
                     continue
                 b0, b1 = spec["data_offsets"]
                 m = _PER_EXPERT_PROJ_RE.match(name)

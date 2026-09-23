@@ -307,6 +307,8 @@ class EngineConfig:
     # case) there is no concurrent request to stay responsive to, so we burst
     # aggressively (decode_burst_budget_single_s). Once concurrent, we use the
     # tight decode_burst_budget_s to keep admission/abort latency low.
+    # A request's first generated chunk always ends the burst so buffering
+    # later decode steps does not add to its time to first token.
     # max_steps is a safety cap (bounds the host-side output list), NOT a
     # memory knob. Set both budgets <= 0, or max_steps <= 1, to disable.
     decode_burst_max_steps: int = field(
@@ -473,7 +475,8 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        prefill eviction needs the (async) callback, or the budget elapses —
+        request produces its first chunk, a prefill eviction needs the (async)
+        callback, or the budget elapses —
         the budget also ends the burst when a slow prefill-chunk step lands.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
@@ -496,6 +499,15 @@ class EngineCore:
         deadline = time.monotonic() + budget
         while len(outputs) < max_steps:
             last = outputs[-1]
+            # Also release the first chunk of a request admitted mid-burst.
+            # Comparing cumulative and new tokens covers multi-token steps
+            # without per-request tracking. Later chunks retain normal bursts.
+            if any(
+                item.new_token_ids
+                and item.completion_tokens == len(item.new_token_ids)
+                for item in last.outputs
+            ):
+                break
             if (
                 not last.has_work  # throttled/idle: stop and let the loop wait
                 or not self.scheduler.has_requests()

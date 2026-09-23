@@ -368,3 +368,24 @@ final class ServerProcessIntegrationTests: XCTestCase {
         return result == 0
     }
 }
+
+@MainActor
+final class StartupNoticeTests: XCTestCase {
+    func testNoticeUpdatesEndpointAndIsConsumedOnce() throws {
+        let runtime = PythonRuntime(
+            executable: URL(fileURLWithPath: "/usr/bin/python3"),
+            homebrewPaths: [], pythonPath: [], pythonHome: nil, isBundled: false
+        )
+        let server = ServerProcess(runtime: runtime, bindAddress: "192.168.1.10", port: 18150)
+        let services = AppServices(server: server)
+        let url = server.prepareStartupNotice()
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertNil(server.consumeStartupNotice())
+        try "Server access is now limited to this Mac".write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(server.consumeStartupNotice(), "Server access is now limited to this Mac")
+        XCTAssertEqual(server.bindAddress, "127.0.0.1")
+        XCTAssertEqual(services.config.bindAddress, "127.0.0.1")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertNil(server.consumeStartupNotice())
+    }
+}

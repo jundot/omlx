@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,53 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+
+def audio_cache_key_ranges(
+    token_ids: list[int],
+    audio_codes: mx.array,
+    audio_token_id: int,
+    image_ranges: list[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Extend image cache boundaries with cumulative audio-code identities."""
+    events = [(start, key, None) for start, key in image_ranges]
+    audio_hash = hashlib.sha256()
+    offset = 0
+    position = 0
+    while position < len(token_ids):
+        if token_ids[position] != audio_token_id:
+            position += 1
+            continue
+        start = position
+        while position < len(token_ids) and token_ids[position] == audio_token_id:
+            position += 1
+        count = position - start
+        codes = np.asarray(audio_codes[offset : offset + count], dtype=np.int32)
+        audio_hash.update(str(codes.shape).encode())
+        audio_hash.update(codes.tobytes())
+        events.append((start, None, audio_hash.hexdigest()))
+        offset += count
+    if offset != audio_codes.shape[0]:
+        raise ValueError("MiMo audio cache boundaries do not match audio codes")
+
+    ranges = []
+    image_key = ""
+    audio_key = None
+    for start, image_update, audio_update in sorted(events, key=lambda event: event[0]):
+        if image_update is not None:
+            image_key = image_update
+        if audio_update is not None:
+            audio_key = audio_update
+        key = image_key
+        if audio_key is not None:
+            key = hashlib.sha256(
+                f"mimo-audio:{image_key}:{audio_key}".encode()
+            ).hexdigest()
+        if ranges and ranges[-1][0] == start:
+            ranges[-1] = (start, key)
+        else:
+            ranges.append((start, key))
+    return ranges
 
 
 class AudioTokenizerAttention(nn.Module):

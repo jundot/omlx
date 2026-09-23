@@ -213,8 +213,9 @@ class MoEGate(nn.Module):
         self.e_score_correction_bias = mx.zeros((config.n_routed_experts,))
 
     def __call__(self, x):
+        # BF16 router logits can collapse distinct expert scores into ties.
         return group_expert_select(
-            x @ self.weight.T,
+            x.astype(mx.float32) @ self.weight.astype(mx.float32).T,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
@@ -420,6 +421,27 @@ class Model(nn.Module):
             for proj in ("gate_proj", "down_proj", "up_proj"):
                 expert0 = f"{prefix}.experts.0.{proj}.weight"
                 if expert0 not in weights:
+                    continue
+                scale0 = expert0 + "_scale"
+                if scale0 in weights:
+                    packed, scales = [], []
+                    for e in range(self.args.n_routed_experts):
+                        key = f"{prefix}.experts.{e}.{proj}.weight"
+                        weight = weights.pop(key)
+                        scale = weights.pop(key + "_scale")
+                        if (
+                            weight.dtype != mx.uint8
+                            or scale.dtype != mx.uint8
+                            or scale.shape != (weight.shape[0], weight.shape[1] // 16)
+                        ):
+                            raise ValueError(
+                                f"Invalid MiMo MXFP4 weight/scale pair: {key}"
+                            )
+                        packed.append(weight.view(mx.uint32))
+                        scales.append(scale)
+                    target = f"{prefix}.switch_mlp.{proj}"
+                    weights[f"{target}.weight"] = mx.stack(packed)
+                    weights[f"{target}.scales"] = mx.stack(scales)
                     continue
                 weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
                     [

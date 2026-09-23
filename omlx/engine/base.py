@@ -137,6 +137,19 @@ async def _run_scheduler_preflight_with_cleanup_retry(
             await asyncio.sleep(_PREFLIGHT_CLEANUP_POLL_INTERVAL_S)
             continue
 
+        # An idle scheduler has no step boundary to refresh its executor-owned
+        # MLX active-memory sample. If that stale sample is the only reason the
+        # first estimate requested eviction, re-measure once before evicting.
+        if (
+            getattr(eviction_request, "stale_usage", False) is True
+            and executor is not None
+        ):
+            refresh_usage = getattr(scheduler, "refresh_route_preflight_usage", None)
+            if callable(refresh_usage):
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(executor, refresh_usage)
+                continue
+
         # Dropping the last Request/KV references and clearing MLX's pool do
         # not make macOS phys_footprint settle atomically. Once a transient
         # rejection has observed pending cleanup, keep re-measuring for the

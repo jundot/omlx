@@ -50,6 +50,7 @@ from ..model_settings import (
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
     validate_moe_expert_offload,
+    MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
 )
 from ..patches.moe_offload_compat import moe_offload_compatibility
@@ -2491,6 +2492,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "moe_expert_offload_supported": moe_offload_supported,
+            "moe_offload_allows_mtp": (
+                (model_info.get("config_model_type") or "").replace("-", "_").lower()
+                in MOE_OFFLOAD_MTP_MODEL_TYPES
+            ),
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
@@ -3542,7 +3547,9 @@ def _validate_model_settings(entry, settings):
     from ..model_settings import validate_moe_expert_offload
 
     try:
-        validate_moe_expert_offload(settings)
+        validate_moe_expert_offload(
+            settings, model_type=getattr(entry, "config_model_type", None)
+        )
         if settings.get("moe_expert_offload_enabled"):
             from ..patches.moe_offload_compat import moe_offload_compatibility
 
@@ -3930,7 +3937,7 @@ def _feature_problem(
         return None
     if name == "moe_expert_offload":
         try:
-            validate_moe_expert_offload(snapshot)
+            validate_moe_expert_offload(snapshot, model_type=entry.config_model_type)
         except ValueError as error:
             return str(error)
         supported, reason = moe_offload_compatibility(entry.model_path)
