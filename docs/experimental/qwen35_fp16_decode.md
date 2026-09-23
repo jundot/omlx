@@ -1,20 +1,20 @@
 # Qwen3.5/3.6 FP16 decode prework
 
-`OMLX_QWEN35_FP16_GDN_DECODE=1` opts into fused Gated DeltaNet prework for
-FP16 Qwen3.5/3.6 35B-A3B models loaded through the VLM engine. It is off by
-default. Set the environment variable before starting oMLX; the patch reads it
-once when installed. Unset it or set it to `0` and restart to use the previous
-decode path.
-
-```bash
-OMLX_QWEN35_FP16_GDN_DECODE=1 omlx serve --model-dir /path/to/models
-```
+Fused Gated DeltaNet prework runs automatically for eligible FP16
+Qwen3.5/3.6 35B-A3B models loaded through the VLM engine on **Apple M1 Max**.
+There is no user setting or opt-in environment variable. Device selection runs
+once at patch installation. Other chips, including M2, retain the original
+FP16 implementation until whole-server measurements validate an expansion.
 
 This reuses the existing Metal convolution/SiLU/QK-normalization kernel at
 single-token decode. It does not requantize weights or change projections,
 forget/update gates, recurrent arithmetic, final normalization or output gating.
 Prefill is unchanged. The existing Qwen4 BF16 decode and BF16 speculative
-verification paths are independent of this switch.
+verification paths are independent of this hardware restriction.
+
+FP16 refers to the activations and convolution tensors, not to quantized weight
+bit width. A BF16 checkpoint remains on its original path; this optimization
+does not convert model precision or download a different checkpoint.
 
 The route is restricted to inference with batch 1, one token, hidden size 2048,
 16 key heads, 32 value heads, head dimensions 128, and a four-tap convolution.
@@ -42,7 +42,7 @@ whole-layer fixture uses cheap deterministic projections, so it does not replace
 validation with a real quantized checkpoint.
 
 For whole-server comparisons, use the same checkpoint and settings in separate
-processes with this flag off/on. Keep sampling, command-buffer settings,
+processes running unchanged main and this branch. Keep sampling, command-buffer settings,
 concurrency and prefix-cache state fixed. Warm both paths, alternate run order,
 and report decode throughput alongside complete response time, TTFT, prefill
 time and peak memory. Check the engagement log, repeated-prefix responses and

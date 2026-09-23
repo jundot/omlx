@@ -27,7 +27,8 @@ def restore_hooks(monkeypatch):
     monkeypatch.setattr(verifier, "_gated_delta", verifier._gated_delta)
     monkeypatch.setattr(prework, "_PATCHED", False)
     monkeypatch.setattr(prework, "_QWEN35_FP16_DECODE_ENGAGED_LOGGED", False)
-    monkeypatch.setenv("OMLX_QWEN35_FP16_GDN_DECODE", "1")
+    monkeypatch.setattr(prework, "get_mlx_device_name", lambda: "Apple M1 Max")
+    monkeypatch.delenv("OMLX_QWEN35_FP16_GDN_DECODE", raising=False)
 
 
 def _module():
@@ -242,12 +243,22 @@ def test_fp16_decode_falls_back_before_cache_mutation(monkeypatch, case):
     assert calls == []
 
 
-@pytest.mark.parametrize("flag", [None, "0", "false"])
-def test_fp16_decode_flag_is_opt_in(monkeypatch, flag):
-    if flag is None:
-        monkeypatch.delenv("OMLX_QWEN35_FP16_GDN_DECODE", raising=False)
-    else:
-        monkeypatch.setenv("OMLX_QWEN35_FP16_GDN_DECODE", flag)
+@pytest.mark.parametrize(
+    "device",
+    [
+        None,
+        "Apple M1",
+        "Apple M1 Pro",
+        "Apple M1 Ultra",
+        "Apple M2 Max",
+        "Apple M3 Max",
+        "Apple M4",
+        "Apple M5",
+        "Unknown",
+    ],
+)
+def test_fp16_decode_keeps_stock_on_unvalidated_hardware(monkeypatch, device):
+    monkeypatch.setattr(prework, "get_mlx_device_name", lambda: device)
     module = _module()
     monkeypatch.setattr(
         language.Qwen3_5GatedDeltaNet, "__call__", lambda *a, **k: "stock"
@@ -256,6 +267,24 @@ def test_fp16_decode_flag_is_opt_in(monkeypatch, flag):
     calls = _record_kernel(monkeypatch)
     assert module(mx.zeros((1, 1, 2048), dtype=mx.float16), cache=_cache()) == "stock"
     assert calls == []
+
+
+def test_fp16_decode_is_automatic_and_probes_hardware_only_at_install(monkeypatch):
+    probes = []
+
+    def device():
+        probes.append(True)
+        return "Apple M1 Max"
+
+    monkeypatch.setattr(prework, "get_mlx_device_name", device)
+    module, cache = _module(), _cache()
+    assert prework.apply_qwen35_gdn_prework_patch()
+    calls = _record_kernel(monkeypatch)
+    for _ in range(3):
+        result = module(mx.zeros((1, 1, 2048), dtype=mx.float16), cache=cache)
+        mx.eval(result, cache.state)
+    assert len(calls) == 3
+    assert probes == [True]
 
 
 @pytest.mark.parametrize(

@@ -19,7 +19,7 @@ multiply's rounding — the composed chain's two casts.
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
-The opt-in ``OMLX_QWEN35_FP16_GDN_DECODE=1`` route also reuses this kernel
+On the validated Apple M1 Max, this kernel also runs automatically
 for ordinary FP16 B1/T1 decode with the Qwen3.5/3.6 35B-A3B geometry. Gates,
 recurrence, final norm and projections remain unchanged. Other Qwen3.5
 decode shapes and prefill keep the stock path. Qwen4 has its separate
@@ -29,10 +29,11 @@ BF16 decode prework and norm-gate kernels below.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 
 import mlx.core as mx
+
+from omlx.utils.hardware import get_mlx_device_name
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
@@ -672,9 +673,10 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls = q35.Qwen3_5GatedDeltaNet
     original = cls.__call__
     original_verify = Qwen3_5BatchInvariantForward._gated_delta
-    # Read once at installation, rather than per layer and token. The
-    # existing Qwen4 and speculative routes do not depend on this flag.
-    fp16_decode = os.environ.get("OMLX_QWEN35_FP16_GDN_DECODE", "0") == "1"
+    # Select once at installation, not per layer/token. Broader chip support
+    # needs whole-server measurements; other Apple GPUs keep stock FP16 decode.
+    # The existing Qwen4 and speculative routes are independent of this gate.
+    fp16_decode = get_mlx_device_name() == "Apple M1 Max"
     if fp16_decode:
         q_scale_fp16 = mx.array(128**-1, dtype=mx.float16)
         k_scale_fp16 = mx.array(128**-0.5, dtype=mx.float16)
