@@ -32,9 +32,9 @@ import logging
 import sys
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from omlx.utils.hardware import get_mlx_device_name
-import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
