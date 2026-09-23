@@ -6513,7 +6513,6 @@ def _build_active_models_data() -> dict:
         collector_request_ids: set = set()
         active_request_ids: set = set()
         activity_requests = 0
-        progress_model_id = model_id
         entry = engine_pool._entries.get(model_id)
         if entry and entry.engine is not None:
             sched = None
@@ -6536,13 +6535,6 @@ def _build_active_models_data() -> dict:
                 # scheduler once their fallback engine is active.
                 sched = getattr(entry.engine, "scheduler", None)
             if sched is not None and hasattr(sched, "snapshot_for_admin"):
-                # Precision-specific cache namespaces are also used by the
-                # scheduler's progress tracker; the public model ID stays put.
-                scheduler_name = getattr(
-                    getattr(sched, "config", None), "model_name", None
-                )
-                if isinstance(scheduler_name, str) and scheduler_name:
-                    progress_model_id = scheduler_name
                 snap = sched.snapshot_for_admin()
                 has_scheduler_snapshot = True
                 running_by_id = snap["running_by_id"]
@@ -6588,7 +6580,7 @@ def _build_active_models_data() -> dict:
             else None
         )
 
-        prefilling = tracker.get_model_progress(progress_model_id)
+        prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
             active_request_ids = set(running_by_id) | prefilling_ids

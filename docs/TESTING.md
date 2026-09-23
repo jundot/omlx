@@ -161,8 +161,8 @@ tests/test_vlm_engine.py tests/test_vlm_cache_boundaries.py`.
 The pinned mlx-vlm loader owns schema-2 Prism model loading and processors.
 oMLX applies its runtime changes after native VLM loading; there is no duplicate
 checkpoint loader or copied Hadamard implementation. Tiny native checkpoints
-verify unchanged stored weights, default logits, FP16 activation/KV boundaries,
-FP32 recurrent state, tied embeddings and isolation from other model types.
+verify unchanged stored weights, logits, native FP32 precision and isolation
+from other model types, including when the retired FP16 experiment flag is set.
 Decoder tests compare logits and used cache contents with upstream across
 single-row decode, padding, multiple rows, prefill and capture options.
 
@@ -170,12 +170,9 @@ For a real-checkpoint check, serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`
 through the VLM engine with a separate base path and port. Check text, vision,
 reordered image reuse, concurrent requests and at least 192 generated tokens.
 Repeat a prompt longer than the scheduler's 4096-token Prism block floor and
-verify the answer and nonzero prefix reuse. Repeat with
-`OMLX_PRISM_FP16_ACTIVATIONS=1`. The opt-in activation mode must use
-`:prism_fp16_v2` in the scheduler cache namespace while retaining the public
-model ID in dashboard progress. It must not reuse FP32 states or the older
-custom-loader adapter's `:prism_fp16_v1` states. Assess FP16 task outputs
-separately; it changes rounding and is not a bit-exact precision mode.
+verify the answer and nonzero prefix reuse. Model precision and the scheduler's
+prefix-cache namespace must remain identical to unchanged main. This patch has
+no activation-conversion option or precision-specific dashboard changes.
 
 For performance measurements, exercise the actual serving transition. oMLX
 already keeps regular `KVCache` for standalone requests; a direct
@@ -208,7 +205,8 @@ tokens/sec; the complete overlapping reply takes 22.37 versus 16.81 seconds.
 Standalone tail throughput is 18.55 versus 18.51 tokens/sec. All retained output
 token IDs and text match. Peak MLX allocation is 21.06 GiB in both arms, including
 load and warmup; this is not a measured peak-memory reduction or a broad quality
-evaluation. The optional FP16 activation path is outside this comparison.
+evaluation. The earlier optional FP16 activation experiment has been removed
+from this PR; this comparison always used native FP32.
 
 The cache ownership behavior originates in mlx-vlm's Qwen3.5 singleton path.
 An upstream dependency fix can replace the scoped runtime patch; these results

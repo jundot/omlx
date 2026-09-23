@@ -10,17 +10,12 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
-from mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35 import (
-    HadamardQuantizedEmbedding,
-    HadamardQuantizedLinear,
-)
 from mlx_vlm.models.qwen3_5 import Model, ModelConfig
 from mlx_vlm.models.qwen3_5.language import Qwen3_5Model
 from mlx_vlm.utils import load_model
 
 from omlx.patches.prism_hadamard import (
     MODEL_TYPE,
-    _enable_fp16_activations,
     apply_runtime_patches,
 )
 from omlx.patches.prism_hadamard.decode import CapacityPreservingModel
@@ -98,9 +93,15 @@ def native_pack(tmp_path):
     return tmp_path
 
 
-@pytest.mark.parametrize("fp16", [False, True])
-def test_native_load_and_runtime_patch_preserve_weights(native_pack, monkeypatch, fp16):
-    monkeypatch.setenv("OMLX_PRISM_FP16_ACTIVATIONS", str(int(fp16)))
+@pytest.mark.parametrize("legacy_flag", [None, "1"])
+def test_native_load_and_runtime_patch_preserve_weights(
+    native_pack, monkeypatch, legacy_flag
+):
+    # The retired experimental setting must not change native precision.
+    if legacy_flag is None:
+        monkeypatch.delenv("OMLX_PRISM_FP16_ACTIVATIONS", raising=False)
+    else:
+        monkeypatch.setenv("OMLX_PRISM_FP16_ACTIVATIONS", legacy_flag)
     # The former custom loader must no longer intercept native pack loading.
     assert maybe_load_custom_quantization(str(native_pack), is_vlm=True) is None
     model = load_model(native_pack, strict=True)
@@ -121,42 +122,14 @@ def test_native_load_and_runtime_patch_preserve_weights(native_pack, monkeypatch
     logits = lm.lm_head(hidden)
     mx.eval(logits, [c.state for c in cache])
     assert mx.all(mx.isfinite(logits)).item()
-    if fp16:
-        assert hidden.dtype == mx.float16
-        assert cache[0][1].dtype == mx.float32
-        assert model._omlx_prism_activation_signature == "prism_fp16_v2"
-        assert cache[lm.model.fa_idx].keys.dtype == mx.float16
-    else:
-        assert not hasattr(model, "_omlx_prism_activation_signature")
-        expected = reference.language_model(
-            inputs, cache=reference.language_model.make_cache()
-        ).logits
-        np.testing.assert_array_equal(np.asarray(logits), np.asarray(expected))
-
-
-@pytest.mark.parametrize("embedding", [False, True])
-@pytest.mark.parametrize("block", [0, 512])
-def test_native_transform_and_tied_embedding_output_are_preserved(embedding, block):
-    cls = HadamardQuantizedEmbedding if embedding else HadamardQuantizedLinear
-    module = cls(512, 4, block)
-    arrays = mx.quantize(mx.random.normal((4, 512)), group_size=128, bits=2)
-    module.weight, module.scales, module.biases = arrays
-    reference = copy.deepcopy(module)
-    _enable_fp16_activations(module)
-    inputs = mx.random.normal((1, 512))
-    if embedding:
-        ids = mx.array([[1, 3]])
-        np.testing.assert_array_equal(
-            np.asarray(module(ids)), np.asarray(reference(ids))
-        )
-        actual = module.as_linear(inputs)
-        expected = reference.as_linear(inputs.astype(mx.float16)).astype(mx.float16)
-    else:
-        actual = module(inputs)
-        expected = reference(inputs.astype(mx.float16)).astype(mx.float16)
-    assert actual.dtype == mx.float16
-    assert module.scales.dtype == mx.float32
-    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    assert not hasattr(model, "_omlx_prism_activation_signature")
+    assert hidden.dtype == mx.float32
+    assert cache[0][1].dtype == mx.float32
+    assert cache[lm.model.fa_idx].keys.dtype == mx.float32
+    expected = reference.language_model(
+        inputs, cache=reference.language_model.make_cache()
+    ).logits
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(expected))
 
 
 def test_other_models_and_decoder_subclasses_are_unchanged(monkeypatch):
