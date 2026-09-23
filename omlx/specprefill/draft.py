@@ -65,8 +65,12 @@ def run_specprefill_draft_scoring(
         draft_cached_tokens = 0
         if draft_prefix_cache is not None:
             try:
+                # Look up without the last token: score_tokens needs a
+                # forward pass over it for the lookahead logits, and a cache
+                # that already holds it cannot provide one. A hit cannot
+                # exceed the tokens queried, so it stops short of the end.
                 block_table, _draft_remaining = draft_prefix_cache.fetch_cache(
-                    request.request_id, tokens_to_score
+                    request.request_id, tokens_to_score[:-1]
                 )
                 if block_table and block_table.num_tokens > 0:
                     draft_prefix_cache.preload_blocks(block_table)

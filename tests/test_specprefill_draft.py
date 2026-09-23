@@ -221,7 +221,10 @@ def test_reconstructed_cache_is_scored_and_stored():
     )
 
     assert trace["score_calls"][0]["existing_cache"] is reconstructed_cache
-    assert draft_cache.fetches == [(request.request_id, list(plan.tokens_to_score))]
+    # The lookup leaves the last token out; the store still covers all of it.
+    assert draft_cache.fetches == [
+        (request.request_id, list(plan.tokens_to_score[:-1]))
+    ]
     assert draft_cache.preloads == [block_table]
     assert draft_cache.reconstructions == [block_table]
     assert draft_cache.stores == [

@@ -462,6 +462,56 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
+def _cache_leaves(cache: list[Any]) -> list[Any]:
+    """Leaf caches of *cache*, descending into composites such as CacheList."""
+    leaves: list[Any] = []
+    for entry in cache:
+        subs = getattr(entry, "caches", None)
+        if isinstance(subs, (list, tuple)):
+            leaves.extend(_cache_leaves(list(subs)))
+        else:
+            leaves.append(entry)
+    return leaves
+
+
+def _is_sliceable_kv(leaf: Any) -> bool:
+    """Whether *leaf* is an unbounded KV cache the lookahead trim can slice back."""
+    return hasattr(leaf, "keys") and not _cache_entry_is_bounded(leaf)
+
+
+def _hold_leaf_state(leaf: Any) -> dict[str, Any]:
+    """Copy of *leaf*'s attributes that survives later in-place updates.
+
+    Containers are rebuilt and arrays copied: ArraysCache writes into its
+    ``cache`` list, and RotatingKVCache slice-assigns into ``keys``, which
+    rebinds the array a held reference points at.
+    """
+    from mlx.utils import tree_map
+
+    return tree_map(
+        lambda v: mx.array(v) if isinstance(v, mx.array) else v, dict(vars(leaf))
+    )
+
+
+def _undo_lookahead(
+    leaves: list[Any], held_states: list[Any], pre_lookahead_offset: int
+) -> None:
+    """Return *leaves* to their state before the lookahead decode.
+
+    Unbounded KV caches store keys/values as contiguous tensors, so slicing
+    back to ``pre_lookahead_offset`` removes the lookahead entries. Every
+    other leaf gets the attributes held by ``_hold_leaf_state`` back.
+    """
+    for leaf, held in zip(leaves, held_states):
+        if held is not None:
+            vars(leaf).update(held)
+        elif getattr(leaf, "offset", 0) > pre_lookahead_offset:
+            if leaf.keys is not None:
+                leaf.keys = leaf.keys[..., :pre_lookahead_offset, :]
+                leaf.values = leaf.values[..., :pre_lookahead_offset, :]
+            leaf.offset = pre_lookahead_offset
+
+
 def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None):
     """Prefill draft model with all prompt tokens. Returns last logits."""
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
@@ -623,26 +673,30 @@ def score_tokens(
     # Phase 1: Prefill (full or suffix-only if cache provided)
     if existing_cache is not None:
         cache = existing_cache
-        # Clamped: a cache reporting more than the prompt would otherwise take
-        # the exact-hit branch below against state that is not this prompt.
-        cached_len = min(_logical_cache_offset(model, cache), n_prompt)
-        suffix = tokens[cached_len:]
-        if suffix:
-            logits = _prefill_draft(
-                model,
-                suffix,
-                cache,
-                step_size=prefill_step_size,
-                progress_callback=(
-                    (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
-                    if progress_callback is not None
-                    else None
-                ),
+        cached_len = _logical_cache_offset(model, cache)
+        # The lookahead starts from the logits at the last prompt position,
+        # which only a forward pass over that token yields. A cache that
+        # already holds it cannot give them back: feeding the token again
+        # attends to it twice and advances recurrent state past the prompt,
+        # and trimming afterwards restores neither the logits nor the state.
+        # The caller has to restore at most N-1 tokens.
+        if cached_len >= n_prompt:
+            raise ValueError(
+                f"existing_cache holds {cached_len} tokens but the prompt has "
+                f"{n_prompt}; leave at least the last prompt token uncached"
             )
-        else:
-            # Exact cache hit — run last token to get logits
-            logits = model(mx.array([tokens[-1]])[None], cache=cache)
-            mx.eval(logits)
+        suffix = tokens[cached_len:]
+        logits = _prefill_draft(
+            model,
+            suffix,
+            cache,
+            step_size=prefill_step_size,
+            progress_callback=(
+                (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
+                if progress_callback is not None
+                else None
+            ),
+        )
     else:
         cache = make_prompt_cache(model)
         logits = _prefill_draft(
@@ -660,14 +714,23 @@ def score_tokens(
     # Record cache offset before lookahead so we can trim afterwards.
     # Lookahead decode appends n_lookahead+1 tokens to the cache which
     # must NOT be persisted when the caller stores the cache to SSD.
-    # Clamped to n_prompt, which is what the cache must hold once scoring is
-    # done: on an exact hit the branch above ran one token to get logits, so
-    # the cache is a token longer than the prompt and the trim below has to
-    # remove it. This is what the old ``else n_prompt`` fallback meant.
     try:
-        pre_lookahead_offset = min(_logical_cache_offset(model, cache), n_prompt)
+        pre_lookahead_offset = _logical_cache_offset(model, cache)
     except IndeterminateCacheOffsetError:
         pre_lookahead_offset = n_prompt
+
+    # The lookahead below advances every layer, and the cache returned here
+    # is the one the caller stores as this prompt's. Unbounded attention KV
+    # is sliced back afterwards. Every other leaf -- recurrent state such as
+    # ArraysCache, a bounded RotatingKVCache whose window has wrapped, a
+    # sub-cache of a CacheList -- cannot be, so its attributes are held here
+    # and put back on the same object, or it would describe the prompt plus
+    # the lookahead tokens.
+    leaves = _cache_leaves(cache)
+    held_states = [
+        None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf)
+        for leaf in leaves
+    ]
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -697,16 +760,7 @@ def score_tokens(
     if progress_callback is not None:
         progress_callback(n_prompt, n_prompt, "importance")
 
-    # Trim lookahead tokens from cache before returning.
-    # KVCache stores keys/values as contiguous tensors; slicing back
-    # to pre_lookahead_offset removes the lookahead-generated entries.
-    for c in cache:
-        if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
-            trim = c.offset - pre_lookahead_offset
-            if hasattr(c, "keys") and c.keys is not None:
-                c.keys = c.keys[..., :pre_lookahead_offset, :]
-                c.values = c.values[..., :pre_lookahead_offset, :]
-            c.offset = pre_lookahead_offset
+    _undo_lookahead(leaves, held_states, pre_lookahead_offset)
 
     del logits, query_buffer, attn_caches
     mx.clear_cache()
