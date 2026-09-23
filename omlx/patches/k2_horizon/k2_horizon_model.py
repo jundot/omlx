@@ -58,6 +58,7 @@ class ModelArgs(BaseModelArgs):
     sliding_window: int | None = None
     tie_word_embeddings: bool = False
     max_position_embeddings: int = 524288
+    quantization: dict[str, Any] | None = None
 
     def __post_init__(self):
         self.rope_parameters = dict(self.rope_parameters)
@@ -461,6 +462,13 @@ class Model(nn.Module):
             if not self.args.is_sparse_layer(layer_idx):
                 continue
             prefix = f"model.layers.{layer_idx}"
+            # mlx-lm conversions store the stacked experts as switch_mlp.
+            for key in [
+                k for k in weights if k.startswith(f"{prefix}.mlp.switch_mlp.")
+            ]:
+                _rename(weights, key, key.replace(".switch_mlp.", ".experts.", 1))
+            for router in ("mlp.gate", "self_attn.v_router"):
+                self._dequantize_router(weights, f"{prefix}.{router}")
             for name in ("gate_proj", "up_proj", "down_proj"):
                 _stack_experts(
                     weights,
@@ -486,6 +494,25 @@ class Model(nn.Module):
                 f"{prefix}.self_attn.v_expert_bias",
             )
         return weights
+
+    def _dequantize_router(self, weights: dict[str, mx.array], path: str) -> None:
+        """Restore a router that a generic conversion quantized to BF16."""
+        scales = weights.pop(f"{path}.scales", None)
+        if scales is None:
+            return
+        if self.args.quantization is None:
+            raise ValueError(f"{path} is quantized but the config has no quantization")
+        # Drop the per-layer entry so the loader keeps a BF16 nn.Linear.
+        spec = self.args.quantization.pop(path, self.args.quantization)
+        weights[f"{path}.weight"] = mx.dequantize(
+            weights[f"{path}.weight"],
+            scales,
+            weights.pop(f"{path}.biases", None),
+            group_size=spec["group_size"],
+            bits=spec["bits"],
+            mode=spec.get("mode", "affine"),
+            dtype=mx.bfloat16,
+        )
 
     @property
     def layers(self):

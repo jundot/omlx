@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
 from omlx.patches.k2_horizon import apply_k2_horizon_patch
 from omlx.patches.k2_horizon.k2_horizon_model import GroupedRMSNorm, Model, ModelArgs
@@ -122,6 +123,63 @@ def test_indexed_checkpoint_roundtrip(tmp_path, quantized):
     (tmp_path / shard).unlink()
     with pytest.raises(FileNotFoundError, match="Missing K2 checkpoint shard"):
         utils.load_model(tmp_path)
+
+
+def test_switch_mlp_checkpoint_with_quantized_routers(tmp_path):
+    """Load the mlx-lm convert layout: switch_mlp experts and quantized routers."""
+    import json
+
+    from mlx.utils import tree_flatten
+    from mlx_lm import utils
+
+    apply_k2_horizon_patch()
+    config = small_config(
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        moe_intermediate_size=64,
+        mova_num_experts=4,
+        mova_num_experts_per_tok=2,
+        attention_gate_func="softplus",
+    )
+    model = Model(ModelArgs.from_dict(config))
+    model.set_dtype(mx.bfloat16)
+    wide = "model.layers.1.self_attn.v_router"
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, module: (
+            {"group_size": 32, "bits": 8, "mode": "affine"}
+            if path == wide
+            else hasattr(module, "to_quantized")
+        ),
+    )
+    config["quantization"] = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "affine",
+        wide: {"group_size": 32, "bits": 8, "mode": "affine"},
+    }
+    weights = {
+        key.replace(".mlp.experts.", ".mlp.switch_mlp."): value
+        for key, value in tree_flatten(model.parameters())
+    }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    restored, _ = utils.load_model(tmp_path)
+    for layer in restored.layers:
+        for router in (layer.mlp.gate, layer.self_attn.v_router):
+            assert not isinstance(router, nn.QuantizedLinear)
+            assert router.weight.dtype == mx.bfloat16
+    source = model.layers[1].self_attn.v_router
+    expected = mx.dequantize(
+        source.weight, source.scales, source.biases, group_size=32, bits=8
+    )
+    assert mx.array_equal(restored.layers[1].self_attn.v_router.weight, expected).item()
+    assert isinstance(restored.layers[0].mlp.experts.gate_proj, QuantizedSwitchLinear)
+    assert mx.all(mx.isfinite(restored(mx.array([[1, 2, 3]])))).item()
 
 
 def test_mova_router_preserves_source_partition_rounding():
