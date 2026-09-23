@@ -200,6 +200,112 @@ def test_flatten_images_drops_empty_slots_of_a_nested_batch():
     assert _flatten_images("a") == ["a"]
 
 
+def _load_compat_module_for_posids_test(monkeypatch, model_module):
+    """Install a fake mlx_embeddings package and load a fresh compat module over it."""
+    qwen3_vl_package = types.ModuleType("mlx_embeddings.models.qwen3_vl")
+    qwen3_vl_package.model = model_module
+
+    _install_fake_module(
+        monkeypatch, "mlx_embeddings", types.ModuleType("mlx_embeddings")
+    )
+    _install_fake_module(
+        monkeypatch, "mlx_embeddings.models", types.ModuleType("mlx_embeddings.models")
+    )
+    _install_fake_module(
+        monkeypatch, "mlx_embeddings.models.qwen3_vl", qwen3_vl_package
+    )
+
+    module_path = (
+        Path(__file__).resolve().parents[1] / "omlx/models/mlx_embeddings_compat.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "omlx.models.mlx_embeddings_compat_under_test_posids", module_path
+    )
+    compat = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compat)
+    monkeypatch.setattr(compat, "_QWEN3_VL_POSIDS_PATCHED", False)
+    return compat
+
+
+def _fake_qwen3_vl_model_module(calls):
+    """Stand-in for mlx_embeddings.models.qwen3_vl.model reproducing the #3731 crash.
+
+    The 3-index re-slice of a cached 2-D position-id array raises the same
+    "Too many indices for array with 2 dimensions" as mx.array indexing.
+    """
+
+    class LanguageModel:
+        def __init__(self):
+            self._position_ids = None
+
+    class Model:
+        def __init__(self):
+            self.language_model = LanguageModel()
+
+    def compute_qwen3_vl_hidden_states(
+        model,
+        input_ids,
+        position_ids=None,
+        **kwargs,
+    ):
+        del kwargs
+        if position_ids is None:
+            if model.language_model._position_ids is not None:
+                position_ids = model.language_model._position_ids[
+                    :, :, : len(input_ids)
+                ]
+            else:
+                position_ids = "recomputed"
+            model.language_model._position_ids = position_ids
+        calls.append(position_ids)
+        return position_ids
+
+    module = types.ModuleType("mlx_embeddings.models.qwen3_vl.model")
+    module.Model = Model
+    module.compute_qwen3_vl_hidden_states = compute_qwen3_vl_hidden_states
+    return module
+
+
+def test_qwen3_vl_posids_patch_recomputes_after_2d_cache(monkeypatch):
+    """A cached 2-D position-id array must not be re-sliced as 3-D (#3731)."""
+    calls = []
+    model_module = _fake_qwen3_vl_model_module(calls)
+    compat = _load_compat_module_for_posids_test(monkeypatch, model_module)
+
+    compat.patch_qwen3_vl_position_ids_recompute()
+    model = model_module.Model()
+
+    # First request populates the cache with a 2-D array, as mlx-vlm's
+    # get_rope_index now returns for text-only inputs.
+    model.language_model._position_ids = [[0, 1, 2]]
+    model_module.compute_qwen3_vl_hidden_states(model, [0, 1, 2])
+    # The next request previously crashed on the stale 3-D re-slice.
+    model_module.compute_qwen3_vl_hidden_states(model, [0, 1])
+
+    assert calls == ["recomputed", "recomputed"]
+
+
+def test_qwen3_vl_posids_patch_is_idempotent_and_keeps_explicit_position_ids(
+    monkeypatch,
+):
+    """The wrapper must survive repeat patching and pass explicit position_ids through."""
+    calls = []
+    model_module = _fake_qwen3_vl_model_module(calls)
+    compat = _load_compat_module_for_posids_test(monkeypatch, model_module)
+
+    original = model_module.compute_qwen3_vl_hidden_states
+    compat.patch_qwen3_vl_position_ids_recompute()
+    first = model_module.compute_qwen3_vl_hidden_states
+    compat.patch_qwen3_vl_position_ids_recompute()
+
+    assert first is not original
+    assert model_module.compute_qwen3_vl_hidden_states is first
+
+    model = model_module.Model()
+    model_module.compute_qwen3_vl_hidden_states(model, [0, 1], position_ids="explicit")
+    assert calls == ["explicit"]
+
+
 def test_contract_compliant_processor_loads_images_before_the_torch_free_port():
     """A data URI must arrive as an image, since the port only knows file paths."""
     seen = {}
