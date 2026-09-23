@@ -3556,6 +3556,18 @@ def _validate_model_settings(entry, settings):
             supported, reason = moe_offload_compatibility(entry.model_path)
             if not supported:
                 raise ValueError(reason)
+            from ..patches.moe_expert_offload import moe_offload_memory_check
+
+            refusal = moe_offload_memory_check(
+                entry.model_path,
+                float(
+                    settings.get("moe_expert_offload_resident_fraction")
+                    or 0.25
+                ),
+                mtp_resident=bool(settings.get("mtp_enabled")),
+            )
+            if refusal:
+                raise ValueError(refusal)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -3941,7 +3953,15 @@ def _feature_problem(
         except ValueError as error:
             return str(error)
         supported, reason = moe_offload_compatibility(entry.model_path)
-        return None if supported else (reason or "not supported for this model")
+        if not supported:
+            return reason or "not supported for this model"
+        from ..patches.moe_expert_offload import moe_offload_memory_check
+
+        return moe_offload_memory_check(
+            entry.model_path,
+            float(snapshot.get("moe_expert_offload_resident_fraction") or 0.25),
+            mtp_resident=bool(snapshot.get("mtp_enabled")),
+        )
     return None
 
 

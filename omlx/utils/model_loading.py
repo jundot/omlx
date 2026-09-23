@@ -509,6 +509,21 @@ def maybe_apply_pre_load_patches(
         if not supported:
             raise ValueError(reason)
 
+        from ..patches.moe_expert_offload import moe_offload_memory_check
+
+        refusal = moe_offload_memory_check(
+            model_name,
+            float(
+                getattr(
+                    model_settings, "moe_expert_offload_resident_fraction", 0.25
+                )
+                or 0.25
+            ),
+            mtp_resident=bool(getattr(model_settings, "mtp_enabled", False)),
+        )
+        if refusal:
+            raise ValueError(refusal)
+
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.

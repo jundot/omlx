@@ -926,6 +926,12 @@ def apply_moe_expert_offload(
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
         return 0
 
+    refusal = moe_offload_memory_check(
+        model_dir, resident_fraction, mtp_resident=mtp_resident
+    )
+    if refusal is not None:
+        raise ValueError(refusal)
+
     # GLM DSA blocks have their own adapter (fused gate/up, native weighted
     # sum); it shares this store format and the same wrap-before-materialize
     # contract, so the engine sees one count. DeepSeek V4 / glm5_next blocks
@@ -1097,6 +1103,103 @@ def estimate_offload_admission_bytes(
     except Exception:
         logger.debug("offload admission estimate failed", exc_info=True)
         return full_size
+
+
+def moe_offload_resident_estimate(
+    model_path: str | Path,
+    resident_fraction: float,
+    *,
+    mtp_resident: bool = False,
+) -> int | None:
+    """Bytes the checkpoint would hold resident at ``resident_fraction``.
+
+    Non-expert tensors plus the per-layer expert slots — the same arithmetic
+    ``apply_moe_expert_offload`` delivers. ``None`` when the checkpoint
+    cannot be inspected; callers should treat that as "unknown", not "fits".
+    """
+    try:
+        model_dir = _resolve_model_dir(model_path)
+        if model_dir is None:
+            return None
+        config_path = Path(model_dir) / "config.json"
+        kind = (
+            json.loads(config_path.read_text()).get("model_type")
+            if config_path.exists()
+            else None
+        )
+        full = sum(
+            f.stat().st_size for f in Path(model_dir).glob("*.safetensors")
+        )
+        if not full:
+            return None
+        if kind == "deepseek_v41":
+            # Its adapter owns the savings estimate (same split the engine
+            # pool uses at admission).
+            from .deepseek_v41.moe_offload import estimate_expert_savings
+
+            return max(
+                0,
+                full
+                - estimate_expert_savings(
+                    model_dir, resident_fraction, mtp_resident=mtp_resident
+                ),
+            )
+        return estimate_offload_admission_bytes(
+            model_dir, full, resident_fraction, mtp_resident=mtp_resident
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _moe_offload_memory_limit() -> int:
+    """Byte budget for the offload resident set on this machine.
+
+    Defaults to 75% of Metal's recommended working set: the estimate covers
+    weights only, so the remainder is left for activations, KV cache, vision
+    towers and in-flight expert reads. Measured overheads over the estimate:
+    ~2 GiB on MiMo at fraction 0.125, >7 GiB on a glm5_next VLM — the margin
+    has to cover the latter, not the former. ``OMLX_MOE_OFFLOAD_MEM_LIMIT_GB``
+    overrides the limit; ``0`` disables the guard for setups the static
+    ceiling misjudges.
+    """
+    raw = os.environ.get("OMLX_MOE_OFFLOAD_MEM_LIMIT_GB")
+    if raw is not None:
+        try:
+            return int(float(raw) * 2**30)
+        except ValueError:
+            pass
+    return int(
+        (mx.device_info().get("max_recommended_working_set_size") or 0) * 0.75
+    )
+
+
+def moe_offload_memory_check(
+    model_path: str | Path,
+    resident_fraction: float,
+    *,
+    mtp_resident: bool = False,
+) -> str | None:
+    """Refusal reason when the resident set would not fit, else ``None``.
+
+    Lets the settings surface reject a fraction that could only ever end in
+    a Metal out-of-memory error at first request — the resident set is fixed
+    at load, so there is no way a load that starts over-budget recovers.
+    """
+    limit = _moe_offload_memory_limit()
+    if limit <= 0:
+        return None
+    estimate = moe_offload_resident_estimate(
+        model_path, resident_fraction, mtp_resident=mtp_resident
+    )
+    if estimate is None or estimate <= limit:
+        return None
+    return (
+        f"MoE expert offload would keep ~{estimate / 2**30:.1f} GiB resident "
+        f"at {resident_fraction:g} residency, but only "
+        f"~{limit / 2**30:.1f} GiB of GPU memory is budgeted for resident "
+        "weights on this machine. Lower "
+        "moe_expert_offload_resident_fraction or free memory first."
+    )
 
 
 def materialize_offload_state(model) -> int:

@@ -993,3 +993,70 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
         assert len(cache.slot_of) <= 64
     if length > 1:
         assert cache.misses > cache.capacity
+
+
+class TestMemoryGuard:
+    """Resident-set admission check: refuse fractions that cannot fit."""
+
+    def _fixture(self, tmp_path):
+        glu = _make_glu()
+        _save_checkpoint(
+            tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu")
+        )
+        return glu
+
+    def test_estimate_below_checkpoint_bytes(self, tmp_path):
+        from omlx.patches.moe_expert_offload import moe_offload_resident_estimate
+
+        self._fixture(tmp_path)
+        full = sum(f.stat().st_size for f in tmp_path.glob("*.safetensors"))
+        est = moe_offload_resident_estimate(tmp_path, 0.25)
+        assert est is not None and 0 < est < full
+        # fraction 1.0 keeps every expert: nothing is discounted.
+        assert moe_offload_resident_estimate(tmp_path, 1.0) == full
+
+    def test_check_passes_when_estimate_fits(self, tmp_path, monkeypatch):
+        from omlx.patches.moe_expert_offload import moe_offload_memory_check
+
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_MEM_LIMIT_GB", "1024")
+        self._fixture(tmp_path)
+        assert moe_offload_memory_check(tmp_path, 0.25) is None
+
+    def test_check_refuses_when_over_limit(self, tmp_path, monkeypatch):
+        import omlx.patches.moe_expert_offload as off
+
+        self._fixture(tmp_path)
+        est = off.moe_offload_resident_estimate(tmp_path, 0.25)
+        monkeypatch.setattr(off, "_moe_offload_memory_limit", lambda: est - 1)
+        reason = off.moe_offload_memory_check(tmp_path, 0.25)
+        assert reason is not None and "GiB" in reason
+
+    def test_check_boundary_admits_exact_fit(self, tmp_path, monkeypatch):
+        import omlx.patches.moe_expert_offload as off
+
+        self._fixture(tmp_path)
+        est = off.moe_offload_resident_estimate(tmp_path, 0.25)
+        monkeypatch.setattr(off, "_moe_offload_memory_limit", lambda: est)
+        assert off.moe_offload_memory_check(tmp_path, 0.25) is None
+
+    def test_guard_disabled_with_zero(self, tmp_path, monkeypatch):
+        from omlx.patches.moe_expert_offload import moe_offload_memory_check
+
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_MEM_LIMIT_GB", "0")
+        self._fixture(tmp_path)
+        assert moe_offload_memory_check(tmp_path, 0.25) is None
+
+    def test_apply_raises_instead_of_wrapping(self, tmp_path, monkeypatch):
+        import omlx.patches.moe_expert_offload as off
+
+        glu = self._fixture(tmp_path)
+        monkeypatch.setattr(off, "_moe_offload_memory_limit", lambda: 1)
+        model = _MiniMoE([glu])
+        with pytest.raises(ValueError, match="resident"):
+            apply_moe_expert_offload(model, tmp_path, 0.25)
+        # The refusal must leave the module untouched.
+        assert not getattr(
+            getattr(model.layers[0].experts.switch_glu, "cache", None),
+            "moe_offload_cache",
+            False,
+        )
