@@ -4,6 +4,7 @@
 import importlib
 import json
 import sys
+import types
 
 import mlx.core as mx
 import pytest
@@ -76,6 +77,24 @@ def test_apply_is_idempotent():
     assert is_applied() is True
     assert second is False
     assert first in (True, False)
+
+
+def test_apply_replaces_upstream_module(monkeypatch):
+    import mlx_lm.models as models_pkg
+
+    import omlx.patches.mimo_v2 as patch
+
+    upstream = types.ModuleType("mlx_lm.models.mimo_v2")
+    upstream.__file__ = "/tmp/upstream/mlx_lm/models/mimo_v2.py"
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.mimo_v2", upstream)
+    monkeypatch.setattr(models_pkg, "mimo_v2", upstream, raising=False)
+    monkeypatch.setattr(patch, "_APPLIED", False)
+
+    assert patch.apply_mimo_v2_patch() is True
+    registered = sys.modules["mlx_lm.models.mimo_v2"]
+    assert registered is not upstream
+    assert registered.__file__.endswith("omlx/patches/mimo_v2/mimo_v2_model.py")
+    assert models_pkg.mimo_v2 is registered
 
 
 def test_get_classes_resolves_mimo_v2():
