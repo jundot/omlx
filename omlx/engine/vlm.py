@@ -594,19 +594,23 @@ def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
 
 
 def _has_audio_weights(model_dir: Path) -> bool:
-    """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
+    """Return True iff checkpoint shards or MiMo's sidecar contain audio weights."""
     import safetensors
 
     weight_files = list(model_dir.glob("*.safetensors"))
     sidecar = _resolve_optiq_vision_sidecar(model_dir)
     if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
         weight_files.append(sidecar)
+    mimo_audio_sidecar = model_dir / "omnimodal" / "audio_encoder.safetensors"
+    if mimo_audio_sidecar.is_file():
+        weight_files.append(mimo_audio_sidecar)
 
     for sf in weight_files:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
-                for k in f.keys():
-                    if k.startswith(("audio_tower.", "embed_audio.")):
+                # safetensors.safe_open exposes keys() but is not a Mapping.
+                for k in f.keys():  # noqa: SIM118
+                    if k.startswith(("audio_tower.", "embed_audio.", "audio_encoder.")):
                         return True
         except Exception:
             # Corrupt or unreadable shard — treat as no audio info, let
@@ -4380,7 +4384,11 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, images, _ = extract_images_from_messages(messages)
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+        text_messages, images, _ = extract_images_from_messages(media_messages)
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
@@ -5088,10 +5096,14 @@ class VLMBatchedEngine(BaseEngine):
         For VLM messages with images, this counts only the text tokens.
         Image tokens are added during vision encoding and vary by model.
         """
-        # Extract text-only version for token counting
-        from ..utils.image import extract_images_from_messages
-
-        text_messages, _, _ = extract_images_from_messages(messages)
+        # Extract text-only version for token counting. MiMo videos must be
+        # sampled first; otherwise the generic extractor rejects video parts
+        # before the real request reaches the multimodal path.
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+        text_messages, _, _ = extract_images_from_messages(media_messages)
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(

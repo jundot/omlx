@@ -1255,6 +1255,38 @@ class TestProcessChatMessages:
         mock_expand_video.assert_called_once_with(messages)
         mock_extract.assert_called_once_with(expanded)
 
+    @pytest.mark.asyncio
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.expand_video_parts")
+    async def test_mimo_video_preflight_expands_frames_before_validation(
+        self, mock_expand_video, mock_extract
+    ):
+        from PIL import Image
+
+        messages = [{"role": "user", "content": "video"}]
+        expanded = [{"role": "user", "content": "sampled frames"}]
+        text_messages = [{"role": "user", "content": "describe"}]
+        mock_expand_video.return_value = expanded
+        mock_extract.return_value = (text_messages, [Image.new("RGB", (4, 4))], [])
+
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        engine._apply_chat_template = MagicMock(return_value="prompt")
+        engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+        engine._processor = _QWEN_PROC
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+
+        await engine.preflight_chat(messages)
+
+        mock_expand_video.assert_called_once_with(messages)
+        mock_extract.assert_called_once_with(expanded)
+
+        mock_expand_video.reset_mock()
+        mock_extract.reset_mock()
+        assert engine.count_chat_tokens(messages) == 1
+        mock_expand_video.assert_called_once_with(messages)
+        mock_extract.assert_called_once_with(expanded)
+
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_image_path_calls_prepare_vision(self, mock_extract):
         """Messages with images → _prepare_vision_inputs() called."""
