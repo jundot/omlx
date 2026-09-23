@@ -2022,6 +2022,12 @@ class TestMtpCompatibilityHelpers:
             _is_mtp_compatible({"num_nextn_predict_layers": 1}, "deepseek_v4") is True
         )
 
+    @pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+    def test_is_mtp_compatible_mimo_v2(self, model_type):
+        assert (
+            _is_mtp_compatible({"num_nextn_predict_layers": 3}, model_type) is True
+        )
+
     def test_is_mtp_compatible_gemma4_unified(self):
         config = {
             "text_config": {

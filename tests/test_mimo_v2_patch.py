@@ -4,6 +4,7 @@
 import importlib
 import json
 import sys
+import types
 
 import mlx.core as mx
 import pytest
@@ -61,10 +62,12 @@ def test_apply_registers_mimo_v2_module():
 
     assert module.__package__ == "mlx_lm.models"
     assert sys.modules["mlx_lm.models.mimo_v2"] is module
+    assert sys.modules["mlx_lm.models.mimo_v2_flash"] is module
 
     import mlx_lm.models as models_pkg
 
     assert models_pkg.mimo_v2 is module
+    assert models_pkg.mimo_v2_flash is module
 
 
 def test_apply_is_idempotent():
@@ -78,12 +81,33 @@ def test_apply_is_idempotent():
     assert first in (True, False)
 
 
-def test_get_classes_resolves_mimo_v2():
+def test_apply_replaces_upstream_module(monkeypatch):
+    import mlx_lm.models as models_pkg
+
+    import omlx.patches.mimo_v2 as patch
+
+    upstream = types.ModuleType("mlx_lm.models.mimo_v2")
+    upstream.__file__ = "/tmp/upstream/mlx_lm/models/mimo_v2.py"
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.mimo_v2", upstream)
+    monkeypatch.setattr(models_pkg, "mimo_v2", upstream, raising=False)
+    monkeypatch.setattr(patch, "_APPLIED", False)
+
+    assert patch.apply_mimo_v2_patch() is True
+    registered = sys.modules["mlx_lm.models.mimo_v2"]
+    assert registered is not upstream
+    assert registered.__file__.endswith("omlx/patches/mimo_v2/mimo_v2_model.py")
+    assert models_pkg.mimo_v2 is registered
+    assert sys.modules["mlx_lm.models.mimo_v2_flash"] is registered
+    assert models_pkg.mimo_v2_flash is registered
+
+
+@pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+def test_get_classes_resolves_mimo_v2(model_type):
     _load_patch_module()
 
     from mlx_lm.utils import _get_classes
 
-    model_cls, args_cls = _get_classes(_minimal_config())
+    model_cls, args_cls = _get_classes(_minimal_config(model_type=model_type))
 
     assert model_cls.__name__ == "Model"
     assert args_cls.__name__ == "ModelArgs"
@@ -153,8 +177,15 @@ def test_sanitize_handles_fused_fp8_and_text_only_weights():
         num_hidden_layers=2,
         hybrid_layer_pattern=[0, 1],
         moe_layer_freq=[0, 1],
+        num_nextn_predict_layers=1,
     )
-    model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
 
     weights = {
         "model.layers.0.self_attn.qkv_proj.weight": mx.to_fp8(mx.ones((240, 128))),
@@ -165,6 +196,8 @@ def test_sanitize_handles_fused_fp8_and_text_only_weights():
         "audio_encoder.ignored": mx.ones((1,)),
         "speech_embeddings.ignored": mx.ones((1,)),
         "model.mtp.ignored": mx.ones((1,)),
+        "model.mtp.layers.0.self_attn.qkv_proj.weight": mx.to_fp8(mx.ones((240, 128))),
+        "model.mtp.layers.0.self_attn.qkv_proj.weight_scale_inv": mx.ones((2, 1)),
     }
     for projection, shape in (
         ("gate_proj", (64, 128)),
@@ -187,27 +220,187 @@ def test_sanitize_handles_fused_fp8_and_text_only_weights():
         64,
         128,
     )
+    assert "model.mtp.ignored" in sanitized
+    assert sanitized["model.mtp.layers.0.self_attn.q_proj.weight"].shape == (
+        128,
+        128,
+    )
+    assert sanitized["model.mtp.layers.0.self_attn.k_proj.weight"].shape == (64, 128)
+    assert sanitized["model.mtp.layers.0.self_attn.v_proj.weight"].shape == (48, 128)
     assert not any(
-        key.startswith(
-            ("visual.", "audio_encoder.", "speech_embeddings.", "model.mtp.")
-        )
+        key.startswith(("visual.", "audio_encoder.", "speech_embeddings."))
         for key in sanitized
     )
 
+    inactive = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    assert "model.mtp.ignored" not in inactive.sanitize(
+        {"model.mtp.ignored": mx.ones((1,))}
+    )
 
-def test_pre_load_dispatch_calls_mimo_patch(tmp_path, monkeypatch):
+
+def test_sanitize_loads_and_splits_quantized_mtp_sidecar(monkeypatch):
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    sidecar_path = "/models/mimo/mtp/model_mtp.safetensors"
+    config = _minimal_config(
+        num_nextn_predict_layers=1,
+        omlx_mtp_sidecar=sidecar_path,
+    )
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
+
+    prefix = "model.mtp.layers.0.self_attn.qkv_proj"
+    sidecar = {
+        f"{prefix}.weight": mx.ones((240, 16), dtype=mx.uint32),
+        f"{prefix}.scales": mx.ones((240, 2)),
+        f"{prefix}.biases": mx.ones((240, 2)),
+    }
+    loaded = []
+
+    def fake_load(path):
+        loaded.append(path)
+        return sidecar
+
+    monkeypatch.setattr(mimo_v2.mx, "load", fake_load)
+    sanitized = model.sanitize({})
+
+    assert loaded == [sidecar_path]
+    for suffix, width in (("weight", 16), ("scales", 2), ("biases", 2)):
+        assert sanitized[f"model.mtp.layers.0.self_attn.q_proj.{suffix}"].shape == (
+            128,
+            width,
+        )
+        assert sanitized[f"model.mtp.layers.0.self_attn.k_proj.{suffix}"].shape == (
+            64,
+            width,
+        )
+        assert sanitized[f"model.mtp.layers.0.self_attn.v_proj.{suffix}"].shape == (
+            48,
+            width,
+        )
+
+
+def test_lightning_mtp_heads_forward_and_adapter_contract():
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mimo_v2.omnimodal import MiMoLanguageAdapter
+    from omlx.patches.mlx_lm_mtp import (
+        set_mtp_active,
+        set_mtp_depth,
+    )
+
+    set_mtp_active(True)
+    set_mtp_depth(3)
+    try:
+        args = mimo_v2.ModelArgs.from_dict(_minimal_config(num_nextn_predict_layers=3))
+        model = mimo_v2.Model(args)
+    finally:
+        set_mtp_active(False)
+        set_mtp_depth(1)
+
+    assert len(model.mtp.layers) == 3
+    assert model._omlx_mtp_decode_enabled is True
+    assert model._omlx_mtp_depth == 3
+
+    cache = model.make_cache()
+    logits, hidden = model(mx.array([[1, 2]]), cache=cache, return_hidden=True)
+    assert logits.shape == (1, 2, 1000)
+    assert hidden.shape == (1, 2, 128)
+
+    mtp_cache = model.make_mtp_cache()
+    assert len(mtp_cache) == 3
+    model.mtp_begin_cycle(mtp_cache, 3)
+    first_logits, first_hidden = model.mtp_forward(
+        hidden,
+        mx.array([[2, 3]]),
+        mtp_cache,
+        return_hidden=True,
+        logits_keep=1,
+    )
+    assert first_logits.shape == (1, 1, 1000)
+    assert first_hidden.shape == (1, 2, 128)
+    assert mtp_cache.layer_idx == 1
+
+    second_logits = model.mtp_forward(first_hidden[:, -1:], mx.array([[4]]), mtp_cache)
+    mx.eval(logits, first_logits, second_logits)
+    assert second_logits.shape == (1, 1, 1000)
+    assert mtp_cache.layer_idx == 2
+
+    changed_hidden = mx.concatenate([hidden[:, :1], hidden[:, 1:] + 5], axis=1)
+    original_logits = model.mtp_forward(
+        hidden, mx.array([[2, 3]]), model.make_mtp_cache()
+    )
+    changed_logits = model.mtp_forward(
+        changed_hidden, mx.array([[2, 3]]), model.make_mtp_cache()
+    )
+    assert mx.allclose(original_logits[:, :1], changed_logits[:, :1]).item()
+
+    adapter = MiMoLanguageAdapter(model)
+    assert adapter._omlx_mtp_decode_enabled is True
+    assert adapter._omlx_mtp_chain is True
+    adapter.mtp_begin_cycle(mtp_cache, 3)
+    assert mtp_cache.layer_idx == 0
+    adapter_logits, adapter_hidden = adapter(
+        mx.array([[5]]), cache=model.make_cache(), return_hidden=True
+    )
+    mx.eval(adapter_logits, adapter_hidden)
+    assert adapter_logits.shape == (1, 1, 1000)
+    assert adapter_hidden.shape == (1, 1, 128)
+
+
+@pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+def test_pre_load_dispatch_calls_mimo_patch(tmp_path, monkeypatch, model_type):
     calls = []
     monkeypatch.setattr(
         "omlx.patches.mimo_v2.apply_mimo_v2_patch",
         lambda: calls.append(True) or True,
     )
-    (tmp_path / "config.json").write_text(json.dumps(_minimal_config()))
+    (tmp_path / "config.json").write_text(
+        json.dumps(_minimal_config(model_type=model_type))
+    )
 
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
     maybe_apply_pre_load_patches(str(tmp_path))
 
     assert calls == [True]
+
+
+def test_mtp_sidecar_counts_as_checkpoint_weights(tmp_path):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    from omlx.utils.model_loading import _checkpoint_has_mtp_weights
+
+    sidecar = tmp_path / "mtp" / "model_mtp.safetensors"
+    sidecar.parent.mkdir()
+    save_file({"model.mtp.layers.0.weight": np.ones((1,), dtype=np.float32)}, sidecar)
+
+    assert _checkpoint_has_mtp_weights(tmp_path) is True
+
+
+def test_load_text_model_injects_mtp_sidecar(tmp_path, monkeypatch):
+    import omlx.utils.model_loading as ml
+
+    sidecar = tmp_path / "mtp" / "model_mtp.safetensors"
+    sidecar.parent.mkdir()
+    sidecar.touch()
+    captured = {}
+    monkeypatch.setattr(ml, "maybe_apply_pre_load_patches", lambda *_a, **_k: None)
+
+    def fake_load(model_name, **kwargs):
+        captured["model_name"] = model_name
+        captured.update(kwargs)
+        return object(), object()
+
+    monkeypatch.setattr(ml, "lm_load_compat", fake_load)
+    ml.load_text_model(str(tmp_path))
+
+    assert captured["model_name"] == str(tmp_path)
+    assert captured["model_config"] == {"omlx_mtp_sidecar": str(sidecar)}
 
 
 def test_multimodal_mimo_is_explicitly_routed_to_text_engine(tmp_path, caplog):
@@ -355,7 +548,8 @@ def test_measure_sensitivity_routes_genuine_vlm_to_mlx_vlm(monkeypatch):
     assert result == {"model.layers.0": 1.0}
 
 
-def test_official_mxfp4_checkpoint_loads_without_requantizing(tmp_path):
+@pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+def test_official_mxfp4_checkpoint_loads_without_requantizing(tmp_path, model_type):
     import mlx.nn as nn
     from mlx.utils import tree_flatten
     from mlx_lm.utils import load_model
@@ -363,7 +557,7 @@ def test_official_mxfp4_checkpoint_loads_without_requantizing(tmp_path):
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
     module = _load_patch_module()
-    config = _minimal_config()
+    config = _minimal_config(model_type=model_type)
     model = module.Model(module.ModelArgs.from_dict(config))
     nn.quantize(
         model,
@@ -418,3 +612,134 @@ def test_official_mxfp4_checkpoint_loads_without_requantizing(tmp_path):
     assert mx.array_equal(original.weight, expert.weight).item()
     assert mx.array_equal(original.scales, expert.scales).item()
     assert mx.isfinite(converted(ids)).all().item()
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 2])
+def test_mtp_partial_rollback_after_rotation(accepted):
+    from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
+    from omlx.patches.mlx_lm_mtp.batch_generator import _call_backbone
+
+    module = _load_patch_module()
+    apply_mlx_lm_mtp_patch()
+    set_mtp_active(True)
+    try:
+        model = module.Model(
+            module.ModelArgs.from_dict(
+                _minimal_config(num_nextn_predict_layers=3, sliding_window_size=8)
+            )
+        )
+    finally:
+        set_mtp_active(False)
+    prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    verify = mx.array([[10, 11, 12, 13]])
+    speculative, reference = model.make_cache(), model.make_cache()
+    model(prompt, cache=speculative)
+    model(prompt, cache=reference)
+    _call_backbone(model, verify, speculative, n_confirmed=1)
+    assert model.mtp_partial_rollback(speculative, accepted, 3)
+    model(verify[:, : accepted + 1], cache=reference)
+    continuation = mx.array([[14]])
+    actual, expected = model(continuation, cache=speculative), model(
+        continuation, cache=reference
+    )
+    mx.eval(actual, expected)
+    assert [c.offset for c in speculative] == [c.offset for c in reference]
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
+def test_mtp_draft_clone_preserves_head_index_and_isolates_cache():
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+    from omlx.patches.mlx_lm_mtp.batch_generator import _clone_mtp_head_cache
+
+    module = _load_patch_module()
+    set_mtp_active(True)
+    try:
+        model = module.Model(
+            module.ModelArgs.from_dict(_minimal_config(num_nextn_predict_layers=3))
+        )
+    finally:
+        set_mtp_active(False)
+    cache = model.make_mtp_cache()
+    hidden = mx.ones((1, 1, 128))
+    ids = mx.array([[1]])
+    model.mtp_begin_cycle(cache, 3)
+    model.mtp_forward(hidden, ids, cache)
+    clone = _clone_mtp_head_cache(cache)
+    model.mtp_forward(hidden, ids, clone)
+    assert clone.layer_idx == 2
+    assert cache.layer_idx == 1
+    assert clone[1].offset == 1
+    assert cache[1].offset == 0
+
+
+@pytest.mark.parametrize("layout", ["root", "nested"])
+def test_oq_preserves_mtp_shards_and_calibrates_all_heads(tmp_path, layout):
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import load_model
+
+    from omlx.oq import (
+        OQImatrixCollector,
+        _collect_mtp_head_imatrix,
+        quantize_oq_streaming,
+    )
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    module = _load_patch_module()
+    config = _minimal_config(
+        num_nextn_predict_layers=3,
+        v_head_dim=32,
+        swa_v_head_dim=32,
+        vocab_size=1024,
+    )
+    set_mtp_active(True)
+    try:
+        model = module.Model(module.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
+    weights = dict(tree_flatten(model.parameters()))
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(config))
+    trunk = {k: v for k, v in weights.items() if not k.startswith("model.mtp.")}
+    head = {k: v for k, v in weights.items() if k.startswith("model.mtp.")}
+    mx.save_safetensors(str(source / "model.safetensors"), trunk)
+    sidecar = source / (
+        "model_mtp.safetensors" if layout == "root" else "mtp/model_mtp.safetensors"
+    )
+    sidecar.parent.mkdir(exist_ok=True)
+    mx.save_safetensors(str(sidecar), head)
+    output = tmp_path / "output"
+    quantize_oq_streaming(
+        str(source),
+        str(output),
+        4,
+        group_size=32,
+        preserve_mtp=True,
+        sensitivity_map_override={i: 1.0 for i in range(4)},
+    )
+    set_mtp_active(True)
+    try:
+        loaded, output_config = load_model(output)
+    finally:
+        set_mtp_active(False)
+    assert output_config["num_nextn_predict_layers"] == 3
+    assert len(loaded.mtp.layers) == 3
+    ids = mx.array([[1, 2, 3, 4]])
+    loaded.model.norm.weight = mx.linspace(0.5, 1.5, config["hidden_size"])
+    _, hidden = loaded(ids, return_hidden=True)
+    head = loaded.mtp.layers[0]
+    expected_input = mx.concatenate(
+        [head.enorm(loaded.model.embed_tokens(ids[:, 1:])), head.hnorm(hidden[:, :-1])],
+        axis=-1,
+    )
+    expected_energy = mx.sum(expected_input.astype(mx.float32) ** 2, axis=(0, 1))
+    collector = OQImatrixCollector()
+    collector.install(loaded)
+    try:
+        assert _collect_mtp_head_imatrix(loaded, ids, hidden)
+        for index in range(3):
+            assert f"model.mtp.layers.{index}.eh_proj" in collector.entries
+        actual_energy = collector.entries["model.mtp.layers.0.eh_proj"].in_sum2
+        assert mx.allclose(mx.array(actual_energy), expected_energy, atol=1e-5).item()
+    finally:
+        collector.restore(loaded)
