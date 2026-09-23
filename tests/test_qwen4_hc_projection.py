@@ -12,7 +12,7 @@ import pytest
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
-def _production_module(bits: int):
+def _production_module(bits: int, dtype=mx.bfloat16):
     from mlx_vlm.models.qwen4_exp.language import (
         Qwen4ExpGatedResidual,
         Qwen4ExpRMSNorm,
@@ -28,7 +28,7 @@ def _production_module(bits: int):
         group_size=2560,
         eps=1e-6,
     )
-    module.hc_norm.weight = (mx.random.normal((10240,)) * 0.02).astype(mx.bfloat16)
+    module.hc_norm.weight = (mx.random.normal((10240,)) * 0.02).astype(dtype)
     module.input_mix_weight_down = nn.QuantizedLinear(
         10240,
         320,
@@ -58,8 +58,8 @@ def _production_module(bits: int):
         module.block_inject_weight,
         module.input_mix_weight_up,
     ):
-        projection.scales = projection.scales.astype(mx.bfloat16)
-        projection.biases = projection.biases.astype(mx.bfloat16)
+        projection.scales = projection.scales.astype(dtype)
+        projection.biases = projection.biases.astype(dtype)
     return module
 
 
@@ -190,3 +190,53 @@ def test_qwen4_exact_hybrid_preparation_fails_closed_for_other_geometry():
         none_metadata.block_inject_weight,
     )
     assert fuse_hyper_connection_projections(none_metadata) == 0
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_hybrid_projection_fp16_matches_canonical(bits):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.hc_projection import hybrid_projection
+
+    mx.random.seed(20260918 + bits)
+    module = _production_module(bits, dtype=mx.float16)
+    inputs = module.hc_norm(mx.random.normal((1, 1, 10240)).astype(mx.float16))
+    down, injection = module.input_mix_weight_down, module.block_inject_weight
+    actual = hybrid_projection(inputs, down, injection)
+    expected = mx.concatenate([down(inputs), injection(inputs)], axis=-1)
+    assert actual is not None
+    mx.eval(actual, expected)
+    assert actual.dtype == mx.float16
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_hybrid_projection_fp16_failure_does_not_disable_future_calls(monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import hc_projection
+
+    module = _production_module(4, dtype=mx.float16)
+    inputs = mx.ones((1, 1, 10240), dtype=mx.float16)
+    failure = RuntimeError("injected projection failure")
+    monkeypatch.setattr(hc_projection, "_kernel", MagicMock(side_effect=failure))
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="injected projection failure") as caught:
+            hc_projection.hybrid_projection(inputs, module.input_mix_weight_down, module.block_inject_weight)
+        assert caught.value is failure
+
+
+def test_hybrid_projection_supports_subclasses_and_rejects_mixed_dtypes():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import hc_projection
+
+    class PrefillLinear(nn.QuantizedLinear):
+        pass
+
+    module = _production_module(4, dtype=mx.float16)
+    down, injection = module.input_mix_weight_down, module.block_inject_weight
+    down.__class__ = PrefillLinear
+    injection.__class__ = PrefillLinear
+    assert hc_projection.compatible_projections(down, injection)
+    inputs = mx.ones((1, 1, 10240), dtype=mx.bfloat16)
+    assert hc_projection.hybrid_projection(inputs, down, injection) is None
+    injection.biases = injection.biases.astype(mx.bfloat16)
+    assert not hc_projection.compatible_projections(down, injection)
