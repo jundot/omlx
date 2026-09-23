@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import patch
 
 import mlx.core as mx
+import pytest
 
 import omlx.specprefill.draft as draft_workflow
 from omlx.request import Request, SamplingParams
@@ -486,26 +487,92 @@ def test_prefill_draft_schedule_is_exactly_this():
     assert _replay_prefill(5, 8)[0] == [0, 4, 5]
 
 
-def test_boundary_prediction_matches_the_real_loop_everywhere():
+def _schedule_oracle(n: int, step: int) -> list[int]:
+    """What ``_prefill_draft`` reports for an *n*-token suffix, without MLX.
+
+    A transcription of the loop, so the exhaustive sweep below can run in
+    milliseconds. It is only trusted because
+    ``test_the_schedule_oracle_is_the_real_loop`` checks it against the real
+    ``_prefill_draft`` on the cases where a transcription is easiest to get
+    wrong, and ``test_prefill_draft_schedule_is_exactly_this`` pins the real
+    loop itself.
+    """
+    reported: list[int] = []
+    processed = 0
+    while n - processed > 1:
+        reported.append(processed)
+        processed += min(step, n - processed - 1)
+        reported.append(processed)
+    reported.append(n)
+    return reported
+
+
+def _reachable(reported: list[int], cached: int, n: int, block: int) -> int | None:
+    aligned = [
+        cached + p
+        for p in reported
+        if p > 0 and cached + p < n and (cached + p) % block == 0
+    ]
+    return max(aligned) if aligned else None
+
+
+# (n, step, block): the real loop runs only on these. Each family is one a
+# plausible transcription or closed form gets wrong.
+_ADVERSARIAL = [
+    (64, 8, 8),  # block == step, prompt end aligned
+    (64, 8, 4),  # block divides step
+    (100, 16, 8),  # block divides step, end unaligned
+    (50, 8, 3),  # block does not divide step
+    (61, 8, 5),
+    (97, 12, 9),
+    (40, 6, 4),
+    (33, 8, 8),  # final chunk truncated to leave the logits token
+    (33, 8, 4),
+    (10, 2, 3),  # only the truncated chunk lands on a boundary
+    (32, 8, 8),  # exact block-aligned prompt end: the end is never the answer
+    (48, 16, 8),
+    (16, 4, 4),
+    (2, 2, 2),  # the smallest suffix that still runs the loop
+    (5, 8, 4),  # a suffix inside one chunk
+]
+
+
+@pytest.mark.parametrize("n,step,block", _ADVERSARIAL)
+def test_the_schedule_oracle_is_the_real_loop(n, step, block):
+    reported, _ = _replay_prefill(n, step)
+    assert reported == _schedule_oracle(n, step)
+
+
+@pytest.mark.parametrize("n,step,block", _ADVERSARIAL)
+def test_boundary_prediction_matches_the_real_loop(n, step, block):
+    reported, _ = _replay_prefill(n, step)
+    predicted = draft_workflow._last_reachable_boundary(0, n, step, block)
+    assert predicted != n
+    assert predicted == _reachable(reported, 0, n, block), predicted
+
+
+def test_boundary_prediction_matches_the_schedule_everywhere():
     """Sweep, because the interesting cases are where block does not divide step.
 
     An earlier version of this test used six hand-picked combinations, all of
     which happened to have ``block_size`` dividing ``step``. That is the one
-    family where a closed-form guess at the schedule is right; over the sweep
-    below it was wrong 6729 times, each one a published boundary missed and a
-    block of reuse lost.
+    family where a closed-form guess at the schedule is right; over this
+    sweep such a guess is wrong thousands of times, each one a published
+    boundary missed and a block of reuse lost. The sweep runs against the
+    oracle; the real loop runs on ``_ADVERSARIAL``.
     """
     for step in range(2, 20):
         for block in range(2, 20):
             for n in range(2, 200):
-                reported, _ = _replay_prefill(n, step)
-                aligned = [p for p in reported if 0 < p < n and p % block == 0]
+                reported = _schedule_oracle(n, step)
                 predicted = draft_workflow._last_reachable_boundary(0, n, step, block)
                 assert predicted != n, (n, step, block)
-                if aligned:
-                    assert predicted == max(aligned), (n, step, block, predicted)
-                else:
-                    assert predicted is None, (n, step, block, predicted)
+                assert predicted == _reachable(reported, 0, n, block), (
+                    n,
+                    step,
+                    block,
+                    predicted,
+                )
 
 
 def test_boundary_prediction_survives_a_nonzero_cached_length():
