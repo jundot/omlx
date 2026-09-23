@@ -3823,6 +3823,31 @@ class TestSchedulerRotatingBlockAlignment:
         # so it gets rounded up to 512 (smallest multiple of 128 >= 512).
         assert scheduler.config.paged_cache_block_size == 512
 
+    def test_mimo_v2_flash_aligns_block_size_to_2048(self, mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class MiMoModel:
+            model_type = "mimo_v2_flash"
+
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 1
+
+            def make_cache(self):
+                cache = RotatingStub()
+                cache.max_size = 128
+                return [cache]
+
+        scheduler = Scheduler(
+            model=MiMoModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+        scheduler._align_block_size_with_rotating_window()
+
+        assert scheduler.config.paged_cache_block_size == 2048
+
     def test_pooling_cache_model_aligns_block_size_to_2048(self, mock_tokenizer):
         RotatingStub = type("RotatingKVCache", (), {})
         PoolingStub = type("PoolingCache", (), {})

@@ -2746,6 +2746,7 @@ class Scheduler:
     # reprocessing reasonable.
     _ROTATING_BLOCK_SIZE_MIN = 512
     _ROTATING_BLOCK_SIZE_MAX = 1024
+    _MIMO_V2_FLASH_ROTATING_BLOCK_SIZE = 2048
 
     # Models with a PoolingCache (DeepSeek V4 family) get 2048 instead.
     # Prefill chunks are clamped to the block boundary, and the native
@@ -2770,6 +2771,7 @@ class Scheduler:
         Models with a PoolingCache (DeepSeek V4 family) target
         _POOLING_ROTATING_BLOCK_SIZE instead, since their prefill
         kernels need 2048-token chunks to reach the measured gains.
+        MiMo V2.6 Flash also uses 2048-token blocks for long prompts.
         """
         if not self.config.paged_ssd_cache_dir:
             return
@@ -2793,6 +2795,8 @@ class Scheduler:
         hi = self._ROTATING_BLOCK_SIZE_MAX
         if self._detect_pooling_cache():
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+        elif getattr(self.model, "model_type", None) == "mimo_v2_flash":
+            lo = hi = self._MIMO_V2_FLASH_ROTATING_BLOCK_SIZE
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
