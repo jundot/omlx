@@ -648,7 +648,8 @@ def _has_vision_tower_weights(model_dir: Path) -> bool:
 
     for sf in weight_files:
         with safetensors.safe_open(str(sf), framework="np") as f:
-            if any(_is_vision_tower_key(k) for k in f.keys()):
+            # safetensors.safe_open exposes keys() but is not a Mapping.
+            if any(_is_vision_tower_key(k) for k in f.keys()):  # noqa: SIM118
                 return True
     return False
 
@@ -2947,13 +2948,11 @@ class VLMBatchedEngine(BaseEngine):
                 )
             ):
                 formatted_messages.append(msg)
-            elif (
-                model_type in {"glm5_next", "mimo_v2", "mimo_v2_flash"}
-                and (msg_num_images > 0 or msg_num_audios > 0)
+            elif model_type == "glm5_next" and (
+                msg_num_images > 0 or msg_num_audios > 0
             ):
-                # mlx-vlm does not register these model types in MODEL_CONFIG.
-                # Preserve media parts and their relative order so each native
-                # chat template can expand them to its own token span.
+                # mlx-vlm does not register GLM-5 in MODEL_CONFIG. Preserve
+                # media parts and their relative order for its native template.
                 glm_content: list[Any] = []
                 inserted_images = 0
                 inserted_audios = 0
@@ -2999,6 +2998,63 @@ class VLMBatchedEngine(BaseEngine):
                     glm_content.append({"type": "text", "text": content})
 
                 formatted_messages.append({"role": role, "content": glm_content})
+            elif model_type in {"mimo_v2", "mimo_v2_flash"} and (
+                msg_num_images > 0 or msg_num_audios > 0
+            ):
+                # Render MiMo's special tokens before applying the chat
+                # template. This also works with tokenizer wrappers that only
+                # preserve string content and would otherwise drop media dicts.
+                mimo_content: list[str] = []
+                inserted_images = 0
+                inserted_audios = 0
+                inserted_text = False
+                if isinstance(raw_content, list):
+                    for item in raw_content:
+                        if isinstance(item, dict):
+                            item_type = item.get("type", "")
+                            item_text = item.get("text", "")
+                        else:
+                            item_type = getattr(item, "type", "")
+                            item_text = getattr(item, "text", "")
+
+                        if item_type in image_part_types:
+                            if inserted_images < msg_num_images:
+                                mimo_content.append(
+                                    "<|vision_start|><|image_pad|><|vision_end|>"
+                                )
+                                inserted_images += 1
+                        elif item_type in audio_part_types:
+                            if inserted_audios < msg_num_audios:
+                                mimo_content.append(
+                                    "<|mimo_audio_start|><|audio_pad|>"
+                                    "<|mimo_audio_end|>"
+                                )
+                                inserted_audios += 1
+                        elif item_type == "text":
+                            mimo_content.append(str(item_text))
+                            inserted_text = True
+                        elif isinstance(item, str):
+                            mimo_content.append(item)
+                            inserted_text = True
+
+                missing_media = [
+                    *(
+                        "<|vision_start|><|image_pad|><|vision_end|>"
+                        for _ in range(msg_num_images - inserted_images)
+                    ),
+                    *(
+                        "<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>"
+                        for _ in range(msg_num_audios - inserted_audios)
+                    ),
+                ]
+                if missing_media:
+                    mimo_content[:0] = missing_media
+                if not inserted_text:
+                    mimo_content.append(content)
+
+                formatted_messages.append(
+                    {"role": role, "content": "".join(mimo_content)}
+                )
             else:
                 formatted = get_message_json(
                     model_type,

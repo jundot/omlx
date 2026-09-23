@@ -2059,8 +2059,8 @@ class TestFormatMessagesForVLMTemplate:
         assert "audio" in types
         assert image_ranges == []
 
-    def test_format_mimo_audio_preserves_native_audio_marker(self):
-        """MiMo bypasses mlx-vlm's unsupported-model formatter for audio."""
+    def test_format_mimo_audio_renders_native_audio_marker_as_text(self):
+        """MiMo renders markers before templates that may drop media dicts."""
         engine = _make_loaded_engine(model_type="mimo_v2_flash")
         messages = [
             {
@@ -2082,13 +2082,44 @@ class TestFormatMessagesForVLMTemplate:
         assert formatted == [
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": "Transcribe this."},
-                    {"type": "audio"},
-                ],
+                "content": (
+                    "Transcribe this."
+                    "<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>"
+                ),
             }
         ]
         assert image_ranges == []
+
+    def test_format_mimo_image_marker_survives_string_only_templates(self):
+        """MiMo image markers must not depend on templates rendering media dicts."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                    {"type": "text", "text": "Describe this."},
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": (
+                    "<|vision_start|><|image_pad|><|vision_end|>"
+                    "Describe this."
+                ),
+            }
+        ]
+        assert image_ranges == [(0, 1)]
 
     def test_format_mimo_preserves_mixed_media_order(self):
         """MiMo keeps image and audio markers in the user's original order."""
@@ -2112,12 +2143,12 @@ class TestFormatMessagesForVLMTemplate:
             messages, num_images=1, num_audios=1
         )
 
-        assert formatted[0]["content"] == [
-            {"type": "text", "text": "Compare these."},
-            {"type": "image"},
-            {"type": "text", "text": "Then transcribe this."},
-            {"type": "audio"},
-        ]
+        assert formatted[0]["content"] == (
+            "Compare these."
+            "<|vision_start|><|image_pad|><|vision_end|>"
+            "Then transcribe this."
+            "<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>"
+        )
         assert image_ranges == [(0, 1)]
 
     def test_audio_parts_capped_by_num_audios(self):
