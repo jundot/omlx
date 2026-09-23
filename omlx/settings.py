@@ -639,6 +639,7 @@ class AuthSettings:
     api_key: str | None = None
     secret_key: str | None = None
     skip_api_key_verification: bool = False
+    allow_unauthenticated_inference: bool = False
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -647,6 +648,7 @@ class AuthSettings:
             "api_key": self.api_key,
             "secret_key": self.secret_key,
             "skip_api_key_verification": self.skip_api_key_verification,
+            "allow_unauthenticated_inference": self.allow_unauthenticated_inference,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
         }
 
@@ -657,6 +659,9 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
+            allow_unauthenticated_inference=data.get(
+                "allow_unauthenticated_inference", False
+            ),
             sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
@@ -1475,7 +1480,6 @@ class GlobalSettings:
         """Save current settings to the settings file."""
         self.ensure_directories()
 
-        settings_file = self.base_path / "settings.json"
         data = {
             "version": SETTINGS_VERSION,
             "server": self.server.to_dict(),
@@ -1497,6 +1501,21 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        self._save_data(data)
+
+    def ensure_inference_auth_setting(self) -> None:
+        """Add the manual opt-in default without persisting runtime overrides."""
+        path = self.base_path / "settings.json"
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        auth = data.setdefault("auth", {})
+        if "allow_unauthenticated_inference" in auth:
+            return
+        auth["allow_unauthenticated_inference"] = False
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        self._save_data(data)
+
+    def _save_data(self, data: dict[str, Any]) -> None:
+        settings_file = self.base_path / "settings.json"
         # Write to a temp file and rename so a crash or a concurrent
         # writer can never leave a torn settings.json (same pattern as
         # ModelSettingsManager._save). The rename also carries the temp
@@ -1583,6 +1602,9 @@ class GlobalSettings:
             List of validation error messages (empty if valid).
         """
         errors = []
+
+        if type(self.auth.allow_unauthenticated_inference) is not bool:
+            errors.append("auth.allow_unauthenticated_inference must be a boolean")
 
         # Server validation
         if not 1 <= self.server.port <= 65535:

@@ -725,6 +725,47 @@ class TestQwenCpuShareMemoryEstimate:
         assert effective.qwen4_ple_ssd_offload is True
         assert signature["qwen4_ple_ssd_offload"] == "True"
 
+    def test_glm5_next_offload_admission_threads_mtp_resident(self, tmp_path):
+        # glm5_next Lightning MTP + expert offload: the admission estimate
+        # must be told the draft head stays resident, or it discounts the
+        # head's expert slab the adapter refuses to offload and the load
+        # OOMs.
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "glm"
+        model.mkdir()
+        settings = ModelSettings(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.8,
+            mtp_enabled=True,
+        )
+        entry = EngineEntry(
+            model_id="glm",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="glm5_next",
+            estimated_size=1000,
+        )
+        pool = _make_pool()
+        seen = []
+
+        def fake_estimate(path, full, fraction, *, mtp_resident=False):
+            seen.append(mtp_resident)
+            return full - 100
+
+        with patch(
+            "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
+            side_effect=fake_estimate,
+        ):
+            projected = pool._entry_runtime_resident_size(
+                entry, settings, base_size=1000
+            )
+
+        assert seen == [True]
+        extra = _qwen35_cpu_share_estimated_bytes(str(model), settings)
+        assert projected == 900 + (extra if extra is not None else 1000)
+
     @pytest.mark.asyncio
     async def test_qwen4_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
         """Real pressure may select mmap without making that override sticky."""

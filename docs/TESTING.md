@@ -17,6 +17,23 @@ speculative routes remain intact. See
 [FP16 decode prework](experimental/qwen35_fp16_decode.md) for the flag, geometry
 limits and real-model benchmark requirements.
 
+# First-token burst release
+
+Run `python -m pytest -q tests/test_engine_core.py tests/test_output_collector.py`
+to check first-chunk delivery across the executor boundary, late admission,
+multi-token chunks, output ordering, later burst limits and request cancellation.
+Burst decode releases each request's first generated chunk before continuing
+with the configured burst policy. This adds one executor hand-off per request;
+it does not shorten prefill or bypass parser, stop-string or stream-interval
+buffering. Subsequent chunks still follow the selected Burst Decode setting.
+
+For a real-server comparison, use the same model, prompt, output length and
+cache state on main and the branch. Measure client-observed first content and
+complete-response time separately from producer-side token timestamps, with
+balanced (0.1 s) and aggressive (0.2 s) burst settings. Include short replies,
+long replies, a second request admitted during decode, and disconnect/recovery.
+Report any custom budgets separately from the stock modes.
+
 Cluster process-group tests use the `mock_cluster_ssh` fixture; remote teardown and serve-marker tests retain their own transport assertions. Mock-model engine tests skip explicit GC, while `test_engine_teardown.py` and `test_per_engine_threads.py` retain teardown and reclamation coverage. GLM5 execution tests reuse the eight-layer KDA/DSA fixture with dense and MoE layers; checkpoint-key tests retain the 45-layer configuration. The SDPA memory test retains the 8K/32K length ratio, head dimension 256, and 6:1 GQA ratio with fewer heads. DeepSeek V4.1 direct and converted engine checks run sequentially in one isolated subprocess with separate checkpoint directories.
 
 # Cache cleanup logging tests

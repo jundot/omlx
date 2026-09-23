@@ -79,6 +79,24 @@ def _make_engine(**overrides):
     return engine
 
 
+@pytest.mark.asyncio
+async def test_start_rejects_unsupported_mtp_offload_before_loading(tmp_path):
+    from omlx.model_settings import ModelSettings
+
+    (tmp_path / "config.json").write_text('{"model_type": "qwen3_5_moe"}')
+    engine = _make_engine(
+        model_name=str(tmp_path),
+        model_settings=ModelSettings(moe_expert_offload_enabled=True, mtp_enabled=True),
+    )
+    with patch(
+        "omlx.utils.model_loading.maybe_load_custom_quantization",
+        side_effect=AssertionError("Unsupported settings reached the model loader"),
+    ) as load:
+        with pytest.raises(ValueError, match="MoE expert offload cannot"):
+            await engine.start()
+        load.assert_not_called()
+
+
 def _make_loaded_engine(model_type=None, tokenizer=None, **overrides):
     """Create a VLMBatchedEngine with mocked internals (no actual model load)."""
     engine = _make_engine(**overrides)

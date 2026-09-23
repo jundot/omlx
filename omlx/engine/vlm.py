@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import functools
 import importlib
 import inspect
 import json
@@ -1918,6 +1919,8 @@ class VLMBatchedEngine(BaseEngine):
                 model_settings=self._model_settings,
                 for_vlm=True,
             )
+        except ValueError:
+            raise
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
 
@@ -2060,9 +2063,17 @@ class VLMBatchedEngine(BaseEngine):
                     0.25,
                 )
             )
+            # glm5_next Lightning MTP: the draft head's experts stay resident
+            # while the backbone streams (run_in_executor takes no kwargs,
+            # so bind with partial).
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
-                apply_moe_expert_offload,
+                functools.partial(
+                    apply_moe_expert_offload,
+                    mtp_resident=bool(
+                        getattr(self._model_settings, "mtp_enabled", False)
+                    ),
+                ),
                 self._vlm_model,
                 self._model_name,
                 fraction,
