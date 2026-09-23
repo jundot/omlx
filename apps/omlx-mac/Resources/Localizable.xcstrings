@@ -17773,6 +17773,216 @@
         }
       }
     },
+    "server.advanced.systemone" : {
+      "comment" : "Advanced row label for the /jev/v1/systemone switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev Structured Reads"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev 構造化読み取り"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev 구조화 읽기"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Структурированные чтения Jev"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev 结构化读取"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev 結構化讀取"
+          }
+        }
+      }
+    },
+    "server.advanced.systemone.sub" : {
+      "comment" : "Sublabel for the /jev/v1/systemone switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "Serve /jev/v1/systemone: one-shot structured extraction from images and documents, with every answer schema-validated. Needs a diffusion model. Takes effect immediately."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "/jev/v1/systemone を提供：画像やドキュメントから一度で構造的な抽出を行い、すべての回答を schema で検証します。拡散モデルが必要です。ただちに適用されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "/jev/v1/systemone 제공: 이미지와 문서에서 한 번으로 구조화된 추출을 수행하고 모든 응답을 schema로 검증합니다. diffusion 모델이 필요합니다. 즉시 적용됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "Обслуживает /jev/v1/systemone: однократное структурированное извлечение из изображений и документов с проверкой каждого ответа по схеме. Нужна диффузионная модель. Применяется немедленно."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "提供 /jev/v1/systemone：对图像和文档进行一次性结构化提取，所有回答均经 schema 校验。需要扩散模型。立即生效。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "提供 /jev/v1/systemone：對影像和檔案進行一次性結構化擷取，所有回答均經 schema 驗證。需要擴散模型。立即生效。"
+          }
+        }
+      }
+    },
+    "server.advanced.systemone_model" : {
+      "comment" : "Advanced row label for the diffusion model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev Model"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev モデル"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev 모델"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель Jev"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev 模型"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jev 模型"
+          }
+        }
+      }
+    },
+    "server.advanced.systemone_model.auto" : {
+      "comment" : "Picker option: pick the newest diffusion model automatically",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Авто"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自动"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動"
+          }
+        }
+      }
+    },
+    "server.advanced.systemone_model.sub" : {
+      "comment" : "Sublabel for the diffusion model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "Which diffusion model answers these requests. Auto picks the newest one you have downloaded."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "これらのリクエストに応答する拡散モデル。自動はダウンロード済みの最新モデルを選択します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "이 요청에 응답할 diffusion 모델. 자동은 다운로드한 최신 모델을 선택합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "Какая диффузионная модель отвечает на эти запросы. «Авто» выбирает новейшую загруженную модель."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "由哪个扩散模型响应这些请求。自动会选择你已下载的最新模型。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+"value" : "由哪個擴散模型響應這些請求。自動會選擇你已下載的最新模型。"
+          }
+        }
+      }
+    },
     "server.button.apply" : {
       "comment" : "Button to apply pending storage changes",
       "extractionState" : "manual",

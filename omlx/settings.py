@@ -200,6 +200,17 @@ class ServerSettings:
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
     distributed_inference_enabled: bool = False
+    # Structured System One reads (POST /jev/v1/systemone): one read-only
+    # denoise of a seeded answer template answers every question at once, so
+    # nothing is generated and nothing is parsed. Off by default. The /jev routes
+    # are registered at startup either way and a per-request dependency reads this
+    # value, so flipping it opens and closes the surface without a restart; with it
+    # off every /jev request is refused before any engine is touched.
+    systemone_enabled: bool = False
+    # Physical id of the block-diffusion checkpoint that serves those reads, and
+    # what the Jev aliases (jev-latest, openjev-latest, …) resolve to. Empty
+    # means: whichever diffusion model is loaded, else the first discovered.
+    systemone_model: str = ""
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
@@ -243,6 +254,8 @@ class ServerSettings:
                 "distributed_inference_enabled",
                 False,
             ),
+            systemone_enabled=bool(data.get("systemone_enabled", False)),
+            systemone_model=str(data.get("systemone_model", "") or ""),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),

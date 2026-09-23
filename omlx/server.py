@@ -283,6 +283,10 @@ class ServerState:
     # Snapshot at init_server(). Settings may be edited while this process is
     # running, but routes, navigation, and Bonjour switch together on restart.
     distributed_inference_enabled: bool = False
+    # Snapshot at init_server(): whether the /jev structured-read surface exists
+    # this run, and which diffusion checkpoint serves it.
+    systemone_enabled: bool = False
+    systemone_model: str = ""
 
 
 # Global server state instance
@@ -406,6 +410,32 @@ async def require_distributed_inference_enabled() -> bool:
     """Hide the experimental cluster surface until explicitly enabled."""
 
     if not distributed_inference_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    return True
+
+
+def systemone_enabled() -> bool:
+    """Whether the Jev structured-read surface answers right now."""
+
+    return _server_state.systemone_enabled
+
+
+def systemone_model_id() -> str:
+    """Configured checkpoint for structured reads, or "" for automatic choice."""
+
+    return _server_state.systemone_model
+
+
+async def require_systemone_enabled() -> bool:
+    """Primary gate on the /jev surface, evaluated per request.
+
+    The routes stay mounted for the life of the process so the admin switch
+    takes effect without a restart; this is what stops a disabled server from
+    serving reads nobody opted into, and it answers 404 to match the
+    not-registered case.
+    """
+
+    if not systemone_enabled():
         raise HTTPException(status_code=404, detail="Not found")
     return True
 
@@ -735,6 +765,55 @@ from .api.websearch_routes import set_global_settings_getter as _set_websearch_s
 
 _set_websearch_settings(lambda: _server_state.global_settings)
 app.include_router(websearch_router, dependencies=[Depends(verify_inference_api_key)])
+
+# Include System One structured-read routes: one read-only denoise of a seeded
+# answer template answers every question at once, so nothing is generated and
+# nothing is parsed. Needs a block-diffusion model; the route answers 404 for
+# anything else. resolve_model_id is late-bound because it is defined below.
+_systemone_routes_registered = False
+
+# The whole Jev contract hangs off this prefix. Both endpoints must sit under
+# the same one because the SDK builds them from a single base_url
+# (config.base_url + "/v1/models" and + "/v1/systemone").
+SYSTEMONE_URL_PREFIX = "/jev"
+
+
+def _register_systemone_routes() -> None:
+    """Mount the /jev surface; ``require_systemone_enabled`` gates every request.
+
+    Registration is unconditional so the admin switch takes effect immediately:
+    the gate reads ``_server_state`` per request, and while the feature is off a
+    request gets 404 here just as it did when no route existed. The module is
+    imported here rather than at module scope to keep the read path out of
+    startup's import graph. Everything lives under one prefix because the Jev
+    listing shape ({"models": [{name, description, release_date}]}) cannot share a
+    path with the OpenAI one, and the SDK builds both URLs from a single
+    base_url.
+    """
+
+    global _systemone_routes_registered
+    if _systemone_routes_registered:
+        return
+    from .api.systemone_routes import router as systemone_router
+    from .api.systemone_routes import set_systemone_getters
+
+    set_systemone_getters(
+        get_engine_pool,
+        resolve_model_id=lambda model_id: resolve_model_id(model_id),
+        get_metrics=get_server_metrics,
+        get_systemone_model=systemone_model_id,
+    )
+    app.include_router(
+        systemone_router,
+        prefix=SYSTEMONE_URL_PREFIX,
+        dependencies=[Depends(verify_api_key), Depends(require_systemone_enabled)],
+    )
+    _systemone_routes_registered = True
+    logger.info(
+        "SystemOne: /jev surface mounted (enabled=%s, model=%s)",
+        _server_state.systemone_enabled,
+        systemone_model_id() or "auto",
+    )
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -2154,6 +2233,18 @@ def init_server(
     _server_state.distributed_inference_enabled = is_enabled(global_settings)
     if _server_state.distributed_inference_enabled:
         _register_cluster_routes()
+    _server_state.systemone_enabled = bool(
+        getattr(
+            getattr(global_settings, "server", None), "systemone_enabled", False
+        )
+    )
+    _server_state.systemone_model = str(
+        getattr(getattr(global_settings, "server", None), "systemone_model", "")
+        or ""
+    )
+    # Mounted unconditionally: the per-request gate makes the switch live, so a
+    # flip here needs no restart.
+    _register_systemone_routes()
     response_state_dir = None
     if global_settings:
         response_state_dir = (

@@ -766,14 +766,38 @@ private struct ServerAdvancedSection: View {
                                       comment: "Advanced row label for the server aliases input"),
                         sublabel: String(localized: "server.advanced.aliases.sub",
                                          defaultValue: "Extra host names the server identifies as. Comma-separated. Used for cookie / Host header matching.",
-                                         comment: "Sublabel describing the server aliases input format"),
-                        isLast: true
+                                         comment: "Sublabel describing the server aliases input format")
                     ) {
                         TextInput(
                             text: $vm.serverAliasesText,
                             placeholder: "omlx.local, oMLX.lan",
                             mono: true,
                             width: .controlWide
+                        )
+                    }
+                    Row(
+                        label: String(localized: "server.advanced.systemone",
+                                      defaultValue: "Jev Structured Reads",
+                                      comment: "Advanced row label for the /jev/v1/systemone switch"),
+                        sublabel: String(localized: "server.advanced.systemone.sub",
+                                         defaultValue: "Serve /jev/v1/systemone: one-shot structured extraction from images and documents, with every answer schema-validated. Needs a diffusion model. Takes effect immediately.",
+                                         comment: "Sublabel for the /jev/v1/systemone switch")
+                    ) {
+                        RowSwitch(isOn: vm.bind($vm.systemoneEnabled, save: vm.saveSystemOneEnabled))
+                    }
+                    Row(
+                        label: String(localized: "server.advanced.systemone_model",
+                                      defaultValue: "Jev Model",
+                                      comment: "Advanced row label for the diffusion model picker"),
+                        sublabel: String(localized: "server.advanced.systemone_model.sub",
+                                         defaultValue: "Which diffusion model answers these requests. Auto picks the newest one you have downloaded.",
+                                         comment: "Sublabel for the diffusion model picker"),
+                        isLast: true
+                    ) {
+                        Popup(
+                            selection: vm.bind($vm.systemoneModel, save: vm.saveSystemOneModel),
+                            width: .controlCompact,
+                            options: vm.systemoneModelOptions
                         )
                     }
                 }

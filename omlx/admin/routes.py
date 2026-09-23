@@ -597,6 +597,11 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     distributed_inference_enabled: bool | None = None
+    # Structured System One reads (/jev). The router is registered at startup and
+    # gated per request, so both apply live; the POST publishes them to
+    # `_server_state` alongside `global_settings`.
+    systemone_enabled: bool | None = None
+    systemone_model: str | None = None
     max_audio_upload_size: str | None = None
 
     # Model settings
@@ -4561,6 +4566,20 @@ def _global_settings_response(global_settings):
                 "distributed_inference_enabled",
                 False,
             ),
+            "systemone_enabled": bool(
+                getattr(global_settings.server, "systemone_enabled", False)
+            ),
+            "systemone_model": str(
+                getattr(global_settings.server, "systemone_model", "") or ""
+            ),
+            # Options for the model picker: block-diffusion checkpoints only, read
+            # from discovered config so no model is loaded to build the list.
+            "systemone_readable_models": (
+                sorted(pool.systemone_model_ids())
+                if (pool := getattr(server_state, "engine_pool", None)) is not None
+                and hasattr(pool, "systemone_model_ids")
+                else []
+            ),
             "distributed_inference_active": bool(
                 server_state is not None
                 and getattr(
@@ -4859,6 +4878,26 @@ async def update_global_settings(
         global_settings.server.distributed_inference_enabled = (
             request.distributed_inference_enabled
         )
+    if request.systemone_enabled is not None:
+        global_settings.server.systemone_enabled = bool(request.systemone_enabled)
+        # The gate is a per-request dependency, so publishing the new value here
+        # is the whole mechanism: /jev opens and closes without a restart.
+        from ..server import _server_state
+
+        _server_state.systemone_enabled = bool(request.systemone_enabled)
+        runtime_applied.append("systemone_enabled")
+    if request.systemone_model is not None:
+        # Stored as given, including "" for automatic choice. A name that is not
+        # a block-diffusion checkpoint is not rejected here — the model may not
+        # be downloaded yet — and the read path falls back with a warning.
+        jev_model = str(request.systemone_model or "").strip()
+        global_settings.server.systemone_model = jev_model
+        # Read per request, so the next request targets this checkpoint. Switching
+        # to one not already resident still costs whatever loading it costs.
+        from ..server import _server_state
+
+        _server_state.systemone_model = jev_model
+        runtime_applied.append("systemone_model")
     if request.max_audio_upload_size is not None:
         from ..config import parse_size
 

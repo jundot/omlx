@@ -60,6 +60,14 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let sseKeepaliveMode: String?
         let autoStartOnLaunch: Bool?
         let maxAudioUploadSize: String?
+        /// Jev structured-read surface. Live: the gate is a per-request
+        /// dependency, so a saved change takes effect without a restart.
+        let systemoneEnabled: Bool?
+        let systemoneModel: String?
+        /// Picker options: block-diffusion checkpoints discovered on disk. Comes
+        /// from this response rather than `/jev/v1/models`, whose payload the
+        /// admin needs before it can decide to enable the feature.
+        let systemoneReadableModels: [String]?
     }
 
     struct ModelSettings: Codable, Equatable, Sendable {
@@ -224,6 +232,11 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var autoStartOnLaunch: Bool? = nil
     /// Human-readable cap such as `100MB` or `1GB`. Applied immediately.
     var maxAudioUploadSize: String? = nil
+
+    // Server — Jev structured reads. Applied live; see `ServerSettings`.
+    var systemoneEnabled: Bool? = nil
+    /// Diffusion model id, or `"auto"` to pick the newest diffusion model.
+    var systemoneModel: String? = nil
 
     // Claude Code (PR 9)
     var claudeCodeContextScalingEnabled: Bool? = nil

@@ -21,6 +21,28 @@ final class ServerScreenVM {
     /// Live switch; commits through `saveUsageHistory()` like the other
     /// auto-apply rows rather than the Apply button.
     var usageHistoryEnabled: Bool = true
+
+    /// Jev structured reads (`/jev/v1/*`). Live: the router is mounted at
+    /// startup and gated per request, so a saved change takes effect at once.
+    var systemoneEnabled: Bool = false
+    /// `"auto"` or a diffusion model id from `systemoneModelIds`.
+    var systemoneModel: String = "auto"
+    /// Eligible checkpoints from `server.systemone_readable_models`. Empty when
+    /// no diffusion model has been downloaded.
+    var systemoneModelIds: [String] = []
+
+    /// Popup options: a leading `Auto` sentinel + every eligible checkpoint.
+    var systemoneModelOptions: [(String, String)] {
+        var out: [(String, String)] = [
+            ("auto", String(localized: "server.advanced.systemone_model.auto",
+                             defaultValue: "Auto",
+                             comment: "Picker option: pick the newest diffusion model automatically"))
+        ]
+        for id in systemoneModelIds {
+            out.append((id, id))
+        }
+        return out
+    }
     private(set) var hasPendingDefaults = false
     @ObservationIgnored
     private var restoreBeforeReset: (() -> Void)?
@@ -81,6 +103,8 @@ final class ServerScreenVM {
             sseKeepaliveMode: sseKeepaliveMode,
             maxAudioUploadSizeText: maxAudioUploadSizeText,
             serverAliasesText: serverAliasesText,
+            systemoneEnabled: systemoneEnabled,
+            systemoneModel: systemoneModel,
             hfCacheEnabled: hfCacheEnabled,
             usageHistoryEnabled: usageHistoryEnabled,
             samplingContextText: samplingContextText,
@@ -103,6 +127,8 @@ final class ServerScreenVM {
                 self.sseKeepaliveMode = previous.sseKeepaliveMode
                 self.maxAudioUploadSizeText = previous.maxAudioUploadSizeText
                 self.serverAliasesText = previous.serverAliasesText
+                self.systemoneEnabled = previous.systemoneEnabled
+                self.systemoneModel = previous.systemoneModel
                 self.hfCacheEnabled = previous.hfCacheEnabled
                 self.usageHistoryEnabled = previous.usageHistoryEnabled
                 self.samplingContextText = previous.samplingContextText
@@ -121,6 +147,8 @@ final class ServerScreenVM {
             self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
             self.maxAudioUploadSizeText = dto.server.maxAudioUploadSize ?? "100MB"
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
+            self.systemoneEnabled = dto.server.systemoneEnabled ?? false
+            self.systemoneModel = dto.server.systemoneModel ?? "auto"
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
             self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
             if let s = dto.sampling {
@@ -167,6 +195,9 @@ final class ServerScreenVM {
             self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
             self.maxAudioUploadSizeText = dto.server.maxAudioUploadSize ?? "100MB"
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
+            self.systemoneEnabled = dto.server.systemoneEnabled ?? false
+            self.systemoneModel = dto.server.systemoneModel ?? "auto"
+            self.systemoneModelIds = dto.server.systemoneReadableModels ?? []
             let modelDirs = Self.cleanedModelDirs(
                 dto.model?.modelDirs ?? dto.model?.modelDir.map { [$0] } ?? []
             )
@@ -697,6 +728,14 @@ final class ServerScreenVM {
 
     func saveUsageHistory() {
         Task { await commit(GlobalSettingsPatch(usageHistory: usageHistoryEnabled)) }
+    }
+
+    func saveSystemOneEnabled() {
+        Task { await commit(GlobalSettingsPatch(systemoneEnabled: systemoneEnabled)) }
+    }
+
+    func saveSystemOneModel() {
+        Task { await commit(GlobalSettingsPatch(systemoneModel: systemoneModel)) }
     }
 
     func saveAutoStartOnLaunch(services: AppServices) {
