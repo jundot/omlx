@@ -283,7 +283,7 @@ def test_no_unreachable_functions_in_the_cluster_package():
     )
 
     uncalled = []
-    for path in sorted(_CLUSTER.glob("*.py")):
+    for path in sorted(_CLUSTER.rglob("*.py")):
         for name in _public_functions(path):
             hits = name_counts[name]
             if hits <= 1 and (path.name, name) not in allowed_uncalled:
@@ -299,7 +299,7 @@ def test_every_literal_ssh_and_scp_command_uses_the_shared_policy():
     """One raw subprocess is enough to bring an interactive prompt back."""
 
     offenders = []
-    for path in sorted(_CLUSTER.glob("*.py")):
+    for path in sorted(_CLUSTER.rglob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.List) or not node.elts:

@@ -2218,6 +2218,7 @@ def init_server(
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
+    from .cluster.rdma.store import configure_rdma_link_store
     from .cluster.registry import (
         configure_cluster_registry,
         configure_device_registry,
@@ -2227,6 +2228,7 @@ def init_server(
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
+    configure_rdma_link_store(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
     # Cluster v2: stable node identity + trusted device inventory. Best

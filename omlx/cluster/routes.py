@@ -102,6 +102,7 @@ from .planner import (
     synthetic_model_layout,
 )
 from .probe import collect_cluster_status
+from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
 from .identity import get_node_identity
 from .replan import (
@@ -4016,3 +4017,8 @@ async def load_cluster_deployment(deployment_id: str):
         "canary_completion_tokens": canary.completion_tokens,
         "ranks": status.get("ranks", []),
     }
+
+
+# RDMA links over MCDMA: inventory with live evidence, and on-demand verification.
+router.add_api_route("/rdma-links", cluster_rdma_links, methods=["GET"])
+router.add_api_route("/rdma-links/verify", cluster_rdma_link_verify, methods=["POST"])
