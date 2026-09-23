@@ -4,15 +4,129 @@
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from omlx.patches.mimo_v2.audio import (
+    AudioTokenizerEncoder,
     MiMoAudioProcessor,
+    _load_codebook_weights,
+    _LocalTransformer,
     group_audio_codes,
+    mel_spectrogram,
 )
 
 
-def test_group_audio_codes_pads_time_axis_with_zero_code():
+def test_mel_spectrogram_matches_torchaudio_power_default(monkeypatch):
+    import transformers.audio_utils as audio_utils
+
+    captured = {}
+    monkeypatch.setattr(
+        audio_utils,
+        "mel_filter_bank",
+        lambda **_kwargs: np.ones((5, 4), dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        audio_utils,
+        "window_function",
+        lambda *_args, **_kwargs: np.ones(8, dtype=np.float32),
+    )
+
+    def fake_spectrogram(*_args, **kwargs):
+        captured.update(kwargs)
+        return np.ones((4, 3), dtype=np.float32)
+
+    monkeypatch.setattr(audio_utils, "spectrogram", fake_spectrogram)
+    config = SimpleNamespace(
+        nfft=8,
+        sampling_rate=24_000,
+        n_mels=4,
+        fmin=0,
+        fmax=None,
+        window_size=8,
+        hop_length=2,
+    )
+
+    mel_spectrogram(np.zeros(16, dtype=np.float32), config)
+
+    assert captured["power"] == 2.0
+
+
+def test_audio_tokenizer_uses_reference_hybrid_attention_schedule():
+    encoder = AudioTokenizerEncoder(
+        {
+            "d_model": 8,
+            "encoder_attention_heads": 2,
+            "n_mels": 4,
+            "kernel_size": 3,
+            "stride_size": 2,
+            "hybrid_attention": True,
+            "swa_per_block": 2,
+            "encoder_attn_window_size": [128, 0],
+            "encoder_layers": 4,
+            "encoder_ffn_dim": 16,
+            "encoder_causal": True,
+            "encoder_skip_layer_id": 3,
+            "avg_pooler": 2,
+            "codebook_size": [8],
+            "num_quantizers": 2,
+            "rope_theta": 10_000,
+        }
+    )
+
+    assert [layer.self_attn.window_size for layer in encoder.layers] == [128, -1, 128, -1]
+
+
+def test_audio_bridge_local_transformer_uses_reference_causal_mask():
+    seen = []
+
+    class CapturingLayer(nn.Module):
+        def __call__(self, x, mask=None):
+            seen.append(mask)
+            return x
+
+    transformer = _LocalTransformer.__new__(_LocalTransformer)
+    nn.Module.__init__(transformer)
+    transformer.layers = [CapturingLayer()]
+    transformer.norm = nn.Identity()
+
+    transformer(mx.zeros((2, 4, 8)))
+
+    assert len(seen) == 1
+    assert seen[0].tolist() == [
+        [0.0, -1e9, -1e9, -1e9],
+        [0.0, 0.0, -1e9, -1e9],
+        [0.0, 0.0, 0.0, -1e9],
+        [0.0, 0.0, 0.0, 0.0],
+    ]
+
+
+def test_load_codebook_weights_installs_private_mlx_parameters():
+    layers = [
+        SimpleNamespace(_codebook=SimpleNamespace(embed=mx.zeros((2, 3))))
+        for _ in range(2)
+    ]
+    model = SimpleNamespace(
+        encoder=SimpleNamespace(
+            quantizer=SimpleNamespace(vq=SimpleNamespace(layers=layers))
+        )
+    )
+    first = mx.ones((2, 3))
+    second = mx.full((2, 3), 2)
+
+    _load_codebook_weights(
+        model,
+        {
+            "encoder.quantizer.vq.layers.0._codebook.embed": first,
+            "encoder.quantizer.vq.layers.1._codebook.embed": second,
+        },
+    )
+
+    assert mx.array_equal(layers[0]._codebook.embed, first)
+    assert mx.array_equal(layers[1]._codebook.embed, second)
+
+
+def test_group_audio_codes_pads_time_axis_by_repeating_last_code():
     codes = mx.arange(6 * 20).reshape(6, 20)
 
     grouped = group_audio_codes(codes)
@@ -21,7 +135,7 @@ def test_group_audio_codes_pads_time_axis_with_zero_code():
     assert grouped.shape == (2, 4, 20)
     assert grouped[0].tolist() == codes[:4].tolist()
     assert grouped[1, :2].tolist() == codes[4:].tolist()
-    assert grouped[1, 2:].tolist() == [[1024] * 20, [1024] * 20]
+    assert grouped[1, 2:].tolist() == [codes[-1].tolist(), codes[-1].tolist()]
 
 
 def test_audio_processor_expands_placeholders_and_returns_codes(monkeypatch):
@@ -74,7 +188,7 @@ def test_audio_processor_expands_placeholders_and_returns_codes(monkeypatch):
     assert result["audio_codes"][0].tolist() == [[1] * 20] * 4
     assert result["audio_codes"][1].tolist() == [[2] * 20] * 4
     assert result["audio_codes"][2, :1].tolist() == [[2] * 20]
-    assert result["audio_codes"][2, 1:].tolist() == [[1024] * 20] * 3
+    assert result["audio_codes"][2, 1:].tolist() == [[2] * 20] * 3
 
 
 def test_audio_processor_preserves_text_only_requests():

@@ -209,6 +209,17 @@ class AudioTokenizerEncoder(nn.Module):
         return self.quantizer.encode(x[0])
 
 
+def _load_codebook_weights(model: nn.Module, weights: dict[str, mx.array]) -> None:
+    """Install private ``_codebook`` tensors that MLX omits from parameters()."""
+    prefix = "encoder.quantizer.vq.layers."
+    suffix = "._codebook.embed"
+    for key, value in weights.items():
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        layer_index = int(key[len(prefix) : -len(suffix)])
+        model.encoder.quantizer.vq.layers[layer_index]._codebook.embed = value
+
+
 class MiMoAudioTokenizer(nn.Module):
     def __init__(self, config: dict[str, Any]):
         super().__init__()
@@ -225,7 +236,7 @@ class MiMoAudioTokenizer(nn.Module):
         for key, value in weights.items():
             if not key.startswith("encoder."):
                 continue
-            if ".quantizer." in key and not key.endswith("._codebook.embed"):
+            if ".quantizer." in key:
                 continue
             if key.endswith(
                 ("conv1.weight", "conv2.weight", "down_sample_layer.0.weight")
@@ -234,7 +245,11 @@ class MiMoAudioTokenizer(nn.Module):
                 value = value.transpose(0, 2, 1)
             keep[key] = value
         model.load_weights(list(keep.items()), strict=False)
-        mx.eval(model.parameters())
+        _load_codebook_weights(model, weights)
+        codebooks = [
+            layer._codebook.embed for layer in model.encoder.quantizer.vq.layers
+        ]
+        mx.eval(model.parameters(), codebooks)
         model.eval()
         return model
 
@@ -281,8 +296,17 @@ class _LocalTransformer(nn.Module):
         self.norm = nn.RMSNorm(1024, eps=1e-6)
 
     def __call__(self, x: mx.array) -> mx.array:
+        # Match the reference Qwen2Model path, which applies its standard causal
+        # decoder mask even though MiMo passes is_causal=False as an extra kwarg.
+        length = x.shape[1]
+        positions = mx.arange(length)
+        mask = mx.where(
+            positions[None, :] > positions[:, None],
+            mx.array(-1e9, dtype=x.dtype),
+            mx.array(0, dtype=x.dtype),
+        )
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, mask)
         return self.norm(x)
 
 
@@ -337,7 +361,8 @@ def mel_spectrogram(audio: np.ndarray, config: Any) -> mx.array:
         frame_length=int(config.window_size),
         hop_length=int(config.hop_length),
         fft_length=n_fft,
-        power=1.0,
+        # torchaudio.transforms.MelSpectrogram defaults to a power spectrum.
+        power=2.0,
         center=True,
         pad_mode="reflect",
         mel_filters=filters,
@@ -346,15 +371,14 @@ def mel_spectrogram(audio: np.ndarray, config: Any) -> mx.array:
     return mx.array(np.log(np.clip(mel, 1e-7, None)).astype(np.float32))
 
 
-def group_audio_codes(
-    codes: mx.array, group_size: int = 4, zero_index: int = 1024
-) -> mx.array:
+def group_audio_codes(codes: mx.array, group_size: int = 4) -> mx.array:
     if codes.ndim != 2 or codes.shape[1] != 20:
         raise ValueError(f"MiMo audio codes must have shape [T, 20], got {codes.shape}")
     remainder = codes.shape[0] % group_size
     if remainder:
-        codes = mx.pad(
-            codes, [(0, group_size - remainder), (0, 0)], constant_values=zero_index
+        pad_length = group_size - remainder
+        codes = mx.concatenate(
+            [codes, mx.repeat(codes[-1:], pad_length, axis=0)], axis=0
         )
     return codes.reshape(-1, group_size, 20)
 
