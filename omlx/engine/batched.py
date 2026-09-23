@@ -28,6 +28,7 @@ from .base import (
     _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
+    resolve_specprefill_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -1046,9 +1047,8 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
-        # SpecPrefill: forward per-request overrides to the engine, mirroring
-        # stream_generate so the non-streaming path is not silently ignored.
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        # SpecPrefill: per-request overrides, falling back to model settings
+        specprefill_kwargs = resolve_specprefill_kwargs(kwargs, self._model_settings)
         tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
@@ -1126,8 +1126,8 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
-        # SpecPrefill: pass per-request overrides to engine
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        # SpecPrefill: per-request overrides, falling back to model settings
+        specprefill_kwargs = resolve_specprefill_kwargs(kwargs, self._model_settings)
         tools = kwargs.pop("tools", None)
 
         engine = self._engine
