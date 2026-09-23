@@ -212,8 +212,17 @@ def test_language_adapter_translates_inputs_embeds_keyword():
             self.args = SimpleNamespace()
             self.calls = []
 
-        def __call__(self, input_ids, *, cache=None, input_embeddings=None):
-            self.calls.append((input_ids, cache, input_embeddings))
+        def __call__(
+            self,
+            input_ids,
+            *,
+            cache=None,
+            input_embeddings=None,
+            return_hidden=False,
+        ):
+            self.calls.append((input_ids, cache, input_embeddings, return_hidden))
+            if return_hidden:
+                return input_embeddings, input_embeddings
             return input_embeddings
 
         def make_cache(self):
@@ -232,12 +241,14 @@ def test_language_adapter_translates_inputs_embeds_keyword():
         logits_keep=1,
     )
 
-    assert result is embeddings
+    assert result[0] is embeddings
+    assert result[1] is embeddings
     assert len(target.calls) == 1
-    called_ids, called_cache, called_embeddings = target.calls[0]
+    called_ids, called_cache, called_embeddings, called_return_hidden = target.calls[0]
     assert called_ids is input_ids
     assert called_cache == ["active"]
     assert called_embeddings is embeddings
+    assert called_return_hidden is True
     assert adapter.make_cache() == ["cache"]
 
 

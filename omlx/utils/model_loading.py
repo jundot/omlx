@@ -371,7 +371,9 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
 
 def normalize_mimo_mxfp4_quant(cfg: dict) -> dict:
     """Keep official MiMo MXFP4 experts packed during model loading."""
-    if cfg.get("model_type") != "mimo_v2" or isinstance(cfg.get("quantization"), dict):
+    if cfg.get("model_type") not in {"mimo_v2", "mimo_v2_flash"} or isinstance(
+        cfg.get("quantization"), dict
+    ):
         return cfg
     qc = cfg.get("quantization_config") or {}
     if qc.get("store_dtype") == "mxfp4":
@@ -622,11 +624,11 @@ def maybe_apply_pre_load_patches(
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
 
-    if model_type == "mimo_v2":
+    if model_type in {"mimo_v2", "mimo_v2_flash"}:
         from ..patches.mimo_v2 import apply_mimo_v2_patch
 
         if apply_mimo_v2_patch():
-            logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
+            logger.info("MiMo V2 text pre-load patch applied for %s", model_name)
 
     if model_type == "bailing_hybrid":
         from ..patches.bailing_hybrid import apply_bailing_hybrid_patch
@@ -1192,22 +1194,24 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     LLM, and vision is silently dropped (issue #1426).
 
     Reads ``model.safetensors.index.json`` when present (no shard I/O).
-    Falls back to the first safetensors shard's metadata header. Returns
-    False when neither resolves — callers treat that as "no MTP weights"
-    (the conservative choice: skip MTPModule attachment).
+    Falls back to safetensors metadata headers, including MiMo's separate
+    ``mtp/model_mtp.safetensors`` sidecar. If neither contains MTP weights,
+    callers skip attaching the MTP module.
     """
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
-    return _checkpoint_weight_prefix(model_path, prefixes) is not None
+    if _checkpoint_weight_prefix(model_path, prefixes) is not None:
+        return True
+    return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
-    """Decide whether the native MTP patch can be applied to this model.
+    """Decide whether the Lightning MTP patch can be applied to this model.
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
-    fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
-    only). The model also has to declare MTP heads in the config; otherwise
-    the patch is a no-op.
+    fork PR 15), MiMo V2/2.6 Flash, GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids
+    (nemotron_h) and Gemma 4 merged-assistant checkpoints (gemma4 and
+    gemma4_unified, VLM path only). The model also has to declare MTP heads in
+    the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -1217,6 +1221,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+        or model_type in ("mimo_v2", "mimo_v2_flash")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
         or model_type == "glm5_next"
@@ -1238,10 +1243,16 @@ def load_text_model(
         if model_settings is not None
         else False
     )
+    load_kwargs = {}
+    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
+    if mtp_sidecar.is_file():
+        load_kwargs["model_config"] = {"omlx_mtp_sidecar": str(mtp_sidecar)}
+        logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
     return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,
         trust_remote_code=trust_remote_code,
+        **load_kwargs,
     )
 
 

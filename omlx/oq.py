@@ -251,7 +251,7 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
         _is_deepseek_v4_config(config)
         or config.get("model_type") == "bailing_hybrid"
         or (
-            config.get("model_type") == "mimo_v2"
+            config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}
             and quantization_config.get("store_dtype") == "mxfp4"
         )
     )
@@ -3256,15 +3256,17 @@ def validate_quantizable(config: dict) -> bool:
     return True
 
 
-def _sensitivity_lm_config_override(config: dict) -> dict | None:
-    """Return a model_config override for mlx_lm.load when the model has a
-    QAT quantization_config that mlx-lm cannot process (missing quant_method).
-
-    mlx-lm does ``quantization_config["quant_method"]`` without a fallback, so
-    QAT configs (e.g. Google Gemma 4 QAT) raise KeyError and abort the load.
-    Passing ``{"quantization_config": None}`` via model_config causes
-    config.update() to replace the offending key before that branch runs.
-    """
+def _sensitivity_lm_config_override(
+    config: dict, model_path: str | Path | None = None
+) -> dict | None:
+    """Include MiMo sidecars and bypass unsupported QAT metadata during calibration."""
+    if model_path is not None and config.get("model_type") in {
+        "mimo_v2",
+        "mimo_v2_flash",
+    }:
+        sidecar = Path(model_path) / "mtp" / "model_mtp.safetensors"
+        if sidecar.is_file():
+            return {"omlx_mtp_sidecar": str(sidecar)}
     for qc in (
         config.get("quantization_config"),
         config.get("text_config", {}).get("quantization_config"),
@@ -3310,7 +3312,7 @@ def estimate_bpw_and_size(
     with open(config_path) as f:
         config = json.load(f)
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _source_weight_files(source)
     if not weight_files:
         return {
             "effective_bpw": float(oq_level),
@@ -3556,7 +3558,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
-    source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
+    source_total = sum(sf.stat().st_size for sf in _source_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
@@ -3632,6 +3634,17 @@ def _metal_available_memory_bytes() -> int:
     return max(0, max_working_set - active)
 
 
+def _source_weight_files(model_path: str | Path) -> list[Path]:
+    source = Path(model_path)
+    files = sorted(source.glob("*.safetensors"))
+    sidecar = source / "mtp" / "model_mtp.safetensors"
+    if sidecar.is_file():
+        config = json.loads((source / "config.json").read_text())
+        if config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}:
+            files.append(sidecar)
+    return files
+
+
 def _checkpoint_storage_bytes(weight_files) -> int:
     """Return the complete on-disk size of checkpoint weight shards.
 
@@ -3660,7 +3673,7 @@ def _calibration_resident_checkpoint_bytes(
     layer walk invokes neither the vision tower nor the ordinary ``lm_head``.
     Safetensors headers and every other tensor remain charged to the model.
     """
-    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    weight_files = _source_weight_files(model_path)
     checkpoint_bytes = _checkpoint_storage_bytes(weight_files)
     if not _is_qwen4_exp_config(config):
         return checkpoint_bytes
@@ -4298,7 +4311,7 @@ def _build_model_sanitizer(
             except Exception as patch_err:
                 logger.debug(f"hy_v3 patch not applied: {patch_err}")
 
-        if config.get("model_type") == "mimo_v2":
+        if config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}:
             try:
                 from omlx.patches.mimo_v2 import apply_mimo_v2_patch
 
@@ -4648,7 +4661,7 @@ class _LazyTensorIndex:
         self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
         self._mimo_mxfp4 = bool(
             config
-            and config.get("model_type") == "mimo_v2"
+            and config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}
             and (config.get("quantization_config") or {}).get("store_dtype") == "mxfp4"
         )
         self._index = {}
@@ -5233,7 +5246,7 @@ def _progress_total_bytes(all_weights, source: Path) -> int:
     lets progress exceed 100% and makes ETA negative.
     """
     candidates = [
-        sum(sf.stat().st_size for sf in source.glob("*.safetensors")),
+        sum(sf.stat().st_size for sf in _source_weight_files(source)),
     ]
 
     if hasattr(all_weights, "nbytes"):
@@ -5284,9 +5297,9 @@ def _source_imatrix_signature(
     stable_config = {k: v for k, v in config.items() if not str(k).startswith("_oq_")}
     cfg_bytes = json.dumps(stable_config, sort_keys=True, default=str).encode("utf-8")
     h = hashlib.sha256(cfg_bytes)
-    for sf in sorted(source.glob("*.safetensors")):
+    for sf in _source_weight_files(source):
         st = sf.stat()
-        h.update(sf.name.encode("utf-8"))
+        h.update(str(sf.relative_to(source)).encode("utf-8"))
         h.update(str(st.st_size).encode("ascii"))
         h.update(str(int(st.st_mtime_ns)).encode("ascii"))
     calib_hash = ""
@@ -6057,7 +6070,7 @@ def quantize_oq_streaming(
 
     cb("loading", 5.0, "Reading model config")
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _source_weight_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
@@ -8029,14 +8042,9 @@ def _collect_mtp_head_imatrix(
     hidden,
     dspark_hiddens=None,
 ) -> bool:
-    """Run the MTP head over a calibration micro-batch.
+    """Collect head activations with shifted tokens and decode-time normalization.
 
-    The trunk-layer walk never invokes the head, so without this pass every
-    ``mtp.*`` linear lands in the imatrix "missing" list and gets quantized
-    without calibration — measurably hurting draft acceptance. Mirrors the
-    decode-time contract: fuse the trunk's post-norm hidden at position t
-    with the embedding of token t+1 (the head's own input RMSNorms make the
-    residual pre/post-norm difference negligible for activation statistics).
+    The trunk-layer walk does not invoke MTP heads, so they need a separate pass.
     """
     inner = getattr(model, "language_model", None) or model
     mtp = getattr(inner, "mtp", None)
@@ -8100,7 +8108,9 @@ def _collect_mtp_head_imatrix(
             from mlx_lm.models.cache import KVCache
 
             mtp_cache = [KVCache() for _ in mtp.layers]
-        h = norm(hidden[:, :-1, :])
+        h = hidden[:, :-1, :]
+        if not getattr(inner, "_omlx_mtp_head_prenorm", False):
+            h = norm(h)
         out = mtp(h, batch[:, 1:], embed, mtp_cache)
         mx.eval(out)
         return True
@@ -8285,10 +8295,7 @@ def _collect_imatrix_from_model(
                 _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
                 _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
 
-                # MTP-head pass: the layer walk above leaves ``inputs`` as
-                # the final-layer hidden states; feed them (post-norm) plus
-                # the shifted token ids through the head so its linears
-                # contribute imatrix entries too.
+                # Match the head's decode-time hidden-state normalization.
                 if _collect_mtp_head_imatrix(
                     model,
                     batch,
@@ -8490,7 +8497,7 @@ def _streamed_source_plan(
     own instance instead of sharing the quantize loop's. The rebuild is
     header-only and costs seconds.
     """
-    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    weight_files = _source_weight_files(model_path)
     if not weight_files:
         raise FileNotFoundError(f"no safetensors shards under {model_path}")
     lazy_index = _LazyTensorIndex(weight_files, config=config)
@@ -9410,7 +9417,7 @@ def _collect_imatrix(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
-                model_config=_sensitivity_lm_config_override(config),
+                model_config=_sensitivity_lm_config_override(config, model_path),
             )
     except Exception as e:
         logger.error("oQe imatrix: model load failed (%s)", e)
@@ -9808,7 +9815,7 @@ def _measure_sensitivity(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
-                model_config=_sensitivity_lm_config_override(config),
+                model_config=_sensitivity_lm_config_override(config, model_path),
             )
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")
@@ -9996,7 +10003,7 @@ def _build_streaming_proxy_for_sensitivity(
     _validate_oq_dtype_for_model(config, dtype)
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _source_weight_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
