@@ -363,11 +363,12 @@ OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
 The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
 
 
-All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
-Set the main API key before changing the server host to a LAN address or
-`0.0.0.0`, or save both settings together. oMLX refuses to start on any
-non-loopback address without an API key, and API key verification can only be
-skipped for loopback-only binds.
+Most settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. The existing `skip_api_key_verification` option remains restricted to loopback-only binds.
+
+To allow clients to use inference without sending an API key, stop the server, edit `auth.allow_unauthenticated_inference` to `true` in `settings.json`, and restart. Startup adds this field with a default of `false` if it is missing. This option is available only through the settings file, not the admin UI, CLI flags, or environment variables. Keep `skip_api_key_verification` set to `false` and keep a main API key configured for management access on network binds.
+
+This opt-in permits anyone who can reach the server to use model listing, Chat/Completions, Messages and token counting, Embeddings, Rerank, Responses (including stored response retrieval, continuation, and deletion), audio including realtime transcription, MCP tools, and web search/page fetching without authentication. Stored Responses are shared; response IDs are not an authorization boundary. MCP tools run with their configured server permissions, and web tools use the server's network access and provider credentials. Only enable this option when you intend to expose these capabilities to every client that can connect. It does not restrict access to LAN clients or change the bind address. Admin endpoints, operational status, and explicit model load/unload retain their existing authentication.
 
 <details>
 <summary>Architecture</summary>

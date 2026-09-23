@@ -605,3 +605,115 @@ class TestRejectedKeyFingerprint:
             assert fingerprint_key(bad_key) in rejection_logs
         finally:
             _server_state.api_key = original_key
+
+
+class TestUnauthenticatedInference:
+    @pytest.fixture
+    def configured_server(self, monkeypatch, tmp_path):
+        from omlx import server
+        from omlx.admin import auth
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "management-key"
+        settings.auth.allow_unauthenticated_inference = True
+        monkeypatch.setattr(server._server_state, "global_settings", settings)
+        monkeypatch.setattr(server._server_state, "api_key", "management-key")
+        monkeypatch.setattr(server._server_state, "bind_host", "0.0.0.0")
+        monkeypatch.setattr(auth, "_get_global_settings", lambda: settings)
+        return server, settings
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/embeddings",
+            "/v1/rerank",
+            "/v1/responses",
+            "/v1/audio/speech",
+        ],
+    )
+    def test_http_inference_auth_gate(self, configured_server, path):
+        server, settings = configured_server
+        client = TestClient(server.app)
+        settings.auth.allow_unauthenticated_inference = False
+        assert client.post(path, json={}).status_code == 401
+        response = client.post(
+            path, json={}, headers={"Authorization": "Bearer management-key"}
+        )
+        assert response.status_code == 422
+        settings.auth.allow_unauthenticated_inference = True
+        # An empty payload reaches request validation only after auth succeeds.
+        assert client.post(path, json={}).status_code == 422
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("GET", "/api/status"),
+            ("GET", "/v1/models/status"),
+            ("POST", "/v1/models/example/load"),
+            ("POST", "/v1/models/example/unload"),
+            ("GET", "/admin/api/global-settings"),
+            ("POST", "/admin/api/server/restart"),
+        ],
+    )
+    def test_management_routes_still_reject_anonymous_requests(
+        self, configured_server, method, path
+    ):
+        server, _ = configured_server
+        response = TestClient(server.app).request(method, path)
+        assert response.status_code == 401
+
+    def test_tool_routes_execute_without_key(self, configured_server, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from omlx.api import mcp_routes, websearch_routes
+
+        server, _ = configured_server
+        result = SimpleNamespace(
+            tool_name="example", content=[], is_error=False, error_message=None
+        )
+        manager = SimpleNamespace(execute_tool=AsyncMock(return_value=result))
+        monkeypatch.setattr(mcp_routes, "_get_mcp_manager", lambda: manager)
+        search = AsyncMock(return_value={"ok": True, "results": []})
+        monkeypatch.setattr(websearch_routes, "run_web_search", search)
+        monkeypatch.setattr(
+            websearch_routes,
+            "_get_global_settings",
+            lambda: server._server_state.global_settings,
+        )
+        client = TestClient(server.app)
+        response = client.post(
+            "/v1/mcp/execute", json={"tool_name": "example", "arguments": {}}
+        )
+        assert response.status_code == 200
+        manager.execute_tool.assert_awaited_once_with("example", {})
+        assert client.post("/v1/web/search", json={"query": "example"}).json()["ok"]
+        search.assert_awaited_once()
+
+    def test_stored_responses_can_be_read_and_deleted(
+        self, configured_server, monkeypatch
+    ):
+        from omlx.api.responses_utils import ResponseStore
+
+        server, _ = configured_server
+        store = ResponseStore()
+        store.put("resp_test", {"id": "resp_test", "object": "response"})
+        monkeypatch.setattr(server._server_state, "responses_store", store)
+        client = TestClient(server.app)
+        assert client.get("/v1/responses/resp_test").json()["id"] == "resp_test"
+        assert client.delete("/v1/responses/resp_test").json()["deleted"] is True
+        assert client.get("/v1/responses/resp_test").status_code == 404
+
+    def test_realtime_audio_uses_manual_opt_in(self, configured_server):
+        from omlx.api.audio_routes import _verify_ws_api_key
+
+        _, settings = configured_server
+        assert _verify_ws_api_key(None) is True
+        settings.auth.allow_unauthenticated_inference = False
+        assert _verify_ws_api_key(None) is False
+        assert _verify_ws_api_key("management-key") is True

@@ -1634,3 +1634,15 @@ class TestSavedNetworkAuthMigration:
         with pytest.raises(SystemExit):
             _migrate_saved_network_auth(self.load(), self.args)
         assert self.path.read_bytes() == before
+
+    def test_inference_opt_in_keeps_authenticated_network_bind(self):
+        self.data["auth"].update(
+            skip_api_key_verification=False, allow_unauthenticated_inference=True
+        )
+        before = self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        self.prompt.assert_not_called()
+        assert self.path.read_bytes() == before
+        assert settings.server.host == "0.0.0.0"
+        assert settings.validate() == []
