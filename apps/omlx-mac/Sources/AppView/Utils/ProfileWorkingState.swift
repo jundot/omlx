@@ -186,6 +186,8 @@ enum ProfileSettingsKey {
     static let vlmMtpEnabled = "vlm_mtp_enabled"
     static let vlmMtpDraftModel = "vlm_mtp_draft_model"
     static let vlmMtpDraftBlockSize = "vlm_mtp_draft_block_size"
+    static let moeExpertOffloadEnabled = "moe_expert_offload_enabled"
+    static let moeExpertOffloadResidentFraction = "moe_expert_offload_resident_fraction"
 }
 
 /// Resolves the *display* scope for the model's currently active profile.
