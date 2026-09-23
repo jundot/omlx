@@ -48,6 +48,26 @@ class MiMoLanguageAdapter(nn.Module):
     def layers(self):
         return self.target.layers
 
+    @property
+    def _omlx_mtp_decode_enabled(self):
+        return getattr(self.target, "_omlx_mtp_decode_enabled", False)
+
+    @property
+    def _omlx_mtp_chain(self):
+        return getattr(self.target, "_omlx_mtp_chain", False)
+
+    @property
+    def _omlx_mtp_depth(self):
+        return getattr(self.target, "_omlx_mtp_depth", 1)
+
+    @property
+    def _omlx_mtp_head_clone(self):
+        return getattr(self.target, "_omlx_mtp_head_clone", False)
+
+    @property
+    def _omlx_mtp_head_prenorm(self):
+        return getattr(self.target, "_omlx_mtp_head_prenorm", False)
+
     def make_cache(self):
         return self.target.make_cache()
 
@@ -58,16 +78,22 @@ class MiMoLanguageAdapter(nn.Module):
         inputs_embeds: mx.array | None = None,
         **kwargs,
     ):
-        kwargs.pop("return_hidden", None)
+        return_hidden = bool(kwargs.pop("return_hidden", False))
         kwargs.pop("logits_keep", None)
+        n_confirmed = int(kwargs.pop("n_confirmed", 0) or 0)
+        target_kwargs = {"cache": cache}
+        if return_hidden:
+            target_kwargs["return_hidden"] = True
+        if n_confirmed:
+            target_kwargs["n_confirmed"] = n_confirmed
         if inputs_embeds is None:
-            return self.target(input_ids, cache=cache)
+            return self.target(input_ids, **target_kwargs)
         if self._accepts_input_embeddings:
             # The vendored ``mimo_v2`` model already exposes this seam.
             return self.target(
                 input_ids,
-                cache=cache,
                 input_embeddings=inputs_embeds,
+                **target_kwargs,
             )
 
         # mlx-lm's released ``mimo_v2_flash`` model does not expose an
@@ -95,8 +121,15 @@ class MiMoLanguageAdapter(nn.Module):
         for layer, layer_cache in zip(language_model.layers, cache):
             mask = sliding_mask if layer.is_sliding_window else full_mask
             hidden_states = layer(hidden_states, mask, cache=layer_cache)
+        hidden = hidden_states
         hidden_states = language_model.norm(hidden_states)
-        return self.target.lm_head(hidden_states)
+        if getattr(self.target.args, "tie_word_embeddings", False):
+            logits = language_model.embed_tokens.as_linear(hidden_states)
+        else:
+            logits = self.target.lm_head(hidden_states)
+        if return_hidden:
+            return logits, hidden
+        return logits
 
     def get_mtp_module(self):
         getter = getattr(self.target, "get_mtp_module", None)
@@ -105,6 +138,11 @@ class MiMoLanguageAdapter(nn.Module):
     def make_mtp_cache(self):
         method = getattr(self.target, "make_mtp_cache", None)
         return method() if callable(method) else []
+
+    def mtp_begin_cycle(self, *args, **kwargs):
+        method = getattr(self.target, "mtp_begin_cycle", None)
+        if callable(method):
+            return method(*args, **kwargs)
 
     def mtp_forward(self, *args, **kwargs):
         return self.target.mtp_forward(*args, **kwargs)

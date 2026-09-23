@@ -61,6 +61,7 @@ class ModelArgs(BaseModelArgs):
     attention_value_scale: Optional[float] = None
     rope_scaling: Optional[Dict[str, Any]] = None
     tie_word_embeddings: bool = False
+    num_nextn_predict_layers: int = 0
 
     def __post_init__(self):
         n = self.num_hidden_layers
@@ -269,6 +270,60 @@ class DecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
+class MiMoV2MTPLayer(nn.Module):
+    """One checkpoint-native MiMo next-token predictor head."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        hidden = config.hidden_size
+        self.enorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.hnorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.eh_proj = nn.Linear(2 * hidden, hidden, bias=False)
+        self.input_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.self_attn = Attention(config, is_sliding_window=True)
+        self.pre_mlp_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.mlp = MLP(config)
+        self.final_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.sliding_window_size = config.sliding_window_size
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        token_embeddings: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        x = self.eh_proj(
+            mx.concatenate(
+                [self.enorm(token_embeddings), self.hnorm(hidden_states)], axis=-1
+            )
+        )
+        mask = create_attention_mask(
+            x,
+            cache,
+            window_size=self.sliding_window_size,
+        )
+        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        h = h + self.mlp(self.pre_mlp_layernorm(h))
+        return self.final_layernorm(h)
+
+
+class MiMoV2MultiTokenPredictor(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.layers = [
+            MiMoV2MTPLayer(config)
+            for _ in range(int(config.num_nextn_predict_layers or 0))
+        ]
+
+
+class _MiMoMTPCache(list):
+    """Per-head caches plus the current predictor index for one draft cycle."""
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.layer_idx = 0
+
+
 class MiMoV2Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -291,7 +346,8 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
-    ) -> mx.array:
+        return_hidden: bool = False,
+    ) -> Any:
         h = (
             input_embeddings
             if input_embeddings is not None
@@ -337,7 +393,10 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(h)
+        normed = self.norm(h)
+        if return_hidden:
+            return normed, h
+        return normed
 
 
 class Model(nn.Module):
@@ -349,24 +408,93 @@ class Model(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        from omlx.patches.mlx_lm_mtp import get_mtp_depth, is_mtp_active
+
+        n_mtp = int(config.num_nextn_predict_layers or 0)
+        self._omlx_mtp_decode_enabled = bool(n_mtp and is_mtp_active())
+        if self._omlx_mtp_decode_enabled:
+            self.model.mtp = MiMoV2MultiTokenPredictor(config)
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = min(int(get_mtp_depth()), n_mtp)
+            self._omlx_mtp_head_clone = False
+            self._omlx_mtp_rowwise_unsupported = True
+            self._omlx_mtp_head_prenorm = True
+
+    @property
+    def mtp(self):
+        return self.model.mtp
+
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        del n_confirmed
+        result = self.model(
+            inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+        )
+        if return_hidden:
+            out, hidden = result
+        else:
+            out = result
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def mtp_begin_cycle(self, mtp_cache, depth):
+        del depth
+        if isinstance(mtp_cache, _MiMoMTPCache):
+            mtp_cache.layer_idx = 0
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        layer_idx = getattr(mtp_cache, "layer_idx", 0) % len(self.mtp.layers)
+        cache = mtp_cache[layer_idx] if mtp_cache else None
+        token_embeddings = self.model.embed_tokens(next_token_ids)
+        hidden = self.mtp.layers[layer_idx](hidden_states, token_embeddings, cache)
+        if isinstance(mtp_cache, _MiMoMTPCache):
+            mtp_cache.layer_idx = layer_idx + 1
+        logits_source = hidden[:, -logits_keep:] if logits_keep else hidden
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def make_mtp_cache(self):
+        if not hasattr(self.model, "mtp"):
+            return _MiMoMTPCache()
+        return _MiMoMTPCache(
+            RotatingKVCache(max_size=self.args.sliding_window_size)
+            for _ in self.mtp.layers
+        )
 
     def sanitize(self, weights):
         skip_prefixes = (
-            "model.mtp.",
             "visual.",
             "audio_encoder.",
             "speech_embeddings.",
         )
+        if not hasattr(self.model, "mtp"):
+            skip_prefixes += ("model.mtp.",)
         weights = {k: v for k, v in weights.items() if not k.startswith(skip_prefixes)}
 
         BS = FUSED_QKV_BLOCK_SIZE
@@ -405,6 +533,25 @@ class Model(nn.Module):
                 n_kv=n_kv,
                 hd=hd,
                 vhd=vhd,
+            )
+            weights[f"{prefix}.q_proj.weight"] = q
+            weights[f"{prefix}.k_proj.weight"] = k
+            weights[f"{prefix}.v_proj.weight"] = v
+
+        for layer_idx in range(int(self.args.num_nextn_predict_layers or 0)):
+            prefix = f"model.mtp.layers.{layer_idx}.self_attn"
+            qkv_key = f"{prefix}.qkv_proj.weight"
+            scale_key = f"{qkv_key}_scale_inv"
+            if qkv_key not in weights or scale_key not in weights:
+                continue
+            q, k, v = split_fused_qkv(
+                weights.pop(qkv_key),
+                weights.pop(scale_key),
+                tp=TP,
+                n_h=self.args.swa_num_attention_heads,
+                n_kv=self.args.swa_num_key_value_heads,
+                hd=self.args.swa_head_dim,
+                vhd=self.args.swa_v_head_dim,
             )
             weights[f"{prefix}.q_proj.weight"] = q
             weights[f"{prefix}.k_proj.weight"] = k

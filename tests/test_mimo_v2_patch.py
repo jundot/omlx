@@ -140,8 +140,15 @@ def test_sanitize_handles_fused_fp8_and_text_only_weights():
         num_hidden_layers=2,
         hybrid_layer_pattern=[0, 1],
         moe_layer_freq=[0, 1],
+        num_nextn_predict_layers=1,
     )
-    model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
 
     weights = {
         "model.layers.0.self_attn.qkv_proj.weight": mx.to_fp8(mx.ones((240, 128))),
@@ -152,6 +159,10 @@ def test_sanitize_handles_fused_fp8_and_text_only_weights():
         "audio_encoder.ignored": mx.ones((1,)),
         "speech_embeddings.ignored": mx.ones((1,)),
         "model.mtp.ignored": mx.ones((1,)),
+        "model.mtp.layers.0.self_attn.qkv_proj.weight": mx.to_fp8(
+            mx.ones((240, 128))
+        ),
+        "model.mtp.layers.0.self_attn.qkv_proj.weight_scale_inv": mx.ones((2, 1)),
     }
     for projection, shape in (
         ("gate_proj", (64, 128)),
@@ -174,12 +185,86 @@ def test_sanitize_handles_fused_fp8_and_text_only_weights():
         64,
         128,
     )
+    assert "model.mtp.ignored" in sanitized
+    assert sanitized["model.mtp.layers.0.self_attn.q_proj.weight"].shape == (
+        128,
+        128,
+    )
+    assert sanitized["model.mtp.layers.0.self_attn.k_proj.weight"].shape == (64, 128)
+    assert sanitized["model.mtp.layers.0.self_attn.v_proj.weight"].shape == (48, 128)
     assert not any(
-        key.startswith(
-            ("visual.", "audio_encoder.", "speech_embeddings.", "model.mtp.")
-        )
+        key.startswith(("visual.", "audio_encoder.", "speech_embeddings."))
         for key in sanitized
     )
+
+    inactive = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    assert "model.mtp.ignored" not in inactive.sanitize(
+        {"model.mtp.ignored": mx.ones((1,))}
+    )
+
+
+def test_native_mtp_heads_forward_and_adapter_contract():
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mimo_v2.omnimodal import MiMoLanguageAdapter
+    from omlx.patches.mlx_lm_mtp import (
+        set_mtp_active,
+        set_mtp_depth,
+    )
+
+    set_mtp_active(True)
+    set_mtp_depth(3)
+    try:
+        args = mimo_v2.ModelArgs.from_dict(
+            _minimal_config(num_nextn_predict_layers=3)
+        )
+        model = mimo_v2.Model(args)
+    finally:
+        set_mtp_active(False)
+        set_mtp_depth(1)
+
+    assert len(model.mtp.layers) == 3
+    assert model._omlx_mtp_decode_enabled is True
+    assert model._omlx_mtp_depth == 3
+
+    cache = model.make_cache()
+    logits, hidden = model(
+        mx.array([[1, 2]]), cache=cache, return_hidden=True
+    )
+    assert logits.shape == (1, 2, 1000)
+    assert hidden.shape == (1, 2, 128)
+
+    mtp_cache = model.make_mtp_cache()
+    assert len(mtp_cache) == 3
+    model.mtp_begin_cycle(mtp_cache, 3)
+    first_logits, first_hidden = model.mtp_forward(
+        hidden,
+        mx.array([[2, 3]]),
+        mtp_cache,
+        return_hidden=True,
+        logits_keep=1,
+    )
+    assert first_logits.shape == (1, 1, 1000)
+    assert first_hidden.shape == (1, 2, 128)
+    assert mtp_cache.layer_idx == 1
+
+    second_logits = model.mtp_forward(
+        first_hidden[:, -1:], mx.array([[4]]), mtp_cache
+    )
+    mx.eval(logits, first_logits, second_logits)
+    assert second_logits.shape == (1, 1, 1000)
+    assert mtp_cache.layer_idx == 2
+
+    adapter = MiMoLanguageAdapter(model)
+    assert adapter._omlx_mtp_decode_enabled is True
+    assert adapter._omlx_mtp_chain is True
+    adapter.mtp_begin_cycle(mtp_cache, 3)
+    assert mtp_cache.layer_idx == 0
+    adapter_logits, adapter_hidden = adapter(
+        mx.array([[5]]), cache=model.make_cache(), return_hidden=True
+    )
+    mx.eval(adapter_logits, adapter_hidden)
+    assert adapter_logits.shape == (1, 1, 1000)
+    assert adapter_hidden.shape == (1, 1, 128)
 
 
 def test_pre_load_dispatch_calls_mimo_patch(tmp_path, monkeypatch):
@@ -209,7 +294,7 @@ def test_multimodal_mimo_is_explicitly_routed_to_text_engine(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         assert detect_model_type(tmp_path) == "llm"
 
-    assert "text-only" in caplog.text
+    assert "using the LLM engine" in caplog.text
 
 
 def test_oq_uses_mlx_lm_sanitizer_for_multimodal_mimo(monkeypatch):
