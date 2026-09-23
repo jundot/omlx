@@ -2760,6 +2760,23 @@ class Scheduler:
     # cached prefixes floor to 2048-token multiples instead of 512.
     _POOLING_ROTATING_BLOCK_SIZE = 2048
 
+    def _is_mimo_hybrid(self) -> bool:
+        """MiMo hybrid MoE (standard softmax attn + rotating KV).
+
+        Wides prefill blocks so gather_qmm tiles fill at realistic
+        skewed top-k routing. Detected by model family name.
+        """
+        for target in (self.model, getattr(self.model, "model", None)):
+            if target is None:
+                continue
+            mt = str(getattr(target, "model_type", "") or "")
+            if not mt:
+                mt = str(getattr(getattr(target, "config", None),
+                               "model_type", "") or "")
+            if "mimo" in mt.lower():
+                return True
+        return False
+
     def _align_block_size_with_rotating_window(self) -> None:
         """
         Align paged cache block size to a multiple of RotatingKVCache
@@ -2796,7 +2813,12 @@ class Scheduler:
         # If window_size itself is already >= max, just use window_size.
         lo = self._ROTATING_BLOCK_SIZE_MIN
         hi = self._ROTATING_BLOCK_SIZE_MAX
-        if self._detect_pooling_cache():
+        if self._detect_pooling_cache() or self._is_mimo_hybrid():
+            # MiMo hybrid MoE: skewed top-8 routing leaves ~10 rows
+            # per expert at a 512-token chunk, so the gather_qmm BM
+            # tiles mostly compute padding; a 2048-token chunk fills
+            # them for a measured ~+34% MoE prefill throughput on
+            # M3 Ultra. 2048 is a multiple of the 128 window.
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
 
         if window_size >= hi or window_size >= lo:
