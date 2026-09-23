@@ -71,8 +71,13 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
             multi_eligible,
         )
 
-        if multi_eligible(attn.wo_a, prepared[0]):
-            projected = finish(exact_verify_multi_qmv(attn.wo_a, prepared[0])[None])
+        batch, groups, length, width = prepared.shape
+        grouped = prepared.transpose(1, 0, 2, 3).reshape(groups, batch * length, width)
+        if multi_eligible(attn.wo_a, grouped):
+            projected = exact_verify_multi_qmv(attn.wo_a, grouped)
+            projected = finish(
+                projected.reshape(groups, batch, length, -1).transpose(1, 0, 2, 3)
+            )
         else:
             projected = mx.concatenate(
                 [

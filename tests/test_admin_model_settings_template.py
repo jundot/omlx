@@ -22,7 +22,9 @@ def _dashboard_script() -> str:
 
 def _status_template() -> str:
     root = Path(__file__).resolve().parents[1]
-    return (root / "omlx/admin/templates/dashboard/_status.html").read_text()
+    return (
+        root / "omlx/admin/templates/dashboard/blocks/_active_models.html"
+    ).read_text()
 
 
 def _section(html: str, start_marker: str, end_marker: str) -> str:
@@ -78,7 +80,7 @@ def test_reasoning_effort_has_presets_and_custom_input():
 
     assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
     assert ':value="value" x-text="value"' in section
-    assert '!selectedModel?.reasoning_effort_custom && !entry.custom' in section
+    assert "!selectedModel?.reasoning_effort_custom && !entry.custom" in section
 
 
 def test_reasoning_effort_add_guard_covers_custom_entries():
@@ -272,22 +274,52 @@ def test_qwen_ane_web_defaults_match_configured_profile():
         "_resetPresetApplicableFields()", 1
     )[0]
 
-    assert "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048" in state
+    assert (
+        "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048"
+        in state
+    )
     assert (
         "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53"
         in state
     )
-    assert "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
-    assert "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
+    assert (
+        "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
+    )
+    assert (
+        "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
+    )
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
-    assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
-    assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state
-    assert "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false" in state
-    assert "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135" in state
-    assert "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0" in state
-    assert "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0" in state
-    assert "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
-    assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
+    assert (
+        "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0"
+        in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
+    )
+    assert (
+        "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false"
+        in state
+    )
 
 
 def test_js_embedded_translations_escape_apostrophes():
@@ -297,9 +329,7 @@ def test_js_embedded_translations_escape_apostrophes():
     # chain instead of interpolating the raw translation.
     import re
 
-    unsafe = re.findall(
-        r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
-    )
+    unsafe = re.findall(r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template())
     assert unsafe == []
 
 
@@ -395,12 +425,16 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
         catalog = json.loads(path.read_text())
         missing = set(english) - set(catalog)
         assert not missing, f"{path.name} is missing {sorted(missing)}"
-        # Extraction only: every locale renders the English source, exactly as
-        # the button did before. Translations land in the companion PR.
+        if path.name == "zh.json":
+            # Simplified Chinese carries its own labels; every other locale
+            # keeps the English fallback until its own translation lands.
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
+            continue
         for key, value in english.items():
-            assert catalog[key] == value, (
-                f"{path.name} {key} is not the English fallback"
-            )
+            assert (
+                catalog[key] == value
+            ), f"{path.name} {key} is not the English fallback"
 
 
 def test_moe_expert_offload_toggle_blocks_speculative_decoding():
@@ -408,7 +442,7 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     html = _model_settings_template()
     section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
     assert "modelSettings.moe_expert_offload_enabled" in section
-    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert "modelSettings.moe_expert_offload_resident_percent" in section
     assert ":disabled" in section
     for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
         assert f"modelSettings.{key}" in section
@@ -543,6 +577,125 @@ test('Template matching ignores nested dictionary ordering', () => {
     copy.settings.chat_template_kwargs.custom = 2;
     assert.equal(state.matchingProfileTemplate(copy), null);
 });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+DASHBOARD_BLOCK_IDS = (
+    "serving_stats",
+    "usage_history",
+    "active_models",
+    "cache_observability",
+    "api_endpoints",
+    "claude_code",
+    "applications",
+    "engine_versions",
+)
+
+
+def test_dashboard_layout_template_contract():
+    """Every block renders as a parked GridStack item with a tray pill."""
+    from jinja2 import Environment, FileSystemLoader
+
+    root = Path(__file__).resolve().parents[1]
+    admin = root / "omlx/admin"
+    env = Environment(loader=FileSystemLoader(str(admin / "templates")))
+    env.globals.update(t=lambda key: key, static=lambda path: path)
+    status = env.get_template("dashboard/_status.html").render()
+    dashboard = (admin / "templates/dashboard.html").read_text()
+    dashboard_js = _dashboard_script()
+
+    for block_id in DASHBOARD_BLOCK_IDS:
+        item = (
+            f'class="grid-stack-item dash-block dash-block-parked" gs-id="{block_id}"'
+        )
+        assert status.count(item) == 1, block_id
+        assert f"dashRemoveBlock('{block_id}')" in status
+        # Alpine directives stay on the wrapper: GridStack clones the pill into
+        # <body> while dragging, outside any x-data scope.
+        pill = (
+            f"""<div class="contents" x-show="!dashPlaced('{block_id}')">\n"""
+            '                            <div class="dash-tray-pill grid-stack-item"'
+            f' gs-w="12" gs-h="1" gs-min-w="6" data-block="{block_id}">'
+        )
+        assert pill in status, block_id
+        assert f"status.layout.block.{block_id}" in status
+
+    assert "css/gridstack.min.css" in dashboard
+    assert "js/gridstack-all.js" in dashboard
+    assert "js/dashboard_layout.js" in dashboard
+    assert "dashboardWidthClass : 'max-w-7xl'" in dashboard
+    assert 'class="max-w-7xl mx-auto px-4' not in dashboard
+
+    assert "ui_dashboard_layout" in dashboard_js
+    assert "columnMax: lib.COLUMNS" in dashboard_js
+
+    locales = sorted((admin / "i18n").glob("*.json"))
+    assert locales
+    keys = [
+        "status.layout.customize",
+        "status.layout.width_full",
+        "status.layout.save",
+        *[f"status.layout.block.{block_id}" for block_id in DASHBOARD_BLOCK_IDS],
+    ]
+    for locale in locales:
+        data = json.loads(locale.read_text(encoding="utf-8"))
+        for key in keys:
+            assert key in data, f"{locale.name} missing {key}"
+
+
+def test_dashboard_layout_normalizer():
+    """dashboard_layout.js clamps hand-edited layouts to the grid contract."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard layout tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+
+const source = fs.readFileSync('omlx/admin/static/js/dashboard_layout.js', 'utf8');
+const context = { window: {} };
+vm.runInNewContext(source, context);
+const lib = context.window.DashboardLayout;
+// Objects built inside the vm realm have a different Object.prototype, so
+// strict deepEqual rejects them; compare plain JSON copies instead.
+const plain = value => JSON.parse(JSON.stringify(value));
+
+assert.equal(lib.COLUMNS, 24);
+assert.equal(lib.MIN_W, 6);
+const def = lib.defaultLayout();
+assert.equal(def.blocks.length, 8);
+assert.ok(def.blocks.every((b, i) => b.x === 0 && b.y === i && b.w === 24));
+assert.deepEqual(plain(lib.normalizeLayout(null)), plain(def));
+assert.deepEqual(plain(lib.normalizeLayout({ blocks: 'nope' })), plain(def));
+
+const messy = lib.normalizeLayout({
+    width: 'huge',
+    blocks: [
+        { id: 'serving_stats', x: 20, y: '3', w: 12 },   // x clamped to 12
+        { id: 'unknown', x: 0, y: 0, w: 24 },            // dropped
+        { id: 'serving_stats', x: 0, y: 0, w: 24 },      // duplicate dropped
+        { id: 'engine_versions', x: 0, y: -4, w: 2 },    // w -> 6, y -> 0
+        { id: 'applications', x: 0, y: 1, w: 99 },       // w -> 24
+    ],
+});
+assert.equal(messy.width, 'default');
+assert.deepEqual(plain(messy.blocks), [
+    { id: 'serving_stats', x: 12, y: 3, w: 12 },
+    { id: 'engine_versions', x: 0, y: 0, w: 6 },
+    { id: 'applications', x: 0, y: 1, w: 24 },
+]);
+assert.deepEqual(plain(lib.normalizeLayout({ width: 'full', blocks: [] }).blocks), []);
+assert.equal(lib.widthClass('wide'), 'max-w-[90rem]');
+assert.equal(lib.widthClass('bogus'), 'max-w-7xl');
 """
     result = subprocess.run(
         [node, "-e", script],

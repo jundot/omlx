@@ -61,6 +61,95 @@ logger = logging.getLogger(__name__)
 _MAX_ENTRIES_DEFAULT = 512
 
 
+def _wire_state(entry: Any) -> tuple[Any, Any]:
+    from mlx_lm.models.cache import CacheList, QuantizedKVCache
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    if isinstance(entry, CacheList):
+        states, metadata = zip(*(_wire_state(c) for c in entry.caches))
+        return list(states), ([type(c).__name__ for c in entry.caches], list(metadata))
+    if isinstance(entry, (PoolingCacheSnapshot, EmptyLeafSnapshot, KVCacheSegment)):
+        return entry.state, entry.meta_state
+    if isinstance(entry, QuantizedKVCache):
+        state = entry.keys_and_values() if entry.keys is not None else (None, None)
+        return list(state), (entry.offset, entry.group_size, entry.bits)
+    handler = CacheTypeRegistry.get_handler_for_object(entry)
+    state = handler.serialize_state(entry)
+    return list(state), handler.serialize_meta_state(entry) or ""
+
+
+def _from_wire_state(name: str, state: Any, metadata: Any) -> Any:
+    from mlx_lm.models.cache import CacheList
+
+    wrappers = {
+        c.__name__: c for c in (PoolingCacheSnapshot, EmptyLeafSnapshot, KVCacheSegment)
+    }
+    if name in wrappers:
+        return wrappers[name].from_state(state, metadata)
+    if name == "CacheList":
+        names, child_metadata = metadata
+        return CacheList(
+            *(
+                _from_wire_state(n, s, m)
+                for n, s, m in zip(names, state, child_metadata)
+            )
+        )
+    import mlx_lm.models.cache as cache_module
+
+    cache_class = getattr(cache_module, name)
+    if name in ("KVCache", "ConcatenateKVCache"):
+        cache = cache_class()
+        cache.keys, cache.values = state
+        cache.offset = 0 if cache.keys is None else cache.keys.shape[2]
+        return cache
+    if name == "ArraysCache":
+        cache = cache_class(len(state))
+        cache.cache = list(state)
+        return cache
+    if name == "QuantizedKVCache":
+        offset, group_size, bits = map(int, metadata)
+        return cache_class.from_state((*state, offset, group_size, bits))
+    if name == "BatchKVCache":
+        idx = 0 if state[0] is None else state[0].shape[2]
+        return cache_class.from_state((*state, idx))
+    if name == "BatchRotatingKVCache":
+        max_size, offset, idx, rotated = metadata
+        return cache_class.from_state(
+            (*state, int(max_size), int(offset), int(idx), str(rotated) == "True")
+        )
+    if name == "ChunkedKVCache":
+        chunk_size, start, offset = map(int, metadata)
+        return cache_class.from_state((*state, offset, chunk_size, start))
+    if name == "RotatingKVCache":
+        keep, max_size, offset, idx = map(int, metadata)
+        return cache_class.from_state((*state, offset, keep, max_size, idx))
+    return cache_class.from_state(state, metadata)
+
+
+def _save_prompt_snapshot(path: str, cache: list[Any]) -> None:
+    """Keep the distributed SSD wire format independent of mlx-lm's live state."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    states, metadata = zip(*(_wire_state(c) for c in cache))
+    info = [list(metadata), {}, [type(c).__name__ for c in cache]]
+    mx.save_safetensors(
+        path,
+        dict(tree_flatten(list(states))),
+        {k: str(v) for k, v in tree_flatten(info)},
+    )
+
+
+def _load_prompt_snapshot(path: str) -> list[Any]:
+    import mlx.core as mx
+    from mlx.utils import tree_unflatten
+
+    arrays, metadata = mx.load(path, return_metadata=True)
+    states = tree_unflatten(list(arrays.items()))
+    info, _, names = tree_unflatten(list(metadata.items()))
+    return [_from_wire_state(n, s, m) for n, s, m in zip(names, states, info)]
+
+
 class PoolingCacheSnapshot:
     """Serialisation stand-in for the DeepSeek sparse-attention pool cache.
 
@@ -130,7 +219,7 @@ class EmptyLeafSnapshot:
 
         kept = tuple(
             leaf
-            for _key, leaf in tree_flatten(self._inner.state)
+            for _key, leaf in tree_flatten(_wire_state(self._inner)[0])
             if leaf is not None and leaf.size > 0
         )
         # Same slot-holding placeholder as PoolingCacheSnapshot: the layout
@@ -142,7 +231,7 @@ class EmptyLeafSnapshot:
         from mlx.utils import tree_flatten
 
         layout = []
-        for key, leaf in tree_flatten(self._inner.state):
+        for key, leaf in tree_flatten(_wire_state(self._inner)[0]):
             if leaf is None:
                 layout.append(f"{key}=none")
             elif leaf.size == 0:
@@ -150,12 +239,11 @@ class EmptyLeafSnapshot:
                 layout.append(f"{key}=empty:{shape}:{leaf.dtype}")
             else:
                 layout.append(f"{key}=array")
-        return (type(self._inner).__name__, tuple(layout), self._inner.meta_state)
+        return (type(self._inner).__name__, tuple(layout), _wire_state(self._inner)[1])
 
     @classmethod
     def from_state(cls, state: Any, meta_state: Any) -> Any:
         import mlx.core as mx
-        import mlx_lm.models.cache as cache_module
         from mlx.utils import tree_unflatten
 
         inner_name, layout, inner_meta = meta_state
@@ -172,8 +260,7 @@ class EmptyLeafSnapshot:
                 shape = tuple(int(d) for d in shape_text.split("x") if d)
                 dtype = getattr(mx, dtype_text.rsplit(".", 1)[-1])
                 pairs.append((key, mx.zeros(shape, dtype=dtype)))
-        inner_cls = getattr(cache_module, inner_name)
-        return inner_cls.from_state(tree_unflatten(pairs), inner_meta)
+        return _from_wire_state(inner_name, tree_unflatten(pairs), inner_meta)
 
 
 class KVCacheSegment:
@@ -193,7 +280,7 @@ class KVCacheSegment:
         self._start = start
 
     def _slabs(self) -> tuple[Any, Any]:
-        keys, values = self._inner.state
+        keys, values = self._inner.keys_and_values()
         return (keys[..., self._start :, :], values[..., self._start :, :])
 
     @property
@@ -249,7 +336,8 @@ def _has_unserialisable_leaves(entry: Any) -> bool:
     from mlx.utils import tree_flatten
 
     return any(
-        leaf is None or leaf.size == 0 for _key, leaf in tree_flatten(entry.state)
+        leaf is None or leaf.size == 0
+        for _key, leaf in tree_flatten(_wire_state(entry)[0])
     )
 
 
@@ -560,8 +648,6 @@ class SSDPromptSnapshotStore:
         what lets branching prompts share their common chain.
         """
 
-        from mlx_lm.models.cache import save_prompt_cache
-
         if not self._serialisable:
             return False
         token_tuple = tuple(int(t) for t in tokens)
@@ -590,7 +676,7 @@ class SSDPromptSnapshotStore:
                 prefix=f".{key}.", suffix=".safetensors", dir=self.directory
             )
             os.close(descriptor)
-            save_prompt_cache(temporary, wrapped)
+            _save_prompt_snapshot(temporary, wrapped)
             size = os.path.getsize(temporary)
             os.replace(temporary, target)
         except OSError:
@@ -651,8 +737,6 @@ class SSDPromptSnapshotStore:
     def load(self, model: Any, tokens: list[int], boundary: int) -> list[Any] | None:
         """Assemble the cache for ``tokens[:boundary]`` from its chain."""
 
-        from mlx_lm.models.cache import load_prompt_cache
-
         token_tuple = tuple(int(t) for t in tokens)
         if boundary <= 0 or boundary % self.step != 0 or boundary > len(token_tuple):
             return None
@@ -673,7 +757,7 @@ class SSDPromptSnapshotStore:
                     self._persist_index_locked()
                     return None
         try:
-            files = [load_prompt_cache(str(self._path(key))) for key in chain]
+            files = [_load_prompt_snapshot(str(self._path(key))) for key in chain]
             assembled = _assemble_chain(files, boundary)
         except Exception:
             return None
@@ -720,7 +804,7 @@ def _assemble_chain(files: list[list[Any]], boundary: int) -> list[Any] | None:
         if hasattr(deepest, "_omlx_segment_start"):
             if not all(hasattr(member, "_omlx_segment_start") for member in members):
                 return None
-            slabs = [member.state for member in members]
+            slabs = [member.keys_and_values() for member in members]
             keys = mx.concatenate([keys for keys, _ in slabs], axis=2)
             values = mx.concatenate([values for _, values in slabs], axis=2)
             if keys.shape[2] != boundary:

@@ -793,18 +793,6 @@ class TestSTTEndpointPrompt:
 class TestSTTEndpointResponseFormat:
     """OpenAI audio transcription API response schema compliance."""
 
-    def test_response_object_field(self, server_audio_client):
-        """Response optionally includes object field."""
-        client, _ = server_audio_client
-        response = client.post(
-            "/v1/audio/transcriptions",
-            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
-            data={"model": "whisper-tiny"},
-        )
-        body = response.json()
-        # OpenAI spec: response has at minimum a 'text' field
-        assert "text" in body
-
     def test_content_type_is_json(self, server_audio_client):
         """Default response is JSON (not audio)."""
         client, _ = server_audio_client

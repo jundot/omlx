@@ -54,9 +54,9 @@ _EXECUTOR_DRAIN_TIMEOUT = 10.0
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10+omlx.4 registers QwenGdnTargetOps, Gemma4TargetOps, and
-    MuseGlimmerTargetOps; oMLX adds a
-    Laguna target/draft adapter. The top-level ``model_type`` is the canonical
+    DFlash 0.1.10+omlx.7 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    MuseGlimmerTargetOps; oMLX adds Laguna and MiMo V2 target/draft adapters.
+    The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
     Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
@@ -95,9 +95,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse):
+    is_mimo = model_type in ("mimo_v2", "mimo_v2_flash")
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, and Muse Glimmer "
+            f"DFlash supports only Qwen, Gemma4, Laguna, MiMo V2, and "
+            f"Muse Glimmer "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -537,7 +539,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         runtime_context = self._build_runtime_context()
 
         def _load_models():
-            from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.engine.target_ops import bind_draft_to_target
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
@@ -554,12 +555,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 self._model_name, model_settings=self._model_settings
             )
 
-            # dflash-mlx 0.1.10 has no Laguna backend. Register oMLX's strict
-            # TargetOps plus the official gated Laguna drafter specialization
-            # before load_target_bundle resolves either architecture.
+            # Register oMLX's target and drafter specializations before
+            # load_target_bundle resolves either architecture.
             from ..patches.dflash_laguna import install_dflash_laguna_backend
+            from ..patches.dflash_mimo_v2 import install_dflash_mimo_v2_backend
 
             install_dflash_laguna_backend()
+            install_dflash_mimo_v2_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -613,12 +615,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else None
                 ),
             )
+            from ..patches.dflash_mimo_v2 import (
+                draft_backend_for,
+                prepare_mimo_draft,
+            )
+
+            prepare_mimo_draft(
+                draft,
+                draft_meta,
+                self._draft_model_path,
+            )
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
                 target_ops=target_bundle.target_ops,
             )
-            draft_backend = EagerDraftBackend()
+            draft_backend = draft_backend_for(draft)
             return target_bundle, draft, draft_backend, draft_meta
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
@@ -773,7 +785,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         pre_active = mx.get_active_memory()
 
         # Release dflash model and cache references
-        shutdown_runtime_cache_manager()
+        await loop.run_in_executor(get_mlx_executor(), shutdown_runtime_cache_manager)
         self._dflash_prefix_cache = None
         self._runtime_context = None
         self._target_model = None
@@ -853,8 +865,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
+        from ..engine_core import get_mlx_executor
+
         try:
-            shutdown_runtime_cache_manager()
+            await asyncio.get_running_loop().run_in_executor(
+                get_mlx_executor(), shutdown_runtime_cache_manager
+            )
         except Exception as exc:
             logger.debug(f"shutdown_runtime_cache_manager: {exc}")
         self._dflash_prefix_cache = None

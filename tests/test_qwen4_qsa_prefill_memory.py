@@ -28,6 +28,8 @@ def test_qsa_cache_is_not_retained_in_boundary_snapshots(cache_cls):
 
     captured = []
     scheduler = SimpleNamespace(
+        config=SimpleNamespace(paged_cache_block_size=16),
+        _boundary_snapshot_block_size=lambda request, token_count: 16,
         _on_prefill_boundary_snapshot=(
             lambda request_id, snapshot_cache, token_count: captured.append(
                 snapshot_cache

@@ -24,7 +24,6 @@ from omlx.engine.vlm import (
     _strip_audio_config_if_orphaned,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
@@ -126,6 +125,16 @@ class TestHasAudioWeights:
             tmp_path, name="m2", has_audio_config=True, has_audio_weights=False,
         )
         assert _has_audio_weights(model_dir) is False
+
+    def test_returns_true_for_mimo_audio_sidecar(self, tmp_path: Path):
+        model_dir = _build_model_dir(
+            tmp_path, name="mimo", has_audio_config=True, has_audio_weights=False,
+        )
+        sidecar = model_dir / "omnimodal" / "audio_encoder.safetensors"
+        sidecar.parent.mkdir()
+        _write_safetensors(sidecar, ["audio_encoder.projection.weight"])
+
+        assert _has_audio_weights(model_dir) is True
 
     def test_returns_false_for_empty_dir(self, tmp_path: Path):
         empty = tmp_path / "empty"

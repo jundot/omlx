@@ -703,8 +703,7 @@ def build_venvstacks():
         resolved_toml.unlink()
 
     # Install mlx-audio separately: build wheel from git, install --no-deps.
-    # mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm,
-    # so it can't go through venvstacks' uv resolver.
+    # Its runtime dependencies are resolved in the shared bundle layer.
     _install_mlx_audio(EXPORT_DIR)
 
     # Install paroquant --no-deps. The official [mlx] extra requires
@@ -731,7 +730,7 @@ def build_venvstacks():
 
 
 # mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981"
+_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d"
 
 
 def _install_mlx_audio(export_dir: Path):

@@ -327,21 +327,21 @@ class TestGrammarRowAdvance:
 def _bare_generation_batch(uid, logits_processors):
     """Build a GenerationBatch via __new__ with plain-list state.
 
-    ``filter()`` and ``extend()`` never touch the model, so a bare instance
-    is enough to exercise the real mlx-lm bookkeeping without loading
-    weights. Mirrors the ``__class__.__new__`` idiom of
-    ``_patched_ppb_split`` in omlx/scheduler.py.
+    Filtering and extending do not execute the model, but runtime patches
+    use its identity to release request-owned state. Supply that identity
+    without loading weights.
     """
     from mlx_lm.generate import GenerationBatch
 
     batch = GenerationBatch.__new__(GenerationBatch)
+    batch.model = object()
     batch.uids = [uid]
     batch.prompt_cache = []
     batch.tokens = [[1, 2, 3]]
     batch.samplers = [lambda x: x]
     batch.fallback_sampler = lambda x: x
     batch.logits_processors = logits_processors
-    batch.state_machines = [object()]
+    batch.stop_sequences = [object()]
     batch.max_tokens = [4]
     batch._current_tokens = None
     batch._current_logprobs = []
@@ -349,7 +349,7 @@ def _bare_generation_batch(uid, logits_processors):
     batch._next_logprobs = [object()]
     batch._token_context = [object()]
     batch._num_tokens = [0]
-    batch._matcher_states = [object()]
+    batch._matchers = [object()]
     return batch
 
 
@@ -424,12 +424,12 @@ class TestFilterStaleProcessorAlignment:
         batch.tokens = [[1], [2]]
         batch.samplers = [lambda x: x, lambda x: x]
         batch.logits_processors = [[], [grammar_processor]]
-        batch.state_machines = [object(), object()]
+        batch.stop_sequences = [object(), object()]
         batch.max_tokens = [4, 4]
         batch._next_logprobs = [object(), object()]
         batch._token_context = [object(), object()]
         batch._num_tokens = [0, 0]
-        batch._matcher_states = [object(), object()]
+        batch._matchers = [object(), object()]
         import mlx.core as mx
 
         batch._next_tokens = mx.array([1, 2])

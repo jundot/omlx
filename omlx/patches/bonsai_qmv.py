@@ -247,14 +247,14 @@ def apply_bonsai_qmv_patch() -> bool:
 
     if not has_native():
         logger.debug(
-            "bonsai_qmv: native extension not available, skipping patch."
+            "1/2-bit affine decode optimization skipped: native extension unavailable."
         )
         return False
 
     _original_quantized_linear_call = nn.QuantizedLinear.__call__
     nn.QuantizedLinear.__call__ = _bonsai_quantized_linear_call
     _patch_active = True
-    logger.info("bonsai_qmv: QuantizedLinear patched for 1-bit / 2-bit decode.")
+    logger.info("1/2-bit affine decode optimization enabled for QuantizedLinear.")
     return True
 
 
@@ -266,7 +266,7 @@ def remove_bonsai_qmv_patch() -> None:
     nn.QuantizedLinear.__call__ = _original_quantized_linear_call
     _original_quantized_linear_call = None
     _patch_active = False
-    logger.info("bonsai_qmv: QuantizedLinear patch removed.")
+    logger.info("1/2-bit affine decode optimization removed from QuantizedLinear.")
 
 
 def is_patch_active() -> bool:

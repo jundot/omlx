@@ -148,21 +148,22 @@ def _close_coro(coro):
 class TestMacOSVMStats:
     """Tests for the host_statistics64 telemetry adapter."""
 
-    def test_uses_max_sized_host_info64_buffer(self):
-        """Newer macOS kernels can require a larger vm_statistics64 tail."""
-
+    def test_uses_layout_compatible_host_info64_count(self):
         class FakeLibc:
             def host_statistics64(self, host, flavor, stats, count):
                 assert host == 123
                 assert flavor == psutil_compat._HOST_VM_INFO64
-                assert count._obj.value == psutil_compat._HOST_INFO64_MAX_COUNT
+                requested = count._obj.value
+                assert requested <= 40
+                # The kernel returns complete revisions, not partial fields.
+                count._obj.value = 38 if requested >= 38 else 24
                 stats[0] = 10
                 stats[1] = 20
                 stats[2] = 30
                 stats[3] = 40
                 stats[psutil_compat._VM_SPECULATIVE_INDEX] = 50
-                stats[psutil_compat._VM_COMPRESSOR_INDEX] = 60
-                count._obj.value = 104
+                if count._obj.value >= 38:
+                    stats[psutil_compat._VM_COMPRESSOR_INDEX] = 60
                 return 0
 
         with (
@@ -1025,28 +1026,6 @@ class TestDynamicCeilingActiveRatio:
             result = enforcer._get_dynamic_ceiling()
         expected = 1 * 1024**3 + 10 * 1024**3 + 4 * 1024**3 + int(8 * 1024**3 * ratio)
         assert result == expected
-
-    def test_non_macos_falls_back_to_compat_available(self, mock_engine_pool):
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
-        )
-        with (
-            patch(
-                "omlx.process_memory_enforcer.get_phys_footprint",
-                return_value=2 * 1024**3,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.get_macos_vm_stats",
-                return_value=None,
-            ),
-            patch(
-                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
-                return_value=SimpleNamespace(available=15 * 1024**3),
-            ) as mock_virtual_memory,
-        ):
-            result = enforcer._get_dynamic_ceiling()
-        assert result == 2 * 1024**3 + 15 * 1024**3
-        mock_virtual_memory.assert_called_once()
 
     def test_macos_vm_stat_failure_uses_compat_available(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(

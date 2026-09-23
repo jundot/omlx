@@ -27,7 +27,13 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Header(model: vm.model)
+            HStack(alignment: .center, spacing: 0) {
+                Header(model: vm.model)
+                SnapshotActions(vm: vm, client: services.client)
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 10)
+            }
+            .zIndex(1)
 
             SectionPicker(selection: $vm.section)
 
@@ -113,6 +119,437 @@ private struct Header: View {
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
+    }
+}
+
+
+// MARK: - Snapshot actions (reset / optimal / recipe)
+
+private struct SnapshotActions: View {
+    let vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+    @State private var hoveredAction: String?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if vm.isApplyingSettings {
+                ProgressView().controlSize(.small)
+            }
+            actionButton(String(localized: "settings.actions.reset",
+                          defaultValue: "Reset defaults",
+                          comment: "Header button that returns every setting of the model to its default"),
+                         systemImage: "arrow.counterclockwise") {
+                vm.pendingReset = true
+            }
+            actionButton(String(localized: "settings.actions.optimal",
+                          defaultValue: "Apply optimal settings",
+                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"),
+                         systemImage: "wand.and.stars") {
+                Task { await vm.loadOptimalCandidates(client: client) }
+            }
+            actionButton(String(localized: "settings.actions.recipe",
+                          defaultValue: "Apply custom recipe",
+                          comment: "Header button that opens the paste-a-recipe sheet"),
+                         systemImage: "doc.on.clipboard") {
+                vm.applyError = nil
+                vm.applyOutcome = .recipeInput
+            }
+        }
+        .buttonStyle(.omlx(.normal, size: .small))
+        .buttonBorderShape(.roundedRectangle(radius: 6))
+        .fixedSize(horizontal: true, vertical: false)
+        .disabled(vm.isApplyingSettings)
+        .overlay(alignment: .topTrailing) {
+            if let hoveredAction {
+                Text(hoveredAction)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    .shadow(color: .black.opacity(0.12), radius: 3, y: 2)
+                    .fixedSize()
+                    .offset(y: 34)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .confirmationDialog(
+            String(localized: "settings.actions.reset.confirm_title",
+                   defaultValue: "Reset every setting of this model?",
+                   comment: "Confirmation dialog title before resetting all model settings"),
+            isPresented: Binding(
+                get: { vm.pendingReset },
+                set: { if !$0 { vm.pendingReset = false } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "settings.actions.reset.confirm_button",
+                          defaultValue: "Reset",
+                          comment: "Destructive button inside the reset-settings confirmation dialog"),
+                   role: .destructive) {
+                vm.pendingReset = false
+                Task { await vm.resetDefaults(client: client) }
+            }
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Generic cancel button"),
+                   role: .cancel) { vm.pendingReset = false }
+        } message: {
+            Text(String(localized: "settings.actions.reset.confirm_message",
+                        defaultValue: "Sampling, acceleration, pinned/default flags, aliases and the display name all return to their defaults.",
+                        comment: "Body text inside the reset-settings confirmation dialog"))
+        }
+        .sheet(isPresented: Binding(
+            get: { vm.applyOutcome != nil },
+            set: { if !$0 && !vm.isApplyingSettings { vm.applyOutcome = nil } }
+        )) {
+            SettingsApplySheet(vm: vm, client: client)
+                .environment(\.omlxTheme, theme)
+        }
+    }
+
+    private func actionButton(
+        _ title: String, systemImage: String, action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            hoveredAction = nil
+            action()
+        } label: {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.iconOnly)
+                .font(.omlxText(12))
+                .frame(width: 20, height: 22)
+        }
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            if hovering {
+                hoveredAction = title
+            } else if hoveredAction == title {
+                hoveredAction = nil
+            }
+        }
+    }
+}
+
+private struct SettingsApplySheet: View {
+    let vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+    @State private var recipeText = ""
+
+    private static let benchmarksURL = URL(string: "https://omlx.ai/benchmarks/performance")!
+
+    var body: some View {
+        Group {
+            switch vm.applyOutcome {
+            case .optimalCandidates(let candidates):
+                candidatesBody(candidates)
+            case .optimal(let result):
+                resultBody(result, fromRecipe: false)
+            case .recipe(let result):
+                resultBody(result, fromRecipe: true)
+            case .recipeInput, nil:
+                inputBody
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .background(theme.windowBg)
+    }
+
+    private var closeButton: some View {
+        Button(String(localized: "common.close",
+                      defaultValue: "Close",
+                      comment: "Generic close button")) { vm.applyOutcome = nil }
+            .buttonStyle(.omlx(.primary, size: .small))
+            .disabled(vm.isApplyingSettings)
+    }
+
+    @ViewBuilder
+    private var errorLine: some View {
+        if let error = vm.applyError {
+            Text(error)
+                .font(.omlxText(12))
+                .foregroundStyle(theme.redDot)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var inputBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(String(localized: "settings.apply.recipe.title",
+                        defaultValue: "Apply custom recipe",
+                        comment: "Title of the paste-a-recipe sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            Text(String(localized: "settings.apply.recipe.hint",
+                        defaultValue: "Paste a recipe copied from the Recipe row of a benchmark detail page on omlx.ai.",
+                        comment: "Hint explaining where a settings recipe can be copied from"))
+                .font(.omlxText(12))
+                .foregroundStyle(theme.textSecondary)
+            linkButton(Self.benchmarksURL,
+                       title: String(localized: "settings.apply.result.open_search",
+                                     defaultValue: "Open community benchmarks",
+                                     comment: "Link button that opens the omlx.ai performance leaderboard"))
+            TextEditor(text: $recipeText)
+                .font(.omlxMono(11))
+                .scrollContentBackground(.hidden)
+                .frame(height: 110)
+                .padding(6)
+                .background(theme.inputBg)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(theme.inputBorder, lineWidth: 0.5)
+                )
+            errorLine
+            HStack(spacing: 10) {
+                if vm.isApplyingSettings {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.recipe.applying",
+                                defaultValue: "Applying the recipe...",
+                                comment: "Progress text while a pasted recipe is being applied"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+                Button(String(localized: "common.cancel",
+                              defaultValue: "Cancel",
+                              comment: "Generic cancel button")) { vm.applyOutcome = nil }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(vm.isApplyingSettings)
+                Button(String(localized: "settings.apply.recipe.apply",
+                              defaultValue: "Apply",
+                              comment: "Primary button of the paste-a-recipe sheet")) {
+                    Task { await vm.applyRecipe(recipeText, client: client) }
+                }
+                .buttonStyle(.omlx(.primary, size: .small))
+                .disabled(recipeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || vm.isApplyingSettings)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func candidatesBody(_ candidates: OptimalCandidatesDTO?) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(String(localized: "settings.apply.result.title_optimal",
+                        defaultValue: "Optimal settings from omlx.ai",
+                        comment: "Title of the optimal-settings sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            if let candidates {
+                if candidates.found {
+                    Text(String(localized: "settings.apply.choose.hint",
+                                defaultValue: "Pick a benchmark result to apply its settings. Rows are the best matches for this chip and model with the same or less memory, at a 4k prompt.",
+                                comment: "Hint above the benchmark candidate list"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            candidateGroup(
+                                String(localized: "settings.apply.choose.group_pp",
+                                       defaultValue: "Best prompt processing (PP)",
+                                       comment: "Label above the candidates ranked by prompt processing speed"),
+                                rows: candidates.byPp)
+                            candidateGroup(
+                                String(localized: "settings.apply.choose.group_tg",
+                                       defaultValue: "Best token generation (TG)",
+                                       comment: "Label above the candidates ranked by token generation speed"),
+                                rows: candidates.byTg)
+                        }
+                    }
+                    .frame(maxHeight: 360)
+                } else {
+                    noneBody(searchUrl: candidates.searchUrl)
+                }
+                errorLine
+            } else if let error = vm.applyError {
+                Text(error)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.redDot)
+                    .textSelection(.enabled)
+            } else {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.optimal.loading",
+                                defaultValue: "Fetching the best benchmark results from omlx.ai...",
+                                comment: "Progress text while omlx.ai candidates are fetched"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                .padding(.vertical, 12)
+            }
+            HStack(spacing: 10) {
+                if vm.isApplyingSettings, candidates != nil {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "settings.apply.optimal.applying",
+                                defaultValue: "Applying the benchmark settings...",
+                                comment: "Progress text while a chosen benchmark snapshot is applied"))
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+                closeButton
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func candidateGroup(_ label: String, rows: [OptimalCandidateDTO]) -> some View {
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(label)
+                    .font(.omlxText(11, weight: .semibold))
+                    .foregroundStyle(theme.textSecondary)
+                ForEach(rows) { row in
+                    HStack(alignment: .center, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            if let urlText = row.benchmarkUrl, let url = URL(string: urlText) {
+                                linkButton(url, title: urlText)
+                            } else {
+                                Text(row.benchmarkId)
+                                    .font(.omlxMono(11))
+                                    .foregroundStyle(theme.text)
+                            }
+                            Text(ModelSettingsScreenVM.candidateStats(
+                                pp: row.ppTps, tg: row.tgTps, memoryGb: row.memoryGb,
+                                quantization: row.quantization, omlxVersion: row.omlxVersion))
+                                .font(.omlxMono(11))
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                        Spacer()
+                        Button(String(localized: "settings.apply.recipe.apply",
+                                      defaultValue: "Apply",
+                                      comment: "Primary button of the paste-a-recipe sheet")) {
+                            Task { await vm.applyOptimalCandidate(row.benchmarkId, client: client) }
+                        }
+                        .buttonStyle(.omlx(.primary, size: .small))
+                        .disabled(vm.isApplyingSettings)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(theme.groupBg)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(theme.groupBorder, lineWidth: 0.5)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func noneBody(searchUrl: String?) -> some View {
+        Text(String(localized: "settings.apply.result.none_title",
+                    defaultValue: "No benchmark result matches this device and model.",
+                    comment: "Headline when omlx.ai has no benchmark for the current device and model"))
+            .font(.omlxText(13, weight: .medium))
+            .foregroundStyle(theme.text)
+        Text(String(localized: "settings.apply.result.none_body",
+                    defaultValue: "Find a similar model on the community benchmarks and apply its recipe with Apply custom recipe.",
+                    comment: "Guidance shown when no matching benchmark exists"))
+            .font(.omlxText(12))
+            .foregroundStyle(theme.textSecondary)
+        linkButton(URL(string: searchUrl ?? "") ?? Self.benchmarksURL,
+                   title: String(localized: "settings.apply.result.open_search",
+                                 defaultValue: "Open community benchmarks",
+                                 comment: "Link button that opens the omlx.ai performance leaderboard"))
+    }
+
+    @ViewBuilder
+    private func resultBody(_ result: SettingsApplyResultDTO, fromRecipe: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(fromRecipe
+                 ? String(localized: "settings.apply.result.title_recipe",
+                          defaultValue: "Custom recipe applied",
+                          comment: "Title of the result sheet after applying a pasted recipe")
+                 : String(localized: "settings.apply.result.title_optimal",
+                          defaultValue: "Optimal settings from omlx.ai",
+                          comment: "Title of the optimal-settings sheet"))
+                .font(.omlxText(17, weight: .semibold))
+                .foregroundStyle(theme.text)
+            Text(result.changed == false
+                 ? String(localized: "settings.apply.result.no_change",
+                          defaultValue: "Settings already matched; nothing changed.",
+                          comment: "Result line when the snapshot equals the current settings")
+                 : (fromRecipe
+                    ? String(localized: "settings.apply.result.done_recipe",
+                             defaultValue: "The settings below were applied from the recipe!",
+                             comment: "Result line after a pasted recipe was applied")
+                    : String(localized: "settings.apply.result.done_optimal",
+                             defaultValue: "The settings below were applied from the selected benchmark!",
+                             comment: "Result line after a chosen benchmark snapshot was applied")))
+                .font(.omlxText(13, weight: .medium))
+                .foregroundStyle(theme.text)
+            if let urlText = result.benchmarkUrl, let url = URL(string: urlText) {
+                linkButton(url, title: urlText)
+                Text(ModelSettingsScreenVM.candidateStats(
+                    pp: result.ppTps, tg: result.tgTps,
+                    quantization: result.quantization, omlxVersion: result.omlxVersion))
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            let skipped = ModelSettingsScreenVM.summarizeSkipped(result.skipped)
+            if !skipped.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(String(localized: "settings.apply.result.skipped",
+                                defaultValue: "Skipped on this machine",
+                                comment: "Label above the list of features the server dropped while applying a snapshot"))
+                        .font(.omlxText(12, weight: .semibold))
+                        .foregroundStyle(theme.warningText)
+                    ForEach(skipped, id: \.self) { line in
+                        Text(line)
+                            .font(.omlxText(12))
+                            .foregroundStyle(theme.warningText)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(theme.warningBg)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            Text(String(localized: "settings.apply.result.applied",
+                        defaultValue: "Applied settings",
+                        comment: "Label above the JSON of the applied settings"))
+                .font(.omlxText(11, weight: .medium))
+                .foregroundStyle(theme.textSecondary)
+            ScrollView {
+                Text(ModelSettingsScreenVM.appliedJSON(result.applied))
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.text)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 220)
+            .padding(8)
+            .background(theme.codeBg)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            if result.requiresReload == true {
+                Text(String(localized: "settings.apply.result.reload_note",
+                            defaultValue: "The model will use the new settings after its next load.",
+                            comment: "Note shown when applied settings only take effect at model load"))
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            HStack {
+                Spacer()
+                closeButton
+            }
+        }
+    }
+
+    private func linkButton(_ url: URL, title: String) -> some View {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
+            Label(title, systemImage: "arrow.up.right.square")
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .buttonStyle(.omlx(.plain, size: .small))
     }
 }
 

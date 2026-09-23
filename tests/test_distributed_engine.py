@@ -1344,3 +1344,27 @@ def test_failed_runtime_quiescence_evidence(tmp_path, monkeypatch):
     assert engine.rank_side_active_requests() == 0
     assert engine.has_active_requests() is False
 
+
+def test_stale_marker_reports_zero_rank_side_active_requests(tmp_path, monkeypatch):
+    """A stale rank marker (> 45s old) must report 0 rank-side active requests."""
+    from datetime import UTC, datetime, timedelta
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    engine._supervisor.state_dir = str(tmp_path)
+    marker_path = tmp_path / "engine-test-rank-0.json"
+    old_time = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+    marker_path.write_text(
+        json.dumps(
+            {
+                "pid": 1234,
+                "metrics": {"active_requests": 3},
+                "updated_at": old_time,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(distributed, "marker_owner_is_live", lambda m: True)
+
+    assert engine.rank_side_active_requests() == 0
+
+

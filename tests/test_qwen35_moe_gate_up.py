@@ -66,8 +66,15 @@ def _make_model(
 
 @pytest.fixture(autouse=True)
 def _restore_call(monkeypatch):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
     monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
     orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
+    monkeypatch.setattr(
+        Qwen3_5BatchInvariantForward,
+        "_switch_glu",
+        Qwen3_5BatchInvariantForward._switch_glu,
+    )
     yield
     SwitchGLU.__call__ = orig
     for attr in ("_omlx_gate_up_fused_call", "_omlx_gate_up_original_call"):
@@ -225,22 +232,27 @@ def test_mismatched_quant_params_skipped():
     assert hasattr(glu, "gate_proj")
 
 
-def test_vlm_target_verify_fused_bit_exact():
-    lang = pytest.importorskip("mlx_vlm.models.qwen3_5_moe.language")
+@pytest.mark.parametrize("length", [1, 3, 64])
+def test_vlm_fused_experts_preserve_decode_verify_and_prefill(length):
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
 
-    model = _make_model(n_blocks=1)
-    glu = model.blocks[0]
-    x = (mx.random.normal(shape=(2, 3, HIDDEN)) * 0.5).astype(mx.bfloat16)
-    idx = mx.random.randint(0, E, shape=(2, 3, TOPK))
-
-    ref = lang._target_verify_switch_glu(glu, x, idx, True)
+    mx.random.seed(7)
+    glu = VLMSwitchGLU(HIDDEN, INTER, E)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(32, 4))
+    glu.eval()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    x = (mx.random.normal((2, length, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    idx = mx.random.randint(0, E, shape=(2, length, TOPK))
+    weights = mx.full((2, length, TOPK), 0.5)
+    shared = mx.zeros_like(x)
+    ref = glu(x, idx, weights, shared)
     mx.eval(ref)
 
     assert apply_qwen35_moe_gate_up_fusion(model) == 1
-    out = lang._target_verify_switch_glu(glu, x, idx, True)
+    out = glu(x, idx, weights, shared)
     mx.eval(out)
-
-    assert ref.shape == out.shape
     assert mx.array_equal(ref, out).item()
 
 
@@ -259,3 +271,68 @@ def test_weighted_sum_route_accepts_fused_layout():
         pytest.skip("Metal required for _should_route")
     x = mx.zeros((1, 2048, HIDDEN), dtype=mx.bfloat16)
     assert _should_route(_Block(), x, target_verify=False, min_tokens=1024)
+
+
+def test_vlm_fused_projection_views_cross_execution_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    def load():
+        with mx.stream(mx.new_thread_local_stream(mx.gpu)):
+            glu = VLMSwitchGLU(HIDDEN, INTER, E)
+            glu.gate_proj = glu.gate_proj.to_quantized(32, 4)
+            glu.up_proj = glu.up_proj.to_quantized(32, 4)
+            mx.eval(glu.parameters())
+            patch_mod._fuse_one(glu)
+            return glu
+
+    def verify(glu):
+        with mx.stream(mx.new_thread_local_stream(mx.gpu)):
+            x = mx.ones((1, 1, 1, HIDDEN))
+            indices = mx.zeros((1, TOPK), dtype=mx.uint32)
+            outputs = [glu.gate_proj(x, indices), glu.up_proj(x, indices)]
+            mx.eval(outputs)
+            return all(bool(mx.all(mx.isfinite(value)).item()) for value in outputs)
+
+    with ThreadPoolExecutor(max_workers=1) as loader:
+        glu = loader.submit(load).result()
+    with ThreadPoolExecutor(max_workers=1) as decoder:
+        assert decoder.submit(verify, glu).result()
+
+
+@pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (5, mx.float16)])
+@pytest.mark.parametrize("batch,length", [(1, 3), (2, 6), (16, 2)])
+def test_vlm_fused_short_block_matches_verifier_without_copying_views(
+    monkeypatch, bits, dtype, batch, length
+):
+    from mlx_vlm.models import fast_ops
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    mx.random.seed(19)
+    glu = VLMSwitchGLU(512, 64, 8)
+    glu.set_dtype(dtype)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(32, bits))
+    glu.eval()
+    verifier = Qwen3_5BatchInvariantForward()
+    x = mx.random.normal((batch, length, 512)).astype(dtype)
+    indices = mx.random.randint(0, 8, (batch, length, 6))
+    expected_head = glu(x, indices)
+    expected_verify = verifier._switch_glu(glu, x, indices)
+    mx.eval(expected_head, expected_verify)
+
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+
+    def reject_view_kernel(*args):
+        pytest.fail("Fused verification must not materialize gate/up views")
+
+    monkeypatch.setattr(fast_ops, "exact_affine_switch_gate_up", reject_view_kernel)
+    head = glu(x, indices)
+    verified = verifier._switch_glu(glu, x, indices)
+    mx.eval(head, verified)
+    assert mx.array_equal(head, expected_head).item()
+    assert mx.array_equal(verified, expected_verify).item()

@@ -302,16 +302,15 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
         block_aware_cache=object(),
     )
 
-    # Boundary snapshots cap delivered chunks at the 2048 block edge, so a
-    # 4096 shape can never receive a full tile and must warn loudly.
+    # Boundary snapshots cap chunks below the compiled shape.
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
-    assert "never execute" in caplog.text
+    assert "require eligible tail padding" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
 
     caplog.clear()
     no_boundary = SimpleNamespace(
@@ -320,7 +319,68 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
     )
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(no_boundary, 4096)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
+
+
+@pytest.mark.parametrize("width, recommended", [(2048, 2048), (1500, 1472)])
+def test_oversized_shape_recommends_a_valid_sequence_length(caplog, width, recommended):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=width),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
+
+    assert "require eligible tail padding" in caplog.text
+    assert f"Set sequence_length={recommended} or a smaller valid shape" in caplog.text
+    caplog.clear()
+    ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, recommended)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+def test_sub_minimum_width_requires_padding_or_wider_chunks(caplog):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=512),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
+
+    assert "require eligible tail padding" in caplog.text
+    assert str(ane_patch._ANE_MIN_SEQUENCE_LENGTH) in caplog.text
+    assert "prefill chunk width" in caplog.text
+    assert "Set sequence_length=" not in caplog.text
+    assert "changing sequence_length alone" in caplog.text
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 512)
+
+
+def test_validator_and_warning_share_one_minimum(caplog):
+    minimum = ane_patch._ANE_MIN_SEQUENCE_LENGTH
+    alignment = ane_patch._ANE_SEQUENCE_LENGTH_ALIGNMENT
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(object(), minimum - alignment)
+    with pytest.raises(ValueError):
+        ane_patch.enable_qwen35_ane_prefill(
+            SimpleNamespace(), sequence_length=minimum - alignment
+        )
+
+    exact = SimpleNamespace(
+        config=SimpleNamespace(
+            prefill_step_size=2048, paged_cache_block_size=minimum
+        ),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(exact, minimum)
+    assert "require eligible tail padding" not in caplog.text
 
 
 def test_short_chunks_exit_before_the_tiling_planner(monkeypatch):
@@ -446,7 +506,8 @@ def test_mlp_profitable_tail_is_padded_and_sliced(monkeypatch):
     assert bool(mx.all(result == 7))
 
 
-def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
+@pytest.mark.parametrize("rows, threshold", [(1400, 1358), (512, 512)])
+def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch, rows, threshold):
     seen = []
 
     def exact(_mlp, block, _target_verify=False):
@@ -456,10 +517,10 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
     monkeypatch.setattr(ane_patch, "_backend_exact", exact)
     mlp = SimpleNamespace(
         _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
-            2048, 0.53, 8, tail_padding_min_tokens=1358
+            2048, 0.53, 8, tail_padding_min_tokens=threshold
         )
     )
-    x = mx.ones((1, 1400, 8), dtype=mx.float16)
+    x = mx.ones((1, rows, 8), dtype=mx.float16)
 
     result = ane_patch._backend(mlp, x)
     assert result is not None
@@ -467,8 +528,8 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
 
     assert result.shape == x.shape
     assert seen[0].shape == (1, 2048, 8)
-    assert bool(mx.all(seen[0][:, :1400] == 1))
-    assert bool(mx.all(seen[0][:, 1400:] == 0))
+    assert bool(mx.all(seen[0][:, :rows] == 1))
+    assert bool(mx.all(seen[0][:, rows:] == 0))
     assert bool(mx.all(result == 3))
 
 
@@ -577,47 +638,18 @@ def test_gdn_profitable_tail_is_padded_before_recurrence(monkeypatch):
     assert [part[0, -1, 0].item() for part in result] == [1, 2, 3, 4]
 
 
-def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
-    fallback = object()
-    accelerated = object()
+def test_install_dispatch_adds_gdn_projection_hook(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
 
-    def target_linears(linears, x, target_verify=False):
-        return fallback
-
-    vlm = SimpleNamespace(
-        Qwen3_5MLP=None,
-        register_qwen3_5_mlp_prefill_backend=lambda backend: None,
-        _target_verify_linears=target_linears,
-    )
-    lm = SimpleNamespace(MLP=None)
-
-    def import_module(name):
-        if name == "mlx_vlm.models.qwen3_5.language":
-            return vlm
-        if name == "mlx_lm.models.qwen3_5":
-            return lm
-        raise ImportError(name)
-
-    monkeypatch.setattr(ane_patch.importlib, "import_module", import_module)
-    monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_GDN_MODULES", weakref.WeakValueDictionary())
+    calls = []
     monkeypatch.setattr(
-        ane_patch, "_gdn_backend", lambda gdn, x, target_verify=False: accelerated
+        q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: calls.append("vlm")
     )
-
-    gdn = _GDN()
-    ane_patch._register_gdn_module(gdn)
+    monkeypatch.setattr(q4patch, "register_qwen35_lm_gdn_prefill_backend", calls.append)
+    monkeypatch.setattr(ane_patch, "_wrap_class", lambda cls: None)
 
     assert ane_patch._install_dispatch()
-    assert (
-        vlm._target_verify_linears(
-            (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
-            mx.zeros((1, 1, 128)),
-        )
-        is accelerated
-    )
-    assert vlm._target_verify_linears((object(),), mx.zeros((1, 1, 128))) is fallback
+    assert calls == [ane_patch._gdn_backend, "vlm"]
 
 
 def test_install_dispatch_registers_mlx_lm_gdn_backend(monkeypatch):
@@ -2405,6 +2437,8 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
         def __call__(self, x):
             return x
 
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
     registrations = []
     gdn_registrations = []
     vlm = SimpleNamespace(
@@ -2422,6 +2456,11 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
     monkeypatch.setattr(ane_patch, "_PATCHED_CLASSES", set())
     monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
     monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
+
+    monkeypatch.setattr(q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: None)
+    monkeypatch.setattr(
+        q4patch, "register_qwen35_lm_gdn_prefill_backend", gdn_registrations.append
+    )
 
     assert ane_patch._install_dispatch()
     assert PatchedMLP in ane_patch._PATCHED_CLASSES

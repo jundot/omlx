@@ -115,6 +115,9 @@ class BoundarySnapshotDiagnostics:
         source: str | None = None,
         storage: str | None = None,
         available_boundaries: int | None = None,
+        prompt_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        uncached_prompt_tokens: int | None = None,
     ) -> None:
         counter = {
             "capture_attempt": "capture_attempts",
@@ -152,6 +155,9 @@ class BoundarySnapshotDiagnostics:
                 ("source", source),
                 ("storage", storage),
                 ("available_boundaries", available_boundaries),
+                ("prompt_tokens", prompt_tokens),
+                ("cached_tokens", cached_tokens),
+                ("uncached_prompt_tokens", uncached_prompt_tokens),
                 ("cause", cause),
             ):
                 if value is not None:

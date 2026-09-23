@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from omlx.cluster import runtime_optimizations
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import run_cluster_performance_probe
 from omlx.cluster.performance import (
@@ -25,11 +26,23 @@ from omlx.cluster.planner import (
     plan_unequal_pipeline,
 )
 from omlx.cluster.runtime_optimizations import (
+    _agree_across_ranks,
     install_runtime_optimizations,
     pipeline_prefill_schedule,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
+
+
+@pytest.fixture(autouse=True)
+def _ranks_agree(monkeypatch):
+    """The fake two-rank groups below cannot run a real collective, so model a
+    cluster whose other ranks validated exactly what this rank did."""
+    monkeypatch.setattr(
+        runtime_optimizations,
+        "_agree_across_ranks",
+        lambda group, local: dict(local),
+    )
 
 
 def _profile(node_id: str, rank: int, rate: float) -> NodePerformanceProfile:
@@ -349,6 +362,66 @@ def test_sampling_rank_optimization_is_capability_gated_and_restored():
     assert _ValidatedPipeline.__call__ is original_call
     assert mlx_generate.GenerationBatch._step is original_step
     assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
+
+
+def test_capability_vote_keeps_only_what_every_rank_supports(monkeypatch):
+    class Group:
+        @staticmethod
+        def size():
+            return 3
+
+    local = {"prompt": True, "rank_zero_logits": False, "sampling": True}
+    # The other two ranks support prompt overlap and sampling, but one of them
+    # rejects sampling, so only prompt overlap survives. Votes are sorted by name.
+    others = mx.array([2, 0, 1], dtype=mx.int32)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda votes, group=None: votes + others,
+    )
+
+    assert _agree_across_ranks(Group(), local) == {
+        "prompt": True,
+        "rank_zero_logits": False,
+        "sampling": False,
+    }
+
+
+def test_rank_zero_sampling_stays_off_when_another_rank_cannot_use_it(monkeypatch):
+    """#3521: a rank that takes the token all-sum path while its peer runs
+    MLX-LM's hidden-state gather deadlocks both, so no rank may enable it alone."""
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+    )
+    model = SimpleNamespace(model=_ValidatedPipeline())
+    original_gather = mx.distributed.all_gather
+    original_send = mx.distributed.send
+    original_step = mlx_generate.GenerationBatch._step
+    votes = []
+
+    def peer_rejects_sampling(group, local):
+        votes.append(dict(local))
+        return {**local, "sampling": False}
+
+    monkeypatch.setattr(
+        runtime_optimizations, "_agree_across_ranks", peer_rejects_sampling
+    )
+
+    with install_runtime_optimizations(
+        model,
+        _WorkerGroup(),
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert votes == [{"prompt": True, "rank_zero_logits": False, "sampling": True}]
+        sampling = capabilities["sampling_rank_only"]
+        assert sampling["active"] is False
+        assert "another rank" in sampling["reason"]
+        assert capabilities["pipeline_prefill_overlap"]["active"] is False
+        assert mx.distributed.all_gather is original_gather
+        assert mx.distributed.send is original_send
+        assert mlx_generate.GenerationBatch._step is original_step
 
 
 def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(

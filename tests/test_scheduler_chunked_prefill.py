@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import pytest
 
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.request import Request, RequestStatus, SamplingParams
@@ -133,6 +134,29 @@ def _make_recording_scheduler(
         ),
     )
     return scheduler, model
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_prefill_interrupts_mtp_cost_timing(chunked):
+    from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
+
+    scheduler, model = _make_recording_scheduler("qwen3_5_moe")
+    policy = BatchPolicy([0, 1], 3)
+    scheduler.batch_generator = SimpleNamespace(
+        _generation_batch=SimpleNamespace(_omlx_mtp_batch_policy=policy)
+    )
+    policy.cycle_time_ms("mtp", 1.0, 1.02)
+    request = _make_request("timing", n_tokens=9)
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        if chunked:
+            state = _make_prefill_state(scheduler, request, n_remaining=8)
+            scheduler._step_prefill_chunk(state)
+        else:
+            cache = [SimpleNamespace(state=mx.array([0]))]
+            scheduler._do_external_prefill(request, list(range(9)), cache)
+    assert model.chunk_lengths == [8]
+    assert policy.cycle_time_ms("mtp", 2.0, 2.02) is None
+    assert abs(policy.cycle_time_ms("mtp", 2.025, 2.04) - 20) < 1e-6
 
 
 # ---------------------------------------------------------------------------

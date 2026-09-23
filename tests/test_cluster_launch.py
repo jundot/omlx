@@ -373,7 +373,9 @@ def test_supervisor_collects_every_rank_ready_event():
     assert status["ranks"][1]["measured_weight_bytes"] == 11
 
 
-def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
+def test_supervisor_stop_kills_rank_left_after_launcher_exits(
+    tmp_path, monkeypatch, mock_cluster_ssh
+):
     class Launcher:
         pid = 43210
         stdout = None
@@ -393,6 +395,7 @@ def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
         _deployment(),
         preflight=False,
         stop_timeout=0.1,
+        state_dir=str(tmp_path),
     )
     launcher = Launcher()
     supervisor.process = launcher
@@ -428,7 +431,9 @@ def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
     assert supervisor.status().phase == "stopped"
 
 
-def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
+def test_supervisor_stop_reaps_group_when_launcher_already_exited(
+    tmp_path, monkeypatch, mock_cluster_ssh
+):
     class Launcher:
         pid = 43211
         stdout = None
@@ -442,6 +447,7 @@ def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
         _deployment(),
         preflight=False,
         stop_timeout=0.1,
+        state_dir=str(tmp_path),
     )
     supervisor.process = Launcher()
     signals = []
@@ -469,7 +475,9 @@ def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
     assert supervisor.process is None
 
 
-def test_supervisor_stop_handles_reused_group_permission_error(monkeypatch):
+def test_supervisor_stop_handles_reused_group_permission_error(
+    tmp_path, monkeypatch, mock_cluster_ssh
+):
     class Launcher:
         pid = 43212
         stdout = None
@@ -483,6 +491,7 @@ def test_supervisor_stop_handles_reused_group_permission_error(monkeypatch):
         _deployment(),
         preflight=False,
         stop_timeout=0.1,
+        state_dir=str(tmp_path),
     )
     supervisor.process = Launcher()
     swept = []
@@ -1993,7 +2002,9 @@ def _rank_marker(pid: int, rank: int, *, phase: str = "ready") -> dict:
     }
 
 
-def test_supervisor_stop_retries_sigkill_once_then_succeeds(tmp_path, monkeypatch):
+def test_supervisor_stop_retries_sigkill_once_then_succeeds(
+    tmp_path, monkeypatch, mock_cluster_ssh
+):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
         preflight=False,
@@ -2036,7 +2047,7 @@ def test_supervisor_stop_retries_sigkill_once_then_succeeds(tmp_path, monkeypatc
 
 
 def test_supervisor_stop_raises_and_keeps_state_when_group_survives(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, mock_cluster_ssh
 ):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
@@ -2077,7 +2088,9 @@ def test_supervisor_stop_raises_and_keeps_state_when_group_survives(
     assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
 
 
-def test_supervisor_stop_raises_on_unkillable_leftover_rank(tmp_path, monkeypatch):
+def test_supervisor_stop_raises_on_unkillable_leftover_rank(
+    tmp_path, monkeypatch, mock_cluster_ssh
+):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
         preflight=False,
@@ -2106,7 +2119,9 @@ def test_supervisor_stop_raises_on_unkillable_leftover_rank(tmp_path, monkeypatc
     assert supervisor.process is launcher
 
 
-def test_verified_stop_writes_then_removes_launch_manifest(tmp_path, monkeypatch):
+def test_verified_stop_writes_then_removes_launch_manifest(
+    tmp_path, monkeypatch, mock_cluster_ssh
+):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
         preflight=False,

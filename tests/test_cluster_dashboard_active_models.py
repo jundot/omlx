@@ -427,6 +427,7 @@ def _global_settings(tmp_path):
     return SimpleNamespace(
         base_path=tmp_path,
         cache=SimpleNamespace(
+            ssd_cache_max_size="auto",
             get_ssd_cache_dir=lambda base_path: cache_dir,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
         ),
@@ -515,7 +516,10 @@ def test_runtime_cache_distributed_stale_marker_contributes_no_row(tmp_path):
 
 
 def test_status_template_renders_cluster_badge_and_rank_cache_row():
-    status = (ROOT / "omlx/admin/templates/dashboard/_status.html").read_text()
+    blocks = ROOT / "omlx/admin/templates/dashboard/blocks"
+    status = (blocks / "_active_models.html").read_text() + (
+        blocks / "_cache_observability.html"
+    ).read_text()
     javascript = (ROOT / "omlx/admin/static/js/dashboard.js").read_text()
     en = json.loads((ROOT / "omlx/admin/i18n/en.json").read_text())
 

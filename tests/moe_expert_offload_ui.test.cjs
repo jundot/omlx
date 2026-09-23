@@ -40,5 +40,38 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
         const disabled = lines[i+1].match(/:disabled="([^"]+)"/)[1];
         assert.equal(vm.runInNewContext(disabled, {modelSettings:{[enabled]:true}}), true);
     }
-    console.log('PASS: offload save/reopen and bidirectional speculative toggle exclusion');
+    const percent = 'moe_expert_offload_resident_percent';
+    for (const [stored, displayed] of [[0.125, 12.5], [0.333, 33.3], [0.02, 2], [1, 100]]) {
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:stored});
+        assert.equal(app.modelSettings[percent], displayed);
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(payload[fraction], stored, 'untouched values must survive blur and save');
+        assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
+    }
+    for (const [input, saved] of [[5, 0.05], [10, 0.1], [12.5, 0.125], [33.3, 0.333], [95, 0.95]]) {
+        app.modelSettings[percent] = input;
+        app.onMoeExpertOffloadResidentPercent();
+        assert.equal(app.moeExpertOffloadResidentInvalid(), false);
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(payload[fraction], saved);
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, payload);
+        assert.equal(app.modelSettings[percent], input);
+    }
+    for (const [input, settled] of [['', 5], [0, 5], [100, 95]]) {
+        const previous = app.modelSettings[fraction];
+        app.modelSettings[percent] = input;
+        app.onMoeExpertOffloadResidentPercent();
+        assert.equal(app.moeExpertOffloadResidentInvalid(), true);
+        assert.equal(app.modelSettings[fraction], previous, 'partial input must not change the saved fraction');
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(app.modelSettings[percent], settled);
+        assert.equal(payload[fraction], settled / 100);
+    }
+    assert.match(offload, /<input type="number" min="5" max="95" step="any" inputmode="decimal"/);
+    assert.ok(offload.includes('@input="onMoeExpertOffloadResidentPercent()"'));
+    assert.ok(offload.includes('@blur="onMoeExpertOffloadResidentBlur()"'));
+    console.log('PASS: offload save/reopen, spec toggle exclusion and fractional resident percentage');
 })().catch(error => {console.error(error); process.exitCode = 1});

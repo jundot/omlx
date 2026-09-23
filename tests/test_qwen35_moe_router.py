@@ -19,21 +19,22 @@ K = 8
 NE = 256
 
 
-def _composed(p):
-    inds = mx.argpartition(p, kth=-K, axis=-1)[..., -K:]
+def _composed(p, top_k=K):
+    inds = mx.argpartition(p, kth=-top_k, axis=-1)[..., -top_k:]
     scores = mx.take_along_axis(p, inds, axis=-1)
     scores = scores / scores.sum(axis=-1, keepdims=True)
     return inds, scores
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_selected_set_matches_composed():
+@pytest.mark.parametrize("experts,top_k", [(NE, K), (512, 10)])
+def test_selected_set_matches_composed(experts, top_k):
     mx.random.seed(3)
     for _ in range(300):
-        g = (mx.random.normal((1, 1, NE)) * 2.0).astype(mx.bfloat16)
+        g = (mx.random.normal((1, 1, experts)) * 2.0).astype(mx.bfloat16)
         p = mx.softmax(g, axis=-1, precise=True)
-        ci, cs = _composed(p)
-        fi, fs = fused_router_topk(p, K)
+        ci, cs = _composed(p, top_k)
+        fi, fs = fused_router_topk(p, top_k)
         assert sorted(ci[0, 0].tolist()) == sorted(fi[0, 0].tolist())
         cmap = dict(zip(ci[0, 0].tolist(), cs[0, 0].astype(mx.float32).tolist()))
         fmap = dict(zip(fi[0, 0].tolist(), fs[0, 0].astype(mx.float32).tolist()))
@@ -73,3 +74,43 @@ def test_eligibility_gates():
     assert not router_eligible(x1, 250)  # NE % 32 != 0
     xf = mx.zeros((1, 1, 2048), dtype=mx.float32)
     assert not router_eligible(xf, NE)
+
+
+@pytest.mark.parametrize("length,engaged", [(4, True), (9, False)])
+def test_verifier_routes_short_moe_blocks_through_fused_router(
+    monkeypatch, length, engaged
+):
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+    from omlx.patches import qwen35_moe_router as router
+
+    monkeypatch.setattr(
+        Qwen3_5BatchInvariantForward,
+        "_feed_forward",
+        Qwen3_5BatchInvariantForward._feed_forward,
+    )
+    model = Qwen3_5MoeSparseMoeBlock(
+        SimpleNamespace(
+            hidden_size=64,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            num_experts=512,
+            num_experts_per_tok=10,
+        )
+    )
+    model.set_dtype(mx.bfloat16)
+    x = mx.random.normal((1, length, 64)).astype(mx.bfloat16)
+    calls = []
+    original = router.fused_router_topk
+
+    def record(probs, top_k):
+        calls.append((probs.shape, top_k))
+        return original(probs, top_k)
+
+    monkeypatch.setattr(router, "fused_router_topk", record)
+    router._ensure_vlm_verify_patch()
+    router._ensure_vlm_verify_patch()
+    mx.eval(Qwen3_5BatchInvariantForward()._feed_forward(model, x))
+    assert calls == ([((1, length, 512), 10)] if engaged else [])
