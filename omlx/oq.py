@@ -59,6 +59,28 @@ _QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
 )
 
 
+def _shard_files(directory: Path) -> list[Path]:
+    """Return a checkpoint directory's safetensors shards, sorted by path.
+
+    ``pathlib.Path.glob`` matches dot-prefixed names, unlike shell globbing
+    and :func:`glob.glob`. A model library kept on exFAT/NTFS/SMB therefore
+    hands back the macOS AppleDouble sidecars (``._<shard>``) that carry the
+    extended attributes of each shard: 4 KB of binary xattr data whose first
+    eight bytes decode to a nonsense header length, so indexing one aborts
+    the whole quant task with a ``UnicodeDecodeError``.
+
+    Skipping every dot-prefixed match is the Python 3.11-compatible spelling
+    of the ``include_hidden=False`` flag that :meth:`Path.glob` grew in 3.13,
+    and it covers resource forks, sync-tool temporaries and any other hidden
+    company a checkpoint directory keeps. No checkpoint ships a hidden shard.
+    """
+    return sorted(
+        path
+        for path in directory.glob("*.safetensors")
+        if not path.name.startswith(".")
+    )
+
+
 def _is_qwen4_exp_config(config: dict) -> bool:
     """Return whether *config* selects the Qwen4-Exp/Flash-Next family."""
     text_config = config.get("text_config")
@@ -1479,7 +1501,7 @@ def combine_gemma4_assistant_mtp(
         with open(index_path) as f:
             shards = sorted(set(json.load(f)["weight_map"].values()))
     else:
-        shards = sorted(p.name for p in assistant.glob("*.safetensors"))
+        shards = [p.name for p in _shard_files(assistant)]
     if not shards:
         raise ValueError(f"No safetensors found in assistant model: {assistant}")
 
@@ -1824,7 +1846,7 @@ def _shard_key_map(model_dir: Path) -> dict:
         with open(index_path) as f:
             return dict(json.load(f).get("weight_map") or {})
     key_map: dict = {}
-    for shard in sorted(model_dir.glob("*.safetensors")):
+    for shard in _shard_files(model_dir):
         with open(shard, "rb") as f:
             header_len = int.from_bytes(f.read(8), "little")
             header = json.loads(f.read(header_len))
@@ -3310,7 +3332,7 @@ def estimate_bpw_and_size(
     with open(config_path) as f:
         config = json.load(f)
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _shard_files(source)
     if not weight_files:
         return {
             "effective_bpw": float(oq_level),
@@ -3556,7 +3578,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
-    source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
+    source_total = sum(sf.stat().st_size for sf in _shard_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
@@ -3660,7 +3682,7 @@ def _calibration_resident_checkpoint_bytes(
     layer walk invokes neither the vision tower nor the ordinary ``lm_head``.
     Safetensors headers and every other tensor remain charged to the model.
     """
-    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    weight_files = _shard_files(Path(model_path))
     checkpoint_bytes = _checkpoint_storage_bytes(weight_files)
     if not _is_qwen4_exp_config(config):
         return checkpoint_bytes
@@ -4654,8 +4676,16 @@ class _LazyTensorIndex:
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
-                hlen = _struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(hlen))
+                try:
+                    hlen = _struct.unpack("<Q", f.read(8))[0]
+                    header = json.loads(f.read(hlen))
+                except (ValueError, _struct.error) as exc:
+                    # Naming the shard matters: the bare decode error this
+                    # used to raise identified neither the file nor the
+                    # directory it came from.
+                    raise ValueError(
+                        f"Unreadable safetensors header in {sf_path}: {exc}"
+                    ) from exc
                 data_offset = 8 + hlen
                 for k, meta in header.items():
                     if k == "__metadata__":
@@ -5233,7 +5263,7 @@ def _progress_total_bytes(all_weights, source: Path) -> int:
     lets progress exceed 100% and makes ETA negative.
     """
     candidates = [
-        sum(sf.stat().st_size for sf in source.glob("*.safetensors")),
+        sum(sf.stat().st_size for sf in _shard_files(source)),
     ]
 
     if hasattr(all_weights, "nbytes"):
@@ -5284,7 +5314,7 @@ def _source_imatrix_signature(
     stable_config = {k: v for k, v in config.items() if not str(k).startswith("_oq_")}
     cfg_bytes = json.dumps(stable_config, sort_keys=True, default=str).encode("utf-8")
     h = hashlib.sha256(cfg_bytes)
-    for sf in sorted(source.glob("*.safetensors")):
+    for sf in _shard_files(source):
         st = sf.stat()
         h.update(sf.name.encode("utf-8"))
         h.update(str(st.st_size).encode("ascii"))
@@ -6057,7 +6087,7 @@ def quantize_oq_streaming(
 
     cb("loading", 5.0, "Reading model config")
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _shard_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
@@ -6149,7 +6179,7 @@ def quantize_oq_streaming(
                 trust_remote_code=trust_remote_code,
                 preserve_mtp=preserve_mtp,
             )
-            proxy_bytes = _checkpoint_storage_bytes(candidate.glob("*.safetensors"))
+            proxy_bytes = _checkpoint_storage_bytes(_shard_files(candidate))
             proxy_resident_bytes = _calibration_resident_checkpoint_bytes(
                 candidate,
                 config,
@@ -6780,7 +6810,7 @@ def quantize_oq_streaming(
     cb("saving", 92.0, "Writing model metadata")
 
     if total_shards > 1:
-        total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
+        total_size = sum(f.stat().st_size for f in _shard_files(output))
         index = {
             "metadata": {"total_size": total_size},
             "weight_map": dict(sorted(weight_map.items())),
@@ -9996,7 +10026,7 @@ def _build_streaming_proxy_for_sensitivity(
     _validate_oq_dtype_for_model(config, dtype)
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _shard_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
@@ -10166,7 +10196,7 @@ def _build_streaming_proxy_for_sensitivity(
                     if value == old_name:
                         weight_map[key] = new_name
 
-        total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
+        total_size = sum(f.stat().st_size for f in _shard_files(output))
         index = {
             "metadata": {"total_size": total_size},
             "weight_map": dict(sorted(weight_map.items())),
