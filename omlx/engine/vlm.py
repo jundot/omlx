@@ -2977,12 +2977,11 @@ class VLMBatchedEngine(BaseEngine):
                     glm_content.append({"type": "text", "text": content})
 
                 formatted_messages.append({"role": role, "content": glm_content})
-            elif model_type in {"mimo_v2", "mimo_v2_flash"} and (
-                msg_num_images > 0 or msg_num_audios > 0
-            ):
-                # Render MiMo's special tokens before applying the chat
-                # template. This also works with tokenizer wrappers that only
-                # preserve string content and would otherwise drop media dicts.
+            elif model_type in {"mimo_v2", "mimo_v2_flash"}:
+                # mlx-vlm's get_message_json does not support MiMo, even for
+                # text-only history. Format every turn here so one earlier text
+                # message cannot trigger the fallback that drops image markers.
+                # Render media tokens before templates that drop media dicts.
                 mimo_content: list[str] = []
                 inserted_images = 0
                 inserted_audios = 0

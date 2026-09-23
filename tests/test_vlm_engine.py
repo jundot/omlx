@@ -2121,6 +2121,37 @@ class TestFormatMessagesForVLMTemplate:
         ]
         assert image_ranges == [(0, 1)]
 
+    def test_format_mimo_image_after_text_only_history(self):
+        """Prior text-only turns must not invoke mlx-vlm's unsupported MiMo formatter."""
+        engine = _make_loaded_engine(model_type="mimo_v2_flash")
+        messages = [
+            {"role": "system", "content": "Help the user."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png"}},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted == [
+            {"role": "system", "content": "Help the user."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {
+                "role": "user",
+                "content": "Describe this.<|vision_start|><|image_pad|><|vision_end|>",
+            },
+        ]
+        assert image_ranges == [(3, 1)]
+
     def test_format_mimo_preserves_mixed_media_order(self):
         """MiMo keeps image and audio markers in the user's original order."""
         engine = _make_loaded_engine(model_type="mimo_v2_flash")
