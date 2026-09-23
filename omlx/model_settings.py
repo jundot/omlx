@@ -35,8 +35,11 @@ SETTINGS_VERSION = 1
 # Keep API validation and runtime normalization on the same contract.
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
+# These families keep the MTP head resident while backbone experts stream.
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
 
-def validate_moe_expert_offload(settings: dict) -> None:
+
+def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
     fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
     if (
         isinstance(fraction, bool)
@@ -44,14 +47,22 @@ def validate_moe_expert_offload(settings: dict) -> None:
         or not 0 < fraction <= 1
     ):
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
-    if settings.get("moe_expert_offload_enabled") and any(
-        settings.get(key)
-        for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled")
-    ):
+    if not settings.get("moe_expert_offload_enabled"):
+        return
+    # VLM MTP and DFlash have no offload-aware draft path at all.
+    if any(settings.get(key) for key in ("vlm_mtp_enabled", "dflash_enabled")):
         raise ValueError(
             "MoE expert offload cannot be combined with Lightning MTP, "
             "VLM MTP, or DFlash; disable speculative decoding first."
         )
+    # Settings can load before the checkpoint family is known.
+    if settings.get("mtp_enabled") and model_type is not None:
+        family = model_type.replace("-", "_").lower()
+        if family not in MOE_OFFLOAD_MTP_MODEL_TYPES:
+            raise ValueError(
+                "MoE expert offload cannot be combined with Lightning MTP, "
+                "VLM MTP, or DFlash; disable speculative decoding first."
+            )
 
 
 def ane_prefill_backend(model_type: str | None) -> str | None:

@@ -136,12 +136,39 @@ def test_quantized_expert_eviction_preserves_arithmetic(
         plan.close()
 
 
-@pytest.mark.parametrize("key", ["mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"])
+@pytest.mark.parametrize("key", ["vlm_mtp_enabled", "dflash_enabled"])
 def test_speculative_offload_conflict(key):
     from omlx.model_settings import ModelSettings
 
     with pytest.raises(ValueError, match="MoE expert offload cannot"):
         ModelSettings(moe_expert_offload_enabled=True, **{key: True})
+
+
+def test_lightning_mtp_offload_conflict_is_family_aware():
+    from omlx.model_settings import validate_moe_expert_offload
+
+    settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
+    validate_moe_expert_offload(settings, model_type="deepseek_v41")
+    validate_moe_expert_offload(settings, model_type="glm5_next")
+    validate_moe_expert_offload(settings, model_type="glm5-next")
+    validate_moe_expert_offload(settings, model_type=None)
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        validate_moe_expert_offload(settings, model_type="qwen3_5")
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        validate_moe_expert_offload(settings, model_type="glm_moe_dsa")
+    # DFlash/VLM MTP stay rejected for every family, V4.1 included.
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        validate_moe_expert_offload(
+            {"moe_expert_offload_enabled": True, "dflash_enabled": True},
+            model_type="deepseek_v41",
+        )
+
+
+def test_mtp_offload_pairing_survives_settings_roundtrip():
+    from omlx.model_settings import ModelSettings
+
+    settings = ModelSettings(moe_expert_offload_enabled=True, mtp_enabled=True)
+    assert settings.moe_expert_offload_enabled and settings.mtp_enabled
 
 
 def test_converted_draft_weights_are_not_loaded_with_offload(tmp_path):
@@ -643,3 +670,213 @@ def test_consumed_read_buffers_are_released_within_window(
         assert all(ref() is None for ref, _ in refs)
     finally:
         plan.close()
+
+
+def _mtp_checkpoint(tmp_path, name="converted", experts=8):
+    """A converted -mtp checkpoint: DSpark draft head + offloadable backbone."""
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=experts,
+        n_activated_experts=2,
+        preserve_mtp=True,
+        n_mtp_layers=3,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    )
+    target = tmp_path / name
+    convert(source, target, preserve_mtp=True)
+    return target
+
+
+def test_converted_draft_head_stays_resident_with_offload_and_mtp(
+    tmp_path, monkeypatch
+):
+    from mlx.utils import tree_flatten
+
+    from omlx.patches import mlx_lm_mtp
+
+    target = _mtp_checkpoint(tmp_path)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    model, _ = load(target, moe_expert_offload_resident_fraction=0.5)
+    try:
+        assert model.config.preserve_mtp
+        assert model.language_model.mtp, "The draft head must stay resident"
+        assert model.language_model._omlx_dspark_decode_enabled
+        plan = model._moe_offload_plan
+        assert plan.mtp_resident and plan.draft_bytes > 0
+        assert isinstance(model.language_model.layers[0].ffn.experts, OffloadedExpert)
+        # Draft tensors are loaded normally, never registered for exclusion.
+        assert not any(
+            key.startswith("language_model.mtp.") for key in plan.excluded_keys
+        )
+        draft_names = []
+        for stage in model.language_model.mtp:
+            draft_names.extend(name for name, _ in tree_flatten(stage.parameters()))
+        assert draft_names
+        out = model(mx.array([[3, 4, 5]]))
+        mx.eval(out)
+        assert np.isfinite(np.asarray(out)).all()
+    finally:
+        model.close()
+
+
+def test_offloaded_dspark_verify_matches_resident(tmp_path, monkeypatch):
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.deepseek_v41 import dspark
+
+    target = _mtp_checkpoint(tmp_path)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    offloaded, _ = load(target, moe_expert_offload_resident_fraction=0.5)
+    resident, _ = load(target)
+    prompt = [3, 4, 5, 6, 7, 8, 9]
+    try:
+        off_lm, res_lm = offloaded.language_model, resident.language_model
+        assert isinstance(off_lm.layers[0].ffn.experts, OffloadedExpert)
+        assert not isinstance(res_lm.layers[0].ffn.experts, OffloadedExpert)
+        off_lm.configure_mtp(True, 3)
+        res_lm.configure_mtp(True, 3)
+
+        # Resident draft head proposes from backbone-committed context.
+        _, main_hidden = off_lm(
+            mx.array([prompt]), cache=off_lm.make_cache(), return_dspark_hidden=True
+        )
+        mtp_cache = off_lm.make_mtp_cache()
+        assert (
+            dspark.forward_spec(off_lm, mx.array([[prompt[0]]]), main_hidden, mtp_cache)
+            is None
+        )
+        proposals = dspark.forward_spec(
+            off_lm, mx.array([[prompt[-1]]]), main_hidden[:, -1:], mtp_cache
+        )
+        assert proposals is not None and proposals[0].shape == (
+            1,
+            off_lm._config.dspark_block_size + 1,
+        )
+
+        # Backbone verify (T = k + 1 tokens) through the streamed experts.
+        off_cache, res_cache = off_lm.make_cache(), res_lm.make_cache()
+        off_lm(mx.array([prompt]), cache=off_cache)
+        res_lm(mx.array([prompt]), cache=res_cache)
+        block = mx.array([[21, 22, 23, 24]])
+        off_hidden = off_lm(block, cache=off_cache, return_hidden=True, n_confirmed=1)
+        res_hidden = res_lm(block, cache=res_cache, return_hidden=True, n_confirmed=1)
+        off_hidden = off_hidden[0] if isinstance(off_hidden, tuple) else off_hidden
+        res_hidden = res_hidden[0] if isinstance(res_hidden, tuple) else res_hidden
+        mx.eval(off_hidden, res_hidden)
+        np.testing.assert_allclose(
+            np.asarray(off_hidden), np.asarray(res_hidden), rtol=2e-4, atol=2e-5
+        )
+    finally:
+        offloaded.close()
+        resident.close()
+
+
+def test_mtp_resident_savings_excludes_draft_bytes(tmp_path, monkeypatch):
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.moe_offload import (
+        ExpertOffloadPlan,
+        estimate_expert_savings,
+    )
+
+    target = _mtp_checkpoint(tmp_path)
+    raw = json.loads((target / "config.json").read_text())
+    mapping = json.loads((target / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+
+    def plan(mtp_resident):
+        return ExpertOffloadPlan(
+            target,
+            raw,
+            mapping,
+            ModelConfig.from_dict(raw),
+            0.5,
+            mtp_resident=mtp_resident,
+        )
+
+    streaming = plan(False)
+    resident = plan(True)
+    assert streaming.draft_bytes == resident.draft_bytes > 0
+    assert any(k.startswith("language_model.mtp.") for k in streaming.excluded_keys)
+    assert not any(k.startswith("language_model.mtp.") for k in resident.excluded_keys)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    assert (
+        estimate_expert_savings(target, 0.5, mtp_resident=False)
+        - estimate_expert_savings(target, 0.5, mtp_resident=True)
+        == streaming.draft_bytes
+    )
+
+
+def _stub_checkpoint(tmp_path, model_type):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    return str(tmp_path)
+
+
+def test_load_time_gate_allows_v41_rejects_other_lightning_family(tmp_path):
+    from omlx.utils.model_loading import (
+        _config_model_type,
+        maybe_apply_pre_load_patches,
+    )
+
+    v41 = _stub_checkpoint(tmp_path / "v41", "deepseek_v41")
+    assert _config_model_type(v41) == "deepseek_v41"
+    other = _stub_checkpoint(tmp_path / "qwen", "qwen3_5_moe")
+
+    class Settings:
+        moe_expert_offload_enabled = True
+        moe_expert_offload_resident_fraction = 0.5
+        mtp_enabled = True
+        vlm_mtp_enabled = False
+        dflash_enabled = False
+
+    from omlx.model_settings import validate_moe_expert_offload
+
+    validate_moe_expert_offload(
+        {
+            "moe_expert_offload_enabled": True,
+            "moe_expert_offload_resident_fraction": 0.5,
+            "mtp_enabled": True,
+        },
+        model_type=_config_model_type(v41),
+    )
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        maybe_apply_pre_load_patches(other, Settings())
+
+
+def test_admin_validate_offload_mtp_family_gate(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omlx.admin.routes import _validate_model_settings
+
+    # Isolate the family gate from the checkpoint-layout inspection.
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda *_a, **_k: (True, ""),
+    )
+    settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
+    # V4.1: allowed, no HTTPException.
+    _validate_model_settings(
+        SimpleNamespace(model_path=str(tmp_path), config_model_type="deepseek-v41"),
+        settings,
+    )
+    _validate_model_settings(
+        SimpleNamespace(model_path=str(tmp_path), config_model_type="glm5-next"),
+        settings,
+    )
+    # Any other lightning family: rejected at save time.
+    with pytest.raises(HTTPException) as error:
+        _validate_model_settings(
+            SimpleNamespace(model_path=str(tmp_path), config_model_type="qwen3_5_moe"),
+            settings,
+        )
+    assert error.value.status_code == 400
