@@ -9402,7 +9402,9 @@ def _collect_imatrix(
             )
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
-            tokenizer = load_tokenizer(Path(model_path))
+            tokenizer = load_tokenizer(
+                Path(model_path), {"trust_remote_code": trust_remote_code}
+            )
         else:
             from omlx.utils.model_loading import lm_load_compat as lm_load
 
@@ -9410,6 +9412,7 @@ def _collect_imatrix(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                tokenizer_config={"trust_remote_code": trust_remote_code},
                 model_config=_sensitivity_lm_config_override(config),
             )
     except Exception as e:
@@ -9550,7 +9553,9 @@ def _load_or_collect_imatrix(
         # indirection below does not apply: it calibrates the real weights.
         from mlx_lm.tokenizer_utils import load as load_tokenizer
 
-        tokenizer = load_tokenizer(Path(model_path))
+        tokenizer = load_tokenizer(
+            Path(model_path), {"trust_remote_code": trust_remote_code}
+        )
         entries, collection_metadata = _collect_imatrix_streaming(
             model_path,
             tokenizer,
@@ -9800,7 +9805,9 @@ def _measure_sensitivity(
             )
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
-            tokenizer = load_tokenizer(Path(model_path))
+            tokenizer = load_tokenizer(
+                Path(model_path), {"trust_remote_code": trust_remote_code}
+            )
         else:
             from omlx.utils.model_loading import lm_load_compat as lm_load
 
@@ -9808,6 +9815,7 @@ def _measure_sensitivity(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                tokenizer_config={"trust_remote_code": trust_remote_code},
                 model_config=_sensitivity_lm_config_override(config),
             )
     except Exception as e:
@@ -9859,7 +9867,7 @@ def _measure_sensitivity_streaming(
     source = Path(model_path)
     from mlx_lm.tokenizer_utils import load as load_tokenizer
 
-    tokenizer = load_tokenizer(source)
+    tokenizer = load_tokenizer(source, {"trust_remote_code": trust_remote_code})
     if _stream_source_model_type(config) == "qwen4_exp":
         _qwen4_exp_apply_compat_patch()
     embed_weight = _streamed_embed_weight(source, config)
@@ -10272,7 +10280,9 @@ def _measure_sensitivity_from_quantized_model(
                 # Match the imatrix and non-proxy sensitivity load paths.
                 strict=False,
             )
-            tokenizer = load_tokenizer(Path(model_path))
+            tokenizer = load_tokenizer(
+                Path(model_path), {"trust_remote_code": trust_remote_code}
+            )
         else:
             # Mirror the main quantize path's MTP patch sequence so an
             # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
@@ -10305,6 +10315,7 @@ def _measure_sensitivity_from_quantized_model(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                tokenizer_config={"trust_remote_code": trust_remote_code},
             )
     except Exception as e:
         logger.error(f"Sensitivity proxy load failed ({e})")
