@@ -311,12 +311,55 @@ async def _continue_queue(engine_pool: Any, chain_id: int) -> None:
         f"benchmarks={list(request.benchmarks.keys())}"
     )
 
+    # The previous item has just unloaded its model; without this wait the
+    # admission reads the stale footprint and refuses the load (see the helper).
+    await _wait_for_memory_to_settle(engine_pool)
+
     try:
         await run_accuracy_benchmark(run, engine_pool)
     except Exception as e:
         logger.error(f"Queue: error running {request.model_id}: {e}")
 
     await _continue_queue(engine_pool, chain_id)
+
+
+async def _wait_for_memory_to_settle(engine_pool, timeout_s: float = 90.0) -> None:
+    """Wait for the kernel ledger to give back the previous model's pages.
+
+    Load admission (``engine_pool.get_engine``) compares the cap against
+    ``max(active_memory, phys_footprint, accounted)``, and ``phys_footprint``
+    is the macOS ledger, which keeps counting reclaimable pages of a
+    just-unloaded model. Measured 03/09: the unload reported
+    ``freed=106.72GB, active_memory: 433.66MB (settled)`` at 15:06:25.491 and
+    the queue asked for the next model in the SAME millisecond -- the
+    projection read ``current: 75.91GB`` and refused with
+    InsufficientMemoryError. Two queue items died that way, with the machine
+    genuinely empty; 92 s later the same load went through with no
+    intervention at all.
+
+    The unload's own barrier already waits for ``active_memory`` (and it did
+    its job: 433 MB). What is missing is waiting for the ledger, and that is
+    what this helper does -- only between queue items, where nobody is waiting
+    on a response.
+    """
+    import mlx.core as mx
+
+    from ..utils.proc_memory import get_phys_footprint
+
+    limit = time.monotonic() + timeout_s
+    previous = None
+    while time.monotonic() < limit:
+        footprint = get_phys_footprint()
+        live = mx.get_active_memory()
+        # settled once the ledger comes close to what MLX reports as live
+        if footprint <= live + 8 * 1024**3:
+            return
+        if previous is not None and footprint >= previous:
+            # it stopped falling: insisting does not help, and admission has
+            # its own eviction path if there is still not enough room
+            return
+        previous = footprint
+        await asyncio.sleep(2.0)
 
 
 async def cancel_queue() -> None:
