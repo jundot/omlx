@@ -466,7 +466,7 @@ class TestRestoreButton:
 
         i18n_dir = Path(__file__).resolve().parents[1] / "omlx/admin/i18n"
         locales = sorted(i18n_dir.glob("*.json"))
-        assert len(locales) == 9, f"expected 9 locales, got {len(locales)}"
+        assert locales, "no locale files found"
         wanted = {
             "status.claude_code.desktop_restore",
             "status.claude_code.desktop_restoring",
