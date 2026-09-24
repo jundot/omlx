@@ -482,6 +482,107 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
     }
 
+    func testMoeExpertOffloadWireKeysDecodeAndEncode() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let model = try decoder.decode(
+            ModelDTO.self,
+            from: Data(#"{"id":"mimo","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"mimo_v2_flash","moe_expert_offload_supported":true}"#.utf8)
+        )
+        XCTAssertEqual(model.moeExpertOffloadSupported, true)
+
+        let dto = try decoder.decode(
+            ModelSettingsDTO.self,
+            from: Data(#"{"moe_expert_offload_enabled":true,"moe_expert_offload_resident_fraction":0.125}"#.utf8)
+        )
+        XCTAssertEqual(dto.moeExpertOffloadEnabled, true)
+        XCTAssertEqual(dto.moeExpertOffloadResidentFraction, 0.125)
+
+        var patch = ModelSettingsPatch()
+        patch.moeExpertOffloadEnabled = true
+        patch.moeExpertOffloadResidentFraction = 0.25
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(
+            with: encoder.encode(patch)
+        ) as? [String: Any]
+        XCTAssertEqual(object?["moe_expert_offload_enabled"] as? Bool, true)
+        XCTAssertEqual(object?["moe_expert_offload_resident_fraction"] as? Double, 0.25)
+    }
+
+    func testMoeOffloadFractionOptionsOfferPresetsAndKeepCustomValues() {
+        let presets = ModelSettingsScreenVM.moeOffloadFractionOptions(current: "0.25")
+        XCTAssertEqual(presets.map(\.0), ["0.125", "0.25", "0.5", "0.75"])
+        // Labels are locale-formatted percents — compare against the same
+        // formatter rather than a literal ("12,5%" in pt-BR).
+        XCTAssertEqual(
+            presets.map(\.1),
+            [0.125, 0.25, 0.5, 0.75].map {
+                $0.formatted(.percent.precision(.fractionLength(0...1)))
+            }
+        )
+
+        // A server-side value outside the preset list surfaces as an extra
+        // leading option instead of silently rounding to a preset.
+        let custom = ModelSettingsScreenVM.moeOffloadFractionOptions(current: "0.33")
+        XCTAssertEqual(custom.map(\.0), ["0.33", "0.125", "0.25", "0.5", "0.75"])
+        XCTAssertEqual(custom.first?.1, 0.33.formatted(.percent.precision(.fractionLength(0...2))))
+    }
+
+    func testMoeOffloadSettingsAreIncludedInWorkingProfileOnlyWhenSupported() {
+        let vm = ModelSettingsScreenVM()
+        var model = makeModel(id: "mimo", configModelType: "mimo_v2_flash")
+        model.moeExpertOffloadSupported = true
+        vm.model = model
+        vm.moeExpertOffloadSupported = true
+        vm.moeExpertOffloadEnabled = true
+        vm.moeExpertOffloadResidentFraction = "0.125"
+
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings["moe_expert_offload_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["moe_expert_offload_resident_fraction"]?.value as? Double, 0.125)
+
+        // Unsupported models never emit the keys — the server gate would
+        // reject them anyway.
+        vm.moeExpertOffloadSupported = false
+        let gated = vm.currentSettingsDict()
+        XCTAssertNil(gated["moe_expert_offload_enabled"])
+        XCTAssertNil(gated["moe_expert_offload_resident_fraction"])
+
+        // Disabled offload still writes `enabled=false` (profile can turn a
+        // server-on setting off) but omits the fraction.
+        vm.moeExpertOffloadSupported = true
+        vm.moeExpertOffloadEnabled = false
+        let off = vm.currentSettingsDict()
+        XCTAssertEqual(off["moe_expert_offload_enabled"]?.value as? Bool, false)
+        XCTAssertNil(off["moe_expert_offload_resident_fraction"])
+    }
+
+    func testMoeOffloadConflictsWithSpeculativeDecodersBothWays() {
+        let vm = ModelSettingsScreenVM()
+        XCTAssertNil(vm.moeExpertOffloadConflictReason)
+
+        vm.mtpEnabled = true
+        XCTAssertNotNil(vm.moeExpertOffloadConflictReason)
+        vm.mtpEnabled = false
+
+        vm.vlmMtpEnabled = true
+        XCTAssertNotNil(vm.moeExpertOffloadConflictReason)
+        vm.vlmMtpEnabled = false
+
+        vm.dflashEnabled = true
+        XCTAssertNotNil(vm.moeExpertOffloadConflictReason)
+        vm.dflashEnabled = false
+
+        // Reverse direction: enabling offload blocks the speculative toggles
+        // so the user can't flip into a server-side 400.
+        vm.moeExpertOffloadEnabled = true
+        XCTAssertNotNil(vm.mtpConflictReason)
+        XCTAssertNotNil(vm.vlmMtpConflictReason)
+        XCTAssertNil(vm.moeExpertOffloadConflictReason)
+    }
+
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {
         var model = ModelDTO(
             id: id,

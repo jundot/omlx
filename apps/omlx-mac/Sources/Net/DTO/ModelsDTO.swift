@@ -65,6 +65,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let qwen4PleSsdOffloadForced: Bool?
     let qwen4PleResidentBytes: Int64?
     let qwen4PleMmapBytes: Int64?
+    /// True when the checkpoint passes the server-side MoE expert-offload
+    /// eligibility gate (stacked quantized SwitchGLU experts on a supported
+    /// model type — deepseek_v41/qwen4_exp/gemma4/olmoe/mimo_v2_flash).
+    var moeExpertOffloadSupported: Bool? = nil
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -169,6 +173,12 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let vlmMtpEnabled: Bool?
     let vlmMtpDraftModel: String?
     let vlmMtpDraftBlockSize: Int?
+    // Advanced: MoE expert offload — a resident fraction of each MoE
+    // layer's experts stays in RAM, the rest streams from SSD on miss.
+    // Mutually exclusive with mtpEnabled / vlmMtpEnabled / dflashEnabled
+    // server-side (validate_moe_expert_offload).
+    var moeExpertOffloadEnabled: Bool? = nil
+    var moeExpertOffloadResidentFraction: Double? = nil
 }
 
 /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
@@ -254,6 +264,9 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
+    // Advanced: MoE expert offload
+    var moeExpertOffloadEnabled: Bool? = nil
+    var moeExpertOffloadResidentFraction: Double? = nil
 }
 
 /// Body for POST /admin/api/models/{id}/settings/recipe.

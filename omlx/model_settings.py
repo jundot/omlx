@@ -40,13 +40,18 @@ MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
-    fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
-    if (
+    # None or 0 is automatic: the resident share is sized from the memory
+    # budget at load and the governor may re-tune it at runtime.
+    fraction = settings.get("moe_expert_offload_resident_fraction")
+    if fraction is not None and (
         isinstance(fraction, bool)
         or not isinstance(fraction, (int, float))
-        or not 0 < fraction <= 1
+        or not 0 <= fraction <= 1
     ):
-        raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
+        raise ValueError(
+            "moe_expert_offload_resident_fraction must be in [0, 1] or null "
+            "(0/null = automatic)"
+        )
     if not settings.get("moe_expert_offload_enabled"):
         return
     # VLM MTP and DFlash have no offload-aware draft path at all.
@@ -253,7 +258,8 @@ class ModelSettings:
             checkpoint on demand instead of keeping them all resident (fits
             models larger than memory; costs decode speed). Requires reload.
         moe_expert_offload_resident_fraction: Fraction of each layer's experts
-            kept resident (0 < f <= 1, default 0.25).
+            kept resident (0 < f <= 1). Null or 0 = automatic: sized from the
+            memory budget and re-tuned at runtime (default).
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -397,7 +403,7 @@ class ModelSettings:
 
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
-    moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
+    moe_expert_offload_resident_fraction: Optional[float] = None  # null/0 = auto
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

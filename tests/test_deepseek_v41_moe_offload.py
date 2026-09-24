@@ -200,7 +200,9 @@ def test_converted_draft_weights_are_not_loaded_with_offload(tmp_path):
         model.close()
 
 
-@pytest.mark.parametrize("fraction", [0, -0.25, 1.01, float("nan")])
+# 0 is valid: it selects automatic sizing, resolved against the memory
+# budget at load.
+@pytest.mark.parametrize("fraction", [-0.25, 1.01, float("nan")])
 def test_offload_api_rejects_invalid_fraction(fraction):
     from types import SimpleNamespace
 

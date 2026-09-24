@@ -57,6 +57,7 @@ final class ModelSettingsScreenVM {
         case dflashSsdCache, dflashSsdCacheGib
         case mtpEnabled
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
+        case moeExpertOffloadEnabled, moeExpertOffloadResidentFraction
     }
 
     static var modelTypeOptions: [(String, String)] {
@@ -243,6 +244,12 @@ final class ModelSettingsScreenVM {
     var qwen4PleSsdOffload: Bool = false
     var qwen4PleSsdOffloadSupported: Bool = false
     var qwen4PleSsdOffloadForced: Bool = false
+    // Advanced: MoE expert offload — a resident fraction of each MoE
+    // layer's experts stays resident; the rest streams from SSD on miss.
+    // Capability comes from the server (moe_expert_offload_supported).
+    var moeExpertOffloadEnabled: Bool = false
+    var moeExpertOffloadSupported: Bool = false
+    var moeExpertOffloadResidentFraction: String = "0"
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -408,6 +415,28 @@ final class ModelSettingsScreenVM {
 
     var thinkingForced: Bool { model?.thinkingForced == true }
 
+    /// Resident-fraction choices for the MoE offload picker: "Automatic"
+    /// (value 0 — the server sizes residency from the memory budget and
+    /// re-tunes it at runtime) plus the 12.5/25/50/75% presets. A custom
+    /// server-side value is surfaced as an extra option instead of
+    /// silently rounding.
+    static func moeOffloadFractionOptions(current: String) -> [(String, String)] {
+        let presets = [0.125, 0.25, 0.5, 0.75]
+        var options = [("0", String(localized: "settings.advanced.moe_offload.fraction.auto",
+                                    defaultValue: "Automatic",
+                                    comment: "MoE offload resident-fraction picker option that lets the server size residency"))]
+        options += presets.map {
+            (String($0), $0.formatted(.percent.precision(.fractionLength(0...1))))
+        }
+        if let v = Double(current), v != 0, !presets.contains(v) {
+            options.insert(
+                (current, v.formatted(.percent.precision(.fractionLength(0...2)))),
+                at: 0
+            )
+        }
+        return options
+    }
+
     static func aneFractionOptions(current: String, presets: [Double]) -> [(String, String)] {
         let value = Double(current)
         var options = presets.map { ($0 == value ? current : String($0), $0.formatted(.percent.precision(.fractionLength(0)))) }
@@ -431,8 +460,8 @@ final class ModelSettingsScreenVM {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
-        case .enableThinking, .qwen4PleSsdOffload,
-             .thinkingBudgetEnabled, .thinkingBudgetTokens:
+        case .enableThinking, .qwen4PleSsdOffload, .moeExpertOffloadEnabled,
+             .moeExpertOffloadResidentFraction, .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
@@ -578,6 +607,11 @@ final class ModelSettingsScreenVM {
                     m.qwen4PleSsdOffloadSupported ?? false
                 self.qwen4PleSsdOffload = self.qwen4PleSsdOffloadForced
                     || (s?.qwen4PleSsdOffload ?? false)
+                self.moeExpertOffloadSupported = m.moeExpertOffloadSupported ?? false
+                self.moeExpertOffloadEnabled = s?.moeExpertOffloadEnabled ?? false
+                self.moeExpertOffloadResidentFraction =
+                    s?.moeExpertOffloadResidentFraction.map { Self.formatPct($0) }
+                    ?? "0"
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -725,6 +759,24 @@ final class ModelSettingsScreenVM {
             guard isQwen4Exp, qwen4PleSsdOffloadSupported,
                   !qwen4PleSsdOffloadForced else { return }
             patch.qwen4PleSsdOffload = qwen4PleSsdOffload
+        case .moeExpertOffloadEnabled:
+            guard moeExpertOffloadSupported else { return }
+            // Conflicts only block turning offload ON — a stale/inconsistent
+            // server state must still be able to turn it off.
+            if moeExpertOffloadEnabled, moeExpertOffloadConflictReason != nil { return }
+            patch.moeExpertOffloadEnabled = moeExpertOffloadEnabled
+        case .moeExpertOffloadResidentFraction:
+            guard moeExpertOffloadSupported, moeExpertOffloadEnabled else { return }
+            // 0 is the automatic sentinel — the server sizes residency
+            // from the memory budget.
+            guard let v = Double(moeExpertOffloadResidentFraction), v >= 0, v <= 1 else {
+                lastError = String(
+                    localized: "settings.advanced.moe_offload.fraction.error",
+                    defaultValue: "Resident fraction must be between 0 (automatic) and 1.",
+                    comment: "Validation error when the MoE offload resident fraction is out of range")
+                return
+            }
+            patch.moeExpertOffloadResidentFraction = v
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:
@@ -1109,6 +1161,11 @@ final class ModelSettingsScreenVM {
                           defaultValue: "Disable VLM MTP before enabling Lightning MTP.",
                           comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
+        if moeExpertOffloadEnabled {
+            return String(localized: "settings.mtp.conflict.moe_offload",
+                          defaultValue: "Disable MoE Expert Offload before enabling Lightning MTP.",
+                          comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because MoE expert offload is on")
+        }
         return nil
     }
 
@@ -1159,6 +1216,34 @@ final class ModelSettingsScreenVM {
             return String(localized: "settings.vlm_mtp.conflict.processors",
                           defaultValue: "Unset repetition / presence penalty before enabling VLM MTP.",
                           comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because penalty settings are set")
+        }
+        if moeExpertOffloadEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.moe_offload",
+                          defaultValue: "Disable MoE Expert Offload before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because MoE expert offload is on")
+        }
+        return nil
+    }
+
+    /// MoE expert offload keeps non-resident experts on SSD and is mutually
+    /// exclusive with the speculative decoders — the server rejects offload +
+    /// MTP / VLM MTP / DFlash (validate_moe_expert_offload). Mirrors the
+    /// webui's disabled toggle so the switch can't be flipped into a 400.
+    var moeExpertOffloadConflictReason: String? {
+        if mtpEnabled {
+            return String(localized: "settings.moe_offload.conflict.mtp",
+                          defaultValue: "Disable Lightning MTP before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because Lightning MTP is on")
+        }
+        if vlmMtpEnabled {
+            return String(localized: "settings.moe_offload.conflict.vlm_mtp",
+                          defaultValue: "Disable VLM MTP before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because VLM MTP is on")
+        }
+        if dflashEnabled {
+            return String(localized: "settings.moe_offload.conflict.dflash",
+                          defaultValue: "Disable DFlash before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because DFlash is on")
         }
         return nil
     }
@@ -1323,6 +1408,14 @@ final class ModelSettingsScreenVM {
                 putBool(ProfileSettingsKey.dflashSsdCache, dflashSsdCache)
                 if dflashSsdCache, let bytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib)) {
                     out[ProfileSettingsKey.dflashSsdCacheMaxBytes] = AnyCodable(Int(bytes))
+                }
+            }
+            if moeExpertOffloadSupported {
+                putBool(ProfileSettingsKey.moeExpertOffloadEnabled, moeExpertOffloadEnabled)
+                if moeExpertOffloadEnabled,
+                   let fraction = Double(moeExpertOffloadResidentFraction) {
+                    out[ProfileSettingsKey.moeExpertOffloadResidentFraction] =
+                        AnyCodable(fraction)
                 }
             }
             putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)

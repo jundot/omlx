@@ -1177,6 +1177,32 @@ private struct AdvancedTab: View {
                         .disabled(vm.qwen4PleSsdOffloadForced)
                     }
                 }
+                if vm.moeExpertOffloadSupported {
+                    Row(label: String(localized: "settings.advanced.moe_offload.label",
+                                      defaultValue: "MoE Expert Offload",
+                                      comment: "Row label for the MoE expert offload toggle"),
+                        sublabel: moeOffloadSublabel) {
+                        RowSwitch(isOn: vm.bindProfile($vm.moeExpertOffloadEnabled))
+                            .disabled(vm.moeExpertOffloadConflictReason != nil
+                                      && !vm.moeExpertOffloadEnabled)
+                            .help(vm.moeExpertOffloadConflictReason ?? "")
+                    }
+                    if vm.moeExpertOffloadEnabled {
+                        Row(label: String(localized: "settings.advanced.moe_offload.fraction.label",
+                                          defaultValue: "Resident Experts",
+                                          comment: "Row label for the MoE offload resident-fraction picker"),
+                            sublabel: String(localized: "settings.advanced.moe_offload.fraction.sub",
+                                             defaultValue: "Share of each MoE layer's experts kept in RAM; the rest streams from SSD on demand. Applies on next reload.",
+                                             comment: "Sublabel for the MoE offload resident-fraction picker")) {
+                            Popup(
+                                selection: vm.bindProfile($vm.moeExpertOffloadResidentFraction),
+                                width: .controlCompact,
+                                options: ModelSettingsScreenVM.moeOffloadFractionOptions(
+                                    current: vm.moeExpertOffloadResidentFraction)
+                            )
+                        }
+                    }
+                }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
@@ -1293,6 +1319,13 @@ private struct AdvancedTab: View {
             )
             ExperimentalSection(vm: vm, client: client)
         }
+    }
+
+    private var moeOffloadSublabel: String {
+        if let reason = vm.moeExpertOffloadConflictReason { return reason }
+        return String(localized: "settings.advanced.moe_offload.sub",
+                      defaultValue: "Keep a fraction of MoE experts in RAM and stream the rest from SSD. Trades decode speed for memory. Applies on next reload.",
+                      comment: "Sublabel for the MoE expert offload toggle")
     }
 }
 
@@ -2190,8 +2223,15 @@ private struct ExperimentalSection: View {
                       comment: "Sublabel describing SpecPrefill")
     }
 
+    private var moeOffloadOwnsPathReason: String {
+        String(localized: "settings.speculative.conflict.moe_offload",
+               defaultValue: "Disable MoE Expert Offload before enabling this feature.",
+               comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because MoE expert offload is on")
+    }
+
     private var dflashToggleDisabled: Bool {
         !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+            || vm.moeExpertOffloadEnabled
     }
 
     private var dflashHelp: String {
@@ -2199,7 +2239,8 @@ private struct ExperimentalSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
-        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return vm.moeExpertOffloadEnabled ? moeOffloadOwnsPathReason : ""
     }
 
     private var dflashSublabel: String {
@@ -2208,6 +2249,7 @@ private struct ExperimentalSection: View {
             return reason
         }
         if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        if vm.moeExpertOffloadEnabled { return moeOffloadOwnsPathReason }
         return String(localized: "settings.experimental.dflash.sub",
                       defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",
                       comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")

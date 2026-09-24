@@ -20746,6 +20746,90 @@
         }
       }
     },
+    "settings.advanced.moe_offload.label" : {
+      "comment" : "Row label for the MoE expert offload toggle",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE Expert Offload"
+          }
+        }
+      }
+    },
+    "settings.advanced.moe_offload.sub" : {
+      "comment" : "Sublabel for the MoE expert offload toggle",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep a fraction of MoE experts in RAM and stream the rest from SSD. Trades decode speed for memory. Applies on next reload."
+          }
+        }
+      }
+    },
+    "settings.advanced.moe_offload.fraction.label" : {
+      "comment" : "Row label for the MoE offload resident-fraction picker",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resident Experts"
+          }
+        }
+      }
+    },
+    "settings.advanced.moe_offload.fraction.sub" : {
+      "comment" : "Sublabel for the MoE offload resident-fraction picker",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Share of each MoE layer's experts kept in RAM; the rest streams from SSD on demand. Applies on next reload."
+          }
+        }
+      }
+    },
+    "settings.advanced.moe_offload.fraction.auto" : {
+      "comment" : "MoE offload resident-fraction picker option that lets the server size residency",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatic"
+          }
+        }
+      }
+    },
+    "settings.advanced.moe_offload.fraction.error" : {
+      "comment" : "Validation error when the MoE offload resident fraction is out of range",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resident fraction must be between 0 (automatic) and 1."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Доля резидентных экспертов должна быть в диапазоне от 0 до 1."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "常驻比例必须在 0 和 1 之间。"
+          }
+        }
+      }
+    },
     "settings.advanced.force_sampling.label" : {
       "comment" : "Row label for the force-sampling toggle",
       "extractionState" : "manual",
@@ -23314,6 +23398,30 @@
         }
       }
     },
+    "settings.mtp.conflict.moe_offload" : {
+      "comment" : "Tooltip / sublabel shown when Lightning MTP can't be enabled because MoE expert offload is on",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable MoE Expert Offload before enabling Lightning MTP."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите выгрузку экспертов MoE перед включением Lightning MTP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 Lightning MTP 前请先停用 MoE 专家卸载。"
+          }
+        }
+      }
+    },
     "settings.mtp.conflict.turboquant" : {
       "comment" : "Tooltip / sublabel shown when MTP can't be enabled because TurboQuant KV is on",
       "extractionState" : "manual",
@@ -23814,6 +23922,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "启用此功能前禁用 VLM MTP。"
+          }
+        }
+      }
+    },
+    "settings.speculative.conflict.moe_offload" : {
+      "comment" : "Tooltip / sublabel shown when another speculative feature can't be enabled because MoE expert offload is on",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable MoE Expert Offload before enabling this feature."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите выгрузку экспертов MoE перед включением этой функции."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用此功能前请先停用 MoE 专家卸载。"
           }
         }
       }
@@ -24363,6 +24495,30 @@
         }
       }
     },
+    "settings.vlm_mtp.conflict.moe_offload" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because MoE expert offload is on",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable MoE Expert Offload before enabling VLM MTP."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите выгрузку экспертов MoE перед включением VLM MTP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 VLM MTP 前请先停用 MoE 专家卸载。"
+          }
+        }
+      }
+    },
     "settings.vlm_mtp.conflict.specprefill" : {
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on",
       "extractionState" : "manual",
@@ -24407,6 +24563,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "启用 VLM MTP 前禁用 TurboQuant KV。"
+          }
+        }
+      }
+    },
+    "settings.moe_offload.conflict.mtp" : {
+      "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because Lightning MTP is on",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable Lightning MTP before enabling MoE Expert Offload."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите Lightning MTP перед включением выгрузки экспертов MoE."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MoE 专家卸载前请先停用 Lightning MTP。"
+          }
+        }
+      }
+    },
+    "settings.moe_offload.conflict.vlm_mtp" : {
+      "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because VLM MTP is on",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling MoE Expert Offload."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите VLM MTP перед включением выгрузки экспертов MoE."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MoE 专家卸载前请先停用 VLM MTP。"
+          }
+        }
+      }
+    },
+    "settings.moe_offload.conflict.dflash" : {
+      "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because DFlash is on",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable DFlash before enabling MoE Expert Offload."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отключите DFlash перед включением выгрузки экспертов MoE."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 MoE 专家卸载前请先停用 DFlash。"
           }
         }
       }

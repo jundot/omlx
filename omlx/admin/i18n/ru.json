@@ -1186,6 +1186,7 @@
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "Enter a number from 5 to 95.",
+  "modal.model_settings.moe_expert_offload_resident_auto": "Автоматически (по объёму доступной памяти)",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Использует встроенную MTP-голову модели для черновой генерации нескольких токенов за шаг. Декодирование до ~1,5× быстрее. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",
   "modal.model_settings.mtp_conflict": "Сначала отключите DFlash и TurboQuant KV: они изменяют тот же путь, от которого зависит MTP.",

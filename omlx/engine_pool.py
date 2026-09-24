@@ -416,9 +416,35 @@ class EnginePool:
                 width=runtime_settings.qwen35_ane_prefill_sequence_length,
             )
         if getattr(runtime_settings, "moe_expert_offload_enabled", False):
-            from .patches.moe_expert_offload import estimate_offload_admission_bytes
+            from .patches.moe_expert_offload import (
+                estimate_offload_admission_bytes,
+                resolve_moe_offload_fraction,
+            )
 
-            fraction = runtime_settings.moe_expert_offload_resident_fraction
+            # Automatic (None/0) resolves against the memory budget; an
+            # uninspectable checkpoint estimates at full residency rather
+            # than pretending savings it cannot prove. Admission prices the
+            # static ceiling (budget_bytes), not the avail-aware start —
+            # the governor may grow into the ceiling at runtime.
+            from .patches.moe_expert_offload import _moe_offload_memory_limit
+
+            fraction = resolve_moe_offload_fraction(
+                entry.model_path,
+                runtime_settings.moe_expert_offload_resident_fraction,
+                mtp_resident=bool(
+                    getattr(runtime_settings, "mtp_enabled", False)
+                ),
+                engram_ssd_offload=bool(
+                    getattr(
+                        runtime_settings,
+                        "deepseek_v41_engram_ssd_offload",
+                        False,
+                    )
+                ),
+                budget_bytes=_moe_offload_memory_limit(),
+            )
+            if fraction is None:
+                fraction = 1.0
             if entry.config_model_type == "deepseek_v41":
                 if (
                     v41_estimate is None
@@ -469,9 +495,19 @@ class EnginePool:
 
             estimate = qwen4_exp_residency_estimate(entry.model_path)
             if getattr(settings, "moe_expert_offload_enabled", False):
-                from .patches.moe_expert_offload import estimate_offload_admission_bytes
+                from .patches.moe_expert_offload import (
+                    estimate_offload_admission_bytes,
+                    resolve_moe_offload_fraction,
+                    _moe_offload_memory_limit,
+                )
 
-                fraction = settings.moe_expert_offload_resident_fraction
+                fraction = resolve_moe_offload_fraction(
+                    entry.model_path,
+                    settings.moe_expert_offload_resident_fraction,
+                    budget_bytes=_moe_offload_memory_limit(),
+                )
+                if fraction is None:
+                    fraction = 1.0
                 # Price expert residency before deciding whether PLE must use SSD.
                 # The entry projection consumes these adjusted estimates once.
                 saved = estimate.checkpoint_bytes - estimate_offload_admission_bytes(
@@ -562,10 +598,27 @@ class EnginePool:
                 and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
             ):
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
+                from .patches.moe_expert_offload import (
+                    resolve_moe_offload_fraction,
+                    _moe_offload_memory_limit,
+                )
 
                 saved = estimate_expert_savings(
                     entry.model_path,
-                    settings.moe_expert_offload_resident_fraction,
+                    resolve_moe_offload_fraction(
+                        entry.model_path,
+                        settings.moe_expert_offload_resident_fraction,
+                        mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
+                        engram_ssd_offload=bool(
+                            getattr(
+                                settings,
+                                "deepseek_v41_engram_ssd_offload",
+                                False,
+                            )
+                        ),
+                        budget_bytes=_moe_offload_memory_limit(),
+                    )
+                    or 0.0,
                     mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
                 )
                 estimate = replace(
@@ -916,7 +969,7 @@ class EnginePool:
         if moe_offload_active:
             add(
                 "moe_expert_offload_resident_fraction",
-                data.get("moe_expert_offload_resident_fraction", 0.25),
+                data.get("moe_expert_offload_resident_fraction"),
             )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(

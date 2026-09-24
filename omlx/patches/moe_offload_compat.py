@@ -17,6 +17,7 @@ _SUPPORTED_TYPES = frozenset(
         "olmoe",
         "glm_moe_dsa",
         "glm5_next",
+        "mimo_v2_flash",
     }
 )
 
@@ -59,6 +60,9 @@ def _inspect(path, signature):
         count = int(text.get("n_routed_experts") or 0)
         first_moe = int(text.get("first_k_dense_replace") or 0)
         moe_freq = int(text.get("moe_layer_freq") or 1)
+    elif kind == "mimo_v2_flash":
+        count = int(text.get("n_routed_experts") or text.get("num_experts") or 0)
+        first_moe, moe_freq = 0, 1
     else:
         count = int(text.get("num_experts") or 0)
         first_moe, moe_freq = 0, 1
@@ -81,6 +85,14 @@ def _inspect(path, signature):
         sparse_layers = {i for i, t in enumerate(types) if t == "sparse"}
         if not sparse_layers:
             return False, "The model does not have the supported MoE geometry."
+    # mimo_v2_flash keeps a dense layer (moe_layer_freq 0) ahead of the
+    # routed MoE layers; the config carries the mask as a per-layer list.
+    if kind == "mimo_v2_flash":
+        freq = text.get("moe_layer_freq")
+        if isinstance(freq, list) and len(freq) == layers:
+            sparse_layers = {i for i, f in enumerate(freq) if f}
+        if not sparse_layers:
+            return False, "The model does not have the supported MoE geometry."
     quant = raw.get("quantization", text.get("quantization"))
     if not isinstance(quant, dict):
         return False, "Expert offload requires an MLX quantized checkpoint."
@@ -92,7 +104,7 @@ def _inspect(path, signature):
             continue  # dense layer (GLM's first_k_dense_replace)
         if sparse_layers is not None and layer not in sparse_layers:
             continue  # dense layer (glm5_next's mlp_layer_types)
-        if kind in ("olmoe", "glm_moe_dsa"):
+        if kind in ("olmoe", "glm_moe_dsa", "mimo_v2_flash"):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind in ("qwen4_exp", "qwen3_5_moe"):
