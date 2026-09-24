@@ -69,15 +69,21 @@ def apply() -> bool:
         return False
 
     from mlx_vlm.models.gemma4 import Model
+    from mlx_vlm.models.gemma4_unified import Model as UnifiedModel
 
-    original_sanitize = Model.sanitize
+    def keep_head(original_sanitize):
+        def sanitize(self, weights):
+            head = {
+                k: v for k, v in weights.items() if k.startswith("language_model.mtp.")
+            }
+            backbone = {k: v for k, v in weights.items() if k not in head}
+            return {**original_sanitize(self, backbone), **head}
 
-    def sanitize(self, weights):
-        head = {k: v for k, v in weights.items() if k.startswith("language_model.mtp.")}
-        backbone = {k: v for k, v in weights.items() if k not in head}
-        return {**original_sanitize(self, backbone), **head}
+        return sanitize
 
-    Model.sanitize = sanitize
+    # Text-only gemma4 checkpoints load as gemma4_unified; see omlx.engine.vlm.
+    Model.sanitize = keep_head(Model.sanitize)
+    UnifiedModel.sanitize = keep_head(UnifiedModel.sanitize)
     _patch_text_config(g4_config)
     # Gemma4 unified reuses Gemma4's LanguageModel but declares its own
     # TextConfig subclass. Retain the embedded assistant config there too so
@@ -138,6 +144,23 @@ def _patch_text_config(g4_config: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _align_drafter_dtype(drafter: Any, dtype: Any) -> None:
+    """Match the head to its activation dtype so matmuls don't promote to float32."""
+    from mlx.utils import tree_map
+
+    def _cast(value: Any) -> Any:
+        if (
+            isinstance(value, mx.array)
+            and value.dtype in (mx.float16, mx.bfloat16)
+            and value.dtype != dtype
+        ):
+            return value.astype(dtype)
+        return value
+
+    drafter.update(tree_map(_cast, drafter.parameters()))
+    logger.info("gemma4 vlm assistant head aligned to %s", dtype)
+
+
 def _patch_vlm_language_model(g4_lang: Any) -> None:
     cls = g4_lang.LanguageModel
     if "_omlx_mtp_runtime_patched" in cls.__dict__:
@@ -164,11 +187,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         if attach:
             drafter_config = Gemma4AssistantConfig.from_dict(asst_cfg)
             self.mtp = Gemma4AssistantDraftModel(drafter_config)
-            # Binds the backbone's embed_tokens (+ scale) for the fused
-            # [token_embed, hidden] input and resolves the head's tied
-            # lm_head fn. Function refs read weights at call time, so
-            # binding before load_weights is safe.
-            self.mtp.bind(self)
+            # Defer binding until quantization replaces the initial embedding.
         if self._omlx_mtp_decode_enabled:
             # The chain cycle applies the backbone's final RMSNorm to the
             # verify hidden rows (HEAD_HIDDEN_POST_NORM) — exactly the
@@ -263,10 +282,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         """
         del mtp_cache, logits_keep  # stateless head; output is 1 position
         drafter = self.mtp
-        # Re-bind when the backbone embed module was swapped after the
-        # __init__-time bind — nn.quantize() replaces embed_tokens with a
-        # QuantizedEmbedding AFTER model construction, and a stale binding
-        # keeps a random-init nn.Embedding (garbage drafts, ~10% accept).
+        # Rebind if quantization replaced the backbone embedding.
         if drafter._input_embed is not self.model.embed_tokens:
             drafter.bind(self)
         shared_kv = getattr(self, "_omlx_mtp_shared_kv", None)
@@ -277,6 +293,11 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             )
 
         h = hidden_states[:, -1:, :]
+        # Compare strings because MLX dtype comparison with None raises TypeError.
+        want_dtype = str(h.dtype)
+        if getattr(drafter, "_omlx_head_dtype", None) != want_dtype:
+            _align_drafter_dtype(drafter, h.dtype)
+            drafter._omlx_head_dtype = want_dtype
         ids = next_token_ids[:, -1:]
         tok_embed = drafter._input_embed(ids) * drafter._input_embed_scale
         inputs_embeds = mx.concatenate([tok_embed.astype(h.dtype), h], axis=-1)

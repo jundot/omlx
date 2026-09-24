@@ -4119,8 +4119,9 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
-    def test_qwen4_wide_prefill_aligns_block_size_to_4096(
-        self, mock_tokenizer, tmp_path
+    @pytest.mark.parametrize("model_type", ["qwen4_exp_text", "glm5_next"])
+    def test_sparse_hybrid_wide_prefill_aligns_block_size_to_4096(
+        self, mock_tokenizer, tmp_path, model_type
     ):
         with (
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
@@ -4135,7 +4136,7 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
         ):
             scheduler = Scheduler(
-                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                model=self._hybrid_model(model_type=model_type),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
                     paged_ssd_cache_dir=str(tmp_path),
@@ -4154,10 +4155,12 @@ class TestSchedulerArraysCacheBlockAlignment:
         ("native_available", "symbol_available"),
         [(False, False), (True, False)],
     )
-    def test_qwen4_keeps_2048_without_sparse_native_path(
+    @pytest.mark.parametrize("model_type", ["qwen4_exp_text", "glm5_next"])
+    def test_sparse_hybrid_keeps_2048_without_sparse_native_path(
         self,
         mock_tokenizer,
         tmp_path,
+        model_type,
         native_available,
         symbol_available,
     ):
@@ -4174,7 +4177,7 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
         ):
             scheduler = Scheduler(
-                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                model=self._hybrid_model(model_type=model_type),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
                     paged_ssd_cache_dir=str(tmp_path),

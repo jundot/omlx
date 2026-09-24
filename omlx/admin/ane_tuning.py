@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import statistics
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -129,6 +130,16 @@ class ANETuningRun:
     task: asyncio.Task | None = None
     created_at: float = field(default_factory=time.time)
     deadline: float | None = None
+    _cancel_calibration: threading.Event = field(default_factory=threading.Event, repr=False)
+
+
+class _CalibrationCancelled(Exception):
+    pass
+
+
+def _check_calibration_cancelled(run: ANETuningRun) -> None:
+    if run._cancel_calibration.is_set():
+        raise _CalibrationCancelled
 
 
 class _K2BudgetExpired(Exception):
@@ -331,6 +342,7 @@ def _tail_padding_min_tokens(
 
 
 def _set_phase_running(run: ANETuningRun, slot: int, message: str) -> None:
+    _check_calibration_cancelled(run)
     run.phase = "calibrating"
     run.message = message
     run.results[slot]["state"] = "running"
@@ -345,6 +357,7 @@ def _preview_phase(
     **values: Any,
 ) -> None:
     """Publish a provisional calibration leader without completing its row."""
+    _check_calibration_cancelled(run)
     run.results[slot].update(
         {
             "detail": detail,
@@ -371,6 +384,7 @@ def _complete_phase(
     fused_down: bool = False,
     cpu_threads: int | None = None,
 ) -> None:
+    _check_calibration_cancelled(run)
     result = run.results[slot]
     result.update(
         {
@@ -1653,13 +1667,36 @@ async def _calibrate_components(
     from omlx.engine_core import get_mlx_executor
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
+    future = loop.run_in_executor(
         get_mlx_executor(),
         _calibrate_components_sync,
         run,
         engine,
         base_settings,
     )
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+            run._cancel_calibration.set()
+            run.phase = "cleaning_up"
+            run.message = "Waiting for ANE calibration to stop..."
+        except Exception:
+            if not cancelled:
+                raise
+            break
+    if cancelled:
+        # Await the worker before unload can clear its temporary module state.
+        try:
+            future.result()
+        except _CalibrationCancelled:
+            pass
+        except Exception:
+            logger.debug("ANE calibration failed while cancelling", exc_info=True)
+        raise asyncio.CancelledError
+    return future.result()
 
 
 def _calibrate_components_sync(
@@ -2344,11 +2381,17 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             }
     finally:
         _restore_speed_priority(engine_pool, previous_speed_priority)
+        terminal = run.status, run.phase, run.message
+        run.status = "running"
+        run.phase = "cleaning_up"
+        run.message = "Unloading the test model..."
         try:
             if run.request.model_id in engine_pool.get_loaded_model_ids():
                 await engine_pool._unload_engine(run.request.model_id)
         except Exception:
             logger.warning("Failed to unload model after ANE tuning", exc_info=True)
+        finally:
+            run.status, run.phase, run.message = terminal
 
 
 def _validate_k2_tuning_model(model: Any) -> None:

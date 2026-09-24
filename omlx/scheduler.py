@@ -65,7 +65,6 @@ from .exceptions import (
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
-from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
@@ -579,12 +578,6 @@ _uid_row_registry_lock = threading.Lock()
 # rest to DEBUG so the signal survives without flooding the logs.
 _UID_ROW_DRIFT_WARNING_INTERVAL_S = 60.0
 _uid_row_drift_last_warning = float("-inf")
-
-# Headroom sentinel handed to the sdpa256 route gate when the memory guard
-# is explicitly disabled: the user opted out of memory management, so route
-# selection must not slow prefill down on its behalf (#2283). Far above any
-# real unfused-transient estimate, so the gate always picks the fast path.
-_SDPA256_UNBOUNDED_HEADROOM = 1 << 62
 
 
 def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
@@ -1615,6 +1608,7 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
+    qwen4_gdn_decode_wide_proj: bool = False
     prefill_step_size: int = 2048
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
@@ -1998,14 +1992,6 @@ class Scheduler:
         # must steer the user to that knob instead of "close other apps".
         self._memory_guard_tier: str = "balanced"
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
-        # True once ProcessMemoryEnforcer has pushed guard state at least
-        # once. Until then _prefill_memory_guard=False means "unknown", not
-        # "user disabled the guard", and the sdpa256 route keeps its
-        # memory-safe tiled default (#2283).
-        self._memory_limits_propagated: bool = False
-        # One-shot marker for the guard-off fast-path INFO emitted by
-        # _sdpa256_unfused_headroom.
-        self._sdpa256_unguarded_logged: bool = False
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
@@ -2070,7 +2056,6 @@ class Scheduler:
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
-        self._sdpa256_bounded_route_active: bool | None = None
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -2761,6 +2746,23 @@ class Scheduler:
     # cached prefixes floor to 2048-token multiples instead of 512.
     _POOLING_ROTATING_BLOCK_SIZE = 2048
 
+    def _is_mimo_hybrid(self) -> bool:
+        """MiMo hybrid MoE (standard softmax attn + rotating KV).
+
+        Wides prefill blocks so gather_qmm tiles fill at realistic
+        skewed top-k routing. Detected by model family name.
+        """
+        for target in (self.model, getattr(self.model, "model", None)):
+            if target is None:
+                continue
+            mt = str(getattr(target, "model_type", "") or "")
+            if not mt:
+                mt = str(getattr(getattr(target, "config", None),
+                               "model_type", "") or "")
+            if "mimo" in mt.lower():
+                return True
+        return False
+
     def _align_block_size_with_rotating_window(self) -> None:
         """
         Align paged cache block size to a multiple of RotatingKVCache
@@ -2797,7 +2799,12 @@ class Scheduler:
         # If window_size itself is already >= max, just use window_size.
         lo = self._ROTATING_BLOCK_SIZE_MIN
         hi = self._ROTATING_BLOCK_SIZE_MAX
-        if self._detect_pooling_cache():
+        if self._detect_pooling_cache() or self._is_mimo_hybrid():
+            # MiMo hybrid MoE: skewed top-8 routing leaves ~10 rows
+            # per expert at a 512-token chunk, so the gather_qmm BM
+            # tiles mostly compute padding; a 2048-token chunk fills
+            # them for a measured ~+34% MoE prefill throughput on
+            # M3 Ultra. 2048 is a multiple of the 128 window.
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
 
         if window_size >= hi or window_size >= lo:
@@ -2824,7 +2831,7 @@ class Scheduler:
             self.config.paged_cache_block_size = target_block_size
 
     def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for Qwen hybrid architectures."""
+        """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
@@ -2844,13 +2851,21 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            if is_qwen35 or is_qwen4:
+            # Wider GLM chunks require the native sparse MLA path.
+            is_glm5_next = model_type.startswith("glm5_next")
+            if is_glm5_next:
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "glm_dsa_sparse_mla_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Qwen4 needs its sparse native path before wider chunks
-                    # are safe. NAX/M5 stays at 2048 for both model families.
+                    # Keep the default chunk size on NAX hosts.
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
@@ -4234,48 +4249,6 @@ class Scheduler:
         base_cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
         safety_cap = self._prefill_abort_cap()
         return base_cap, safety_cap, self._prefill_abort_margin
-
-    def _sdpa256_bounded_route_changed(self, active: bool) -> None:
-        """Retire measurements when SDPA256 changes memory regimes."""
-        previous = getattr(self, "_sdpa256_bounded_route_active", None)
-        active = bool(active)
-        self._sdpa256_bounded_route_active = active
-        if previous != active and (previous is not None or active):
-            self._prefill_transient_tracker.reset_history()
-
-    def _sdpa256_unfused_headroom(self) -> int:
-        """Live headroom (bytes) for one unfused SDPA transient, under the
-        same target the adaptive prefill throttle enforces (hard ceiling x
-        headroom safety, clamped by the abort cap). Negative when the
-        ceiling is unknown (enforcer not propagated yet), which tells the
-        sdpa256 route to keep its memory-bounded default. When the guard
-        is explicitly disabled there is no ceiling to respect: the user
-        opted out of memory management, so the route gets unbounded
-        headroom and keeps the unfused fast path (#2283). Called from
-        the route gate on the MLX step thread mid-prefill, where refreshing
-        the active-memory sample is safe (issue #2204)."""
-        hard_cap = self._memory_hard_limit_bytes
-        if hard_cap <= 0:
-            if self._memory_limits_propagated and not self._prefill_memory_guard:
-                if not self._sdpa256_unguarded_logged:
-                    self._sdpa256_unguarded_logged = True
-                    logger.info(
-                        "sdpa256: memory guard disabled, head-dim-256 "
-                        "prefill keeps the unfused fast path with no memory "
-                        "ceiling (long-context OOM protection off). Enable "
-                        "the memory guard or set OMLX_SDPA256_TILED=1 for "
-                        "the memory-bounded path."
-                    )
-                return _SDPA256_UNBOUNDED_HEADROOM
-            return -1
-        headroom_safety = getattr(
-            self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
-        )
-        target = int(hard_cap * headroom_safety)
-        abort_cap = self._prefill_abort_cap()
-        if abort_cap > 0:
-            target = min(target, abort_cap)
-        return target - self._current_usage_bytes()
 
     # Two pauses, not one: a marginal pooled-buffer reclaim can satisfy the
     # first pass's target check while buying only a couple of minutes of KV
@@ -12931,11 +12904,6 @@ class Scheduler:
         Returns:
             SchedulerOutput with results of this step
         """
-        # Bind on the thread that runs model forwards. Scheduler construction
-        # can happen on a shared event-loop thread, while every engine executes
-        # steps on its own worker. The setter is idempotent for repeated steps.
-        set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
-
         output = SchedulerOutput()
 
         # Publish decode activity for cross-engine prefill fairness (a

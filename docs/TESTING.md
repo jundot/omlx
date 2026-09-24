@@ -16,6 +16,13 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 
 CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
 
+The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
+fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
+`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
+speculative routes remain intact. See
+[GDN decode prework](experimental/qwen35_fp16_decode.md) for the hardware, geometry
+limits and real-model benchmark requirements.
+
 # First-token burst release
 
 Run `python -m pytest -q tests/test_engine_core.py tests/test_output_collector.py`

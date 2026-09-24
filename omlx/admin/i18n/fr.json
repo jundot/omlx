@@ -1039,6 +1039,7 @@
   "settings.language.es": "Español",
   "settings.language.fr": "Français",
   "settings.language.pt-BR": "Português (Brasil)",
+  "settings.language.cs": "Čeština",
   "settings.save.button": "Enregistrer les paramètres",
   "settings.save.saving": "Enregistrement en cours...",
   "settings.models.section_label": "Paramètres du modèle",
@@ -2003,5 +2004,7 @@
   "settings.global.reset_title": "Settings Reset",
   "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
   "settings.global.reset_ok": "OK",
-  "settings.global.reset_cancel": "Annuler"
+  "settings.global.reset_cancel": "Annuler",
+  "settings.advanced.qwen4_gdn_decode_wide_proj": "Qwen4 Extended Fused Decode",
+  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes."
 }
