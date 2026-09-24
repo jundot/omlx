@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
@@ -4707,6 +4708,112 @@ def _global_settings_response(global_settings):
     }
 
 
+def _set_generator_decode_cap(scheduler, value: int) -> None:
+    """Write the live BatchGenerator cap. Runs on the engine's MLX executor.
+
+    The MTP wrapper temporarily zeroes this attribute around a generation
+    step and restores its saved value afterwards, so a write from the admin
+    thread could be lost to that save/restore cycle (or clobber an active
+    drain). Posting to the executor serialises the write onto the step
+    thread: it lands between steps, after any in-flight zero/restore pair.
+    """
+    generator = getattr(scheduler, "batch_generator", None)
+    if generator is not None:
+        # max() mirrors BatchGenerator.__init__: prefill rows must always fit.
+        generator.completion_batch_size = max(value, generator.prefill_batch_size)
+
+
+def _apply_max_concurrent_requests_live(pool, value: int) -> None:
+    """Push a new max_concurrent_requests into the pool and every loaded engine.
+
+    One settings value feeds two engine limits (``GlobalSettings.
+    to_scheduler_config``): ``max_num_seqs`` bounds admission and
+    ``completion_batch_size`` bounds the decode batch. Updating only the
+    former lets the scheduler admit requests the generator still decodes
+    serially, so both are written to:
+
+    - the pool template (engines loaded later inherit it),
+    - each loaded engine's own scheduler-config snapshot — a per-engine
+      ``copy.copy``; DFlash deliberately snapshots the template at build
+      time so its lazily-started fallback engine sees the new limits,
+    - each loaded scheduler's config, plus its live BatchGenerator cap
+      written on that engine's MLX executor (see _set_generator_decode_cap).
+
+    All consumers (admission tick, waiting-queue bound, per-step decode cap,
+    pressure-gate regrowth target) re-read these attributes per decision, so
+    this takes effect without unloading models. Raising admits sooner;
+    lowering stops the decode batch from growing while in-flight rows keep
+    decoding — nothing is aborted. The ``_StoreCacheGate`` is left alone: it
+    is pressure-shrunk by ``ProcessMemoryEnforcer`` and regrows toward the
+    new max on its own; forcing it back up would undo an active shrink.
+    """
+    if pool is None:
+        return
+    pool._scheduler_config.max_num_seqs = value
+    pool._scheduler_config.completion_batch_size = value
+    for entry in pool._entries.values():
+        if entry is None or getattr(entry, "engine", None) is None:
+            continue
+        if getattr(entry.engine, "_prefill_memory_guard_managed_externally", False):
+            # Distributed (cluster) engines: the coordinator owns no local
+            # scheduler; rank processes build theirs from the signed
+            # deployment and are not reachable from here. Not live-applied —
+            # the new limit takes effect when the cluster model is reloaded.
+            continue
+        for engine in _scheduler_host_engines(entry.engine):
+            template = getattr(engine, "_scheduler_config", None)
+            if template is not None and template is not pool._scheduler_config:
+                template.max_num_seqs = value
+                template.completion_batch_size = value
+            async_core = getattr(engine, "_engine", None)
+            core = getattr(async_core, "engine", None)
+            scheduler = getattr(core, "scheduler", None)
+            if scheduler is not None and hasattr(scheduler, "config"):
+                scheduler.config.max_num_seqs = value
+                scheduler.config.completion_batch_size = value
+                executor = getattr(core, "_mlx_executor", None)
+                if executor is not None:
+                    try:
+                        future = executor.submit(
+                            _set_generator_decode_cap, scheduler, value
+                        )
+                    except RuntimeError:
+                        # Executor already shut down: the engine is stopping
+                        # and its generator goes away with it.
+                        continue
+                    # submit() runs the write between generation steps;
+                    # log instead of swallowing a failure to apply it.
+                    future.add_done_callback(
+                        functools.partial(
+                            _log_decode_cap_failure,
+                            model_name=getattr(scheduler.config, "model_name", "?"),
+                        )
+                    )
+
+
+def _log_decode_cap_failure(future, model_name) -> None:
+    """Done-callback for the posted decode-cap write (runs on the executor thread)."""
+    try:
+        exc = future.exception()
+    except BaseException:  # cancelled future
+        return
+    if exc is not None:
+        logger.warning(f"Live decode-cap update failed for {model_name}: {exc!r}")
+
+
+def _scheduler_host_engines(engine):
+    """Engines under one pool entry that own a scheduler.
+
+    A DFlash entry delegates long-context requests to a lazily-started
+    fallback engine whose scheduler holds its own config copy; batched/VLM
+    entries host exactly one engine.
+    """
+    fallback = getattr(engine, "_fallback_engine", None)
+    if fallback is not None:
+        return (engine, fallback)
+    return (engine,)
+
+
 @router.post("/api/global-settings")
 async def update_global_settings(
     request: GlobalSettingsRequest,
@@ -4792,6 +4899,8 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    pending_max_concurrent_requests: int | None = None
+    previous_max_concurrent_requests: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -4999,44 +5108,17 @@ async def update_global_settings(
             request.max_concurrent_requests
             != global_settings.scheduler.max_concurrent_requests
         ):
+            # Live-apply deferred until after validation and save succeed
+            # (same pattern as embedding_batch_size), so a rejected or
+            # failed save never leaves runtime limits diverging from the
+            # settings file.
+            previous_max_concurrent_requests = (
+                global_settings.scheduler.max_concurrent_requests
+            )
             global_settings.scheduler.max_concurrent_requests = (
                 request.max_concurrent_requests
             )
-            # Live-apply the admission cap. Scheduler._effective_max_num_seqs(),
-            # the waiting-queue bound and the pressure-gate regrowth all read
-            # config.max_num_seqs per decision, so updating the pool template
-            # (engines loaded later) plus every loaded scheduler takes effect
-            # on the next admission tick without unloading models: raising
-            # admits sooner, lowering stops admitting until in-flight requests
-            # drain. The _StoreCacheGate keeps its own pressure-shrunk cap and
-            # regrows toward the new max on its own; do not force it back up.
-            from ..server import _server_state
-
-            pool = _server_state.engine_pool
-            if pool is not None:
-                pool._scheduler_config.max_num_seqs = (
-                    request.max_concurrent_requests
-                )
-                for mid, entry in pool._entries.items():
-                    if entry is None or entry.engine is None:
-                        continue
-                    async_core = getattr(entry.engine, "_engine", None)
-                    core = (
-                        getattr(async_core, "engine", None)
-                        if async_core is not None
-                        else None
-                    )
-                    scheduler = (
-                        getattr(core, "scheduler", None) if core is not None else None
-                    )
-                    if scheduler is not None and hasattr(scheduler, "config"):
-                        scheduler.config.max_num_seqs = (
-                            request.max_concurrent_requests
-                        )
-            runtime_applied.append("max_concurrent_requests")
-            logger.info(
-                f"Max concurrent requests set to {request.max_concurrent_requests} (live)"
-            )
+            pending_max_concurrent_requests = request.max_concurrent_requests
 
     # Apply embedding batch size setting (Live for loaded embedding engines)
     if request.embedding_batch_size is not None:
@@ -5753,6 +5835,10 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
@@ -5763,7 +5849,22 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_max_concurrent_requests is not None:
+        from ..server import _server_state
+
+        _apply_max_concurrent_requests_live(
+            _server_state.engine_pool, pending_max_concurrent_requests
+        )
+        runtime_applied.append("max_concurrent_requests")
+        logger.info(
+            f"Max concurrent requests set to {pending_max_concurrent_requests} (live)"
+        )
 
     if pending_embedding_batch_size is not None:
         from ..server import _server_state
