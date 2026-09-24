@@ -4776,6 +4776,60 @@ def _recovery_calls(events, api):
     ]
 
 
+def _recovery_content(events, api):
+    if api == "chat":
+        return "".join(
+            delta.get("content", "")
+            for event in events
+            for choice in event.get("choices", [])
+            for delta in [choice.get("delta", {})]
+        )
+    if api == "anthropic":
+        return "".join(
+            event.get("delta", {}).get("text", "")
+            for event in events
+            if event.get("type") == "content_block_delta"
+            and event.get("delta", {}).get("type") == "text_delta"
+        )
+    return "".join(
+        event.get("delta", "")
+        for event in events
+        if event.get("type") == "response.output_text.delta"
+    )
+
+
+def _recovery_reasoning(events, api):
+    if api == "chat":
+        return "".join(
+            delta.get("reasoning_content", "")
+            for event in events
+            for choice in event.get("choices", [])
+            for delta in [choice.get("delta", {})]
+        )
+    if api == "anthropic":
+        return "".join(
+            event.get("delta", {}).get("thinking", "")
+            for event in events
+            if event.get("type") == "content_block_delta"
+            and event.get("delta", {}).get("type") == "thinking_delta"
+        )
+    return "".join(
+        event.get("delta", "")
+        for event in events
+        if event.get("type") == "response.reasoning_summary_text.delta"
+    )
+
+
+def _recovery_errors(events, api):
+    if api == "responses":
+        return [
+            event["response"]["error"]
+            for event in events
+            if event.get("type") == "response.failed"
+        ]
+    return [event["error"] for event in events if "error" in event]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "api,chunk_size",
@@ -4961,6 +5015,120 @@ async def test_qwen_malformed_first_call_does_not_consume_later_valid_call():
     assert len(calls) == 1
     assert json.loads(calls[0]["arguments"]) == {"content": "hello"}
     assert events[-1]["error"]["code"] == "invalid_tool_call"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+async def test_qwen_literal_inline_marker_is_recovered_after_final_parse(
+    api, chunk_size
+):
+    raw = "Use `\x3ctool_call\x3e` literally."
+    events = await _recovery_stream(raw, api, chunk_size)
+    content = _recovery_content(events, api)
+    calls = _recovery_calls(events, api)
+    errors = _recovery_errors(events, api)
+
+    assert content == raw
+    assert calls == []
+    assert errors == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+async def test_qwen_literal_marker_before_real_call_is_recovered(api, chunk_size):
+    literal = "Use `\x3ctool_call\x3e` literally. "
+    raw = literal + _RECOVERY_CALL + " Done."
+    events = await _recovery_stream(raw, api, chunk_size)
+    content = _recovery_content(events, api)
+    calls = _recovery_calls(events, api)
+    errors = _recovery_errors(events, api)
+
+    assert content == literal + " Done."
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write"
+    assert errors == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+async def test_qwen_fenced_marker_before_real_call_is_recovered(api, chunk_size):
+    literal = "Example:\n```\n\x3ctool_call\x3e\nwrite\n``` "
+    raw = literal + _RECOVERY_CALL + " Done."
+    events = await _recovery_stream(raw, api, chunk_size)
+    content = _recovery_content(events, api)
+    calls = _recovery_calls(events, api)
+    errors = _recovery_errors(events, api)
+
+    assert content == literal + " Done."
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write"
+    assert errors == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+async def test_qwen_literal_marker_in_thinking_is_recovered(api, chunk_size):
+    thinking = "Use `\x3ctool_call\x3e` literally."
+    raw = "<think>" + thinking + "</think>"
+    events = await _recovery_stream(raw, api, chunk_size)
+    reasoning = _recovery_reasoning(events, api)
+    content = _recovery_content(events, api)
+    calls = _recovery_calls(events, api)
+    errors = _recovery_errors(events, api)
+
+    assert reasoning == thinking
+    assert content == ""
+    assert calls == []
+    assert errors == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+async def test_qwen_unbalanced_code_context_is_not_recovered(api, chunk_size):
+    raw = "Use `\x3ctool_call\x3e without a closing backtick"
+    events = await _recovery_stream(raw, api, chunk_size)
+    content = _recovery_content(events, api)
+    calls = _recovery_calls(events, api)
+    errors = _recovery_errors(events, api)
+
+    assert content == "Use `"
+    assert calls == []
+    assert [error["code"] for error in errors] == ["incomplete_tool_call"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+async def test_qwen_literal_marker_is_not_recovered_before_error(api, chunk_size):
+    raw = (
+        "Use `\x3ctool_call\x3e` literally. "
+        "\x3ctool_call\x3enot a function\x3c/tool_call\x3e"
+    )
+    events = await _recovery_stream(raw, api, chunk_size)
+    content = _recovery_content(events, api)
+    calls = _recovery_calls(events, api)
+    errors = _recovery_errors(events, api)
+
+    assert content == "Use `"
+    assert calls == []
+    assert [error["code"] for error in errors] == ["invalid_tool_call"]
 
 
 @pytest.mark.asyncio

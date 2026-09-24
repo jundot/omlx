@@ -42,6 +42,7 @@ from omlx.api.tool_calling import (
     extract_json_from_text,
     extract_tool_calls_with_thinking,
     format_tool_call_for_message,
+    literal_code_candidate_is_safe,
     parse_json_output,
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
@@ -5358,6 +5359,112 @@ def test_attribute_cdata_does_not_select_an_embedded_dialect(value):
     assert len(calls) == 1
     assert calls[0].function.name == "read"
     assert json.loads(calls[0].function.arguments) == {"path": value}
+
+
+class TestLiteralGenericToolCallMarkers:
+    """Narrow #3794 recovery for unambiguous code-display contexts."""
+
+    TOOLS = [{"type": "function", "function": {"name": "write"}}]
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_inline_code_marker_is_preserved(self, chunk_size):
+        raw = "Use `\x3ctool_call\x3e` literally."
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        recovered = stream.take_recovery_candidate()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert visible == "Use `"
+        assert candidate == "\x3ctool_call\x3e` literally."
+        assert recovered == ""
+        assert cleaned == raw
+        assert calls is None
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_fenced_code_marker_is_preserved(self, chunk_size):
+        raw = "Example:\n```\n\x3ctool_call\x3e\nwrite\n```"
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        recovered = stream.take_recovery_candidate()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert visible == "Example:\n```\n"
+        assert candidate == "\x3ctool_call\x3e\nwrite\n```"
+        assert recovered == ""
+        assert cleaned == raw
+        assert calls is None
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_code_marker_does_not_hide_later_call(self, chunk_size):
+        literal = "Use `\x3ctool_call\x3e` literally. "
+        call = '\x3ctool_call\x3e{"name":"write","arguments":{}}\x3c/tool_call\x3e'
+        raw = literal + call + " Done."
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        recovered = stream.take_recovery_candidate()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert visible == "Use `"
+        assert candidate.startswith("\x3ctool_call\x3e` literally.")
+        assert recovered == ""
+        assert cleaned == literal + " Done."
+        assert len(calls) == 1
+        assert calls[0].function.name == "write"
+
+    def test_thinking_sanitizer_recovers_only_safe_code_marker(self):
+        safe = "Use `\x3ctool_call\x3e` literally."
+        unsafe_cases = [
+            "Use `\x3ctool_call\x3e` literally. \x3ctool_call\x3e{\"name\":",
+            "Use `\x3ctool_call\x3e` literally. <|im_start|>function: execute_code>",
+        ]
+
+        cleaned = sanitize_tool_call_markup(safe, _make_tokenizer(), self.TOOLS)
+        assert cleaned == safe
+        for unsafe in unsafe_cases:
+            cleaned = sanitize_tool_call_markup(
+                unsafe, _make_tokenizer(), self.TOOLS
+            )
+            assert cleaned == "Use `"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Use `\x3ctool_call\x3e without a closing backtick",
+            "Example:\n```\n\x3ctool_call\x3e\nwrite without a closing fence",
+        ],
+    )
+    def test_unbalanced_code_context_is_not_literal(self, raw):
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, 7) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert candidate.startswith("\x3ctool_call\x3e")
+        assert "\x3ctool_call\x3e" not in visible
+        assert not literal_code_candidate_is_safe(cleaned)
+        assert calls is None
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_plain_prose_and_malformed_call_stay_suppressed(self, chunk_size):
+        prose = "The \x3ctool_call\x3e marker starts a call."
+        malformed = '\x3ctool_call\x3e{"name":'
+
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+        visible = _feed_chunked(stream, prose, chunk_size) + stream.finish()
+        assert visible == "The "
+        assert stream.take_recovery_candidate() == "\x3ctool_call\x3e marker starts a call."
+
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+        visible = _feed_chunked(stream, malformed, chunk_size) + stream.finish()
+        assert visible == ""
+        assert stream.take_recovery_candidate() == malformed
 
 
 @pytest.mark.parametrize("dialect", ["json", "qwen", "namespaced"])
