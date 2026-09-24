@@ -23,6 +23,7 @@ from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
 from .base_model import last_token_pool, mean_pooling, normalize_embeddings
 from .mlx_embeddings_compat import (
+    patch_qwen3_vl_position_ids_recompute,
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
 
@@ -321,6 +322,7 @@ class MLXEmbeddingModel:
         # 2. Fallback to mlx-embeddings
         try:
             patch_qwen3_vl_processor_for_torch_free_image_loading()
+            patch_qwen3_vl_position_ids_recompute()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
