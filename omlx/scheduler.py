@@ -6410,6 +6410,7 @@ class Scheduler:
         self._on_prefill_boundary_snapshot(
             request.request_id, snapshot_cache, total_tokens, source="prefill_tail"
         )
+        _mtp_priming.capture_tail_boundary(self.model, request.request_id, total_tokens)
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
@@ -9094,7 +9095,7 @@ class Scheduler:
             request.remaining_tokens = request.prompt_token_ids
 
         # Lightning-MTP has a small prompt-history cache separate from the
-        # backbone KV restored above.  Bind an exact full-block sidecar (when
+        # backbone KV restored above.  Bind an exact cache-boundary sidecar (when
         # one exists) to this singleton timeline before any uncached suffix is
         # forwarded.  The hook is intentionally best-effort/fail-closed:
         # ordinary inference and prefix reuse stay valid if MTP is disabled,

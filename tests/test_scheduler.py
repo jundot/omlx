@@ -3699,9 +3699,9 @@ class TestSchedulerBoundarySnapshots:
 
         RotatingStub = type("RotatingKVCache", (), {})
         snapshot_cache = [RotatingStub()]
-        scheduler._on_prefill_boundary_snapshot(
-            request.request_id, snapshot_cache, 3, source="prefill_tail"
-        )
+        with patch("omlx.scheduler._mtp_priming.capture_tail_boundary") as capture:
+            scheduler._emit_prefill_tail_snapshot(request, snapshot_cache, 3)
+        capture.assert_called_once_with(mock_model, request.request_id, 3)
         # Other sources stay on the grid.
         scheduler._on_prefill_boundary_snapshot(
             request.request_id, [RotatingStub()], 5, source="completion"
