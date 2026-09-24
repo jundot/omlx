@@ -2823,7 +2823,7 @@ class Scheduler:
             self.config.paged_cache_block_size = target_block_size
 
     def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for Qwen hybrid architectures."""
+        """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
@@ -2843,7 +2843,21 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            if is_qwen35 or is_qwen4:
+            # GLM-5.3-Flash (glm5_next) runs the same wide-chunk economics as the
+            # Qwen hybrids: KDA linear attention amortizes its per-token kernels,
+            # skewed top-8 MoE gather_qmm tiles fill at wider widths, and the
+            # native sparse MLA engages once kv reaches 4096. Measured on M3 Ultra
+            # 512GB (admin bench, tg=128, two independent runs): pp4096 +7.5%
+            # prefill tps, pp8192 +4.9%, pp1024 neutral.
+            is_glm5_next = model_type.startswith("glm5_next")
+            if is_glm5_next:
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "glm_dsa_sparse_mla_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 

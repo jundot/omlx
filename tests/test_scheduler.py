@@ -4150,6 +4150,76 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
+    def test_glm5_next_wide_prefill_aligns_block_size_to_4096(
+        self, mock_tokenizer, tmp_path
+    ):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=512 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 4096
+            assert scheduler._prefill_step_size_for_progress(0, 8192) == 4096
+            assert scheduler.config.paged_cache_block_size == 4096
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize(
+        ("native_available", "symbol_available"),
+        [(False, False), (True, False)],
+    )
+    def test_glm5_next_keeps_2048_without_sparse_native_path(
+        self,
+        mock_tokenizer,
+        tmp_path,
+        native_available,
+        symbol_available,
+    ):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=512 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=native_available,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=symbol_available,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 0
+            assert scheduler._prefill_step_size_for_progress(0, 8192) == 2048
+            assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
     @pytest.mark.parametrize(
         ("native_available", "symbol_available"),
         [(False, False), (True, False)],
