@@ -1474,7 +1474,14 @@ class ProcessMemoryEnforcer:
             if dropped_images:
                 current = self._current_usage_bytes()
         prev_level = self._pressure_level
-        emergency = self._is_emergency_pressure(current, ceiling)
+        # Dynamic headroom can fall abruptly while another app allocates RAM.
+        # Keep throttling against that ceiling, but use the same stable
+        # physical abort cap as the prefill loop before killing live requests.
+        # This leaves the bounded pool-reclaim grace available when a dynamic
+        # dip alone makes the process appear over its ceiling.
+        abort_limit = self._get_abort_limit_bytes()
+        emergency_limit = abort_limit if abort_limit > 0 else ceiling
+        emergency = self._is_emergency_pressure(current, emergency_limit)
 
         if current < soft:
             new_level = "ok"
@@ -1498,6 +1505,17 @@ class ProcessMemoryEnforcer:
                 f"soft={_format_gb(soft)}, hard={_format_gb(hard)}, "
                 f"ceiling={_format_gb(ceiling)})"
             )
+
+        # Return unused Metal buffers at the first soft-pressure tick, before
+        # another prefill/decode step can push a busy model into the hard path.
+        # The scheduler performs the clear at its synchronized step boundary;
+        # requesting once per soft episode avoids clearing the pool every poll.
+        if (
+            new_level == "soft"
+            and prev_level != "soft"
+            and os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1"
+        ):
+            self._request_scheduler_cache_reclaim(0)
 
         if new_level == "hard":
             # When pooled Metal buffers can be returned at the next inference
@@ -1544,7 +1562,7 @@ class ProcessMemoryEnforcer:
                 self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
-                emergency = self._is_emergency_pressure(current, ceiling)
+                emergency = self._is_emergency_pressure(current, emergency_limit)
                 if current < soft:
                     recovered_level = "ok"
                 elif current < hard:
@@ -1682,7 +1700,7 @@ class ProcessMemoryEnforcer:
                                 emergency_current = self._current_usage_bytes()
                             else:
                                 emergency_current = 0
-                            if emergency and emergency_current >= ceiling:
+                            if emergency and emergency_current >= emergency_limit:
                                 aborted = await (
                                     self._abort_loaded_requests_for_memory_emergency()
                                 )
