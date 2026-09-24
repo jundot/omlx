@@ -614,6 +614,85 @@ def _patch_text_model(q35: Any) -> None:
                 c.trim(trim_n)
         return True
 
+    def mtp_batch_rollback(self, cache, accepted, num_drafts: int) -> bool:
+        """Per-row ``mtp_partial_rollback`` on a shared multi-row cache.
+
+        ``accepted`` holds one accepted-draft count per batch row. KV layers
+        trim to the longest kept prefix, then shift each shorter row's
+        rejected tail into its left padding (``prepare(right_padding)`` +
+        ``finalize``, the mlx-vlm ragged-tail contract). GatedDeltaNet layers
+        replay every row from its pre-verify state in one masked chunk:
+        ``ssm_mask`` stops each row's recurrence at its own kept length and
+        ``lengths`` selects the matching conv window. The cache stays merged,
+        so no per-row extraction, deep copy or re-merge is needed.
+        """
+        import mlx.core as mx
+
+        layers = self.model.layers
+        if len(cache) != len(layers):
+            return False
+        window = num_drafts + 1
+        keeps = [1 + int(a) for a in accepted]
+        if not keeps or min(keeps) < 1 or max(keeps) > window:
+            return False
+        max_keep = max(keeps)
+        replay = min(keeps) < window
+        right_padding = [max_keep - k for k in keeps]
+        ragged = any(right_padding)
+        for layer, c in zip(layers, cache):
+            if getattr(layer, "is_linear", False):
+                if replay and (
+                    getattr(c, "rollback_state", None) is None
+                    or getattr(c, "_mtp_draft_stash", None) is None
+                ):
+                    return False
+            else:
+                if not (hasattr(c, "is_trimmable") and c.is_trimmable()):
+                    return False
+                if ragged and not (
+                    callable(getattr(c, "prepare", None))
+                    and callable(getattr(c, "finalize", None))
+                ):
+                    return False
+        if replay:
+            lengths = mx.array(keeps, dtype=mx.int32)
+            ssm_mask = mx.arange(window)[None, :] < lengths[:, None]
+        for layer, c in zip(layers, cache):
+            if getattr(layer, "is_linear", False):
+                if replay:
+                    conv_0, ssm_0 = c.rollback_state
+                    qkv_s, a_s, b_s = c._mtp_draft_stash
+                    _, conv_m, ssm_m = layer.linear_attn._process_chunk(
+                        qkv_s,
+                        a_s,
+                        b_s,
+                        conv_0,
+                        ssm_0,
+                        ssm_mask,
+                        lengths=lengths,
+                    )
+                    c[0] = conv_m
+                    c[1] = ssm_m
+                c.rollback_state = None
+                c._mtp_draft_stash = None
+            else:
+                trim_n = window - max_keep
+                if trim_n > 0:
+                    c.trim(trim_n)
+                if ragged:
+                    c.prepare(right_padding=right_padding)
+                    c.finalize()
+                    # Every ragged commit grows the shared left padding; drop
+                    # the common part once it spans a whole allocation step
+                    # (BatchKVCache.filter's shift, amortised).
+                    shared = min(c.left_padding.tolist())
+                    if shared >= c.step:
+                        c.keys = c.keys[..., shared:, :]
+                        c.values = c.values[..., shared:, :]
+                        c._idx -= shared
+                        c.left_padding = c.left_padding - shared
+        return True
+
     def sanitize(self, weights):
         # Full PR 990 replacement of TextModel.sanitize. We can't call the
         # original because mlx-lm's stock body unconditionally strips the
@@ -699,6 +778,7 @@ def _patch_text_model(q35: Any) -> None:
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_partial_rollback = mtp_partial_rollback
+    cls.mtp_batch_rollback = mtp_batch_rollback
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
 
@@ -752,11 +832,15 @@ def _patch_outer_model(q35: Any) -> None:
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         return self.language_model.mtp_partial_rollback(cache, accepted, num_drafts)
 
+    def mtp_batch_rollback(self, cache, accepted, num_drafts: int) -> bool:
+        return self.language_model.mtp_batch_rollback(cache, accepted, num_drafts)
+
     __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_partial_rollback = mtp_partial_rollback
+    cls.mtp_batch_rollback = mtp_batch_rollback
     # Informational marker for external code that just wants to know "is
     # this class touched by the MTP patch". Idempotency itself uses the
     # function-level _omlx_mtp_call_marker above.

@@ -4961,6 +4961,85 @@ def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
         mlx_lm_mtp.set_mtp_depth(previous_depth)
 
 
+@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("late_join", [False, True])
+@pytest.mark.parametrize("kv_step", [256, 4])
+def test_lm_vector_rollback_matches_scalar_rows_and_ordinary_tokens(
+    monkeypatch, batch_size, late_join, kv_step
+):
+    """mlx-lm Qwen3.5 keeps its merged cache in place on ragged acceptance.
+
+    Each row of the vector rollback must equal a private scalar
+    ``mtp_partial_rollback`` of that row, and batched Lightning MTP must emit
+    the ordinary-decode tokens. A small KV step exercises padding compaction.
+    """
+    from mlx_lm.models.cache import BatchKVCache
+
+    from omlx.patches.mlx_lm_mtp import fused_batch
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    previous_depth = mlx_lm_mtp.get_mtp_depth()
+    mlx_lm_mtp.set_mtp_active(True)
+    mlx_lm_mtp.set_mtp_depth(2)
+    monkeypatch.setattr(bg, "_DepthController", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    monkeypatch.setattr(BatchKVCache, "step", kv_step)
+    try:
+        mx.random.seed(191)
+        model = _model("qwen")
+        mx.eval(model.parameters())
+        prompts = [
+            [3, 4, 5, 6, 7],
+            [3, 6, 7, 8, 4, 5, 6],
+            [4, 5, 6],
+            [7, 8, 9, 10, 11, 12],
+        ][:batch_size]
+        limits = [18, 22, 17, 26][:batch_size]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, limits, late_join=late_join)
+        model._omlx_mtp_decode_enabled = True
+        original = model.mtp_batch_rollback
+        checked = []
+
+        def rollback(cache, accepted, num_drafts):
+            size = num_drafts + 1
+            cases = [
+                [0] * len(accepted),
+                [num_drafts] * len(accepted),
+                [i % size for i in range(len(accepted))],
+                list(accepted),
+            ]
+            for values in cases:
+                references = {}
+                for count in set(values):
+                    reference = copy.deepcopy(cache)
+                    assert model.mtp_partial_rollback(reference, count, num_drafts)
+                    references[count] = reference
+                actual = copy.deepcopy(cache)
+                assert original(actual, values, num_drafts)
+                _assert_rows_equal(actual, references, values)
+                checked.append(tuple(values))
+            return original(cache, accepted, num_drafts)
+
+        monkeypatch.setattr(model, "mtp_batch_rollback", rollback)
+        # The scalar fallback deep-copies the whole batch cache per accepted
+        # length; the vector path must never reach it.
+        monkeypatch.setattr(
+            fused_batch, "copy", SimpleNamespace(deepcopy=_no_whole_cache_copy)
+        )
+        actual, _ = generate(model, prompts, limits, late_join=late_join)
+        assert actual == expected
+        assert any(len(values) == batch_size for values in checked)
+        assert any(len(set(values)) > 1 for values in checked)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+        mlx_lm_mtp.set_mtp_depth(previous_depth)
+
+
+def _no_whole_cache_copy(value, *args, **kwargs):
+    raise AssertionError("shared verify must not deep-copy the batch cache")
+
+
 def _cache_rows(cache):
     for layer in cache or ():
         offset = getattr(layer, "offset", None)
