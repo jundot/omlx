@@ -77,6 +77,13 @@ def test_external_prefill_resumes_without_replaying_tokens(
         lambda *args, **kwargs: 50 if route == "adaptive" else 4,
     )
     monkeypatch.setattr(scheduler, "_admission_transient_bound", lambda *a, **kw: 50)
+    original_guard = scheduler._guard_prefill_chunk
+
+    def guard(n, **kwargs):
+        assert kwargs["kv_len"] == len(model.seen)
+        return original_guard(n, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_guard_prefill_chunk", guard)
 
     for _ in range(pause_count):
         with pytest.raises(_PrefillEvictionNeeded) as exc:
