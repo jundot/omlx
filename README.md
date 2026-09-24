@@ -191,6 +191,11 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 - **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
 - **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
 
+SpecPrefill also persists stable system and tool prefixes. Hybrid ArraysCache/GDN
+models keep the exact terminal recurrent state in an SSD sidecar, so repeated
+agent requests can reuse that prefix without exposing sparse conversation state
+to ordinary partial-prefix matching.
+
 <p align="center">
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>
