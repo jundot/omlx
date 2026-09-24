@@ -337,8 +337,8 @@ def test_discovery_does_not_import_the_transport_prober():
             )
 
 
-def test_every_get_route_answers_without_a_server_error():
-    """Smoke every read-only route through the real app.
+def test_every_get_route_answers_without_a_server_error(cluster_home):
+    """Smoke every GET route through the real app.
 
     Not about the payloads — about the wiring. A route that raises on import,
     a missing dependency, or a handler signature FastAPI cannot satisfy shows up
@@ -371,6 +371,11 @@ def test_every_get_route_answers_without_a_server_error():
             assert response.status_code != 500, (
                 f"GET {route.path} returned {response.status_code}: {response.text[:200]}"
             )
+            if route.path == "/admin/api/cluster/ssh-key":
+                key_path = cluster_home / ".ssh/omlx_cluster"
+                assert response.json()["private_key_path"] == str(key_path)
+                assert key_path.is_file()
+                assert key_path.with_suffix(".pub").is_file()
             checked += 1
     assert checked >= 5, "expected to smoke several GET routes"
 

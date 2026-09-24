@@ -740,9 +740,18 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
     import mlx.nn as _nn
     import mlx_vlm.utils as _vu
 
+    original_load_config = _vu.load_config
     original_update_module_configs = _vu.update_module_configs
     original_load_weights = _nn.Module.load_weights
     warned = False
+
+    def _text_capable_load_config(path, **kwargs):
+        cfg = original_load_config(path, **kwargs)
+        # mlx-vlm's gemma4 builds a vision tower unconditionally; gemma4_unified
+        # shares its language_model layout and runs without one.
+        if cfg.get("model_type") == "gemma4":
+            cfg = {**cfg, "model_type": "gemma4_unified"}
+        return cfg
 
     def _patched_update_module_configs(model_config, model_class, config, modules):
         model_config = original_update_module_configs(
@@ -778,11 +787,13 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
             )
         return original_load_weights(self, kept, *args, **kwargs)
 
+    _vu.load_config = _text_capable_load_config
     _vu.update_module_configs = _patched_update_module_configs
     _nn.Module.load_weights = _vision_filtering_load_weights
     try:
         yield
     finally:
+        _vu.load_config = original_load_config
         _vu.update_module_configs = original_update_module_configs
         _nn.Module.load_weights = original_load_weights
 
@@ -2317,8 +2328,13 @@ class VLMBatchedEngine(BaseEngine):
         try:
             from ..patches.qwen35_gdn_prework import (
                 apply_qwen35_gdn_prework_patch,
+                configure_qwen4_decode,
             )
 
+            configure_qwen4_decode(
+                self._vlm_model,
+                wide_projections=scheduler_config.qwen4_gdn_decode_wide_proj,
+            )
             apply_qwen35_gdn_prework_patch()
         except Exception:
             logger.debug("Qwen GDN prework patch not applied", exc_info=True)
@@ -4470,6 +4486,15 @@ class VLMBatchedEngine(BaseEngine):
         if model_type in {"mimo_v2", "mimo_v2_flash"}:
             media_messages = expand_video_parts(messages)
         text_messages, images, _ = extract_images_from_messages(media_messages)
+        if (
+            images
+            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self._vlm_model.config.vision_config is None
+        ):
+            raise InvalidRequestError(
+                "This text-only Gemma 4 model does not support image input.",
+                field="messages",
+            )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,

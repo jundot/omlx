@@ -433,6 +433,21 @@ def _is_unsupported_model(model_path: Path) -> bool:
     return normalized in UNSUPPORTED_MODEL_TYPES or model_type in UNSUPPORTED_MODEL_TYPES
 
 
+def _model_name_hint(model_path: Path) -> str:
+    """
+    Return the lowercased name used by the directory-name heuristics.
+
+    HF Hub cache snapshots live at ``models--Org--Name/snapshots/<commit>``,
+    so their directory name is a commit hash. Use the repo name there,
+    otherwise the model directory name.
+    """
+    if model_path.parent.name == "snapshots":
+        decoded = _decode_hf_cache_model_id(model_path.parent.parent)
+        if decoded is not None:
+            return decoded[1].rsplit("/", 1)[-1].lower()
+    return model_path.name.lower()
+
+
 def _is_causal_lm_reranker(model_path: Path) -> bool:
     """
     Heuristic check for CausalLM models fine-tuned as rerankers.
@@ -442,7 +457,7 @@ def _is_causal_lm_reranker(model_path: Path) -> bool:
     scoring. We detect them by checking the model directory name for "reranker"
     or "rerank" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "reranker" in name_lower or "rerank" in name_lower
 
 
@@ -455,7 +470,7 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     weights. We detect them by checking the model directory name for "embedding"
     or "embed" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "embedding" in name_lower or "embed" in name_lower
 
 
@@ -1514,6 +1529,33 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     return False
 
 
+def _gemma4_text_only_wants_vlm_engine(config: dict) -> bool:
+    """True for a text-only gemma4 whose merged MTP head only mlx-vlm drives."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type != "gemma4":
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return _has_merged_mtp_head(config)
+
+
+def _has_merged_mtp_head(config: dict) -> bool:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    return isinstance(text_config.get("mtp_assistant_config"), dict)
+
+
+def _gemma4_text_only_prefers_llm_engine(config: dict) -> bool:
+    """True for a text-only Gemma 4 with no MTP head; mlx-lm serves it cheaper."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in ("gemma4", "gemma4_unified"):
+        return False
+    if _has_vision_subconfig(config) or config.get("audio_config") is not None:
+        return False
+    return not _has_merged_mtp_head(config)
+
+
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
@@ -1570,14 +1612,37 @@ def _register_model(
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
         is_helper = False
+        # The routing below reads this even when config.json does not parse.
+        _config: dict = {}
         try:
             import json
             with open(model_dir / "config.json") as f:
-                _config = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _config = loaded
             config_model_type = _config.get("model_type", "")
             is_helper = is_helper_model_config(_config)
         except Exception:
             pass
+
+        # Keep text-only capability metadata when selecting the VLM MTP engine.
+        if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
+            engine_type = "vlm"
+            logger.info(
+                "%s is text-only Gemma 4 with a merged MTP head; serving it "
+                "on the VLM engine, which can drive that head",
+                model_id,
+            )
+        elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
+            # Integrations use model_type to advertise image support.
+            engine_type = "batched"
+            model_type = "llm"
+            text_only_size = 0
+            logger.info(
+                "%s is text-only Gemma 4 with no merged MTP head; serving it "
+                "on the LLM engine, which carries less overhead",
+                model_id,
+            )
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)

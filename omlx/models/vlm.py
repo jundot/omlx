@@ -137,6 +137,21 @@ class VLMModelAdapter(nn.Module):
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
+        if self._vlm_model is not None:
+            try:
+                from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+                # EngineCore calls this hook after draining its worker.
+                released, programs = release_qwen35_ane_prefill(self._vlm_model)
+                if released:
+                    logger.info(
+                        "Released %d ANE prefill module state(s) (%d program(s)) "
+                        "on VLM engine close",
+                        released,
+                        programs,
+                    )
+            except Exception:
+                logger.warning("ANE prefill state release failed", exc_info=True)
         close = getattr(self._vlm_model, "close", None)
         if callable(close):
             close()

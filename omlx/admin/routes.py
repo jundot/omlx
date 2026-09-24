@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -596,6 +597,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -4551,6 +4553,7 @@ def _global_settings_response(global_settings):
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
+            "qwen4_gdn_decode_wide_proj": global_settings.server.qwen4_gdn_decode_wide_proj,
             "preserve_mid_system_cache": getattr(
                 global_settings.server,
                 "preserve_mid_system_cache",
@@ -4848,6 +4851,18 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
+    if request.qwen4_gdn_decode_wide_proj is not None:
+        global_settings.server.qwen4_gdn_decode_wide_proj = (
+            request.qwen4_gdn_decode_wide_proj
+        )
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            pool._scheduler_config.qwen4_gdn_decode_wide_proj = (
+                request.qwen4_gdn_decode_wide_proj
+            )
+
     if request.preserve_mid_system_cache is not None:
         global_settings.server.preserve_mid_system_cache = (
             request.preserve_mid_system_cache
@@ -6092,6 +6107,43 @@ def _distributed_runtime_cache_stats(engine) -> dict | None:
     }
 
 
+def _scan_offline_gdn_sidecars(
+    cache_dir: Path, *, clear: bool = False
+) -> tuple[int, int]:
+    count = total_bytes = 0
+    try:
+        root_fd = os.open(
+            cache_dir / "_gdn_sidecars", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    except FileNotFoundError:
+        return count, total_bytes
+    except OSError as exc:
+        logger.warning("Could not open GDN sidecar directory: %s", exc)
+        return count, total_bytes
+
+    try:
+        # Keep deletion relative to open directories, even if a parent is replaced.
+        for _, _, files, directory_fd in os.fwalk(".", dir_fd=root_fd):
+            for name in files:
+                if not name.endswith(".safetensors"):
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    if clear:
+                        os.unlink(name, dir_fd=directory_fd)
+                    count += 1
+                    total_bytes += info.st_size
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning("Could not process GDN sidecar %s: %s", name, exc)
+    finally:
+        os.close(root_fd)
+    return count, total_bytes
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -6416,8 +6468,9 @@ def _build_runtime_cache_observability(
                     for f in subdir_path.glob("*.safetensors"):
                         num_files += 1
                         total_bytes += f.stat().st_size
-            payload["total_num_files"] = num_files
-            payload["total_size_bytes"] = total_bytes
+            sidecar_count, sidecar_bytes = _scan_offline_gdn_sidecars(cache_dir)
+            payload["total_num_files"] = num_files + sidecar_count
+            payload["total_size_bytes"] = total_bytes + sidecar_bytes
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
@@ -6991,6 +7044,8 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                                 total_deleted += 1
                             except OSError:
                                 pass
+                sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
+                total_deleted += sidecar_count
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 

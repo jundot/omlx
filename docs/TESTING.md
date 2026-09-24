@@ -1,3 +1,9 @@
+# Cluster test filesystem isolation
+
+The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
+
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+
 # macOS readability theme tests
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.

@@ -1039,6 +1039,7 @@
   "settings.language.es": "Español",
   "settings.language.fr": "Français",
   "settings.language.pt-BR": "Português (Brasil)",
+  "settings.language.cs": "Čeština",
   "settings.save.button": "Save Settings",
   "settings.save.saving": "Saving...",
   "settings.models.section_label": "Model Settings",
@@ -1392,6 +1393,7 @@
   "models.oq.about_table_oqe_use": "Better low-bit retention, especially for MoE and activation-skewed layers",
   "models.oq.about_table_path": "Path",
   "models.oq.about_universal_heading": "oQ: oMLX Universal Dynamic Quantization",
+  "models.oq.v41_policy_hint": "DeepSeek V4.1 supports oQ3/oQ3e and oQ4/oQ4e with BF16 output. oQ4 preserves the original FP4/FP8 projection precision and quantizes Engram tables to 4 bits. The vision encoder is retained.",
   "models.oq.full_precision_only": "(full precision only)",
   "models.oq.quantization_started": "Quantization started: {name} → {model}",
   "models.oq.sensitivity_model": "Sensitivity Model",
@@ -1999,5 +2001,7 @@
   "settings.global.reset_title": "Settings Reset",
   "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
   "settings.global.reset_ok": "OK",
-  "settings.global.reset_cancel": "Cancel"
+  "settings.global.reset_cancel": "Cancel",
+  "settings.advanced.qwen4_gdn_decode_wide_proj": "Qwen4 Extended Fused Decode",
+  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes."
 }
