@@ -6114,6 +6114,17 @@ async def stream_anthropic_messages(
                             )
 
             if output.finished:
+                if output.finish_reason == "error":
+                    # A guard rejection reaches the engine stream as an
+                    # ordinary finished output; ``stream_outputs`` raises the
+                    # typed error only on the NEXT pull (see
+                    # ``_raise_request_output_error``). Breaking here would
+                    # end the turn before that raise and close the stream as
+                    # a normal empty completion, so the handler below — and
+                    # the client — would never see the rejection. The OpenAI
+                    # and Responses generators run their loop to exhaustion,
+                    # which is why they surface it and this one did not.
+                    continue
                 break
     except Exception as e:
         if isinstance(e, PrefillMemoryExceededError):
