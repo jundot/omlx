@@ -1253,6 +1253,9 @@ def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
         )
         assert "cache" in result["runtime_applied"]
         pool._unload_engine.assert_awaited_once_with("loaded-model")
+        assert pool._scheduler_config.paged_ssd_cache_auto_size == (
+            cache_size == "auto"
+        )
         assert pool._scheduler_config.initial_cache_blocks == 512
 
 

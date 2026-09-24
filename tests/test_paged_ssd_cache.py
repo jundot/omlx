@@ -762,6 +762,70 @@ class TestPagedSSDCacheManagerWithMLX:
             assert keys.shape == (1, 8, 64, 64)
             assert values.shape == (1, 8, 64, 64)
 
+    def test_save_block_persists_tail_metadata_and_reindexes(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Tail blocks keep their parent and marker across a rescan."""
+        import hashlib
+        import time as time_mod
+
+        from omlx.cache.paged_ssd_cache import PagedSSDBlockMetadata
+
+        mx = mock_mlx
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        parent_hash = hashlib.sha256(b"parent").digest()
+        tail_hash = hashlib.sha256(b"tail").digest()
+        full_hash = hashlib.sha256(b"full").digest()
+        try:
+            assert manager.save_block(
+                block_hash=tail_hash,
+                cache_data=[(mx.zeros((1, 2, 3, 8)), mx.zeros((1, 2, 3, 8)))],
+                token_count=3,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                parent_hash=parent_hash,
+                tail_terminal=True,
+            )
+            assert manager.save_block(
+                block_hash=full_hash,
+                cache_data=[(mx.zeros((1, 2, 4, 8)), mx.zeros((1, 2, 4, 8)))],
+                token_count=4,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                parent_hash=parent_hash,
+            )
+            for _ in range(50):
+                with manager._pending_write_hashes_lock:
+                    if not manager._pending_write_hashes:
+                        break
+                time_mod.sleep(0.1)
+        finally:
+            manager.close()
+
+        reopened = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        try:
+            meta = reopened.get_block_metadata(tail_hash)
+            assert meta is not None
+            assert meta.parent_hash == parent_hash
+            assert meta.tail_terminal is True
+            assert meta.token_count == 3
+            full_meta = reopened.get_block_metadata(full_hash)
+            assert full_meta.parent_hash == parent_hash
+            assert full_meta.tail_terminal is False
+            assert reopened.iter_tail_blocks() == [(parent_hash, tail_hash, 3)]
+
+            round_trip = PagedSSDBlockMetadata.from_dict(meta.to_dict())
+            assert round_trip.parent_hash == parent_hash
+            assert round_trip.tail_terminal is True
+        finally:
+            reopened.close()
+
     def test_load_block_with_metadata(self, tmp_path: Path, mock_mlx):
         """Test loading block with metadata."""
         mx = mock_mlx
@@ -2354,6 +2418,34 @@ class TestEffectiveMaxSize:
         expected = int(100 * 1024**3 * 0.99)
         assert effective == expected
 
+    def test_auto_budget_does_not_count_unwritten_reservations(self, tmp_path):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "cache", max_size_bytes=1000, auto_size=True
+        )
+        try:
+            block_hash = b"pending"
+            manager._index.add(
+                PagedSSDBlockMetadata(
+                    block_hash=block_hash,
+                    file_path=tmp_path / "pending.safetensors",
+                    file_size=100,
+                    token_count=256,
+                    created_at=0,
+                    last_access=0,
+                    num_layers=1,
+                )
+            )
+            manager._pending_write_hashes.add(block_hash)
+            manager._disk_usage_cache = None
+            with patch(
+                "shutil.disk_usage", return_value=self._make_disk_usage(1000, 700, 300)
+            ):
+                assert manager.max_size == 150
+        finally:
+            manager._index.remove(block_hash)
+            manager._pending_write_hashes.clear()
+            manager.close()
+
     def test_effective_max_size_oserror_fallback(self, tmp_path: Path):
         """When disk_usage fails, fall back to configured max."""
         manager = PagedSSDCacheManager(
@@ -2366,31 +2458,32 @@ class TestEffectiveMaxSize:
 
         assert effective == 50 * 1024**3
 
-    def test_effective_max_size_cache_30s(self, tmp_path: Path):
-        """disk_usage result is cached for 30 seconds."""
+    @pytest.mark.parametrize("auto_size,expected_gib", [(True, 250), (False, 495)])
+    def test_effective_max_size_cache_30s(self, tmp_path, auto_size, expected_gib):
         manager = PagedSSDCacheManager(
             cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=100 * 1024**3,
+            max_size_bytes=1000 * 1024**3,
+            auto_size=auto_size,
         )
-
-        mock_usage = self._make_disk_usage(
-            total=1000 * 1024**3, used=500 * 1024**3, free=500 * 1024**3
-        )
-        with patch("shutil.disk_usage", return_value=mock_usage) as mock_du:
-            # First call — should invoke disk_usage
-            manager._get_effective_max_size()
-            assert mock_du.call_count == 1
-
-            # Second call within 30s — should use cache
-            manager._get_effective_max_size()
-            assert mock_du.call_count == 1
-
-            # Expire cache by rewinding timestamp
-            manager._disk_usage_cache_time -= 31.0
-
-            # Third call — should invoke disk_usage again
-            manager._get_effective_max_size()
-            assert mock_du.call_count == 2
+        try:
+            manager._disk_usage_cache = None
+            mock_usage = self._make_disk_usage(
+                1000 * 1024**3, 500 * 1024**3, 500 * 1024**3
+            )
+            with patch("shutil.disk_usage", return_value=mock_usage) as mock_du:
+                assert manager.max_size == expected_gib * 1024**3
+                manager._index._total_size = 100 * 1024**3
+                assert manager.max_size == expected_gib * 1024**3
+                assert mock_du.call_count == 1
+                manager._disk_usage_cache_time -= 31
+                mock_du.return_value = self._make_disk_usage(
+                    1000 * 1024**3, 600 * 1024**3, 400 * 1024**3
+                )
+                assert manager.max_size == expected_gib * 1024**3
+                assert mock_du.call_count == 2
+        finally:
+            manager._index._total_size = 0
+            manager.close()
 
     def test_utilization_never_exceeds_1(self, tmp_path: Path):
         """Utilization should never exceed 1.0 with effective max size."""

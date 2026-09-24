@@ -8,14 +8,18 @@ import sys
 import zlib
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.api.utils import extract_text_content, uses_native_reasoning_content
+from omlx.cache.deepseek_v41_delta import compact_state
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.patches.deepseek_v41.language import LanguageModel
+from omlx.patches.deepseek_v41.processing import Processor
 
 
 def tiny(**kwargs):
@@ -166,6 +170,69 @@ def test_chunk_boundaries_and_late_join():
     np.testing.assert_allclose(
         result, model(mx.array([[12, 13, 14, 16, 17]]))[:, -1:], atol=1e-5
     )
+
+
+def test_extract_trims_batch_padding_to_row_offset():
+    model = LanguageModel(tiny(window_size=8))
+    a = mx.array([[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]])
+    b = mx.array([[12, 13, 14, 15]])
+    ca, cb = model.make_cache(), model.make_cache()
+    model(a, cache=ca)
+    model(b, cache=cb)
+    merged = [DeepseekV41Cache.merge([x, y]) for x, y in zip(ca, cb)]
+    next_ids = mx.array([[16], [17]])
+    model(next_ids, cache=merged)
+    for row, offset in ((0, 12), (1, 5)):
+        for layer in merged:
+            ratio = layer.compress_ratio
+            extracted = layer.extract(row)
+            assert int(extracted.offset.item()) == offset
+            assert extracted[1].shape[1] == min(offset, 8)
+            assert (
+                extracted[2].shape[1]
+                == extracted[3].shape[1]
+                == (offset // ratio if ratio else 0)
+            )
+            assert (
+                extracted[4].shape[1]
+                == extracted[5].shape[1]
+                == (offset % ratio if ratio > 1 else 0)
+            )
+            if ratio:
+                compact_state(tuple(extracted.cache), extracted.meta_state, 0, offset)
+        solo = model.make_cache()
+        prompt = mx.concatenate([a if row == 0 else b, next_ids[row : row + 1]], 1)
+        model(prompt, cache=solo)
+        rows = [layer.extract(row) for layer in merged]
+        np.testing.assert_allclose(
+            model(mx.array([[18]]), cache=rows),
+            model(mx.array([[18]]), cache=solo),
+            atol=1e-5,
+        )
+
+
+def test_echoed_reasoning_renders_one_think_block():
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "write_file", "parameters": {"type": "object"}},
+        }
+    ]
+    messages = [
+        SimpleNamespace(role="user", content="Fix the bug."),
+        SimpleNamespace(
+            role="assistant", content="", reasoning_content="Let me write."
+        ),
+        SimpleNamespace(role="user", content="Continue."),
+    ]
+    native = uses_native_reasoning_content(config_model_type="deepseek_v41")
+    processor = Processor(SimpleNamespace(), SimpleNamespace(image_token_id=129264))
+    prompt = processor.apply_chat_template(
+        extract_text_content(messages, native_reasoning_content=native), tools=tools
+    )
+    turn = prompt[prompt.index("<｜Assistant｜>") : prompt.index("<｜User｜>Continue.")]
+    assert turn.startswith("<｜Assistant｜><think>Let me write.</think>")
+    assert turn.count("<think>") == 1
 
 
 def test_left_padding():

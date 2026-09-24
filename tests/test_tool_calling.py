@@ -4971,6 +4971,13 @@ def final_qwen_parser():
 
 
 @pytest.mark.parametrize(
+    "parser_module",
+    [
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ],
+)
+@pytest.mark.parametrize(
     "value",
     [
         "안녕하세요 🌍",
@@ -4980,8 +4987,11 @@ def final_qwen_parser():
         "x" * 50000,
     ],
 )
-def test_final_qwen_outer_recovery_preserves_parameter_bytes(final_qwen_parser, value):
+def test_final_qwen_outer_recovery_preserves_parameter_bytes(
+    final_qwen_parser, monkeypatch, parser_module, value
+):
     tok, tools = final_qwen_parser
+    monkeypatch.setattr(tok.tool_parser, "__module__", parser_module)
     raw = (
         f"<tool_call><function=write><parameter=content>{value}</parameter></function>"
     )
@@ -5393,8 +5403,17 @@ def test_attribute_call_preserves_following_other_dialect_call():
     ]
 
 
+@pytest.mark.parametrize(
+    "parser_module",
+    [
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ],
+)
 @pytest.mark.parametrize("keyword", ["oneOf", "anyOf"])
-def test_qwen_untyped_tool_parameter(keyword):
+def test_qwen_untyped_tool_parameter(monkeypatch, parser_module, keyword):
+    tokenizer = TestNakedQwenFollowup.tokenizer()
+    monkeypatch.setattr(tokenizer.tool_parser, "__module__", parser_module)
     schema = {
         "type": "object",
         "properties": {
@@ -5423,7 +5442,7 @@ def test_qwen_untyped_tool_parameter(keyword):
         "</function></tool_call>"
     )
     result = extract_tool_calls_with_thinking(
-        "", raw, TestNakedQwenFollowup.tokenizer(), tools, finish_reason="stop"
+        "", raw, tokenizer, tools, finish_reason="stop"
     )
     assert not result.parse_errors
     args = json.loads(result.tool_calls[0].function.arguments)

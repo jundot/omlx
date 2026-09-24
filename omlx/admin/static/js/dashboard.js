@@ -1899,6 +1899,7 @@
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
+                    moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -5924,7 +5925,10 @@
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
                 const val = this.globalSettings.cache?.ssd_cache_max_size;
-                if (val && val !== 'auto') {
+                if (val === 'auto') {
+                    return Math.round((this.globalSettings.cache.ssd_cache_auto_size_bytes || 0) / 1024 ** 3);
+                }
+                if (val) {
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }
@@ -6597,6 +6601,19 @@
             oqSelectedModelType() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.model_type || '';
+            },
+
+            oqAvailableLevels() {
+                return this.oqSelectedModelType() === 'deepseek_v41'
+                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+            },
+
+            oqApplyModelPolicy() {
+                if (this.oqSelectedModelType() !== 'deepseek_v41') return;
+                if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
+                this.oqDtype = 'bfloat16';
+                this.oqTextOnly = false;
+                if (this.oqLevel === 4) this.oqSensitivityModelPath = '';
             },
 
             oqLevelLabel(level) {

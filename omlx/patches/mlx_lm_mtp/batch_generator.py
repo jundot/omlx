@@ -1855,7 +1855,9 @@ def _clone_mtp_head_cache(mtp_cache: List[Any]) -> List[Any]:
                 setattr(new, attr, list(val))
         return new
 
-    return [clone_one(c) for c in mtp_cache]
+    cloned = copy.copy(mtp_cache)
+    cloned[:] = [clone_one(c) for c in mtp_cache]
+    return cloned
 
 
 def _trunk_norm_module(model: Any):

@@ -10606,19 +10606,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cold-spillover ceiling. \"auto\" = 10% of SSD capacity."
+            "value" : "Cold-spillover ceiling. \"auto\" = 50% of the sum of free space and existing SSD cache."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Предел холодного spillover. \"auto\" = 10% емкости SSD."
+            "value" : "Предел холодного spillover. \"auto\" = 50% суммы свободного места и существующего SSD-кэша."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "冷溢出上限。'auto' = SSD 容量的 10%。"
+            "value" : "冷溢出上限。'auto' = 可用空间与现有 SSD 缓存之和的 50%。"
           }
         }
       }

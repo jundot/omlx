@@ -1,3 +1,9 @@
+# Cluster test filesystem isolation
+
+The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
+
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+
 # macOS readability theme tests
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.
@@ -9,6 +15,23 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 # Test timing
 
 CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+
+# First-token burst release
+
+Run `python -m pytest -q tests/test_engine_core.py tests/test_output_collector.py`
+to check first-chunk delivery across the executor boundary, late admission,
+multi-token chunks, output ordering, later burst limits and request cancellation.
+Burst decode releases each request's first generated chunk before continuing
+with the configured burst policy. This adds one executor hand-off per request;
+it does not shorten prefill or bypass parser, stop-string or stream-interval
+buffering. Subsequent chunks still follow the selected Burst Decode setting.
+
+For a real-server comparison, use the same model, prompt, output length and
+cache state on main and the branch. Measure client-observed first content and
+complete-response time separately from producer-side token timestamps, with
+balanced (0.1 s) and aggressive (0.2 s) burst settings. Include short replies,
+long replies, a second request admitted during decode, and disconnect/recovery.
+Report any custom budgets separately from the stock modes.
 
 Cluster process-group tests use the `mock_cluster_ssh` fixture; remote teardown and serve-marker tests retain their own transport assertions. Mock-model engine tests skip explicit GC, while `test_engine_teardown.py` and `test_per_engine_threads.py` retain teardown and reclamation coverage. GLM5 execution tests reuse the eight-layer KDA/DSA fixture with dense and MoE layers; checkpoint-key tests retain the 45-layer configuration. The SDPA memory test retains the 8K/32K length ratio, head dimension 256, and 6:1 GQA ratio with fewer heads. DeepSeek V4.1 direct and converted engine checks run sequentially in one isolated subprocess with separate checkpoint directories.
 

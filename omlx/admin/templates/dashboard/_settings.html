@@ -476,10 +476,15 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.cold_cache_limit') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">
                                             {{ t('settings.resource.cold_cache_description') }}
+                                            <span x-show="globalSettings.cache.ssd_cache_max_size === 'auto'">{{ t('settings.resource.cold_cache_auto_description') }}</span>
                                         </p>
                                     </div>
                                     <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <input type="range" min="0" max="100" step="1"
+                                        <button type="button" @click="globalSettings.cache.ssd_cache_max_size = 'auto'"
+                                                :aria-pressed="globalSettings.cache.ssd_cache_max_size === 'auto'"
+                                                class="text-sm underline">{{ t('settings.resource.cold_cache_auto') }}</button>
+                                        <input type="range" min="1" max="100" step="1"
+                                               x-show="globalSettings.cache.ssd_cache_max_size !== 'auto'"
                                                x-model.number="cachePercent"
                                                @input="updateCacheFromSlider()"
                                                class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
@@ -487,7 +492,7 @@
                                                       [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
                                                       [&::-webkit-slider-thumb]:shadow-sm">
                                         <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
-                                            <span x-text="cachePercent + '%'"></span>
+                                            <span x-text="globalSettings.cache.ssd_cache_max_size === 'auto' ? window.t('settings.resource.cold_cache_auto') : cachePercent + '%'"></span>
                                             <span class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
                                                    type="number"
                                                    :value="cacheSizeGB"
