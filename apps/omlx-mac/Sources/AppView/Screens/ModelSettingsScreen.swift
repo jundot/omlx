@@ -1550,10 +1550,25 @@ private struct AccelerationSection: View {
                               defaultValue: "Lightning MTP",
                               comment: "Row label for the Lightning MTP toggle"),
                 sublabel: mtpSublabel,
-                isLast: true) {
+                isLast: !vm.mtpEnabled) {
                 RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
                     .disabled(mtpToggleDisabled)
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
+            }
+            if vm.mtpEnabled {
+                Row(label: String(localized: "settings.acceleration.mtp.depth.label",
+                                  defaultValue: "Draft Depth",
+                                  comment: "Row label for the Lightning MTP draft depth picker"),
+                    sublabel: String(localized: "settings.acceleration.mtp.depth.sub",
+                                     defaultValue: "Adaptive adjusts the draft depth each step. Depth N always drafts N tokens.",
+                                     comment: "Sublabel for the Lightning MTP draft depth picker"),
+                    isLast: true) {
+                    Popup(
+                        selection: vm.bindProfile($vm.mtpFixedDepth),
+                        width: .controlMedium,
+                        options: ModelSettingsScreenVM.mtpDepthOptions
+                    )
+                }
             }
         }
     }

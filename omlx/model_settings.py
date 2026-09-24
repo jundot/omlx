@@ -447,10 +447,13 @@ class ModelSettings:
     # Mutually exclusive with DFlash.
     mtp_enabled: bool = False
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
-    # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
-    # An adaptive controller picks 1..max per sequence from rolling
-    # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
-    mtp_num_draft_tokens: Optional[int] = None
+    # None = model-specific default (4 for dense Qwen3.5-family on M5, else 3
+    # for DeepSeek-V4 and Qwen3.5/3.6). An adaptive controller picks 1..max
+    # per sequence from rolling acceptance/latency estimates.
+    mtp_adaptive_max_depth: Optional[int] = None
+    # Draft exactly this many tokens every cycle, with no adaptive controller.
+    # Takes precedence over mtp_adaptive_max_depth; None = adaptive.
+    mtp_fixed_depth: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
@@ -1498,7 +1501,12 @@ class ModelSettingsManager:
         merged = {
             k: v for k, v in current.to_dict().items() if k not in UNIVERSAL_FIELDS_SET
         }
-        merged.update(filter_profile_fields(profile_settings))
+        overlay = filter_profile_fields(profile_settings)
+        merged.update(overlay)
+        # A profile that sets the Lightning MTP toggle also owns the depth
+        # choice; no fixed depth there selects adaptive depth.
+        if "mtp_enabled" in overlay and "mtp_fixed_depth" not in overlay:
+            merged["mtp_fixed_depth"] = None
         merged["active_profile_name"] = name
         if settings_sanitizer is not None:
             settings_sanitizer(merged)

@@ -443,3 +443,24 @@ def test_std_tax_probe_measures_and_smooths():
     for _ in range(_STD_TAX_SAMPLES):
         _record_std_tax_sample(gb, 11.0)
     assert 1.0 < model._omlx_mtp_loop_tax < 1.2
+
+
+def test_unreached_position_borrows_previous_estimate():
+    c = _DepthController(3)
+    c._warmup = []
+    c.p = [0.9, None, None]
+    assert c._p_eff(2) == 0.9
+    # First reach of position 2 starts its EMA from position 1's estimate.
+    c.observe(2, 2, 10.0)
+    assert c.p[1] > 0.9
+    assert c.p[2] is None
+
+
+def test_seed_skips_measured_warmup_and_copies_estimates():
+    prev = _simulate(_DepthController(2), 20, [0.9, 0.9], {0: 8.0, 1: 10.0, 2: 12.0})
+    c = _DepthController(3, seed=prev)
+    assert c.p[:2] == prev.p and c.p[2] is None
+    assert c.t == prev.t
+    # Only the depth the seed never ran is swept.
+    assert c._warmup == [3]
+    assert c.cur == 3

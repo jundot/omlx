@@ -2171,6 +2171,23 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
+        # Dense Qwen3.5-family 4-bit projections -> tile-repacked layout for
+        # the M5 tensor units. Replaces the layers in place, so resident
+        # memory does not grow; runs on the MLX executor before any forward.
+        try:
+            from ..patches import qwen35_packed_linear
+
+            if qwen35_packed_linear.enabled(self._vlm_model):
+                packed = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    qwen35_packed_linear.pack_model,
+                    self._vlm_model,
+                )
+                if packed:
+                    logger.info("Qwen packed 4-bit projections: %d layers", packed)
+        except Exception:
+            logger.warning("Qwen packed 4-bit projections not applied", exc_info=True)
+
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
         if self.is_diffusion_model:

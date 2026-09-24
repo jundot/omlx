@@ -155,7 +155,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
 
     def __init__(self, config):
         from . import is_mtp_attach_enabled
-        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         original_init(self, config)
         asst_cfg = getattr(config, "mtp_assistant_config", None)
@@ -175,6 +175,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             # ``speculative_draft_hidden`` variant this drafter consumes.
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with MTP-cycle shared-K/V capture.

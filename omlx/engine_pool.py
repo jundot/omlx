@@ -840,7 +840,8 @@ class EnginePool:
         # signature while Lightning MTP is active so a change reloads the
         # engine, but a stale value must not force one when MTP is off.
         if mtp_active:
-            add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
+            add("mtp_adaptive_max_depth", data.get("mtp_adaptive_max_depth"))
+            add("mtp_fixed_depth", data.get("mtp_fixed_depth"))
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)

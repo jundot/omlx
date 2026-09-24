@@ -13,6 +13,7 @@ Auto depth and parking use the measured cost of the whole active batch.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 import math
 import time
@@ -85,9 +86,7 @@ def apply() -> bool:
         original_extend = GenerationBatch.extend
 
         def patched_init(self, model, uids, *args, **kwargs):
-            with _prompt_priming.decode_scope(model, uids), _drafter_scope(
-                model, uids
-            ):
+            with _prompt_priming.decode_scope(model, uids), _drafter_scope(model, uids):
                 original_init(self, model, uids, *args, **kwargs)
             # Do not activate MTP here. Fresh singleton batches created by
             # PromptProcessingBatch.generate() may still be merged into a larger
@@ -127,7 +126,8 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        return _mtp_batch_next(self, batch_state)
+                        with _spec_command_buffers():
+                            return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
                     if not _reconcile_mtp_batch_to_standard(self):
@@ -153,7 +153,8 @@ def apply() -> bool:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            return _mtp_next(self, state)
+                            with _spec_command_buffers():
+                                return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
@@ -336,6 +337,32 @@ def _model_has_mtp_module(model: Any) -> bool:
     return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
 
 
+# MLX commits a command buffer every ~50 ops or 50 MB of inputs, weights
+# included, and blocks eval at ten in flight, so a cycle could not queue the
+# next draft behind a running verify. Prefill keeps MLX's caps: larger ones
+# raise its peak memory.
+_SPEC_BUFFER_CAPS = (200, 512)
+
+
+@contextlib.contextmanager
+def _spec_command_buffers():
+    """Raise MLX's command-buffer caps for one speculative decode step.
+
+    Measured on M5 only, so other GPUs keep MLX's caps.
+    """
+    from omlx.custom_kernels.nax import is_nax_available
+    from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
+
+    previous = None
+    if is_nax_available():
+        previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+    try:
+        yield
+    finally:
+        if previous is not None:
+            set_command_buffer_caps(*previous)
+
+
 def _drafter_for(model: Any) -> Optional[Any]:
     """Return the external block drafter attached to the model, if any.
 
@@ -350,7 +377,9 @@ def _drafter_for(model: Any) -> Optional[Any]:
         if inner is not None and inner is not model:
             candidates.append(inner)
     for candidate in candidates:
-        drafter = getattr(candidate, "_omlx_drafter", None)
+        # Only an attribute attach_drafter actually set counts; a dynamic
+        # __getattr__ (mocks, adapters) must not look like a drafter.
+        drafter = inspect.getattr_static(candidate, "_omlx_drafter", None)
         if drafter is not None:
             return drafter
     return None
@@ -1273,7 +1302,8 @@ def _batch_policy_for_next(gen_batch: Any):
         policy = BatchPolicy(
             gen_batch.uids,
             depth if chain else 1,
-            fixed=_drafter_for(gen_batch.model) is not None,
+            fixed=_drafter_for(gen_batch.model) is not None
+            or _mtp_depth_fixed(gen_batch.model),
         )
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
@@ -1535,7 +1565,12 @@ def _accept_lp_for(sampler, lp):
     """
     import mlx.core as mx
 
-    from omlx.utils.sampling import apply_min_p, apply_top_k, apply_top_p
+    from omlx.utils.sampling import (
+        apply_min_p,
+        apply_top_k,
+        apply_top_p,
+        apply_top_p_top_k,
+    )
 
     temp = float(getattr(sampler, "temp", 0.0) or 0.0)
     if temp == 0.0:
@@ -1544,15 +1579,18 @@ def _accept_lp_for(sampler, lp):
 
     out = lp
     top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
-    if 0.0 < top_p < 1.0:
-        out = apply_top_p(out, top_p)
     min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
-    if min_p != 0.0:
-        min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
-        out = apply_min_p(out, min_p, min_keep)
     top_k = int(getattr(sampler, "top_k", 0) or 0)
-    if top_k > 0:
-        out = apply_top_k(out, top_k)
+    if 0.0 < top_p < 1.0 and top_k > 0 and min_p == 0.0:
+        out = apply_top_p_top_k(out, top_p, top_k)
+    else:
+        if 0.0 < top_p < 1.0:
+            out = apply_top_p(out, top_p)
+        if min_p != 0.0:
+            min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
+            out = apply_min_p(out, min_p, min_keep)
+        if top_k > 0:
+            out = apply_top_k(out, top_k)
 
     # Temperature scale + renormalize so the output is a proper logprob
     # distribution that can be indexed by token id for the acceptance check.
@@ -1827,6 +1865,20 @@ def _resolve_mtp_chain_depth(model: Any) -> Tuple[bool, int, bool]:
             head_clone = bool(getattr(candidate, "_omlx_mtp_head_clone", False))
             return True, max(1, min(8, depth)), head_clone
     return False, 1, False
+
+
+def _mtp_depth_fixed(model: Any) -> bool:
+    """True when the model was loaded with a fixed draft depth (no controller)."""
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    return any(
+        getattr(candidate, "_omlx_mtp_chain", False)
+        and bool(getattr(candidate, "_omlx_mtp_depth_fixed", False))
+        for candidate in candidates
+    )
 
 
 def _clone_mtp_head_cache(mtp_cache: List[Any]) -> List[Any]:
@@ -2116,6 +2168,7 @@ class _DepthController:
         max_depth: int,
         marginal_ms: Optional[float] = None,
         exit_margin: Optional[float] = None,
+        seed: Optional["_DepthController"] = None,
     ):
         if marginal_ms:
             self.MARGINAL_MS = float(marginal_ms)
@@ -2123,7 +2176,9 @@ class _DepthController:
             self.EXIT_MARGIN = min(_STD_TAX_MAX, max(1.0, float(exit_margin)))
         self.max_depth = max(1, int(max_depth))
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
-        self.p = [0.6] * self.max_depth
+        # A position never reached yet (None) borrows the estimate of the
+        # position before it; a flat 0.6 prior kept deep drafts unexplored.
+        self.p: List[Optional[float]] = [0.6] + [None] * (self.max_depth - 1)
         self.t: Dict[int, float] = {}
         self.t_age: Dict[int, float] = {}  # ms since each depth was measured
         self.cycles = 0
@@ -2141,6 +2196,24 @@ class _DepthController:
         self._warmup: List[int] = list(range(self.max_depth, 0, -1))
         if self.max_depth > 1:
             self._warmup.extend([0, 0, 0])
+        if seed is not None and seed.t:
+            self._adopt(seed)
+
+    def _adopt(self, seed: "_DepthController") -> None:
+        """Start from the previous sequence's estimates on this model.
+
+        Costs are a property of model x chip x context and acceptance moves
+        with content; both keep adapting through the usual EMAs. Only depths
+        the seed never measured are swept.
+        """
+        for j in range(min(self.max_depth, len(seed.p))):
+            self.p[j] = seed.p[j]
+        self.t = {d: v for d, v in seed.t.items() if d <= self.max_depth}
+        self.t_age = {d: 0.0 for d in self.t}
+        self._warmup = [d for d in range(self.max_depth, 0, -1) if d not in self.t]
+        if self.max_depth > 1 and 0 not in self.t:
+            self._warmup.extend([0, 0, 0])
+        self.cur = self._warmup[0] if self._warmup else self._best()
 
     def observe(
         self,
@@ -2155,6 +2228,8 @@ class _DepthController:
         # Acceptance: token-domain EMA (a property of model/content, not load).
         a = self.ALPHA
         for j in range(used):
+            if self.p[j] is None:
+                self.p[j] = self._p_eff(j)
             hit = 1.0 if j < accepted else 0.0
             self.p[j] = (1.0 - a) * self.p[j] + a * hit
             if j >= accepted:
@@ -2281,11 +2356,16 @@ class _DepthController:
         ref = min(self.t, key=lambda x: abs(x - d))
         return max(1e-3, self.t[ref] + self._marginal_est() * (d - ref))
 
+    def _p_eff(self, j: int) -> float:
+        while self.p[j] is None:
+            j -= 1
+        return self.p[j]
+
     def _score(self, d: int) -> float:
         expected = 1.0
         run = 1.0
         for j in range(d):
-            run *= self.p[j]
+            run *= self._p_eff(j)
             expected += run
         return expected / max(1e-6, self._t_est(d))
 
@@ -2606,6 +2686,8 @@ def _chain_next_drafts(
         draft_accept_lps.append(accept_lp.squeeze(0))
         if j + 1 == depth:
             break
+        # Start this step on the GPU while the host encodes the next one.
+        mx.async_eval(tok, h)
         logits, head_hidden = model.mtp_forward(
             h,
             tok.reshape(1, 1),
@@ -2720,12 +2802,10 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
             state.queue.append(
                 (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
             )
-            drafter.draft(
-                [(gen_batch, state, captured, state.next_main, prev_buf)]
-            )
+            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
             gen_batch._omlx_mtp_state = state
             return
-        if depth > 1:
+        if depth > 1 and not _mtp_depth_fixed(gen_batch.model):
             factory = getattr(
                 _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
             )
@@ -2736,7 +2816,13 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
                     depth,
                     marginal_ms=getattr(gen_batch.model, "_omlx_mtp_marginal_ms", None),
                     exit_margin=_effective_loop_tax(gen_batch.model),
+                    seed=getattr(gen_batch.model, "_omlx_mtp_depth_seed", None),
                 )
+                try:
+                    # The next sequence starts from this one's latest estimates.
+                    gen_batch.model._omlx_mtp_depth_seed = state.controller
+                except Exception:
+                    pass
         primed = _prompt_priming.take_primed(
             gen_batch.model,
             gen_batch.prompt_cache,
@@ -3257,11 +3343,91 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     return _run_verify_cycle_legacy(gen_batch, state)
 
 
+def _sparse_top_k(sampler) -> int:
+    """Top-k of a sampler whose target filter is exactly top-p + top-k, else 0."""
+    top_k = int(getattr(sampler, "top_k", 0) or 0)
+    if (
+        float(getattr(sampler, "temp", 0.0) or 0.0) <= 0.0
+        or not 0 < top_k <= 64
+        or float(getattr(sampler, "min_p", 0.0) or 0.0) != 0.0
+        or float(getattr(sampler, "xtc_probability", 0.0) or 0.0) > 0.0
+    ):
+        return 0
+    return top_k
+
+
+def _stochastic_verify_tokens_sparse(
+    sampler, combined_lp, drafts, draft_accept_lps, top_k
+):
+    """``_stochastic_verify_tokens`` on the target's top-k support only.
+
+    With a top-k filter the target density p is zero outside its top-k
+    tokens, and so are the residual max(p - q, 0) and the bonus draw. Only the
+    draft densities q are read at the needed ids, so no vocab-wide op runs
+    after the top-k selection. The sampled distributions are unchanged.
+    """
+    import mlx.core as mx
+
+    from omlx.utils.sampling import top_k_indices
+
+    k = int(drafts.shape[0])
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    temp = float(sampler.temp)
+    ids = top_k_indices(combined_lp, top_k)
+    vals = mx.take_along_axis(combined_lp, ids, axis=-1).astype(mx.float32)
+    order = mx.argsort(-vals, axis=-1)
+    vals = mx.take_along_axis(vals, order, axis=-1)
+    ids = mx.take_along_axis(ids, order, axis=-1)
+    if 0.0 < top_p < 1.0:
+        probs = mx.exp(vals)
+        vals = mx.where(mx.cumsum(probs, axis=-1) - probs < top_p, vals, -float("inf"))
+    scaled = vals * (1.0 / temp)
+    logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)  # (k+1, top_k)
+
+    d = drafts.astype(mx.int32)
+    hit = ids[:k] == d[:, None]
+    p_at = mx.where(
+        mx.any(hit, axis=-1),
+        mx.sum(mx.where(hit, logp[:k], 0.0), axis=-1),
+        -float("inf"),
+    )
+    q_rows = mx.stack(draft_accept_lps)  # (k, V)
+    q_at = mx.take_along_axis(q_rows, d[:, None], axis=-1).squeeze(-1)
+    ratio = p_at - q_at
+    u = mx.random.uniform(shape=(k,))
+    acc = mx.logical_or(ratio >= 0, mx.log(u) < ratio)
+    m_arr = mx.cumprod(acc.astype(mx.int32)).sum().reshape(1)
+    p_sup = mx.exp(logp[:k])
+    q_sup = mx.exp(mx.take_along_axis(q_rows, ids[:k], axis=-1).astype(mx.float32))
+    res = mx.maximum(p_sup - q_sup, 0.0)
+    z = res.sum(axis=-1, keepdims=True)
+    res_dist = mx.where(z > 0, res, p_sup)
+    res_pos = mx.random.categorical(mx.log(res_dist))
+    res_samples = mx.take_along_axis(ids[:k], res_pos[:, None], axis=-1).squeeze(-1)
+    bonus_pos = mx.random.categorical(logp[k : k + 1])
+    bonus_tok = mx.take_along_axis(ids[k : k + 1], bonus_pos[:, None], axis=-1).reshape(
+        1
+    )
+    return mx.concatenate(
+        [
+            m_arr.astype(mx.int32),
+            d,
+            res_samples.astype(mx.int32),
+            bonus_tok.astype(mx.int32),
+        ]
+    )
+
+
 def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
     """Build acceptance and correction tokens without a host synchronization."""
     import mlx.core as mx
 
     k = int(drafts.shape[0])
+    top_k = _sparse_top_k(sampler)
+    if top_k and k > 0:
+        return _stochastic_verify_tokens_sparse(
+            sampler, combined_lp, drafts, draft_accept_lps, top_k
+        )
     sampling_logits = getattr(sampler, "_mtp_sampling_logits", None)
     filtered = None
     if sampling_logits is None:
@@ -3299,6 +3465,19 @@ def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
             bonus_tok.astype(mx.int32),
         ]
     )
+
+
+def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> bool:
+    """Queue the next block draft behind this cycle's acceptance, pre-sync."""
+    import mlx.core as mx
+
+    predraft = getattr(drafter, "predraft", None)
+    if predraft is None or captured is None:
+        return False
+    # Scheduled alone, the host read gets its own completion event; read as
+    # an input of the draft it would wait for the whole draft.
+    mx.async_eval(host_arr)
+    return bool(predraft(gen_batch, state, captured, m_arr + 1, anchor))
 
 
 def _run_verify_cycle_chain(
@@ -3379,6 +3558,16 @@ def _run_verify_cycle_chain(
             row_snaps[j] = _snap_snapshotable(procs)
         rows = mx.stack(applied)
     combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
+    # A block drafter can start the next block on the GPU while the host
+    # settles this cycle; plain single-row cycles only.
+    can_predraft = (
+        drafter is not None
+        and procs is None
+        and draft_jobs is None
+        and commit_cache is None
+        and not defer_commit
+    )
+    predrafted = False
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -3398,9 +3587,18 @@ def _run_verify_cycle_chain(
             targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
             matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
             m_arr = mx.cumprod(matches).sum().reshape(1)
-            host = mx.concatenate(
-                [m_arr, targets, state.drafts.astype(mx.int32)]
-            ).tolist()
+            host_arr = mx.concatenate([m_arr, targets, state.drafts.astype(mx.int32)])
+            if can_predraft:
+                predrafted = _predraft(
+                    gen_batch,
+                    state,
+                    drafter,
+                    captured,
+                    host_arr,
+                    m_arr,
+                    mx.take(targets, m_arr),
+                )
+            host = host_arr.tolist()
         else:
             host = greedy_result
         m = int(host[0])
@@ -3418,9 +3616,20 @@ def _run_verify_cycle_chain(
         # ONE host sync (mirrors the greedy path's sync structure).
         host = stochastic_result
         if host is None:
-            host = _stochastic_verify_tokens(
+            result = _stochastic_verify_tokens(
                 sampler, combined_lp, state.drafts, state.draft_accept_lps
-            ).tolist()
+            )
+            if can_predraft:
+                m_arr = result[:1]
+                anchor = mx.where(
+                    m_arr < k,
+                    mx.take(result[k + 1 : 2 * k + 1], mx.minimum(m_arr, k - 1)),
+                    result[2 * k + 1 : 2 * k + 2],
+                )
+                predrafted = _predraft(
+                    gen_batch, state, drafter, captured, result, m_arr, anchor
+                )
+            host = result.tolist()
         m = int(host[0])
         draft_ids = host[1 : k + 1]
         res_ids = host[k + 1 : 2 * k + 1]
@@ -3439,6 +3648,7 @@ def _run_verify_cycle_chain(
     # bounded). Emitting fewer verified drafts is always correct; position
     # ``m`` was itself accepted when the clamp lowers it, so its draft
     # token is a fair emit for the correction slot.
+    m_gpu = m
     clamp = getattr(gen_batch.model, "mtp_clamp_accept", None)
     if m < k:
         if callable(clamp):
@@ -3550,7 +3760,11 @@ def _run_verify_cycle_chain(
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
-        if drafter is not None:
+        if drafter is not None and predrafted and m == m_gpu:
+            drafter.adopt_predraft(state, m + 1)
+        elif drafter is not None:
+            if predrafted:
+                drafter.discard_predraft()
             rows_hidden = [c[:, : m + 1] for c in captured]
             job = (gen_batch, state, rows_hidden, committed, prev_buf)
             if draft_jobs is None:

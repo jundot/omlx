@@ -319,7 +319,9 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
-    mtp_num_draft_tokens: int | None = None
+    mtp_adaptive_max_depth: int | None = None
+    # Fixed Lightning MTP draft depth (None = adaptive).
+    mtp_fixed_depth: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
@@ -2863,17 +2865,19 @@ async def update_model_settings(
             if request.thinking_budget_tokens and request.thinking_budget_tokens > 0
             else None
         )
-    if "mtp_num_draft_tokens" in sent:
-        value = request.mtp_num_draft_tokens
+    for name in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+        if name not in sent:
+            continue
+        value = getattr(request, name)
         if value is not None and not 1 <= value <= MAX_LIGHTNING_MTP_DRAFT_TOKENS:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "mtp_num_draft_tokens must be between 1 and "
+                    f"{name} must be between 1 and "
                     f"{MAX_LIGHTNING_MTP_DRAFT_TOKENS} (or null)."
                 ),
             )
-        current_settings.mtp_num_draft_tokens = value
+        setattr(current_settings, name, value)
     if "preserve_thinking" in sent:
         current_settings.preserve_thinking = request.preserve_thinking
     if "cache_reasoning_output" in sent:
@@ -3909,13 +3913,14 @@ def _feature_problem(
         ok, reason = _mtp_compat_for_model(info)
         if not ok:
             return reason or "Lightning MTP is not available for this model"
-        depth = snapshot.get("mtp_num_draft_tokens")
-        if depth is not None and (
-            isinstance(depth, bool)
-            or not isinstance(depth, int)
-            or not 1 <= depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
-        ):
-            snapshot.pop("mtp_num_draft_tokens", None)
+        for key in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+            depth = snapshot.get(key)
+            if depth is not None and (
+                isinstance(depth, bool)
+                or not isinstance(depth, int)
+                or not 1 <= depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
+            ):
+                snapshot.pop(key, None)
         return None
     if name in ("turboquant", "index_cache"):
         is_paro, reason = _paroquant_compat_for_model(info)

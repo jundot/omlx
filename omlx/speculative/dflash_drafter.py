@@ -16,7 +16,7 @@ verify path feeds it the accepted positions after every cycle.
 from __future__ import annotations
 
 import logging
-import os
+import math
 import time
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
@@ -28,8 +28,10 @@ import mlx.nn as nn
 from mlx_vlm.speculative.drafters import load_drafter
 
 from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
+from ..patches import qwen35_packed_linear
 from ..patches.mlx_lm_mtp import batch_generator as bg
 from ..patches.qwen35_verify_qmm import set_verify_qmm_armed
+from ..utils.sampling import top_k_indices
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +40,18 @@ logger = logging.getLogger(__name__)
 class _RowContext:
     """Per-request drafter state: the context ring plus unfed hidden rows.
 
-    ``keys``/``values`` hold one ``(n_kv, W, D)`` ring per draft layer with
+    ``keys``/``values`` hold one ``(n_kv, C, D)`` ring per draft layer with
     RoPE already applied, so slot order does not matter for the non-causal
     context attention. ``fed`` counts every token the ring has seen; the
-    write slot is ``fed % W`` and the oldest entries fall out silently.
+    write slot is ``fed % C``. ``pos`` holds each slot's absolute position,
+    and only the newest ``W - 1`` positions are attended.
     """
 
     pending: list[mx.array] = field(default_factory=list)
     fed: int = 0
     keys: list[mx.array] | None = None
     values: list[mx.array] | None = None
+    pos: mx.array | None = None
 
 
 @dataclass
@@ -57,6 +61,20 @@ class _Cohort:
     uids: tuple
     keys: list[mx.array]
     values: list[mx.array]
+    pos: mx.array
+
+
+@dataclass
+class _Predraft:
+    """A block drafted before the host read how many verify rows committed."""
+
+    uids: tuple
+    keys: list[mx.array]
+    values: list[mx.array]
+    pos: mx.array
+    bases: list[int]
+    unfed: list[int]
+    proposals: list[tuple]
 
 
 def _greedy_proposals(logits: mx.array) -> mx.array:
@@ -89,13 +107,10 @@ class DFlashDrafter:
         # Prefill captures wait under the request id until the scheduler
         # learns the row uid at insert time.
         self._request_seeds: dict[str, list[mx.array]] = {}
-        # Rowwise drafting through mlx-vlm's own cache objects; kept as the
-        # numerical reference for the batched forward.
-        self.rowwise = bool(os.environ.get("OMLX_DFLASH_ROWWISE"))
-        self._rowwise_caches: dict[Any, list[Any]] = {}
         # Row order of the generation batch whose ordinary decode step is
         # running, so a plain forward can be attributed to rows.
         self.scope_uids: tuple | None = None
+        self._predraft: _Predraft | None = None
 
     @property
     def window(self) -> int:
@@ -122,10 +137,34 @@ class DFlashDrafter:
         # mlx-vlm keeps window - 1 context tokens in front of the block.
         return self.window - 1
 
+    @property
+    def capacity(self) -> int:
+        # A block of spare slots lets a predraft write every verify row
+        # without overwriting a position that is still attended.
+        return self.ring_slots + self.block_size
+
     def seed(self, uid: Any, captured: Sequence[mx.array]) -> None:
         """Queue prefill captures ``[(1, n, H), ...]`` as context for ``uid``."""
         if captured:
-            self._row(uid).pending.append(_concat_captured(captured))
+            row = self._row(uid)
+            row.pending.append(_concat_captured(captured))
+            self._bound_pending(row)
+
+    def _bound_pending(self, row: _RowContext) -> None:
+        # Only the newest ring_slots rows are ever attended, so rows queued
+        # while drafting is off are dropped here; fed still counts them.
+        drop = sum(int(p.shape[1]) for p in row.pending) - self.ring_slots
+        if drop <= 0:
+            return
+        row.fed += drop
+        while drop > 0:
+            head = row.pending[0]
+            if int(head.shape[1]) <= drop:
+                drop -= int(head.shape[1])
+                row.pending.pop(0)
+            else:
+                row.pending[0] = head[:, drop:]
+                drop = 0
 
     def observe(self, uids: Iterable[Any], captured: Sequence[mx.array] | None) -> None:
         """Queue one committed position per row from a batched ``(B, 1, H)`` capture."""
@@ -144,7 +183,9 @@ class DFlashDrafter:
     def bind_uid(self, request_id: str, uid: Any) -> None:
         seeds = self._request_seeds.pop(request_id, None)
         if seeds:
-            self._row(uid).pending.extend(seeds)
+            row = self._row(uid)
+            row.pending.extend(seeds)
+            self._bound_pending(row)
 
     def release_request(self, request_id: str) -> None:
         self._request_seeds.pop(request_id, None)
@@ -159,14 +200,14 @@ class DFlashDrafter:
             self.scope_uids = previous
 
     def release(self, uids: Iterable[Any]) -> None:
+        self._predraft = None
         for uid in uids:
             if self._rows.pop(uid, None) is not None:
                 self._detach_cohort()
-            self._rowwise_caches.pop(uid, None)
 
     def clear(self) -> None:
+        self._predraft = None
         self._rows.clear()
-        self._rowwise_caches.clear()
         self._cohort = None
         self._request_seeds.clear()
 
@@ -210,15 +251,7 @@ class DFlashDrafter:
         started = time.perf_counter()
         set_verify_qmm_armed(True)
         try:
-            if self.rowwise:
-                if any(sampler is not None for *_, sampler in rows):
-                    raise RuntimeError("rowwise DFlash drafting is greedy only")
-                proposals = [
-                    (self._draft_rowwise(state.uid, context, anchor), [])
-                    for state, _row, context, anchor, _sampler in rows
-                ]
-            else:
-                proposals = self._draft_batched(rows)
+            proposals = self._draft_batched(rows)
         finally:
             set_verify_qmm_armed(False)
         for (state, *_), (tokens, accept_lps) in zip(rows, proposals):
@@ -234,18 +267,56 @@ class DFlashDrafter:
             if stats is not None:
                 stats.mtp_head_ms += share
 
-    def _draft_rowwise(self, uid: Any, context: mx.array, anchor: mx.array) -> mx.array:
-        cache = self._rowwise_caches.get(uid)
-        if cache is None:
-            cache = self._rowwise_caches[uid] = self.model.make_cache()
-        row = self._row(uid)
-        row.fed += int(context.shape[1])
-        # draft_block appends ``context`` to the row cache and returns the
-        # proposals for the block after ``anchor``. The selector runs for
-        # greedy rows too; draft_block_greedy would bypass it.
-        return self.model.draft_block(
-            anchor, context, cache, self.block_size, _greedy_proposals, mx.int32
-        )
+    def predraft(self, gen_batch, state, captured, count, anchor) -> bool:
+        """Queue the next block before the host reads this cycle's acceptance.
+
+        ``captured`` holds every verify row; ``count`` (a lazy ``(1,)`` array)
+        of them commit and ``anchor`` is the lazy last emitted token. The GPU
+        drafts while the host settles the cycle; ``adopt_predraft`` then keeps
+        the block if the host commits the same count.
+        """
+        if not captured:
+            return False
+        row = self._row(state.uid)
+        unfed = sum(int(p.shape[1]) for p in row.pending)
+        context = mx.concatenate([*row.pending, _concat_captured(captured)], axis=1)
+        if int(context.shape[1]) > self.ring_slots:
+            return False
+        sampler = None
+        if gen_batch is not None and not bg._is_greedy(gen_batch):
+            sampler = bg._resolve_draft_sampler(gen_batch, state)
+        set_verify_qmm_armed(True)
+        try:
+            proposals = self._draft_batched(
+                [(state, row, context, anchor.reshape(1).astype(mx.int32), sampler)],
+                counts=[count.reshape(1) + unfed],
+                commit=False,
+            )
+        finally:
+            set_verify_qmm_armed(False)
+        self._predraft.unfed = [unfed]
+        tokens, accept_lps = proposals[0]
+        mx.async_eval(tokens, *accept_lps)
+        return True
+
+    def adopt_predraft(self, state, count: int) -> None:
+        """Commit the queued block: ``count`` verify rows entered the context."""
+        pre = self._predraft
+        self._predraft = None
+        cohort = self._cohort
+        if pre is None or cohort is None or cohort.uids != pre.uids:
+            raise RuntimeError("DFlash predraft does not match the drafting cohort")
+        cohort.keys, cohort.values, cohort.pos = pre.keys, pre.values, pre.pos
+        row = self._row(state.uid)
+        row.fed = pre.bases[0] + pre.unfed[0] + int(count)
+        row.pending = []
+        tokens, accept_lps = pre.proposals[0]
+        state.drafts = tokens.reshape(-1).astype(mx.uint32)
+        state.draft_lps = []
+        state.draft_accept_lps = accept_lps
+
+    def discard_predraft(self) -> None:
+        self._predraft = None
 
     # --- batched forward -------------------------------------------------
 
@@ -258,6 +329,7 @@ class DFlashDrafter:
             if row is not None:
                 row.keys = [layer[index] for layer in cohort.keys]
                 row.values = [layer[index] for layer in cohort.values]
+                row.pos = cohort.pos[index]
         self._cohort = None
 
     def _assemble_cohort(self, uids: Sequence[Any], dtype) -> _Cohort:
@@ -268,7 +340,7 @@ class DFlashDrafter:
         self._detach_cohort()
         layers = self.model.layers
         attn = layers[0].self_attn
-        shape = (attn.n_kv_heads, self.ring_slots, attn.head_dim)
+        shape = (attn.n_kv_heads, self.capacity, attn.head_dim)
         keys, values = [], []
         for layer_index in range(len(layers)):
             keys.append(
@@ -295,14 +367,27 @@ class DFlashDrafter:
                     ]
                 )
             )
-        self._cohort = _Cohort(uids=uids, keys=keys, values=values)
+        empty = mx.full((self.capacity,), -1, dtype=mx.int32)
+        pos = mx.stack(
+            [
+                self._rows[uid].pos if self._rows[uid].pos is not None else empty
+                for uid in uids
+            ]
+        )
+        self._cohort = _Cohort(uids=uids, keys=keys, values=values, pos=pos)
         return self._cohort
 
-    def _draft_batched(self, rows: Sequence[tuple]) -> list[mx.array]:
-        """One draft forward for every row; mirrors DFlashAttention rowwise math."""
+    def _draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
+        """One draft forward for every row; mirrors DFlashAttention rowwise math.
+
+        ``counts`` optionally gives each row's committed context rows as a lazy
+        ``(1,)`` array; the rest of its context is written but never attended.
+        Without ``commit`` the new rings wait in ``self._predraft``.
+        """
         model = self.model
         uids = [state.uid for state, *_ in rows]
         slots = self.ring_slots
+        capacity = self.capacity
         batch = len(rows)
         block = self.block_size
         dtype = model.fc.weight.dtype if hasattr(model.fc, "weight") else mx.bfloat16
@@ -352,20 +437,25 @@ class DFlashDrafter:
 
         cohort = self._assemble_cohort(uids, dtype)
         base_arr = mx.array(bases, dtype=mx.int32)
-        query_offsets = mx.array(
-            [b + n for b, n in zip(bases, lengths)], dtype=mx.int32
-        )
-        # Ring slot validity after this cycle's writes; block keys always visible.
-        valid_counts = [min(b + n, slots) for b, n in zip(bases, lengths)]
-        slot_index = mx.arange(slots)[None, :]
-        ring_valid = slot_index < mx.array(valid_counts, dtype=mx.int32)[:, None]
+        if counts is None:
+            totals = mx.array([b + n for b, n in zip(bases, lengths)], dtype=mx.int32)
+        else:
+            totals = base_arr + mx.concatenate(counts).astype(mx.int32)
+        query_offsets = totals
+        write_slots = [
+            mx.array([(b + j) % capacity for j in range(n)], dtype=mx.int32)
+            for b, n in zip(bases, lengths)
+        ]
+        # Fresh wrappers: an index assignment rebinds the wrapped array, and a
+        # predraft must leave the cohort's rings untouched.
+        pos = mx.stop_gradient(cohort.pos)
+        for index, (b, n, slots_b) in enumerate(zip(bases, lengths, write_slots)):
+            pos[index, slots_b] = mx.arange(b, b + n, dtype=mx.int32)
+        # Attend the newest ``slots`` committed positions; block keys always.
+        ring_valid = (pos >= (totals - slots)[:, None]) & (pos < totals[:, None])
         mask = mx.concatenate(
             [ring_valid, mx.ones((batch, block), dtype=mx.bool_)], axis=1
         )[:, None, None, :]
-        write_slots = [
-            mx.array([(b + j) % slots for j in range(n)], dtype=mx.int32)
-            for b, n in zip(bases, lengths)
-        ]
 
         new_keys, new_values = [], []
         for layer_index, layer in enumerate(model.layers):
@@ -388,8 +478,8 @@ class DFlashDrafter:
             ).transpose(0, 2, 1, 3)
             ctx_keys = model.rope(ctx_keys, offset=base_arr)
 
-            ring_keys = cohort.keys[layer_index]
-            ring_values = cohort.values[layer_index]
+            ring_keys = mx.stop_gradient(cohort.keys[layer_index])
+            ring_values = mx.stop_gradient(cohort.values[layer_index])
             for index, (n, slots_b) in enumerate(zip(lengths, write_slots)):
                 ring_keys[index, :, slots_b, :] = ctx_keys[index, :, :n, :]
                 ring_values[index, :, slots_b, :] = ctx_values[index, :, :n, :]
@@ -435,12 +525,14 @@ class DFlashDrafter:
                 x = mlp_conv.finish(x, kernel)
             h = residual + x
 
-        cohort.keys = new_keys
-        cohort.values = new_values
-        for (_state, row, _context, _anchor, _sampler), b, n in zip(
-            rows, bases, lengths
-        ):
-            row.fed = b + n
+        if commit:
+            cohort.keys = new_keys
+            cohort.values = new_values
+            cohort.pos = pos
+            for (_state, row, _context, _anchor, _sampler), b, n in zip(
+                rows, bases, lengths
+            ):
+                row.fed = b + n
 
         draft_hidden = model.norm(h)[:, 1:]
         logits = model._logits(draft_hidden)
@@ -448,15 +540,29 @@ class DFlashDrafter:
         selector = getattr(model, "candidate_selector", None)
         if all(sampler is None for sampler in samplers):
             if selector is not None:
-                proposals = selector.select(
+                tokens = selector.select(
                     draft_hidden, logits, anchors, _greedy_proposals
                 )
             else:
-                proposals = _greedy_proposals(logits)
-            return [(proposals[i : i + 1], []) for i in range(batch)]
-        if selector is not None:
-            return _select_sampled(selector, draft_hidden, logits, anchors, samplers)
-        return _sample_positions(logits, samplers)
+                tokens = _greedy_proposals(logits)
+            proposals = [(tokens[i : i + 1], []) for i in range(batch)]
+        elif selector is not None:
+            proposals = _select_sampled(
+                selector, draft_hidden, logits, anchors, samplers
+            )
+        else:
+            proposals = _sample_positions(logits, samplers)
+        if not commit:
+            self._predraft = _Predraft(
+                uids=tuple(uids),
+                keys=new_keys,
+                values=new_values,
+                pos=pos,
+                bases=bases,
+                unfed=[],
+                proposals=proposals,
+            )
+        return proposals
 
 
 def _sample_positions(logits: mx.array, samplers: list) -> list[tuple]:
@@ -478,23 +584,55 @@ def _sample_positions(logits: mx.array, samplers: list) -> list[tuple]:
     return out
 
 
+def _sample_candidates(scores: mx.array, sampler) -> tuple[mx.array, mx.array]:
+    """Draw from ``sampler``'s filters applied to candidate scores ``(1, C)``.
+
+    Returns the chosen column and the log density over the candidates. The
+    density is the proposal q that acceptance reads, so the filters only have
+    to match the request's in spirit, not bit for bit.
+    """
+    lp = scores.astype(mx.float32)
+    lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+    count = lp.shape[-1]
+    top_k = int(getattr(sampler, "top_k", 0) or 0)
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
+    temp = float(getattr(sampler, "temp", 1.0) or 1.0)
+    if 0 < top_k < count:
+        kth = mx.sort(lp, axis=-1)[..., count - top_k : count - top_k + 1]
+        lp = mx.where(lp >= kth, lp, -float("inf"))
+    if 0.0 < top_p < 1.0:
+        order = mx.argsort(-lp, axis=-1)
+        ranked = mx.take_along_axis(lp, order, axis=-1)
+        probs = mx.exp(ranked)
+        keep = (mx.cumsum(probs, axis=-1) - probs) < top_p
+        keep = mx.put_along_axis(
+            mx.zeros(keep.shape, dtype=mx.bool_), order, keep, axis=-1
+        )
+        lp = mx.where(keep, lp, -float("inf"))
+    if min_p > 0.0:
+        floor = lp.max(axis=-1, keepdims=True) + math.log(min_p)
+        lp = mx.where(lp >= floor, lp, -float("inf"))
+    scaled = lp * (1.0 / temp)
+    pick = mx.random.categorical(scaled)
+    return pick, scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+
+
 def _select_sampled(selector, hidden, logits, anchors, samplers) -> list[tuple]:
     """DFlash2 selector path with per-row sampling over the candidate set.
 
     Mirrors ``CandidateSelector.select``: top-k candidates per position, a
     predecessor/successor edge score, then the next predecessor is the
-    chosen token. Sampled rows draw from the normalized candidate scores
-    through their own sampler and keep that sparse distribution as q.
+    chosen token. Sampled rows draw from their sampler's filters over the
+    candidate scores and expose that sparse distribution as q.
     """
     batch, length, vocab = logits.shape
-    candidates = mx.argpartition(logits, -selector.top_k, axis=-1)[
-        ..., -selector.top_k :
-    ]
+    candidates = top_k_indices(logits, selector.top_k)
     unary = mx.take_along_axis(logits, candidates, axis=-1)
     projected = selector.hidden_projection(hidden)
     predecessor = anchors.reshape(-1)
     tokens = [[] for _ in range(batch)]
-    accept = [[] for _ in range(batch)]
+    densities = [[] for _ in range(batch)]
     for position in range(length):
         edges = mx.sum(
             selector.predecessor_codebook(predecessor)[:, None]
@@ -506,21 +644,22 @@ def _select_sampled(selector, hidden, logits, anchors, samplers) -> list[tuple]:
         chosen = []
         for index, sampler in enumerate(samplers):
             if sampler is None:
-                pick = mx.argmax(scores[index])
-                token = candidates[index, position, pick]
-                chosen.append(token.reshape(1))
-                tokens[index].append(token.reshape(1))
-                continue
-            row_scores = scores[index]
-            row_lp = row_scores - mx.logsumexp(row_scores)
-            sparse = mx.full((vocab,), float("-inf"), dtype=row_lp.dtype)
-            sparse[candidates[index, position]] = row_lp
-            token, accept_lp = bg._sample_draft_with_logprobs(sampler, sparse[None])
-            token = token.reshape(1)
-            chosen.append(token)
-            tokens[index].append(token)
-            accept[index].append(accept_lp.reshape(-1))
+                pick = mx.argmax(scores[index], keepdims=True)
+            else:
+                pick, density = _sample_candidates(scores[index : index + 1], sampler)
+                densities[index].append(density)
+            token = candidates[index, position][pick]
+            chosen.append(token.reshape(1))
+            tokens[index].append(token.reshape(1))
         predecessor = mx.concatenate(chosen).astype(mx.int32)
+    accept = [[] for _ in range(batch)]
+    for index in range(batch):
+        if not densities[index]:
+            continue
+        rows = mx.concatenate(densities[index])  # (length, top_k)
+        q = mx.full((length, vocab), -float("inf"), dtype=mx.float32)
+        q = mx.put_along_axis(q, candidates[index], rows, axis=-1)
+        accept[index] = [q[position] for position in range(length)]
     return [
         (mx.concatenate(tokens[index])[None].astype(mx.int32), accept[index])
         for index in range(batch)
@@ -584,6 +723,9 @@ def load_dflash_drafter(
     model.bind(target_model)
     block = resolve_block_size(model, block_size)
     mx.eval(model.parameters())
+    if qwen35_packed_linear.enabled(target_model):
+        packed = qwen35_packed_linear.pack_drafter(model)
+        logger.info("DFlash drafter packed 4-bit projections: %d layers", packed)
     drafter = DFlashDrafter(model, block_size=block, source_path=path)
     logger.info(
         "DFlash drafter loaded: path=%s kind=%s block=%d target_layers=%s",

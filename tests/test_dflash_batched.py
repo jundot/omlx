@@ -144,6 +144,78 @@ def test_batched_forward_matches_rows_drafted_alone():
     assert batched.context_length(2) == sum(rows[2][0] for rows in plan if 2 in rows)
 
 
+def test_predraft_adopt_matches_drafting_committed_rows():
+    """A predraft over every verify row equals drafting the committed rows, and
+    a discarded one leaves the ring as it was, across ring wrap-around."""
+
+    def cycle(drafter, uid, captured, count, anchor, mode):
+        state = SimpleNamespace(
+            uid=uid, drafts=None, draft_lps=None, draft_accept_lps=None
+        )
+        if mode == "plain":
+            committed = mx.array([anchor], dtype=mx.uint32)
+            drafter.draft(
+                [(None, state, [c[:, :count] for c in captured], committed, None)]
+            )
+        else:
+            assert drafter.predraft(
+                None, state, captured, mx.array([count - 1]) + 1, mx.array([anchor])
+            )
+            if mode == "adopt":
+                drafter.adopt_predraft(state, count)
+            else:
+                drafter.discard_predraft()
+                committed = mx.array([anchor], dtype=mx.uint32)
+                drafter.draft(
+                    [(None, state, [c[:, :count] for c in captured], committed, None)]
+                )
+        return state.drafts.tolist()
+
+    counts = [2, 4, 1, 4, 3, 2, 4, 1]
+    for mode in ("adopt", "discard"):
+        plain, other = _tiny_drafter(), _tiny_drafter()
+        for d in (plain, other):
+            d.seed(0, _captured(WINDOW - 3, seed=77))
+            d.draft(
+                [
+                    (
+                        None,
+                        SimpleNamespace(
+                            uid=0, drafts=None, draft_lps=None, draft_accept_lps=None
+                        ),
+                        [],
+                        mx.array([2], dtype=mx.uint32),
+                        None,
+                    )
+                ]
+            )
+        for step, count in enumerate(counts):
+            captured = _captured(BLOCK, seed=500 + step)
+            expected = cycle(plain, 0, captured, count, step + 3, "plain")
+            assert cycle(other, 0, captured, count, step + 3, mode) == expected
+        assert other.context_length(0) == plain.context_length(0)
+
+
+def test_pending_captures_stay_within_the_window():
+    """Decode steps with drafting off keep only the attended rows, at their positions."""
+    kept, tail = _tiny_drafter(), _tiny_drafter()
+    rows = _captured(30, seed=9)
+    for j in range(30):
+        kept.observe([0], [layer[:, j : j + 1] for layer in rows])
+    assert sum(p.shape[1] for p in kept._rows[0].pending) == kept.ring_slots
+    tail._row(0).fed = 30 - tail.ring_slots
+    tail.seed(0, [layer[:, 30 - tail.ring_slots :] for layer in rows])
+    drafts = []
+    for drafter in (kept, tail):
+        state = SimpleNamespace(
+            uid=0, drafts=None, draft_lps=None, draft_accept_lps=None
+        )
+        drafter.draft([(None, state, [], mx.array([5], dtype=mx.uint32), None)])
+        drafts.append(state.drafts.tolist())
+    assert drafts[0] == drafts[1]
+    assert kept.context_length(0) == tail.context_length(0) == 30
+
+
 def test_release_detaches_rows_and_new_cohort_reuses_ring():
     drafter = _tiny_drafter()
     _run_cycles(drafter, [{0: (3, 1), 1: (2, 2)}])

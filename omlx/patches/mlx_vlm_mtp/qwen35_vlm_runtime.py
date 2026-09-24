@@ -339,11 +339,12 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             # Depth-k chained drafting works on this path: mtp_forward
             # supports return_hidden below, and rollback uses mlx-vlm's
             # stock rollback_speculative_cache (native partial accepts).
-            from ..mlx_lm_mtp import get_mtp_depth
+            from ..mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_batch_rollback = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             # Prompt-priming capture runs inside the inner Qwen3_5Model
             # forward, which has no reference back to this LanguageModel
             # (the mtp module / make_mtp_cache live here). A weakref avoids

@@ -3386,7 +3386,7 @@ class TableDrafter:
 
     def observe(self, uids, captured):
         assert len(captured) == len(self.target_layer_ids)
-        for index, uid in enumerate(uids):
+        for uid in uids:
             self.fed[uid] = self.fed.get(uid, 0) + int(captured[0].shape[1])
 
     def release(self, uids):
@@ -3656,6 +3656,19 @@ def test_fixed_depth_survivor_does_not_cache_past_length_limit(monkeypatch):
     assert cached in (tokens, tokens[:-1])
 
 
+@pytest.mark.parametrize("prompts", [[[1, 2]], [[1, 2], [10, 11]]])
+def test_fixed_depth_drafts_the_full_depth_every_cycle(prompts):
+    model = CountingModel()
+    model._omlx_mtp_depth = 4
+    model._omlx_mtp_depth_fixed = True
+    output, _ = generate(model, prompts, [24] * len(prompts))
+    for uid, prompt in enumerate(prompts):
+        assert output[uid] == list(range(prompt[-1] + 1, prompt[-1] + 25))
+    widths = [shape[1] for shape, _ in model.calls]
+    first = next(i for i, width in enumerate(widths) if width > 1)
+    assert set(widths[first:]) == {5}
+
+
 def test_unrecoverable_batch_cache_failure_does_not_resume_decode(monkeypatch):
     def fail(*args, **kwargs):
         raise bg._MtpStepFallback("injected verify failure")
@@ -3862,6 +3875,37 @@ def test_stochastic_acceptance_preserves_target_marginal():
         # The proposal strongly favors the opposite token from the target.
         # Acceptance without residual correction cannot satisfy this bound.
         assert mx.all(mx.abs(counts / 4096 - target) < 0.03)
+    finally:
+        mx.set_default_device(previous_device)
+
+
+def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
+    from omlx.utils.sampling import make_sampler
+
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.random.seed(783)
+        sampler = make_sampler(temp=1.0, top_k=3)
+        assert bg._sparse_top_k(sampler) == 3
+        target = mx.array([0.05, 0.1, 0.3, 0.55])
+        filtered = mx.array([0.0, 0.1, 0.3, 0.55]) / 0.95
+        q = mx.log(mx.array([0.05, 0.8, 0.1, 0.05]))
+        lp = mx.broadcast_to(mx.log(target), (3, 4))
+        counts = mx.zeros((4,), dtype=mx.int32)
+        for _ in range(64):
+            samples = []
+            for _ in range(64):
+                drafts = mx.random.categorical(mx.broadcast_to(q, (2, 4)))
+                result = bg._stochastic_verify_tokens(sampler, lp, drafts, [q, q])
+                samples.append(mx.where(result[0] > 0, result[1], result[3]))
+            emitted = mx.stack(samples)
+            counts += (emitted[:, None] == mx.arange(4)).sum(axis=0)
+            mx.eval(counts)
+        # Token 0 is outside the target's top-k and must never be emitted even
+        # though the draft proposes it.
+        assert counts[0].item() == 0
+        assert mx.all(mx.abs(counts / 4096 - filtered) < 0.03)
     finally:
         mx.set_default_device(previous_device)
 
@@ -4999,6 +5043,98 @@ def test_lightning_verify_preserves_quantized_linear_dispatch(monkeypatch, batch
     assert calls == [x.shape] * 7
 
 
+def _nax_available() -> bool:
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:
+        return False
+
+
+def _quantized_linear(n, k, bits, seed):
+    mx.random.seed(seed)
+    layer = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=bits)
+    weight = (mx.random.normal((n, k)) * 0.02).astype(mx.bfloat16)
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        weight, group_size=64, bits=bits
+    )
+    return layer
+
+
+def _reference(layer, x):
+    return mx.quantized_matmul(
+        x.astype(mx.float32),
+        layer.weight,
+        layer.scales.astype(mx.float32),
+        layer.biases.astype(mx.float32),
+        transpose=True,
+        group_size=64,
+        bits=layer.bits,
+    )
+
+
+def _close(actual, expected, tol=1e-2):
+    scale = mx.abs(expected).max().item()
+    return mx.abs(actual.astype(mx.float32) - expected).max().item() <= tol * scale
+
+
+@pytest.mark.skipif(not _nax_available(), reason="needs the M5 tensor unit")
+def test_packed_linear_replaces_4bit_projections(monkeypatch):
+    from omlx.patches import qwen35_packed_linear as packed
+
+    # GDN input projections: 4-bit qkv/z pack together, 5-bit b/a stay.
+    gdn = nn.Module()
+    gdn.in_proj_qkv = _quantized_linear(256, 512, 4, 1)
+    gdn.in_proj_z = _quantized_linear(128, 512, 4, 2)
+    gdn.in_proj_b = _quantized_linear(48, 512, 5, 3)
+    gdn.in_proj_a = _quantized_linear(48, 512, 5, 4)
+    mlp = nn.Module()
+    mlp.gate_proj = _quantized_linear(256, 512, 4, 5)
+    mlp.up_proj = _quantized_linear(256, 512, 4, 6)
+    mlp.down_proj = _quantized_linear(512, 256, 5, 7)
+    layer = nn.Module()
+    layer.linear_attn = gdn
+    layer.mlp = mlp
+    language = nn.Module()
+    language.model = nn.Module()
+    language.model.layers = [layer]
+    language.lm_head = _quantized_linear(384, 512, 4, 8)
+    originals = [
+        (gdn, "in_proj_qkv", gdn.in_proj_qkv),
+        (gdn, "in_proj_z", gdn.in_proj_z),
+        (mlp, "gate_proj", mlp.gate_proj),
+        (mlp, "up_proj", mlp.up_proj),
+        (language, "lm_head", language.lm_head),
+    ]
+    kept = (gdn.in_proj_b, gdn.in_proj_a, mlp.down_proj)
+
+    assert packed.pack_model(language) == len(originals)
+    assert (gdn.in_proj_b, gdn.in_proj_a, mlp.down_proj) == kept
+    # The tensor-unit matvec (<= 8 rows) and GEMM paths, aligned or not.
+    for rows in (1, 3, 8, 9, 70):
+        x = (mx.random.normal((1, rows, 512)) * 0.5).astype(mx.bfloat16)
+        for parent, name, original in originals:
+            module = getattr(parent, name)
+            assert isinstance(module, packed.PackedLinear)
+            out = module(x)
+            assert out.shape == (1, rows, original.weight.shape[0])
+            assert _close(out[0], _reference(original, x[0]))
+
+    class Verifier:
+        def _linears(self, linears, x):
+            return tuple(linear(x) for linear in linears)
+
+    packed.apply(Verifier)
+    x = (mx.random.normal((1, 5, 512)) * 0.5).astype(mx.bfloat16)
+    outputs = Verifier()._linears(
+        (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a), x
+    )
+    references = (originals[0][2], originals[1][2], *kept[:2])
+    for out, original in zip(outputs, references):
+        assert _close(out[0], _reference(original, x[0]))
+
+
 @pytest.mark.parametrize("bits", [4, 5])
 @pytest.mark.parametrize("batch,length", [(1, 8), (2, 6), (4, 6), (1, 24), (3, 5)])
 def test_verify_qmm_routes_batched_rows_through_mma_kernel(
@@ -5042,3 +5178,25 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
     assert out.shape == (batch, length, 288)
     tolerance = 2.0 * mx.abs(expected).max().item() / 256 + 1e-2
     assert mx.abs(out - expected).max().item() <= tolerance
+
+
+@pytest.mark.parametrize("nax", [True, False])
+def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, nax):
+    """Speculative steps raise MLX's buffer caps on M5 only and always restore them."""
+    from omlx.custom_kernels import nax as nax_mod
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    caps = [(50, 50)]
+
+    def fake_set(ops, mb):
+        previous = caps[-1]
+        caps.append((ops, mb))
+        return previous
+
+    monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
+    monkeypatch.setattr(nax_mod, "is_nax_available", lambda: nax)
+    with pytest.raises(RuntimeError), bg._spec_command_buffers():
+        inside = caps[-1]
+        raise RuntimeError("step failed")
+    assert inside == (bg._SPEC_BUFFER_CAPS if nax else (50, 50))
+    assert caps[-1] == (50, 50)

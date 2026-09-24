@@ -239,11 +239,12 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             # Depth-k chained drafting works on this path: mtp_forward
             # supports return_hidden below, and rollback uses mlx-vlm's
             # stock rollback_speculative_cache (native partial accepts).
-            from ..mlx_lm_mtp import get_mtp_depth
+            from ..mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_batch_rollback = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             # Qwen3_5MoeModel inherits the dense Qwen3_5Model.__call__, so
             # the prompt-priming capture wrap installed by the dense runtime
             # already runs here — it only needs the host backref to engage.
