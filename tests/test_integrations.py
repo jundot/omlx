@@ -554,6 +554,46 @@ class TestOpenCodeIntegration:
         model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
         assert "limit" not in model_config
 
+    def test_configure_reasoning_flag_true(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(
+                ctx(port=8000, api_key="key", model="llama-3.1-8b", reasoning=True)
+            )
+
+        config = json.loads(config_path.read_text())
+        assert config["provider"]["omlx"]["models"]["llama-3.1-8b"]["reasoning"] is True
+
+    def test_configure_reasoning_flag_false(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="deepseek-r1-distill",
+                    reasoning=False,
+                )
+            )
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["deepseek-r1-distill"]
+        assert model_config["reasoning"] is False
+
+    def test_configure_reasoning_defaults_false_when_unknown(self, tmp_path):
+        # When the server hasn't plumbed a value through (None), default to
+        # False rather than guessing from the model name.
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(ctx(port=8000, api_key="key", model="deepseek-r1-distill"))
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["deepseek-r1-distill"]
+        assert model_config["reasoning"] is False
+
     def test_launch_scrubs_python_env(self, tmp_path):
         oc = OpenCodeIntegration()
         config_path = tmp_path / "opencode" / "opencode.json"
@@ -997,6 +1037,60 @@ class TestHermesIntegration:
         config = yaml.safe_load(config_path.read_text())
         assert config["model"]["context_length"] == 32768
 
+    def test_configure_reasoning_true_sets_high_effort(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                ctx(port=8000, api_key="key", model="qwen3.5", reasoning=True)
+            )
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["agent"]["reasoning_effort"] == "high"
+
+    def test_configure_reasoning_false_sets_none_effort(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                ctx(port=8000, api_key="key", model="qwen3.5", reasoning=False)
+            )
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["agent"]["reasoning_effort"] == "none"
+
+    def test_configure_reasoning_none_leaves_effort_unset(self, tmp_path):
+        # Auto (None) must not write reasoning_effort: guessing "none" here
+        # would disable thinking on reasoning models. Hermes' own "medium"
+        # default should stand instead.
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(ctx(port=8000, api_key="key", model="qwen3.5"))
+
+        config = yaml.safe_load(config_path.read_text())
+        assert "agent" not in config
+
+    def test_configure_reasoning_none_clears_stale_effort(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "agent": {"max_turns": 90, "reasoning_effort": "high"},
+                    "model": {"provider": "omlx", "default": "old"},
+                }
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(ctx(port=8000, api_key="key", model="new"))
+
+        agent_config = yaml.safe_load(config_path.read_text())["agent"]
+        # Stale reasoning_effort removed; unmanaged agent keys preserved.
+        assert "reasoning_effort" not in agent_config
+        assert agent_config["max_turns"] == 90
+
     def test_launch_sets_config_and_execs(self, tmp_path):
         config_path = tmp_path / "config.yaml"
         hermes = HermesIntegration()
@@ -1164,6 +1258,53 @@ class TestPiIntegration:
 
         provider = json.loads(models_path.read_text())["providers"]["omlx"]
         assert provider["baseUrl"] == "http://192.168.1.100:9000/v1"
+
+    def test_configure_reasoning_flag_true(self, tmp_path):
+        # The reported bug: a thinking-configured model (Qwen 3.6) whose slug
+        # does not match the legacy heuristic must still be advertised to Pi as
+        # a reasoning model when the server resolves it as one.
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(ctx(port=8000, api_key="key", model="qwen3.6", reasoning=True))
+
+        model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
+        assert model_config["reasoning"] is True
+
+    def test_configure_reasoning_flag_false_overrides_slug(self, tmp_path):
+        # Server says not-a-reasoning-model; trust it over the slug heuristic.
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(ctx(port=8000, api_key="key", model="some-thinking-model", reasoning=False))
+
+        model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
+        assert model_config["reasoning"] is False
+
+    def test_configure_reasoning_falls_back_to_heuristic(self, tmp_path):
+        # No server-resolved value (older server): fall back to the slug heuristic.
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(ctx(port=8000, api_key="key", model="qwen3-thinking"))
+
+        model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
+        assert model_config["reasoning"] is True
 
     def test_configure_creates_backup(self, tmp_path):
         models_path = tmp_path / "models.json"

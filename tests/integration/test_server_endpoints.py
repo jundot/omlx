@@ -831,6 +831,12 @@ class TestModelsStatusEndpoint:
             model_alias = "gpt-4o"
             max_context_window = 32768
             max_tokens = 8192
+            enable_thinking = True
+            preserve_thinking = False
+            chat_template_kwargs = None
+            forced_ct_kwargs = None
+            thinking_budget_enabled = False
+            thinking_budget_tokens = None
             is_favorite = False
             is_hidden = False
 
@@ -854,6 +860,73 @@ class TestModelsStatusEndpoint:
         assert model["model_alias"] == "gpt-4o"
         assert model["max_context_window"] == 32768
         assert model["max_tokens"] == 8192
+        assert model["enable_thinking"] is True
+        assert model["preserve_thinking"] is False
+
+    @staticmethod
+    def _llm_entry(**defaults):
+        from omlx.engine_pool import EngineEntry
+
+        return EngineEntry(
+            model_id="test-model",
+            model_path="/models/test-model",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=0,
+            **defaults,
+        )
+
+    def _status_with(self, client, mock_engine_pool, entry, settings_manager):
+        from omlx.server import _server_state
+
+        original_settings_manager = _server_state.settings_manager
+        mock_engine_pool._entries["test-model"] = entry
+        try:
+            _server_state.settings_manager = settings_manager
+            response = client.get("/v1/models/status")
+        finally:
+            _server_state.settings_manager = original_settings_manager
+            mock_engine_pool._entries.pop("test-model", None)
+        assert response.status_code == 200
+        return response.json()["models"][0]
+
+    def test_models_status_reports_template_thinking_default(
+        self, client, mock_engine_pool
+    ):
+        """No per-model override: the chat template's own default is reported
+        (the launcher bug this field exists to fix)."""
+        model = self._status_with(
+            client,
+            mock_engine_pool,
+            self._llm_entry(thinking_default=True, preserve_thinking_default=True),
+            settings_manager=None,
+        )
+        assert model["enable_thinking"] is True
+        assert model["preserve_thinking"] is True
+
+    def test_models_status_thinking_follows_chat_template_kwargs(
+        self, client, mock_engine_pool
+    ):
+        """A chat_template_kwargs override is what the engine renders, so it
+        must beat the template default; and disabling thinking also drops
+        preserve_thinking, as the request path does."""
+        from omlx.model_settings import ModelSettings
+
+        class SettingsManager:
+            def get_settings(self, model_id):
+                return ModelSettings(chat_template_kwargs={"enable_thinking": False})
+
+            def get_settings_for_request(self, model_id, resolved_model_id=None):
+                return self.get_settings(model_id)
+
+        model = self._status_with(
+            client,
+            mock_engine_pool,
+            self._llm_entry(thinking_default=True, preserve_thinking_default=True),
+            settings_manager=SettingsManager(),
+        )
+        assert model["enable_thinking"] is False
+        assert model["preserve_thinking"] is None
 
 
 class TestCompletionEndpoint:
