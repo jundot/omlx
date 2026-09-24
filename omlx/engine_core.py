@@ -340,12 +340,23 @@ class EngineConfig:
     # max_steps is a safety cap (bounds the host-side output list), NOT a
     # memory knob. Set both budgets <= 0, or max_steps <= 1, to disable.
     decode_burst_max_steps: int = field(
+        # See release_first_chunk_early for the first-chunk burst break.
         default_factory=lambda: int(os.environ.get("OMLX_DECODE_BURST_MAX_STEPS", "64"))
     )
     decode_burst_budget_single_s: float = field(
         default_factory=lambda: float(
             os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S", "0.1")
         )
+    )
+    # Break the decode burst when a request produces its first chunk, so
+    # buffering later steps does not add to its TTFT. Disabling restores
+    # continuous MTP bursts (#3895: speculative-decode continuity is worth
+    # more than first-token latency for agent workloads).
+    release_first_chunk_early: bool = field(
+        default_factory=lambda: os.environ.get(
+            "OMLX_RELEASE_FIRST_CHUNK_EARLY", "0"
+        )
+        == "1"
     )
     decode_burst_budget_s: float = field(
         default_factory=lambda: float(
@@ -530,7 +541,9 @@ class EngineCore:
             # Also release the first chunk of a request admitted mid-burst.
             # Comparing cumulative and new tokens covers multi-token steps
             # without per-request tracking. Later chunks retain normal bursts.
-            if any(
+            # NOTE: disabled for MTP-heavy workloads — breaking the burst on
+            # the first chunk kills speculative-decode continuity (#3895).
+            if self.config.release_first_chunk_early and any(
                 item.new_token_ids
                 and item.completion_tokens == len(item.new_token_ids)
                 for item in last.outputs
