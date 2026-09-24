@@ -183,6 +183,7 @@ enum ProfileSettingsKey {
     static let dflashSsdCache = "dflash_ssd_cache"
     static let dflashSsdCacheMaxBytes = "dflash_ssd_cache_max_bytes"
     static let mtpEnabled = "mtp_enabled"
+    static let mtpFixedDepth = "mtp_fixed_depth"
     static let vlmMtpEnabled = "vlm_mtp_enabled"
     static let vlmMtpDraftModel = "vlm_mtp_draft_model"
     static let vlmMtpDraftBlockSize = "vlm_mtp_draft_block_size"

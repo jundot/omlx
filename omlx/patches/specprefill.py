@@ -229,6 +229,79 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
     return layer_to_cache
 
 
+class IndeterminateCacheOffsetError(RuntimeError):
+    """A populated cache has no readable token position."""
+
+
+def _leaf_cache_offset(cache_entry: Any) -> int | None:
+    """Read an integer token offset, descending into composite caches."""
+    for sub in getattr(cache_entry, "caches", None) or ():
+        offset = _leaf_cache_offset(sub)
+        if offset is not None:
+            return offset
+    offset = getattr(cache_entry, "offset", None)
+    # bool is a subclass of int, and would otherwise read as position 0 or 1.
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        return None
+    return offset
+
+
+def _cache_entry_is_bounded(cache_entry: Any) -> bool:
+    """Detect bounded caches, including composite members."""
+    subs = getattr(cache_entry, "caches", None)
+    if isinstance(subs, (list, tuple)):
+        return any(_cache_entry_is_bounded(sub) for sub in subs)
+    return getattr(cache_entry, "max_size", None) is not None
+
+
+def _cache_entry_is_empty(cache_entry: Any) -> bool:
+    """Require a successful empty() probe before treating a cache as empty."""
+    empty = getattr(cache_entry, "empty", None)
+    if not callable(empty):
+        return False
+    try:
+        return bool(empty())
+    except Exception:
+        return False
+
+
+def _logical_cache_offset(model, cache: list[Any]) -> int:
+    """Read the sequence position from mapped attention caches."""
+    held: list[int] = []
+    bounded: list[int] = []
+
+    def _record(entry: Any) -> None:
+        offset = _leaf_cache_offset(entry)
+        if offset is not None:
+            (bounded if _cache_entry_is_bounded(entry) else held).append(offset)
+
+    layer_to_cache = _build_layer_to_cache_map(model)
+    for layer_idx, _layer in _find_attention_layers(model):
+        cache_idx = layer_to_cache.get(layer_idx, layer_idx)
+        if 0 <= cache_idx < len(cache):
+            _record(cache[cache_idx])
+
+    # Prefer unbounded layer offsets; use bounded layers only when necessary.
+    offsets = held or bounded
+
+    if not offsets:
+        if any(not _cache_entry_is_empty(entry) for entry in cache):
+            raise IndeterminateCacheOffsetError(
+                f"cache of {len(cache)} layers holds state but reports no "
+                f"token offset; refusing to assume 0"
+            )
+        return 0
+
+    lowest = min(offsets)
+    if lowest != max(offsets):
+        logger.warning(
+            "SpecPrefill: cache layers disagree on sequence position %s, using %d",
+            sorted(set(offsets)),
+            lowest,
+        )
+    return max(0, lowest)
+
+
 def _linear_output_dims(linear) -> Optional[int]:
     """Best-effort output dimension lookup for Linear / QuantizedLinear layers."""
     if linear is None:
@@ -342,6 +415,80 @@ def _unpatch_attention_capture(model, originals):
     """Restore original attention modules after capture."""
     for layer_idx, orig in originals:
         _set_attn_module(model.layers[layer_idx], orig)
+
+
+def _cache_leaves(cache: list[Any]) -> list[Any]:
+    """Leaf caches of *cache*, descending into composites such as CacheList."""
+    leaves: list[Any] = []
+    for entry in cache:
+        subs = getattr(entry, "caches", None)
+        if isinstance(subs, (list, tuple)):
+            leaves.extend(_cache_leaves(list(subs)))
+        else:
+            leaves.append(entry)
+    return leaves
+
+
+def _is_sliceable_kv(leaf: Any) -> bool:
+    """Whether *leaf* is an unbounded KV cache the lookahead trim can slice back."""
+    return hasattr(leaf, "keys") and not _cache_entry_is_bounded(leaf)
+
+
+class _HeldObject:
+    """An object nested in a cache leaf, with its attributes as they were."""
+
+    __slots__ = ("obj", "attrs")
+
+    def __init__(self, obj: Any, attrs: dict[str, Any]) -> None:
+        self.obj = obj
+        self.attrs = attrs
+
+
+def _hold_value(value: Any, seen: set[int]) -> Any:
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_hold_value(v, seen) for v in value)
+    if isinstance(value, dict):
+        return {k: _hold_value(v, seen) for k, v in value.items()}
+    # Visit each nested object once to preserve aliases and avoid object cycles.
+    if hasattr(value, "__dict__") and not callable(value) and id(value) not in seen:
+        return _HeldObject(value, _hold_leaf_state(value, seen))
+    return value
+
+
+def _restore_value(held: Any) -> Any:
+    if isinstance(held, _HeldObject):
+        vars(held.obj).update(
+            {k: _restore_value(v) for k, v in held.attrs.items()}
+        )
+        return held.obj
+    if isinstance(held, (list, tuple)):
+        return type(held)(_restore_value(v) for v in held)
+    if isinstance(held, dict):
+        return {k: _restore_value(v) for k, v in held.items()}
+    return held
+
+
+def _hold_leaf_state(leaf: Any, seen: set[int] | None = None) -> dict[str, Any]:
+    """Copy mutable cache state, including nested wrapper objects."""
+    seen = set() if seen is None else seen
+    seen.add(id(leaf))
+    return {k: _hold_value(v, seen) for k, v in vars(leaf).items()}
+
+
+def _undo_lookahead(
+    leaves: list[Any], held_states: list[Any], pre_lookahead_offset: int
+) -> None:
+    """Trim unbounded KV and restore the saved state of all other leaves."""
+    for leaf, held in zip(leaves, held_states):
+        if held is not None:
+            vars(leaf).update({k: _restore_value(v) for k, v in held.items()})
+        elif getattr(leaf, "offset", 0) > pre_lookahead_offset:
+            if leaf.keys is not None:
+                leaf.keys = leaf.keys[..., :pre_lookahead_offset, :]
+                leaf.values = leaf.values[..., :pre_lookahead_offset, :]
+            leaf.offset = pre_lookahead_offset
 
 
 def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None):
@@ -505,24 +652,25 @@ def score_tokens(
     # Phase 1: Prefill (full or suffix-only if cache provided)
     if existing_cache is not None:
         cache = existing_cache
-        cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
-        suffix = tokens[cached_len:]
-        if suffix:
-            logits = _prefill_draft(
-                model,
-                suffix,
-                cache,
-                step_size=prefill_step_size,
-                progress_callback=(
-                    (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
-                    if progress_callback is not None
-                    else None
-                ),
+        cached_len = _logical_cache_offset(model, cache)
+        # The final prompt token must run once to produce the lookahead logits.
+        if cached_len >= n_prompt:
+            raise ValueError(
+                f"existing_cache holds {cached_len} tokens but the prompt has "
+                f"{n_prompt}; leave at least the last prompt token uncached"
             )
-        else:
-            # Exact cache hit — run last token to get logits
-            logits = model(mx.array([tokens[-1]])[None], cache=cache)
-            mx.eval(logits)
+        suffix = tokens[cached_len:]
+        logits = _prefill_draft(
+            model,
+            suffix,
+            cache,
+            step_size=prefill_step_size,
+            progress_callback=(
+                (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
+                if progress_callback is not None
+                else None
+            ),
+        )
     else:
         cache = make_prompt_cache(model)
         logits = _prefill_draft(
@@ -537,10 +685,18 @@ def score_tokens(
             ),
         )
 
-    # Record cache offset before lookahead so we can trim afterwards.
-    # Lookahead decode appends n_lookahead+1 tokens to the cache which
-    # must NOT be persisted when the caller stores the cache to SSD.
-    pre_lookahead_offset = cache[0].offset if hasattr(cache[0], "offset") else n_prompt
+    # The returned cache must exclude lookahead tokens.
+    try:
+        pre_lookahead_offset = _logical_cache_offset(model, cache)
+    except IndeterminateCacheOffsetError:
+        pre_lookahead_offset = n_prompt
+
+    # Recurrent state and wrapped rotating buffers cannot be trimmed like KV.
+    leaves = _cache_leaves(cache)
+    held_states = [
+        None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf)
+        for leaf in leaves
+    ]
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -570,16 +726,7 @@ def score_tokens(
     if progress_callback is not None:
         progress_callback(n_prompt, n_prompt, "importance")
 
-    # Trim lookahead tokens from cache before returning.
-    # KVCache stores keys/values as contiguous tensors; slicing back
-    # to pre_lookahead_offset removes the lookahead-generated entries.
-    for c in cache:
-        if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
-            trim = c.offset - pre_lookahead_offset
-            if hasattr(c, "keys") and c.keys is not None:
-                c.keys = c.keys[..., :pre_lookahead_offset, :]
-                c.values = c.values[..., :pre_lookahead_offset, :]
-            c.offset = pre_lookahead_offset
+    _undo_lookahead(leaves, held_states, pre_lookahead_offset)
 
     del logits, query_buffer, attn_caches
     mx.clear_cache()

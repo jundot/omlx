@@ -107,7 +107,7 @@ _BACKFILL_CHECKED_MAX_ENTRIES = 4096
 # Lightning-MTP prompt priming has one small attention cache of its own.  The
 # normal prefix cache stores only the backbone cache, so a warm trunk restore
 # used to lose the MTP history and restart speculative decode unprimed.  Keep a
-# deliberately tiny in-memory sidecar of full-block boundary snapshots.  Four
+# deliberately tiny in-memory sidecar of cache boundary snapshots.  Four
 # entries bounds the worst-case Qwen4 100K-context footprint to roughly the
 # same order as one ordinary request cache while covering the recent branches
 # of an interactive conversation.  The entries are keyed by the *same* chain
@@ -5014,7 +5014,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
     ) -> bytes | None:
-        """Return the ordinary full-block chain hash for an MTP sidecar.
+        """Return the backbone chain hash, including a terminal tail, for an MTP sidecar.
 
         VLM requests can change hidden states without changing token ids.  The
         generic prefix cache supports per-range media keys, but
@@ -5026,7 +5026,6 @@ class BlockAwarePrefixCache(CacheManager):
         if (
             boundary_tokens <= 0
             or boundary_tokens > len(tokens)
-            or boundary_tokens % self.block_size != 0
             or extra_key_token_start is not None
             or extra_key_ranges is not None
         ):
@@ -5035,7 +5034,7 @@ class BlockAwarePrefixCache(CacheManager):
         for start in range(0, boundary_tokens, self.block_size):
             parent_hash = compute_block_hash(
                 parent_hash,
-                tokens[start : start + self.block_size],
+                tokens[start : min(start + self.block_size, boundary_tokens)],
                 extra_keys=extra_keys,
                 model_name=self.paged_cache.model_name,
             )
@@ -5051,7 +5050,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
     ) -> bool:
-        """Keep an exact Lightning-MTP history at one backbone block boundary.
+        """Keep an exact Lightning-MTP history at one backbone cache boundary.
 
         This is intentionally memory-only.  SSD persistence would require a
         versioned serialization contract for every model family's MTP cache;

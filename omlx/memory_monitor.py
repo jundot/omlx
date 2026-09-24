@@ -54,16 +54,8 @@ _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # dim-less path and matches the fp16/bf16 majority of MLX inference models.
 _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 
-# Bytes/elem the unfused head-dim-256 fallback actually materializes on
-# Metal: MLX keeps the attention score matrix in fp32 even for bf16/fp16
-# models (measured ~33GiB IOAccelerator spike on a 160k-token VLM prefill at
-# head_dim=256). Shared by the sdpa256 route gate
-# (patches/sdpa256_attention._tiled_route_required) and the Qwen4 prefill
-# profile so the router and the guard price the real fallback identically.
-# Kept separate from _SDPA_FALLBACK_SCORE_DTYPE_SIZE: that default covers
-# the dim-less generic path where the compute dtype is unknown and the
-# fp16/bf16 majority is the better prior; widening it globally would
-# re-price unrelated models without evidence.
+# Conservative score width for head-dim-256 unfused memory estimates.
+# Keep the generic fallback width unchanged for other model profiles.
 SDPA256_UNFUSED_SCORE_DTYPE_SIZE = 4
 
 # Head dims whose multi-token prefill is routed to an O(L) tiled/online-softmax
@@ -137,12 +129,7 @@ def estimate_unfused_sdpa_call_bytes(
     head_dim: int,
     score_dtype_size: float = _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
 ) -> int:
-    """Transient bytes for ONE SDPA call taking the unfused fallback: the
-    materialized ``[n_q, query_tokens, kv_len]`` score matrix plus the fp32
-    output. Shared by the per-request prefill-peak estimate
-    (``MemoryMonitor._estimate_sdpa_activation_bytes``) and the sdpa256 route
-    gate (``patches/sdpa256_attention._tiled_route_required``) so the guard
-    and the router price the unfused path with the same math (issue #2204)."""
+    """Estimate one unfused call's score matrix and FP32 output allocation."""
     scores = n_q_heads * query_tokens * kv_len * score_dtype_size
     output = n_q_heads * query_tokens * head_dim * 4
     return int(scores + output)

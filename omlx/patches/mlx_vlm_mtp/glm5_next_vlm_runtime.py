@@ -455,7 +455,7 @@ def _patch_language_model(g5_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         from . import is_mtp_attach_enabled
-        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         original_init(self, args, config)
         self._omlx_mtp_multi_request = True
@@ -477,6 +477,7 @@ def _patch_language_model(g5_lang: Any) -> None:
             # a full rejection cannot be undone. Cap the chain one below it.
             requested_depth = get_mtp_depth()
             self._omlx_mtp_depth = min(_MAX_CHAIN_DEPTH, requested_depth)
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             if requested_depth > _MAX_CHAIN_DEPTH:
                 logger.info(
                     "glm5_next MTP chain depth capped at %d (requested %d): the "

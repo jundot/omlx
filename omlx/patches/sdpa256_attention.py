@@ -3,18 +3,17 @@
 
 MLX 0.32.2 ships a fused full-attention kernel for head dimensions 192 and 256,
 but deliberately keeps the faster unfused path as the default on pre-NAX GPUs.
-That default materializes the full ``[n_q, query_len, kv_len]`` score matrix and
-can still exceed oMLX's memory-guard ceiling.
+That default materializes the full ``[n_q, query_len, kv_len]`` score matrix,
+quadratic in context length, and can still exceed oMLX's memory-guard ceiling.
 
-When the unfused transient fits, this patch preserves MLX's default routing.
-Otherwise, it uses ``force_fused=True`` for FP16/BF16 inputs and array tiling for FP32.
+Qualifying calls use the bounded route. Metal uses native fused attention for supported FP16/BF16 calls, while FP32 and array masks use array tiling.
 The native FP32 full-attention kernel exceeds 32 KiB of threadgroup memory.
-On NAX, MLX's default selects its fast split-D head-dim-256 kernel for causal prefills with at least 1024 queries.
+On NAX, MLX's default selects its split-D head-dim-256 kernel for causal prefills with at least 1024 queries.
 
 ``OMLX_SDPA256_TILED=1/0`` remains accepted for compatibility and now forces or
 disables the bounded route. Metal uses the native fused kernel; CUDA retains
 the prior array-tiled implementation because MLX 0.32.2's CUDA fused kernel
-does not support head_dim 256. The default is memory-aware.
+does not support head_dim 256.
 
 Install mechanics mirror turboquant_attention.py (patch the module attr + rebind
 already-imported model modules). The route is strictly gated (see _should_route);
@@ -23,15 +22,8 @@ everything else passes through to the original SDPA unchanged.
 
 import logging
 import os
-import threading
-import weakref
 
 import mlx.core as mx
-
-from omlx.memory_monitor import (
-    SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
-    estimate_unfused_sdpa_call_bytes,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -52,15 +44,8 @@ _Q_TILE = 512
 _KV_TILE = 1024
 _NEG_INF = -1e30
 
-# Live guard-headroom provider for memory-aware routing (issue #2204).
-# Scheduler.step registers the active Scheduler on its execution thread. Each
-# engine uses its own worker, so thread-local storage keeps concurrent engines
-# from replacing one another's provider. The bound method is weakly held so a
-# torn-down Scheduler leaves that worker on the memory-bounded native fused
-# default.
-_HEADROOM_PROVIDER_LOCAL = threading.local()
-# Backward-compatible override: True = always force fused, False = never force,
-# None = memory-aware auto.
+# Backward-compatible override: True = force the bounded route, False = never
+# force it (opt out of the #2025 memory fix), None = the default below.
 _FORCE_TILED: bool | None = None
 # Bounded-route reasons already logged. The first engagement per reason logs at
 # INFO; repeats stay silent to keep the hot path quiet.
@@ -72,30 +57,10 @@ def _note_tiled_route(reason: str, detail: str) -> None:
         return
     _TILED_ROUTE_LOGGED.add(reason)
     logger.info(
-        "sdpa256: head-dim-256 prefill forcing the memory-bounded path: %s. "
-        "The default fast path resumes when guard "
-        "headroom allows; "
-        "OMLX_SDPA256_TILED=1/0 forces the route.",
+        "sdpa256: head-dim-256 long-context prefill is using the "
+        "memory-bounded path: %s. OMLX_SDPA256_TILED=0 opts out.",
         detail,
     )
-
-
-def set_unfused_headroom_provider(method) -> None:
-    """Bind the active Scheduler's headroom provider to this worker thread."""
-    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
-    current = ref() if ref is not None else None
-    if (
-        current is not None
-        and current.__self__ is method.__self__
-        and current.__func__ is method.__func__
-    ):
-        return
-    _HEADROOM_PROVIDER_LOCAL.ref = weakref.WeakMethod(method)
-
-
-def _get_unfused_headroom_provider():
-    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
-    return ref() if ref is not None else None
 
 
 def _parse_force_tiled_env() -> bool | None:
@@ -107,73 +72,17 @@ def _parse_force_tiled_env() -> bool | None:
     return None
 
 
-def _notify_bounded_route(provider, active: bool) -> None:
-    """Let the scheduler retire measurements from the previous route."""
-    try:
-        owner = getattr(provider, "__self__", None)
-        callback = getattr(owner, "_sdpa256_bounded_route_changed", None)
-        if callable(callback):
-            callback(active)
-    except Exception:
-        logger.debug("sdpa256 route notification failed", exc_info=True)
-
-
-def _tiled_route_required(queries, keys) -> bool:
-    """Decide forced-fused vs default for a matched call (True = force).
-
-    The stock unfused fallback is faster wherever its score matrix fits
-    (issues #2155 / #2204), so force the fused path only when the unfused
-    transient would not fit under the guard ceiling — or when no headroom
-    info is available, keeping the memory-safe #2025 behavior."""
-    provider = _get_unfused_headroom_provider()
+def _tiled_route_required() -> bool:
+    """Use the bounded route unless the environment override disables it."""
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
             _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
-        _notify_bounded_route(provider, _FORCE_TILED)
         return _FORCE_TILED
-    try:
-        if provider is None:
-            _note_tiled_route(
-                "no-provider",
-                "no guard headroom provider registered "
-                "(engine without a scheduler, or scheduler gone)",
-            )
-            return True
-        headroom = provider()
-        if headroom is None or headroom < 0:
-            _note_tiled_route(
-                "no-ceiling",
-                "memory ceiling not available (enforcer state not yet "
-                "propagated)",
-            )
-            _notify_bounded_route(provider, True)
-            return True
-        batch, n_q, q_len, _ = queries.shape
-        transient = estimate_unfused_sdpa_call_bytes(
-            batch * n_q,
-            q_len,
-            keys.shape[-2],
-            HEAD_DIM,
-            # The unfused fallback materializes fp32 scores even for bf16
-            # inputs (issue #2204 follow-up): pricing it at the query dtype
-            # halves the predicted matrix and admits OOM spikes at long
-            # context. Shared with the guard via the memory_monitor constant.
-            score_dtype_size=SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
-        )
-        bounded = transient > headroom
-        _notify_bounded_route(provider, bounded)
-        if bounded:
-            _note_tiled_route(
-                "insufficient-headroom",
-                f"unfused transient ~{transient / 2**20:.0f}MiB exceeds live "
-                f"guard headroom ~{headroom / 2**20:.0f}MiB at "
-                f"kv_len={keys.shape[-2]}",
-            )
-        return bounded
-    except Exception:
-        _note_tiled_route("probe-error", "guard headroom probe failed")
-        logger.debug("sdpa256 headroom probe failed", exc_info=True)
-        return True  # headroom info unavailable -> memory-safe default
+    _note_tiled_route(
+        "long-context",
+        "bounded attention keeps execution consistent with prefill memory pricing",
+    )
+    return True
 
 
 def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
@@ -348,7 +257,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
         n_kv = keys.shape[-3]
         if n_kv <= 0 or n_q % n_kv != 0:
             return False
-        return _tiled_route_required(queries, keys)
+        return _tiled_route_required()
     except Exception:
         return False
 
@@ -467,7 +376,7 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
 
     _PATCHED = True
     if _FORCE_TILED is None:
-        routing = "force bounded when unfused exceeds guard headroom"
+        routing = "always force bounded for qualifying calls (#2025)"
     elif _FORCE_TILED:
         routing = "always force bounded (OMLX_SDPA256_TILED=1)"
     else:

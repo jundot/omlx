@@ -422,7 +422,11 @@ class Model(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        from omlx.patches.mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from omlx.patches.mlx_lm_mtp import (
+            get_mtp_depth,
+            is_mtp_active,
+            is_mtp_depth_fixed,
+        )
 
         n_mtp = int(config.num_nextn_predict_layers or 0)
         self._omlx_mtp_decode_enabled = bool(n_mtp and is_mtp_active())
@@ -430,6 +434,7 @@ class Model(nn.Module):
             self.model.mtp = MiMoV2MultiTokenPredictor(config)
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = min(int(get_mtp_depth()), n_mtp)
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             self._omlx_mtp_head_clone = True
             self._omlx_mtp_head_prenorm = True
 

@@ -770,14 +770,18 @@ def maybe_apply_pre_load_patches(
 
         set_mtp_active(mtp_active)
         depth = (
-            getattr(model_settings, "mtp_num_draft_tokens", None)
+            getattr(model_settings, "mtp_adaptive_max_depth", None)
             if model_settings is not None
             else None
         )
+        fixed = getattr(model_settings, "mtp_fixed_depth", None)
         # Qwen4-Exp uses the same adaptive draft-depth controller as the
         # general Lightning MTP path.  A single MTP hidden layer can be
         # chained autoregressively, so default to the validated max depth 3.
-        set_mtp_depth(int(depth) if depth else 3)
+        if fixed:
+            set_mtp_depth(int(fixed), fixed=True)
+        else:
+            set_mtp_depth(int(depth) if depth else 3)
         if mtp_active and not apply_mlx_lm_mtp_patch():
             logger.warning(
                 "Qwen4-Exp Lightning MTP dispatch patch failed for %s; "
@@ -823,7 +827,12 @@ def maybe_apply_pre_load_patches(
     # correctly, but Model.__init__ skips ``self.mtp = MTPModule(args)``;
     # the resulting model is indistinguishable from a stock model that
     # never had MTP heads.
-    if _is_mtp_compatible(config, model_type):
+    # The batched DFlash drafter rides the Lightning MTP verify path, so its
+    # patches are installed even when the checkpoint declares no MTP heads.
+    dflash_batched = for_vlm and dflash_batched_supported(
+        model_type, "vlm"
+    ) and dflash_batched_requested(model_settings)
+    if _is_mtp_compatible(config, model_type) or dflash_batched:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
@@ -835,15 +844,19 @@ def maybe_apply_pre_load_patches(
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
-            # mtp_num_draft_tokens is the MAX draft depth; an adaptive
+            # mtp_adaptive_max_depth is the MAX draft depth; an adaptive
             # controller picks 1..max per sequence from rolling accept/latency
             # estimates, so prose/chat settles at 1 and predictable text
-            # climbs. Set it to 1 for a fixed depth-1 cycle. Note: depth >= 2
+            # climbs. mtp_fixed_depth skips the controller and drafts exactly
+            # that many tokens every cycle. Note: depth >= 2
             # verify forwards route through the verify-shape qmm kernels
             # (M >= 3), whose numerics can diverge from the unrouted path at
             # bf16 tail-ULP level.
-            depth = getattr(model_settings, "mtp_num_draft_tokens", None)
-            if depth:
+            depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
+            fixed = getattr(model_settings, "mtp_fixed_depth", None)
+            if fixed:
+                set_mtp_depth(int(fixed), fixed=True)
+            elif depth:
                 set_mtp_depth(int(depth))
             elif model_type.startswith("nemotron_h"):
                 # The stock nemotron_h head is depth-1 trained; the adaptive
@@ -864,6 +877,10 @@ def maybe_apply_pre_load_patches(
                 set_mtp_depth(
                     int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
                 )
+            elif model_type == "qwen3_5" and _nax_available():
+                # The M5 packed verify kernels keep a 5-row verify close to
+                # a 4-row one on dense Qwen, so depth 4 pays there.
+                set_mtp_depth(4)
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
@@ -1202,6 +1219,34 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     if _checkpoint_weight_prefix(model_path, prefixes) is not None:
         return True
     return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
+
+
+_DFLASH_BATCHED_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe")
+
+
+def dflash_batched_supported(model_type: str | None, engine_type: str | None) -> bool:
+    """True when DFlash runs as a block drafter inside the batched VLM engine.
+
+    Other DFlash targets (gemma4, laguna, muse, mlx-lm text loads) keep the
+    single-stream DFlashEngine.
+    """
+    return engine_type == "vlm" and model_type in _DFLASH_BATCHED_MODEL_TYPES
+
+
+def dflash_batched_requested(model_settings: Any | None) -> bool:
+    return bool(
+        model_settings is not None
+        and getattr(model_settings, "dflash_enabled", False)
+        and getattr(model_settings, "dflash_draft_model", None)
+    )
+
+
+def _nax_available() -> bool:
+    try:
+        from ..custom_kernels.nax import is_nax_available
+    except ImportError:
+        return False
+    return bool(is_nax_available())
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:

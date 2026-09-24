@@ -42,7 +42,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     lightning_mtp = _section(
         html,
         "<!-- Lightning MTP (built-in MTP head speculative decoding) -->",
-        "<!-- Experimental Features -->",
+        "<!-- DFlash -->",
     )
 
     assert "modelSettings.mtp_enabled" not in turboquant
@@ -54,7 +54,7 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     vlm_mtp = _section(
         html,
         "<!-- VLM MTP",
-        "<!-- Performance",
+        "<!-- Experimental Features -->",
     )
 
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
@@ -430,6 +430,11 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
             # keeps the English fallback until its own translation lands.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
+            continue
+        if path.name == "cs.json":
+            # Czech carries its own labels (ZAP/VYP), same exemption as zh.
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
             continue
         for key, value in english.items():
             assert (

@@ -3309,11 +3309,12 @@ class LanguageModel(Qwen3_5LanguageModel):
         self._enable_mtp_decode_markers()
 
     def _enable_mtp_decode_markers(self) -> None:
-        from omlx.patches.mlx_lm_mtp import get_mtp_depth
+        from omlx.patches.mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
 
         self._omlx_mtp_decode_enabled = True
         self._omlx_mtp_chain = True
         self._omlx_mtp_depth = get_mtp_depth()
+        self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
         self._omlx_mtp_head_prenorm = True
 
     def get_mtp_module(self):
