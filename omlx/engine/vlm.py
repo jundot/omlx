@@ -32,6 +32,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -5193,6 +5194,115 @@ class VLMBatchedEngine(BaseEngine):
                 self._diffusion_cancel_events.discard(cancel_event)
                 self._diffusion_active_requests -= 1
 
+    @contextlib.asynccontextmanager
+    async def diffusion_read_session(
+        self, prompt_ids: list[int]
+    ) -> AsyncIterator["DiffusionReadSession"]:
+        """Prefill ``prompt_ids`` once and hold the diffusion lane for
+        read-only decoder passes against it.
+
+        Every ``DiffusionReadSession.read`` inside the block reuses the one
+        prefill, so extra noise draws cost decoder passes, not prompt tokens.
+        """
+        if not self._loaded:
+            await self.start()
+        if not self.is_diffusion_model:
+            raise RuntimeError(f"{self._model_name} is not a diffusion model")
+
+        async with self._diffusion_lock:
+            self._diffusion_active_requests += 1
+            session = None
+            try:
+                session = DiffusionReadSession(
+                    self,
+                    await self._run_diffusion_job(
+                        functools.partial(self._prefill_diffusion_sync, prompt_ids)
+                    ),
+                )
+                yield session
+            finally:
+                if session is not None:
+                    session._cache = None
+                    await self._run_diffusion_job(mx.clear_cache)
+                self._diffusion_active_requests -= 1
+
+    async def _run_diffusion_job(self, fn: Any) -> Any:
+        """Run ``fn`` on the MLX executor. A cancelled caller still waits for
+        it, so the lane is never freed while the model is in use."""
+        from ..engine_core import get_mlx_executor
+
+        future = asyncio.get_running_loop().run_in_executor(get_mlx_executor(), fn)
+        try:
+            return await asyncio.shield(future)
+        finally:
+            with contextlib.suppress(BaseException):
+                await future
+
+    def _prefill_diffusion_sync(self, prompt_ids: list[int]) -> Any:
+        from mlx_vlm.generate.common import generation_stream, wired_limit
+
+        model = self._vlm_model
+        with wired_limit(model, [generation_stream]), mx.stream(generation_stream):
+            # A text-only prompt always satisfies the model's chunked prefill
+            # policy (no padding, pixels or static cache).
+            cache = model.diffusion_prefill_cache(
+                mx.array([prompt_ids]),
+                cache=model.make_cache(),
+                prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
+                chunk_prefill=len(prompt_ids) > DIFFUSION_PREFILL_STEP_SIZE,
+            )
+            mx.eval([c.state for c in cache])
+        return cache
+
+    def _read_diffusion_canvas_sync(
+        self,
+        cache: Any,
+        canvas: list[int],
+        slots: list[tuple[int, list[int]]],
+        seeds: list[int],
+        top_k: int,
+    ) -> list[list[dict[int, float]]]:
+        from mlx_vlm.generate.common import generation_stream, wired_limit
+
+        model = self._vlm_model
+        vocab_size = int(model.config.text_config.vocab_size)
+        positions = mx.array([pos for pos, _ in slots])
+        # One gather picks every slot's labels out of its log-softmax row.
+        label_rows = mx.array(
+            [row for row, (_, labels) in enumerate(slots) for _ in labels]
+        )
+        label_cols = mx.array([label for _, labels in slots for label in labels])
+        reads = []
+        with wired_limit(model, [generation_stream]), mx.stream(generation_stream):
+            masks = model.diffusion_decoder_masks(mx.array([canvas]), cache, None)
+            for seed in seeds:
+                rng = random.Random(seed)
+                noised = list(canvas)
+                for pos, _ in slots:
+                    noised[pos] = rng.randrange(vocab_size)
+                logits = model.diffusion_decoder_logits(
+                    mx.array([noised]), cache=cache, decoder_attention_mask=masks
+                )
+                rows = logits[0, positions].astype(mx.float32)
+                logprobs = rows - mx.logsumexp(rows, axis=-1, keepdims=True)
+                top_ids = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[
+                    :, :top_k
+                ]
+                top_logprobs = mx.take_along_axis(logprobs, top_ids, axis=-1)
+                label_logprobs = logprobs[label_rows, label_cols].tolist()
+                read, start = [], 0
+                for ids, lps, (_, labels) in zip(
+                    top_ids.tolist(), top_logprobs.tolist(), slots
+                ):
+                    row = dict(zip(ids, lps))
+                    row.update(
+                        zip(labels, label_logprobs[start : start + len(labels)])
+                    )
+                    start += len(labels)
+                    read.append(row)
+                reads.append(read)
+        return reads
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -5274,3 +5384,47 @@ class VLMBatchedEngine(BaseEngine):
                 error_code=error_code,
             )
         return 0
+
+
+class DiffusionReadSession:
+    """Read-only decoder passes over one prefilled prompt; see
+    ``VLMBatchedEngine.diffusion_read_session``."""
+
+    def __init__(self, engine: VLMBatchedEngine, cache: Any):
+        self._engine = engine
+        self._cache = cache
+
+    async def read(
+        self,
+        canvas: list[int],
+        slots: list[tuple[int, list[int]]],
+        seeds: list[int],
+        top_k: int,
+    ) -> list[list[dict[int, float]]]:
+        """One decoder pass over ``canvas`` per seed.
+
+        The canvas stays as given except at each slot's position, which every
+        pass refills with a random token drawn from its seed, the way a
+        denoising step starts from noise.
+
+        Args:
+            canvas: Decoder canvas token ids.
+            slots: ``(canvas position, label token ids)`` per slot.
+            seeds: One pass per seed.
+            top_k: How many of each slot's most likely tokens to return.
+
+        Returns:
+            Per seed, per slot, the log-probabilities under the full
+            vocabulary of the slot's top ``top_k`` tokens and of every label,
+            keyed by token id.
+        """
+        return await self._engine._run_diffusion_job(
+            functools.partial(
+                self._engine._read_diffusion_canvas_sync,
+                self._cache,
+                canvas,
+                slots,
+                seeds,
+                top_k,
+            )
+        )

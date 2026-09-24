@@ -1224,6 +1224,16 @@ private struct AdvancedTab: View {
                               placeholder: "auto", mono: true, width: .controlCompact)
                 }
             }
+            if vm.isDiffusionModel {
+                Row(label: String(localized: "settings.advanced.system_one_rereads.label",
+                                  defaultValue: "Re-read uncertain System One answers",
+                                  comment: "Row label for the System One re-read toggle (diffusion models)"),
+                    sublabel: String(localized: "settings.advanced.system_one_rereads.sub",
+                                     defaultValue: "When an answer is uncertain, read it three more times with fresh noise and average, as djev does. Off reads once: about half the latency, with the same JevBench accuracy.",
+                                     comment: "Sublabel for the System One re-read toggle")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.systemOneRereadsEnabled))
+                }
+            }
             Row(label: String(localized: "settings.advanced.pin_memory.label",
                               defaultValue: "Pin in memory",
                               comment: "Row label for the pin-in-memory toggle"),

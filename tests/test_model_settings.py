@@ -34,6 +34,14 @@ class TestModelSettings:
         assert settings.is_favorite is False
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
+        # System One reads follow djev's re-read policy unless turned off.
+        assert settings.system_one_rereads_enabled is True
+
+    def test_system_one_rereads_roundtrip(self):
+        restored = ModelSettings.from_dict(
+            ModelSettings(system_one_rereads_enabled=False).to_dict()
+        )
+        assert restored.system_one_rereads_enabled is False
 
     def test_trust_remote_code_roundtrip(self):
         """Test trust_remote_code field survives to_dict -> from_dict roundtrip."""

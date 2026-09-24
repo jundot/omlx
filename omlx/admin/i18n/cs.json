@@ -1209,6 +1209,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Vynutit parametry vzorkování",
   "modal.model_settings.force_sampling_hint": "Přepsat parametry vzorkování požadavku nastavenými hodnotami",
+  "modal.model_settings.system_one_rereads": "Znovu číst nejisté odpovědi System One",
+  "modal.model_settings.system_one_rereads_hint": "Když je odpověď nejistá, přečte ji ještě třikrát s novým šumem a výsledky zprůměruje, jako djev. Vypnuto čte jen jednou: zhruba poloviční latence při stejné přesnosti v JevBench.",
   "modal.model_settings.trust_remote_code": "Věřit přiloženému kódu",
   "modal.model_settings.trust_remote_code_hint": "Umožňuje repozitáři modelu při načtení spustit libovolný Python. Povolte jen pro důvěryhodné zdroje.",
   "modal.model_settings.chat_template_kwargs": "Parametry šablony chatu",

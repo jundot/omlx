@@ -293,6 +293,8 @@ class ModelSettings:
             to BatchGenerator so the constraints stay enforced (#2399).
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
+        system_one_rereads_enabled: Re-read an uncertain System One read with
+            more noise draws (djev's auto policy); off reads once.
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -462,6 +464,12 @@ class ModelSettings:
     vlm_mtp_draft_block_size: Optional[int] = (
         None  # Tokens per draft round (None = mlx-vlm default)
     )
+
+    # System One reads (DiffusionGemma, /v1/systemone). When any answer of a
+    # read is uncertain, re-read it with three more noise draws and average,
+    # as djev does. Off reads once: about half the latency on the serial
+    # diffusion lane, with the same JevBench accuracy.
+    system_one_rereads_enabled: bool = True
 
     # Model management flags
     is_pinned: bool = False

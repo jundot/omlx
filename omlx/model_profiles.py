@@ -39,6 +39,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "max_tool_result_tokens",
     "chat_template_kwargs",
     "forced_ct_kwargs",
+    "system_one_rereads_enabled",
 )
 
 # Model-specific fields — eligible for per-model profiles only (never templates).

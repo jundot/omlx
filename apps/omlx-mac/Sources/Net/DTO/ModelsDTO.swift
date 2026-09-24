@@ -94,6 +94,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let presencePenalty: Double?
     let repetitionPenalty: Double?
     let forceSampling: Bool?
+    let systemOneRereadsEnabled: Bool?
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?

@@ -142,6 +142,9 @@ from .api.responses_models import (
     ResponseObject,
     ResponsesRequest,
 )
+from .api.systemone import SUPPORTED_MODEL_TYPES as SYSTEM_ONE_MODEL_TYPES
+from .api.systemone import SystemOnePlan
+from .api.systemone_models import SystemOneRequest, SystemOneResponse
 from .api.responses_utils import (
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
@@ -3709,6 +3712,88 @@ async def create_rerank(
         model=request.model,
         usage=RerankUsage(total_tokens=output.total_tokens),
     )
+
+
+@app.post("/v1/systemone")
+async def create_systemone(
+    request: SystemOneRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_inference_api_key),
+):
+    """
+    Answer typed questions about a state with calibrated probabilities.
+
+    TypeSafe System One API (OpenAPI 0.2.0), served by DiffusionGemma
+    diffusion reads instead of text generation.
+
+    Example request:
+    ```json
+    {
+        "model": "diffusiongemma-26B-A4B-it-4bit",
+        "state": "I was charged twice this month.",
+        "questions": {
+            "is_billing": {"type": "noul", "instructions": "Is this a billing issue?"},
+            "tone": {"type": "score", "instructions": "How upset is the customer?",
+                     "criteria": ["calm", "annoyed", "furious"]}
+        }
+    }
+    ```
+    """
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+    lease = _LLMEngineLease()
+    try:
+        engine = await get_engine_for_model(request.model, lease=lease)
+        if not (
+            isinstance(engine, VLMBatchedEngine)
+            and engine.is_diffusion_model
+            and engine.model_type in SYSTEM_ONE_MODEL_TYPES
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{request.model}' does not support System One "
+                    "reads. Use a DiffusionGemma model."
+                ),
+            )
+        resolved_model = _serving_model_id(lease, request.model)
+        settings = get_model_settings_for_request(request.model)
+        plan = SystemOnePlan(
+            engine.tokenizer,
+            request,
+            max_prompt_tokens=get_max_context_window(request.model),
+            rereads=settings is None or settings.system_one_rereads_enabled,
+        )
+
+        async def _build_systemone():
+            await _raise_if_llm_lease_abort_requested(lease)
+            start_time = time.perf_counter()
+            answers = await plan.answer(engine)
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                f"System One: model={resolved_model}, {len(answers)} questions, "
+                f"{plan.prefill_tokens} prompt tokens in {elapsed:.3f}s"
+            )
+            get_server_metrics().record_request_complete(
+                prompt_tokens=plan.prefill_tokens,
+                completion_tokens=0,
+                prefill_duration=elapsed,
+                model_id=resolved_model,
+                request_duration=elapsed,
+            )
+            return SystemOneResponse(
+                model=resolved_model, answers=answers, usage=plan.usage
+            ).model_dump_json()
+
+        return await _json_response_or_keepalive(
+            http_request, _build_systemone(), lease=lease
+        )
+    except BaseException:
+        await lease.release()
+        raise
 
 
 # =============================================================================

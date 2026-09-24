@@ -672,6 +672,70 @@ class TestModelsResponseActiveProfile:
         assert settings["mtp_enabled"] is False
         assert settings["vlm_mtp_enabled"] is False
 
+    def test_system_one_rereads_setting(self, client):
+        c, mgr = client
+        pool = admin_routes._get_engine_pool()
+        pool._entries["diffusion"] = _FakeEntry(
+            "diffusion",
+            engine_type="vlm",
+            model_type="vlm",
+            config_model_type="diffusion_gemma",
+        )
+        url = "/admin/api/models/diffusion/settings"
+
+        r = c.put(url, json={"system_one_rereads_enabled": False})
+        assert r.status_code == 200, r.text
+        assert r.json()["settings"]["system_one_rereads_enabled"] is False
+        assert mgr.get_settings("diffusion").system_one_rereads_enabled is False
+
+        # Unrelated saves leave it alone; null restores the default.
+        c.put(url, json={"max_tokens": 32})
+        assert mgr.get_settings("diffusion").system_one_rereads_enabled is False
+        c.put(url, json={"system_one_rereads_enabled": None})
+        assert mgr.get_settings("diffusion").system_one_rereads_enabled is True
+
+    def test_profiles_carry_system_one_rereads(self, client):
+        """A request-time (universal) field: applying a profile sets it, and a
+        profile without it restores the default."""
+        c, mgr = client
+        pool = admin_routes._get_engine_pool()
+        pool._entries["diffusion"] = _FakeEntry(
+            "diffusion",
+            engine_type="vlm",
+            model_type="vlm",
+            config_model_type="diffusion_gemma",
+        )
+        for name, settings in (
+            ("fast", {"system_one_rereads_enabled": False}),
+            ("plain", {"temperature": 0.0}),
+        ):
+            r = c.post(
+                "/admin/api/models/diffusion/profiles",
+                json={"name": name, "display_name": name, "settings": settings},
+            )
+            assert r.status_code == 200, r.text
+
+        r = c.post("/admin/api/models/diffusion/profiles/fast/apply")
+        assert r.json()["settings"]["system_one_rereads_enabled"] is False
+        r = c.post("/admin/api/models/diffusion/profiles/plain/apply")
+        assert r.json()["settings"]["system_one_rereads_enabled"] is True
+
+        # An exposed profile changes it per request, without touching the
+        # base model's settings.
+        r = c.put(
+            "/admin/api/models/diffusion/profiles/fast",
+            json={"expose_as_model": True},
+        )
+        assert r.status_code == 200, r.text
+        profile_id = next(
+            m["model_id"]
+            for m in mgr.list_exposed_profile_models()
+            if m["source_model_id"] == "diffusion"
+        )
+        request_settings = mgr.get_settings_for_request(profile_id)
+        assert request_settings.system_one_rereads_enabled is False
+        assert mgr.get_settings("diffusion").system_one_rereads_enabled is True
+
 
 class TestActiveProfileDriftClearing:
     def test_active_preserved_when_no_drift(self, client):

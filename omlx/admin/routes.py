@@ -303,6 +303,7 @@ class ModelSettingsRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     force_sampling: bool | None = None
+    system_one_rereads_enabled: bool | None = None
     max_tool_result_tokens: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     forced_ct_kwargs: list[str] | None = None
@@ -2826,6 +2827,10 @@ async def update_model_settings(
         current_settings.presence_penalty = request.presence_penalty
     if "force_sampling" in sent:
         current_settings.force_sampling = request.force_sampling
+    if "system_one_rereads_enabled" in sent:
+        current_settings.system_one_rereads_enabled = (
+            request.system_one_rereads_enabled is not False
+        )
     if "max_tool_result_tokens" in sent:
         # 0 means disable (reset to None)
         current_settings.max_tool_result_tokens = (

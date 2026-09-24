@@ -1209,6 +1209,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "强制采样",
   "modal.model_settings.force_sampling_hint": "使用配置的值覆盖请求的采样参数",
+  "modal.model_settings.system_one_rereads": "System One 答案不确定时补读",
+  "modal.model_settings.system_one_rereads_hint": "答案不确定时换新噪声再读 3 次并取平均（djev 的策略）。关闭后只读 1 次：延迟约减半，JevBench 准确率不变。",
   "modal.model_settings.trust_remote_code": "信任远程代码",
   "modal.model_settings.trust_remote_code_hint": "允许模型仓库在加载时运行任意 Python 代码。请仅对可信的发布者启用。",
   "modal.model_settings.chat_template_kwargs": "聊天模板参数",

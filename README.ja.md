@@ -237,7 +237,10 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | テキストエンベディング |
 | `POST /v1/rerank` | ドキュメントリランキング |
+| `POST /v1/systemone` | System One 型付き判定（TypeSafe API） |
 | `GET /v1/models` | 利用可能なモデル一覧 |
+
+`POST /v1/systemone` は DiffusionGemma 上で [TypeSafe の System One API](https://docs.typesafe.ai/api)（OpenAPI 0.2.0）を実装します。`state` と型付きの `noul`（はい/いいえ）、`choice`、`score` の質問を送ると、各回答はモデルの分布から直接読み取った較正済み確率として返されます。モデルはテキストを生成しないため、回答がスキーマから外れることはありません。`model` には DiffusionGemma のモデル ID を指定します。TypeSafe SDK をそのまま使うには、`TYPESAFE_BASE_URL` を oMLX に向け、そのモデルに SDK の既定モデルであるエイリアス `jev-latest` を設定します。`GET /v1/models` は OpenAI 形式のままなので、SDK のモデル一覧機能には対応していません。読み取り結果が不確実なとき、oMLX は djev と同様に新しいノイズで 3 回追加で読み取り、平均します。モデル設定で「System One の不確実な回答を再読する」をオフにすると 1 回だけ読み取り、レイテンシは約半分になります。
 
 ### ツール呼び出し＆構造化出力
 

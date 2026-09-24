@@ -1209,6 +1209,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "強制サンプリング",
   "modal.model_settings.force_sampling_hint": "設定値でリクエストのサンプリングパラメータを上書きします",
+  "modal.model_settings.system_one_rereads": "System One の不確実な回答を再読する",
+  "modal.model_settings.system_one_rereads_hint": "回答が不確実なとき、新しいノイズで 3 回追加で読み取り平均します（djev の方式）。オフにすると 1 回だけ読み取り、レイテンシは約半分、JevBench の精度は同じです。",
   "modal.model_settings.trust_remote_code": "Trust Remote Code",
   "modal.model_settings.trust_remote_code_hint": "Lets the model repo run arbitrary Python at load. Only enable for trusted publishers.",
   "modal.model_settings.chat_template_kwargs": "チャットテンプレート引数",
