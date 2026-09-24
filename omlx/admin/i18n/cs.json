@@ -1393,7 +1393,7 @@
   "models.oq.about_table_oqe_use": "Lepší udržení kvality při nízkém počtu bitů, zejména u MoE a vrstev se zkreslenými aktivacemi",
   "models.oq.about_table_path": "Cesta",
   "models.oq.about_universal_heading": "oQ: univerzální dynamická kvantizace oMLX",
-  "models.oq.v41_policy_hint": "DeepSeek V4.1 supports oQ3/oQ3e and oQ4/oQ4e with BF16 output. oQ4 preserves the original FP4/FP8 projection precision and quantizes Engram tables to 4 bits. The vision encoder is retained.",
+  "models.oq.v41_policy_hint": "DeepSeek V4.1 podporuje oQ3/oQ3e a oQ4/oQ4e s BF16 výstupem. oQ4 zachovává původní přesnost projekcí FP4/FP8 a kvantizuje Engram tabulky na 4 bity. Kodek vidění je zachován.",
   "models.oq.full_precision_only": "(pouze plná přesnost)",
   "models.oq.quantization_started": "Kvantizace zahájena: {name} → {model}",
   "models.oq.sensitivity_model": "Model citlivosti",
@@ -2003,5 +2003,5 @@
   "settings.global.reset_ok": "OK",
   "settings.global.reset_cancel": "Zrušit",
   "settings.advanced.qwen4_gdn_decode_wide_proj": "Qwen4 Extended Fused Decode",
-  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes."
+  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Zrychluje generování při jediném požadavku u podporovaných modelů rodiny Qwen4 s kvantizací affine a skrytou dimenzí 2560. Benchmarky přispěvatelů na 8bitovém modelu Qwen3.8-Flash-Next hlásily o 3–6 % rychlejší generování za cenu 1.5 GiB paměti navíc; výsledky se mohou lišit. Nevztahuje se na prefill ani dávkové generování. Ve výchozím stavu vypnuto. Změny se projeví po znovunačtení modelu."
 }
