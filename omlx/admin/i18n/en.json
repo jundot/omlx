@@ -112,6 +112,7 @@
   "status.stat.total_tokens": "Total Prefill Tokens",
   "status.stat.cached_tokens": "Cached Tokens",
   "status.stat.cache_efficiency": "Cache Efficiency",
+  "status.stat.generated_tokens": "Generated Tokens",
   "status.speed.section_label": "Average Speed",
   "status.speed.prompt_processing": "Prompt Processing",
   "status.speed.prompt_processing_note": "(excl. cached)",

@@ -112,6 +112,7 @@
   "status.stat.total_tokens": "預填充 Token 總數",
   "status.stat.cached_tokens": "快取 Token 數",
   "status.stat.cache_efficiency": "快取效率",
+  "status.stat.generated_tokens": "生成 Token 數",
   "status.speed.section_label": "平均速度",
   "status.speed.prompt_processing": "Prompt 處理速度",
   "status.speed.prompt_processing_note": "（不含快取）",

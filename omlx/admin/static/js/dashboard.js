@@ -310,6 +310,7 @@
             stats: {
                 total_prompt_tokens: 0,
                 total_cached_tokens: 0,
+                total_completion_tokens: 0,
                 cache_efficiency: 0.0,
                 avg_prefill_tps: 0.0,
                 avg_generation_tps: 0.0,
@@ -349,6 +350,7 @@
             alltimeStats: {
                 total_prompt_tokens: 0,
                 total_cached_tokens: 0,
+                total_completion_tokens: 0,
                 cache_efficiency: 0.0,
                 avg_prefill_tps: 0.0,
                 avg_generation_tps: 0.0,

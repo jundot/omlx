@@ -112,6 +112,7 @@
   "status.stat.total_tokens": "Total des tokens de pré-remplissage",
   "status.stat.cached_tokens": "Tokens en cache",
   "status.stat.cache_efficiency": "Efficacité du cache",
+  "status.stat.generated_tokens": "Tokens générés",
   "status.speed.section_label": "Vitesse moyenne",
   "status.speed.prompt_processing": "Traitement du prompt",
   "status.speed.prompt_processing_note": "(excl. en cache)",
