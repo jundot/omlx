@@ -140,7 +140,7 @@ final class DownloadsScreenVM {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.refreshTasks()
+                await self.refreshTasks(clearsError: false)
                 try? await Task.sleep(for: .seconds(1))
             }
         }
@@ -476,16 +476,25 @@ final class DownloadsScreenVM {
         return merged
     }
 
-    private func refreshTasks() async {
+    /// `clearsError`: the background poll loop (below) calls this every 1s
+    /// and must NOT touch `lastError` — it was wiping a `startDownload`/
+    /// `cancel`/`retry`/`remove` failure within that same second (§G2), so a
+    /// rejected download flashed its error and vanished. The four action
+    /// methods call this right after their own successful request, where
+    /// clearing a stale prior error (or surfacing a failure of the refresh
+    /// itself) is legitimate action-triggered feedback, not a poll clobbering
+    /// it — matching QuantizationScreenVM.loadTasks()'s template, which never
+    /// touches lastError from its poll body at all.
+    private func refreshTasks(clearsError: Bool = true) async {
         guard let client else { return }
         do {
             switch source {
             case .hf: self.tasks   = try await client.listHFTasks().tasks
             case .ms: self.msTasks = try await client.listMSTasks().tasks
             }
-            self.lastError = nil
+            if clearsError { self.lastError = nil }
         } catch {
-            self.lastError = error.omlxDescription
+            if clearsError { self.lastError = error.omlxDescription }
         }
     }
 
