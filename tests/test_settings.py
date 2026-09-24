@@ -382,6 +382,7 @@ class TestSchedulerSettings:
             "max_concurrent_requests": 8,
             "embedding_batch_size": 32,
             "chunked_prefill": False,
+            "prefill_max_batch_size": 1,
             "prefill_priority": "context",
             "decode_fairness": True,
         }

@@ -113,6 +113,7 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
+        "prefill_max_batch_size",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

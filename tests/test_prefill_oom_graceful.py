@@ -1221,6 +1221,7 @@ def test_step_prefill_reclaims_before_first_guard(
         memory_monitor=monitor,
         _stream="stream",
         _memory_limit_bytes=0,
+        _prefill_tokens_remaining=None,
         _glm_dsa_adaptive_prefill=None,
         model=lambda *args, **kwargs: events.append("model"),
         _supports_skip_lm_head=lambda: False,

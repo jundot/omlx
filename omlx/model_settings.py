@@ -395,6 +395,9 @@ class ModelSettings:
     qwen35_oq_a8_enabled: bool = False
     qwen35_oq_a8_min_tokens: int = 128
 
+    # None inherits the global limit; 1 disables new prefill groups.
+    prefill_max_batch_size: Optional[int] = None
+
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
@@ -480,6 +483,10 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        if self.prefill_max_batch_size is not None and (
+            type(self.prefill_max_batch_size) is not int or self.prefill_max_batch_size < 1
+        ):
+            raise ValueError("prefill_max_batch_size must be a positive integer or None")
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
             raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping

@@ -345,6 +345,7 @@ class ModelSettingsRequest(BaseModel):
     # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
     qwen35_oq_a8_enabled: bool | None = None
     qwen35_oq_a8_min_tokens: int | None = None
+    prefill_max_batch_size: int | None = Field(default=None, strict=True, ge=1)
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
@@ -618,6 +619,7 @@ class GlobalSettingsRequest(BaseModel):
     # Scheduler settings
     max_concurrent_requests: int | None = None
     embedding_batch_size: int | None = None
+    prefill_max_batch_size: int | None = Field(default=None, strict=True)
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
     decode_fairness: bool | None = None
@@ -2737,6 +2739,8 @@ async def update_model_settings(
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
+    if "prefill_max_batch_size" in sent:
+        current_settings.prefill_max_batch_size = request.prefill_max_batch_size
     prev_engine_type = entry.engine_type  # Track for requires_reload check
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
@@ -3372,6 +3376,8 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+    if "prefill_max_batch_size" in sent:
+        await engine_pool.apply_model_prefill_max_batch_size(model_id)
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective
@@ -4594,6 +4600,7 @@ def _global_settings_response(global_settings):
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
             "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
+            "prefill_max_batch_size": global_settings.scheduler.prefill_max_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
             "decode_fairness": global_settings.scheduler.decode_fairness,
@@ -4785,6 +4792,17 @@ async def update_global_settings(
                 "the server first."
             ),
         )
+
+    pending_prefill_max_batch_size = request.prefill_max_batch_size
+    if (
+        pending_prefill_max_batch_size is not None
+        and pending_prefill_max_batch_size <= 0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid prefill_max_batch_size: must be a positive integer",
+        )
+    previous_prefill_max_batch_size: int | None = None
 
     # Track which settings were applied at runtime
     runtime_applied: list[str] = []
@@ -5687,6 +5705,13 @@ async def update_global_settings(
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
         global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
+    if pending_prefill_max_batch_size is not None:
+        previous_prefill_max_batch_size = (
+            global_settings.scheduler.prefill_max_batch_size
+        )
+        global_settings.scheduler.prefill_max_batch_size = (
+            pending_prefill_max_batch_size
+        )
 
     # Validate settings
     errors = global_settings.validate()
@@ -5694,6 +5719,10 @@ async def update_global_settings(
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
+            )
+        if previous_prefill_max_batch_size is not None:
+            global_settings.scheduler.prefill_max_batch_size = (
+                previous_prefill_max_batch_size
             )
         raise HTTPException(status_code=400, detail=errors)
 
@@ -5705,7 +5734,22 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_prefill_max_batch_size is not None:
+            global_settings.scheduler.prefill_max_batch_size = (
+                previous_prefill_max_batch_size
+            )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_prefill_max_batch_size is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_prefill_max_batch_size(pending_prefill_max_batch_size)
+        runtime_applied.append("prefill_max_batch_size")
+        logger.info(
+            "Prefill maximum batch size set to %s", pending_prefill_max_batch_size
+        )
 
     if pending_embedding_batch_size is not None:
         from ..server import _server_state

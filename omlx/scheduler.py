@@ -65,6 +65,25 @@ from .exceptions import (
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.sdpa256_attention import set_unfused_headroom_provider
+from .prefill.execution import BatchedPrefillGroup
+from .prefill.memory import (
+    PrefillMemoryContext,
+    PrefillTransition,
+)
+from .prefill.planning import (
+    PrefillCandidate,
+    PrefillDecision,
+    PrefillDefer,
+    PrefillEstimate,
+    PrefillFallback,
+    PrefillReason,
+    PrefillRun,
+    plan_prefill_batch,
+)
+from .prefill.models import model_geometry_from_args
+from .prefill.policy import prefill_eligibility
+from .prefill.runtime import PrefillBatchRuntime
+from .prefill.timing import PrefillTiming
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
@@ -1666,6 +1685,14 @@ class SchedulerConfig:
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+    prefill_max_batch_size: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.prefill_max_batch_size) is not int
+            or self.prefill_max_batch_size < 1
+        ):
+            raise ValueError("prefill_max_batch_size must be a positive integer")
 
 
 @dataclass
@@ -1931,6 +1958,27 @@ class Scheduler:
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
         self._prefill_states: dict[str, _PrefillState] = {}
+        self._prefill_runtime = PrefillBatchRuntime()
+        self._prefill_tokens_remaining: int | None = None
+        self._step_prefill_batch_size: int | None = None
+        self._batched_prefill_timings: dict[tuple[int, int], PrefillTiming] = {}
+        self._batched_prefill_stats: dict[str, Any] = {
+            "groups": 0,
+            "chunks": 0,
+            "tokens": 0,
+            "executed_tokens": 0,
+            "padding_tokens": 0,
+            "discarded_tokens": 0,
+            "requeued_tokens": 0,
+            "memory_demotions": 0,
+            "forward_seconds": 0.0,
+            "step_seconds": 0.0,
+            "transition_reclaims": 0,
+            "transition_rejections": 0,
+            "failures": 0,
+            "max_batch_size": 0,
+            "fallbacks": defaultdict(int),
+        }
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
@@ -3901,72 +3949,14 @@ class Scheduler:
                         request, prompt_cache, total_tokens
                     )
 
-            # Memory monitoring — use max(active, phys_footprint) so MLX
-            # cache pool and IOAccelerator-backed allocations that don't
-            # show in mx.get_active_memory() still trigger the guard.
-            # See utils/proc_memory.py for why phys_footprint matters.
-            if self._memory_limit_bytes > 0:
-                current = self._current_usage_bytes()
-                _hard = self._memory_hard_limit_bytes
-                _soft = self._memory_limit_bytes
-                # Only log when crossing the soft watermark — that's the
-                # caution zone where adaptive throttle decisions matter.
-                # Skipped on healthy traffic to keep the log quiet.
-                if current > _soft:
-                    logger.debug(
-                        "[memcheck:external] rid=%s n=%d processed=%d "
-                        "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
-                        request.request_id,
-                        n_to_process,
-                        processed_tokens,
-                        current / 1024**3,
-                        _soft / 1024**3,
-                        _hard / 1024**3,
-                        "OVER_HARD" if _hard > 0 and current > _hard else "OVER_SOFT",
-                    )
-                # Abort decision uses the STABLE physical cap, not the jittery
-                # dynamic ceiling: only kill an in-flight prefill if it would
-                # breach what Metal actually allows. Throttling above still
-                # targets the dynamic ceiling. Falls back to the dynamic hard
-                # limit if the abort limit hasn't been propagated yet.
-                _abort = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
-                if _abort > 0 and current > _abort:
-                    # Reclaim the just-computed chunk's Metal transients before
-                    # giving up — they are still resident at this pre-clear
-                    # check and are usually what tipped us over the cap.
-                    current = self._reclaim_prefill_headroom()
-                    if current > _abort:
-                        logger.warning(
-                            f"Prefill force-stopped at {processed_tokens} "
-                            f"tokens: memory {current / 1024**3:.1f}GB "
-                            f"exceeds physical cap "
-                            f"{_abort / 1024**3:.1f}GB (after reclaim)"
-                        )
-                        raise RuntimeError("Memory limit exceeded during prefill")
-                    logger.info(
-                        "Prefill recovered after reclaim at %d tokens "
-                        "(%.1fGB <= cap %.1fGB)",
-                        processed_tokens,
-                        current / 1024**3,
-                        _abort / 1024**3,
-                    )
-                elif current > self._memory_limit_bytes:
-                    # Speed priority runs full chunks through this caution
-                    # band by design — the per-chunk notice is DEBUG there,
-                    # not a warning about an unexpected state.
-                    _log = (
-                        logger.debug
-                        if self._prefill_speed_priority
-                        else logger.warning
-                    )
-                    _log(
-                        f"Prefill above max_bytes at "
-                        f"{processed_tokens} tokens: "
-                        f"{current / 1024**3:.1f}GB > "
-                        f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                        f"(ceiling: "
-                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
-                    )
+            Scheduler._check_post_prefill_memory(
+                self,
+                request_id=request.request_id,
+                chunk_tokens=n_to_process,
+                processed_tokens=processed_tokens,
+                total_tokens=total_length,
+                loop_label="external",
+            )
 
             # Check for pending aborts between prefill chunks.
             abort_uids = self._check_pending_aborts_for_uids(
@@ -5216,6 +5206,7 @@ class Scheduler:
                 total / 1024**2,
             )
 
+
     def _reclaim_prefill_headroom(self) -> int:
         """Reclaim Metal headroom mid-prefill and return the re-measured usage.
 
@@ -5237,6 +5228,79 @@ class Scheduler:
         """
         Scheduler._clear_cache(self)
         return self._current_usage_bytes()
+
+    def _check_post_prefill_memory(
+        self,
+        *,
+        request_id: str,
+        chunk_tokens: int,
+        processed_tokens: int,
+        total_tokens: int,
+        loop_label: str,
+    ) -> None:
+        """Check materialized usage independently of predicted admission costs.
+
+        Use max(MLX active memory, physical footprint), reclaim once above the
+        stable physical cap, and stop if still over it. RuntimeError preserves
+        the existing bounded memory-pressure retry path. Batched callers must
+        check before any cancellation compaction, extraction or decode handoff.
+        """
+        if self._memory_limit_bytes > 0:
+            current = self._current_usage_bytes()
+            _hard = self._memory_hard_limit_bytes
+            _soft = self._memory_limit_bytes
+            # Only log when crossing the soft watermark.
+            if current > _soft:
+                logger.debug(
+                    "[memcheck:%s] rid=%s n=%d processed=%d/%d "
+                    "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
+                    loop_label,
+                    request_id,
+                    chunk_tokens,
+                    processed_tokens,
+                    total_tokens,
+                    current / 1024**3,
+                    _soft / 1024**3,
+                    _hard / 1024**3,
+                    "OVER_HARD" if _hard > 0 and current > _hard else "OVER_SOFT",
+                )
+            # Abort on the stable physical cap, not the jittery dynamic ceiling
+            # used by admission estimates.
+            _abort = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
+            if _abort > 0 and current > _abort:
+                # Release Metal transients from the completed chunk before
+                # deciding whether the physical cap is still exceeded.
+                current = self._reclaim_prefill_headroom()
+                if current > _abort:
+                    raise RuntimeError(
+                        f"Memory limit exceeded during prefill ({loop_label}) at "
+                        f"{processed_tokens}/{total_tokens} tokens: "
+                        f"{current / 1024**3:.1f}GB exceeds physical cap "
+                        f"{_abort / 1024**3:.1f}GB (after reclaim)"
+                    )
+                logger.info(
+                    "Prefill recovered after reclaim at %d/%d tokens "
+                    "(%.1fGB <= cap %.1fGB)",
+                    processed_tokens,
+                    total_tokens,
+                    current / 1024**3,
+                    _abort / 1024**3,
+                )
+            elif current > self._memory_limit_bytes:
+                # Speed priority runs full chunks through this caution band
+                # by design — the per-chunk notice is DEBUG there, not a
+                # warning about an unexpected state.
+                _log = (
+                    logger.debug if self._prefill_speed_priority else logger.warning
+                )
+                _log(
+                    f"Prefill above max_bytes at "
+                    f"{processed_tokens} tokens: "
+                    f"{current / 1024**3:.1f}GB > "
+                    f"{self._memory_limit_bytes / 1024**3:.1f}GB "
+                    f"(ceiling: "
+                    f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                )
 
     # ------------------------------------------------------------------
     # Chunked prefill helpers (used when config.chunked_prefill=True)
@@ -5304,6 +5368,11 @@ class Scheduler:
           so concurrent prefillers pause together.
         The debt resets whenever no decode is running anywhere.
         """
+        if (
+            self._prefill_tokens_remaining is not None
+            and self._prefill_tokens_remaining <= 0
+        ):
+            return False
         if not self._decode_fairness:
             return True
         if self.running and self._decode_time_owed_s > 0.0:
@@ -5544,6 +5613,488 @@ class Scheduler:
             state.block_size,
         )
 
+    def _prefill_batch_limit(self) -> int:
+        """Snapshot admission policy for a turn; apply live changes next turn."""
+        if self._step_prefill_batch_size is not None:
+            return self._step_prefill_batch_size
+        return self.config.prefill_max_batch_size
+
+    def _stage_batched_prefill(
+        self,
+        request: Request,
+        tokens: list[int],
+        cache: list[Any] | None,
+        sampler: Any,
+        logits_processors: list[Any] | None,
+    ) -> bool:
+        """Prepare an opt-in candidate without a forward or a gathering delay."""
+        if self._prefill_batch_limit() == 1:
+            return False
+        if self._prefill_speed_priority:
+            self._batched_prefill_stats["fallbacks"]["speed_priority"] += 1
+            return False
+        if getattr(request, "_batched_prefill_disabled", False):
+            return False
+        with mx.stream(self._stream):
+            prompt_cache = cache if cache is not None else make_prompt_cache(self.model)
+        eligibility = prefill_eligibility(
+            self.model,
+            request,
+            prompt_cache,
+            turboquant_enabled=self._turboquant_kv_bits is not None,
+            speculative_enabled=(
+                self._specprefill_draft_model is not None
+                or self._vlm_mtp_drafter is not None
+            ),
+            snapshots_required=(
+                self.config.paged_cache_block_size > 0
+                and self.block_aware_cache is not None
+                and _prompt_cache_needs_snapshots(prompt_cache)
+            ),
+        )
+        if not eligibility.eligible:
+            self._batched_prefill_stats["fallbacks"][eligibility.reason] += 1
+            return False
+        state = self._begin_prefill(request, tokens, prompt_cache)
+        state.sampler = sampler
+        state.sm = self._build_state_machine(request)
+        state.per_row_lps = list(logits_processors or [])
+        self._prefill_runtime.stage(request.request_id, tokens[:-1])
+        self._prefill_states[request.request_id] = state
+        self.prefilling.append(request)
+        return True
+
+    def _prefill_memory_context(
+        self, group: BatchedPrefillGroup | None = None
+    ) -> PrefillMemoryContext:
+        safety_cap = self._prefill_abort_cap()
+        admission_cap = self._admission_limit_bytes()
+        if admission_cap > 0:
+            safety_cap = min(safety_cap, admission_cap)
+        return PrefillMemoryContext(
+            geometry=model_geometry_from_args(getattr(self.model, "args", None)),
+            current_usage_bytes=self._current_usage_bytes(),
+            limit_bytes=safety_cap,
+            current_cache_bytes=group.cache_nbytes if group is not None else 0,
+            decode_batch_size=len(self.running),
+            decode_max_tokens=max(
+                (request.num_tokens for request in self.running.values()), default=0
+            ),
+        )
+
+    def _plan_batched_prefill(
+        self,
+        states: list[_PrefillState],
+        group: BatchedPrefillGroup | None = None,
+    ) -> PrefillDecision:
+        """Plan from a fresh memory observation and optional timing estimates."""
+        context = self._prefill_memory_context(group)
+        if context.geometry is None or context.limit_bytes <= 0:
+            return PrefillFallback(PrefillReason.ESTIMATE_UNAVAILABLE)
+        contended = self._decode_fairness and self._decode_contention()
+        duration_limit = _DECODE_STALL_TARGET_MS / 1000.0 if contended else None
+        planning_time = time.perf_counter()
+
+        def estimate(batch_size: int, chunk_tokens: int, _cache_tokens: int):
+            max_prompt_tokens = max(state.total_length for state in states[:batch_size])
+            cost = context.estimate(batch_size, chunk_tokens, max_prompt_tokens)
+            if cost is None:
+                return None
+            duration = None
+            if contended:
+                timing = self._batched_prefill_timings.get(
+                    (batch_size, max_prompt_tokens.bit_length())
+                )
+                if timing is not None:
+                    duration = timing.estimate(
+                        batch_size * chunk_tokens, now=planning_time
+                    )
+                if duration is None:
+                    duration = (
+                        batch_size
+                        * chunk_tokens
+                        * duration_limit
+                        / max(1, _CONTENDED_PREFILL_CHUNK)
+                    )
+            return PrefillEstimate(cost.additional_peak_bytes, duration)
+
+        remaining = group.remaining_tokens if group is not None else {}
+        candidates = [
+            PrefillCandidate(
+                request_id=state.request.request_id,
+                remaining_tokens=(
+                    remaining[state.request.request_id]
+                    if group is not None
+                    else int(state.tokens_remaining.shape[1])
+                ),
+                max_chunk_tokens=self.config.prefill_step_size,
+                priority=state.request.priority,
+                cache_tokens=(group.tokens_processed if group is not None else 0),
+            )
+            for state in states
+        ]
+        token_budget = (
+            self.config.max_num_batched_tokens
+            if self._prefill_tokens_remaining is None
+            else self._prefill_tokens_remaining
+        )
+        decision = plan_prefill_batch(
+            candidates,
+            max_batch_size=(group.batch_size if group else self._prefill_batch_limit()),
+            token_budget=token_budget,
+            estimate=estimate,
+            max_memory_bytes=context.headroom_bytes,
+            max_duration_seconds=duration_limit,
+            allow_width_reduction=group is None,
+        )
+        return decision
+
+    def _guard_prefill_group_transition(
+        self, group: BatchedPrefillGroup, transition: PrefillTransition
+    ) -> None:
+        """Admit extraction/filtering without relying on an earlier forward check."""
+        request_ids = self._prefill_runtime.owned_ids(group)
+        if not request_ids:
+            return
+        for attempt in range(2):
+            context = self._prefill_memory_context(group)
+            cost = context.estimate_transition(
+                transition,
+                physical_rows=group.batch_size,
+                owned_rows=len(request_ids),
+                cache_tokens=group.tokens_processed,
+            )
+            admitted = (
+                cost is not None
+                and cost.additional_peak_bytes <= context.headroom_bytes
+                and context.current_usage_bytes <= context.limit_bytes
+            )
+            reclaim = not admitted and attempt == 0 and cost is not None
+            logger.debug(
+                "[batched-prefill-transition] phase=%s attempt=%d outcome=%s "
+                "physical_rows=%d owned_rows=%d decode_rows=%d cache_tokens=%d "
+                "cache_bytes=%d usage_bytes=%d limit_bytes=%d additional_bytes=%s",
+                transition.value,
+                attempt,
+                "admitted" if admitted else "reclaim" if reclaim else "rejected",
+                group.batch_size,
+                len(request_ids),
+                context.decode_batch_size,
+                group.tokens_processed,
+                context.current_cache_bytes,
+                context.current_usage_bytes,
+                context.limit_bytes,
+                cost.additional_peak_bytes if cost is not None else None,
+            )
+            if admitted:
+                return
+            if not reclaim:
+                break
+            self._batched_prefill_stats["transition_reclaims"] += 1
+            self._reclaim_prefill_headroom()
+        self._batched_prefill_stats["transition_rejections"] += 1
+        raise PrefillMemoryExceededError(
+            "Insufficient headroom for batched prefill cache transition",
+            estimated_bytes=(
+                cost.peak_bytes(context.current_usage_bytes)
+                if cost is not None
+                else None
+            ),
+            limit_bytes=context.limit_bytes,
+        )
+
+    def _form_prefill_group(self, pending: list[Request]) -> BatchedPrefillGroup | None:
+        """Group only a contiguous prepared prefix; never bypass an older row."""
+        states = []
+        for request in pending[: self._prefill_batch_limit()]:
+            state = self._prefill_states.get(request.request_id)
+            if state is None or not self._prefill_runtime.is_candidate(
+                request.request_id
+            ):
+                break
+            if states and request.priority != states[0].request.priority:
+                break
+            states.append(state)
+        if len(states) < 2:
+            return None
+        decision = self._plan_batched_prefill(states)
+        if not isinstance(decision, PrefillRun):
+            self._batched_prefill_stats["fallbacks"][decision.reason.value] += 1
+            return None
+        try:
+            group = self._prefill_runtime.create(
+                self.model,
+                decision.plan.request_ids,
+                stream=self._stream,
+                skip_lm_head=self._supports_skip_lm_head(),
+            )
+        except (MemoryError, RuntimeError, ValueError):
+            self._batched_prefill_stats["fallbacks"]["cache_setup"] += 1
+            logger.debug("Batched prefill cache setup declined", exc_info=True)
+            return None
+        for state in states[: len(decision.plan.request_ids)]:
+            state.cache = []
+        self._batched_prefill_stats["groups"] += 1
+        self._batched_prefill_stats["max_batch_size"] = max(
+            self._batched_prefill_stats["max_batch_size"], group.batch_size
+        )
+        return group
+
+    def _release_prefill_group_row(self, state: _PrefillState) -> None:
+        """Cancel ownership before transforming survivors.
+
+        A completed sole survivor stays in place for the ongoing decode handoff.
+        """
+        group = self._prefill_runtime.cancel(state.request.request_id)
+        if group is None or not group.valid:
+            return
+        try:
+            owned_ids = self._prefill_runtime.owned_ids(group)
+            if len(owned_ids) == 1:
+                if group.remaining_tokens[owned_ids[0]] > 0:
+                    self._dissolve_prefill_group(group)
+            else:
+                self._guard_prefill_group_transition(group, PrefillTransition.COMPACT)
+                self._prefill_runtime.compact(group)
+        except Exception as error:
+            logger.warning("Batched prefill cancellation cleanup failed: %s", error)
+            self._prefill_runtime.invalidate(group, error)
+
+    def _dissolve_prefill_group(self, group: BatchedPrefillGroup) -> None:
+        """Transfer a live group to scalar execution without replaying tokens."""
+        self._guard_prefill_group_transition(group, PrefillTransition.DEMOTE)
+        caches = self._prefill_runtime.demote(group)
+        for request_id, cache in caches.items():
+            self._prefill_states[request_id].cache = cache
+
+    def _close_prefill_groups(self) -> None:
+        self._prefill_runtime.close_all()
+
+    def _fail_prefill_group(
+        self,
+        group: BatchedPrefillGroup,
+        error: Exception,
+        rejected: list[RequestOutput],
+    ) -> None:
+        """Recover only runtime-owned rows; acknowledged decode rows are excluded."""
+        request_ids = self._prefill_runtime.discard(group)
+        self._batched_prefill_stats["discarded_tokens"] += sum(
+            group.processed_tokens_for(request_id) for request_id in request_ids
+        )
+        capacity_rejection = isinstance(error, PrefillMemoryExceededError)
+        if capacity_rejection:
+            self._batched_prefill_stats["fallbacks"]["memory_limit"] += 1
+        else:
+            self._batched_prefill_stats["failures"] += 1
+        memory_pressure = (
+            capacity_rejection
+            or isinstance(error, MemoryError)
+            or "Memory limit exceeded" in str(error)
+        )
+        for request_id in reversed(request_ids):
+            state = self._prefill_states.pop(request_id, None)
+            if state is None:
+                continue
+            request = state.request
+            state.cache = []
+            request._batched_prefill_disabled = True
+            request.prompt_cache = None
+            self._release_paged_cache_for_request(request_id)
+            self._drop_boundary_snapshots_for_request(request_id)
+            self.requests.pop(request_id, None)
+            self._clear_request_admission_bookkeeping(request_id)
+            get_prefill_tracker().remove(request_id)
+            if self._requeue_or_fail_prefill(
+                request, error, memory_pressure=memory_pressure
+            ):
+                self._batched_prefill_stats[
+                    "requeued_tokens"
+                ] += group.processed_tokens_for(request_id)
+                continue
+            rejected.append(
+                _prefill_memory_exception_output(request_id, error)
+                if capacity_rejection
+                else RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    error=str(error),
+                )
+            )
+
+    def _advance_prefill_group(
+        self,
+        group: BatchedPrefillGroup,
+        scheduled: list[Request],
+        rejected: list[RequestOutput],
+    ) -> None:
+        """Advance once and acknowledge each successfully registered decode row."""
+        started = time.perf_counter()
+        result = None
+        phase = "planning"
+        outcome = "failed"
+        try:
+            states = [
+                self._prefill_states[request_id]
+                for request_id in self._prefill_runtime.owned_ids(group)
+            ]
+            decision = self._plan_batched_prefill(states, group)
+            if isinstance(decision, PrefillDefer):
+                if decision.reason is PrefillReason.TOKEN_BUDGET:
+                    outcome = "deferred"
+                    return
+                self._reclaim_prefill_headroom()
+                decision = self._plan_batched_prefill(states, group)
+            if (
+                isinstance(decision, PrefillDefer)
+                and decision.reason is PrefillReason.MEMORY_LIMIT
+            ):
+                # A future batched forward may not fit even when copying the
+                # existing KV does. Admit that transition independently and
+                # preserve completed work; scalar execution retains its own
+                # forward guards. If the copy cannot fit, normal recovery runs.
+                phase = "demotion"
+                self._dissolve_prefill_group(group)
+                self._batched_prefill_stats["memory_demotions"] += 1
+                outcome = "demoted"
+                return
+            if (
+                isinstance(decision, PrefillFallback)
+                and decision.reason is PrefillReason.DURATION_LIMIT
+            ):
+                self._batched_prefill_stats["fallbacks"]["duration_limit"] += 1
+                phase = "demotion"
+                self._dissolve_prefill_group(group)
+                outcome = "demoted"
+                return
+            if not isinstance(decision, PrefillRun):
+                raise PrefillMemoryExceededError(
+                    "Batched prefill admission declined: " + decision.reason.value
+                )
+            plan = decision.plan
+            if self._prefill_tokens_remaining is not None:
+                self._prefill_tokens_remaining -= plan.total_tokens
+            phase = "forward"
+            result = self._prefill_runtime.advance(group, plan.chunk_tokens)
+            self._maybe_record_fixed_state_bytes(group.cache)
+            self._batched_prefill_stats["chunks"] += 1
+            self._batched_prefill_stats["tokens"] += result.processed_tokens
+            self._batched_prefill_stats["executed_tokens"] += result.executed_tokens
+            self._batched_prefill_stats["padding_tokens"] += result.padding_tokens
+            self._batched_prefill_stats["forward_seconds"] += result.elapsed_s
+            timing_key = (
+                len(result.request_ids),
+                max(state.total_length for state in states).bit_length(),
+            )
+            timing = self._batched_prefill_timings.setdefault(
+                timing_key, PrefillTiming()
+            )
+            timing.observe(
+                result.executed_tokens, result.elapsed_s, now=time.perf_counter()
+            )
+            phase = "memory"
+            Scheduler._check_post_prefill_memory(
+                self,
+                request_id=",".join(result.request_ids),
+                chunk_tokens=plan.chunk_tokens,
+                processed_tokens=group.tokens_processed,
+                total_tokens=max(state.total_length - 1 for state in states),
+                loop_label="batched",
+            )
+            phase = "progress"
+            with mx.stream(self._stream):
+                for state in states:
+                    request_id = state.request.request_id
+                    processed = result.tokens_for(request_id)
+                    state.tokens_processed = group.processed_tokens_for(request_id)
+                    state.request.text_positions_proven = True
+                    state.tokens_remaining = state.tokens_remaining[:, processed:]
+                    get_prefill_tracker().update(
+                        state.request.request_id,
+                        state.tokens_processed,
+                        state.total_length - 1,
+                        self.config.model_name,
+                    )
+                    if getattr(state.request, "benchmark_trace", False):
+                        state.request.benchmark_prefill_chunks.append(processed)
+                        state.request.benchmark_requested_steps.append(
+                            self.config.prefill_step_size
+                        )
+            phase = "cancellation"
+            for state in states:
+                if state.request.request_id in self._pending_abort_ids:
+                    self._cleanup_prefill_abort_request(state.request)
+            error = self._prefill_runtime.error_for(group)
+            if error is not None:
+                raise error
+            phase = "handoff"
+            for request_id in result.completed_request_ids:
+                if self._prefill_runtime.group_for(request_id) is not group:
+                    continue
+                state = self._prefill_states[request_id]
+                request = state.request
+                self._guard_prefill_group_transition(group, PrefillTransition.HANDOFF)
+                state.cache = self._prefill_runtime.prepare_handoff(group, request_id)
+                self._maybe_record_fixed_state_bytes(state.cache)
+                self._ensure_batch_generator(request.sampling_params)
+                if self.batch_generator is None:
+                    raise RuntimeError(
+                        "BatchGenerator unavailable at batched prefill completion"
+                    )
+                uid = self._insert_prefilled_request(request, state, scheduled)
+                if uid is None:
+                    raise RuntimeError(
+                        "BatchGenerator did not accept completed prefill"
+                    )
+                self._prefill_runtime.commit_handoff(group, request_id)
+                self._prefill_states.pop(request_id)
+                get_prefill_tracker().remove(request_id)
+            if group.valid:
+                if len(self._prefill_runtime.owned_ids(group)) == 1:
+                    phase = "demotion"
+                    self._dissolve_prefill_group(group)
+                elif self._prefill_runtime.needs_compaction(group):
+                    phase = "compaction"
+                    self._guard_prefill_group_transition(
+                        group, PrefillTransition.COMPACT
+                    )
+                    self._prefill_runtime.compact(group)
+            phase = "cleanup"
+            if self._should_clear_after_chunk():
+                Scheduler._clear_cache(self)
+            outcome = "completed"
+        except Exception as error:
+            logger.warning("Batched prefill stopped: %s", error)
+            self._fail_prefill_group(group, error, rejected)
+        finally:
+            elapsed = time.perf_counter() - started
+            self._batched_prefill_stats["step_seconds"] += elapsed
+            if result is not None:
+                logger.debug(
+                    "[batched-prefill] width=%d chunk=%d total_tokens=%d "
+                    "executed_tokens=%d padding_tokens=%d "
+                    "elapsed_ms=%.3f forward_ms=%.3f boundary_ms=%.3f "
+                    "outcome=%s phase=%s",
+                    len(result.request_ids),
+                    result.tokens_per_request,
+                    result.processed_tokens,
+                    result.executed_tokens,
+                    result.padding_tokens,
+                    elapsed * 1000,
+                    result.elapsed_s * 1000,
+                    max(0.0, elapsed - result.elapsed_s) * 1000,
+                    outcome,
+                    phase,
+                )
+            else:
+                logger.debug(
+                    "[batched-prefill-step] elapsed_ms=%.3f outcome=%s phase=%s",
+                    elapsed * 1000,
+                    outcome,
+                    phase,
+                )
+            self._accrue_decode_debt(elapsed)
+
     def _step_prefill_chunk(self, state: _PrefillState) -> bool:
         """Process one prefill chunk from *state*.
 
@@ -5569,6 +6120,8 @@ class Scheduler:
             state.tokens_processed, remaining
         )
         n = min(prefill_step_size, remaining)
+        if self._prefill_tokens_remaining is not None:
+            n = min(n, self._prefill_tokens_remaining)
 
         if state.tokens_processed == 0:
             Scheduler._clear_cache(self)
@@ -5623,6 +6176,9 @@ class Scheduler:
         )
         # Count only tokens actually passed to the model.
         n = min(n, remaining)
+        if self._prefill_tokens_remaining is not None:
+            n = min(n, self._prefill_tokens_remaining)
+            self._prefill_tokens_remaining -= n
         if getattr(state.request, "benchmark_trace", False):
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
@@ -5721,67 +6277,14 @@ class Scheduler:
             ),
         )
 
-        # Memory monitoring — use max(active, phys_footprint) so MLX cache
-        # pool and IOAccelerator-backed allocations that don't show up in
-        # mx.get_active_memory() still trigger the guard. Matches the
-        # _do_external_prefill check; on macOS jetsam watches
-        # phys_footprint, so the active-only check could miss the page
-        # before the kernel kills us.
-        if self._memory_limit_bytes > 0:
-            current = self._current_usage_bytes()
-            _hard = self._memory_hard_limit_bytes
-            _soft = self._memory_limit_bytes
-            # Caution-zone-only memcheck log (see external loop counterpart).
-            if current > _soft:
-                logger.debug(
-                    "[memcheck:chunked_step] rid=%s n=%d processed=%d/%d "
-                    "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
-                    state.request.request_id,
-                    n,
-                    state.tokens_processed,
-                    state.total_length - 1,
-                    current / 1024**3,
-                    _soft / 1024**3,
-                    _hard / 1024**3,
-                    "OVER_HARD" if _hard > 0 and current > _hard else "OVER_SOFT",
-                )
-            # Abort on the stable physical cap, not the jittery dynamic ceiling
-            # (mirrors the external prefill loop).
-            _abort = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
-            if _abort > 0 and current > _abort:
-                # Reclaim the just-computed chunk's Metal transients before
-                # giving up (mirrors the external prefill loop).
-                current = self._reclaim_prefill_headroom()
-                if current > _abort:
-                    raise RuntimeError(
-                        f"Memory limit exceeded during chunked prefill at "
-                        f"{state.tokens_processed}/{state.total_length - 1} tokens: "
-                        f"{current / 1024**3:.1f}GB exceeds physical cap "
-                        f"{_abort / 1024**3:.1f}GB (after reclaim)"
-                    )
-                logger.info(
-                    "Chunked prefill recovered after reclaim at %d/%d tokens "
-                    "(%.1fGB <= cap %.1fGB)",
-                    state.tokens_processed,
-                    state.total_length - 1,
-                    current / 1024**3,
-                    _abort / 1024**3,
-                )
-            elif current > self._memory_limit_bytes:
-                # Speed priority runs full chunks through this caution band
-                # by design — the per-chunk notice is DEBUG there, not a
-                # warning about an unexpected state.
-                _log = (
-                    logger.debug if self._prefill_speed_priority else logger.warning
-                )
-                _log(
-                    f"Chunked prefill above max_bytes at "
-                    f"{state.tokens_processed} tokens: "
-                    f"{current / 1024**3:.1f}GB > "
-                    f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                    f"(ceiling: "
-                    f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
-                )
+        Scheduler._check_post_prefill_memory(
+            self,
+            request_id=state.request.request_id,
+            chunk_tokens=n,
+            processed_tokens=state.tokens_processed,
+            total_tokens=state.total_length - 1,
+            loop_label="chunked_step",
+        )
 
         if self._should_clear_after_chunk():
             Scheduler._clear_cache(self)
@@ -5864,7 +6367,7 @@ class Scheduler:
         request: "Request",
         state: _PrefillState,
         scheduled: "list[Request]",
-    ) -> None:
+    ) -> int | None:
         """Insert a fully-prefilled request into BatchGenerator.
 
         Handles the batch_generator.insert() call, uid bookkeeping, and moving
@@ -5911,7 +6414,7 @@ class Scheduler:
                     request.request_id,
                     vlm_mtp_uid,
                 )
-                return
+                return vlm_mtp_uid
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
 
@@ -5930,22 +6433,35 @@ class Scheduler:
                 stop_sequences=[state.sm],
             )
         if uids:
-            _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
-            _mtp_priming.bind_uid(self.model, request.request_id, uid)
-            self.request_id_to_uid[request.request_id] = uid
-            self.uid_to_request_id[uid] = request.request_id
-            now = time.monotonic()
+            try:
+                _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
+                _mtp_priming.bind_uid(self.model, request.request_id, uid)
+                if hasattr(self.model, "register_rope_delta"):
+                    self.model.register_rope_delta(uid, request.rope_deltas)
+                _mark_text_positions(self.model, request, uid)
+                now = time.monotonic()
+                self.request_id_to_uid[request.request_id] = uid
+                self.uid_to_request_id[uid] = request.request_id
+                self.running[request.request_id] = request
+                scheduled.append(request)
+            except Exception:
+                _mtp_priming.release_uids(self.model, uids)
+                for inserted_uid in uids:
+                    self._remove_uid_from_active_batch(inserted_uid)
+                    _unregister_uid_row(self.model, inserted_uid)
+                    self.uid_to_request_id.pop(inserted_uid, None)
+                    if hasattr(self.model, "unregister_rope_delta"):
+                        self.model.unregister_rope_delta(inserted_uid)
+                self.request_id_to_uid.pop(request.request_id, None)
+                self.running.pop(request.request_id, None)
+                if request in scheduled:
+                    scheduled.remove(request)
+                raise
             request.batch_uid = uid
             request.status = RequestStatus.RUNNING
             request.generation_started_at = now
             request.last_activity_at = now
-            self.running[request.request_id] = request
-            scheduled.append(request)
-
-            if hasattr(self.model, "register_rope_delta"):
-                self.model.register_rope_delta(uid, request.rope_deltas)
-            _mark_text_positions(self.model, request, uid)
 
             self.total_prompt_tokens += request.num_prompt_tokens
             cache_info = (
@@ -5960,11 +6476,14 @@ class Scheduler:
                 request.num_prompt_tokens,
                 cache_info,
             )
+            return uid
+        return None
 
     def _advance_chunked_prefills(
         self,
         scheduled: "list[Request]",
         rejected: "list[RequestOutput]",
+        request_ids: set[str] | None = None,
     ) -> None:
         """Advance in-flight prefills until decode fairness requires a yield.
 
@@ -5983,6 +6502,7 @@ class Scheduler:
 
         pending_prefills = list(self.prefilling)
         still_prefilling: deque[Request] = deque()
+        advanced_ids: set[str] = set()
 
         for index, request in enumerate(pending_prefills):
             rid = request.request_id
@@ -5993,9 +6513,59 @@ class Scheduler:
             if state is None:
                 continue
 
+            if rid in advanced_ids or (
+                request_ids is not None and rid not in request_ids
+            ):
+                still_prefilling.append(request)
+                continue
+            if rid in self._pending_abort_ids:
+                self._cleanup_prefill_abort_request(request)
+                continue
+            group = self._prefill_runtime.group_for(rid)
+            if group is not None and not group.valid:
+                self._fail_prefill_group(
+                    group,
+                    self._prefill_runtime.error_for(group)
+                    or RuntimeError("Batched prefill cache invalidated"),
+                    rejected,
+                )
+                continue
             if not self._prefill_gate_open():
                 still_prefilling.extendleft(reversed(pending_prefills[index:]))
                 break
+
+            if (
+                self._prefill_runtime.is_candidate(rid)
+                and self._prefill_batch_limit() > 1
+                and not self._prefill_speed_priority
+            ):
+                self._form_prefill_group(pending_prefills[index:])
+            group = self._prefill_runtime.group_for(rid)
+            if group is not None and (
+                self._prefill_speed_priority
+                or group.batch_size == 1
+                or group.batch_size
+                > max(1, self.config.max_num_batched_tokens)
+            ):
+                try:
+                    self._dissolve_prefill_group(group)
+                except Exception as error:
+                    self._fail_prefill_group(group, error, rejected)
+                    continue
+            group = self._prefill_runtime.group_for(rid)
+            if group is not None:
+                if (
+                    self._prefill_tokens_remaining is not None
+                    and self._prefill_tokens_remaining < group.batch_size
+                ):
+                    still_prefilling.extendleft(reversed(pending_prefills[index:]))
+                    break
+                advanced_ids.update(self._prefill_runtime.owned_ids(group))
+                self._advance_prefill_group(group, scheduled, rejected)
+                if rid in self._prefill_states:
+                    still_prefilling.append(request)
+                continue
+            self._prefill_runtime.unstage(rid)
 
             try:
                 done = self._step_prefill_chunk(state)
@@ -6084,7 +6654,11 @@ class Scheduler:
 
             self._insert_prefilled_request(request, state, scheduled)
 
-        self.prefilling = still_prefilling
+        self.prefilling = deque(
+            request
+            for request in still_prefilling
+            if request.request_id in self._prefill_states
+        )
 
     def _build_state_machine(self, request: "Request") -> StopSequences:
         """Build a StopSequences for per-request stop tokens.
@@ -10085,6 +10659,8 @@ class Scheduler:
 
         # Remove from chunked-prefill queue (if mid-prefill)
         if request_id in self._prefill_states:
+            state = self._prefill_states[request_id]
+            self._release_prefill_group_row(state)
             self._prefill_states.pop(request_id, None)
             self.prefilling = deque(
                 r for r in self.prefilling if r.request_id != request_id
@@ -10286,6 +10862,7 @@ class Scheduler:
         Returns:
             List of failed request IDs.
         """
+        self._close_prefill_groups()
         failed_ids: list[str] = []
         for request_id in list(self.running):
             failed_ids.append(request_id)
@@ -10838,6 +11415,8 @@ class Scheduler:
         """
         scheduled = []
         rejected_outputs: list[RequestOutput] = []
+        staged_prefill_ids: set[str] = set()
+        staged_priority: int | None = None
 
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
@@ -10953,6 +11532,8 @@ class Scheduler:
                     break
 
             request = self.waiting[0]
+            if staged_prefill_ids and request.priority != staged_priority:
+                break
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
             if self._should_defer_for_cache_freshness(request):
@@ -11103,6 +11684,18 @@ class Scheduler:
                     )
                 )
                 continue
+
+            if self._stage_batched_prefill(
+                request, tokens_to_process, cache_to_use, sampler, logits_processors
+            ):
+                staged_prefill_ids.add(request.request_id)
+                staged_priority = request.priority
+                if len(staged_prefill_ids) >= self._prefill_batch_limit():
+                    break
+                continue
+            if staged_prefill_ids:
+                self.waiting.appendleft(request)
+                break
 
             # SpecPrefill: replace tokens with selected subset and pre-fill
             # cache via sparse_prefill before inserting into BatchGenerator.
@@ -11313,10 +11906,12 @@ class Scheduler:
                     if force_chunk
                     else self.config.prefill_step_size
                 )
-                if (
-                    (self.config.chunked_prefill or force_chunk)
-                    and vlm_embeds is None
-                    and len(tokens_to_process) > chunk_threshold + 1
+                if vlm_embeds is None and (
+                    self._prefill_tokens_remaining is not None
+                    or (
+                        (self.config.chunked_prefill or force_chunk)
+                        and len(tokens_to_process) > chunk_threshold + 1
+                    )
                 ):
                     sm = self._build_state_machine(request)
                     per_row_lps = list(logits_processors) if logits_processors else []
@@ -11608,6 +12203,10 @@ class Scheduler:
                     f"({request.num_prompt_tokens} total){cache_info}, {cache_used}"
                 )
 
+        if staged_prefill_ids:
+            self._advance_chunked_prefills(
+                scheduled, rejected_outputs, staged_prefill_ids
+            )
         return scheduled, rejected_outputs
 
     def _process_batch_responses(
@@ -12609,6 +13208,9 @@ class Scheduler:
 
     def _drop_from_prefill_queues(self, request_id: str) -> None:
         """Remove a request from the chunked-prefill queue and its state."""
+        state = self._prefill_states.get(request_id)
+        if state is not None:
+            self._release_prefill_group_row(state)
         self._prefill_states.pop(request_id, None)
         get_prefill_tracker().remove(request_id)
         if any(request.request_id == request_id for request in self.prefilling):
@@ -12636,6 +13238,7 @@ class Scheduler:
         failed_ids: list[str] = []
         count = 0
         if is_corruption:
+            self._close_prefill_groups()
             candidates = [
                 (request.request_id, request)
                 for request in self._collect_corruption_retry_requests()
@@ -12702,6 +13305,7 @@ class Scheduler:
             collect(request)
 
         collected_ids = {request.request_id for request in retry_candidates}
+        self._close_prefill_groups()
         for request_id in collected_ids:
             self.running.pop(request_id, None)
             self._prefill_states.pop(request_id, None)
@@ -12749,7 +13353,13 @@ class Scheduler:
     # failure before we give up and emit a clean error to the client.
     _MAX_PREFILL_OOM_RETRIES = 2
 
-    def _requeue_or_fail_prefill(self, request: "Request", error: Exception) -> bool:
+    def _requeue_or_fail_prefill(
+        self,
+        request: "Request",
+        error: Exception,
+        *,
+        memory_pressure: bool | None = None,
+    ) -> bool:
         """Decide whether to requeue a prefill that hit the memory ceiling.
 
         The three #1405 catch sites have already torn the request down
@@ -12764,7 +13374,9 @@ class Scheduler:
         Only memory-limit failures are retried; any other RuntimeError fails
         immediately so genuine model errors don't loop.
         """
-        if "Memory limit exceeded" not in str(error):
+        if memory_pressure is None:
+            memory_pressure = "Memory limit exceeded" in str(error)
+        if not memory_pressure:
             return False
         if request.prefill_oom_retries >= self._MAX_PREFILL_OOM_RETRIES:
             logger.warning(
@@ -12850,6 +13462,21 @@ class Scheduler:
         )
 
     def step(self) -> SchedulerOutput:
+        """Run a scheduler turn with one shared opt-in text-prefill token budget."""
+        self._step_prefill_batch_size = self.config.prefill_max_batch_size
+        batching_active = (
+            self._prefill_batch_limit() > 1 or self._prefill_runtime.has_groups
+        )
+        self._prefill_tokens_remaining = (
+            max(1, self.config.max_num_batched_tokens) if batching_active else None
+        )
+        try:
+            return self._step_with_recovery()
+        finally:
+            self._prefill_tokens_remaining = None
+            self._step_prefill_batch_size = None
+
+    def _step_with_recovery(self) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
 
@@ -13190,6 +13817,10 @@ class Scheduler:
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
         }
+        stats["batched_prefill"] = {
+            **self._batched_prefill_stats,
+            "fallbacks": dict(self._batched_prefill_stats["fallbacks"]),
+        }
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
@@ -13234,6 +13865,8 @@ class Scheduler:
 
         # Drain any pending deferred aborts
         self._pending_abort_ids.clear()
+
+        self._close_prefill_groups()
 
         # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):

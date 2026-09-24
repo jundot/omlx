@@ -1008,6 +1008,40 @@ class EnginePool:
                 if isinstance(engine, EmbeddingEngine):
                     engine._batch_size = batch_size
 
+    def _effective_prefill_batch_size(self, model_id: str, settings=None) -> int:
+        if settings is None and self._settings_manager is not None:
+            settings = self._settings_manager.get_settings(model_id)
+        override = getattr(settings, "prefill_max_batch_size", None)
+        if override is not None:
+            if type(override) is not int or override < 1:
+                raise ValueError("prefill_max_batch_size must be a positive integer")
+            return override
+        return self._scheduler_config.prefill_max_batch_size
+
+    def _apply_model_prefill_batch_size(self, model_id: str, settings=None) -> None:
+        entry = self._entries.get(model_id)
+        if entry is None or entry.engine is None:
+            return
+        scheduler = self._resolve_scheduler_from_engine(entry.engine)
+        if scheduler is not None:
+            scheduler.config.prefill_max_batch_size = self._effective_prefill_batch_size(
+                model_id, settings
+            )
+
+    async def apply_model_prefill_max_batch_size(self, model_id: str) -> None:
+        """Resolve persisted model settings under the engine-load lock."""
+        async with self._lock:
+            self._apply_model_prefill_batch_size(model_id)
+
+    async def apply_prefill_max_batch_size(self, batch_size: int) -> None:
+        """Update inherited limits while retaining explicit model overrides."""
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("prefill_max_batch_size must be a positive integer")
+        async with self._lock:
+            self._scheduler_config.prefill_max_batch_size = batch_size
+            for model_id in self._entries:
+                self._apply_model_prefill_batch_size(model_id)
+
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
     ) -> None:
@@ -2978,6 +3012,10 @@ class EnginePool:
             # right values when it builds `SchedulerConfig` internally.
             self._scheduler_config.model_name = model_id
             self._scheduler_config.model_path = entry.model_path
+            scheduler_config = copy.copy(self._scheduler_config)
+            scheduler_config.prefill_max_batch_size = self._effective_prefill_batch_size(
+                model_id, model_settings
+            )
 
             # Native MTP forces LM-only dispatch even for VLM models. Vision
             # encoder weights are ignored because the patched mtp_forward only
@@ -3037,7 +3075,7 @@ class EnginePool:
                             ),
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
-                            scheduler_config=self._scheduler_config,
+                            scheduler_config=scheduler_config,
                             omlx_ssd_cache_dir=getattr(
                                 self._scheduler_config, "paged_ssd_cache_dir", None
                             ),
@@ -3104,7 +3142,7 @@ class EnginePool:
                     engine = EmbeddingEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
-                        scheduler_config=self._scheduler_config,
+                        scheduler_config=scheduler_config,
                     )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(
@@ -3115,7 +3153,7 @@ class EnginePool:
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
-                        scheduler_config=self._scheduler_config,
+                        scheduler_config=scheduler_config,
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
@@ -3132,7 +3170,7 @@ class EnginePool:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
-                        scheduler_config=self._scheduler_config,
+                        scheduler_config=scheduler_config,
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
@@ -3168,7 +3206,7 @@ class EnginePool:
                         engine = VLMBatchedEngine(
                             model_name=entry.model_path,
                             trust_remote_code=trc,
-                            scheduler_config=self._scheduler_config,
+                            scheduler_config=scheduler_config,
                             model_settings=model_settings,
                             prefill_eviction_callback=prefill_eviction_callback,
                         )
@@ -3176,7 +3214,7 @@ class EnginePool:
                         engine = BatchedEngine(
                             model_name=entry.model_path,
                             trust_remote_code=trc,
-                            scheduler_config=self._scheduler_config,
+                            scheduler_config=scheduler_config,
                             model_settings=model_settings,
                             prefill_eviction_callback=prefill_eviction_callback,
                         )
@@ -3214,7 +3252,7 @@ class EnginePool:
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
-                        scheduler_config=self._scheduler_config,
+                        scheduler_config=scheduler_config,
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
@@ -3250,7 +3288,7 @@ class EnginePool:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
-                        scheduler_config=self._scheduler_config,
+                        scheduler_config=scheduler_config,
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
