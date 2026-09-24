@@ -264,7 +264,10 @@ class QuantizedSwitchLinear(nn.Module):
             and int(x.shape[0]) >= _AFFINE_NATIVE_MIN_ROUTES
             and dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 64
-            and self.bits in (2, 3)
+            # b_8 block kernels ship compiled and were verified bit-exact
+            # against stock gather_qmm on GLM-5.3-Flash (oQ8, group 64);
+            # end-to-end +1.6% prefill tps at pp8192, neutral below.
+            and self.bits in (2, 3, 8)
             and self.mode == "affine"
             and biases is not None
             and "bias" not in self

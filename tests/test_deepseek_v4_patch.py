@@ -2422,6 +2422,21 @@ class TestAffineBlockRouteThreshold:
         # unsorted routes never take the block path, whatever the count
         assert linear._can_use_affine_blocks(at, sorted_indices=False) is False
 
+    def test_affine_blocks_allow_oq8_metadata(self, monkeypatch):
+        """oQ8 (bits=8, group=64) takes the block path: b_8 kernels ship
+        compiled and were verified bit-exact on GLM-5.3-Flash."""
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl.glm_fast, "has_symbol", lambda name: True)
+        linear = self._linear()
+        linear.bits = 8
+        at = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES, 1, 64), dtype=mx.bfloat16)
+        assert linear._can_use_affine_blocks(at, sorted_indices=True) is True
+        linear.bits = 4
+        assert linear._can_use_affine_blocks(at, sorted_indices=True) is False
+
     def test_thresholds_default_to_the_measured_crossovers(self):
         from omlx.patches.deepseek_v4 import switch_layers as sl
 
