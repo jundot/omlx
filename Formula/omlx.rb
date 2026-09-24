@@ -151,7 +151,9 @@ class Omlx < Formula
   # The 0.1.32+ wheel ships libxgrammar_bindings.dylib with
   # @rpath/libtvm_ffi.dylib but no LC_RPATH pointing at where tvm_ffi
   # installs its native lib, and the dist-info is missing a RECORD
-  # entry for the dylib so tvm_ffi's manifest-based lookup fails.
+  # entry for the dylib so tvm_ffi's manifest-based lookup fails. Homebrew's
+  # cleanup can remove that metadata after installation, so also expose the
+  # binding from tvm_ffi's stable fallback library directory.
   # Both manifest as RuntimeError("Cannot find library: ...") at
   # `import xgrammar`, which crashes /admin/api/grammar/parsers and
   # hides the Reasoning Parser dropdown. Tracking upstream:
@@ -170,6 +172,21 @@ class Omlx < Formula
 
     odie "xgrammar dylib not found at #{dylib}" unless File.exist?(dylib)
     odie "xgrammar dist-info not found under #{site}" if dist_dirs.empty?
+
+    # Patch 0: tvm_ffi first consults package metadata, then searches its own
+    # lib directory. A relative link keeps that fallback valid even if brew
+    # removes RECORD during relocation/cleanup.
+    loader_dylib = "#{tvmlib}/libxgrammar_bindings.dylib"
+    if File.exist?(loader_dylib)
+      unless File.realpath(loader_dylib) == File.realpath(dylib)
+        odie "unexpected xgrammar binding at #{loader_dylib}"
+      end
+      ohai "  loader fallback link already points at xgrammar"
+    else
+      relative_dylib = Pathname.new(dylib).relative_path_from(Pathname.new(tvmlib))
+      ohai "  linking loader fallback -> #{relative_dylib}"
+      FileUtils.ln_sf relative_dylib, loader_dylib
+    end
 
     # Patch 1: add tvm_ffi/lib to the dylib's rpath, then re-codesign so
     # macOS will load the modified dylib.
