@@ -598,6 +598,7 @@ class GlobalSettingsRequest(BaseModel):
     sse_keepalive_mode: str | None = None
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
+    gpu_keepwarm: bool | None = None  # applies on restart
     preserve_mid_system_cache: bool | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
@@ -4559,6 +4560,7 @@ def _global_settings_response(global_settings):
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
             "qwen4_gdn_decode_wide_proj": global_settings.server.qwen4_gdn_decode_wide_proj,
+            "gpu_keepwarm": getattr(global_settings.server, "gpu_keepwarm", True),
             "preserve_mid_system_cache": getattr(
                 global_settings.server,
                 "preserve_mid_system_cache",
@@ -4853,6 +4855,10 @@ async def update_global_settings(
                     cfg.decode_burst_budget_single_s = single_s
         runtime_applied.append("burst_decode_mode")
         logger.info(f"Burst Decode mode set to '{mode}'")
+    # No runtime_applied: the engine loop reads the keepwarm flag once, when it
+    # starts, so this only takes effect on the next start.
+    if request.gpu_keepwarm is not None:
+        global_settings.server.gpu_keepwarm = bool(request.gpu_keepwarm)
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
