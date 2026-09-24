@@ -6485,6 +6485,19 @@ class Scheduler:
                 )
                 if parser_trailing_ids is not None:
                     trailing_ids = parser_trailing_ids
+                # Gemma 4 opens <|channel>thought itself, so only count once
+                # the model opens thinking unless the prompt already did. K2
+                # Horizon may open any of three markers but exposes only the
+                # first, so keep starting in thinking there rather than leave
+                # a think_fast block unbudgeted.
+                factory = getattr(self, "_output_parser_factory", None)
+                parser_think_start = self._get_output_parser_thinking_start_text()
+                think_start_ids = (
+                    self._encode_thinking_marker(parser_think_start)
+                    if parser_think_start
+                    and not getattr(factory, "thinking_marker_pairs", ())
+                    else None
+                )
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
                     budget=sampling_params.thinking_budget,
@@ -6492,6 +6505,11 @@ class Scheduler:
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
                     token_to_piece=self._thinking_budget_token_to_piece,
+                    start_in_thinking=(
+                        getattr(request, "needs_think_prefix", False)
+                        or not think_start_ids
+                    ),
+                    think_start_token_ids=think_start_ids,
                 )
                 logits_processors.append(processor)
 
