@@ -4971,6 +4971,13 @@ def final_qwen_parser():
 
 
 @pytest.mark.parametrize(
+    "parser_module",
+    [
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ],
+)
+@pytest.mark.parametrize(
     "value",
     [
         "안녕하세요 🌍",
@@ -4980,8 +4987,11 @@ def final_qwen_parser():
         "x" * 50000,
     ],
 )
-def test_final_qwen_outer_recovery_preserves_parameter_bytes(final_qwen_parser, value):
+def test_final_qwen_outer_recovery_preserves_parameter_bytes(
+    final_qwen_parser, monkeypatch, parser_module, value
+):
     tok, tools = final_qwen_parser
+    monkeypatch.setattr(tok.tool_parser, "__module__", parser_module)
     raw = (
         f"<tool_call><function=write><parameter=content>{value}</parameter></function>"
     )
@@ -5391,3 +5401,97 @@ def test_attribute_call_preserves_following_other_dialect_call():
         "/workspace/TASK.md",
         "/second",
     ]
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    [
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ],
+)
+@pytest.mark.parametrize("keyword", ["oneOf", "anyOf"])
+def test_qwen_untyped_tool_parameter(monkeypatch, parser_module, keyword):
+    tokenizer = TestNakedQwenFollowup.tokenizer()
+    monkeypatch.setattr(tokenizer.tool_parser, "__module__", parser_module)
+    schema = {
+        "type": "object",
+        "properties": {
+            "plugin": {
+                keyword: [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "new"},
+                            "idPrefix": {"type": "string"},
+                        },
+                        "required": ["kind", "idPrefix"],
+                    },
+                    {"type": "array", "items": {"type": "string"}},
+                ]
+            },
+            "literal": {"type": "string"},
+            "count": {"type": "integer"},
+        },
+        "required": ["plugin", "literal", "count"],
+    }
+    tools = [{"type": "function", "function": {"name": "f", "parameters": schema}}]
+    raw = (
+        '<tool_call><function=f><parameter=plugin>{"kind":"new","idPrefix":"abc"}'
+        "</parameter><parameter=literal>123</parameter><parameter=count>7</parameter>"
+        "</function></tool_call>"
+    )
+    result = extract_tool_calls_with_thinking(
+        "", raw, tokenizer, tools, finish_reason="stop"
+    )
+    assert not result.parse_errors
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args == {
+        "plugin": {"kind": "new", "idPrefix": "abc"},
+        "literal": "123",
+        "count": 7,
+    }
+    assert validate_json_schema(args, schema)[0]
+
+
+@pytest.mark.parametrize(
+    "spec, raw, expected",
+    [
+        (
+            {"anyOf": [{"type": "array"}, {"type": "null"}]},
+            "[true, null]",
+            [True, None],
+        ),
+        ({"oneOf": [{"type": "string"}, {"type": "object"}]}, '"123"', "123"),
+        (
+            {"oneOf": [{"type": "string"}, {"type": "object"}]},
+            "plain text",
+            "plain text",
+        ),
+        ({"type": "string"}, '{"a":1}', '{"a":1}'),
+        ({}, '{"unfinished":', '{"unfinished":'),
+    ],
+)
+def test_qwen_untyped_parameter_conversion_boundaries(spec, raw, expected):
+    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": spec}}}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        TestNakedQwenFollowup.tokenizer(),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == expected
+
+
+def test_qwen_untyped_parameter_is_not_decoded_twice(monkeypatch):
+    from mlx_lm.tool_parsers import qwen3_coder
+
+    monkeypatch.setattr(
+        qwen3_coder, "_convert_param_value", lambda value, *args: json.loads(value)
+    )
+    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": {}}}}}]
+    _, calls = parse_tool_calls(
+        '<tool_call><function=f><parameter=v>"123"</parameter></function></tool_call>',
+        TestNakedQwenFollowup.tokenizer(),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == "123"

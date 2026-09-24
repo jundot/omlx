@@ -431,6 +431,11 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
             continue
+        if path.name == "cs.json":
+            # Czech carries its own labels (ZAP/VYP), same exemption as zh.
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
+            continue
         for key, value in english.items():
             assert (
                 catalog[key] == value
@@ -442,7 +447,7 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     html = _model_settings_template()
     section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
     assert "modelSettings.moe_expert_offload_enabled" in section
-    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert "modelSettings.moe_expert_offload_resident_percent" in section
     assert ":disabled" in section
     for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
         assert f"modelSettings.{key}" in section

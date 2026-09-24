@@ -91,7 +91,8 @@ def test_flash_sdpa256_chunked_prefill_offset_causal(q_len, k_len):
     assert _max_abs(out, ref) < 2e-2
 
 
-def test_flash_sdpa256_memory_is_sub_quadratic():
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
+def test_flash_sdpa256_memory_is_sub_quadratic(dtype):
     """Peak memory must grow ~O(L), not O(L^2). Over an 8K->32K span (4x in L)
     O(L^2) would grow ~16x; we require < 6x (O(L) is ~4x), a sharp signal."""
     if not hasattr(mx, "reset_peak_memory"):
@@ -101,7 +102,7 @@ def test_flash_sdpa256_memory_is_sub_quadratic():
     peaks = []
     for seq_len in (8192, 32768):
         baseline = mx.get_active_memory()
-        q, k, v = _qkv(seq_len, seq_len, n_q=6, n_kv=1)
+        q, k, v = _qkv(seq_len, seq_len, n_q=6, n_kv=1, dtype=dtype)
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
         mx.reset_peak_memory()
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
@@ -121,9 +122,9 @@ def test_metal_bounded_path_forces_mlx0322_fused_kernel(monkeypatch):
 
     monkeypatch.setattr(sdpa256.mx.metal, "is_available", lambda: True)
     monkeypatch.setattr(sdpa256.mx.fast, "scaled_dot_product_attention", fake_sdpa)
-    q = types.SimpleNamespace(shape=(1, 4, 16, 256))
-    k = types.SimpleNamespace(shape=(1, 2, 32, 256))
-    v = types.SimpleNamespace(shape=(1, 2, 32, 256))
+    q = types.SimpleNamespace(shape=(1, 4, 16, 256), dtype=mx.float16)
+    k = types.SimpleNamespace(shape=(1, 2, 32, 256), dtype=mx.float16)
+    v = types.SimpleNamespace(shape=(1, 2, 32, 256), dtype=mx.float16)
     assert sdpa256._flash_sdpa256(q, k, v, SCALE_256, "causal") is q
     assert calls == [
         {
@@ -201,8 +202,9 @@ def test_metal_array_masks_never_reach_native_fused(mask_kind, monkeypatch):
     assert calls[0][1] is sinks
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("mask", ["causal", None], ids=["causal", "none"])
-def test_metal_causal_and_none_keep_native_fused(mask, monkeypatch):
+def test_metal_causal_and_none_keep_native_fused(mask, dtype, monkeypatch):
     """The router dtype fix must not push the proven causal/no-mask paths off
     the native fused kernel."""
     from omlx.patches import sdpa256_attention as sdpa256
@@ -220,12 +222,34 @@ def test_metal_causal_and_none_keep_native_fused(mask, monkeypatch):
     monkeypatch.setattr(sdpa256.mx.fast, "scaled_dot_product_attention", fake_sdpa)
     monkeypatch.setattr(sdpa256, "_array_tiled_sdpa256", tiled)
 
-    q, k, v = _qkv(16, 32, n_q=4, n_kv=2)
+    q, k, v = _qkv(16, 32, n_q=4, n_kv=2, dtype=dtype)
     out = sdpa256._flash_sdpa256(q, k, v, SCALE_256, mask)
     assert out is q
     assert calls == [
         {"scale": SCALE_256, "mask": mask, "sinks": None, "force_fused": True}
     ]
+
+
+@pytest.mark.parametrize("fp32_input", ["all", "keys", "values", "mixed_16"])
+@pytest.mark.parametrize("mask", ["causal", None])
+def test_fp32_bounded_prefill_matches_reference(fp32_input, mask):
+    from omlx.patches.sdpa256_attention import _flash_sdpa256
+
+    q, k, v = _qkv(32, 8192, n_q=4, n_kv=2, dtype=mx.float32)
+    if fp32_input != "all":
+        q = q.astype(mx.float16)
+        if fp32_input == "mixed_16":
+            k = k.astype(mx.bfloat16)
+            v = v.astype(mx.float16)
+        elif fp32_input == "keys":
+            v = v.astype(mx.float16)
+        else:
+            k = k.astype(mx.float16)
+    out = _flash_sdpa256(q, k, v, SCALE_256, mask)
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask=mask)
+    mx.eval(out, ref)
+    assert out.dtype == ref.dtype == mx.float32
+    assert _max_abs(out, ref) < 2e-5
 
 
 @pytest.mark.parametrize("mask_kind", ["boolean", "additive"])

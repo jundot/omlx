@@ -1938,6 +1938,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(effective_scheduler, "prefill_speed_priority", None),
             getattr(effective_scheduler, "max_num_batched_tokens", None),
         )
+        del runtime_scheduler
 
         for pp_len in single_prompt_lengths:
             current_test += 1

@@ -716,6 +716,9 @@ class _MtpState:
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
     reentry_probe: bool = False
 
+    # Boundary tokens need a one-row forward on a private cache.
+    boundary_emit_pending: bool = False
+
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
 
@@ -1725,7 +1728,9 @@ def _clone_mtp_head_cache(mtp_cache: List[Any]) -> List[Any]:
                 setattr(new, attr, list(val))
         return new
 
-    return [clone_one(c) for c in mtp_cache]
+    cloned = copy.copy(mtp_cache)
+    cloned[:] = [clone_one(c) for c in mtp_cache]
+    return cloned
 
 
 def _trunk_norm_module(model: Any):
@@ -3312,6 +3317,7 @@ def _run_verify_cycle_chain(
     # accept can put its bonus token there. Neither token is present in the
     # backbone cache yet, so materialize it before the queue reaches it.
     materialize_boundary_emit = align > 0 and to_boundary > 0 and to_boundary == m + 1
+    state.boundary_emit_pending = materialize_boundary_emit
 
     # --- stats ---
     state.stats.cycles += 1
@@ -3375,6 +3381,7 @@ def _run_verify_cycle_chain(
         state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
         if materialize_boundary_emit:
             _materialize_mtp_boundary_emit(gen_batch, state)
+            state.boundary_emit_pending = False
         if state.controller is not None:
             was_warmup = bool(state.controller._warmup)
             keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))

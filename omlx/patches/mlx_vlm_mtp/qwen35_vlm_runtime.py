@@ -36,6 +36,7 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 
 from __future__ import annotations
 
+import importlib
 import logging
 import weakref
 from typing import Any
@@ -75,10 +76,43 @@ def apply() -> bool:
     # too; the function is idempotent so calling it twice is safe.
     _patch_vlm_model_adapter()
     _patch_vlm_outer_model_load_weights()
+    _patch_batch_cache_padding_identity()
 
     _APPLIED = True
     logger.info("mlx-vlm Qwen3.5 (dense) runtime MTP patch applied")
     return True
+
+
+def _patch_batch_cache_padding_identity() -> None:
+    """Refresh Qwen's padding metadata after ragged finalization.
+
+    Qwen keys it by array identity, so in-place updates require rebinding.
+    """
+    for module_name in ("mlx_lm.models.cache", "mlx_vlm.models.cache"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:
+            logger.debug(f"{module_name} not importable: {e}")
+            continue
+        for name in ("BatchKVCache", "BatchRotatingKVCache", "BatchQuantizedKVCache"):
+            cls = getattr(module, name, None)
+            if cls is None or getattr(cls, "_omlx_padding_rebind_patched", False):
+                continue
+            original_finalize = cls.finalize
+
+            def finalize(self, _original=original_finalize):
+                padding_pending = (
+                    getattr(self, "_right_padding", None) is not None
+                    or getattr(self, "_lengths", None) is not None
+                )
+                before = getattr(self, "left_padding", None)
+                _original(self)
+                after = getattr(self, "left_padding", None)
+                if padding_pending and isinstance(after, mx.array) and after is before:
+                    self.left_padding = mx.array(after)
+
+            cls.finalize = finalize
+            cls._omlx_padding_rebind_patched = True
 
 
 def _patch_vlm_outer_model_load_weights() -> None:

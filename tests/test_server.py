@@ -1134,7 +1134,9 @@ def test_responses_reasoning_cache_policy(
         "get_model_settings_for_request",
         lambda name: ModelSettings(cache_reasoning_output=forced),
     )
-    monkeypatch.setitem(srv.app.dependency_overrides, srv.verify_api_key, lambda: True)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
     with TestClient(srv.app, raise_server_exceptions=False) as client:
         response = client.post(
             "/v1/responses",

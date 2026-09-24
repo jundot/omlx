@@ -5273,3 +5273,84 @@ def test_responses_namespace_tool_continuation(
             for call in message.get("tool_calls", [])
         ] == ["mcp__demo", "mcp__other"]
     client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_stream_thinking_length_channels(api, with_tools):
+    from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import (
+        stream_anthropic_messages,
+        stream_chat_completion,
+        stream_responses_api,
+    )
+
+    text = "<think>unfinished</thi"
+    engine = MockBaseEngine()
+    engine.set_stream_outputs(
+        [
+            MockGenerationOutput(
+                text=text,
+                new_text=text,
+                finish_reason="length",
+                completion_tokens=64,
+                finished=True,
+            )
+        ]
+    )
+    messages = [{"role": "user", "content": "Reply OK"}]
+    kwargs = {}
+    if with_tools:
+        kwargs["tools"] = [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ]
+    if api == "chat":
+        request = ChatCompletionRequest(model="test-model", messages=messages)
+        stream = stream_chat_completion(engine, messages, request, **kwargs)
+    elif api == "anthropic":
+        request = AnthropicMessagesRequest(
+            model="test-model", messages=messages, max_tokens=64
+        )
+        stream = stream_anthropic_messages(engine, messages, request, **kwargs)
+    else:
+        request = ResponsesRequest(model="test-model", input="Reply OK")
+        stream = stream_responses_api(
+            engine, messages, request, store_response=False, **kwargs
+        )
+    events = parse_sse_events("".join([frame async for frame in stream]))
+    assert not any("error" in event for event in events)
+    if api == "chat":
+        deltas = [c["delta"] for e in events for c in e.get("choices", [])]
+        content = "".join(d.get("content") or "" for d in deltas)
+        reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
+    elif api == "anthropic":
+        deltas = [e.get("delta", {}) for e in events]
+        content = "".join(d.get("text") or "" for d in deltas)
+        reasoning = "".join(d.get("thinking") or "" for d in deltas)
+    else:
+        content = "".join(
+            e["delta"] for e in events if e["type"] == "response.output_text.delta"
+        )
+        reasoning = "".join(
+            e["delta"]
+            for e in events
+            if e["type"] == "response.reasoning_summary_text.delta"
+        )
+        final = next(
+            e["response"] for e in events if e["type"] == "response.incomplete"
+        )
+        assert not any(
+            b["text"]
+            for item in final["output"]
+            if item["type"] == "message"
+            for b in item["content"]
+            if b["type"] == "output_text"
+        )
+    assert content == ""
+    assert reasoning == "unfinished</thi"

@@ -464,6 +464,10 @@ A slower node can increase maximum model capacity while reducing token rate.
 The dashboard must present both effects rather than reducing cluster quality to
 one aggregate-memory number.
 
+A Mac with a ConnectX card driven by MCDMA can move the rank 1 to rank 0 stage
+activation over RDMA instead of the 10 GbE Ring hop, after a byte-checked probe
+proves the link before each launch. See [RDMA stage links](rdma-links.md).
+
 ## Hardware feasibility probe
 
 The normal path is entirely in the Cluster dashboard. When two CUDA workers

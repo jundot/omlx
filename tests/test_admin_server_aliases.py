@@ -1182,3 +1182,124 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         assert gs.cache.gdn_ssd_pending_max_size == "512MB"
         assert gs.cache.gdn_sidecar_state_dtype == "fp32"
         gs.save.assert_not_called()
+
+
+def test_global_defaults_ignore_overrides_and_do_not_write(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.server.port = 9123
+    gs.memory.prefill_memory_guard = False
+    gs.cache.ssd_cache_max_size = "321GB"
+    gs.auth.api_key = "keep-key"
+    gs.model.model_dirs = [str(tmp_path / "models")]
+    gs.save()
+    original = (tmp_path / "settings.json").read_bytes()
+    monkeypatch.setenv("OMLX_PORT", "9456")
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    app.dependency_overrides[admin_routes.require_admin] = lambda: True
+    with _patched_global_settings(gs), TestClient(app) as client:
+        response = client.get("/admin/api/global-settings/defaults")
+    assert response.status_code == 200
+    data = response.json()
+    defaults = GlobalSettings()
+    assert data["server"]["port"] == defaults.server.port
+    assert data["memory"]["prefill_memory_guard"] is True
+    assert data["cache"]["ssd_cache_max_size"] == "auto"
+    assert data["sampling"] == defaults.sampling.to_dict()
+    assert data["auth"]["api_key"] == ""
+    assert gs.server.port == 9123
+    assert gs.auth.api_key == "keep-key"
+    assert gs.model.model_dirs == [str(tmp_path / "models")]
+    assert (tmp_path / "settings.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("cache_size", ["auto", "1536MB"])
+def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
+    from omlx.scheduler import SchedulerConfig
+    from omlx.server import _server_state
+
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.save = MagicMock()
+    gs.cache.ssd_cache_max_size = cache_size
+    pool = MagicMock()
+    pool._scheduler_config = SchedulerConfig()
+    pool.get_loaded_model_ids.return_value = ["loaded-model"]
+    pool._unload_engine = AsyncMock()
+
+    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
+        data = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        payload = dict(data["cache"])
+        payload["cache_enabled"] = payload.pop("enabled")
+        payload.pop("gdn_ssd_split_enabled")
+        payload.pop("ane_compile_cache")
+        result = asyncio.run(
+            admin_routes.update_global_settings(
+                GlobalSettingsRequest(**payload), is_admin=True
+            )
+        )
+        assert "cache" not in result["runtime_applied"]
+        pool._unload_engine.assert_not_awaited()
+        assert gs.cache.ssd_cache_dir is None
+        assert gs.cache.ssd_cache_max_size == cache_size
+
+        payload["initial_cache_blocks"] = 512
+        result = asyncio.run(
+            admin_routes.update_global_settings(
+                GlobalSettingsRequest(**payload), is_admin=True
+            )
+        )
+        assert "cache" in result["runtime_applied"]
+        pool._unload_engine.assert_awaited_once_with("loaded-model")
+        assert pool._scheduler_config.paged_ssd_cache_auto_size == (
+            cache_size == "auto"
+        )
+        assert pool._scheduler_config.initial_cache_blocks == 512
+
+
+@pytest.mark.parametrize("alias, split", [("ssd", True), ("hot", False)])
+def test_gdn_storage_alias_only_rebuilds_on_policy_change(alias, split):
+    gs = GlobalSettings()
+    gs.save = MagicMock()
+    gs.cache.gdn_ssd_split_enabled = split
+    request = GlobalSettingsRequest(gdn_snapshot_storage=alias)
+
+    with (
+        _patched_global_settings(gs),
+        patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            new_callable=AsyncMock,
+            return_value=(True, "applied"),
+        ) as apply_cache,
+    ):
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+        apply_cache.assert_not_awaited()
+        gs.cache.gdn_ssd_split_enabled = not split
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+        apply_cache.assert_awaited_once()
+        assert gs.cache.gdn_ssd_split_enabled is split
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_qwen4_decode_setting_updates_future_model_loads(enabled):
+    from omlx.scheduler import SchedulerConfig
+    from omlx.server import _server_state
+
+    gs = _make_global_settings()
+    gs.server.qwen4_gdn_decode_wide_proj = not enabled
+    pool = SimpleNamespace(
+        _scheduler_config=SchedulerConfig(qwen4_gdn_decode_wide_proj=not enabled)
+    )
+    request = GlobalSettingsRequest(qwen4_gdn_decode_wide_proj=enabled)
+    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+    assert result["success"] is True
+    assert "qwen4_gdn_decode_wide_proj" not in result["runtime_applied"]
+    assert gs.server.qwen4_gdn_decode_wide_proj is enabled
+    assert pool._scheduler_config.qwen4_gdn_decode_wide_proj is enabled
+    gs.save.assert_called_once()

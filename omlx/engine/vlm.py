@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import functools
 import importlib
 import inspect
 import json
@@ -55,6 +56,7 @@ from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
 )
+from ..utils.video import expand_video_parts
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -593,19 +595,23 @@ def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
 
 
 def _has_audio_weights(model_dir: Path) -> bool:
-    """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
+    """Return True iff checkpoint shards or MiMo's sidecar contain audio weights."""
     import safetensors
 
     weight_files = list(model_dir.glob("*.safetensors"))
     sidecar = _resolve_optiq_vision_sidecar(model_dir)
     if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
         weight_files.append(sidecar)
+    mimo_audio_sidecar = model_dir / "omnimodal" / "audio_encoder.safetensors"
+    if mimo_audio_sidecar.is_file():
+        weight_files.append(mimo_audio_sidecar)
 
     for sf in weight_files:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
-                for k in f.keys():
-                    if k.startswith(("audio_tower.", "embed_audio.")):
+                # safetensors.safe_open exposes keys() but is not a Mapping.
+                for k in f.keys():  # noqa: SIM118
+                    if k.startswith(("audio_tower.", "embed_audio.", "audio_encoder.")):
                         return True
         except Exception:
             # Corrupt or unreadable shard — treat as no audio info, let
@@ -617,6 +623,9 @@ def _has_audio_weights(model_dir: Path) -> bool:
 # Text-only oQ checkpoints can retain embed_vision without a vision tower.
 _VISION_TOWER_MARKER = "vision_tower"
 _VISION_TENSOR_MARKERS = (_VISION_TOWER_MARKER, "embed_vision")
+# Moondream stores its tower under `vision` (current, converted) or
+# `vision_encoder` (2024 revisions) and never declares a vision_config.
+_VISION_TOWER_PATH_MARKERS = (_VISION_TOWER_MARKER, "vision", "vision_encoder")
 
 
 def _is_vision_tensor_key(key: str) -> bool:
@@ -626,7 +635,7 @@ def _is_vision_tensor_key(key: str) -> bool:
 
 def _is_vision_tower_key(key: str) -> bool:
     """Exclude orphan projection weights when detecting a vision tower."""
-    return _VISION_TOWER_MARKER in key.split(".")
+    return any(marker in key.split(".") for marker in _VISION_TOWER_PATH_MARKERS)
 
 
 def _has_vision_tower_weights(model_dir: Path) -> bool:
@@ -640,7 +649,8 @@ def _has_vision_tower_weights(model_dir: Path) -> bool:
 
     for sf in weight_files:
         with safetensors.safe_open(str(sf), framework="np") as f:
-            if any(_is_vision_tower_key(k) for k in f.keys()):
+            # safetensors.safe_open exposes keys() but is not a Mapping.
+            if any(_is_vision_tower_key(k) for k in f.keys()):  # noqa: SIM118
                 return True
     return False
 
@@ -730,9 +740,18 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
     import mlx.nn as _nn
     import mlx_vlm.utils as _vu
 
+    original_load_config = _vu.load_config
     original_update_module_configs = _vu.update_module_configs
     original_load_weights = _nn.Module.load_weights
     warned = False
+
+    def _text_capable_load_config(path, **kwargs):
+        cfg = original_load_config(path, **kwargs)
+        # mlx-vlm's gemma4 builds a vision tower unconditionally; gemma4_unified
+        # shares its language_model layout and runs without one.
+        if cfg.get("model_type") == "gemma4":
+            cfg = {**cfg, "model_type": "gemma4_unified"}
+        return cfg
 
     def _patched_update_module_configs(model_config, model_class, config, modules):
         model_config = original_update_module_configs(
@@ -768,11 +787,13 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
             )
         return original_load_weights(self, kept, *args, **kwargs)
 
+    _vu.load_config = _text_capable_load_config
     _vu.update_module_configs = _patched_update_module_configs
     _nn.Module.load_weights = _vision_filtering_load_weights
     try:
         yield
     finally:
+        _vu.load_config = original_load_config
         _vu.update_module_configs = original_update_module_configs
         _nn.Module.load_weights = original_load_weights
 
@@ -1423,10 +1444,13 @@ def _uses_mrope(vlm_model) -> bool:
 _QWEN_VISION_MODELS = {
     "qwen3_5",
     "qwen3_5_moe",
+    "prism_hadamard_qwen35",  # Ternary Bonsai 2 keeps the Qwen3.5 vision tower.
     "qwen3_vl",
     "qwen3_vl_moe",
     "qwen2_vl",
     "qwen2_5_vl",
+    "mimo_v2",
+    "mimo_v2_flash",
 }
 
 # Grid-based VLMs whose flat vision features can be split with grid_thw.
@@ -1914,6 +1938,8 @@ class VLMBatchedEngine(BaseEngine):
                 model_settings=self._model_settings,
                 for_vlm=True,
             )
+        except ValueError:
+            raise
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
 
@@ -1937,6 +1963,22 @@ class VLMBatchedEngine(BaseEngine):
                     Path(self._model_name)
                 ),
             ):
+                model_type = _read_config_model_type(self._model_name)
+                if model_type in {"mimo_v2", "mimo_v2_flash"}:
+                    from ..patches.mimo_v2.omnimodal import (
+                        has_vision_sidecar,
+                    )
+                    from ..patches.mimo_v2.omnimodal import (
+                        load as load_mimo_omnimodal,
+                    )
+
+                    if has_vision_sidecar(self._model_name):
+                        return load_mimo_omnimodal(
+                            self._model_name,
+                            model_settings=self._model_settings,
+                            trust_remote_code=self._trust_remote_code,
+                        )
+
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
                     is_vlm=True,
@@ -1945,7 +1987,6 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                model_type = _read_config_model_type(self._model_name)
                 if model_type == "deepseek_v41":
                     from ..patches.deepseek_v41.loading import load
 
@@ -2056,9 +2097,17 @@ class VLMBatchedEngine(BaseEngine):
                     0.25,
                 )
             )
+            # glm5_next Lightning MTP: the draft head's experts stay resident
+            # while the backbone streams (run_in_executor takes no kwargs,
+            # so bind with partial).
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
-                apply_moe_expert_offload,
+                functools.partial(
+                    apply_moe_expert_offload,
+                    mtp_resident=bool(
+                        getattr(self._model_settings, "mtp_enabled", False)
+                    ),
+                ),
                 self._vlm_model,
                 self._model_name,
                 fraction,
@@ -2279,8 +2328,13 @@ class VLMBatchedEngine(BaseEngine):
         try:
             from ..patches.qwen35_gdn_prework import (
                 apply_qwen35_gdn_prework_patch,
+                configure_qwen4_decode,
             )
 
+            configure_qwen4_decode(
+                self._vlm_model,
+                wide_projections=scheduler_config.qwen4_gdn_decode_wide_proj,
+            )
             apply_qwen35_gdn_prework_patch()
         except Exception:
             logger.debug("Qwen GDN prework patch not applied", exc_info=True)
@@ -2900,14 +2954,14 @@ class VLMBatchedEngine(BaseEngine):
                 )
             ):
                 formatted_messages.append(msg)
-            elif model_type == "glm5_next" and msg_num_images > 0:
-                # mlx-vlm does not yet register glm5_next in MODEL_CONFIG, so
-                # get_message_json() treats it as unsupported and its generic
-                # fallback strips image parts.  Preserve their relative order
-                # as template-visible markers; the checkpoint's native chat
-                # template expands each marker to the GLM image token triplet.
+            elif model_type == "glm5_next" and (
+                msg_num_images > 0 or msg_num_audios > 0
+            ):
+                # mlx-vlm does not register GLM-5 in MODEL_CONFIG. Preserve
+                # media parts and their relative order for its native template.
                 glm_content: list[Any] = []
                 inserted_images = 0
+                inserted_audios = 0
                 if isinstance(raw_content, list):
                     for item in raw_content:
                         if isinstance(item, dict):
@@ -2921,16 +2975,27 @@ class VLMBatchedEngine(BaseEngine):
                             if inserted_images < msg_num_images:
                                 glm_content.append({"type": "image"})
                                 inserted_images += 1
+                        elif item_type in audio_part_types:
+                            if inserted_audios < msg_num_audios:
+                                glm_content.append({"type": "audio"})
+                                inserted_audios += 1
                         elif item_type == "text":
                             glm_content.append({"type": "text", "text": item_text})
                         elif isinstance(item, str):
                             glm_content.append(item)
 
-                if inserted_images < msg_num_images:
-                    glm_content[:0] = [
+                missing_media = [
+                    *(
                         {"type": "image"}
                         for _ in range(msg_num_images - inserted_images)
-                    ]
+                    ),
+                    *(
+                        {"type": "audio"}
+                        for _ in range(msg_num_audios - inserted_audios)
+                    ),
+                ]
+                if missing_media:
+                    glm_content[:0] = missing_media
                 if not any(
                     isinstance(item, str)
                     or (isinstance(item, dict) and item.get("type") == "text")
@@ -2939,6 +3004,62 @@ class VLMBatchedEngine(BaseEngine):
                     glm_content.append({"type": "text", "text": content})
 
                 formatted_messages.append({"role": role, "content": glm_content})
+            elif model_type in {"mimo_v2", "mimo_v2_flash"}:
+                # mlx-vlm's get_message_json does not support MiMo, even for
+                # text-only history. Format every turn here so one earlier text
+                # message cannot trigger the fallback that drops image markers.
+                # Render media tokens before templates that drop media dicts.
+                mimo_content: list[str] = []
+                inserted_images = 0
+                inserted_audios = 0
+                inserted_text = False
+                if isinstance(raw_content, list):
+                    for item in raw_content:
+                        if isinstance(item, dict):
+                            item_type = item.get("type", "")
+                            item_text = item.get("text", "")
+                        else:
+                            item_type = getattr(item, "type", "")
+                            item_text = getattr(item, "text", "")
+
+                        if item_type in image_part_types:
+                            if inserted_images < msg_num_images:
+                                mimo_content.append(
+                                    "<|vision_start|><|image_pad|><|vision_end|>"
+                                )
+                                inserted_images += 1
+                        elif item_type in audio_part_types:
+                            if inserted_audios < msg_num_audios:
+                                mimo_content.append(
+                                    "<|mimo_audio_start|><|audio_pad|>"
+                                    "<|mimo_audio_end|>"
+                                )
+                                inserted_audios += 1
+                        elif item_type == "text":
+                            mimo_content.append(str(item_text))
+                            inserted_text = True
+                        elif isinstance(item, str):
+                            mimo_content.append(item)
+                            inserted_text = True
+
+                missing_media = [
+                    *(
+                        "<|vision_start|><|image_pad|><|vision_end|>"
+                        for _ in range(msg_num_images - inserted_images)
+                    ),
+                    *(
+                        "<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>"
+                        for _ in range(msg_num_audios - inserted_audios)
+                    ),
+                ]
+                if missing_media:
+                    mimo_content[:0] = missing_media
+                if not inserted_text:
+                    mimo_content.append(content)
+
+                formatted_messages.append(
+                    {"role": role, "content": "".join(mimo_content)}
+                )
             else:
                 formatted = get_message_json(
                     model_type,
@@ -3314,10 +3435,9 @@ class VLMBatchedEngine(BaseEngine):
             - token_ids: List of token IDs for BatchGenerator
             - inputs_embeds: Merged vision+text embeddings (or None if text-only)
             - extra_kwargs: Model-specific kwargs for language model
-            - image_hash: SHA256 hash of images for prefix cache
-            - image_cache_key_start: Token index where image-aware cache keying begins
-            - image_cache_key_ranges: Per-image-turn cache key boundaries with
-              cumulative image hashes
+            - image_hash: Image/audio identity for prefix cache
+            - image_cache_key_start: Token index where media-aware keying begins
+            - image_cache_key_ranges: Media boundaries with cumulative hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
@@ -3326,7 +3446,7 @@ class VLMBatchedEngine(BaseEngine):
         num_images = len(images)
         num_audios = len(audio) if audio else 0
 
-        model_type = self.model_type or ""
+        model_type = self.model_type or _read_config_model_type(self._model_name) or ""
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -3351,8 +3471,17 @@ class VLMBatchedEngine(BaseEngine):
                 )
 
                 ensure_mlx_audio_resample_export()
+            feature_extractor = getattr(self._processor, "feature_extractor", None)
+            target_sample_rate = (
+                getattr(feature_extractor, "sampling_rate", 16000)
+                if feature_extractor is not None
+                else 16000
+            )
+            if not isinstance(target_sample_rate, (int, float)):
+                target_sample_rate = 16000
             audio = [
-                _load_audio(a, 16000) if not isinstance(a, tuple) else a for a in audio
+                _load_audio(a, target_sample_rate) if not isinstance(a, tuple) else a
+                for a in audio
             ]
         # Validate multi-image support
         if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
@@ -3599,8 +3728,11 @@ class VLMBatchedEngine(BaseEngine):
             and v is not None
         }
 
-        # Check for any multimodal inputs: images or audio
-        has_audio = "input_features" in extra_model_inputs
+        # Check for any multimodal inputs. Most processors expose audio as
+        # ``input_features``; MiMo's tokenizer produces discrete ``audio_codes``.
+        has_audio = any(
+            key in extra_model_inputs for key in ("input_features", "audio_codes")
+        )
         has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
 
         if has_multimodal:
@@ -3762,6 +3894,22 @@ class VLMBatchedEngine(BaseEngine):
                 getattr(self._vlm_model, "language_model", None), extra_kwargs
             )
 
+            if model_type in {"mimo_v2", "mimo_v2_flash"} and has_audio:
+                from ..patches.mimo_v2.audio import audio_cache_key_ranges
+
+                # Keep vision-feature identities independent of audio inputs.
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                image_cache_key_ranges = audio_cache_key_ranges(
+                    token_ids,
+                    extra_model_inputs["audio_codes"],
+                    self._vlm_model.config.audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
+
             return (
                 token_ids,
                 embed_features.inputs_embeds,
@@ -3780,6 +3928,7 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
     ) -> str:
         """Apply chat template for text-only messages (no images).
 
@@ -3789,6 +3938,8 @@ class VLMBatchedEngine(BaseEngine):
                 ``partial`` key is cleaned from message dicts but no detection
                 is performed.  ``None`` (default) — auto-detect from messages
                 for direct engine callers.
+            add_generation_prompt: Overrides the partial-derived default, used
+                to render the same messages without the generation prompt.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
@@ -3798,9 +3949,11 @@ class VLMBatchedEngine(BaseEngine):
                 # so the chat template never sees the non-standard field.
                 for msg in messages:
                     msg.pop("partial", None)
+            if add_generation_prompt is None:
+                add_generation_prompt = not is_partial
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": not is_partial,
+                "add_generation_prompt": add_generation_prompt,
             }
             if is_partial:
                 template_kwargs["continue_final_message"] = True
@@ -3845,7 +3998,7 @@ class VLMBatchedEngine(BaseEngine):
                 return get_chat_template(
                     self._processor,
                     messages,
-                    add_generation_prompt=True,
+                    add_generation_prompt=add_generation_prompt,
                 )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -3866,6 +4019,8 @@ class VLMBatchedEngine(BaseEngine):
             "specprefill_keep_pct",
             "specprefill_threshold",
             "specprefill_system_end",
+            "generation_prompt_text",
+            "generation_prompt_persists",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -4219,6 +4374,9 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         loop = asyncio.get_running_loop()
+        # _process_chat_messages pops these; the tail marker needs them too.
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
         (
             prompt,
             vlm_embeds,
@@ -4236,6 +4394,10 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         return await self.generate(
             prompt=prompt,
@@ -4319,7 +4481,20 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, images, _ = extract_images_from_messages(messages)
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+        text_messages, images, _ = extract_images_from_messages(media_messages)
+        if (
+            images
+            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self._vlm_model.config.vision_config is None
+        ):
+            raise InvalidRequestError(
+                "This text-only Gemma 4 model does not support image input.",
+                field="messages",
+            )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
@@ -4447,6 +4622,9 @@ class VLMBatchedEngine(BaseEngine):
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
         loop = asyncio.get_running_loop()
+        # _process_chat_messages pops these; the tail marker needs them too.
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
         (
             prompt,
             vlm_embeds,
@@ -4464,6 +4642,10 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -4553,8 +4735,14 @@ class VLMBatchedEngine(BaseEngine):
         Returns:
             Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs, image_hash)
         """
-        # Extract images from messages
-        text_messages, images, audio = extract_images_from_messages(messages)
+        # MiMo consumes video as a bounded, chronological sequence of frames
+        # through the same vision tower used for still images.
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+
+        text_messages, images, audio = extract_images_from_messages(media_messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
@@ -4562,7 +4750,12 @@ class VLMBatchedEngine(BaseEngine):
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
         # on the first image-bearing turn and invalidates early prefix blocks.
-        vlm_messages = self._apply_ocr_prompt(messages) if images else text_messages
+        if images:
+            vlm_messages = self._apply_ocr_prompt(media_messages)
+        elif audio and model_type in {"mimo_v2", "mimo_v2_flash"}:
+            vlm_messages = media_messages
+        else:
+            vlm_messages = text_messages
         template_tools = convert_tools_for_template(tools) if tools else None
         (
             token_ids,
@@ -5012,10 +5205,14 @@ class VLMBatchedEngine(BaseEngine):
         For VLM messages with images, this counts only the text tokens.
         Image tokens are added during vision encoding and vary by model.
         """
-        # Extract text-only version for token counting
-        from ..utils.image import extract_images_from_messages
-
-        text_messages, _, _ = extract_images_from_messages(messages)
+        # Extract text-only version for token counting. MiMo videos must be
+        # sampled first; otherwise the generic extractor rejects video parts
+        # before the real request reaches the multimodal path.
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+        text_messages, _, _ = extract_images_from_messages(media_messages)
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(

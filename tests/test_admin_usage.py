@@ -254,7 +254,7 @@ def test_dashboard_renders_usage_history_switch_and_disabled_notice(client):
 
 def test_usage_history_i18n_keys_present_in_every_locale():
     locales = sorted(I18N_DIR.glob("*.json"))
-    assert len(locales) == 9
+    assert len(locales) == 10
     for locale_path in locales:
         locale = json.loads(locale_path.read_text(encoding="utf-8"))
         missing = {key for key in USAGE_HISTORY_I18N_KEYS if not locale.get(key)}

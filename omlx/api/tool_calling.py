@@ -1987,6 +1987,26 @@ def _parse_tool_calls_impl(
                     for p in items:
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
+                        if (
+                            getattr(tool_parser, "__module__", None)
+                            in (
+                                "mlx_lm.tool_parsers.qwen3_coder",
+                                "mlx_vlm.tools.parsers.qwen3_coder",
+                            )
+                            and isinstance(arguments, dict)
+                        ):
+                            props = _tool_param_properties(name, tools)
+                            # Use XML values to avoid decoding parsed strings twice.
+                            for key, val in _iter_xml_parameters(match):
+                                spec = props.get(key)
+                                if (
+                                    isinstance(spec, dict)
+                                    and "type" not in spec
+                                    and isinstance(arguments.get(key), str)
+                                ):
+                                    arguments[key] = _coerce_param_value(
+                                        val, key, props, name
+                                    )
                         _built = _build_tool_call(name, arguments)
                         if _built is not None:
                             tool_calls.append(_built)
@@ -2300,7 +2320,11 @@ def extract_tool_calls_with_thinking(
     if (
         finish_reason is not None
         and tools
-        and getattr(parser, "__module__", None) == "mlx_lm.tool_parsers.qwen3_coder"
+        and getattr(parser, "__module__", None)
+        in (
+            "mlx_lm.tool_parsers.qwen3_coder",
+            "mlx_vlm.tools.parsers.qwen3_coder",
+        )
     ):
         cleaned_text, tool_calls, parse_errors = parse_qwen_tool_calls(
             regular_content, tokenizer, tools, finish_reason

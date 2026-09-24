@@ -45,7 +45,7 @@ final class OMLXClient: ObservableObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil) {
+    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil, session: URLSession? = nil) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
@@ -56,7 +56,7 @@ final class OMLXClient: ObservableObject {
         cfg.httpCookieAcceptPolicy = .always
         cfg.timeoutIntervalForRequest = 15
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: cfg)
+        self.session = session ?? URLSession(configuration: cfg)
 
         let enc = JSONEncoder()
         enc.keyEncodingStrategy = .convertToSnakeCase
@@ -77,6 +77,10 @@ final class OMLXClient: ObservableObject {
 
     func getGlobalSettings() async throws -> GlobalSettingsDTO {
         try await get("/admin/api/global-settings")
+    }
+
+    func getGlobalSettingsDefaults() async throws -> GlobalSettingsDTO {
+        try await get("/admin/api/global-settings/defaults")
     }
 
     func updateGlobalSettings(_ patch: GlobalSettingsPatch) async throws -> UpdateGlobalSettingsResponse {

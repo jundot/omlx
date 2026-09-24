@@ -794,6 +794,29 @@ class BatchedEngine(BaseEngine):
                     cancelled = await _close_engine_core(self._engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
+
+        # ANE procedure banks retain native mapped weights and IOSurfaces on
+        # the model modules. Release them after the engine has stopped, but
+        # before dropping the wrapper's model reference, so unload does not
+        # depend on a later GC pass to reclaim the ANE allocation.
+        if self._model is not None:
+            try:
+                from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+                released, programs = release_qwen35_ane_prefill(self._model)
+                if released:
+                    logger.info(
+                        "Released %d ANE prefill module state(s) (%d program(s)) "
+                        "on engine stop",
+                        released,
+                        programs,
+                    )
+            except Exception:
+                # ANE is optional; a release failure must not prevent the
+                # normal wrapper teardown from clearing all other references.
+                logger.warning(
+                    "ANE prefill state release failed during stop", exc_info=True
+                )
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -815,6 +838,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -828,6 +852,8 @@ class BatchedEngine(BaseEngine):
                 key is cleaned from message dicts but no detection is performed.
                 ``None`` (default) — auto-detect from messages for backward
                 compatibility with direct engine callers.
+            add_generation_prompt: Overrides the partial-derived default, used
+                to render the same messages without the generation prompt.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
@@ -839,7 +865,11 @@ class BatchedEngine(BaseEngine):
                     msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": not is_partial,
+                "add_generation_prompt": (
+                    not is_partial
+                    if add_generation_prompt is None
+                    else add_generation_prompt
+                ),
             }
             if is_partial:
                 template_kwargs["continue_final_message"] = True
@@ -914,12 +944,12 @@ class BatchedEngine(BaseEngine):
 
     @staticmethod
     def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Pop SpecPrefill per-request overrides out of ``kwargs``.
+        """Pop per-request prompt overrides out of ``kwargs``.
 
         The engine's ``add_request`` accepts these as dedicated arguments, so
         they must be forwarded explicitly rather than left in ``**kwargs``.
         Shared by ``generate`` and ``stream_generate`` so both request paths
-        honour SpecPrefill overrides identically.
+        honour SpecPrefill overrides and the generation prompt marker alike.
         """
         specprefill_kwargs: dict[str, Any] = {}
         for key in (
@@ -927,6 +957,8 @@ class BatchedEngine(BaseEngine):
             "specprefill_keep_pct",
             "specprefill_threshold",
             "specprefill_system_end",
+            "generation_prompt_text",
+            "generation_prompt_persists",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -1247,6 +1279,10 @@ class BatchedEngine(BaseEngine):
         self._inject_specprefill_system_end(
             messages, prompt, template_tools, ct_kwargs, kwargs
         )
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         return await self.generate(
             prompt=prompt,
@@ -1405,6 +1441,10 @@ class BatchedEngine(BaseEngine):
         self._inject_specprefill_system_end(
             messages, prompt, template_tools, ct_kwargs, kwargs
         )
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         async for output in self.stream_generate(
             prompt=prompt,

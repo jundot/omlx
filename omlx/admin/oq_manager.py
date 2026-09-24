@@ -327,6 +327,7 @@ class OQManager:
             OQ_DTYPES,
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
+            _validate_v41_oq_settings,
             resolve_output_name,
             validate_gemma4_assistant_pair,
             validate_mtp_donor_pair,
@@ -346,6 +347,8 @@ class OQManager:
 
         with open(source / "config.json") as f:
             config = json.load(f)
+        if config.get("model_type") == "deepseek_v41":
+            _validate_v41_oq_settings(oq_level, dtype, group_size)
         _validate_oq_dtype_for_model(config, dtype)
 
         source_size = _safetensors_size(source)

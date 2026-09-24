@@ -508,3 +508,90 @@ def test_registry_rotating_family():
     assert not CacheTypeRegistry.is_rotating_family("TurboQuantKVCache")
     assert not CacheTypeRegistry.is_rotating_family("ArraysCache")
     assert not CacheTypeRegistry.is_rotating_family("SomethingElse")
+
+
+def test_superseded_tail_deleted_two_extensions_later(tmp_path):
+    """Tail tips follow the same lineage: the tail two turns back is dropped.
+
+    Each turn ends mid-block, so the previous turn's tail is popped when the
+    chain is extended and enters the lineage as the previous tip. A stripped
+    tail is only ever walked back over on restore, so it is deleted from the
+    cache instead of being rewritten with placeholders."""
+    cache, ssd = _make_cache(tmp_path)
+
+    def store_turn(rid, n_tokens):
+        table = cache.store_cache(
+            rid,
+            list(range(n_tokens)),
+            _hybrid_cache_data(seq_len=n_tokens),
+            _store_tail_terminal=True,
+        )
+        assert table is not None and table.num_tokens == n_tokens
+        cache.paged_cache.release_for_eviction(table.block_ids)
+        return table
+
+    def fetch_turn(rid, n_tokens):
+        table, remaining = cache.fetch_cache(rid, list(range(n_tokens)))
+        return table, remaining
+
+    t1 = store_turn("turn-1", 6)
+    tail1 = _block_hash(cache, t1, -1)
+    assert _rotating_layer_shape(ssd, tail1) == REAL_ROTATING_SHAPE
+
+    table, remaining = fetch_turn("turn-2", 10)
+    assert table.num_tokens == 6 and remaining == [6, 7, 8, 9]
+    t2 = store_turn("turn-2", 10)
+    tail2 = _block_hash(cache, t2, -1)
+    assert cache._rotating_tip_lineage.get(tail2) == tail1
+    # The immediate previous tail stays as the walk-back fallback.
+    assert ssd.has_block(tail1)
+    assert _rotating_layer_shape(ssd, tail2) == REAL_ROTATING_SHAPE
+
+    table, remaining = fetch_turn("turn-3", 14)
+    assert table.num_tokens == 10 and remaining == [10, 11, 12, 13]
+    t3 = store_turn("turn-3", 14)
+    tail3 = _block_hash(cache, t3, -1)
+    assert cache._rotating_tip_lineage.get(tail3) == tail2
+    # Two generations back: gone from every tier, not merely stripped.
+    assert not ssd.has_block(tail1)
+    assert cache.paged_cache.cached_block_hash_to_block.get_block(tail1) is None
+    assert tail1 not in cache._tail_hashes
+    assert ssd.has_block(tail2)
+    assert ssd.has_block(tail3)
+
+    # A lookup on the old branch prunes the stale tail entry and stops at
+    # the last full block.
+    table, remaining = fetch_turn("turn-4", 6)
+    assert table.num_tokens == 4 and remaining == [4, 5]
+    first_full = _block_hash(cache, t1, 0)
+    assert tail1 not in cache.paged_cache._tail_index.get(first_full, {})
+
+
+def test_shared_tail_is_not_deleted_while_referenced(tmp_path):
+    """A superseded tail still held by another request survives the lineage."""
+    cache, ssd = _make_cache(tmp_path)
+
+    def store_turn(rid, n_tokens):
+        table = cache.store_cache(
+            rid,
+            list(range(n_tokens)),
+            _hybrid_cache_data(seq_len=n_tokens),
+            _store_tail_terminal=True,
+        )
+        cache.paged_cache.release_for_eviction(table.block_ids)
+        return table
+
+    t1 = store_turn("turn-1", 6)
+    tail1 = _block_hash(cache, t1, -1)
+    # A concurrent request holds the tail.
+    holder, _ = cache.fetch_cache("holder", list(range(6)))
+    assert holder.num_tokens == 6
+
+    cache.fetch_cache("turn-2", list(range(10)))
+    store_turn("turn-2", 10)
+    cache.fetch_cache("turn-3", list(range(14)))
+    store_turn("turn-3", 14)
+
+    assert ssd.has_block(tail1)
+    held = cache.paged_cache.cached_block_hash_to_block.get_block(tail1)
+    assert held is not None and held.ref_count == 1

@@ -764,6 +764,115 @@ def test_adaptive_throttle_charges_recently_reclaimed_footprint():
     assert _call(ns, 2048, kv_len=147_680) < 2048
 
 
+@pytest.mark.parametrize("gathered_core", [False, True])
+@pytest.mark.parametrize("path", ["adaptive", "guard", "adaptive_then_guard"])
+def test_generic_chunk_sizing_preserves_fixed_reclaim_charge(path, gathered_core):
+    """Shrinking token-scaled work must not discount released pool bytes."""
+    mib = 1024**2
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    current = cap - 1000 * mib
+    ns = _throttle_ctx(
+        current=current,
+        hard=hard,
+        monitor=_monitor(head_dim=128),
+        min_chunk=32,
+    )
+    ns._fake_current = current
+    ns._prefill_transient_tracker.record_reclaim(960 * mib)
+
+    chosen = 512
+    if path != "guard":
+        chosen = _call(ns, chosen, kv_len=90000, gathered_core=gathered_core)
+    if path != "adaptive":
+        chosen = _guard_call(ns, chosen, kv_len=90000, gathered_core=gathered_core)
+
+    # Use the unchanged production admission predictor for each legal width.
+    # The full requested width cannot fit; the floor and smaller widths can.
+    fitting = [
+        n
+        for n in range(32, 513, 32)
+        if ns._admission_transient_bound(n, 90000, gathered_core=gathered_core)
+        <= cap - current
+    ]
+    assert fitting and max(fitting) < 512
+    assert chosen == max(fitting)
+    assert (
+        current
+        + ns._admission_transient_bound(chosen, 90000, gathered_core=gathered_core)
+        <= cap
+    )
+
+
+@pytest.mark.parametrize("gathered_core", [False, True])
+def test_generic_reclaim_that_cannot_fit_still_aborts(gathered_core):
+    """Searching smaller chunks cannot evade a size-independent charge."""
+    mib = 1024**2
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    current = cap - 1000 * mib
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=_monitor(head_dim=128), min_chunk=32
+    )
+    ns._fake_current = current
+    ns._prefill_transient_tracker.record_reclaim(1001 * mib)
+
+    chosen = _call(ns, 512, kv_len=90000, gathered_core=gathered_core)
+    assert chosen == 32
+    with pytest.raises(PrefillMemoryExceededError):
+        _guard_call(ns, chosen, kv_len=90000, gathered_core=gathered_core)
+
+
+@pytest.mark.parametrize("path", ["adaptive", "guard"])
+@pytest.mark.parametrize("snap", ["0", "1"])
+@pytest.mark.parametrize("budget_tokens", [32, 63, 64, 511, 512, 513])
+def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
+    monkeypatch, path, snap, budget_tokens
+):
+    """A linear predictor keeps its previous sizes, including the opt-out."""
+    monkeypatch.setenv("OMLX_CHUNK_SNAP", snap)
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    # A 10-byte observation produces an exactly representable 13-byte
+    # prediction after safety, making cap equality independent of rounding.
+    current = cap - budget_tokens * 13
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=10, min_chunk=32)
+    ns._fake_current = current
+    call = _call if path == "adaptive" else _guard_call
+    chosen = call(ns, 512)
+
+    expected = min(512, budget_tokens)
+    if snap == "1":
+        expected = expected // 32 * 32
+    assert chosen == expected
+    assert current + ns._admission_transient_bound(chosen, 0) <= cap
+
+
+@pytest.mark.parametrize(
+    ("requested", "reclaim_mib"),
+    [(1, 100), (16, 100), (31, 100), (500, 2000), (513, 2000)],
+)
+def test_generic_guard_keeps_requested_width_after_reclaim(requested, reclaim_mib):
+    """Successful reclaim preserves a fitting tail or off-grid full slice."""
+    mib = 1024**2
+    hard = 20 * _GB
+    cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+    ns = _throttle_ctx(
+        current=cap,
+        hard=hard,
+        samples_bpt=2 * mib,
+        min_chunk=32,
+        reclaim_to=cap - reclaim_mib * mib,
+    )
+    ns._fake_current = cap
+
+    chosen = _guard_call(ns, requested)
+
+    assert ns._fake_current == cap - reclaim_mib * mib
+    assert chosen == requested
+    assert ns._fake_current + ns._admission_transient_bound(chosen, 0) <= cap
+
+
 def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
     """A conservative raw-last sample may already cover pool reallocation."""
     raw_prediction = 11.83 * _GB
@@ -1373,9 +1482,8 @@ def test_speed_priority_context_mode_shrink_unchanged():
     assert _call(ns, 2048, kv_len=5000) < 2048
 
 
-def test_speed_priority_guard_aborts_at_full_step_instead_of_shrinking():
-    """The guard's abort gate charges the full chunk in speed mode: a chunk
-    that context mode would shrink aborts upfront instead."""
+def test_speed_priority_guard_shrinks_when_full_chunk_breaches():
+    """Speed priority shrinks unsafe chunks and rejects only a floor-size breach."""
     hard = 42 * _GB
     current = 30 * _GB
     bpt = 27 * 1024 * 1024
@@ -1384,8 +1492,11 @@ def test_speed_priority_guard_aborts_at_full_step_instead_of_shrinking():
     # Context-mode control on the identical setup shrinks (guard test above).
     assert _guard_call(ns, 2048, kv_len=122_000) < 2048
     ns._prefill_speed_priority = True
-    with pytest.raises(PrefillMemoryExceededError):
-        _guard_call(ns, 2048, kv_len=122_000)
+    n = _guard_call(ns, 2048, kv_len=122_000)
+    assert ns._prefill_min_chunk_tokens <= n < 2048
+    # The shrunk chunk's predicted peak fits under the safety cap.
+    cap = ns._prefill_abort_cap()
+    assert current + ns._admission_transient_bound(n, 122_000) <= cap
 
 
 def test_speed_priority_guard_passes_full_chunk_that_fits():
@@ -1452,6 +1563,81 @@ def test_qwen4_local_reclaim_updates_next_guard_prediction(route):
     assert ns._predicted_chunk_transient(
         512, 180_000, gathered_core=route
     ) == pytest.approx(before + charge)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_generic_prefill_loop_submits_chunks_with_fixed_reclaim_charge(
+    chunked, monkeypatch
+):
+    """Both loops submit only widths which fit the unchanged predictor."""
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+        )
+    )
+    sched_mod.mx.eval(model.parameters())
+    ns = Scheduler(
+        model,
+        SimpleNamespace(eos_token_id=2, encode=lambda s: [1]),
+        SchedulerConfig(prefill_step_size=512, paged_cache_block_size=0),
+    )
+    # Use full-size generic metadata and controlled readings while executing
+    # a tiny model, so this tests submission without approaching a real OOM.
+    ns.memory_monitor = _monitor(head_dim=128)
+    ns._memory_hard_limit_bytes = 20 * _GB
+    ns._memory_limit_bytes = int(20 * _GB * 0.85)
+    ns._memory_abort_limit_bytes = 20 * _GB
+    ns._prefill_min_chunk_tokens = 32
+    ns._prefill_speed_priority = False
+    ns._prefill_abort_margin = Scheduler._PREFILL_ABORT_MARGIN
+    ns._prefill_headroom_safety = Scheduler._PREFILL_HEADROOM_SAFETY
+    cap = ns._prefill_abort_cap()
+    current = cap - 1000 * 1024**2
+    ns._prefill_transient_tracker.record_reclaim(960 * 1024**2)
+    monkeypatch.setattr(sched_mod, "get_phys_footprint", lambda: current)
+    submitted = []
+
+    def forward(tokens, *args, **kwargs):
+        width = tokens.shape[1]
+        assert current + ns._admission_transient_bound(width, sum(submitted)) <= cap
+        submitted.append(width)
+        return model(tokens, *args, **kwargs)
+
+    ns.model = forward
+    prompt = [10] * 1025
+    req = Request(
+        request_id="reclaim-loop", prompt=prompt, sampling_params=SamplingParams()
+    )
+    req.prompt_token_ids = prompt
+    req.num_prompt_tokens = len(prompt)
+    cache = make_prompt_cache(model)
+    if chunked:
+        state = _PrefillState(
+            request=req,
+            cache=cache,
+            tokens_remaining=sched_mod.mx.array(prompt[:-1])[None],
+            last_token=prompt[-1:],
+            tokens_processed=0,
+            base_size=0,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=len(prompt),
+        )
+        while not ns._step_prefill_chunk(state):
+            pass
+    else:
+        ns._do_external_prefill(req, prompt, cache)
+
+    assert submitted == [192, 192, 192, 192, 192, 64]
+    assert all(layer.offset == len(prompt) - 1 for layer in cache)
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -1586,6 +1772,321 @@ def test_guard_rejects_image_prefix_that_cannot_fit_whole():
             loop_label="image-prefix",
             minimum_tokens=2048,
         )
+
+
+# --------------------------------------------------------------------------
+# GLM-5.x (glm5_next) DSA prefill: static profile + flat-overhead pricing
+# --------------------------------------------------------------------------
+
+
+def _glm5_next_config():
+    # Real GLM-5.3-Flash text_config dims (head_dim=0 by design: NoPE MLA,
+    # head width lives in qk_nope_head_dim). 45 layers: 34 GDN + 11 DSA.
+    layer_types = [
+        "deepseek_sparse_attention" if i % 4 == 3 else "linear_attention"
+        for i in range(45)
+    ]
+    return SimpleNamespace(
+        model_type="glm5_next_text",
+        num_hidden_layers=45,
+        num_attention_heads=64,
+        head_dim=0,
+        qk_nope_head_dim=256,
+        v_head_dim=256,
+        kv_lora_rank=512,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        index_kpool=4,
+        linear_attn_config={"num_heads": 64, "head_dim": 128},
+        num_experts_per_tok=8,
+        hidden_size=4096,
+        layer_types=layer_types,
+    )
+
+
+def _glm5_next_monitor():
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=45,
+        num_kv_heads=64,
+        head_dim=0,
+        dtype_size=2,
+        num_attention_heads=64,
+        num_kv_cache_layers=11,
+        prefill_memory_profile=make_prefill_memory_profile(
+            _glm5_next_config(), compute_dtype_size=2
+        ),
+    )
+    return monitor
+
+
+def test_glm5_next_prefill_profile_registered():
+    profile = make_prefill_memory_profile(
+        _glm5_next_config(), compute_dtype_size=2
+    )
+    assert profile is not None
+    # Resident KV: 11 sparse layers x (512 latent + 128/4 pooled index key)
+    # x fp16 per token; GDN state is fixed and probed separately.
+    assert profile.estimate_resident_kv_bytes(1000) == 11 * (512 + 32) * 2 * 1000
+    dense = profile.estimate_prefill_transient_bytes(2048, 2048)
+    assert dense > 0
+    # Past index_topk the indexer + gathered-latent core take over and the
+    # price stays bounded (does not fall back to dense Q x kv_len scoring).
+    sparse = profile.estimate_prefill_transient_bytes(2048, 4096)
+    assert sparse > 0
+    gathered_bound = 2048 * 2048 * 512 * 2
+    assert sparse <= gathered_bound * 2
+
+
+def test_glm5_next_profile_prices_exact_block_expansion_for_small_chunks():
+    """Exact-block pricing must include K/V expansion even for small query chunks."""
+    profile = make_prefill_memory_profile(_glm5_next_config(), compute_dtype_size=2)
+    MiB = 1 << 20
+
+    # Expanded K/V includes FP32 projection outputs and FP16 kernel inputs.
+    expansion_3072 = 3072 * 64 * (256 + 256) * (2 + 4)
+    est_32_3072 = profile.estimate_prefill_transient_bytes(32, 3072)
+    assert expansion_3072 == pytest.approx(576 * MiB, rel=0.01)
+    assert est_32_3072 >= expansion_3072, (
+        "exact-block regime must charge the full head-expanded K/V, not the "
+        f"gathered bound ({est_32_3072 / MiB:.1f} MiB < {expansion_3072 / MiB:.1f})"
+    )
+
+    # Expansion cost must grow with KV length within the exact-block route.
+    est_prev = 0
+    for kv_len in (2049, 2560, 3072, 3584, 4095):
+        est = profile.estimate_prefill_transient_bytes(32, kv_len)
+        assert est > est_prev, f"price must grow with kv_len (got {kv_len})"
+        est_prev = est
+
+    # Larger query chunks must retain the full K/V expansion charge.
+    est_big = profile.estimate_prefill_transient_bytes(256, 3072)
+    assert est_big >= expansion_3072
+
+    # The sparse-MLA route no longer needs full K/V expansion.
+    native = profile.estimate_prefill_transient_bytes(32, 4096)
+    assert native < est_prev, (
+        "Kv>=4096 native route must price below the exact-block expansion"
+    )
+
+
+def test_glm5_next_flat_overhead_guard_admits_full_chunk_at_1948_numbers():
+    """Retained pool memory must not be charged twice during admission."""
+    monitor = _glm5_next_monitor()
+    assert monitor.uses_flat_overhead_accounting() is True
+    assert monitor.is_qwen4_gathered_prefill_profile() is False
+    hard = int(123.5 * _GB)
+    current = int(80.67 * _GB)
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=monitor, reclaim_to=current, min_chunk=512
+    )
+    ns._fake_current = current
+    ns._prefill_speed_priority = True
+    # Chunk 2 of pp=4096: 2047 remaining query tokens over kv_len=2048.
+    n = _guard_call(ns, 2047, kv_len=2048)
+    assert n == 2047
+
+
+def test_glm5_next_flat_overhead_charges_pool_once_and_releases_on_reclaim():
+    """Charge measured pool overhead only after reclamation releases it."""
+    monitor = _glm5_next_monitor()
+    ns = _throttle_ctx(
+        current=0, hard=int(123.5 * _GB), monitor=monitor, min_chunk=512
+    )
+    ns._fake_current = 0
+    predicted = ns._predicted_chunk_transient(2047, 2048)
+    # Static profile pricing only — no EWMA term feeds this route.
+    static = monitor.estimate_chunk_transient_bytes(
+        2047, 2048 + 2047
+    ) + monitor.estimate_prompt_kv_bytes(2047)
+    assert predicted == pytest.approx(static * 1.3, rel=1e-6)
+    # Retained overhead is already included in the current footprint.
+    Scheduler._record_chunk_transient(
+        ns,
+        2047,
+        pre_bytes=0,
+        post_bytes=int(20 * _GB),
+        request_id="r",
+        loop_label="test",
+        kv_len=2048,
+    )
+    retained = ns._predicted_chunk_transient(2047, 2048)
+    assert retained == pytest.approx(static * 1.3, rel=1e-6)
+    flat = ns._prefill_transient_tracker.flat_overhead_bytes_for(False)
+    assert flat > 0
+    # Released overhead must be charged once when it is allocated again.
+    ns._prefill_transient_tracker.record_flat_reclaim(20 * _GB)
+    charged = ns._predicted_chunk_transient(2047, 2048)
+    assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)
+
+
+def test_glm5_next_guard_rejects_exact_block_chunk_when_headroom_unavailable():
+    """Reviewer #3808: in the exact-block regime (index_topk < kv_len < 4096)
+    the core expands the full head-width K/V, so the required headroom is
+    driven by kv_len and is essentially independent of the chunk size —
+    shrinking the chunk cannot rescue the admission. At 3,072 cached KV tokens
+    with a 32-token chunk the expansion measured ~577 MiB of extra GPU peak
+    against a ~73 MiB gathered-static estimate; when the resident footprint
+    leaves less than that under the safety cap the guard must REJECT the chunk
+    rather than admit a doomed prefill. The same footprint admits the native
+    sparse-MLA route (kv_len>=4096), which tiles the gather and stays within
+    its estimate."""
+    monitor = _glm5_next_monitor()
+    assert monitor.uses_flat_overhead_accounting() is True
+    hard = int(123.5 * _GB)
+    current = int(110.6 * _GB)
+    # Reclaim cannot help: the head-expanded K/V is live working set, not
+    # reclaimable pool churn, so the guard's reclaim-and-recheck stays put.
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=monitor, reclaim_to=current, min_chunk=32
+    )
+    ns._fake_current = current
+
+    # The exact-block expansion is what tips the admission over the cap: the
+    # charged transient carries at least the full head-expanded K/V, and it is
+    # far above the native sparse-MLA bound for the same 32-token chunk.
+    expansion = 3072 * 64 * (256 + 256) * (2 + 4)
+    exact_bound = ns._admission_transient_bound(32, 3072)
+    native_bound = ns._admission_transient_bound(32, 8192)
+    assert exact_bound >= expansion
+    assert exact_bound > native_bound * 4
+
+    # Exact-block regime: reject, not admit.
+    with pytest.raises(PrefillMemoryExceededError) as exc:
+        _guard_call(ns, 32, kv_len=3072)
+    assert "too large for available memory" in str(exc.value)
+    assert exc.value.estimated_bytes > exc.value.limit_bytes
+
+    # Shrinking is futile — a bigger chunk that stays inside the exact-block
+    # regime (3072 + 512 < 4096) shrinks to the 32-token floor and still
+    # breaches, because the expansion scales with kv_len, not the chunk.
+    with pytest.raises(PrefillMemoryExceededError):
+        _guard_call(ns, 512, kv_len=3072)
+
+    # Contrast: the native sparse-MLA route tiles the gather, its bound
+    # collapses, and the identical footprint admits the chunk.
+    assert _guard_call(ns, 32, kv_len=8192) == 32
+
+
+def _v41_text_dict():
+    ratios = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
+    return {
+        "model_type": "deepseek_v41",
+        "text_config": {
+            "vocab_size": 129280,
+            "hidden_size": 5120,
+            "moe_intermediate_size": 2304,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 64,
+            "head_dim": 512,
+            "q_lora_rank": 1280,
+            "o_lora_rank": 1024,
+            "o_groups": 8,
+            "sliding_window": 128,
+            "compress_ratios": ratios,
+            "kv_source_layer_ids": [2, 8, 14, 20],
+            "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+            "index_n_heads": 32,
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "n_routed_experts": 384,
+            "num_experts_per_tok": 6,
+        },
+    }
+
+
+def _v41_config():
+    from omlx.patches.deepseek_v41.config import ModelConfig
+
+    return ModelConfig.from_dict(_v41_text_dict())
+
+
+def _v41_monitor():
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=40,
+        num_kv_heads=64,
+        head_dim=512,
+        dtype_size=2,
+        num_attention_heads=64,
+        num_kv_cache_layers=40,
+        prefill_memory_profile=make_prefill_memory_profile(
+            _v41_config(), compute_dtype_size=2
+        ),
+    )
+    return monitor
+
+
+def test_v41_prefill_profile_registered():
+    profile = make_prefill_memory_profile(_v41_config(), compute_dtype_size=2)
+    assert profile is not None
+    # Four KV source layers store both latents and index keys at ratios 2, 2, 2, 1.
+    per_token = (144 * 3 + 288) + (34 * 3 + 68)
+    assert profile.estimate_resident_kv_bytes(1000) == per_token * 1000
+    short = profile.estimate_prefill_transient_bytes(2048, 2048)
+    long_ctx = profile.estimate_prefill_transient_bytes(2048, 32768)
+    assert short > 0 and long_ctx > 0
+    # The attention core runs inside the packed native kernel: the score
+    # surface is priced as a gather over index_topk + window latents, never
+    # as dense query x kv_len scoring — bounded as the context grows.
+    gather_bound = 2048 * (512 + 128) * 512 * 2
+    dense_scores = 64 * 2048 * 32768 * 2
+    assert long_ctx < dense_scores
+    assert long_ctx <= gather_bound * 4
+
+
+def test_v41_flat_overhead_guard_admits_chunk_at_2337_numbers():
+    """Regression for the 2026-09-21 23:00 abort path: v41 at 134-expert
+    residency, footprint 102.93GB with the EWMA still charging 8.89GB of
+    pool bytes the footprint already retained, crossing the 105.75GB
+    throttle target after chunk 1. With the static packed-attention profile
+    and flat-overhead accounting the same admission passes at full chunk."""
+    monitor = _v41_monitor()
+    assert monitor.uses_flat_overhead_accounting() is True
+    assert monitor.is_qwen4_gathered_prefill_profile() is False
+    hard = int(123.5 * _GB)
+    current = int(102.93 * _GB)
+    ns = _throttle_ctx(
+        current=current, hard=hard, monitor=monitor, reclaim_to=current, min_chunk=512
+    )
+    ns._fake_current = current
+    ns._prefill_speed_priority = True
+    # Chunk 2 of pp=8192: 2048 query tokens over kv_len=2048.
+    n = _guard_call(ns, 2048, kv_len=2048)
+    assert n == 2048
+
+
+def test_v41_flat_overhead_charges_pool_once_and_releases_on_reclaim():
+    """The 8-14GB per-chunk IOAccelerator sawtooth is retained pool churn:
+    the flat path must price it once from the measured residual and never
+    re-charge it on top of a footprint that already contains it."""
+    monitor = _v41_monitor()
+    ns = _throttle_ctx(
+        current=0, hard=int(123.5 * _GB), monitor=monitor, min_chunk=512
+    )
+    ns._fake_current = 0
+    predicted = ns._predicted_chunk_transient(2047, 2048)
+    static = monitor.estimate_chunk_transient_bytes(
+        2047, 2048 + 2047
+    ) + monitor.estimate_prompt_kv_bytes(2047)
+    assert predicted == pytest.approx(static * 1.3, rel=1e-6)
+    Scheduler._record_chunk_transient(
+        ns,
+        2047,
+        pre_bytes=0,
+        post_bytes=int(12 * _GB),
+        request_id="r",
+        loop_label="test",
+        kv_len=2048,
+    )
+    retained = ns._predicted_chunk_transient(2047, 2048)
+    assert retained == pytest.approx(static * 1.3, rel=1e-6)
+    flat = ns._prefill_transient_tracker.flat_overhead_bytes_for(False)
+    assert flat > 0
+    ns._prefill_transient_tracker.record_flat_reclaim(12 * _GB)
+    charged = ns._predicted_chunk_transient(2047, 2048)
+    assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)
 
 
 # --------------------------------------------------------------------------
