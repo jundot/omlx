@@ -16,6 +16,7 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkStatus,
     TransportInfo,
+    _read,
     assess_link,
     classify_link,
     configure_link,
@@ -817,3 +818,41 @@ def test_the_detected_link_speed_is_carried_into_the_explanation():
     assert link.link_speed_gbps == 120
     assert "120 Gb/s" in link.reason
     assert link.to_dict()["source"]["address"] == "10.0.1.1"
+
+
+def test_read_retries_a_transient_ssh_failure_before_giving_up(monkeypatch):
+    """A single dropped mDNS round trip must not read as "no addresses" —
+    that used to surface as the confusing "has no routable IPv4 address"
+    report even though the peer answers fine a moment later."""
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(argv, 255, "", "Could not resolve hostname")
+        return subprocess.CompletedProcess(argv, 0, "inet 169.254.1.1\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    output = _read("Studio.local", ["ifconfig", "-a"])
+
+    assert output == "inet 169.254.1.1\n"
+    assert len(calls) == 2
+
+
+def test_read_gives_up_after_exhausting_retries(monkeypatch):
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 255, "", "Could not resolve hostname")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    output = _read("Studio.local", ["ifconfig", "-a"])
+
+    assert output == ""
+    assert len(calls) == 3
