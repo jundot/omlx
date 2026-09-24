@@ -440,6 +440,10 @@ class ModelSettings:
     dflash_draft_sink_size: Optional[int] = 0
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    # Auto-revert cooldown: while in VLM fallback mode (image requests), reload
+    # dflash once no fallback request has been served for this many seconds
+    # (0 disables auto-revert). See DFlashEngine._should_auto_revert.
+    dflash_fallback_cooldown_secs: Optional[float] = 30.0
 
     # Lightning MTP uses the embedded head for single and concurrent requests.
     # Equal-depth rows share target verification when supported by the backbone;
