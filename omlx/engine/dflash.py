@@ -1238,6 +1238,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return 0
         return max(0, int(getattr(prefix_flow, "hit_tokens", 0) or 0))
 
+    @staticmethod
+    def _summary_finish_reason(summary, stop_ids, max_tokens: int) -> str:
+        """Return "length" when generation reached max_tokens without a stop token."""
+        if summary is None:
+            return "stop"
+        stops = set(stop_ids)
+        # A committed block can hold tokens after the stop token, so scan all.
+        if any(int(token) in stops for token in summary.generated_token_ids):
+            return "stop"
+        return "length" if int(summary.generation_tokens) >= max_tokens else "stop"
+
     def _create_output_parser_session(self, tools: list[dict] | None) -> Any | None:
         """Create a request-local parser, including its tool schemas."""
         factory = self._output_parser_factory
@@ -1377,11 +1388,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         # (usage) chunk so the API reports cached_tokens (#1441).
                         "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
-                    if parser_final is not None:
-                        if parser_final.tool_calls:
-                            metrics["tool_calls"] = parser_final.tool_calls
-                        if parser_final.finish_reason:
-                            metrics["finish_reason"] = parser_final.finish_reason
+                    if parser_final is not None and parser_final.tool_calls:
+                        metrics["tool_calls"] = parser_final.tool_calls
+                    metrics["finish_reason"] = (
+                        parser_final.finish_reason
+                        if parser_final is not None and parser_final.finish_reason
+                        else self._summary_finish_reason(event, stop_ids, max_tokens)
+                    )
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
                     )
@@ -1560,6 +1573,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    self._summary_finish_reason(summary, stop_ids, max_tokens),
                 )
             finally:
                 self._record_prefill_guard_active_memory()
@@ -1592,6 +1606,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    summary_finish,
                 ) = await asyncio.shield(asyncio.wrap_future(future))
             except asyncio.CancelledError:
                 stop_event.set()
@@ -1655,7 +1670,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             finish_reason=(
                 parser_final.finish_reason
                 if parser_final is not None and parser_final.finish_reason
-                else "stop"
+                else summary_finish
             ),
             tool_calls=(
                 parser_final.tool_calls
