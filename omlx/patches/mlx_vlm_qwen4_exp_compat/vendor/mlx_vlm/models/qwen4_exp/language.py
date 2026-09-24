@@ -1556,23 +1556,44 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             text_position_ids,
         ).transpose(0, 2, 1, 3)
 
-        output = contiguous_causal_gathered_qsa(
-            queries,
-            keys,
-            values,
-            index_queries,
-            raw_index_keys,
-            full_position_ids,
-            num_query_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            indexer_head_dim=self.indexer.head_dim,
-            compress_ratio=self.indexer.compress_ratio,
-            token_budget=self.indexer.token_budget,
-            index_key_norm=self.indexer.k_layernorm,
-            apply_index_rope=self.indexer._apply_rope,
-            pooled_index_keys=pooled_index_keys,
-        )
+        # Rows that see at most the QSA block budget select every visible
+        # block, so they are plain causal attention over the cached prefix.
+        dense_rows = self.indexer.token_budget + self.indexer.compress_ratio - 1
+        dense_rows = min(length, max(0, dense_rows - past_len))
+        if length - dense_rows == 1:
+            dense_rows -= 1  # Gathered QSA needs at least two query rows.
+        outputs = []
+        if dense_rows:
+            outputs.append(
+                mx.fast.scaled_dot_product_attention(
+                    queries[:, :, :dense_rows],
+                    keys[:, :, : past_len + dense_rows],
+                    values[:, :, : past_len + dense_rows],
+                    scale=self.scale,
+                    mask="causal",
+                ).transpose(0, 2, 1, 3)
+            )
+        if dense_rows < length:
+            outputs.append(
+                contiguous_causal_gathered_qsa(
+                    queries[:, :, dense_rows:],
+                    keys,
+                    values,
+                    index_queries[:, dense_rows:],
+                    raw_index_keys,
+                    full_position_ids,
+                    num_query_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    head_dim=self.head_dim,
+                    indexer_head_dim=self.indexer.head_dim,
+                    compress_ratio=self.indexer.compress_ratio,
+                    token_budget=self.indexer.token_budget,
+                    index_key_norm=self.indexer.k_layernorm,
+                    apply_index_rope=self.indexer._apply_rope,
+                    pooled_index_keys=pooled_index_keys,
+                )
+            )
+        output = outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=1)
         output = output.reshape(batch, length, -1)
         return (
             _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
@@ -1765,7 +1786,16 @@ class Qwen4ExpGatedResidual(nn.Module):
                 hc_hidden_size, self.hc_count, bias=False
             )
 
-    def __call__(self, hyper_input: mx.array, target_verify: bool = False):
+    def __call__(
+        self, hyper_input: mx.array, target_verify: bool = False, write=None
+    ):
+        # ``write`` is a pending (branch, gate) residual write onto hyper_input.
+        if write is not None:
+            if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
+                fused = hc_fused.prefill_forward(self, hyper_input, write)
+                if fused is not None:
+                    return fused
+            hyper_input = _hc_write(hyper_input, *write)
         if hc_fused.compatible(self, hyper_input):
             fused = hc_fused.fused_forward(self, hyper_input)
             if fused is not None:
@@ -2640,35 +2670,31 @@ class ShardedEmbedding(nn.Module):
         # One tiny host sync avoids scheduling gathers against all 128 giant
         # PLE shards for every token.
         mx.eval(flat)
-        host_indices = [int(index) for index in flat.tolist()]
-        if not host_indices:
+        host = np.array(flat).astype(np.int64, copy=False)
+        if not host.size:
             return self.shards[0](flat).reshape(*indices.shape, self.dims)
-        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+        offsets = np.asarray(self.shard_offsets, dtype=np.int64)
+        if int(host.min()) < 0 or int(host.max()) >= int(offsets[-1]):
             raise IndexError("embedding index is outside the sharded vocabulary")
 
-        shard_indices = [
-            bisect_right(self.shard_offsets, index) - 1 for index in host_indices
-        ]
-        result = None
-        for shard_index in sorted(set(shard_indices)):
-            positions_list = [
-                position
-                for position, current_shard in enumerate(shard_indices)
-                if current_shard == shard_index
-            ]
-            local_indices = [
-                host_indices[position] - self.shard_offsets[shard_index]
-                for position in positions_list
-            ]
-            positions = mx.array(positions_list, dtype=mx.int32)
-            values = self.shards[shard_index](mx.array(local_indices, dtype=mx.int32))
+        # Group rows by shard on the host, gather each touched shard once, and
+        # restore token order with one inverse permutation.
+        shard = np.searchsorted(offsets, host, side="right") - 1
+        order = np.argsort(shard, kind="stable")
+        touched, starts = np.unique(shard[order], return_index=True)
+        ends = np.append(starts[1:], order.size)
+        parts = []
+        for shard_index, start, end in zip(touched, starts, ends):
+            local = host[order[start:end]] - offsets[shard_index]
+            values = self.shards[int(shard_index)](mx.array(local.astype(np.int32)))
             if values.dtype == mx.uint8:
                 values = mx.from_fp8(values, dtype=mx.bfloat16)
-            values = values * self.weight_scale
-            if result is None:
-                result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
-            result = result.at[positions].add(values)
-        return result.reshape(*indices.shape, self.dims)
+            parts.append(values)
+        values = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+        inverse = np.empty_like(order)
+        inverse[order] = np.arange(order.size)
+        values = mx.take(values, mx.array(inverse.astype(np.int32)), axis=0)
+        return (values * self.weight_scale).reshape(*indices.shape, self.dims)
 
     def fuse_quantized_shards(self) -> bool:
         """Join compatible packed shards without dequantizing the PLE table.
@@ -3000,6 +3026,11 @@ class Qwen4ExpPLELayer(nn.Module):
         return gated_values + conv_output
 
 
+def _hc_write(hyper_input, branch, weights):
+    injection = branch[..., None, :] * weights[..., None]
+    return hyper_input + injection.reshape(*hyper_input.shape)
+
+
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -3056,20 +3087,17 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 position_ids=position_ids,
                 target_verify=target_verify,
             )
-        injection = branch[..., None, :] * injection_weights[..., None]
-        hidden_states = hyper_input + injection.reshape(*hyper_input.shape)
-
         mixed, hyper_input, injection_weights = self.mlp_hyper_connection(
-            hidden_states,
+            hyper_input,
             target_verify=target_verify,
+            write=(branch, injection_weights),
         )
         branch = (
             _VERIFIER._feed_forward(self.mlp, mixed)
             if target_verify
             else self.mlp(mixed)
         )
-        injection = branch[..., None, :] * injection_weights[..., None]
-        return hyper_input + injection.reshape(*hyper_input.shape)
+        return _hc_write(hyper_input, branch, injection_weights)
 
 
 class Qwen4ExpModel(nn.Module):

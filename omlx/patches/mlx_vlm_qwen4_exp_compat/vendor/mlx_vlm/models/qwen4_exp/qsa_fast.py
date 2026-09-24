@@ -565,9 +565,9 @@ def contiguous_causal_gathered_qsa(
     if query_chunk is None:
         query_chunk = contiguous_causal_query_chunk(key_tokens)
         # The direct-index main-attention kernel carries no per-query gathered
-        # K/V tensor, so a 256-row score tile stays comfortably bounded and
-        # halves Python/Metal dispatch overhead. Preserve the smaller portable
-        # tiles whenever the exact production ABI is absent.
+        # K/V tensor, so a 1024-row tile keeps the FP32 score sheet small
+        # (268 MB at 256K keys) while cutting per-tile dispatches. Preserve
+        # the smaller portable tiles whenever the exact production ABI is absent.
         if (
             queries.shape[1:] == (24, query_tokens, 256)
             and keys.shape[1] == 2
@@ -580,7 +580,7 @@ def contiguous_causal_gathered_qsa(
                 if fast.is_native_available() and fast.has_symbol(
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
-                    query_chunk = max(query_chunk, 256)
+                    query_chunk = max(query_chunk, 1024)
             except Exception:
                 pass
     if query_chunk <= 0:
@@ -657,9 +657,11 @@ def contiguous_causal_gathered_qsa(
                 mx.arange(selected_width, dtype=mx.int32)[None, None],
                 (batch, chunk_tokens, selected_width),
             )
+            chronological = True
             if max_blocks > block_budget:
                 ranked = _native_topk_indices(block_scores, block_budget)
                 if ranked is None:
+                    chronological = False
                     ranked = mx.argpartition(
                         block_scores,
                         kth=-block_budget,
@@ -673,10 +675,12 @@ def contiguous_causal_gathered_qsa(
             else:
                 selected_block_rows = canonical
 
-            # The top-k set is unordered. Restore checkpoint/dense-mask token
-            # order before either the portable gathered SDPA or the direct
-            # native kernel performs its FP32 online-softmax reduction.
-            selected_block_rows = mx.sort(selected_block_rows, axis=-1)
+            # argpartition's top-k set is unordered. Restore checkpoint/dense
+            # token order before the portable gathered SDPA or the direct native
+            # kernel performs its FP32 online-softmax reduction. The native
+            # top-k already emits ascending block ids.
+            if not chronological:
+                selected_block_rows = mx.sort(selected_block_rows, axis=-1)
 
             selected_count = mx.minimum(complete_counts, block_budget)
 

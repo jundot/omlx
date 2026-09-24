@@ -355,7 +355,7 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
 @pytest.mark.parametrize("rows", [17, 2048])
 @pytest.mark.parametrize("use_combine", [True, False])
 def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
-    """Prefill retains canonical normalization while compiling the stream mean."""
+    """Prefill fuses the stream norm and, with inject weights, the mix/inject tail."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     module = _module(bits, use_combine)
@@ -363,11 +363,11 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
     mx.eval(x)
     assert not hc_fused.compatible(module, x)
     assert hc_fused.prefill_compatible(module, x)
-    kernel_norm = Mock(side_effect=AssertionError("prefill must use canonical norm"))
-    monkeypatch.setattr(hc_fused, "_kernel_norm", kernel_norm)
+    tail = Mock(wraps=hc_fused._tail)
+    monkeypatch.setattr(hc_fused, "_tail", tail)
     out = hc_fused.prefill_forward(module, x)
-    kernel_norm.assert_not_called()
     assert out is not None
+    assert tail.called is not use_combine
     canon = module._forward(x)
     if use_combine:
         mixed, passthrough, inject = out
@@ -381,6 +381,26 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
     assert mixed.dtype == mx.bfloat16
     max_ulps, mean_ulps = _ulps(mixed, canon_mixed)
     assert max_ulps <= 16 and mean_ulps <= 0.5
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_prefill_pending_write_matches_eager_write():
+    from mlx_vlm.models.qwen4_exp import hc_fused, language
+
+    mx.random.seed(11)
+    rows = hc_fused.MAX_ROWS + 1
+    module = _module(4)
+    hyper = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
+    branch = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
+    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+    written = language._hc_write(hyper, branch, gate)
+    expected = hc_fused.prefill_forward(module, written)
+    actual = hc_fused.prefill_forward(module, hyper, (branch, gate))
+    mx.eval(expected, actual)
+    for observed, reference in zip(actual, expected):
+        assert mx.array_equal(
+            observed.view(mx.uint16), reference.view(mx.uint16)
+        ).item()
 
 
 def test_prefill_path_not_offered_for_fused_rows():

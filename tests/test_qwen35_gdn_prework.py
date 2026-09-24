@@ -347,6 +347,65 @@ def test_qwen4_decode_norm_gate_is_bit_exact():
     assert mx.array_equal(expected, observed).item()
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_qwen4_prefill_route_is_bit_exact_across_chunks(monkeypatch):
+    from mlx.utils import tree_map
+    from mlx_vlm.models.cache import ArraysCache
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedDeltaNet
+
+    cls = language.Qwen3_5GatedDeltaNet
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    monkeypatch.setattr(cls, "_omlx_gdn_prework_patched", False, raising=False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+
+    mx.random.seed(37)
+    config = SimpleNamespace(
+        hidden_size=2560,
+        linear_num_value_heads=HV,
+        linear_num_key_heads=HK,
+        linear_key_head_dim=DK,
+        linear_value_head_dim=DV,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+        output_gate_type="sigmoid",
+        hidden_act="silu",
+    )
+    module = Qwen4ExpGatedDeltaNet(config)
+    module.update(
+        tree_map(lambda p: (p * 0.2).astype(mx.bfloat16), module.parameters())
+    )
+    module.eval()
+    chunks = [
+        (mx.random.normal((1, rows, 2560)) * 0.5).astype(mx.bfloat16)
+        for rows in (80, 67)
+    ]
+
+    def run(fused):
+        monkeypatch.setattr(prework_mod, "_QWEN4_PREFILL_ENABLED", fused)
+        cache = ArraysCache(size=2)
+        outputs = [module(x, cache=cache) for x in chunks]
+        mx.eval(outputs, cache[0], cache[1])
+        return outputs, cache
+
+    monkeypatch.setattr(prework_mod, "_QWEN4_PREFILL_ENGAGED_LOGGED", False)
+    stock_out, stock_cache = run(False)
+    assert not prework_mod._QWEN4_PREFILL_ENGAGED_LOGGED
+    fused_out, fused_cache = run(True)
+    assert prework_mod._QWEN4_PREFILL_ENGAGED_LOGGED
+
+    for expected, observed in zip(stock_out, fused_out):
+        assert mx.array_equal(expected, observed).item()
+    for i in (0, 1):
+        assert fused_cache[i].dtype == stock_cache[i].dtype
+        assert mx.array_equal(stock_cache[i], fused_cache[i]).item()
+
+
 class _FakeCache:
     """Minimal cache[0]/cache[1]/advance duck-type for patched_call."""
 
