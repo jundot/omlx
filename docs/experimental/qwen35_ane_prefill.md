@@ -251,6 +251,58 @@ approximate INT8 ANE prefix. Peak memory increased by about 4.15 GB, and eager
 load time increased from 3.35 to about 27-29 seconds on the test system.
 Token-generation throughput was unchanged because decode remains on the GPU.
 
+## M5 Pro single-ANE reference result
+
+The NAX GPU on the M5 family shifts the optimum well below the M3 Ultra
+figures above, and the Pro and Max dies expose one ANE instance, so
+`qwen35_ane_prefill_dual_ane` must be off. Measured 2026-09-12 on an M5 Pro
+with 64 GB, macOS 27.0, MLX 0.32.2, `Qwen3.8-27B-oQ4e-mtp`, with
+`benchmarks/qwen35_ane_prefill_bench.py --force-lm --modes gpu single
+--tokens 2048 --repeats 3`:
+
+| MLP share | GDN z share | GPU only | Single ANE/GPU | Versus GPU | ANE / GPU ms per MLP layer |
+|---:|---:|---:|---:|---:|---:|
+| 15% | off | 447.5 tok/s | 480.0 tok/s | 1.073x | 8.1 / 22.7 |
+| 25% | off | 413.1 tok/s | 452.0 tok/s | 1.094x | 13.3 / 22.4 |
+| 35% | off | 406.3 tok/s | 516.1 tok/s | 1.270x | 18.2 / 17.8 |
+| 35% | 37.5% | 449.5 tok/s | 541.8 tok/s | 1.205x | 18.1 / 17.2 |
+| 40% | 37.5% | 403.1 tok/s | 512.6 tok/s | 1.272x | 21.0 / 16.1 |
+| 45% | 37.5% | 394.8 tok/s | 495.8 tok/s | 1.256x | 23.9 / 14.7 |
+
+The GPU-only baseline drifts down by about 10% across back-to-back runs on
+this machine, so compare within a row. The balance point is 35%: below it the
+ANE finishes early and idles, above it the ANE becomes the long pole and the
+per-layer region grows again. The GDN share must equal this model's z floor
+of 37.5%; smaller requests compile zero GDN procedures and leave GDN prefill
+on the GPU. Eager preparation of 64 MLP and 48 GDN procedures took about 18
+seconds.
+
+Last-token logit cosine similarity against the GPU path was 0.999994 at every
+share, the top token was unchanged, and the final hidden-state maximum
+absolute error stayed at 16 to 24 with RMSE 0.10 to 0.12 regardless of the
+ANE share, which is consistent with per-channel INT8 noise rather than
+accumulator saturation.
+
+Through `omlx serve` with the prefix cache off, a 16,317-token prompt took
+34.1 s and 35.3 s with 35% MLP and 37.5% GDN on the ANE against 37.1 s and
+39.5 s GPU-only, an 8% to 11% reduction in time to first token. The gain is
+smaller than at 2,048 tokens because attention and the GDN recurrence, which
+stay on the GPU, take a larger share of the time at long context. Decode is
+unchanged.
+
+Settings used:
+
+```json
+{
+  "qwen35_ane_prefill_enabled": true,
+  "qwen35_ane_prefill_sequence_length": 2048,
+  "qwen35_ane_prefill_fraction": 0.35,
+  "qwen35_ane_prefill_dual_ane": false,
+  "qwen35_ane_prefill_gdn": true,
+  "qwen35_ane_prefill_gdn_fraction": 0.375
+}
+```
+
 ## M3 Ultra reference result
 
 On `True2456/Qwen3.8-27B-AWQ-4.85bpw`, sequence length 2,048:
