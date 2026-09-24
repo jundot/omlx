@@ -211,6 +211,21 @@ FP16 gate/up and GDN rows, the down-projection GPU suffix, and bounded
 materialization scratch. This projected size participates in the normal memory
 guard before the model begins loading.
 
+## Pricing the banks at admission
+
+A resident bank is charged to the kernel's neural ledger and excluded from
+`phys_footprint`, so admission adds the banks' compiled size to the projected
+memory. Compiling one projection reports the same `wiredMemory` the driver
+reports when the program loads, and the size depends on the geometry rather
+than the weight values, so one compile prices every layer of a shape; the
+Qwen3.8-27B layout is two shapes. The compiler is `ANECompiler.framework`,
+resolved by name and targeting the runtime's own `aneArchitectureType`. When
+it is missing the price is zero, and banks are charged nothing.
+
+The layer count is still an estimate: layers the backend later declines for
+dtype or row alignment are charged anyway, so the total errs high. Pricing a
+shape briefly holds a zero-filled blob of that projection's weight shape.
+
 ## Recurrent-safe GDN validation
 
 The current z-only policy was selected from a controlled 32K comparison on
