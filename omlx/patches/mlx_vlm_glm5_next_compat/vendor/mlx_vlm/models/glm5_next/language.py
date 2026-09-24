@@ -207,6 +207,20 @@ class Glm5NextLinearAttention(nn.Module):
             out = inputs @ self._fw.T
         return mx.split(out, self._split_pts, axis=-1)
 
+    # Acima desta largura a camada se fatia sozinha. O kernel gated_delta
+    # escala mal com o comprimento: medido no modelo real (04/09,
+    # prefill_heterogeneo.py) uma camada custa 16,24 ms em S=512, 90,87 em
+    # 2048 e 193,47 em 4096 -- 11,9x de tempo para 8x de tokens. Processar o
+    # mesmo bloco em fatias de 512, encadeadas pelo cache, cai para 63,81 ms
+    # (+29,8%) e 127,48 (+34,1%), e o resultado e BIT A BIT o mesmo
+    # (dif max 0,00e+00 nas tres larguras): a recorrencia ja e sequencial, a
+    # fatia so muda a ordem em que os blocos entram.
+    #
+    # Isto e o que permite ao preparo do prompt usar pedacos maiores que 512
+    # sem pagar a recorrencia: o MoE, que e 59% do tempo do pedaco, rende mais
+    # com largura (177 tok/s em 512 contra 193 em 2048).
+    _FATIA_RECORRENTE = 512
+
     def __call__(
         self,
         inputs: mx.array,
@@ -214,6 +228,30 @@ class Glm5NextLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+        if (
+            S > self._FATIA_RECORRENTE
+            and cache is not None
+            and cache.lengths is None
+            and not getattr(cache, "_omlx_captura_desfazer", False)
+        ):
+            # Fatiado apenas no preparo do prompt: com preenchimento a direita
+            # (cache.lengths) a mascara e por sequencia e nao fatia, e com a
+            # captura do desfazer armada quem chama espera os tensores de UMA
+            # passada -- e a janela de verificacao do MTP nunca chega perto de
+            # 512 posicoes.
+            fatia = self._FATIA_RECORRENTE
+            corta = mask is not None and mask.ndim >= 1 and mask.shape[-1] == S
+            return mx.concatenate(
+                [
+                    self(
+                        inputs[:, i : i + fatia],
+                        mask[..., i : i + fatia] if corta else None,
+                        cache,
+                    )
+                    for i in range(0, S, fatia)
+                ],
+                axis=1,
+            )
         has_right_padding = cache is not None and cache.lengths is not None
         if has_right_padding:
             mask = mx.arange(S)[None] < cache.lengths[:, None]
