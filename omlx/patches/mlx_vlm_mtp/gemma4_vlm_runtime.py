@@ -187,11 +187,8 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         if attach:
             drafter_config = Gemma4AssistantConfig.from_dict(asst_cfg)
             self.mtp = Gemma4AssistantDraftModel(drafter_config)
-            # Binds the backbone's embed_tokens (+ scale) for the fused
-            # [token_embed, hidden] input and resolves the head's tied
-            # lm_head fn. Function refs read weights at call time, so
-            # binding before load_weights is safe.
-            self.mtp.bind(self)
+            # Bound at the first draft: a bind here pins the float embed_tokens
+            # that nn.quantize() replaces, and materialize_lazy_state builds it.
         if self._omlx_mtp_decode_enabled:
             # The chain cycle applies the backbone's final RMSNorm to the
             # verify hidden rows (HEAD_HIDDEN_POST_NORM) — exactly the
@@ -285,10 +282,8 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         """
         del mtp_cache, logits_keep  # stateless head; output is 1 position
         drafter = self.mtp
-        # Re-bind when the backbone embed module was swapped after the
-        # __init__-time bind — nn.quantize() replaces embed_tokens with a
-        # QuantizedEmbedding AFTER model construction, and a stale binding
-        # keeps a random-init nn.Embedding (garbage drafts, ~10% accept).
+        # Bind on first use and whenever embed_tokens is swapped; a stale
+        # module drafts through random-init weights (~10% accept).
         if drafter._input_embed is not self.model.embed_tokens:
             drafter.bind(self)
         shared_kv = getattr(self, "_omlx_mtp_shared_kv", None)
