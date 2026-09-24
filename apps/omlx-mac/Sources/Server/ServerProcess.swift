@@ -13,6 +13,13 @@
 //   crashes : auto-restart with 5s/10s/20s backoff, max 3 attempts, counter
 //             resets after 60s of stable .running
 //
+// Adoption: start() hitting a port already held by a verified oMLX server
+// (PortConflict.isOMLX) does NOT fail silently — it returns .portConflict
+// and the caller (MenubarController) may call adoptExternal(_:) to treat
+// that pid as this instance's managed process. stop()/forceRestart() then
+// signal it via PortConflictResolver.killExternal(_:) instead of an owned
+// Process handle. We never adopt a non-oMLX or unverified process.
+//
 // Spawn invocation:
 //   <python> -m omlx.cli serve --base-path <base> --port <port>
 //   stdout+stderr → ~/Library/Application Support/oMLX/logs/server.log
@@ -164,6 +171,11 @@ final class ServerProcess: @unchecked Sendable {
     private var lastAuxiliaryHealthyAt: Date?
     private var expectingExit       = false   // set by stop()/forceRestart() so terminationHandler doesn't trigger auto-restart
     private let logURL: URL
+    /// Set by `adoptExternal(_:)` when `.running`/`.unresponsive` refers to a
+    /// process we didn't spawn (`process` stays nil). `stop()`/`forceRestart()`
+    /// fall back to killing this pid via the resolver instead of signalling
+    /// an owned `Process` handle.
+    private var adoptedPID: Int32?
 
     init(
         runtime: PythonRuntime,
@@ -190,8 +202,31 @@ final class ServerProcess: @unchecked Sendable {
         return process?.isRunning == true
     }
 
-    var pid: Int32? { process?.processIdentifier }
+    var pid: Int32? { process?.processIdentifier ?? adoptedPID }
     var serverLogURL: URL { logURL }
+
+    /// Adopt an already-running, externally-started oMLX server instead of
+    /// spawning a new one. Called after `start()` returns `.portConflict`
+    /// with `conflict.isOMLX == true` — we never adopt an unverified or
+    /// non-oMLX process. Health polling and `stop()`/`forceRestart()` work
+    /// against the adopted pid exactly as they would against a spawned one.
+    @discardableResult
+    func adoptExternal(_ conflict: PortConflict) -> Bool {
+        guard conflict.isOMLX, let pid = conflict.pid else { return false }
+        switch state {
+        case .running, .starting, .stopping, .unresponsive:
+            return false
+        default:
+            break
+        }
+        adoptedPID = pid
+        process = nil
+        consecutiveFailures = 0
+        lastAuxiliaryHealthyAt = nil
+        update(.running(pid: pid))
+        startHealthCheckLoop()
+        return true
+    }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
     /// already up, or .portConflict if the port is busy. Throws on invalid
@@ -252,6 +287,9 @@ final class ServerProcess: @unchecked Sendable {
                 kill(proc.processIdentifier, SIGKILL)
                 try? await Task.sleep(for: .seconds(0.5))
             }
+        } else if let externalPID = adoptedPID {
+            // No owned Process handle — this is an adopted external server.
+            _ = await resolver.killExternal(externalPID, timeout: timeout)
         }
 
         // terminationHandler updates state to .stopped; force in case it
@@ -261,6 +299,7 @@ final class ServerProcess: @unchecked Sendable {
         }
         expectingExit = false
         process = nil
+        adoptedPID = nil
         lastAuxiliaryHealthyAt = nil
         closeLog()
     }
@@ -277,8 +316,11 @@ final class ServerProcess: @unchecked Sendable {
             while proc.isRunning && Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(50))
             }
+        } else if let externalPID = adoptedPID {
+            _ = await resolver.killExternal(externalPID, timeout: 2)
         }
         process = nil
+        adoptedPID = nil
         closeLog()
         autoRestartBudget.reset()
         consecutiveFailures = 0
