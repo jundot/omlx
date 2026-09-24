@@ -2465,12 +2465,36 @@ class TestJsonOutputParsing:
         assert "Hello" in output_text
 
 
+class PromptOpenedThinkingTokenizer(MockTokenizer):
+    """Chat template that leaves <think> open, like Qwen3.5/3.6/3.8."""
+
+    think_start = "<think>"
+    think_end = "</think>"
+    think_start_id = 9001
+    think_end_id = 9002
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+        if text.rstrip().endswith(self.think_start):
+            return [101, self.think_start_id]
+        return [101]
+
+    def apply_chat_template(
+        self, messages: List[Dict], tokenize: bool = False, **kwargs
+    ) -> str:
+        return "user: Reply OK\nassistant:<think>"
+
+
+@pytest.mark.parametrize("prompt_opened", [False, True])
 @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
-def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
+def test_nonstream_thinking_length_channels(
+    client, mock_llm_engine, api, prompt_opened
+):
+    # A prompt-opened block has no <think> in the decoded output.
+    text = "unfinished" if prompt_opened else "<think>unfinished"
+    if prompt_opened:
+        mock_llm_engine._tokenizer = PromptOpenedThinkingTokenizer()
     mock_llm_engine.chat = AsyncMock(
-        return_value=MockGenerationOutput(
-            text="<think>unfinished", finish_reason="length"
-        )
+        return_value=MockGenerationOutput(text=text, finish_reason="length")
     )
     body = {"model": "test-model", "max_tokens": 64}
     if api == "responses":
