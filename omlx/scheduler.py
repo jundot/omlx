@@ -1786,6 +1786,48 @@ class _BoundarySnapshotProvider:
                 staged_path.unlink()
             return False
 
+    @classmethod
+    def stage_and_commit(
+        cls,
+        *,
+        store: Any,
+        paged_ssd_manager: Any,
+        request_id: str,
+        token_count: int,
+        snapshot: list[dict[str, Any]],
+        source_block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+        layer_meta_states: list[Any] | None,
+        model_name: str,
+        block_size: int,
+    ) -> bool:
+        """Stage one extracted recurrent snapshot and promote it to a sidecar."""
+        if store is None or paged_ssd_manager is None:
+            return False
+        if not store.save(
+            request_id,
+            token_count,
+            snapshot,
+            lambda extracted: (extracted, None),
+            block_size=block_size,
+        ):
+            return False
+        provider = cls(
+            store=store,
+            request_id=request_id,
+            valid_tcs=[token_count],
+            in_memory_snapshots={},
+            paged_ssd_manager=paged_ssd_manager,
+        )
+        return provider.commit_gdn_checkpoint(
+            token_count,
+            source_block_hash,
+            layer_cache_types=list(layer_cache_types or []),
+            layer_meta_states=layer_meta_states,
+            model_name=model_name,
+            block_size=block_size,
+        )
+
 
 class Scheduler:
     """
@@ -14074,6 +14116,15 @@ class Scheduler:
                             dequantization_counter=lambda: (
                                 self._boundary_snapshot_store.gdn_state_dequantizations
                             ),
+                        )
+                        boundary_store = self._boundary_snapshot_store
+                        paged_ssd_manager = self.paged_ssd_cache_manager
+                        self.block_aware_cache.set_exact_gdn_checkpoint_writer(
+                            lambda **kwargs: _BoundarySnapshotProvider.stage_and_commit(
+                                store=boundary_store,
+                                paged_ssd_manager=paged_ssd_manager,
+                                **kwargs,
+                            )
                         )
                 except Exception as e:
                     logger.debug(

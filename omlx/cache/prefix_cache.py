@@ -135,6 +135,7 @@ def _wrap_cachelist_sub_marker(
         name = sub_class_names[sub_idx]
     return ("__nstate__", name, list(elements))
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
+_EXACT_PREFIX_SPLIT_BLOCK_KEY = "specprefill-static-exact-split-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 # Sentinel: the CacheList restore chain carries no PoolingCacheDelta
 # markers, so the caller restores the boundary member last-block-wins.
@@ -229,6 +230,7 @@ class BlockAwarePrefixCache(CacheManager):
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
         self._gdn_split_fallback_reported = False
         self._gdn_checkpoint_loader: Callable[[Any], list[dict[str, Any]] | None] | None = None
+        self._exact_gdn_checkpoint_writer: Callable[..., bool] | None = None
 
         # Expected number of layers for cache validation
         self.expected_num_layers = self._get_model_num_layers(model)
@@ -316,6 +318,12 @@ class BlockAwarePrefixCache(CacheManager):
         """Attach the scheduler-owned recurrent checkpoint deserializer."""
         self._gdn_checkpoint_loader = loader
         self._gdn_dequantization_counter = dequantization_counter
+
+    def set_exact_gdn_checkpoint_writer(
+        self, writer: Callable[..., bool] | None
+    ) -> None:
+        """Attach the scheduler-owned exact-prefix checkpoint writer."""
+        self._exact_gdn_checkpoint_writer = writer
 
     def _gdn_dequantization_count(self) -> int | None:
         """Read the store counter without making restore depend on metrics."""
@@ -447,6 +455,57 @@ class BlockAwarePrefixCache(CacheManager):
         except Exception:
             logger.exception(
                 "Failed to commit split-GDN checkpoint for block hash %s",
+                block_hash.hex()[:16],
+            )
+            return False
+
+    def _commit_exact_split_gdn_checkpoint(
+        self,
+        request_id: str,
+        token_count: int,
+        block_hash: bytes,
+        cache_data: list[Any],
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+        layer_meta_states: list[Any] | None,
+    ) -> bool:
+        """Persist the final recurrent state for a domain-separated exact prefix."""
+        writer = self._exact_gdn_checkpoint_writer
+        if not callable(writer):
+            return False
+
+        recurrent_payloads = self._validated_gdn_snapshot_layers(
+            cache_data, layer_cache_types
+        )
+        if not recurrent_payloads:
+            return False
+
+        recurrent_snapshot: list[dict[str, Any]] = []
+        for layer_idx, layer_state in enumerate(cache_data):
+            if not isinstance(layer_state, dict):
+                return False
+            if layer_idx in recurrent_payloads:
+                recurrent_snapshot.append(layer_state)
+            else:
+                placeholder = dict(layer_state)
+                placeholder["state"] = ()
+                recurrent_snapshot.append(placeholder)
+
+        try:
+            return bool(
+                writer(
+                    request_id=request_id,
+                    token_count=token_count,
+                    snapshot=recurrent_snapshot,
+                    source_block_hash=block_hash,
+                    layer_cache_types=layer_cache_types,
+                    layer_meta_states=layer_meta_states,
+                    model_name=self.paged_cache.model_name,
+                    block_size=self.block_size,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to commit exact-prefix GDN checkpoint for block hash %s",
                 block_hash.hex()[:16],
             )
             return False
@@ -1050,8 +1109,12 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 break
 
-            if split_gdn_layout and not callable(
-                getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
+            if (
+                split_gdn_layout
+                and not _store_exact_terminal
+                and not callable(
+                    getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
+                )
             ):
                 logger.warning(
                     "Stopping split-GDN prefix store for %s at %d tokens: "
@@ -1069,6 +1132,7 @@ class BlockAwarePrefixCache(CacheManager):
                 if prev_block and prev_block.block_hash:
                     parent_hash = prev_block.block_hash
 
+            is_exact_split_block = _store_exact_terminal and split_gdn_layout
             is_exact_terminal = _store_exact_terminal and i == num_new_blocks - 1
             is_tail_terminal = (
                 _store_tail_terminal
@@ -1076,7 +1140,12 @@ class BlockAwarePrefixCache(CacheManager):
                 and len(block_tokens) < self.block_size
             )
             block_extra_keys: tuple[Any, ...] | None
-            if is_exact_terminal:
+            if is_exact_split_block:
+                # Isolate the whole chain. Intermediate split-GDN exact-prefix
+                # blocks carry structural recurrent placeholders and must never
+                # enter ordinary partial-prefix matching.
+                block_extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
+            elif is_exact_terminal:
                 block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
             else:
                 block_extra_keys = resolve_block_extra_keys(
@@ -1089,7 +1158,7 @@ class BlockAwarePrefixCache(CacheManager):
             # Check if this block already exists (deduplication)
             if (
                 len(block_tokens) == self.block_size or is_tail_terminal
-            ) and not is_exact_terminal:
+            ) and not (is_exact_terminal or is_exact_split_block):
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
@@ -1190,16 +1259,20 @@ class BlockAwarePrefixCache(CacheManager):
                 model_name=self.paged_cache.model_name,
             )
 
-            # Register ordinary full blocks for general prefix matching. The
-            # exact terminal uses a separate hash domain so it can carry the
-            # complete non-sliceable state without colliding with a normal
-            # block that may contain placeholders.
-            if len(block_tokens) == self.block_size and not is_exact_terminal:
+            # Split-GDN exact-prefix blocks use a separate hash domain and are
+            # reachable only through fetch_exact_prefix(). Full-attention
+            # exact-prefix blocks retain ordinary reuse before their isolated
+            # terminal block.
+            if (
+                len(block_tokens) == self.block_size
+                and not is_exact_terminal
+                and not is_exact_split_block
+            ):
                 self.paged_cache.register_block_hash(
                     block, block_tokens, parent_hash, extra_keys=block_extra_keys
                 )
             elif (
-                is_exact_terminal or is_tail_terminal
+                is_exact_terminal or is_exact_split_block or is_tail_terminal
             ) and block.block_hash is not None:
                 # Tail blocks join the parent-keyed tail index once saved.
                 self.paged_cache.cached_block_hash_to_block.insert(
@@ -1369,15 +1442,28 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                     if saved:
                         if split_gdn_layout:
-                            checkpoint_committed = (
-                                self._commit_split_gdn_checkpoint(
-                                    boundary_snapshots,
-                                    block_boundary_tc,
-                                    block.block_hash,
-                                    layer_cache_types,
-                                    layer_meta_states,
+                            if is_exact_split_block:
+                                checkpoint_committed = (
+                                    not is_exact_terminal
+                                    or self._commit_exact_split_gdn_checkpoint(
+                                        request_id,
+                                        block_boundary_tc,
+                                        block.block_hash,
+                                        cache_data,
+                                        layer_cache_types,
+                                        layer_meta_states,
+                                    )
                                 )
-                            )
+                            else:
+                                checkpoint_committed = (
+                                    self._commit_split_gdn_checkpoint(
+                                        boundary_snapshots,
+                                        block_boundary_tc,
+                                        block.block_hash,
+                                        layer_cache_types,
+                                        layer_meta_states,
+                                    )
+                                )
                             if not checkpoint_committed:
                                 logger.warning(
                                     "Rejecting split-GDN placeholder block %s "
@@ -1537,22 +1623,20 @@ class BlockAwarePrefixCache(CacheManager):
     ) -> BlockTable | None:
         """Persist a complete prefix, including its exact terminal boundary.
 
-        Ordinary prefix matching remains full-block-only. This path stores one
-        domain-separated terminal block, excludes it from general matching,
-        and restores it only when the complete static-prefix token chain
-        matches. That captures an arbitrary system/tool boundary without
-        making the target model repeatedly prefill its uncached suffix.
-        SSD-backed configurations use write-through so the hot tier is never
-        the only durable copy.
+        The terminal boundary is restored only when every static-prefix token
+        matches. SSD-backed configurations use write-through so the hot tier is
+        never the only durable copy. Split-GDN layouts domain-separate the whole
+        chain and store one recurrent sidecar at the exact terminal; preceding
+        blocks contain only KV slices and structural recurrent placeholders.
         """
         if not tokens or self.paged_ssd_cache is None:
             return None
 
-        # Exact-prefix storage has no boundary-snapshot provider to commit
-        # the recurrent state. Refuse split-GDN entries before store_cache()
-        # allocates a terminal block; otherwise the terminal would contain
-        # only the structural ArraysCache placeholder and could never be
-        # reconstructed.
+        # Exact-prefix storage has no prefill-boundary provider. Split-GDN
+        # layouts can still persist safely when the scheduler supplies a writer:
+        # the full static prefix has just been evaluated, so its terminal
+        # recurrent state is exact. Intermediate blocks stay domain-separated
+        # and need no recurrent checkpoints.
         exact_layer_cache_types = None
         if model_cache_config:
             exact_layer_cache_types = model_cache_config.get_type_names()
@@ -1572,10 +1656,12 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 for layer_state in cache_data
             ]
-        if self._gdn_split_layout_supported(exact_layer_cache_types):
+        if self._gdn_split_layout_supported(exact_layer_cache_types) and not callable(
+            self._exact_gdn_checkpoint_writer
+        ):
             logger.info(
                 "Skipping exact-prefix store for %s: split-GDN terminal "
-                "sidecar commit is unavailable",
+                "sidecar writer is unavailable",
                 request_id,
             )
             self._exact_prefix_store_failures += 1
@@ -1605,16 +1691,23 @@ class BlockAwarePrefixCache(CacheManager):
         return stored_table
 
     def _exact_prefix_hashes(self, tokens: list[int]) -> list[tuple[BlockHash, int]]:
-        """Return deterministic block hashes and token counts for an exact prefix."""
+        """Return deterministic hashes for an exact prefix."""
         block_hashes_and_token_counts: list[tuple[BlockHash, int]] = []
         parent_hash: BlockHash | None = None
         terminal_start = ((len(tokens) - 1) // self.block_size) * self.block_size
+        expected_layer_types = getattr(
+            self.paged_ssd_cache, "_expected_layer_cache_types", None
+        )
+        split_gdn_layout = self._gdn_split_layout_supported(expected_layer_types)
 
         for block_start in range(0, len(tokens), self.block_size):
             block_tokens = tokens[block_start : block_start + self.block_size]
-            extra_keys = (
-                (_EXACT_PREFIX_TERMINAL_KEY,) if block_start == terminal_start else None
-            )
+            if split_gdn_layout:
+                extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
+            elif block_start == terminal_start:
+                extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+            else:
+                extra_keys = None
             block_hash = compute_block_hash(
                 parent_hash,
                 block_tokens,
