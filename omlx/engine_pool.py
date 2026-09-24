@@ -19,6 +19,7 @@ import gc
 import json
 import logging
 import os
+import random
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -66,6 +67,31 @@ logger = logging.getLogger(__name__)
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+
+# Bounded pre-load admission retry (#1970).
+#
+# A request for a resident model can be starved by a concurrent request that
+# loads a *different* model: the competing load evicts the requested model to
+# fit, and the competing model then holds a request lease, so the LRU sweep has
+# nothing to evict and admission failed instantly with InsufficientMemoryError
+# (HTTP 507) even though the pool state was still changing. The request now
+# re-attempts admission until a deadline instead of failing on the first look.
+#
+# Two windows, because the two things that can free memory have very different
+# time constants. A load or unload in flight settles in seconds, so it earns the
+# full budget below. A competing request's lease may belong to a minutes-long
+# generation, so when that is the only hope the wait is capped at the busy grace
+# instead: long enough to cover the short requests that dominate real traffic
+# (a plain request finishing is what frees the memory), far short of the full
+# budget so an unadmittable request still reports its refusal promptly. A
+# quiescent pool - nothing loading, unloading, or serving - fails fast with the
+# original diagnosis, and each wait is jittered so concurrent victims do not
+# wake up in lockstep.
+_ADMISSION_RETRY_BUDGET_S = 30.0
+_ADMISSION_RETRY_BUSY_GRACE_S = 10.0
+_ADMISSION_RETRY_INITIAL_DELAY_S = 0.05
+_ADMISSION_RETRY_MAX_DELAY_S = 0.5
+_ADMISSION_RETRY_JITTER = 0.25  # ±25% per wait
 
 
 def _positive_int(value: object) -> int:
@@ -1807,6 +1833,17 @@ class EnginePool:
         4. Load the model
         5. Return the engine
 
+        An admission refusal is retried for a bounded budget (see the
+        ``_ADMISSION_RETRY_*`` constants) while the pool can still change
+        (#1970): a concurrent request that loaded a different model may hold
+        the only evictable candidate under a lease, so the eviction sweep has
+        nothing to give up *yet*. Each retry re-acquires the pool lock and the
+        lock is never held across a wait. Retries stop at the deadline, and
+        immediately when the pool is quiescent — nothing loading, unloading, or
+        serving — in which case the original ``InsufficientMemoryError`` is
+        raised unchanged. Losses that can never be recovered (a model that
+        cannot fit at all, an unknown model) are never retried.
+
         Args:
             model_id: The model ID to get engine for
             force_lm: Force loading as LM (BatchedEngine) even for VLM models.
@@ -1825,290 +1862,420 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
-        ready = self._acquire_loaded_engine(
-            model_id, force_lm, _lease, runtime_settings
-        )
-        if ready is not None:
-            return ready
-        async with self._lock:
-            entry = self._entries.get(model_id)
-            if not entry:
-                raise ModelNotFoundError(model_id, list(self._entries.keys()))
-            if entry.pending_unload_reason:
-                raise ModelBusyError(model_id, "start work while unload is pending")
-            expected_signature = self._engine_runtime_signature(
-                model_id,
-                runtime_settings,
-            )
-            ngram_admission_ceiling = None
-            if (entry.config_model_type or "").replace("-", "_").lower() in {
-                "qwen4_exp",
-                "deepseek_v41",
-            }:
-                candidate = self._current_ceiling()
-                if candidate <= 0:
-                    candidate = self._fallback_admission_ceiling()
-                if candidate > 0:
-                    ngram_admission_ceiling = candidate
-            unloaded_for_admission = False
 
-            # Already loaded - just update access time
-            if entry.engine is not None:
-                if (
-                    expected_signature is not None
-                    and entry.runtime_settings_signature is not None
-                    and entry.runtime_settings_signature != expected_signature
-                ) or (
-                    runtime_settings is not None
-                    and entry.runtime_settings_signature is None
-                ):
-                    self._raise_if_reload_busy(
-                        entry,
-                        "reload runtime settings variant",
-                    )
-                    logger.info(
-                        "Runtime settings variant changed for %s; "
-                        "unloading before reload.",
+        started = time.monotonic()
+        deadline = started + max(0.0, _ADMISSION_RETRY_BUDGET_S)
+        busy_deadline = started + max(0.0, _ADMISSION_RETRY_BUSY_GRACE_S)
+        delay = max(0.0, _ADMISSION_RETRY_INITIAL_DELAY_S)
+        retrying = False
+        while True:
+            ready = self._acquire_loaded_engine(
+                model_id, force_lm, _lease, runtime_settings
+            )
+            if ready is not None:
+                return ready
+            try:
+                async with self._lock:
+                    return await self._admit_engine_locked(
                         model_id,
+                        force_lm=force_lm,
+                        _lease=_lease,
+                        runtime_settings=runtime_settings,
                     )
-                    await self._unload_engine(model_id)
-                    unloaded_for_admission = True
-                # If force_lm requested but current engine is VLM, unload and reload
-                if (
-                    entry.engine is not None
-                    and force_lm
-                    and isinstance(entry.engine, VLMBatchedEngine)
+            except InsufficientMemoryError:
+                # Bounded retry (#1970). The refusal above was decided with the
+                # lock held, so the wait below happens only after the lock is
+                # released: sleeping under ``self._lock`` would serialize every
+                # other model behind this one request and reintroduce the stall
+                # this retry exists to remove. Re-acquiring the lock per attempt
+                # also means a competing load that finished while we waited is
+                # observed on the next pass.
+                if not await self._admission_retry_worthwhile(
+                    model_id, deadline, busy_deadline
                 ):
-                    self._raise_if_reload_busy(entry, "reload as LM")
+                    raise
+                if not retrying:
+                    retrying = True
                     logger.info(
-                        f"Unloading VLM engine for {model_id} "
-                        f"(force_lm=True, reloading as LM)"
+                        "Admission for '%s' refused while the pool can still "
+                        "change (a load or unload in flight, or another "
+                        "request's lease); retrying for up to %.1fs (%.1fs "
+                        "when only an unrelated in-flight request can free "
+                        "memory).",
+                        model_id,
+                        _ADMISSION_RETRY_BUDGET_S,
+                        _ADMISSION_RETRY_BUSY_GRACE_S,
                     )
-                    await self._unload_engine(model_id)
-                    unloaded_for_admission = True
-                elif entry.engine is not None:
-                    self._validate_llm_engine_ready(model_id, entry.engine)
-                    if entry.runtime_settings_signature is None:
-                        entry.runtime_settings_signature = expected_signature
-                    entry.last_access = time.time()
-                    if _lease:
-                        entry.in_use += 1
-                    return entry.engine
+                wait = delay * (
+                    1.0
+                    + random.uniform(
+                        -_ADMISSION_RETRY_JITTER, _ADMISSION_RETRY_JITTER
+                    )
+                )
+                delay = min(delay * 2.0, _ADMISSION_RETRY_MAX_DELAY_S)
+                # Floor the sleep so tuning the constants to zero cannot turn
+                # the retry loop into a hot spin.
+                await asyncio.sleep(max(0.01, wait))
 
-            self._raise_if_model_path_missing_locked(model_id, entry)
-            self._raise_if_load_failed(model_id, entry)
+    async def _admission_retry_worthwhile(
+        self, model_id: str, deadline: float, busy_deadline: float
+    ) -> bool:
+        """Whether a refused admission should be re-attempted (#1970).
 
-            # Pre-load admission against the memory ceiling from the
-            # process memory enforcer (min of static and dynamic). Try
-            # evicting LRU non-pinned models first; if the model still
-            # cannot fit after evicting everything available, raise.
-            #
-            # Eviction starts at the enforcer's *soft* watermark, not the
-            # ceiling (#2319): the soft..ceiling band is exactly the
-            # hard-pressure zone, and a second model admitted into it kept
-            # both models resident through the load (swapping for minutes)
-            # only to have the first request's prefill guard evict the old
-            # one anyway. Evicting down to the same soft target *before*
-            # the new weights allocate fixes the ordering; refusing a load
-            # still requires exceeding the ceiling.
-            #
-            # ceiling == 0 means the guard is disabled or the enforcer is
-            # not wired up. Eviction on model swap must not die with the
-            # guard (#2290): fall back to the best-effort admission
-            # ceiling (static, guard-independent) and keep evicting, but
-            # never refuse the load under it — with the guard off the
-            # user opted out of hard limits.
-            # A distributed coordinator admits only rank zero's planned shard,
-            # not the complete model. A local VLM-shaped checkpoint served by
-            # the text engine (force_lm or a model_type_override that flipped
-            # engine_type to "batched") loads only its language weights, so
-            # admit that path by the text-only estimate instead of the
-            # vision-inclusive file size (#2385).
-            deployment = self._distributed_deployment_for_entry(entry)
-            admission_size = self._entry_resident_size(entry)
+        False once the applicable window is spent, or while the pool is
+        quiescent: with nothing loading, unloading, or serving, no other actor
+        can free memory, so the request fails fast with the original diagnosis
+        instead of stalling. A load or unload in flight settles in seconds and
+        earns the full budget; when the only hope is another request's lease -
+        which may belong to a minutes-long generation - the wait is capped at
+        ``busy_deadline``. The pool state is read under the lock, and the lock
+        is dropped before the caller waits.
+        """
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        async with self._lock:
+            hope = self._admission_hope_kind_locked(model_id)
+        if hope is None:
+            return False
+        # A load or unload in flight earns the full budget; when another
+        # request's lease is the only hope, only the short grace.
+        return hope != "busy" or now < busy_deadline
+
+    def _admission_may_improve_locked(self, model_id: str) -> bool:
+        """Whether waiting can plausibly make room for ``model_id``.
+
+        Caller must hold ``self._lock``. See ``_admission_hope_kind_locked``
+        for what each kind of hope means.
+        """
+        return self._admission_hope_kind_locked(model_id) is not None
+
+    def _admission_hope_kind_locked(self, model_id: str) -> str | None:
+        """Classify what could still free memory for ``model_id`` (#1970).
+
+        Caller must hold ``self._lock``. Returns ``"load"`` when a load or
+        unload is in flight - that settles in seconds, so it earns the full
+        retry budget. Returns ``"busy"`` when the only hope is another model's
+        in-flight lease or request, which may be a minutes-long generation and
+        therefore earns only the short busy grace. Returns ``None`` when the
+        pool is quiescent: a resident, idle, unpinned model is already
+        evictable, so waiting cannot change the outcome.
+        """
+        if self._shutting_down:
+            return None
+        if self._unloading_models or self._pending_unload_tasks:
+            return "load"
+        busy = False
+        for mid, entry in self._entries.items():
+            if mid == model_id:
+                continue
+            if entry.is_loading or entry.pending_unload_reason:
+                return "load"
+            if entry.engine is None or entry.is_pinned:
+                continue
+            if entry.in_use > 0 or self._entry_has_active_requests(entry):
+                busy = True
+        return "busy" if busy else None
+
+    async def _admit_engine_locked(
+        self,
+        model_id: str,
+        *,
+        force_lm: bool,
+        _lease: bool,
+        runtime_settings: object | None,
+    ) -> (
+        BaseEngine
+        | EmbeddingEngine
+        | RerankerEngine
+        | STTEngine
+        | STSEngine
+        | TTSEngine
+    ):
+        """Run the pre-load admission sequence and load the model.
+
+        Caller must hold ``self._lock``. Raises ``InsufficientMemoryError``
+        when nothing evictable is left and the projected footprint exceeds the
+        ceiling; ``get_engine`` decides whether that refusal is worth retrying.
+        """
+        entry = self._entries.get(model_id)
+        if not entry:
+            raise ModelNotFoundError(model_id, list(self._entries.keys()))
+        if entry.pending_unload_reason:
+            raise ModelBusyError(model_id, "start work while unload is pending")
+        expected_signature = self._engine_runtime_signature(
+            model_id,
+            runtime_settings,
+        )
+        ngram_admission_ceiling = None
+        if (entry.config_model_type or "").replace("-", "_").lower() in {
+            "qwen4_exp",
+            "deepseek_v41",
+        }:
+            candidate = self._current_ceiling()
+            if candidate <= 0:
+                candidate = self._fallback_admission_ceiling()
+            if candidate > 0:
+                ngram_admission_ceiling = candidate
+        unloaded_for_admission = False
+
+        # Already loaded - just update access time
+        if entry.engine is not None:
             if (
-                deployment is None
-                and entry.text_only_size
-                and (force_lm or entry.engine_type == "batched")
+                expected_signature is not None
+                and entry.runtime_settings_signature is not None
+                and entry.runtime_settings_signature != expected_signature
+            ) or (
+                runtime_settings is not None
+                and entry.runtime_settings_signature is None
             ):
-                admission_size = entry.text_only_size
-            admission_settings = runtime_settings
-            if admission_settings is None and self._settings_manager is not None:
-                get_settings = getattr(self._settings_manager, "get_settings", None)
-                if callable(get_settings):
-                    admission_settings = get_settings(model_id)
-            load_settings = self._effective_qwen4_model_settings(
-                entry,
-                admission_settings,
-                ceiling=ngram_admission_ceiling,
-            )
-            load_settings = self._effective_deepseek_v41_model_settings(
-                entry, load_settings, ceiling=ngram_admission_ceiling
-            )
-            ngram_admission_override = load_settings is not admission_settings
-            runtime_load_settings = (
-                load_settings if ngram_admission_override else runtime_settings
-            )
-            admission_size = self._entry_runtime_resident_size(
-                entry,
-                load_settings,
-                base_size=admission_size,
-            )
-            admission_kind = "local shard" if deployment is not None else "model"
+                self._raise_if_reload_busy(
+                    entry,
+                    "reload runtime settings variant",
+                )
+                logger.info(
+                    "Runtime settings variant changed for %s; "
+                    "unloading before reload.",
+                    model_id,
+                )
+                await self._unload_engine(model_id)
+                unloaded_for_admission = True
+            # If force_lm requested but current engine is VLM, unload and reload
+            if (
+                entry.engine is not None
+                and force_lm
+                and isinstance(entry.engine, VLMBatchedEngine)
+            ):
+                self._raise_if_reload_busy(entry, "reload as LM")
+                logger.info(
+                    f"Unloading VLM engine for {model_id} "
+                    f"(force_lm=True, reloading as LM)"
+                )
+                await self._unload_engine(model_id)
+                unloaded_for_admission = True
+            elif entry.engine is not None:
+                self._validate_llm_engine_ready(model_id, entry.engine)
+                if entry.runtime_settings_signature is None:
+                    entry.runtime_settings_signature = expected_signature
+                entry.last_access = time.time()
+                if _lease:
+                    entry.in_use += 1
+                return entry.engine
 
-            ceiling = self._current_ceiling()
-            best_effort = False
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-                best_effort = ceiling > 0
-            if ceiling > 0:
-                soft_target = self._admission_soft_target()
-                evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
-                evicted_any = unloaded_for_admission
-                while True:
-                    # Consult the tracked accumulator alongside live memory:
-                    # after a model settles or idles, mx.get_active_memory() and
-                    # the process footprint can read well below the model's true
-                    # resident size, while _current_model_memory still reflects
-                    # the committed total. Using only live memory lets a second
-                    # large model load without evicting the first, over-
-                    # committing past the ceiling (#1623).
-                    current = max(
-                        mx.get_active_memory(),
-                        get_phys_footprint(),
-                        self._current_model_memory,
+        self._raise_if_model_path_missing_locked(model_id, entry)
+        self._raise_if_load_failed(model_id, entry)
+
+        # Pre-load admission against the memory ceiling from the
+        # process memory enforcer (min of static and dynamic). Try
+        # evicting LRU non-pinned models first; if the model still
+        # cannot fit after evicting everything available, raise.
+        #
+        # Eviction starts at the enforcer's *soft* watermark, not the
+        # ceiling (#2319): the soft..ceiling band is exactly the
+        # hard-pressure zone, and a second model admitted into it kept
+        # both models resident through the load (swapping for minutes)
+        # only to have the first request's prefill guard evict the old
+        # one anyway. Evicting down to the same soft target *before*
+        # the new weights allocate fixes the ordering; refusing a load
+        # still requires exceeding the ceiling.
+        #
+        # ceiling == 0 means the guard is disabled or the enforcer is
+        # not wired up. Eviction on model swap must not die with the
+        # guard (#2290): fall back to the best-effort admission
+        # ceiling (static, guard-independent) and keep evicting, but
+        # never refuse the load under it — with the guard off the
+        # user opted out of hard limits.
+        # A distributed coordinator admits only rank zero's planned shard,
+        # not the complete model. A local VLM-shaped checkpoint served by
+        # the text engine (force_lm or a model_type_override that flipped
+        # engine_type to "batched") loads only its language weights, so
+        # admit that path by the text-only estimate instead of the
+        # vision-inclusive file size (#2385).
+        deployment = self._distributed_deployment_for_entry(entry)
+        admission_size = self._entry_resident_size(entry)
+        if (
+            deployment is None
+            and entry.text_only_size
+            and (force_lm or entry.engine_type == "batched")
+        ):
+            admission_size = entry.text_only_size
+        admission_settings = runtime_settings
+        if admission_settings is None and self._settings_manager is not None:
+            get_settings = getattr(self._settings_manager, "get_settings", None)
+            if callable(get_settings):
+                admission_settings = get_settings(model_id)
+        load_settings = self._effective_qwen4_model_settings(
+            entry,
+            admission_settings,
+            ceiling=ngram_admission_ceiling,
+        )
+        load_settings = self._effective_deepseek_v41_model_settings(
+            entry, load_settings, ceiling=ngram_admission_ceiling
+        )
+        ngram_admission_override = load_settings is not admission_settings
+        runtime_load_settings = (
+            load_settings if ngram_admission_override else runtime_settings
+        )
+        admission_size = self._entry_runtime_resident_size(
+            entry,
+            load_settings,
+            base_size=admission_size,
+        )
+        admission_kind = "local shard" if deployment is not None else "model"
+
+        ceiling = self._current_ceiling()
+        best_effort = False
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
+            best_effort = ceiling > 0
+        if ceiling > 0:
+            soft_target = self._admission_soft_target()
+            evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
+            evicted_any = unloaded_for_admission
+            while True:
+                # Consult the tracked accumulator alongside live memory:
+                # after a model settles or idles, mx.get_active_memory() and
+                # the process footprint can read well below the model's true
+                # resident size, while _current_model_memory still reflects
+                # the committed total. Using only live memory lets a second
+                # large model load without evicting the first, over-
+                # committing past the ceiling (#1623).
+                current = max(
+                    mx.get_active_memory(),
+                    get_phys_footprint(),
+                    self._current_model_memory,
+                )
+                projected = current + admission_size
+                if projected <= evict_target:
+                    break
+                victim = self._find_lru_victim()
+                if victim is not None:
+                    logger.info(
+                        f"Evicting '{victim}' to fit '{model_id}' "
+                        f"under the admission soft target "
+                        f"({format_size(projected)} > "
+                        f"{format_size(evict_target)})"
                     )
-                    projected = current + admission_size
-                    if projected <= evict_target:
-                        break
-                    victim = self._find_lru_victim()
-                    if victim is not None:
+                    await self._unload_engine(victim)
+                    evicted_any = True
+                    continue
+                if projected <= ceiling:
+                    # Above the soft target with nothing left to
+                    # evict, but still under the ceiling: admit. The
+                    # soft target only decides when eviction starts
+                    # (#2319); refusal keeps the ceiling-only
+                    # contract.
+                    if evict_target < ceiling:
                         logger.info(
-                            f"Evicting '{victim}' to fit '{model_id}' "
-                            f"under the admission soft target "
+                            f"Admitting '{model_id}' above the "
+                            f"admission soft target with no idle "
+                            f"model left to evict "
                             f"({format_size(projected)} > "
-                            f"{format_size(evict_target)})"
+                            f"{format_size(evict_target)}, ceiling "
+                            f"{format_size(ceiling)})"
                         )
-                        await self._unload_engine(victim)
-                        evicted_any = True
-                        continue
-                    if projected <= ceiling:
-                        # Above the soft target with nothing left to
-                        # evict, but still under the ceiling: admit. The
-                        # soft target only decides when eviction starts
-                        # (#2319); refusal keeps the ceiling-only
-                        # contract.
-                        if evict_target < ceiling:
-                            logger.info(
-                                f"Admitting '{model_id}' above the "
-                                f"admission soft target with no idle "
-                                f"model left to evict "
-                                f"({format_size(projected)} > "
-                                f"{format_size(evict_target)}, ceiling "
-                                f"{format_size(ceiling)})"
-                            )
-                        break
-                    failure_current = current
-                    failure_projected = projected
-                    failure_label = "current"
+                    break
+                failure_current = current
+                failure_projected = projected
+                failure_label = "current"
 
-                    if evicted_any:
-                        # Nothing else to evict after unloading at least one
-                        # model in this get_engine() call. Before failing,
-                        # re-test against the *tracked committed* baseline.
-                        # The phys_footprint term folded into `current` is the
-                        # macOS kernel ledger, which can still count
-                        # reclaimable residue from models we just evicted.
-                        # Pinned/in-use models that could not be evicted remain
-                        # counted in _current_model_memory, preserving the
-                        # #1623 undercount guard. Without a local eviction,
-                        # keep trusting phys_footprint because it may be
-                        # unrelated process pressure rather than model residue.
-                        committed = max(
-                            mx.get_active_memory(), self._current_model_memory
-                        )
-                        committed_projected = committed + admission_size
-                        if committed_projected <= ceiling:
-                            logger.info(
-                                f"Admitting '{model_id}': committed baseline "
-                                f"{format_size(committed_projected)} fits ceiling "
-                                f"{format_size(ceiling)} "
-                                f"(live footprint {format_size(projected)} included "
-                                "reclaimable residue from evicted models)"
-                            )
-                            break
-                        failure_current = committed
-                        failure_projected = committed_projected
-                        failure_label = "committed"
-
-                    if best_effort:
-                        # Memory guard is off: evicting was all we could
-                        # do. Admit over the static ceiling instead of
-                        # refusing, matching the unguarded no-hard-limit
-                        # contract.
-                        logger.warning(
-                            f"Loading '{model_id}' past the static memory "
-                            f"ceiling with the memory guard disabled "
-                            f"(projected {format_size(failure_projected)} > "
-                            f"ceiling {format_size(ceiling)}, "
-                            f"{failure_label} baseline) and nothing left to "
-                            f"evict; the system may swap heavily."
+                if evicted_any:
+                    # Nothing else to evict after unloading at least one
+                    # model in this get_engine() call. Before failing,
+                    # re-test against the *tracked committed* baseline.
+                    # The phys_footprint term folded into `current` is the
+                    # macOS kernel ledger, which can still count
+                    # reclaimable residue from models we just evicted.
+                    # Pinned/in-use models that could not be evicted remain
+                    # counted in _current_model_memory, preserving the
+                    # #1623 undercount guard. Without a local eviction,
+                    # keep trusting phys_footprint because it may be
+                    # unrelated process pressure rather than model residue.
+                    committed = max(
+                        mx.get_active_memory(), self._current_model_memory
+                    )
+                    committed_projected = committed + admission_size
+                    if committed_projected <= ceiling:
+                        logger.info(
+                            f"Admitting '{model_id}': committed baseline "
+                            f"{format_size(committed_projected)} fits ceiling "
+                            f"{format_size(ceiling)} "
+                            f"(live footprint {format_size(projected)} included "
+                            "reclaimable residue from evicted models)"
                         )
                         break
+                    failure_current = committed
+                    failure_projected = committed_projected
+                    failure_label = "committed"
 
-                    # Still over budget under the applicable baseline. Use
-                    # ModelTooLargeError when the model alone exceeds the
-                    # ceiling (no chance of fitting), InsufficientMemoryError
-                    # when current usage leaves no room.
-                    if admission_size > ceiling:
-                        binding, advice = self._ceiling_binding_and_advice(
-                            ceiling=ceiling,
-                            current=failure_current,
-                            tail="use a smaller model",
-                        )
-                        raise ModelTooLargeError(
-                            model_id,
-                            admission_size,
-                            ceiling,
-                            binding=binding,
-                            advice=advice,
-                        )
+                if best_effort:
+                    # Memory guard is off: evicting was all we could
+                    # do. Admit over the static ceiling instead of
+                    # refusing, matching the unguarded no-hard-limit
+                    # contract.
+                    logger.warning(
+                        f"Loading '{model_id}' past the static memory "
+                        f"ceiling with the memory guard disabled "
+                        f"(projected {format_size(failure_projected)} > "
+                        f"ceiling {format_size(ceiling)}, "
+                        f"{failure_label} baseline) and nothing left to "
+                        f"evict; the system may swap heavily."
+                    )
+                    break
+
+                # Still over budget under the applicable baseline. Use
+                # ModelTooLargeError when the model alone exceeds the
+                # ceiling (no chance of fitting), InsufficientMemoryError
+                # when current usage leaves no room.
+                if admission_size > ceiling:
                     binding, advice = self._ceiling_binding_and_advice(
                         ceiling=ceiling,
                         current=failure_current,
-                        tail="unload another model",
+                        tail="use a smaller model",
                     )
-                    label = f"{binding} memory ceiling" if binding else "memory ceiling"
-                    raise InsufficientMemoryError(
-                        required=admission_size,
-                        current=failure_current,
-                        message=(
-                            f"Cannot load {model_id}: projected memory "
-                            f"{format_size(failure_projected)} would exceed "
-                            f"the {label} {format_size(ceiling)} "
-                            f"({failure_label}: {format_size(failure_current)}, "
-                            f"{admission_kind}: {format_size(admission_size)}). "
-                            f"{advice or DEFAULT_CEILING_ADVICE}."
-                        ),
+                    raise ModelTooLargeError(
+                        model_id,
+                        admission_size,
+                        ceiling,
+                        binding=binding,
+                        advice=advice,
                     )
+                binding, advice = self._ceiling_binding_and_advice(
+                    ceiling=ceiling,
+                    current=failure_current,
+                    tail="unload another model",
+                )
+                label = f"{binding} memory ceiling" if binding else "memory ceiling"
+                raise InsufficientMemoryError(
+                    required=admission_size,
+                    current=failure_current,
+                    message=(
+                        f"Cannot load {model_id}: projected memory "
+                        f"{format_size(failure_projected)} would exceed "
+                        f"the {label} {format_size(ceiling)} "
+                        f"({failure_label}: {format_size(failure_current)}, "
+                        f"{admission_kind}: {format_size(admission_size)}). "
+                        f"{advice or DEFAULT_CEILING_ADVICE}."
+                    ),
+                )
 
-            # Now load the model
-            await self._load_engine(
-                model_id,
-                force_lm=force_lm,
-                runtime_settings=runtime_load_settings,
-            )
+        # Now load the model
+        await self._load_engine(
+            model_id,
+            force_lm=force_lm,
+            runtime_settings=runtime_load_settings,
+        )
 
-            loaded = self._entries[model_id]
-            if ngram_admission_override and expected_signature is not None:
-                # Automatic mmap is local to this admission attempt. Keep the
-                # user's requested variant as the reuse key so the next request
-                # does not reload the model merely because pressure recovered.
-                loaded.runtime_settings_signature = expected_signature
-            self._validate_llm_engine_ready(model_id, loaded.engine)
-            if _lease:
-                loaded.in_use += 1
-            return loaded.engine
+        loaded = self._entries[model_id]
+        if ngram_admission_override and expected_signature is not None:
+            # Automatic mmap is local to this admission attempt. Keep the
+            # user's requested variant as the reuse key so the next request
+            # does not reload the model merely because pressure recovered.
+            loaded.runtime_settings_signature = expected_signature
+        self._validate_llm_engine_ready(model_id, loaded.engine)
+        if _lease:
+            loaded.in_use += 1
+        return loaded.engine
 
     async def _release_engine_lease(self, model_id: str) -> None:
         # A normal completed request need not wait behind unrelated teardown.
