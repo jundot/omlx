@@ -5036,6 +5036,56 @@ def test_lm_vector_rollback_matches_scalar_rows_and_ordinary_tokens(
         mlx_lm_mtp.set_mtp_depth(previous_depth)
 
 
+@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("late_join", [False, True])
+def test_lm_batch_priming_shares_one_forward(monkeypatch, batch_size, late_join):
+    """mlx-lm Qwen3.5 primes fresh Lightning MTP rows in one shared forward.
+
+    The per-row fallback extracts every row cache, runs one forward per row
+    and re-merges the batch. The shared forward must emit the same tokens as
+    that fallback and as ordinary decode.
+    """
+    previous = mlx_lm_mtp.is_mtp_active()
+    previous_depth = mlx_lm_mtp.get_mtp_depth()
+    mlx_lm_mtp.set_mtp_active(True)
+    mlx_lm_mtp.set_mtp_depth(2)
+    monkeypatch.setattr(bg, "_DepthController", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    try:
+        mx.random.seed(207)
+        model = _model("qwen")
+        mx.eval(model.parameters())
+        prompts = [
+            [3, 4, 5, 6, 7],
+            [3, 6, 7, 8, 4, 5, 6],
+            [4, 5, 6],
+            [7, 8, 9, 10, 11, 12],
+        ][:batch_size]
+        limits = [18, 22, 17, 26][:batch_size]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, limits, late_join=late_join)
+        model._omlx_mtp_decode_enabled = True
+
+        original = bg._initial_batch_forward
+        shared = []
+
+        def spy(gen_batch):
+            result = original(gen_batch)
+            shared.append(result is not None)
+            return result
+
+        monkeypatch.setattr(bg, "_initial_batch_forward", spy)
+        actual, _ = generate(model, prompts, limits, late_join=late_join)
+        assert any(shared), "fresh mlx-lm rows must prime in one shared forward"
+
+        monkeypatch.setattr(bg, "_initial_batch_forward", lambda gen_batch: None)
+        fallback, _ = generate(model, prompts, limits, late_join=late_join)
+        assert actual == fallback == expected
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+        mlx_lm_mtp.set_mtp_depth(previous_depth)
+
+
 def _no_whole_cache_copy(value, *args, **kwargs):
     raise AssertionError("shared verify must not deep-copy the batch cache")
 

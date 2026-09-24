@@ -1197,11 +1197,16 @@ def _initial_batch_forward(gen_batch):
 
     host = getattr(gen_batch.model, "_language_model", None)
     chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
+    # mlx-lm backbones advance the shared cache in place too; their per-row
+    # rollback hook marks the same capability the VLM runtimes flag.
+    shared_rows = getattr(host, "_omlx_mtp_batch_rollback", False) or callable(
+        getattr(gen_batch.model, "mtp_batch_rollback", None)
+    )
     if not (
         len(gen_batch.uids) > 1
         and chain
         and not head_clone
-        and getattr(host, "_omlx_mtp_batch_rollback", False)
+        and shared_rows
         and gen_batch._next_tokens is not None
         and all(type(c) in cache_types for c in gen_batch.prompt_cache)
         and all(
