@@ -2200,20 +2200,11 @@ class _DepthController:
             self._adopt(seed)
 
     def _adopt(self, seed: "_DepthController") -> None:
-        """Start from the previous sequence's estimates on this model.
-
-        Costs are a property of model x chip x context and acceptance moves
-        with content; both keep adapting through the usual EMAs. Only depths
-        the seed never measured are swept.
-        """
+        """Reuse estimates, then remeasure costs in the new request's warmup."""
         for j in range(min(self.max_depth, len(seed.p))):
             self.p[j] = seed.p[j]
         self.t = {d: v for d, v in seed.t.items() if d <= self.max_depth}
-        self.t_age = {d: 0.0 for d in self.t}
-        self._warmup = [d for d in range(self.max_depth, 0, -1) if d not in self.t]
-        if self.max_depth > 1 and 0 not in self.t:
-            self._warmup.extend([0, 0, 0])
-        self.cur = self._warmup[0] if self._warmup else self._best()
+        self.t_age = {d: math.inf for d in self.t}
 
     def observe(
         self,
@@ -2256,6 +2247,8 @@ class _DepthController:
 
         # Warmup sweep: keep walking max..1 until every depth is measured once.
         if self._warmup:
+            if not time_sample:
+                return
             self._warmup.pop(0)
             if self._warmup:
                 self.cur = self._warmup[0]
@@ -2303,7 +2296,8 @@ class _DepthController:
     def _update_time(self, used: int, cycle_ms: float) -> None:
         cycle_ms = max(0.0, float(cycle_ms))
         prev = self.t.get(used)
-        if prev is None:
+        # Inherited costs must not cap the new request's first measurement.
+        if prev is None or self.t_age.get(used) == math.inf:
             self.t[used] = cycle_ms
             return
         if self._warmup:

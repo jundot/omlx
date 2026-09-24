@@ -456,11 +456,31 @@ def test_unreached_position_borrows_previous_estimate():
     assert c.p[2] is None
 
 
-def test_seed_skips_measured_warmup_and_copies_estimates():
+def test_seed_revalidates_costs_before_selecting_depth():
     prev = _simulate(_DepthController(2), 20, [0.9, 0.9], {0: 8.0, 1: 10.0, 2: 12.0})
+    prev.t = {0: 1.0, 1: 40.0, 2: 3.0}
     c = _DepthController(3, seed=prev)
     assert c.p[:2] == prev.p and c.p[2] is None
     assert c.t == prev.t
-    # Only the depth the seed never ran is swept.
-    assert c._warmup == [3]
-    assert c.cur == 3
+    for depth, cost in [(3, 14.0), (2, 12.0), (1, 10.0), (0, 9.0), (0, 8.0), (0, 9.0)]:
+        assert c.cur == depth
+        c.observe(depth, depth, cost)
+    assert c.t == {0: 8.0, 1: 10.0, 2: 12.0, 3: 14.0}
+    assert c._warmup == []
+    assert c.cur > 0
+    assert not c.should_exit()
+    assert prev.t == {0: 1.0, 1: 40.0, 2: 3.0}
+
+
+def test_seed_revalidation_waits_for_a_valid_timing_sample():
+    prev = _DepthController(2)
+    prev.t = {0: 1.0, 1: 2.0, 2: 3.0}
+    c = _DepthController(2, seed=prev)
+    c.observe(2, 2, 100.0, time_sample=False)
+    assert c.cur == 2
+    assert c.t[2] == 3.0
+    assert math.isinf(c.t_age[2])
+    c.observe(2, 2, 15.0)
+    assert c.t[2] == 15.0
+    assert c.t_age[2] == 0.0
+    assert c.cur == 1
