@@ -22649,19 +22649,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Block-diffusion speculative decoding. Single-stream only (requests run one at a time)."
+            "value" : "Block-diffusion speculative decoding."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Block-diffusion speculative decoding. Только single-stream (запросы выполняются по одному)."
+            "value" : "Block-diffusion speculative decoding."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "块扩散推测性解码。仅单流（请求逐个运行）。"
+            "value" : "块扩散推测性解码。"
           }
         }
       }
@@ -23153,19 +23153,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Multi-token prediction for vision-language models via an assistant drafter."
+            "value" : "External drafter (Gemma 4 assistant or Qwen MTP) speeds up single requests."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Multi-token prediction для vision-language моделей через assistant drafter."
+            "value" : "Внешний драфтер (ассистент Gemma 4 или Qwen MTP) ускоряет одиночные запросы."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "通过助手起草器为视觉语言模型进行多 Token 预测。"
+            "value" : "使用外部起草器（Gemma 4 assistant 或 Qwen MTP）加速单个请求。"
           }
         }
       }
