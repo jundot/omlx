@@ -565,13 +565,15 @@ class ModelSettings:
         Returns:
             New ModelSettings instance with values from dict.
         """
-        # Backward compat: mtp_num_draft_tokens was renamed to
-        # mtp_fixed_depth when the adaptive controller landed (#3797).
-        # Map the old key so existing model_settings.json files keep
-        # their fixed depth instead of silently falling to adaptive.
-        if "mtp_num_draft_tokens" in data and "mtp_fixed_depth" not in data:
+        # Backward compat: mtp_num_draft_tokens maps to
+        # mtp_adaptive_max_depth under the adaptive controller (#3797) —
+        # the old value was a per-cycle ceiling, which is the adaptive
+        # controller's max depth, not a fixed-depth override. Mapping it
+        # to mtp_fixed_depth would silently lock migrated configs into
+        # fixed mode.
+        if "mtp_num_draft_tokens" in data and "mtp_adaptive_max_depth" not in data:
             data = dict(data)
-            data["mtp_fixed_depth"] = data.pop("mtp_num_draft_tokens")
+            data["mtp_adaptive_max_depth"] = data.pop("mtp_num_draft_tokens")
 
         # Get valid field names
         valid_fields = {f.name for f in fields(cls)}
