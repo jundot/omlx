@@ -196,6 +196,41 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
     return _load_image_bytes(img_bytes, field=field)
 
 
+def _decode_downscaled(image: Image.Image) -> Image.Image:
+    """Decode an opened image to RGB, downscaled to the max side length.
+
+    Downscaling happens before EXIF orientation and RGB conversion so that
+    large images are not held as several full-size copies. The bounding box
+    is square, so orienting after the resize gives the same size.
+    """
+    max_side = get_max_image_side_length()
+    if max_side > 0 and (image.width > max_side or image.height > max_side):
+        scale = max_side / max(image.width, image.height)
+        # Decoder-assisted downscaling (JPEG DCT scaling). It never goes
+        # below the requested size; formats without support ignore it.
+        image.draft(
+            None,
+            (
+                max(1, math.floor(image.width * scale)),
+                max(1, math.floor(image.height * scale)),
+            ),
+        )
+        # Resize only in modes where it filters the way RGB conversion
+        # followed by resizing would. Pillow resizes "1" and "P" with
+        # NEAREST, premultiplies alpha, and does not resize every mode.
+        if image.mode == "1":
+            image = image.convert("L")
+        elif image.mode not in ("L", "RGB"):
+            image = image.convert("RGB")
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        image.thumbnail((max_side, max_side), resample=resample)
+    # Apply EXIF orientation (phone photos etc.) before returning.
+    # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
+    oriented = ImageOps.exif_transpose(image)
+    # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
+    return oriented.convert("RGB")
+
+
 def _load_image_bytes(
     img_bytes: bytes, *, field: str, generation: int | None = None
 ) -> Image.Image:
@@ -215,12 +250,7 @@ def _load_image_bytes(
         return hit
 
     try:
-        loaded = Image.open(io.BytesIO(img_bytes))
-        # Apply EXIF orientation (phone photos etc.) before processing.
-        # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
-        oriented = ImageOps.exif_transpose(loaded)
-        # Ensure RGB format (RGBA/P/L etc. cause broadcast errors in vision processors)
-        rgb = oriented.convert("RGB")
+        rgb = _decode_downscaled(Image.open(io.BytesIO(img_bytes)))
     except Image.DecompressionBombError as exc:
         raise InvalidRequestError(
             f"{field} exceeds maximum allowed image resolution (decompression bomb detected).",
@@ -231,12 +261,6 @@ def _load_image_bytes(
             f"{field} does not contain a decodable image.",
             field=field,
         ) from exc
-
-    # Downscale oversized images preserving aspect ratio to prevent memory spikes in VLMs
-    max_side = get_max_image_side_length()
-    if max_side > 0 and (rgb.width > max_side or rgb.height > max_side):
-        resample = getattr(Image, "Resampling", Image).LANCZOS
-        rgb.thumbnail((max_side, max_side), resample=resample)
 
     nbytes = _decoded_pixel_bytes(rgb)
     if nbytes <= _IMAGE_DECODE_CACHE_MAX_BYTES:
