@@ -22,7 +22,7 @@ HC, HIDDEN, LOWRANK = 4, 2560, 320
 WIDTH = HC * HIDDEN
 
 
-def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
+def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, dtype=mx.bfloat16):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
 
@@ -31,7 +31,7 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
     nn.Module.__init__(module)
     module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, LOWRANK
     module.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
-    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(mx.bfloat16)
+    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(dtype)
     module.input_mix_weight_down = nn.QuantizedLinear(
         width, LOWRANK, bias=False, group_size=64, bits=bits
     )
@@ -49,10 +49,10 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
             # up-projection gate into saturation where any rounding difference flips whole elements.
             projection.scales = (
                 mx.abs(mx.random.normal(projection.scales.shape)) * 0.01 + 0.002
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
             projection.biases = (
                 mx.random.normal(projection.biases.shape) * 0.005
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
     mx.eval(module.parameters())
     return module
 
@@ -471,3 +471,60 @@ def test_fused_rows_match_independent_singletons(bits, batch, length):
     mx.eval(actual, expected, actual_injection, expected_injection)
     assert mx.array_equal(actual, expected).item()
     assert mx.array_equal(actual_injection, expected_injection).item()
+
+
+@pytest.mark.parametrize("rows", [1, 4, 64])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_fp16_hyper_connection_matches_canonical_with_tolerance(rows, bits):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(20260918 + rows + bits)
+    module = _module(bits, hidden=256, dtype=mx.float16)
+    inputs = (mx.random.normal((1, rows, HC * 256)) * 0.5).astype(mx.float16)
+    expected = module._forward(inputs)
+    actual = module(inputs)
+    mx.eval(actual, expected)
+    for observed, reference in zip(actual, expected):
+        assert observed.dtype == reference.dtype == mx.float16
+        assert mx.allclose(observed, reference, rtol=5e-3, atol=5e-3).item()
+    gate = hc_fused.compatible if rows <= hc_fused.MAX_ROWS else hc_fused.prefill_compatible
+    assert gate(module, inputs)
+
+
+def test_fp16_hc_gate_requires_matching_norm_and_projection_dtypes():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4, hidden=256, dtype=mx.float16)
+    inputs = mx.zeros((1, 1, HC * 256), dtype=mx.float16)
+    assert hc_fused.compatible(module, inputs)
+    module.input_mix_weight_up.scales = module.input_mix_weight_up.scales.astype(mx.bfloat16)
+    assert not hc_fused.compatible(module, inputs)
+
+
+@pytest.mark.parametrize("rows", [1, 64])
+def test_fp16_hc_errors_propagate_on_repeated_calls(monkeypatch, rows):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4, hidden=256, dtype=mx.float16)
+    inputs = mx.ones((1, rows, HC * 256), dtype=mx.float16)
+    failure = RuntimeError("injected FP16 kernel failure")
+    if rows == 1:
+        monkeypatch.setattr(hc_fused, "_kernel_norm", Mock(side_effect=failure))
+    else:
+        monkeypatch.setattr(hc_fused, "_tail", Mock(side_effect=failure))
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="injected FP16 kernel failure") as caught:
+            module(inputs)
+        assert caught.value is failure
+
+
+def test_hc_fused_accepts_quantized_linear_subclasses():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    class PrefillLinear(nn.QuantizedLinear):
+        pass
+
+    module = _module(4, hidden=256, dtype=mx.float16)
+    module.input_mix_weight_down.__class__ = PrefillLinear
+    assert hc_fused.compatible(module, mx.zeros((1, 1, HC * 256), dtype=mx.float16))
