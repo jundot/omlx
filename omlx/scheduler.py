@@ -2843,12 +2843,7 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            # GLM-5.3-Flash (glm5_next) runs the same wide-chunk economics as the
-            # Qwen hybrids: KDA linear attention amortizes its per-token kernels,
-            # skewed top-8 MoE gather_qmm tiles fill at wider widths, and the
-            # native sparse MLA engages once kv reaches 4096. Measured on M3 Ultra
-            # 512GB (admin bench, tg=128, two independent runs): pp4096 +7.5%
-            # prefill tps, pp8192 +4.9%, pp1024 neutral.
+            # Wider GLM chunks require the native sparse MLA path.
             is_glm5_next = model_type.startswith("glm5_next")
             if is_glm5_next:
                 from .custom_kernels.glm_moe_dsa import fast
@@ -2862,8 +2857,7 @@ class Scheduler:
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Qwen4 needs its sparse native path before wider chunks
-                    # are safe. NAX/M5 stays at 2048 for both model families.
+                    # Keep the default chunk size on NAX hosts.
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
