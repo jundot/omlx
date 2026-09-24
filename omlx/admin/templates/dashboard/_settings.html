@@ -513,7 +513,9 @@
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label>
-                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                            <!-- Applied live, except to distributed (cluster) engines -->
+                                            <span x-show="globalSettings.server.distributed_inference_active" x-cloak
+                                                  class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
                                                 {{ t('settings.resource.restart_badge') }}
                                             </span>
                                         </div>
