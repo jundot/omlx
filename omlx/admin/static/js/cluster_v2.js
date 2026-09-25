@@ -888,6 +888,36 @@ function clusterV2Wizard() {
             );
         },
 
+        // Stage hops and sampled tokens of the running deployment, from its launch report.
+        deploymentStageLinks(deployment = this.configuredDeployment()) {
+            const report = this.deploymentRuntimeLauncher(deployment)?.stage_links;
+            return report && Array.isArray(report.edges) && report.edges.length
+                ? report
+                : null;
+        },
+
+        stageLinksSummary(report) {
+            const edges = report?.edges || [];
+            return window.t('cluster.v2.transport.hops')
+                .replace('{live}', String(edges.filter((edge) => edge.active).length))
+                .replace('{total}', String(edges.length));
+        },
+
+        stageHopLabel(edge) {
+            return window.t('cluster.v2.transport.hop')
+                .replace('{sender}', String(edge.sender_rank))
+                .replace('{receiver}', String(edge.receiver_rank));
+        },
+
+        stageHopDetail(edge) {
+            const measured = edge.measurements;
+            if (!edge.active || !measured) return edge.reason || '';
+            return window.t('cluster.v2.rdma.measured')
+                .replace('{latency}', measured.latency_p50_us.toFixed(1))
+                .replace('{to}', measured.to_peer_gbit_s.toFixed(1))
+                .replace('{from}', measured.from_peer_gbit_s.toFixed(1));
+        },
+
         deploymentRuntimeState(deployment = this.configuredDeployment()) {
             if (!deployment) return 'none';
             if (!this.runtimeLoaded) return 'unknown';

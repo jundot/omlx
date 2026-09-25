@@ -973,6 +973,44 @@
                     </span>
                 </div>
 
+                <!-- Which stage hops and sampled tokens cross MCDMA, from the launch's own checks. -->
+                <div class="mt-4 rounded-xl border border-neutral-200 overflow-hidden"
+                     x-show="deploymentRuntimeState() === 'ready' && deploymentStageLinks()" x-cloak
+                     data-cluster-v2-rdma-transport>
+                    <div class="flex items-center justify-between gap-3 px-4 py-2.5 bg-neutral-50 border-b border-neutral-200">
+                        <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">{{ t('cluster.v2.transport.title') }}</div>
+                        <span class="text-[10px] font-semibold text-neutral-500"
+                              x-text="deploymentStageLinks() ? stageLinksSummary(deploymentStageLinks()) : ''"></span>
+                    </div>
+                    <div class="divide-y divide-neutral-100">
+                        <template x-for="edge in (deploymentStageLinks() ? deploymentStageLinks().edges : [])" :key="'hop-' + edge.sender_rank">
+                            <div class="flex items-center justify-between gap-3 px-4 py-2">
+                                <div class="min-w-0">
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-[11px] font-semibold text-neutral-900" x-text="stageHopLabel(edge)"></span>
+                                        <span class="text-[10px] text-neutral-500" x-text="edge.link || ''"></span>
+                                    </div>
+                                    <div class="text-[10px] text-neutral-500 mt-0.5 truncate" x-text="stageHopDetail(edge)"></div>
+                                </div>
+                                <span class="shrink-0 text-[9px] font-bold uppercase tracking-wider"
+                                      :class="edge.active ? 'text-green-700' : 'text-amber-700'"
+                                      x-text="edge.active ? window.t('cluster.v2.transport.mcdma') : window.t('cluster.v2.transport.ring')"></span>
+                            </div>
+                        </template>
+                        <div class="flex items-center justify-between gap-3 px-4 py-2"
+                             x-show="deploymentStageLinks()?.token_relay" data-cluster-v2-token-relay>
+                            <div class="min-w-0">
+                                <div class="text-[11px] font-semibold text-neutral-900">{{ t('cluster.v2.transport.tokens') }}</div>
+                                <div class="text-[10px] text-neutral-500 mt-0.5 truncate"
+                                     x-text="deploymentStageLinks()?.token_relay?.reason || ''"></div>
+                            </div>
+                            <span class="shrink-0 text-[9px] font-bold uppercase tracking-wider"
+                                  :class="deploymentStageLinks()?.token_relay?.active ? 'text-green-700' : 'text-amber-700'"
+                                  x-text="deploymentStageLinks()?.token_relay?.active ? window.t('cluster.v2.transport.mcdma') : window.t('cluster.v2.transport.ring')"></span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Resolved worker limits and capability, not profile
                      guesses. Runtime can reduce the requested profile for
                      headroom or decline cache merging for an incompatible
