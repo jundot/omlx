@@ -65,7 +65,11 @@ def _make_scheduler():
         prefill_step_size=2048,
         paged_cache_block_size=0,
     )
-    return Scheduler(model=model, tokenizer=tokenizer, config=config)
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+    # Admission also plans against hard limit * headroom safety; tests that
+    # pin other terms keep that line at the hard limit.
+    scheduler._prefill_headroom_safety = 1.0
+    return scheduler
 
 
 class TestPreflightOrRaise:

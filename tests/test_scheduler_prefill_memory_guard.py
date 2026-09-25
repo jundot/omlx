@@ -53,7 +53,11 @@ def _make_scheduler() -> Scheduler:
         prefill_step_size=2048,
         paged_cache_block_size=0,
     )
-    return Scheduler(model=model, tokenizer=tokenizer, config=config)
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+    # Admission also plans against hard limit * headroom safety; tests that
+    # pin other terms keep that line at the hard limit.
+    scheduler._prefill_headroom_safety = 1.0
+    return scheduler
 
 
 def _make_request(prompt_tokens: int = 65536) -> Request:
@@ -123,6 +127,42 @@ def test_preflight_rejects_when_estimated_peak_exceeds_hard_limit():
     assert rejection.limit_bytes == 1
 
 
+def test_preflight_does_not_charge_a_resumed_request_for_its_own_reserve():
+    """A request resumed after an eviction pause keeps its reserved cache.
+
+    That spare capacity is part of the KV the estimate prices, so it must
+    not also count as current usage.
+    """
+    from mlx_lm.models.cache import KVCache
+
+    from omlx import scheduler as sched_mod
+
+    cache = KVCache()
+    keys = mx.zeros((1, 1, 256, 8), dtype=mx.float16)
+    cache.update_and_fetch(keys, keys)
+    sched_mod._grow_kv_capacity(cache, 4096)
+    spare = sched_mod._reserved_spare_bytes([cache])
+    assert spare == (4096 - 256) * 8 * 2 * 2
+
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    req = _make_request(65536)
+    req.cached_tokens = 256
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=65536, cached_tokens=256, current=0
+    )
+    scheduler._memory_hard_limit_bytes = est.estimated + spare // 2
+    # Isolate the admission line from the physical safety cap.
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=spare),
+    ):
+        assert scheduler._preflight_memory_check(req) is not None
+        req.prompt_cache = [cache]
+        assert scheduler._preflight_memory_check(req) is None
+
+
 def test_route_preflight_requests_eviction_before_safety_cap_rejection(monkeypatch):
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
@@ -183,6 +223,22 @@ def test_current_usage_keeps_mlx_active_as_floor_after_hot_cache_subtract():
         patch("omlx.scheduler.get_phys_footprint", return_value=10 * 1024**3),
     ):
         assert scheduler._current_usage_bytes() == 6 * 1024**3
+
+
+def test_current_usage_discounts_pool_release_the_kernel_still_charges():
+    """A just-cleared pool stays in phys_footprint for a moment (#3917)."""
+    gb = 1024**3
+    scheduler = _make_scheduler()
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=22 * gb),
+        patch("omlx.scheduler.mx.get_cache_memory", side_effect=[8 * gb, 0]),
+        patch("omlx.scheduler.get_phys_footprint", return_value=40 * gb),
+        patch("omlx.utils.metal_sync.get_graphics_footprint", return_value=30.5 * gb),
+    ):
+        # Settled: 0.5 GB of Metal memory outside MLX, all of it charged.
+        assert scheduler._current_usage_bytes() == 40 * gb
+        # MLX released its 8 GB pool; the ledgers still charge it.
+        assert scheduler._current_usage_bytes() == 32 * gb
 
 
 def test_current_usage_falls_back_to_local_hot_cache_counter():
@@ -294,7 +350,11 @@ def _make_vlm_scheduler() -> Scheduler:
         prefill_step_size=2048,
         paged_cache_block_size=0,
     )
-    return Scheduler(model=model, tokenizer=tokenizer, config=config)
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+    # Admission also plans against hard limit * headroom safety; tests that
+    # pin other terms keep that line at the hard limit.
+    scheduler._prefill_headroom_safety = 1.0
+    return scheduler
 
 
 def test_vlm_nested_config_populates_estimator_dims():
@@ -779,7 +839,7 @@ def test_admission_estimate_is_the_single_formula():
 
 
 def test_admission_charges_full_step_under_speed_priority():
-    """Speed priority prices the full prefill_step_size chunk instead of the
+    """Speed priority prices the widest scheduled step instead of the
     throttle floor, so admission only accepts what completes at full speed."""
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
@@ -826,6 +886,17 @@ def test_admission_charges_full_step_under_speed_priority():
         )
     assert est_small is not None
     assert est_small.floor_chunk == 1023
+
+    # Qwen4-Exp widens later chunks of a long prompt; the widest step is
+    # charged, not the configured one.
+    from omlx.scheduler import _QWEN4_WIDE_PREFILL_STEP
+
+    scheduler._qwen4_wide_prefill_step = _QWEN4_WIDE_PREFILL_STEP
+    with patches[0], patches[1]:
+        est_wide = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est_wide.floor_chunk == _QWEN4_WIDE_PREFILL_STEP
 
 
 def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
@@ -989,6 +1060,53 @@ def test_admission_compares_against_hard_watermark():
     scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def test_admission_plans_against_the_prefill_headroom_line():
+    """A final KV above hard * headroom runs its tail at the floor chunk and
+    dies in the watermark band, so admission stops at that line."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    hard = int(est.estimated) + 100 * 1024**2
+    scheduler._memory_hard_limit_bytes = hard
+    scheduler._memory_hard_watermark_bytes = hard
+
+    scheduler._prefill_headroom_safety = 0.9
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError) as ei:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+    assert ei.value.limit_bytes == int(hard * 0.9)
+
+    scheduler._prefill_headroom_safety = 1.0
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def test_resumed_prefill_is_not_readmitted_against_the_full_prompt():
+    """A request paused mid-prefill for eviction resumes its own prefill."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    req = _make_request(65536)
+    req.cached_tokens = 16384
+    req.prompt_cache = [object()]
+    req._prefill_resumed = True
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        assert scheduler._preflight_memory_check(req) is None
+        # One-shot: a later admission of the same request is checked again.
+        assert scheduler._preflight_memory_check(req) is not None
 
 
 def _qwen4_prefill_profile():

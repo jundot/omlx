@@ -92,6 +92,28 @@ def test_single_capacity_regrowth_preserves_data():
         assert cur == prev or cur >= 2 * prev
 
 
+def test_single_prefill_reserve_sizes_pool_once():
+    cache = PoolingCache(4)
+    ref = _RefSingle()
+    px = _rows(0, 3, 8)
+    cache.update_and_fetch(px)
+    ref.update_and_fetch(px)
+    assert cache.prefill_capacity_bytes(400) == 97 * 8 * 4
+    mx.eval(cache.reserve_prefill_capacity(400))
+    assert cache._pool_buf.shape[1] == 100
+    _assert_same(cache.pooled, ref.pooled)
+    # Appends up to the prompt length write in place.
+    buf = cache._pool_buf
+    for i in range(3, 100, 7):
+        px = _rows(i, min(7, 100 - i), 8)
+        cache.update_and_fetch(px)
+        ref.update_and_fetch(px)
+    assert cache._pool_buf is buf
+    _assert_same(cache.pooled, ref.pooled)
+    assert cache.prefill_capacity_bytes(400) == 0
+    assert cache.reserve_prefill_capacity(400) == []
+
+
 def test_single_snapshot_immune_to_later_appends():
     cache = PoolingCache(4)
     ref = _RefSingle()

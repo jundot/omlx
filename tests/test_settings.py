@@ -6,7 +6,7 @@ import os
 import tempfile
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1111,6 +1111,35 @@ class TestMemorySettings:
         """Test deserialization with prefill guard disabled."""
         settings = MemorySettings.from_dict({"prefill_memory_guard": False})
         assert settings.prefill_memory_guard is False
+
+    def test_admin_rejects_custom_tier_without_ceiling_before_applying(
+        self, tmp_path, monkeypatch
+    ):
+        """A zero custom ceiling must never reach the live enforcer."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.admin import routes as admin_routes
+        from omlx.server import _server_state
+
+        gs = GlobalSettings(base_path=tmp_path)
+        enforcer = MagicMock()
+        enforcer.memory_guard_tier = "balanced"
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(_server_state, "process_memory_enforcer", enforcer)
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"memory_guard_tier": "custom", "memory_guard_custom_ceiling_gb": 0}
+        )
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc.value.status_code == 400
+        assert gs.memory.memory_guard_tier == "balanced"
+        assert enforcer.memory_guard_tier == "balanced"
 
 
 class TestGlobalSettings:

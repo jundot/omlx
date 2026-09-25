@@ -72,8 +72,86 @@ class _RusageInfoV4(ctypes.Structure):
 
 _RUSAGE_INFO_V4 = 4
 
+
+# task_vm_info from /usr/include/mach/task_info.h (rev7). Metal buffers are
+# charged to ledger_tag_graphics_footprint, so phys_footprint minus that tag
+# is the CPU-side footprint. The kernel fills only whole revisions that fit
+# the caller's count, so the struct must span a complete revision.
+class _TaskVMInfo(ctypes.Structure):
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("region_count", ctypes.c_int32),
+        ("page_size", ctypes.c_int32),
+        *[
+            (name, ctypes.c_uint64)
+            for name in (
+                "resident_size",
+                "resident_size_peak",
+                "device",
+                "device_peak",
+                "internal",
+                "internal_peak",
+                "external",
+                "external_peak",
+                "reusable",
+                "reusable_peak",
+                "purgeable_volatile_pmap",
+                "purgeable_volatile_resident",
+                "purgeable_volatile_virtual",
+                "compressed",
+                "compressed_peak",
+                "compressed_lifetime",
+                "phys_footprint",
+                "min_address",
+                "max_address",
+            )
+        ],
+        *[
+            (name, ctypes.c_int64)
+            for name in (
+                "ledger_phys_footprint_peak",
+                "ledger_purgeable_nonvolatile",
+                "ledger_purgeable_novolatile_compressed",
+                "ledger_purgeable_volatile",
+                "ledger_purgeable_volatile_compressed",
+                "ledger_tag_network_nonvolatile",
+                "ledger_tag_network_nonvolatile_compressed",
+                "ledger_tag_network_volatile",
+                "ledger_tag_network_volatile_compressed",
+                "ledger_tag_media_footprint",
+                "ledger_tag_media_footprint_compressed",
+                "ledger_tag_media_nofootprint",
+                "ledger_tag_media_nofootprint_compressed",
+                "ledger_tag_graphics_footprint",
+                "ledger_tag_graphics_footprint_compressed",
+                "ledger_tag_graphics_nofootprint",
+                "ledger_tag_graphics_nofootprint_compressed",
+                "ledger_tag_neural_footprint",
+                "ledger_tag_neural_footprint_compressed",
+                "ledger_tag_neural_nofootprint",
+                "ledger_tag_neural_nofootprint_compressed",
+            )
+        ],
+        ("limit_bytes_remaining", ctypes.c_uint64),
+        ("decompressions", ctypes.c_int32),
+        ("_pad", ctypes.c_int32),
+        ("ledger_swapins", ctypes.c_int64),
+        ("ledger_tag_neural_nofootprint_total", ctypes.c_int64),
+        ("ledger_tag_neural_nofootprint_peak", ctypes.c_int64),
+    ]
+
+
+_TASK_VM_INFO = 22
+_TASK_VM_INFO_COUNT = ctypes.sizeof(_TaskVMInfo) // 4
+# Smallest reply that includes the graphics ledger (end of rev3).
+_TASK_VM_INFO_GRAPHICS_COUNT = (
+    _TaskVMInfo.ledger_tag_neural_nofootprint_compressed.offset + 8
+) // 4
+
 _libproc: ctypes.CDLL | None = None
 _proc_pid_rusage = None
+_task_info = None
+_mach_task_self: ctypes.c_uint | None = None
 
 if sys.platform == "darwin":
     try:
@@ -89,6 +167,21 @@ if sys.platform == "darwin":
         logger.warning(f"libproc unavailable, phys_footprint will return 0: {e}")
         _libproc = None
         _proc_pid_rusage = None
+    try:
+        _libc = ctypes.CDLL("/usr/lib/libc.dylib")
+        _task_info = _libc.task_info
+        _task_info.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        _task_info.restype = ctypes.c_int
+        _mach_task_self = ctypes.c_uint.in_dll(_libc, "mach_task_self_")
+    except (OSError, ValueError) as e:
+        logger.debug(f"task_info unavailable, graphics footprint will return 0: {e}")
+        _task_info = None
+        _mach_task_self = None
 
 
 def get_phys_footprint(pid: int | None = None) -> int:
@@ -140,3 +233,26 @@ def get_lifetime_max_phys_footprint(pid: int | None = None) -> int:
     if rc != 0:
         return 0
     return info.ri_lifetime_max_phys_footprint
+
+
+def get_graphics_footprint() -> int:
+    """Return this process's graphics (Metal/IOGPU) footprint in bytes.
+
+    MLX buffers are charged to this ledger, so it tracks MLX active + cache
+    plus other Metal allocations. Like phys_footprint, it drops only after
+    the driver finishes releasing freed buffers (0.1-0.3s on macOS 27).
+
+    Returns:
+        Bytes, or 0 on non-Darwin platforms, older kernels without the rev3
+        ledger fields, or if the task_info call fails.
+    """
+    if _task_info is None or _mach_task_self is None:
+        return 0
+    info = _TaskVMInfo()
+    count = ctypes.c_uint(_TASK_VM_INFO_COUNT)
+    rc = _task_info(
+        _mach_task_self.value, _TASK_VM_INFO, ctypes.byref(info), ctypes.byref(count)
+    )
+    if rc != 0 or count.value < _TASK_VM_INFO_GRAPHICS_COUNT:
+        return 0
+    return max(0, int(info.ledger_tag_graphics_footprint))

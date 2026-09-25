@@ -29,6 +29,7 @@ _VM_STATS_MIN_COUNT = 4
 # against `vm_stat` output on Apple Silicon.
 _VM_SPECULATIVE_INDEX = 23
 _VM_COMPRESSOR_INDEX = 32
+_VM_EXTERNAL_INDEX = 34
 # HOST_VM_INFO64 revision 2 fits older SDKs and includes compressor counters.
 _HOST_INFO64_INITIAL_COUNT = 40
 _MIG_ARRAY_TOO_LARGE = -307
@@ -138,6 +139,8 @@ def get_macos_vm_stats() -> dict[str, int] | None:
             result["speculative"] = int(stats[_VM_SPECULATIVE_INDEX]) * ps
         if count.value > _VM_COMPRESSOR_INDEX:
             result["compressed"] = int(stats[_VM_COMPRESSOR_INDEX]) * ps
+        if count.value > _VM_EXTERNAL_INDEX:
+            result["external"] = int(stats[_VM_EXTERNAL_INDEX]) * ps
         return result
     except Exception:  # noqa: BLE001
         return None

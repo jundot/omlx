@@ -4490,6 +4490,52 @@ def test_qwen4_moe_savings_precede_ple_force_decision(
         assert pool._entry_runtime_resident_size(entry, settings) == expected
 
 
+@pytest.mark.parametrize(
+    ("headroom", "forced"), [(0.9, True), (0.95, False), (None, False)]
+)
+def test_qwen4_ple_resident_load_must_leave_room_to_serve(tmp_path, headroom, forced):
+    """A resident load above ceiling * tier headroom admits no prompt, so
+    mmap wins when it fits that line; the checkpoint is the footprint."""
+    from types import SimpleNamespace
+
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+        Qwen4ExpResidencyEstimate,
+    )
+
+    entry = EngineEntry(
+        model_id="qwen4",
+        model_path=str(tmp_path),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="qwen4_exp",
+        estimated_size=1050,
+    )
+    # Checkpoint 1000 fits the 1060 ceiling (resident estimate 1050).
+    estimate = Qwen4ExpResidencyEstimate(
+        supported=True,
+        checkpoint_bytes=1000,
+        ple_bytes=400,
+        resident_bytes=1050,
+        mmap_bytes=630,
+    )
+    pool = _make_pool(ceiling=1060)
+    if headroom is not None:
+        pool._process_memory_enforcer = SimpleNamespace(
+            _prefill_headroom_safety=headroom
+        )
+    with patch(
+        "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+        "qwen4_exp_residency_estimate",
+        return_value=estimate,
+    ):
+        _, is_forced, _ = pool._qwen4_ple_offload_status(
+            entry, ModelSettings(), ceiling=1060
+        )
+    # 0.9 -> line 954 < 1000; 0.95 -> line 1007 >= 1000.
+    assert is_forced is forced
+
+
 @pytest.mark.asyncio
 async def test_prepare_cluster_reload_unloads_failed_engine_without_busy_error():
     """A failed distributed engine must reload cleanly even if busy check would otherwise trigger."""
