@@ -842,6 +842,11 @@ class EnginePool:
         if mtp_active:
             add("mtp_adaptive_max_depth", data.get("mtp_adaptive_max_depth"))
             add("mtp_fixed_depth", data.get("mtp_fixed_depth"))
+        # The chunk width is read once when the engine copies the scheduler
+        # config, so a change has to reload an already-loaded engine or it
+        # keeps running the old width while the panel reports the new one. No
+        # dependent field here, so the add is unconditional (#3381).
+        add("prefill_step_size", data.get("prefill_step_size"))
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)

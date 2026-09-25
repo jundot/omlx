@@ -18,6 +18,7 @@ from omlx.engine_core import get_mlx_executor
 
 logger = logging.getLogger(__name__)
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
+logger = logging.getLogger(__name__)
 
 _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 4.0
 _PREFLIGHT_CLEANUP_POLL_INTERVAL_S = 0.05
@@ -28,6 +29,139 @@ _PREFLIGHT_CLEANUP_POLL_INTERVAL_S = 0.05
 # runtime condition — so once-per-pair is enough to alert oncall
 # without flooding the journal at request rate.
 _PREFLIGHT_UNREACHABLE_WARNED: set[tuple[str, str]] = set()
+
+# Prefill chunk widths a per-model override may select: the power-of-two divisors
+# of Scheduler._ARRAYS_CACHE_BLOCK_SIZE. A step that does not divide the 2048-token
+# block leaves a ragged tail at every block edge, so prefill would stop running
+# on identical forward boundaries with the cache on and off
+# (Scheduler._enlarge_block_size_for_arrays_cache). 2048 is also the ceiling: above it the scheduler raises
+# paged_cache_block_size to match, which coarsens snapshot granularity (#3381).
+_PREFILL_STEP_SIZE_CHOICES = (256, 512, 1024, 2048)
+
+
+def _coerce_prefill_step_size(value: int, model_name: str) -> int:
+    """Snap a per-model prefill_step_size override onto the tested grid (#3381)."""
+    if value in _PREFILL_STEP_SIZE_CHOICES:
+        return value
+    # Ties resolve to the smaller width — the memory-safe direction for a knob
+    # whose whole purpose is cutting the prefill attention transient (#3381).
+    nearest = min(_PREFILL_STEP_SIZE_CHOICES, key=lambda c: (abs(c - value), c))
+    logger.warning(
+        "prefill_step_size=%d for %s is not a supported chunk width %s; using %d",
+        value,
+        model_name,
+        _PREFILL_STEP_SIZE_CHOICES,
+        nearest,
+    )
+    return nearest
+
+
+def resolve_prefill_step_size(
+    scheduler_config: Any, model_settings: Any, model_name: str
+) -> None:
+    """Apply a per-model prefill_step_size override in place (#3381).
+
+    Called from each engine's per-engine ``copy.copy(scheduler_config)`` seam so
+    the override never reaches the pool's shared instance, and shared by all
+    three seams so they cannot diverge.
+    """
+    # DFlash leaves its scheduler config optional (dflash.py:324-326), so the
+    # override has to tolerate None instead of raising AttributeError the moment
+    # a user sets the knob on a DFlash model (#3381).
+    if scheduler_config is None:
+        return
+    # Also absorbs a ModelSettings from an older code path that lacks the field.
+    value = getattr(model_settings, "prefill_step_size", None)
+    if not value:
+        return
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        # settings.json is hand-editable and ModelSettings.from_dict does not
+        # validate, so a junk value costs a warning, never a failed start().
+        logger.warning(
+            "Ignoring non-numeric prefill_step_size %r for %s", value, model_name
+        )
+        return
+    resolved = _coerce_prefill_step_size(requested, model_name)
+    previous = scheduler_config.prefill_step_size
+    scheduler_config.prefill_step_size = resolved
+    # The *configured* width only. The qwen3.5 floor can raise it and glm_moe_dsa
+    # / minimax_m3 widening can multiply it, so the effective width is reported
+    # separately once the scheduler exists (#3381).
+    logger.info(
+        "prefill_step_size override for %s: %d (was %s)",
+        model_name,
+        resolved,
+        previous,
+    )
+
+
+def log_effective_prefill_step_size(scheduler: Any, model_name: str) -> None:
+    """Report the prefill chunk width a live scheduler will actually use (#3381).
+
+    The configured value is not the effective one: the qwen3.5 floor and the
+    qwen4_exp wide step raise it, and glm_moe_dsa / minimax_m3 widening multiplies
+    it (Scheduler._base_prefill_step_size). Only the scheduler knows all of them,
+    so read them back instead of re-deriving the detection in the engine layer.
+    """
+    # Never let a log line break start(): every read below is best-effort, and a
+    # pin bump moving one of the widening symbols must cost a debug line only.
+    try:
+        configured = scheduler.config.prefill_step_size
+        # Probe deep in the bulk phase: processed_tokens clears the widening
+        # configs' `after` and the qwen4_exp wide step's first narrow chunk
+        # (#3903), and is a multiple of that 8192 step so its grid alignment is
+        # a no-op; remaining_tokens clears min_remaining (glm 0, minimax 4096).
+        # Minimax's tail (<4096 remaining) runs the nominal value (#3381).
+        effective = scheduler._base_prefill_step_size(1 << 20, 1 << 30)
+        logger.info(
+            "prefill chunk width for %s: configured=%d effective=%d",
+            model_name,
+            configured,
+            effective,
+        )
+        # An override also switches adaptive prefill widening off, because both
+        # builders gate on prefill_step_size == 2048. That makes the override 4-8x
+        # more aggressive than the number the user picked, so name the concrete
+        # before/after rather than an abstract "widening disabled" (#3381).
+        if configured == 2048:
+            return
+        if scheduler._glm_dsa_adaptive_prefill is not None:
+            return
+        if getattr(scheduler, "_minimax_m3_adaptive_prefill", None) is not None:
+            return
+        # Lazily, mirroring Scheduler.__init__: these are the counterfactual
+        # widths the model would have run at the default 2048.
+        from ..patches.glm_moe_dsa.generate_patch import (
+            _glm_dsa_adaptive_prefill_config,
+        )
+        from ..patches.minimax_m3.generate_patch import (
+            _minimax_m3_adaptive_prefill_config,
+        )
+
+        counterfactual = _glm_dsa_adaptive_prefill_config(scheduler.model, 2048)
+        if counterfactual is None:
+            counterfactual = _minimax_m3_adaptive_prefill_config(
+                scheduler.model,
+                2048,
+                getattr(scheduler.config, "model_name", None),
+            )
+        if counterfactual is not None:
+            logger.warning(
+                "prefill_step_size=%d on %s disables adaptive prefill widening: "
+                "effective chunk %d -> %d",
+                configured,
+                model_name,
+                counterfactual.step_size,
+                effective,
+            )
+    except Exception:
+        logger.debug(
+            "Effective prefill chunk width unavailable for %s",
+            model_name,
+            exc_info=True,
+        )
 
 
 async def _close_engine_core(engine) -> bool:
