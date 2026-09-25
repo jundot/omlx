@@ -4233,6 +4233,75 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
+    @pytest.mark.parametrize("paged", [True, False])
+    def test_glm53_prefill_is_wide_from_the_first_chunk(
+        self, mock_tokenizer, tmp_path, paged
+    ):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    prefill_step_size=2048,
+                    paged_ssd_cache_dir=str(tmp_path) if paged else None,
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            step = scheduler._prefill_step_size_for_progress
+            assert scheduler._glm53_wide_prefill_step == 8192
+            # No SSD n-gram gather to overlap: GLM goes wide from chunk one.
+            assert step(0, 16384) == 8192
+            if paged:
+                assert scheduler.config.paged_cache_block_size == 8192
+                assert step(2048, 14336) == 8192
+            else:
+                assert step(2048, 14336) == 6144
+        finally:
+            scheduler.shutdown()
+
+    def test_glm53_wide_prefill_needs_native_sparse_mla(self, mock_tokenizer, tmp_path):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=False,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    prefill_step_size=2048,
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._glm53_wide_prefill_step == 0
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == 2048
+            assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
     def test_qwen35_nax_host_keeps_2048_block(self, mock_tokenizer, tmp_path):
         with (
             patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
