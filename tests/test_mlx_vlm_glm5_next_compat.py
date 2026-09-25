@@ -1242,3 +1242,234 @@ def test_dense_prefix_rows_gating():
     assert attention._dense_prefix_rows(13, per_key, None) == (0, 0)
     aligned = mx.ones((1, 1, 13, 13), dtype=mx.bool_)
     assert attention._dense_prefix_rows(13, aligned, None) == (5, 0)
+
+
+# ---------------------------------------------------------------------------
+# Fused KDA (linear attention) prefill prework / norm-gate.
+# ---------------------------------------------------------------------------
+
+
+def _kda_reference_prework(mixed, conv_state, conv_w, heads, dim, q_scale):
+    """Stock Glm5NextLinearAttention prework chain in MX ops."""
+    import mlx.nn as nn
+
+    length = mixed.shape[1]
+    c_dim = 3 * heads * dim
+    conv = nn.Conv1d(c_dim, c_dim, kernel_size=4, groups=c_dim, bias=False)
+    conv.weight = conv_w
+    conv_input = mx.concatenate([conv_state, mixed], axis=1)
+    activated = nn.silu(conv(conv_input))
+    q, k, v = mx.split(activated, [heads * dim, 2 * heads * dim], axis=-1)
+    shape = (1, length, heads, dim)
+    q, k, v = q.reshape(shape), k.reshape(shape), v.reshape(shape)
+
+    def l2norm(x):
+        return x * mx.rsqrt((x * x).sum(axis=-1, keepdims=True) + 1e-6)
+
+    q = (l2norm(q.astype(mx.float32)) * q_scale).astype(mixed.dtype)
+    k = l2norm(k.astype(mx.float32)).astype(mixed.dtype)
+    return q, k, v, conv_input[:, -3:, :]
+
+
+@pytest.mark.parametrize("seq", [1, 2, 3, 5, 130])
+def test_kda_prework_kernel_matches_stock(seq):
+    from omlx.patches.glm53_kda_prework import kda_prework_fused
+
+    mx.random.seed(41)
+    heads, dim = 2, 128
+    c_dim = 3 * heads * dim
+    mixed = (mx.random.normal((1, seq, c_dim)) * 0.5).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((1, 3, c_dim)) * 0.5).astype(mx.bfloat16)
+    conv_w = (mx.random.normal((c_dim, 4, 1)) * 0.2).astype(mx.bfloat16)
+    q_scale = dim**-0.5
+
+    q, k, v, next_state = kda_prework_fused(
+        mixed, conv_state, conv_w, mx.array(q_scale, dtype=mx.float32), seq, heads, dim
+    )
+    rq, rk, rv, r_state = _kda_reference_prework(
+        mixed, conv_state, conv_w, heads, dim, q_scale
+    )
+    mx.eval(q, k, v, next_state, rq, rk, rv, r_state)
+    assert mx.array_equal(q, rq)
+    assert mx.array_equal(k, rk)
+    assert mx.array_equal(v, rv)
+    assert mx.array_equal(next_state, r_state)
+
+
+def test_kda_norm_gate_kernel_matches_o_norm():
+    from mlx_vlm.models.glm5_next.language import Glm5NextRMSNormGated
+    from omlx.patches.glm53_kda_prework import kda_norm_gate_fused
+
+    mx.random.seed(42)
+    heads, dim, seq = 2, 128, 40
+    y = (mx.random.normal((1, seq, heads, dim)) * 0.8).astype(mx.bfloat16)
+    gate = (mx.random.normal((1, seq, heads, dim)) * 0.8).astype(mx.bfloat16)
+    norm = Glm5NextRMSNormGated(dim, eps=1e-5)
+    norm.weight = (mx.random.normal((dim,)) * 0.5 + 1.0).astype(mx.float32)
+
+    fused = kda_norm_gate_fused(y, gate, norm.weight, norm.eps, heads, dim)
+    reference = norm(y, gate).reshape(1, seq, heads * dim)
+    mx.eval(fused, reference)
+    assert mx.array_equal(fused, reference)
+
+
+def _kda_tiny_config():
+    from mlx_vlm.models import glm5_next
+
+    config = _tiny_config()
+    text = config.text_config
+    text.linear_num_heads = 2
+    text.linear_head_dim = 128
+    return config
+
+
+def _kda_model(seed: int):
+    from mlx_vlm.models.glm5_next import language
+
+    mx.random.seed(seed)
+    config = _kda_tiny_config()
+    model = language.LanguageModel(config.text_config, config)
+    model.set_dtype(mx.bfloat16)
+    return model, language
+
+
+def test_kda_fused_prefill_matches_stock(monkeypatch):
+    from omlx.patches import glm53_kda_prework as kda
+
+    model, language = _kda_model(77)
+    prompt = mx.arange(70, dtype=mx.int32)[None] + 1
+
+    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", False)
+    reference_cache = model.make_cache()
+    reference = model(prompt, cache=reference_cache).logits
+    mx.eval(reference)
+    ref_conv = [cache[0] for cache in reference_cache]
+    ref_state = [cache[1] for cache in reference_cache]
+
+    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", True)
+    engaged = []
+    original = kda.glm53_kda_prefill
+
+    def spy(module, inputs, cache):
+        engaged.append(int(inputs.shape[1]))
+        return original(module, inputs, cache)
+
+    monkeypatch.setattr(kda, "glm53_kda_prefill", spy)
+    fused_cache = model.make_cache()
+    fused = model(prompt, cache=fused_cache).logits
+    fused_conv = [cache[0] for cache in fused_cache]
+    fused_state = [cache[1] for cache in fused_cache]
+    decoded = model(mx.array([[71]], dtype=mx.int32), cache=fused_cache).logits
+    reference_decoded = model(
+        mx.array([[71]], dtype=mx.int32), cache=reference_cache
+    ).logits
+    mx.eval(fused, decoded, reference_decoded)
+
+    # The single linear-attention layer takes the fused route for this chunk.
+    assert engaged == [70]
+    assert mx.allclose(fused, reference, atol=3e-4, rtol=3e-4).item()
+    for layer, (conv, ref_conv_row) in enumerate(zip(fused_conv, ref_conv)):
+        state, ref_state_row = fused_state[layer], ref_state[layer]
+        if not isinstance(conv, mx.array) or not isinstance(ref_conv_row, mx.array):
+            continue
+        assert mx.array_equal(conv, ref_conv_row), f"layer {layer} conv state"
+        assert mx.allclose(state, ref_state_row, atol=1e-6, rtol=1e-6).item(), (
+            f"layer {layer} recurrent state"
+        )
+    assert mx.allclose(decoded, reference_decoded, atol=1e-5, rtol=1e-5).item()
+
+
+def test_kda_fused_chunked_prefill_matches_single_pass(monkeypatch):
+    model, language = _kda_model(78)
+    prompt = mx.arange(80, dtype=mx.int32)[None] + 1
+
+    single_cache = model.make_cache()
+    single = model(prompt, cache=single_cache).logits
+
+    chunked_cache = model.make_cache()
+    first = model(prompt[:, :64], cache=chunked_cache).logits
+    # The narrow tail chunk runs the stock path with the fused chunk's state.
+    second = model(prompt[:, 64:], cache=chunked_cache).logits
+    mx.eval(single, first, second)
+
+    assert mx.allclose(second, single[:, 64:], atol=3e-4, rtol=3e-4).item()
+
+
+def test_kda_prefill_eligibility_gating(monkeypatch):
+    from mlx_vlm.models.glm5_next import language
+    from omlx.patches.glm53_kda_prework import (
+        glm53_kda_prefill,
+        glm53_kda_prefill_eligible,
+    )
+
+    model = _kda_model(79)[0]
+    layer = model.model.layers[0].self_attn
+    assert layer.__class__ is language.Glm5NextLinearAttention
+    cache = model.make_cache()[0]
+    inputs = (mx.random.normal((1, 70, model.args.hidden_size))).astype(mx.bfloat16)
+    assert glm53_kda_prefill_eligible(layer, inputs, None, cache)
+
+    assert not glm53_kda_prefill_eligible(
+        layer, inputs, mx.ones((1, 70), dtype=mx.bool_), cache
+    )
+    assert not glm53_kda_prefill_eligible(layer, inputs[:, :63], None, cache)
+    assert not glm53_kda_prefill_eligible(
+        layer, inputs.astype(mx.float32), None, cache
+    )
+    padded = model.make_cache()[0]
+    padded.lengths = mx.array([70])
+    assert not glm53_kda_prefill_eligible(layer, inputs, None, padded)
+
+    monkeypatch.setattr(
+        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
+    )
+    assert not glm53_kda_prefill_eligible(layer, inputs, None, cache)
+    monkeypatch.undo()
+
+    # The fused driver runs end to end and matches the module's own route.
+    fused_cache = model.make_cache()[0]
+    out_fused = glm53_kda_prefill(layer, inputs, fused_cache)
+    stock_cache = model.make_cache()[0]
+    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", False)
+    out_stock = layer(inputs, None, stock_cache)
+    mx.eval(out_fused, out_stock)
+    assert mx.allclose(out_fused, out_stock, atol=3e-4, rtol=3e-4).item()
+    assert mx.array_equal(fused_cache[0], stock_cache[0])
+
+
+def test_kda_fused_prefill_survives_mtp_runtime_patch(monkeypatch):
+    """The MTP runtime replaces the whole __call__; it must keep fusing.
+
+    ``glm5_next_vlm_runtime.apply()`` is process-wide and sticky, so any
+    test ordering that runs it first used to silently disable fused KDA
+    prefill for every later forward.
+    """
+    from mlx_vlm.models.glm5_next import language
+    from omlx.patches import glm53_kda_prework as kda
+    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+
+    assert glm5_next_vlm_runtime.apply()
+    assert getattr(language.Glm5NextLinearAttention, "_omlx_mtp_capture_patched", False)
+
+    model = _kda_model(80)[0]
+    prompt = mx.arange(70, dtype=mx.int32)[None] + 1
+
+    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", False)
+    reference_cache = model.make_cache()
+    reference = model(prompt, cache=reference_cache).logits
+
+    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", True)
+    engaged = []
+    original = kda.glm53_kda_prefill
+
+    def spy(module, inputs, cache):
+        engaged.append(int(inputs.shape[1]))
+        return original(module, inputs, cache)
+
+    monkeypatch.setattr(kda, "glm53_kda_prefill", spy)
+    fused_cache = model.make_cache()
+    fused = model(prompt, cache=fused_cache).logits
+    mx.eval(fused, reference)
+
+    assert engaged == [70]
+    assert mx.allclose(fused, reference, atol=3e-4, rtol=3e-4).item()

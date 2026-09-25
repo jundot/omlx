@@ -34,6 +34,7 @@ _NATIVE_INDEXER_WARNED = False
 # Prefill rows whose DSA selection is provably the full causal prefix skip
 # the indexer top-k and run dense causal SDPA (see _dense_prefix_rows).
 _DENSE_PREFIX_BYPASS = os.environ.get("OMLX_GLM53_DENSE_PREFIX", "1") != "0"
+_KDA_PREFILL_FUSED = os.environ.get("OMLX_GLM53_KDA_PREFILL_FUSED", "1") != "0"
 
 
 def _cache_parts(cache):
@@ -227,6 +228,14 @@ class Glm5NextLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+        if _KDA_PREFILL_FUSED and B == 1 and mask is None and S >= 64:
+            from omlx.patches.glm53_kda_prework import (
+                glm53_kda_prefill,
+                glm53_kda_prefill_eligible,
+            )
+
+            if glm53_kda_prefill_eligible(self, inputs, mask, cache):
+                return glm53_kda_prefill(self, inputs, cache)
         has_right_padding = cache is not None and cache.lengths is not None
         if has_right_padding:
             mask = mx.arange(S)[None] < cache.lengths[:, None]

@@ -75,5 +75,22 @@ python -m pytest -q tests/test_mlx_vlm_glm5_next_compat.py
   `tests/test_scheduler.py` 全量 359 通过。
   注意：测试必须用 `.venv/bin/python`（homebrew python 的 mlx_lm 版本过旧，
   会产生与代码无关的收集/断言失败）。P1 在 venv 下复跑 40/40、MTP 92/92。
-- 待办 P3：KDA 线性注意力 prefill 融合内核（conv+SiLU+L2 预处理 /
-  RMSNormGated 尾部）。
+- P3 完成：KDA 线性注意力 prefill 融合内核。新增
+  `omlx/patches/glm53_kda_prework.py`：`omlx_glm53_kda_prefill_prework`
+  （conv4+SiLU+fp32 sum-L2+q 缩放+conv-state 滚动，单 kernel）与
+  `omlx_glm53_kda_norm_gate_fused`（fp32 RMSNormGated 全链，单次回写 bf16）。
+  与 Qwen4 供体的几何差异：GLM `_l2norm` 是 **sum**（非 mean）且全程 fp32、
+  forget gate 是逐通道向量 g[B,T,H,D]（非标量）、conv K=4。门控接在
+  `Glm5NextLinearAttention.__call__`（B==1 / mask None / S≥64 / fail-closed
+  eligibility：bf16、生产几何、ArraysCache 无 padding、非投机、无 history）。
+  **关键修复**：`glm5_next_vlm_runtime._patch_linear_attention` 整体替换
+  `__call__`（MTP 捕获路径），会静默抹掉 vendor 侧融合门控——已在替换体顶部
+  加同款门控（`gdn_sink is None` 时短路，verify 捕获路径不受影响），并加回归
+  测试 `test_kda_fused_prefill_survives_mtp_runtime_patch`。该 bug 是测试套件
+  顺序污染（oq roundtrip 测试 sticky apply）暴露的真实生产缺陷：GLM-5.3 生产
+  必开 MTP，不修则 P3 在生产永不生效。
+  新增 11 条测试：prework/norm-gate 内核 **位级一致**（`mx.array_equal`，
+  含 S<3 状态滚动边界）、端到端等价（logits/conv 态/递归态/续 decode）、
+  分块不变量、eligibility 门控、MTP runtime 存活。compat 50/50、
+  MTP+scheduler 451/451、ruff 干净。
+- 待办 P4：verify 路径（packed_linear/moe_verify_gather）接线评估。
