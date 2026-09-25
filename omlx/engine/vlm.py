@@ -2422,6 +2422,17 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
+        # One-token routed experts: gate+up/SwiGLU and down/weighted-sum in
+        # two launches instead of five (bit-identical; needs the router patch).
+        try:
+            from ..patches.qwen35_moe_routed_decode import (
+                apply_qwen35_moe_routed_decode_patch,
+            )
+
+            apply_qwen35_moe_routed_decode_patch()
+        except Exception:
+            logger.debug("Qwen MoE routed decode patch not applied", exc_info=True)
+
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
