@@ -25,7 +25,9 @@ import mlx.core as mx
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """Top-p (nucleus) filtering — keep the smallest set of tokens whose
     cumulative probability mass is at least ``top_p``."""
-    probs = mx.exp(logprobs)
+    # Sum in float32: a bfloat16 running sum over a large vocabulary stops
+    # growing once each new term is below its rounding step.
+    probs = mx.exp(logprobs.astype(mx.float32))
     sorted_indices = mx.argsort(logprobs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
 

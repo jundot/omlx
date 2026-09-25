@@ -329,3 +329,15 @@ def test_near_zero_temperature_is_greedy(temp):
     assert sampler.temp == 0.0
     assert not hasattr(sampler, "sample_with_logprobs")
     assert [sampler(lp).item() for _ in range(4)] == [7] * 4
+
+
+def test_top_p_mass_is_accumulated_in_float32():
+    """A bfloat16 running sum stops growing long before it reaches the nucleus."""
+    mx.random.seed(0)
+    logits = mx.random.normal((1, 151936)) * 2.0
+    lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    kept_f32 = (apply_top_p(lp, 0.9) > -float("inf")).sum().item()
+    out = apply_top_p(lp.astype(mx.bfloat16), 0.9)
+    kept_bf16 = (out > -float("inf")).sum().item()
+    assert out.dtype == mx.bfloat16
+    assert abs(kept_bf16 - kept_f32) <= 0.01 * kept_f32
