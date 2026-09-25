@@ -305,6 +305,39 @@ def test_rank_zero_routes_its_incoming_edge_over_rdma_when_both_ends_agree(
     )
 
 
+def test_a_receive_by_shape_and_dtype_takes_the_rdma_edge_too(link, monkeypatch):
+    # kimi_k3 with attention residual blocks receives with recv(shape, dtype, src).
+    _fake_gather(monkeypatch, [0, 1])
+    ring = []
+
+    def ring_recv(shape, dtype, src, **kwargs):
+        ring.append(src)
+        return mx.zeros(shape, dtype=dtype)
+
+    monkeypatch.setattr(mx.distributed, "recv", ring_recv)
+    process = _start_sender(link, "first")
+    message = _messages()[0]
+    try:
+        with install_stage_links(
+            mx,
+            None,
+            (_stage(link),),
+            rank=0,
+            ops_loader=lambda: (PythonWordOps(), ""),
+            timeout_s=60,
+        ):
+            received = mx.distributed.recv(message.shape, message.dtype, src=1)
+            assert received.dtype == message.dtype
+            assert mx.array_equal(received, message).item()
+            # A rank with no edge to this one still receives on the ring.
+            mx.distributed.recv((2,), mx.float32, 2)
+    finally:
+        process.join(timeout=30)
+    assert process.exitcode == 0
+    assert ring == [2]
+    assert mx.distributed.recv is ring_recv
+
+
 def test_an_edge_the_peer_could_not_attach_stays_on_the_ring(link, monkeypatch):
     _fake_gather(monkeypatch, [0, 0])
     ring = []

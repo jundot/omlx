@@ -29,8 +29,8 @@ def _free_port() -> int:
     shutil.which("mlx.launch", path=os.path.dirname(sys.executable)) is None,
     reason="mlx.launch is not installed",
 )
-@pytest.mark.parametrize("ranks", [2, 3])
-def test_pipeline_tokens_match_with_every_edge_and_the_tokens_on_rdma(ranks):
+@pytest.mark.parametrize("model,ranks", [("qwen2", 2), ("qwen2", 3), ("kimi_k3", 2)])
+def test_pipeline_tokens_match_with_every_edge_and_the_tokens_on_rdma(model, ranks):
     links = [
         LoopbackLink(request_bytes=64 * 1024, reply_bytes=64 * 1024)
         for _ in range(ranks - 1)
@@ -48,6 +48,7 @@ def test_pipeline_tokens_match_with_every_edge_and_the_tokens_on_rdma(ranks):
             **os.environ,
             "RDMA_TEST_LINKS": json.dumps(edges),
             "RDMA_TEST_TOKENS": str(_NEW_TOKENS),
+            "RDMA_TEST_MODEL": model,
             "PYTHONPATH": os.pathsep.join(
                 [str(_TESTS), os.environ.get("PYTHONPATH", "")]
             ),
@@ -81,6 +82,11 @@ def test_pipeline_tokens_match_with_every_edge_and_the_tokens_on_rdma(ranks):
     assert len(results) == ranks, completed.stdout + completed.stderr
     for result in results:
         assert result["stage_links_active"] and result["matches"], result
+        # Every stage message took its edge, whichever receive call the model makes.
+        assert result["ring_recvs"] == 0, result
+        if model == "kimi_k3":
+            # Its two send paths keep MLX-LM's sampler, so no token relay here.
+            continue
         assert result["sampling_rank_only"] and result["prefill_overlap"], result
         assert result["token_relay"]["active"], result
         # No decode step used the ring for its tokens.

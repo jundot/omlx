@@ -86,9 +86,13 @@ class StageReceiver:
 
     def recv_like(self, template: Any) -> Any:
         """The next stage message, shaped and typed like `template`."""
-        shape = tuple(int(dim) for dim in template.shape)
-        dtype = _dtype_name(template.dtype)
-        total = int(template.nbytes)
+        return self.recv(template.shape, template.dtype)
+
+    def recv(self, shape: Any, dtype: Any) -> Any:
+        """The next stage message, which must have this shape and MLX dtype."""
+        shape = tuple(int(dim) for dim in shape)
+        total = int(np.prod(shape, dtype=np.int64)) * int(dtype.size)
+        mlx_dtype, dtype = dtype, _dtype_name(dtype)
         message = self._message + 1
         # Each frame is copied once, straight into an MLX buffer; frames join on the GPU.
         parts = []
@@ -147,7 +151,7 @@ class StageReceiver:
             ((message + 1, 0), self._request(message + 1, 0)) if self.prepost else None
         )
         flat = parts[0] if len(parts) == 1 else self._mx.concatenate(parts)
-        return flat.view(template.dtype).reshape(shape)
+        return flat.view(mlx_dtype).reshape(shape)
 
     def send_tokens(self, tokens: np.ndarray) -> None:
         """Hand this step's sampled tokens to the sender in the request for its next message."""
@@ -393,6 +397,7 @@ def install_stage_links(
             if live and service is not None:
                 sender = StageSender(mx, service, outgoing, timeout_s=timeout_s)
         original_send = mx.distributed.send
+        original_recv = mx.distributed.recv
         original_recv_like = mx.distributed.recv_like
 
         def send(array: Any, dst: int, *args: Any, **kwargs: Any) -> Any:
@@ -400,12 +405,18 @@ def install_stage_links(
                 return sender.send(array)
             return original_send(array, dst, *args, **kwargs)
 
+        def recv(shape: Any, dtype: Any, src: int, *args: Any, **kwargs: Any) -> Any:
+            if receiver is not None and src == receiver.peer_rank:
+                return receiver.recv(shape, dtype)
+            return original_recv(shape, dtype, src, *args, **kwargs)
+
         def recv_like(array: Any, src: int, *args: Any, **kwargs: Any) -> Any:
             if receiver is not None and src == receiver.peer_rank:
                 return receiver.recv_like(array)
             return original_recv_like(array, src, *args, **kwargs)
 
         mx.distributed.send = send
+        mx.distributed.recv = recv
         mx.distributed.recv_like = recv_like
         active = receiver is not None or sender is not None
         report = {
@@ -429,4 +440,5 @@ def install_stage_links(
             yield StageLinks(report, relay)
         finally:
             mx.distributed.send = original_send
+            mx.distributed.recv = original_recv
             mx.distributed.recv_like = original_recv_like

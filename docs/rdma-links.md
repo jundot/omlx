@@ -58,7 +58,9 @@ A link carries activations only after three independent checks agree.
 3. **Rank agreement.** After loading, every rank attaches its end of the
    mailbox and votes. An edge uses RDMA only when both ends attached and both
    daemons report the link up; a rank that cannot load the helper or reach its
-   daemon votes no and the edge stays on the Ring.
+   daemon votes no and the edge stays on the Ring. On a live edge, the model's
+   `send`, `recv_like` and `recv` calls to that neighbour all go through the
+   mailbox.
 
 If a check fails for an edge, that edge goes over the Ring and the rest keep
 their links. The deployment's cluster status reports every edge, its evidence
