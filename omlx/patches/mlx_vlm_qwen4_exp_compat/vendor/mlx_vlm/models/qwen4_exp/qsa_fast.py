@@ -78,6 +78,16 @@ def contiguous_causal_query_chunk(key_tokens: int) -> int:
     return 128
 
 
+def _native_causal_query_chunk(key_tokens: int) -> int:
+    """Amortize native QSA dispatches while bounding its FP32 score sheet."""
+
+    if key_tokens <= 32768:
+        return 4096
+    if key_tokens <= 65536:
+        return 2048
+    return 1024
+
+
 _TOKEN_MAJOR_MIN_QUERIES = 32
 _TOKEN_MAJOR_MAX_TOKENS = 131072
 
@@ -565,9 +575,9 @@ def contiguous_causal_gathered_qsa(
     if query_chunk is None:
         query_chunk = contiguous_causal_query_chunk(key_tokens)
         # The direct-index main-attention kernel carries no per-query gathered
-        # K/V tensor, so a 1024-row tile keeps the FP32 score sheet small
-        # (268 MB at 256K keys) while cutting per-tile dispatches. Preserve
-        # the smaller portable tiles whenever the exact production ABI is absent.
+        # K/V tensor. Use wider tiles while the FP32 score sheet stays bounded
+        # to 128 MiB through 64K keys, then preserve the 1,024-row long-context
+        # tile (256 MiB at the model's 256K context limit).
         if (
             queries.shape[1:] == (24, query_tokens, 256)
             and keys.shape[1] == 2
@@ -580,7 +590,9 @@ def contiguous_causal_gathered_qsa(
                 if fast.is_native_available() and fast.has_symbol(
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
-                    query_chunk = max(query_chunk, 1024)
+                    query_chunk = max(
+                        query_chunk, _native_causal_query_chunk(key_tokens)
+                    )
             except Exception:
                 pass
     if query_chunk <= 0:

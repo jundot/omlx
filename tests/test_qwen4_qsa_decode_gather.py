@@ -325,6 +325,49 @@ def test_qwen4_decode_gather_stays_budget_bounded_at_long_cache(
     assert output.shape == (1, 1, 4, 8)
 
 
+def test_qwen4_gathered_prefill_is_exact_across_uneven_query_chunks():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import qsa_fast
+
+    mx.random.seed(29)
+    key_tokens = 18
+    query_tokens = 9
+    queries = mx.random.normal((1, 4, query_tokens, 8)).astype(mx.bfloat16)
+    keys = mx.random.normal((1, 2, key_tokens, 8)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 2, key_tokens, 8)).astype(mx.bfloat16)
+    index_queries = mx.random.normal((1, query_tokens, 2, 8)).astype(mx.bfloat16)
+    index_keys = mx.random.normal((1, key_tokens, 8)).astype(mx.bfloat16)
+    index_positions = mx.arange(key_tokens, dtype=mx.int32)[None]
+    pooled_index_keys = mx.random.normal((1, key_tokens // 2, 8)).astype(mx.bfloat16)
+
+    def gathered(query_chunk):
+        return qsa_fast.contiguous_causal_gathered_qsa(
+            queries,
+            keys,
+            values,
+            index_queries,
+            index_keys,
+            index_positions,
+            num_query_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            indexer_head_dim=8,
+            compress_ratio=2,
+            token_budget=8,
+            index_key_norm=lambda value: value,
+            apply_index_rope=lambda value, _: value,
+            pooled_index_keys=pooled_index_keys,
+            query_chunk=query_chunk,
+        )
+
+    reference = gathered(2)
+    actual = gathered(5)
+    mx.eval(reference, actual)
+
+    assert reference.shape == actual.shape == (1, query_tokens, 4, 8)
+    assert mx.array_equal(actual, reference).item()
+
+
 def test_qwen4_decode_sdpa_fails_closed_when_native_shape_is_rejected(monkeypatch):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
