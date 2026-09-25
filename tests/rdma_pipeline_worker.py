@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One rank of the two-rank RDMA pipeline test, launched by mlx.launch."""
+"""One rank of the RDMA pipeline test, launched by mlx.launch with one stand-in link per edge."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def build() -> qwen2.Model:
     args = qwen2.ModelArgs(
         model_type="qwen2",
         hidden_size=64,
-        num_hidden_layers=4,
+        num_hidden_layers=6,
         intermediate_size=128,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -65,32 +65,50 @@ def main() -> int:
     group = mx.distributed.init(backend="ring", strict=True)
     rank = group.rank()
     reference = decode(build())
-    link = StageLink(1, 0, os.environ["RDMA_TEST_LINK"], os.environ["RDMA_TEST_SOCKET"])
-    mailbox_path = os.environ["RDMA_TEST_MAILBOX"]
+    # Edge r+1 -> r uses entry r: {"name", "socket", "mailbox"}.
+    edges = json.loads(os.environ["RDMA_TEST_LINKS"])
+    links = tuple(
+        StageLink(index + 1, index, edge["name"], edge["socket"])
+        for index, edge in enumerate(edges)
+    )
+    mailboxes = {edge["name"]: edge["mailbox"] for edge in edges}
     model = build()
     model.model.pipeline(group)
     with (
         install_stage_links(
             mx,
             group,
-            (link,),
+            links,
             rank=rank,
             ops_loader=lambda: (PythonWordOps(), ""),
             attach_service=lambda name, socket_path, ops: ServiceMailbox.attach(
-                name, socket_path, ops, mailbox_path=mailbox_path
+                name, socket_path, ops, mailbox_path=mailboxes[name]
             ),
             timeout_s=60,
         ) as stage_links,
         install_runtime_optimizations(
-            model, group, ExecutionSettings(prefill_step_size=4), batchable=True
+            model,
+            group,
+            ExecutionSettings(prefill_step_size=4),
+            batchable=True,
+            token_relay=stage_links.relay,
         ) as optimizations,
     ):
-        tokens = decode(model)
+        # Counts ring all-sums while decoding; tokens on the relay need none.
+        ring_sums = []
+        all_sum = mx.distributed.all_sum
+        mx.distributed.all_sum = lambda *a, **k: ring_sums.append(1) or all_sum(*a, **k)
+        try:
+            tokens = decode(model)
+        finally:
+            mx.distributed.all_sum = all_sum
     print(
         json.dumps(
             {
                 "rank": rank,
-                "stage_links_active": stage_links["active"],
+                "stage_links_active": stage_links.report["active"],
+                "token_relay": stage_links.report["token_relay"],
+                "ring_sums": len(ring_sums),
                 "sampling_rank_only": optimizations["sampling_rank_only"]["active"],
                 "prefill_overlap": optimizations["pipeline_prefill_overlap"]["active"],
                 "matches": tokens == reference,

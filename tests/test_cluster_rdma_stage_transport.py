@@ -8,6 +8,7 @@ import threading
 import time
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from rdma_loopback import LoopbackLink, PythonWordOps
 
@@ -143,6 +144,129 @@ def test_a_link_that_resets_under_a_waiting_sender_raises_instead_of_waiting(lin
     assert time.monotonic() - began < 3
 
 
+def _token_sender_main(name, socket_path, mailbox_path, results):
+    # Takes the tokens that ride the first request, then serves two messages.
+    service = ServiceMailbox.attach(
+        name, socket_path, PythonWordOps(), mailbox_path=mailbox_path
+    )
+    try:
+        sender = StageSender(
+            mx, service, StageLink(1, 0, name, socket_path), timeout_s=20
+        )
+        results.put(sender.take_tokens(3).tolist())
+        sender.send(mx.full((2, 8), 5.0))
+        sender.send(mx.full((2, 8), 6.0))
+    finally:
+        service.close()
+
+
+def test_tokens_ride_the_request_for_the_next_message(link):
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    process = context.Process(
+        target=_token_sender_main,
+        args=(link.name, link.socket_path, link.mailbox_path, results),
+        daemon=True,
+    )
+    process.start()
+    link.wait_service()
+    client = ClientMailbox.attach(link.name, PythonWordOps())
+    receiver = StageReceiver(mx, client, _stage(link), timeout_s=60)
+    receiver.prepost = False
+    try:
+        receiver.send_tokens(np.array([7, 8, 4_000_000_000], dtype=np.uint32))
+        first = receiver.recv_like(mx.zeros((2, 8)))
+        # Nothing was pre-posted, so this request goes out when the receiver asks.
+        second = receiver.recv_like(mx.zeros((2, 8)))
+        assert results.get(timeout=30) == [7, 8, 4_000_000_000]
+    finally:
+        process.join(timeout=30)
+        client.close()
+    assert process.exitcode == 0
+    assert mx.all(first == 5.0).item() and mx.all(second == 6.0).item()
+
+
+def _ends(link):
+    client = ClientMailbox.attach(link.name, PythonWordOps())
+    service = ServiceMailbox.attach(
+        link.name, link.socket_path, PythonWordOps(), mailbox_path=link.mailbox_path
+    )
+    receiver = StageReceiver(mx, client, _stage(link), timeout_s=5)
+    sender = StageSender(mx, service, _stage(link), timeout_s=5)
+    return client, service, receiver, sender
+
+
+def test_tokens_cannot_follow_a_request_that_is_already_posted(link):
+    client, service, receiver, _ = _ends(link)
+    try:
+        receiver.send_tokens(np.array([1], dtype=np.uint32))
+        with pytest.raises(frames.FrameError, match="already posted"):
+            receiver.send_tokens(np.array([2], dtype=np.uint32))
+    finally:
+        client.close()
+        service.close()
+
+
+def test_a_sender_refuses_tokens_where_a_plain_request_is_due(link):
+    client, service, receiver, sender = _ends(link)
+    try:
+        receiver.send_tokens(np.array([1, 2], dtype=np.uint32))
+        with pytest.raises(frames.FrameError, match="not a request for message 1"):
+            sender.send(mx.ones((4,)))
+    finally:
+        client.close()
+        service.close()
+
+
+def test_a_sender_refuses_a_plain_request_where_tokens_are_due(link):
+    client, service, _, sender = _ends(link)
+    try:
+        client.stage((frames.pack(frames.request(1, 0)),))
+        with pytest.raises(frames.FrameError, match="not 2 tokens for message 1"):
+            sender.take_tokens(2)
+    finally:
+        client.close()
+        service.close()
+
+
+def test_a_sender_refuses_tokens_for_a_different_batch(link):
+    client, service, receiver, sender = _ends(link)
+    try:
+        receiver.send_tokens(np.array([1, 2, 3], dtype=np.uint32))
+        with pytest.raises(frames.FrameError, match="shape \\(3,\\), not 2 tokens"):
+            sender.take_tokens(2)
+    finally:
+        client.close()
+        service.close()
+
+
+def test_a_sender_cannot_take_two_steps_of_tokens_for_one_message(link):
+    client, service, receiver, sender = _ends(link)
+    try:
+        receiver.send_tokens(np.array([9], dtype=np.uint32))
+        assert sender.take_tokens(1).tolist() == [9]
+        with pytest.raises(frames.FrameError, match="already sent the tokens"):
+            sender.take_tokens(1)
+    finally:
+        client.close()
+        service.close()
+
+
+def test_a_link_that_resets_while_a_rank_waits_for_tokens_raises(link):
+    service = ServiceMailbox.attach(
+        link.name, link.socket_path, PythonWordOps(), mailbox_path=link.mailbox_path
+    )
+    sender = StageSender(mx, service, _stage(link), timeout_s=5)
+    threading.Timer(0.2, link.flap).start()
+    began = time.monotonic()
+    try:
+        with pytest.raises(LinkDownError, match="dropped the service end"):
+            sender.take_tokens(2)
+    finally:
+        service.close()
+    assert time.monotonic() - began < 3
+
+
 def _fake_gather(monkeypatch, peers):
     def all_gather(value, group=None):
         votes = [*value.tolist(), *peers]
@@ -167,7 +291,7 @@ def test_rank_zero_routes_its_incoming_edge_over_rdma_when_both_ends_agree(
             ops_loader=lambda: (PythonWordOps(), ""),
             timeout_s=60,
         ) as state:
-            assert state["active"] and state["edges"][0]["active"]
+            assert state.report["active"] and state.report["edges"][0]["active"]
             received = mx.distributed.recv_like(
                 mx.zeros(message.shape, dtype=message.dtype), 1
             )
@@ -192,8 +316,8 @@ def test_an_edge_the_peer_could_not_attach_stays_on_the_ring(link, monkeypatch):
     with install_stage_links(
         mx, None, (_stage(link),), rank=0, ops_loader=lambda: (PythonWordOps(), "")
     ) as state:
-        edge = state["edges"][0]
-        assert not state["active"] and not edge["active"]
+        edge = state.report["edges"][0]
+        assert not state.report["active"] and not edge["active"]
         assert edge["reason"] == "rank 1 could not attach its end"
         mx.distributed.recv_like(mx.zeros((2,)), 1)
     assert ring == [1]
@@ -215,8 +339,8 @@ def test_a_rank_that_cannot_load_the_helper_still_votes(link, monkeypatch):
         ops_loader=lambda: (None, "libmcdma-rpc is not installed"),
     ) as state:
         assert calls == [[0, 0]]
-        assert state["edges"][0]["reason"] == "libmcdma-rpc is not installed"
-        assert not state["active"]
+        assert state.report["edges"][0]["reason"] == "libmcdma-rpc is not installed"
+        assert not state.report["active"]
 
 
 def test_a_sending_rank_whose_daemon_reports_the_link_down_votes_no(link, monkeypatch):
@@ -237,7 +361,7 @@ def test_a_sending_rank_whose_daemon_reports_the_link_down_votes_no(link, monkey
             name, sock, ops, mailbox_path=link.mailbox_path
         ),
     ) as state:
-        (edge,) = state["edges"]
+        (edge,) = state.report["edges"]
     assert not edge["active"]
     assert edge["reason"] == "mcdma-rpcd reports the link down"
 
@@ -249,10 +373,11 @@ def test_a_deployment_without_stage_links_changes_nothing(monkeypatch):
     monkeypatch.setattr(mx.distributed, "all_gather", never)
     original = mx.distributed.send
     with install_stage_links(mx, None, (), rank=0) as state:
-        assert state == {
+        assert state.report == {
             "enabled": False,
             "active": False,
             "reason": "no verified RDMA stage link",
             "edges": [],
         }
+        assert state.relay is None
         assert mx.distributed.send is original

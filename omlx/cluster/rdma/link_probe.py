@@ -9,19 +9,16 @@ import shlex
 import subprocess
 import threading
 import time
-import zlib
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-
 from ..launch import _cluster_ssh_argv
-from . import layout, probe_wire
+from . import layout
 from .daemon import DaemonStatus
 from .links import NodeAddress, RdmaLink
 from .mailbox import ClientMailbox, MailboxError
-from .probe_wire import ProbeError, ProbeRequest
+from .probe_run import FULL, QUICK, ProbeSettings, probe_link
+from .probe_wire import ProbeError
 from .verification import (
     DriverIdentity,
     LinkVerification,
@@ -29,111 +26,6 @@ from .verification import (
     link_identity,
 )
 from .words import WordOps
-
-
-@dataclass(frozen=True)
-class ProbeSettings:
-    """How hard one probe works the link."""
-
-    warmup: int = 20
-    round_trips: int = 200
-    bulk_bytes: int = 64 << 20
-    repeats: int = 3
-    call_timeout_s: float = 10.0
-
-
-FULL = ProbeSettings()
-# Before every launch: enough to prove bytes move both ways without delaying the load.
-QUICK = ProbeSettings(warmup=5, round_trips=50, bulk_bytes=8 << 20, repeats=1)
-
-
-def _call(
-    mailbox: ClientMailbox, parts: tuple[Any, ...], timeout_s: float
-) -> memoryview:
-    seq = mailbox.stage(parts)
-    reply = mailbox.wait(seq, timeout_s)
-    if reply is None:
-        state = "up" if mailbox.connected else "down"
-        raise ProbeError(
-            f"no reply within {timeout_s:.0f} s (daemon reports the link {state})"
-        )
-    return reply
-
-
-def _percentile(samples: list[float], fraction: float) -> float:
-    ordered = sorted(samples)
-    return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
-
-
-def probe_link(
-    mailbox: ClientMailbox,
-    settings: ProbeSettings = FULL,
-    *,
-    clock: Callable[[], float] = time.perf_counter,
-) -> ProbeMeasurements:
-    """Run the probe through an attached client mailbox; raises ProbeError on any wrong byte."""
-    echo = probe_wire.pack_request(ProbeRequest(probe_wire.ECHO))
-    body = probe_wire.pattern(7, 64).tobytes()
-    samples = []
-    for index in range(settings.warmup + settings.round_trips):
-        began = clock()
-        reply = _call(mailbox, (echo, body), settings.call_timeout_s)
-        elapsed = clock() - began
-        if bytes(reply) != body[::-1]:
-            raise ProbeError("echo reply did not match the request")
-        if index >= settings.warmup:
-            samples.append(elapsed * 1e6)
-    to_peer = min(
-        settings.bulk_bytes, mailbox.sizes.max_request - probe_wire.HEADER_BYTES
-    )
-    from_peer = min(settings.bulk_bytes, mailbox.sizes.max_reply)
-    sink = probe_wire.pack_request(ProbeRequest(probe_wire.SINK))
-    sent_seconds = 0.0
-    for repeat in range(settings.repeats):
-        payload = probe_wire.pattern(1000 + repeat, to_peer)
-        began = clock()
-        reply = _call(mailbox, (sink, payload), settings.call_timeout_s)
-        sent_seconds += clock() - began
-        if len(reply) < probe_wire.SINK_REPLY.size:
-            raise ProbeError("the peer's answer to a bulk transfer was short")
-        crc, length = probe_wire.SINK_REPLY.unpack_from(reply, 0)
-        if length != to_peer or crc != zlib.crc32(payload):
-            raise ProbeError("the peer received different bytes than were sent")
-    received_seconds = 0.0
-    for repeat in range(settings.repeats):
-        seed = 2000 + repeat
-        source = probe_wire.pack_request(
-            ProbeRequest(probe_wire.SOURCE, seed=seed, reply_bytes=from_peer)
-        )
-        began = clock()
-        reply = _call(mailbox, (source,), settings.call_timeout_s)
-        received_seconds += clock() - began
-        if len(reply) != from_peer or not np.array_equal(
-            np.frombuffer(reply, dtype=np.uint8), probe_wire.pattern(seed, from_peer)
-        ):
-            raise ProbeError("bytes from the peer did not match the expected pattern")
-    if (
-        bytes(
-            _call(
-                mailbox,
-                (probe_wire.pack_request(ProbeRequest(probe_wire.END)),),
-                settings.call_timeout_s,
-            )
-        )
-        != probe_wire.BYE
-    ):
-        raise ProbeError("the probe service did not acknowledge the end of the probe")
-    bits_out = 8 * to_peer * settings.repeats
-    bits_in = 8 * from_peer * settings.repeats
-    return ProbeMeasurements(
-        round_trips=settings.round_trips,
-        latency_p50_us=round(_percentile(samples, 0.50), 2),
-        latency_p99_us=round(_percentile(samples, 0.99), 2),
-        to_peer_bytes=to_peer * settings.repeats,
-        to_peer_gbit_s=round(bits_out / max(sent_seconds, 1e-9) / 1e9, 2),
-        from_peer_bytes=from_peer * settings.repeats,
-        from_peer_gbit_s=round(bits_in / max(received_seconds, 1e-9) / 1e9, 2),
-    )
 
 
 class ProbeService:
@@ -231,6 +123,141 @@ def start_probe_service(
     return ProbeService(process)
 
 
+def _run_client(
+    node: NodeAddress,
+    arguments: list[str],
+    timeout_s: float,
+    run: Callable[..., Any] = subprocess.run,
+) -> dict[str, Any]:
+    """Run the worker-side probe client over the cluster's SSH policy and return its JSON line."""
+    if not node.python_executable:
+        raise ProbeError(f"{node.node_id} has no recorded worker Python")
+    command = [
+        node.python_executable,
+        "-m",
+        "omlx.cluster.rdma.link_probe_client",
+        *arguments,
+    ]
+    done = run(
+        _cluster_ssh_argv(node.ssh, shlex.join(command)),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        check=False,
+    )
+    for line in reversed((done.stdout or "").splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    said = ((done.stderr or "") + (done.stdout or "")).strip().splitlines()
+    last = said[-1][-200:] if said else f"exit code {done.returncode}"
+    raise ProbeError(f"the probe client on {node.node_id} gave no result: {last}")
+
+
+def read_remote_status(
+    node: NodeAddress, *, run: Callable[..., Any] = subprocess.run
+) -> DaemonStatus:
+    """The connect daemon's status on a worker that is the client end of a link."""
+    where = f"{node.node_id}:mcdma-rpcd"
+    try:
+        return DaemonStatus.from_dict(_run_client(node, ["status"], 30.0, run))
+    except (
+        ProbeError,
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
+        return DaemonStatus(
+            where, False, f"could not read mcdma-rpcd on {node.node_id}: {exc}"
+        )
+
+
+def probe_remote_link(
+    node: NodeAddress,
+    link: str,
+    settings: ProbeSettings,
+    *,
+    run: Callable[..., Any] = subprocess.run,
+) -> ProbeMeasurements:
+    """Run the probe on `node`, the client end of `link`; raises ProbeError on any wrong byte."""
+    arguments = [
+        "probe",
+        "--name",
+        layout.valid_link_name(link),
+        "--warmup",
+        str(settings.warmup),
+        "--round-trips",
+        str(settings.round_trips),
+        "--bulk-bytes",
+        str(settings.bulk_bytes),
+        "--repeats",
+        str(settings.repeats),
+        "--call-timeout",
+        str(settings.call_timeout_s),
+    ]
+    calls = settings.warmup + settings.round_trips + 2 * settings.repeats + 1
+    result = _run_client(node, arguments, 60.0 + calls * settings.call_timeout_s, run)
+    if not result.get("ok"):
+        raise ProbeError(str(result.get("error") or "the probe client failed"))
+    return ProbeMeasurements.from_dict(result["measurements"])
+
+
+def _probed(
+    link: RdmaLink,
+    node: NodeAddress,
+    identity: dict[str, str],
+    run_probe: Callable[[], ProbeMeasurements],
+    start_service: Callable[[NodeAddress, str, str], ProbeService],
+    clock: Callable[[], float],
+    missing: str = "",
+) -> LinkVerification:
+    """Start the probe service on `node`, run `run_probe` against it, and keep the evidence."""
+
+    def outcome(
+        reason: str, measurements: ProbeMeasurements | None = None
+    ) -> LinkVerification:
+        return LinkVerification(
+            link.name, node.node_id, not reason, reason, clock(), identity, measurements
+        )
+
+    if not link.usable:
+        return outcome(link.reason or "mcdma-rpcd reports this link down")
+    if link.peer_node_id != node.node_id:
+        return outcome(
+            f"link {link.name} reaches {link.peer_node_id}, not {node.node_id}"
+        )
+    if missing:
+        return outcome(missing)
+    service = None
+    try:
+        service = start_service(node, link.name, layout.service_socket_path(link.name))
+        service.ready()
+        measurements = run_probe()
+        summary = service.finish()
+        if summary.get("ended") != "end":
+            return outcome(
+                f"the probe service ended with {summary.get('ended', 'no summary')}"
+            )
+        return outcome("", measurements)
+    except (
+        ProbeError,
+        MailboxError,
+        OSError,
+        KeyError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
+        return outcome(str(exc))
+    finally:
+        if service is not None:
+            service.close()
+
+
 def verify_link(
     link: RdmaLink,
     node: NodeAddress,
@@ -247,49 +274,48 @@ def verify_link(
     probe: Callable[..., ProbeMeasurements] = probe_link,
     clock: Callable[[], float] = time.time,
 ) -> LinkVerification:
-    """Probe `link` end to end and return the evidence, verified or not."""
-    identity = link_identity(link, status, driver)
+    """Probe `link` from this coordinator to `node` and return the evidence, verified or not."""
 
-    def outcome(
-        reason: str, measurements: ProbeMeasurements | None = None
-    ) -> LinkVerification:
-        return LinkVerification(
-            link.name, node.node_id, not reason, reason, clock(), identity, measurements
-        )
-
-    if not link.usable:
-        return outcome(link.reason or "mcdma-rpcd reports this link down")
-    if link.peer_node_id != node.node_id:
-        return outcome(
-            f"link {link.name} reaches {link.peer_node_id}, not {node.node_id}"
-        )
-    if ops is None:
-        return outcome(ops_reason or "libmcdma-rpc is not installed")
-    service = None
-    try:
-        service = start_service(node, link.name, layout.service_socket_path(link.name))
-        service.ready()
+    def run_probe() -> ProbeMeasurements:
         mailbox = attach(link.name, ops)
         try:
             if not mailbox.connected:
-                return outcome("mcdma-rpcd reports this link down")
-            measurements = probe(mailbox, settings)
+                raise ProbeError("mcdma-rpcd reports this link down")
+            return probe(mailbox, settings)
         finally:
             mailbox.close()
-        summary = service.finish()
-        if summary.get("ended") != "end":
-            return outcome(
-                f"the probe service ended with {summary.get('ended', 'no summary')}"
-            )
-        return outcome("", measurements)
-    except (
-        ProbeError,
-        MailboxError,
-        OSError,
-        ValueError,
-        subprocess.SubprocessError,
-    ) as exc:
-        return outcome(str(exc))
-    finally:
-        if service is not None:
-            service.close()
+
+    return _probed(
+        link,
+        node,
+        link_identity(link, status, driver),
+        run_probe,
+        start_service,
+        clock,
+        "" if ops is not None else ops_reason or "libmcdma-rpc is not installed",
+    )
+
+
+def verify_remote_link(
+    link: RdmaLink,
+    client: NodeAddress,
+    node: NodeAddress,
+    *,
+    status: DaemonStatus,
+    settings: ProbeSettings = QUICK,
+    start_service: Callable[
+        [NodeAddress, str, str], ProbeService
+    ] = start_probe_service,
+    probe: Callable[..., ProbeMeasurements] = probe_remote_link,
+    clock: Callable[[], float] = time.time,
+) -> LinkVerification:
+    """Probe `link` from worker `client`, its connect end, to worker `node` over SSH."""
+    identity = {**link_identity(link, status, None), "client_node_id": client.node_id}
+    return _probed(
+        link,
+        node,
+        identity,
+        lambda: probe(client, link.name, settings),
+        start_service,
+        clock,
+    )

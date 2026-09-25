@@ -219,6 +219,7 @@ def install_runtime_optimizations(
     *,
     batchable: bool,
     pipeline_parallel: bool = True,
+    token_relay: Any = None,
 ) -> Iterator[dict[str, dict[str, Any]]]:
     """Install opt-in token-only output while reporting every capability."""
 
@@ -276,6 +277,12 @@ def install_runtime_optimizations(
             prompt_supported = False
             prompt_reason = "another rank cannot use the validated pipeline prompt loop"
     sampling_active = execution.sampling_rank_only and sampling_supported
+    # Every rank reaches the same answer: the stage-link vote and the sampling vote are shared.
+    relay = (
+        token_relay
+        if token_relay is not None and token_relay.activate(sampling_active)
+        else None
+    )
     rank_zero_logits_active = sampling_active and rank_zero_logits_supported
     prefill_active = (
         execution.async_overlap
@@ -546,8 +553,12 @@ def install_runtime_optimizations(
 
         # Rank zero contributes the selected IDs; all other ranks contribute
         # zeros. Every rank therefore advances the same local KV state without
-        # gathering a hidden-state tensor.
-        sampled = mx.distributed.all_sum(sampled, group=group)
+        # gathering a hidden-state tensor. With live RDMA stage links the IDs
+        # travel up the pipeline instead, one link at a time.
+        if relay is not None:
+            sampled = relay.broadcast(mx, sampled, len(instance.uids))
+        else:
+            sampled = mx.distributed.all_sum(sampled, group=group)
         instance._next_tokens = sampled
         instance._next_logprobs = list(logprobs)
         mx.async_eval(

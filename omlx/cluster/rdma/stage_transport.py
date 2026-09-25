@@ -7,14 +7,16 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-from . import frames
+from . import frames, layout, metal_view
 from .daemon import read_status
 from .mailbox import ClientMailbox, MailboxError, ServiceMailbox
 from .stage_plan import StageLink, links_for_rank
+from .token_relay import TokenRelay
 from .words import WordOps, load_word_ops
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,10 @@ class StageReceiver:
         self._clock = clock
         self._message = 0
         self._pending: tuple[tuple[int, int], int] | None = None
+        # Off under the token relay, whose token request asks for the next message instead.
+        self.prepost = True
+        # Large frames go from the mailbox to an MLX buffer by GPU copy when the Mac can share it.
+        self._window = mailbox.reply_window(mx)
 
     def _request(self, message: int, frame: int) -> int:
         return self._mailbox.stage((frames.pack(frames.request(message, frame)),))
@@ -84,7 +90,8 @@ class StageReceiver:
         dtype = _dtype_name(template.dtype)
         total = int(template.nbytes)
         message = self._message + 1
-        out = np.empty(total, dtype=np.uint8)
+        # Each frame is copied once, straight into an MLX buffer; frames join on the GPU.
+        parts = []
         frame, count, received = 0, 1, 0
         while frame < count:
             key = (message, frame)
@@ -111,9 +118,23 @@ class StageReceiver:
                     f"stage frame mismatch over {self._link.link}: "
                     f"expected {expected}, got {actual}"
                 )
-            out[received : received + header.nbytes] = np.frombuffer(
-                reply, dtype=np.uint8, count=header.nbytes, offset=frames.HEADER_BYTES
-            )
+            if self._window is not None and header.nbytes >= metal_view.MIN_BYTES:
+                parts.append(
+                    self._window.copy(
+                        self._mx, layout.CTRL + frames.HEADER_BYTES, header.nbytes
+                    )
+                )
+            else:
+                parts.append(
+                    self._mx.array(
+                        np.frombuffer(
+                            reply,
+                            dtype=np.uint8,
+                            count=header.nbytes,
+                            offset=frames.HEADER_BYTES,
+                        )
+                    )
+                )
             received += header.nbytes
             count = header.frames
             frame += 1
@@ -122,8 +143,25 @@ class StageReceiver:
                 f"stage message over {self._link.link} carried {received} of {total} bytes"
             )
         self._message = message
-        self._pending = ((message + 1, 0), self._request(message + 1, 0))
-        return self._mx.array(out).view(template.dtype).reshape(shape)
+        self._pending = (
+            ((message + 1, 0), self._request(message + 1, 0)) if self.prepost else None
+        )
+        flat = parts[0] if len(parts) == 1 else self._mx.concatenate(parts)
+        return flat.view(template.dtype).reshape(shape)
+
+    def send_tokens(self, tokens: np.ndarray) -> None:
+        """Hand this step's sampled tokens to the sender in the request for its next message."""
+        if self._pending is not None:
+            raise frames.FrameError(
+                f"a request to rank {self.peer_rank} is already posted over {self._link.link}"
+            )
+        values = np.ascontiguousarray(tokens, dtype=np.uint32)
+        message = self._message + 1
+        header = frames.tokens(message, int(values.size))
+        self._pending = (
+            (message, 0),
+            self._mailbox.stage((frames.pack(header), values)),
+        )
 
 
 class StageSender:
@@ -145,24 +183,57 @@ class StageSender:
         self._timeout_s = timeout_s
         self._clock = clock
         self._message = 0
+        # The request for the next message's first frame, when a token request delivered it early.
+        self._pending: int | None = None
 
     def _await_request(self, message: int, frame: int) -> int:
+        if frame == 0 and self._pending is not None:
+            seq, self._pending = self._pending, None
+            return seq
+        seq, header, _ = self._next_request()
+        if (header.kind, header.message, header.frame) != (
+            frames.REQUEST,
+            message,
+            frame,
+        ):
+            raise frames.FrameError(
+                f"rank {self.peer_rank} sent kind {header.kind} for message "
+                f"{header.message} frame {header.frame}, not a request for "
+                f"message {message} frame {frame}"
+            )
+        return seq
+
+    def take_tokens(self, count: int) -> np.ndarray:
+        """This step's sampled tokens, from the request that also asks for the next message."""
+        message = self._message + 1
+        if self._pending is not None:
+            raise frames.FrameError(
+                f"rank {self.peer_rank} already sent the tokens for message {message}"
+            )
+        seq, header, payload = self._next_request()
+        if (header.kind, header.message, header.shape) != (
+            frames.TOKENS,
+            message,
+            (count,),
+        ):
+            raise frames.FrameError(
+                f"rank {self.peer_rank} sent kind {header.kind} for message "
+                f"{header.message} with shape {header.shape}, not {count} tokens "
+                f"for message {message}"
+            )
+        self._pending = seq
+        return np.frombuffer(
+            payload, dtype=np.uint32, count=count, offset=frames.HEADER_BYTES
+        ).copy()
+
+    def _next_request(self) -> tuple[int, frames.Frame, memoryview]:
+        """The receiver's next request and its parsed header."""
         deadline = self._clock() + self._timeout_s
         while True:
             got = self._mailbox.next_request(_POLL_S)
             if got is not None:
                 seq, payload = got
-                header = frames.unpack(payload)
-                if (header.kind, header.message, header.frame) != (
-                    frames.REQUEST,
-                    message,
-                    frame,
-                ):
-                    raise frames.FrameError(
-                        f"rank {self.peer_rank} asked for message {header.message} "
-                        f"frame {header.frame}, not {message} frame {frame}"
-                    )
-                return seq
+                return seq, frames.unpack(payload), payload
             if not self._mailbox.alive:
                 raise LinkDownError(
                     f"mcdma-rpcd dropped the service end of {self._link.link}"
@@ -204,6 +275,14 @@ class StageSender:
         return array
 
 
+@dataclass
+class StageLinks:
+    """A rank's stage-link report, and the token relay the runtime may switch on."""
+
+    report: dict[str, Any] = field(default_factory=dict)
+    relay: TokenRelay | None = None
+
+
 def _listen_link_up(socket_path: str, name: str) -> bool:
     """Whether the listen daemon serving `name` reports its link up; it accepts services either way."""
     peer = read_status(socket_path).peer(name)
@@ -228,15 +307,17 @@ def install_stage_links(
     ] = ServiceMailbox.attach,
     link_up: Callable[[str, str], bool] = _listen_link_up,
     timeout_s: float = DEFAULT_TIMEOUT_S,
-) -> Iterator[dict[str, Any]]:
+) -> Iterator[StageLinks]:
     """Agree with every rank on which edges are live, then carry this rank's live edges."""
     if not links:
-        yield {
-            "enabled": False,
-            "active": False,
-            "reason": "no verified RDMA stage link",
-            "edges": [],
-        }
+        yield StageLinks(
+            {
+                "enabled": False,
+                "active": False,
+                "reason": "no verified RDMA stage link",
+                "edges": [],
+            }
+        )
         return
     incoming, outgoing = links_for_rank(links, rank)
     with ExitStack() as stack:
@@ -285,6 +366,12 @@ def install_stage_links(
         def ready(peer: int, slot: int) -> bool:
             return flags[2 * peer + slot] == 1
 
+        edge_count = len(flags) // 2 - 1
+        missing = edge_count - len(links)
+        every_edge = not missing and all(
+            ready(link.receiver_rank, 0) and ready(link.sender_rank, 1)
+            for link in links
+        )
         edges = []
         receiver = sender = None
         if incoming is not None:
@@ -321,15 +408,25 @@ def install_stage_links(
         mx.distributed.send = send
         mx.distributed.recv_like = recv_like
         active = receiver is not None or sender is not None
+        report = {
+            "enabled": True,
+            "active": active,
+            "reason": "stage activations cross RDMA"
+            if active
+            else "no live RDMA edge at this rank",
+            "edges": edges,
+        }
+        relay = TokenRelay(
+            receiver,
+            sender,
+            ready=every_edge,
+            reason=f"{missing} of {edge_count} stage edges have no RDMA link"
+            if missing
+            else "an RDMA stage edge is not live",
+            report=report,
+        )
         try:
-            yield {
-                "enabled": True,
-                "active": active,
-                "reason": "stage activations cross RDMA"
-                if active
-                else "no live RDMA edge at this rank",
-                "edges": edges,
-            }
+            yield StageLinks(report, relay)
         finally:
             mx.distributed.send = original_send
             mx.distributed.recv_like = original_recv_like

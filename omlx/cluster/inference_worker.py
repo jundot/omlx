@@ -1422,6 +1422,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     execution,
                     batchable=provider.is_batchable,
                     pipeline_parallel=tensor_parallel_size == 1,
+                    token_relay=stage_links.relay,
                 ) as optimizations,
             ):
                 marker.update(
@@ -1441,7 +1442,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
-                    stage_links=stage_links,
+                    stage_links=stage_links.report,
                     output_protocol=protocol or None,
                 )
                 _emit_event(
@@ -1460,7 +1461,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         "capacity_bytes": assignment.capacity_bytes,
                         "reserve_bytes": assignment.reserve_bytes,
                         "headroom_bytes": assignment.headroom_bytes,
-                        "stage_links": stage_links,
+                        "stage_links": stage_links.report,
                     }
                 )
                 if rank == 0:

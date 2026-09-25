@@ -37,6 +37,8 @@ class NativeWordOps:
 
     def __init__(self, library: ctypes.CDLL, path: str) -> None:
         self.path = path
+        # Also offers the optional Metal buffer calls on macOS builds.
+        self.library = library
         self._wait = library.mcdma_rpc_wait_word
         self._wait.argtypes = [
             ctypes.c_void_p,
