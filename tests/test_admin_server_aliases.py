@@ -745,6 +745,7 @@ class TestGetGlobalSettingsGdnSplit:
             "active_memory_bytes": 2 * 1024**3,
             "iogpu_wired_limit_bytes": 0,
             "omlx_wired_limit_request_bytes": 0,
+            "memory_guard_preview": {},
         }
         disk_info = {"total_bytes": 100 * 1024**3, "total_formatted": "100GB"}
 
