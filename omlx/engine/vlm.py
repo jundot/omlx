@@ -35,7 +35,7 @@ import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 
@@ -4276,6 +4276,7 @@ class VLMBatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 seed=kwargs.get("seed"),
+                preview_callback=kwargs.get("diffusion_preview_callback"),
             ):
                 yield output
             return
@@ -4660,6 +4661,7 @@ class VLMBatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 seed=kwargs.get("seed"),
+                preview_callback=kwargs.get("diffusion_preview_callback"),
             ):
                 yield output
             return
@@ -5019,7 +5021,14 @@ class VLMBatchedEngine(BaseEngine):
         temperature: float,
         seed: int | None = None,
         cancel_event: threading.Event | None = None,
+        preview_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
+        """Yield committed output, optionally reporting revisable draft snapshots.
+
+        The callback runs on the MLX worker thread. Each snapshot contains the
+        committed prefix plus the current canvas, not an append-only delta.
+        Drafts never enter the output parser or completion-token accounting.
+        """
         from mlx_vlm.generate.diffusion import stream_diffusion_generate
 
         try:
@@ -5044,6 +5053,7 @@ class VLMBatchedEngine(BaseEngine):
         block_text: list[str] = []
         emitted_tokens = 0
         last_stream_segment = ""
+        committed_draft_text = ""
 
         # Special tokens are stripped from the stream, EXCEPT protocol
         # markers the model's output parser needs to see in the text:
@@ -5112,11 +5122,22 @@ class VLMBatchedEngine(BaseEngine):
                     skip_special_token_ids=skip_special_ids,
                     mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
                     prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
+                    diffusion_show_unmasking=preview_callback is not None,
+                    diffusion_unmasking_width=0,
                 )
                 for result in results:
                     if cancel_event is not None and cancel_event.is_set():
                         break
                     if getattr(result, "is_draft", False):
+                        if preview_callback is not None:
+                            preview_callback(
+                                {
+                                    "text": committed_draft_text + result.draft_text,
+                                    "block": int(result.diffusion_canvas_index),
+                                    "step": int(result.diffusion_step),
+                                    "total_steps": int(result.diffusion_total_steps),
+                                }
+                            )
                         continue
                     result_tokens = getattr(result, "generation_tokens", None)
                     finish_reason = getattr(result, "finish_reason", None)
@@ -5131,6 +5152,7 @@ class VLMBatchedEngine(BaseEngine):
                         )
                         if has_token_progress or has_final_flush:
                             block_text.append(result_text)
+                            committed_draft_text += result_text
                             last_stream_segment = result_text
                     is_boundary = bool(
                         getattr(result, "diffusion_block_complete", False)
@@ -5195,6 +5217,7 @@ class VLMBatchedEngine(BaseEngine):
         max_tokens: int,
         temperature: float,
         seed: int | None = None,
+        preview_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> AsyncIterator[GenerationOutput]:
         from ..engine_core import get_mlx_executor
 
@@ -5216,6 +5239,7 @@ class VLMBatchedEngine(BaseEngine):
                         temperature=temperature,
                         seed=seed,
                         cancel_event=cancel_event,
+                        preview_callback=preview_callback,
                     ):
                         _put(item)
                         if cancel_event.is_set():

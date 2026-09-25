@@ -344,6 +344,116 @@ class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""
 
     @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.parametrize("preview_enabled", [False, True])
+    def test_draft_snapshots_include_committed_blocks(
+        self, monkeypatch, preview_enabled
+    ):
+        import importlib
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        previews = []
+        stream_kwargs = {}
+
+        def fake_stream(*args, **kwargs):
+            stream_kwargs.update(kwargs)
+            for block, text in enumerate(["First\n", "Second\n", "Third"], start=1):
+                if kwargs.get("diffusion_show_unmasking"):
+                    for step, draft in enumerate(["Revisable", text], start=1):
+                        yield SimpleNamespace(
+                            is_draft=True,
+                            draft_text=draft,
+                            diffusion_canvas_index=block,
+                            diffusion_step=step,
+                            diffusion_total_steps=48,
+                        )
+                yield SimpleNamespace(
+                    is_draft=False,
+                    text=text,
+                    generation_tokens=block,
+                    prompt_tokens=2,
+                    finish_reason=None,
+                    diffusion_block_complete=True,
+                )
+            yield SimpleNamespace(
+                is_draft=False,
+                text="",
+                generation_tokens=3,
+                prompt_tokens=2,
+                finish_reason="stop",
+                diffusion_block_complete=False,
+            )
+
+        monkeypatch.setattr(
+            importlib.import_module("mlx_vlm.generate.diffusion"),
+            "stream_diffusion_generate",
+            fake_stream,
+        )
+        outputs = list(
+            engine._iter_diffusion_outputs_sync(
+                {"input_ids": object(), "prompt_tokens": 2},
+                max_tokens=128,
+                temperature=0.0,
+                preview_callback=previews.append if preview_enabled else None,
+            )
+        )
+        assert stream_kwargs["diffusion_show_unmasking"] is preview_enabled
+        assert "".join(output.new_text for output in outputs) == "First\nSecond\nThird"
+        assert outputs[-1].text == "First\nSecond\nThird"
+        assert outputs[-1].completion_tokens == 3
+        assert outputs[-1].finish_reason == "stop"
+        if preview_enabled:
+            assert [p["text"] for p in previews] == [
+                "Revisable",
+                "First\n",
+                "First\nRevisable",
+                "First\nSecond\n",
+                "First\nSecond\nRevisable",
+                "First\nSecond\nThird",
+            ]
+            assert [(p["block"], p["step"]) for p in previews] == [
+                (1, 1),
+                (1, 2),
+                (2, 1),
+                (2, 2),
+                (3, 1),
+                (3, 2),
+            ]
+            assert all(p["total_steps"] == 48 for p in previews)
+        else:
+            assert previews == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.parametrize("api", ["stream_chat", "stream_generate"])
+    async def test_stream_forwards_diffusion_preview_callback(self, monkeypatch, api):
+        from omlx.engine.base import GenerationOutput
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._process_diffusion_chat_messages = MagicMock(return_value={})
+        engine._prepare_diffusion_inputs_from_prompt = MagicMock(return_value={})
+        previews = []
+
+        def fake_iter(inputs, **kwargs):
+            kwargs["preview_callback"](
+                {"text": "draft", "block": 1, "step": 1, "total_steps": 2}
+            )
+            yield GenerationOutput(text="answer", new_text="answer", finished=True)
+
+        monkeypatch.setattr(engine, "_iter_diffusion_outputs_sync", fake_iter)
+        prompt = [{"role": "user", "content": "Hi"}] if api == "stream_chat" else "Hi"
+        outputs = [
+            output
+            async for output in getattr(engine, api)(
+                prompt,
+                diffusion_preview_callback=previews.append,
+            )
+        ]
+        assert previews == [{"text": "draft", "block": 1, "step": 1, "total_steps": 2}]
+        assert outputs[-1].text == "answer"
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
     @pytest.mark.parametrize("default_mode, expected", [(None, "block"), ("ar", None)])
     def test_detects_model_owned_diffusion_generator(self, default_mode, expected):
         engine = _make_loaded_engine(model_type="diffusion_gemma")
