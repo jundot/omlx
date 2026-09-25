@@ -6458,6 +6458,15 @@ def get_usage_history(
         raise HTTPException(status_code=503, detail="Usage history unavailable") from exc
 
 
+@router.get("/api/remote-prefill")
+async def get_remote_prefill_status(is_admin: bool = Depends(require_admin)):
+    """Remote prefill state for each loaded model that uses it."""
+    from ..remote_prefill.routes import remote_prefill_status
+
+    pool = _get_engine_pool() if _get_engine_pool is not None else None
+    return remote_prefill_status(pool) if pool is not None else {"models": []}
+
+
 @router.get("/api/stats")
 async def get_server_stats(
     model: str = "",

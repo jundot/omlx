@@ -1787,6 +1787,13 @@ class _BoundarySnapshotProvider:
             return False
 
 
+def _remote_prefill_for(scheduler: Any) -> Any:
+    """The scheduler's remote prefill when OMLX_REMOTE_PREFILL_* names its model, else None."""
+    from .remote_prefill.service import RemotePrefill
+
+    return RemotePrefill.for_scheduler(scheduler)
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -1814,6 +1821,8 @@ class Scheduler:
     _DEFERRED_CLEAR_DELAY: int = 8
     _GENERATION_OVERFLOW_PATTERN = "__next_prime overflow"
     _MAX_GENERATION_OVERFLOW_RETRIES = 1
+    # Prefill on a vLLM server over MCDMA; set in __init__ when configured for this model.
+    _remote_prefill: Any = None
 
     def __init__(
         self,
@@ -2145,6 +2154,7 @@ class Scheduler:
         # blocking the scheduler step that continues existing decode/prefill.
         self._cache_freshness_waits: dict[str, _CacheFreshnessWait] = {}
         self._prefix_cache_prepared: set[str] = set()
+        self._remote_prefill = _remote_prefill_for(self)
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -4908,12 +4918,18 @@ class Scheduler:
         if drafter is not None:
             drafter.bind_uid(request_id, uid)
 
+    def remote_prefill_status(self) -> dict[str, Any] | None:
+        """Remote prefill settings, state and latest handoff, or None when it is off."""
+        return self._remote_prefill.status() if self._remote_prefill is not None else None
+
     def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
         _mtp_priming.release_request(getattr(self, "model", None), request_id)
         drafter = _block_drafter_for(getattr(self, "model", None))
         if drafter is not None:
             drafter.release_request(request_id)
         self._cache_freshness_waits.pop(request_id, None)
+        if self._remote_prefill is not None:
+            self._remote_prefill.forget(request_id)
         self._prefix_cache_prepared.discard(request_id)
         self._throttle_notified_requests.discard(request_id)
         self._clear_memory_admission_blocker(request_id)
@@ -9137,6 +9153,10 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
+        # A remote prefill appends the rest of the prompt's KV to whatever was restored above.
+        if self._remote_prefill is not None:
+            self._remote_prefill.inject(request)
+
         # Lightning-MTP has a small prompt-history cache separate from the
         # backbone KV restored above.  Bind an exact cache-boundary sidecar (when
         # one exists) to this singleton timeline before any uncached suffix is
@@ -11037,6 +11057,9 @@ class Scheduler:
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
             if self._should_defer_for_cache_freshness(request):
+                break
+            # Held like a freshness wait while its prompt prefills on the remote server.
+            if self._remote_prefill is not None and self._remote_prefill.defer(request):
                 break
 
             request = self.waiting.popleft()
@@ -13337,6 +13360,8 @@ class Scheduler:
         self._inflight_store_info.clear()
         self._cache_freshness_waits.clear()
         self._prefix_cache_prepared.clear()
+        if self._remote_prefill is not None:
+            self._remote_prefill.clear()
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
