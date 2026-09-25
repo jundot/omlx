@@ -11058,8 +11058,13 @@ class Scheduler:
             self._clear_store_cache_admission_blocker(request.request_id)
             if self._should_defer_for_cache_freshness(request):
                 break
-            # Held like a freshness wait while its prompt prefills on the remote server.
-            if self._remote_prefill is not None and self._remote_prefill.defer(request):
+            # Held like a freshness wait while its prompt prefills on the remote server;
+            # a request put back after its prefix cache was prepared is past that point.
+            if (
+                self._remote_prefill is not None
+                and request.request_id not in self._prefix_cache_prepared
+                and self._remote_prefill.defer(request)
+            ):
                 break
 
             request = self.waiting.popleft()

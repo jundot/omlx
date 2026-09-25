@@ -165,6 +165,14 @@ class LayerExport:
             raise WireError(f"layer {layer.index} has unknown or repeated dims")
         if "block" not in layer.dims or "token" not in layer.dims:
             raise WireError(f"layer {layer.index} pages need block and token dims")
+        if layer.kind == "mla" and not (layer.latent_size and layer.rope_size):
+            raise WireError(f"layer {layer.index} needs its latent and rope sizes")
+        if layer.kind == "attention" and not (
+            layer.heads and layer.head_size and layer.total_heads >= layer.heads
+        ):
+            raise WireError(
+                f"layer {layer.index} needs its heads, total heads and head size"
+            )
         return layer
 
 

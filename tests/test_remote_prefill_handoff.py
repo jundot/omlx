@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import time
+
 import mlx.core as mx
 import pytest
 from kv_handoff_fakes import (
@@ -19,6 +21,7 @@ from mlx_lm.models.cache import make_prompt_cache
 from rdma_loopback import LoopbackLink, PythonWordOps
 
 from omlx.cluster.rdma.mailbox import ClientMailbox
+from omlx.remote_prefill import job as job_module
 from omlx.remote_prefill.inject import extend_caches, layer_updates
 from omlx.remote_prefill.job import PrefillJob
 from omlx.remote_prefill.settings import RemotePrefillSettings
@@ -167,3 +170,30 @@ def test_a_link_that_is_down_fails_before_vllm_is_asked(links):
     job = _job([link], PROMPT[:END], calls=calls)
     assert job.state == "failed" and job.error == f"RDMA link {link.name} is down"
     assert calls == []
+
+
+def test_a_link_without_a_producer_fails_fast_before_vllm_is_asked(links, monkeypatch):
+    monkeypatch.setattr(job_module, "_PRODUCER_CHECK_S", 0.5)
+    (link,) = links()
+    calls = []
+    began = time.monotonic()
+    job = _job([link], PROMPT[:END], calls=calls)
+    assert job.state == "failed" and calls == []
+    assert job.error.startswith(f"no MCDMA connector answered on {link.name}")
+    assert job.pause and time.monotonic() - began < 5
+
+
+def test_an_export_that_never_appears_after_vllm_answers_fails_fast(
+    model, links, monkeypatch
+):
+    monkeypatch.setattr(job_module, "_READY_S", 0.5)
+    local = prefill(model, PROMPT[:END])
+    (link,) = links()
+    # The connector answers, but the export for this prompt never shows up.
+    producer = _serve(link, local, 0, waits=1000, idle_s=2)
+    began = time.monotonic()
+    job = _job([link], PROMPT[:END])
+    producer.join()
+    assert job.state == "failed" and job.pause
+    assert job.error == "the producer never had the handoff ready"
+    assert time.monotonic() - began < 5

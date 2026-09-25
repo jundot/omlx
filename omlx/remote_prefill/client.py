@@ -9,7 +9,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from .receiver import HandoffError
+from .receiver import HandoffError, HandoffTimeoutError
 from .settings import RemotePrefillSettings
 
 
@@ -47,4 +47,10 @@ def request_prefill(
         detail = exc.read()[:300].decode(errors="replace")
         raise HandoffError(f"vLLM answered {exc.code}: {detail}") from exc
     except (urllib.error.URLError, OSError) as exc:
+        if isinstance(exc, TimeoutError) or isinstance(
+            getattr(exc, "reason", None), TimeoutError
+        ):
+            raise HandoffTimeoutError(
+                f"vLLM at {settings.url} did not answer within {settings.timeout_s:.0f} s"
+            ) from exc
         raise HandoffError(f"vLLM at {settings.url} did not answer: {exc}") from exc

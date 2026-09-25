@@ -56,6 +56,19 @@ def _layer(**changes):
     return {**base, **changes}
 
 
+def _mla_layer(**changes):
+    base = {
+        "index": 0,
+        "kind": "mla",
+        "shape": [2, 16, 40],
+        "dims": ["block", "token", "latent"],
+        "dtype": "bfloat16",
+        "latent_size": 32,
+        "rope_size": 8,
+    }
+    return {**base, **changes}
+
+
 def _manifest(**changes):
     base = {
         "protocol": 1,
@@ -94,11 +107,21 @@ def test_a_manifest_parses_with_its_page_geometry():
         {"layers": [_layer(dims=["kv", "head", "token", "head_dim"])]},
         {"layers": [_layer(shape=[2, 2, 16])]},
         {"frames": 0},
+        {"layers": [_layer(heads=0)]},
+        {"layers": [_layer(head_size=0)]},
+        {"layers": [_layer(total_heads=1)]},
+        {"layers": [_mla_layer(latent_size=0)]},
+        {"layers": [_mla_layer(rope_size=0)]},
     ],
 )
 def test_bad_manifests_are_refused(changes):
     with pytest.raises(wire.WireError):
         wire.Manifest.from_json(_manifest(**changes))
+
+
+def test_an_mla_manifest_parses():
+    (layer,) = wire.Manifest.from_json(_manifest(layers=[_mla_layer()])).layers
+    assert (layer.latent_size, layer.rope_size) == (32, 8)
 
 
 def test_a_manifest_that_is_not_json_is_refused():

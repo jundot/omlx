@@ -10,7 +10,7 @@ import urllib.error
 import pytest
 
 from omlx.remote_prefill.client import request_prefill
-from omlx.remote_prefill.receiver import HandoffError
+from omlx.remote_prefill.receiver import HandoffError, HandoffTimeoutError
 from omlx.remote_prefill.settings import RemotePrefillSettings
 
 _ENV = {
@@ -32,6 +32,7 @@ def test_settings_read_the_server_its_model_and_links_in_rank_order():
     assert settings.url == "http://prefill.invalid:8000"
     assert settings.links == ("sparka", "sparkb")
     assert settings.min_tokens == 8192 and settings.checksum is False
+    assert settings.timeout_s == 120
 
 
 def test_no_url_means_no_remote_prefill():
@@ -114,4 +115,12 @@ def test_an_unreachable_vllm_becomes_a_handoff_error():
         raise urllib.error.URLError("connection refused")
 
     with pytest.raises(HandoffError, match="did not answer"):
+        request_prefill(_settings(), [1], "cd" * 16, 0, opener=opener)
+
+
+def test_a_vllm_that_stays_silent_becomes_a_timeout():
+    def opener(request, timeout):
+        raise TimeoutError("timed out")
+
+    with pytest.raises(HandoffTimeoutError, match="did not answer within 120 s"):
         request_prefill(_settings(), [1], "cd" * 16, 0, opener=opener)

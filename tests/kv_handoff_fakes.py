@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import zlib
 
 import mlx.core as mx
@@ -19,14 +20,14 @@ from omlx.remote_prefill import wire
 BLOCK = 16
 
 
-def build_model() -> qwen2.Model:
+def build_model(kv_heads: int = 2) -> qwen2.Model:
     args = qwen2.ModelArgs(
         model_type="qwen2",
         hidden_size=64,
         num_hidden_layers=3,
         intermediate_size=128,
         num_attention_heads=4,
-        num_key_value_heads=2,
+        num_key_value_heads=kv_heads,
         rms_norm_eps=1e-6,
         vocab_size=256,
         rope_theta=10000.0,
@@ -131,7 +132,7 @@ def frames_of(pages: list[tuple[int, np.ndarray]], rows_per_frame: int):
 
 
 class FakeProducer:
-    """Answers OPEN, PULL and CLOSE for one handoff from prepared frames, on a thread."""
+    """Answers OPEN, PULL and CLOSE from prepared frames on a thread, for `handoffs` handoffs in turn."""
 
     def __init__(
         self,
@@ -142,6 +143,9 @@ class FakeProducer:
         waits: int = 0,
         refuse: str = "",
         flip_frame: int | None = None,
+        handoffs: int = 1,
+        pull_delay_s: float = 0.0,
+        idle_s: float = 20.0,
     ) -> None:
         self.service = ServiceMailbox.attach(
             link.name, link.socket_path, PythonWordOps(), mailbox_path=link.mailbox_path
@@ -151,6 +155,11 @@ class FakeProducer:
         self.waits = waits
         self.refuse = refuse
         self.flip_frame = flip_frame
+        self.handoffs = handoffs
+        self.pull_delay_s = pull_delay_s
+        self.idle_s = idle_s
+        # (handoff, kind) of every request, in the order they arrived.
+        self.log: list[tuple[bytes, int]] = []
         self.checksum = None
         self.closed = False
         self.error: BaseException | None = None
@@ -164,11 +173,12 @@ class FakeProducer:
     def _serve(self) -> None:
         try:
             while True:
-                got = self.service.next_request(timeout_s=20)
+                got = self.service.next_request(timeout_s=self.idle_s)
                 if got is None:
                     return
                 seq, payload = got
                 header = wire.unpack(payload)
+                self.log.append((header.handoff, header.kind))
                 if self.refuse:
                     self._reply(seq, wire.ERROR, header.handoff, self.refuse.encode())
                     return
@@ -191,6 +201,7 @@ class FakeProducer:
                         frames=len(self.frames),
                     )
                 elif header.kind == wire.PULL:
+                    time.sleep(self.pull_delay_s)
                     layer, start, rows, data = self.frames[header.frame]
                     crc = zlib.crc32(data)
                     if header.frame == self.flip_frame:
@@ -211,7 +222,9 @@ class FakeProducer:
                 elif header.kind == wire.CLOSE:
                     self.closed = True
                     self._reply(seq, wire.ACK, header.handoff)
-                    return
+                    self.handoffs -= 1
+                    if not self.handoffs:
+                        return
         except BaseException as exc:
             self.error = exc
 

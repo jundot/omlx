@@ -90,6 +90,19 @@ def layer_updates(
     return updates
 
 
+def _check_restored(index: int, cache: Any, keys: Any, values: Any) -> None:
+    """A restored prefix shows the model's own head count and sizes; the update must match them."""
+    held = getattr(cache, "keys", None)
+    if type(cache).__name__ != "KVCache" or held is None:
+        return
+    for name, have, new in (("keys", held, keys), ("values", cache.values, values)):
+        if (have.shape[1], have.shape[3]) != (new.shape[1], new.shape[3]):
+            raise HandoffError(
+                f"layer {index} {name} are {new.shape[1]} x {new.shape[3]}; "
+                f"the restored cache holds {have.shape[1]} x {have.shape[3]}"
+            )
+
+
 def extend_caches(mx: Any, caches: list[Any], updates: list[tuple[Any, Any]]) -> None:
     """Append each layer's update to its cache and materialize them on the caller's stream."""
     if len(caches) != len(updates):
@@ -99,6 +112,9 @@ def extend_caches(mx: Any, caches: list[Any], updates: list[tuple[Any, Any]]) ->
     unsupported = {type(cache).__name__ for cache in caches} - SUPPORTED_CACHES
     if unsupported:
         raise HandoffError(f"cache types {sorted(unsupported)} cannot take a handoff")
+    # Every layer is checked before any is extended, so a refusal leaves the caches as they were.
+    for index, (cache, (keys, values)) in enumerate(zip(caches, updates)):
+        _check_restored(index, cache, keys, values)
     for cache, (keys, values) in zip(caches, updates):
         cache.update_and_fetch(keys, values)
     mx.eval([cache.state for cache in caches])

@@ -21,7 +21,7 @@ class RemotePrefillSettings:
     local_model: str
     links: tuple[str, ...]
     min_tokens: int = 4096
-    timeout_s: float = 600.0
+    timeout_s: float = 120.0
     checksum: bool = True
     api_key: str = ""
 
@@ -54,7 +54,7 @@ class RemotePrefillSettings:
             local_model=get("FOR"),
             links=links,
             min_tokens=int(get("MIN_TOKENS", "4096")),
-            timeout_s=float(get("TIMEOUT", "600")),
+            timeout_s=float(get("TIMEOUT", "120")),
             checksum=get("CHECKSUM", "1").lower() not in {"0", "false", "no", "off"},
             api_key=get("API_KEY"),
         )

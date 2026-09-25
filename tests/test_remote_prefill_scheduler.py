@@ -95,3 +95,24 @@ def test_remote_prefill_serves_only_the_model_it_names(
 
 def test_unconfigured_servers_have_no_remote_prefill(mock_model, mock_tokenizer):
     assert Scheduler(model=mock_model, tokenizer=mock_tokenizer)._remote_prefill is None
+
+
+def test_a_request_put_back_after_its_handoff_is_not_held_again(
+    mock_model, mock_tokenizer
+):
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    scheduler._remote_prefill = _Remote(hold=False)
+    scheduler._ensure_batch_generator = MagicMock()
+    scheduler.batch_generator = MagicMock()
+    # Another request's SpecPrefill puts this one back after its prefix cache is prepared.
+    scheduler._specprefill_active_request_id = "req-other"
+    request = _request()
+    scheduler.add_request(request)
+
+    scheduler._schedule_waiting()
+    scheduler._remote_prefill.hold = True
+    scheduler._schedule_waiting()
+
+    assert list(scheduler.waiting) == [request]
+    assert scheduler._remote_prefill.deferred == ["req-long"]
+    assert [rid for rid, _ in scheduler._remote_prefill.injected] == ["req-long"]

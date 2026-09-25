@@ -19,7 +19,9 @@ from kv_handoff_fakes import (
 from rdma_loopback import LoopbackLink, PythonWordOps
 
 from omlx.cluster.rdma.mailbox import ClientMailbox
-from omlx.remote_prefill.receiver import HandoffError
+from omlx.remote_prefill import service as service_module
+from omlx.remote_prefill import wire
+from omlx.remote_prefill.receiver import HandoffError, HandoffTimeoutError
 from omlx.remote_prefill.service import RemotePrefill
 from omlx.remote_prefill.settings import RemotePrefillSettings
 
@@ -75,7 +77,7 @@ def _request(request_id="r1", prompt=PROMPT, **changes):
     return SimpleNamespace(**{**fields, **changes})
 
 
-def _service(scheduler, link, *, min_tokens=16, requester=None):
+def _service(scheduler, link, *, min_tokens=16, requester=None, clock=time.monotonic):
     settings = RemotePrefillSettings(
         url="http://prefill.invalid:8000",
         model="tiny",
@@ -89,6 +91,7 @@ def _service(scheduler, link, *, min_tokens=16, requester=None):
         settings,
         attach=lambda name: ClientMailbox.attach(name, PythonWordOps()),
         requester=requester or (lambda *args: None),
+        clock=clock,
     )
 
 
@@ -100,11 +103,11 @@ def _held(service, request, timeout_s=30):
         time.sleep(0.01)
 
 
-def _producer(link, local, first):
+def _producer(link, local, first, rows_per_frame=2, **options):
     layers, pages = export_rank(local, first, END)
-    frames = frames_of(pages, 2)
+    frames = frames_of(pages, rows_per_frame)
     return FakeProducer(
-        link, manifest(PROMPT[:END], first, layers, len(frames)), frames
+        link, manifest(PROMPT[:END], first, layers, len(frames)), frames, **options
     )
 
 
@@ -181,14 +184,17 @@ def test_repeated_failures_pause_remote_prefill(model, link):
     def refuse(*args):
         raise HandoffError("vLLM answered 500: boom")
 
+    producer = _producer(link, prefill(model, PROMPT[:END]), 0, idle_s=1)
     service = _service(_scheduler(model), link, requester=refuse)
     for number in range(3):
         request = _request(f"r{number}")
         _held(service, request)
         service.inject(request)
         assert request.cached_tokens == 0
+        assert service.status()["paused"] is (number == 2)
+    producer.join()
     status = service.status()
-    assert status["paused"] and status["last_error"] == "vLLM answered 500: boom"
+    assert status["last_error"] == "vLLM answered 500: boom"
     assert service.defer(_request("r9")) is False
 
 
@@ -201,3 +207,124 @@ def test_a_request_that_leaves_the_queue_drops_its_job(model, link):
     service.inject(request)
     assert request.cached_tokens == 0
     producer.join()
+
+
+def test_a_request_gets_one_remote_prefill_at_most(model, link):
+    calls = []
+    producer = _producer(link, prefill(model, PROMPT[:END]), 0)
+    service = _service(
+        _scheduler(model), link, requester=lambda *args: calls.append(args)
+    )
+    request = _request()
+    _held(service, request)
+    producer.join()
+    service.inject(request)
+    assert request.cached_tokens == END
+    # Put back at the head of the queue after its handoff, it is not held for another.
+    assert service.defer(request) is False
+    assert len(calls) == 1 and service.status()["running"] == 0
+
+
+def test_a_handoff_for_another_kv_geometry_is_refused_before_its_frames(model, link):
+    producer = _producer(link, prefill(build_model(kv_heads=4), PROMPT[:END]), 0)
+    service = _service(_scheduler(model), link)
+    request = _request()
+    _held(service, request)
+    producer.join()
+    service.inject(request)
+    assert request.cached_tokens == 0 and request.prompt_cache is None
+    assert "4 KV heads" in service.status()["last_error"]
+    assert wire.PULL not in [kind for _, kind in producer.log] and producer.closed
+
+
+def test_an_unexpected_error_applying_a_handoff_prefills_here(model, link, monkeypatch):
+    producer = _producer(link, prefill(model, PROMPT[:END]), 0)
+    service = _service(_scheduler(model), link)
+    request = _request()
+    _held(service, request)
+    producer.join()
+
+    def broken(*args):
+        raise ZeroDivisionError("integer division or modulo by zero")
+
+    monkeypatch.setattr(service_module, "layer_updates", broken)
+    service.inject(request)
+    assert request.cached_tokens == 0 and request.prompt_cache is None
+    assert "ZeroDivisionError" in service.status()["last_error"]
+
+
+def _wait_for(condition, timeout_s=20):
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.005)
+
+
+def test_a_forgotten_prefill_stops_before_the_next_one_uses_the_link(model, link):
+    producer = _producer(
+        link, prefill(model, PROMPT[:END]), 0, 1, handoffs=2, pull_delay_s=0.05
+    )
+    service = _service(_scheduler(model), link)
+    assert service.defer(_request("r1"))
+    _wait_for(lambda: wire.PULL in [kind for _, kind in producer.log])
+    service.forget("r1")
+    second = _request("r2")
+    _held(service, second)
+    producer.join()
+    service.inject(second)
+    assert second.cached_tokens == END
+    handoffs = [handoff for handoff, _ in producer.log]
+    first_id, second_id = handoffs[0], handoffs[-1]
+    last_first = max(i for i, h in enumerate(handoffs) if h == first_id)
+    assert first_id != second_id and last_first < handoffs.index(second_id)
+    # The forgotten handoff stopped early and freed its pages.
+    assert producer.log[last_first][1] == wire.CLOSE
+    assert handoffs.count(first_id) < handoffs.count(second_id)
+
+
+def test_clearing_stops_every_running_prefill(model, link):
+    producer = _producer(link, prefill(model, PROMPT[:END]), 0, 1, pull_delay_s=0.05)
+    service = _service(_scheduler(model), link)
+    assert service.defer(_request("r1"))
+    _wait_for(lambda: wire.PULL in [kind for _, kind in producer.log])
+    service.clear()
+    producer.join()
+    pulls = [kind for _, kind in producer.log].count(wire.PULL)
+    assert producer.log[-1][1] == wire.CLOSE and pulls < len(producer.frames)
+    assert service.status()["running"] == 0
+
+
+def test_a_vllm_timeout_pauses_remote_prefill_at_once(model, link):
+    def stuck(*args):
+        raise HandoffTimeoutError(
+            "vLLM at http://prefill.invalid:8000 did not answer in 30 s"
+        )
+
+    producer = _producer(link, prefill(model, PROMPT[:END]), 0, idle_s=1)
+    service = _service(_scheduler(model), link, requester=stuck)
+    request = _request()
+    _held(service, request)
+    service.inject(request)
+    producer.join()
+    status = service.status()
+    assert status["paused"] and status["failures"] == 1
+    assert service.defer(_request("r2")) is False
+
+
+def test_each_pause_without_a_success_between_is_longer(model, link):
+    now = [1000.0]
+
+    def stuck(*args):
+        raise HandoffTimeoutError("vLLM did not answer")
+
+    producer = _producer(link, prefill(model, PROMPT[:END]), 0, idle_s=1, handoffs=3)
+    service = _service(_scheduler(model), link, requester=stuck, clock=lambda: now[0])
+    pauses = []
+    for number in range(2):
+        request = _request(f"r{number}")
+        _held(service, request)
+        service.inject(request)
+        pauses.append(service.status()["paused_for_s"])
+        now[0] += pauses[-1] + 1
+    producer.join()
+    assert pauses[1] == 2 * pauses[0]
