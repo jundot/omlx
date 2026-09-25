@@ -1114,3 +1114,131 @@ def test_patch_overrides_site_packages_glm5_next_copy():
         sys.modules.update(saved_modules)
         mlx_vlm.models.__path__[:] = saved_path
         compat._APPLIED = applied
+
+
+def test_dense_prefix_bypass_matches_reference(monkeypatch):
+    from mlx_vlm.models.glm5_next import language
+
+    mx.random.seed(313)
+    config = _tiny_config()
+    model = language.LanguageModel(config.text_config, config)
+    prompt = mx.arange(13, dtype=mx.int32)[None] + 1
+    attention = model.model.layers[1].self_attn
+
+    monkeypatch.setattr(language, "_DENSE_PREFIX_BYPASS", False)
+    reference_cache = model.make_cache()
+    reference = model(prompt, cache=reference_cache).logits
+
+    monkeypatch.setattr(language, "_DENSE_PREFIX_BYPASS", True)
+    engaged = []
+    original_dense = attention._dense_flat
+
+    def spy(rows):
+        engaged.append(rows)
+        return original_dense
+
+    monkeypatch.setattr(
+        attention,
+        "_dense_flat",
+        lambda q, kv, mask, rows, past: spy(rows)(q, kv, mask, rows, past),
+    )
+    bypass_cache = model.make_cache()
+    bypassed = model(prompt, cache=bypass_cache).logits
+    decoded = model(mx.array([[13]], dtype=mx.int32), cache=bypass_cache).logits
+    reference_decoded = model(
+        mx.array([[13]], dtype=mx.int32), cache=reference_cache
+    ).logits
+    mx.eval(reference, bypassed, decoded, reference_decoded)
+
+    # index_topk=4, index_kpool=2 -> the first (4//2+1)*2-1 = 5 rows bypass.
+    assert engaged == [5]
+    assert mx.allclose(bypassed, reference, atol=3e-4, rtol=3e-4).item()
+    # Dense rows still feed the pool, so following decode selects identically.
+    assert mx.allclose(decoded, reference_decoded, atol=1e-5, rtol=1e-5).item()
+
+
+def test_chunked_prefill_with_dense_bypass_matches_single_pass():
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    mx.random.seed(126)
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    tokens = mx.arange(13, dtype=mx.int32)[None] + 1
+
+    single_cache = model.make_cache()
+    single = model(tokens, cache=single_cache).logits
+
+    # Chunk 1 (9 rows) exercises the dense prefix + scored tail; chunk 2 (4
+    # rows) verifies the pool advanced over the bypassed rows too.
+    chunked_cache = model.make_cache()
+    first = model(tokens[:, :9], cache=chunked_cache).logits
+    second = model(tokens[:, 9:], cache=chunked_cache).logits
+    mx.eval(single, first, second)
+
+    assert mx.allclose(first, single[:, :9], atol=3e-4, rtol=3e-4).item()
+    assert mx.allclose(second, single[:, 9:], atol=3e-4, rtol=3e-4).item()
+
+
+def test_indexer_score_from_matches_suffix():
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    mx.random.seed(7)
+    config = _tiny_config().text_config
+    indexer = Glm5NextIndexer(config)
+    x = mx.random.normal((1, 13, config.hidden_size), dtype=mx.float32)
+    qr = mx.random.normal((1, 13, config.q_lora_rank), dtype=mx.float32)
+
+    full = indexer(x, qr, None)
+    tail = indexer(x, qr, None, score_from=5)
+    mx.eval(full, tail)
+
+    assert full.shape[:3] == (1, 1, 13)
+    assert tail.shape[:3] == (1, 1, 8)
+    assert mx.array_equal(tail, full[:, :, 5:]).item()
+    assert indexer(x, qr, None, score_from=13) is None
+
+
+def test_dense_prefix_rows_gating():
+    from mlx_vlm.models.cache import KVCache
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    attention = model.model.layers[1].self_attn
+    indexer = attention.indexer
+    # index_topk=4, index_kpool=2 -> boundary (4//2+1)*2-1 = 5 rows.
+    assert indexer.index_topk == 4 and indexer.index_kpool == 2
+    assert attention._dense_prefix_rows(13, None, None) == (5, 0)
+
+    populated = KVCache()
+    populated.offset = 3
+    assert attention._dense_prefix_rows(13, None, [populated, None]) == (2, 3)
+    populated.offset = 5
+    assert attention._dense_prefix_rows(13, None, [populated, None]) == (0, 5)
+    assert attention._dense_prefix_rows(4, None, None) == (4, 0)
+
+    without_tail = indexer.index_kpool_always_select_tail
+    indexer.index_kpool_always_select_tail = False
+    assert attention._dense_prefix_rows(13, None, None) == (0, 0)
+    indexer.index_kpool_always_select_tail = without_tail
+
+    padded = KVCache()
+    padded.left_padding = mx.zeros((1,), dtype=mx.int32)
+    assert attention._dense_prefix_rows(13, None, [padded, None]) == (0, 0)
+
+    merged = KVCache()
+    merged.offset = mx.array([3, 3], dtype=mx.int32)
+    assert attention._dense_prefix_rows(13, None, [merged, None]) == (0, 0)
+
+    class _BatchPool:
+        _processed = [1, 2]
+
+    assert attention._dense_prefix_rows(13, None, [None, _BatchPool()]) == (0, 0)
+
+    assert attention._dense_prefix_rows(13, "causal", None) == (0, 0)
+    short_keys = mx.ones((1, 1, 13, 12), dtype=mx.bool_)
+    assert attention._dense_prefix_rows(13, short_keys, None) == (0, 0)
+    per_key = mx.ones((1, 1, 1, 13), dtype=mx.bool_)
+    assert attention._dense_prefix_rows(13, per_key, None) == (0, 0)
+    aligned = mx.ones((1, 1, 13, 13), dtype=mx.bool_)
+    assert attention._dense_prefix_rows(13, aligned, None) == (5, 0)
