@@ -289,3 +289,43 @@ def test_top_k_indices_matches_full_sort(vocab, top_k):
     expected = mx.sort(mx.argsort(-values, axis=-1)[:, :top_k], axis=-1)
     actual = mx.sort(top_k_indices(values, top_k), axis=-1)
     assert mx.array_equal(expected, actual).item()
+
+
+def _flat_logprobs(vocab: int, dtype) -> mx.array:
+    """A near-uniform row with one clear winner: every logprob is about -log(V)."""
+    mx.random.seed(0)
+    logits = mx.random.normal((1, vocab)) * 0.05
+    logits[0, 7] += 1.5
+    lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    return lp.astype(dtype)
+
+
+@pytest.mark.parametrize("temp", [1e-4, 2e-5])
+def test_float16_small_temperature_samples_the_top_token(temp):
+    """float16 logprobs / temp overflows to -inf across the whole row here."""
+    from omlx.patches.mlx_lm_mtp.batch_generator import _accept_lp_for
+
+    lp = _flat_logprobs(50000, mx.float16)
+    sampler = make_sampler(temp=temp)
+    tokens = [sampler(lp).item() for _ in range(8)]
+    assert tokens == [7] * 8
+    token, density = sampler.sample_with_logprobs(lp)
+    assert token.item() == 7
+    assert mx.isfinite(density[0, 7]).item()
+    assert mx.isfinite(_accept_lp_for(sampler, lp)[0, 7]).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_temperature_scaling_keeps_non_float16_dtype(dtype):
+    lp = _flat_logprobs(1000, dtype)
+    assert make_sampler(temp=0.7)._mtp_sampling_logits(lp).dtype == dtype
+
+
+@pytest.mark.parametrize("temp", [1e-39, 1e-7])
+def test_near_zero_temperature_is_greedy(temp):
+    """1 / 1e-39 overflows float32; below 1e-5 sampling is argmax anyway."""
+    lp = _flat_logprobs(50000, mx.float32)
+    sampler = make_sampler(temp=temp, top_p=0.9)
+    assert sampler.temp == 0.0
+    assert not hasattr(sampler, "sample_with_logprobs")
+    assert [sampler(lp).item() for _ in range(4)] == [7] * 4

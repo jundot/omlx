@@ -168,10 +168,28 @@ def apply_xtc(
     )
 
 
+# Below this temperature, sampling is argmax in practice: a 1e-3 logprob gap
+# already becomes a factor of e^100. make_sampler treats these as greedy, which
+# also keeps 1 / temp finite.
+_MIN_SAMPLING_TEMP = 1e-5
+
+
+def scale_by_temperature(logits: mx.array, temp: float) -> mx.array:
+    """Return ``logits / temp``, scaling float16 input in float32.
+
+    float16 tops out at 65504, so a small temperature turns every entry of a
+    flat row into -inf and the draw is no longer from the requested
+    distribution. Other dtypes are kept so seeded draws do not move.
+    """
+    if logits.dtype == mx.float16:
+        logits = logits.astype(mx.float32)
+    return logits * (1 / temp)
+
+
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
     """Sample a token id from the categorical distribution defined by
     ``logits / temp``. RNG state is advanced through ``mx.random.categorical``."""
-    return mx.random.categorical(logits * (1 / temp))
+    return mx.random.categorical(scale_by_temperature(logits, temp))
 
 
 def make_sampler(
@@ -186,9 +204,12 @@ def make_sampler(
 ) -> Callable[[mx.array], mx.array]:
     """Build a sampler callable matching ``mlx_lm.sample_utils.make_sampler``.
 
-    Returns ``argmax`` when ``temp == 0``; otherwise composes optional
-    top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
+    Returns ``argmax`` when ``temp == 0`` (or below ``_MIN_SAMPLING_TEMP``);
+    otherwise composes optional top-p / min-p / xtc / top-k filters and
+    finishes with categorical sampling.
     """
+    if 0 < temp < _MIN_SAMPLING_TEMP:
+        temp = 0.0
     if temp == 0:
         sampler = lambda x: mx.argmax(x, axis=-1)
     else:
@@ -221,7 +242,7 @@ def make_sampler(
         def sampling_logits(logprobs: mx.array):
             for method in sampling_methods:
                 logprobs = method(logprobs)
-            return logprobs * (1 / temp)
+            return scale_by_temperature(logprobs, temp)
 
         def sample_with_logprobs(logprobs: mx.array, *, rowwise: bool = False):
             # Draft sampling and its acceptance density share the same filters.

@@ -3913,7 +3913,7 @@ def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])
 def test_acceptance_density_matches_low_precision_sampler(dtype, temperature):
-    from omlx.utils.sampling import make_sampler
+    from omlx.utils.sampling import make_sampler, scale_by_temperature
 
     previous_device = mx.default_device()
     mx.set_default_device(mx.cpu)
@@ -3921,9 +3921,10 @@ def test_acceptance_density_matches_low_precision_sampler(dtype, temperature):
         mx.random.seed(425)
         lp = bg._logprobs((mx.random.normal((2, 4096)) * 4).astype(dtype))
         sampler = make_sampler(temp=temperature)
-        # Match categorical_sampling's scale in the original dtype. Only the
-        # acceptance normalization is promoted; target sampling is unchanged.
-        scaled = (lp * (1 / temperature)).astype(mx.float32)
+        # Match categorical_sampling's scale (bfloat16 stays in its dtype,
+        # float16 is scaled in float32). Only the acceptance normalization is
+        # promoted; target sampling is unchanged.
+        scaled = scale_by_temperature(lp, temperature).astype(mx.float32)
         expected = mx.softmax(scaled, axis=-1)
         actual = mx.exp(bg._accept_lp_for(sampler, lp))
         assert actual.dtype == mx.float32
