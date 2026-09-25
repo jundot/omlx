@@ -2918,6 +2918,9 @@ class Scheduler:
                 )
             if not model_type.startswith("glm5_next"):
                 return 0
+            force = int(os.environ.get("OMLX_GLM53_WIDE_STEP_FORCE", "0") or 0)
+            if force > 0:
+                return force
             from .custom_kernels.glm_moe_dsa import fast
             from .custom_kernels.nax import is_nax_available
             from .settings import get_system_memory
