@@ -341,3 +341,16 @@ def test_top_p_mass_is_accumulated_in_float32():
     kept_bf16 = (out > -float("inf")).sum().item()
     assert out.dtype == mx.bfloat16
     assert abs(kept_bf16 - kept_f32) <= 0.01 * kept_f32
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("top_p", [1e-8, 1e-6])
+def test_tiny_top_p_keeps_the_most_likely_token(dtype, top_p):
+    """1 - top_p is at or above the float32 total here, so nothing passed."""
+    lp = _flat_logprobs(50000, dtype)
+    out = apply_top_p(lp, top_p)
+    assert out[0, 7].item() == lp[0, 7].item()
+    if dtype == mx.float32:
+        assert (out > -float("inf")).sum().item() == 1
+        sampler = make_sampler(temp=1.0, top_p=top_p)
+        assert [sampler(lp).item() for _ in range(4)] == [7] * 4

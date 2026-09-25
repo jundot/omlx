@@ -24,7 +24,8 @@ import mlx.core as mx
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """Top-p (nucleus) filtering — keep the smallest set of tokens whose
-    cumulative probability mass is at least ``top_p``."""
+    cumulative probability mass is at least ``top_p``. The most likely token
+    is always kept."""
     # Sum in float32: a bfloat16 running sum over a large vocabulary stops
     # growing once each new term is below its rounding step.
     probs = mx.exp(logprobs.astype(mx.float32))
@@ -41,11 +42,11 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     )
     cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
 
-    return mx.where(
-        cumulative_probs > 1 - top_p,
-        logprobs,
-        -float("inf"),
-    )
+    # With a tiny top_p, 1 - top_p rounds to (or above) the float32 total, so
+    # no token passes the threshold. Keep the most likely one regardless.
+    keep = cumulative_probs > 1 - top_p
+    keep = keep | (logprobs == mx.max(logprobs, axis=-1, keepdims=True))
+    return mx.where(keep, logprobs, -float("inf"))
 
 
 def apply_min_p(
