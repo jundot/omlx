@@ -4482,12 +4482,63 @@ def test_qwen4_moe_savings_precede_ple_force_decision(
         ),
         patch(
             "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
-            side_effect=lambda path, size, fraction: size - 400,
+            side_effect=lambda path, size, fraction, **kw: size - 400,
         ),
     ):
         _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
         assert is_forced is forced
         assert pool._entry_runtime_resident_size(entry, settings) == expected
+
+
+@pytest.mark.parametrize("mtp_enabled", [False, True])
+def test_qwen4_ple_admission_keeps_native_mtp_head_resident(tmp_path, mtp_enabled):
+    """Lightning MTP + expert offload: the head is priced as resident."""
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+        Qwen4ExpResidencyEstimate,
+    )
+
+    settings = ModelSettings(
+        moe_expert_offload_enabled=True,
+        moe_expert_offload_resident_fraction=0.5,
+        qwen4_ple_ssd_offload=True,
+        mtp_enabled=mtp_enabled,
+    )
+    entry = EngineEntry(
+        model_id="qwen4",
+        model_path=str(tmp_path),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="qwen4_exp",
+        estimated_size=1000,
+    )
+    estimate = Qwen4ExpResidencyEstimate(
+        supported=True,
+        checkpoint_bytes=950,
+        ple_bytes=400,
+        resident_bytes=1000,
+        mmap_bytes=600,
+    )
+    seen = []
+
+    def fake_estimate(path, size, fraction, mtp_resident=False):
+        seen.append(mtp_resident)
+        return size - (100 if mtp_resident else 400)
+
+    pool = _make_pool(ceiling=10_000)
+    with (
+        patch(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+            "qwen4_exp_residency_estimate",
+            return_value=estimate,
+        ),
+        patch(
+            "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
+            side_effect=fake_estimate,
+        ),
+    ):
+        pool._qwen4_ple_offload_status(entry, settings)
+    assert seen and all(flag is mtp_enabled for flag in seen)
 
 
 @pytest.mark.asyncio

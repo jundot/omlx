@@ -321,6 +321,16 @@ Set `moe_expert_offload_enabled: true` and
 settings. PLE SSD offload (`qwen4_ple_ssd_offload`) is independent and can be
 enabled alongside expert offload. The PLE automatic fallback decision and
 loaded-model memory accounting include expert savings without counting them
-twice. Lightning MTP, VLM MTP, and DFlash must be disabled. Checkpoints that
-include MTP weights can still be used; inactive MTP weights are omitted by
-the existing Qwen loader.
+twice.
+
+Lightning MTP (`mtp_enabled`) can be combined with expert offload when the
+checkpoint carries the native MTP head: the head's experts (`mtp.*`) stay
+resident while backbone experts stream, the same pairing as DeepSeek V4.1
+and GLM-5.3, and admission prices the head as resident. VLM MTP and DFlash
+must still be disabled. Measured on an M1 Max 64 GB with the Jundot oQ4e
+checkpoint (PLE on SSD, 60% residency, adaptive MTP depth up to 3, 500-token
+coding prompt sampled at temperature 1.0): 14.0-14.9 tok/s with MTP off, 16.3-17.3 tok/s
+with MTP on (1.87 committed tokens per cycle, 69.5% acceptance). Fixed depth 3
+was slower (15.0 tok/s) because longer verify windows route to more distinct
+experts; keep the adaptive controller. Checkpoints without MTP weights, or
+with MTP disabled, load exactly as before.
