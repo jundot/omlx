@@ -180,7 +180,7 @@ struct UsageHistoryView: View {
                         comment: "Heading above the usage history day/hour heatmap"))
                 .font(.omlxText(13))
             Text(String(localized: "status.usage.heatmap.note",
-                        defaultValue: "00–23 hours · darker green means more tokens · repeated DST hours combine",
+                        defaultValue: "00–23 hours · brighter green = higher token usage · repeated DST hours are combined",
                         comment: "Legend text under the usage heatmap heading"))
                 .font(.omlxText(11)).foregroundStyle(.secondary)
             HStack(spacing: 3) {
