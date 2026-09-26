@@ -567,6 +567,9 @@ class _RegisteredRow(NamedTuple):
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
 _QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + _QWEN4_WIDE_PREFILL_STEP
+# GLM-5.3-Flash feeds its expert GEMMs wider from the first chunk, matching the
+# GLM-DSA adaptive prefill route; no SSD n-gram gather needs a narrow head.
+_GLM53_WIDE_PREFILL_STEP = 8192
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -1866,6 +1869,7 @@ class Scheduler:
         # prefill step changes cache-ON from one forward into multiple forwards.
         self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
         self._qwen4_wide_prefill_step = self._detect_qwen4_wide_prefill_step()
+        self._glm53_wide_prefill_step = self._detect_glm53_wide_prefill_step()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -2899,6 +2903,39 @@ class Scheduler:
             logger.debug("qwen4 wide prefill probe failed", exc_info=True)
         return 0
 
+    def _detect_glm53_wide_prefill_step(self) -> int:
+        """Return the GLM-5.3-Flash prefill step on native-kernel NAX hosts.
+
+        Wide chunks feed the routed-expert GEMMs more rows per expert and the
+        dense-prefix attention bypass makes the leading rows cheap at any
+        width. Narrow hosts keep the existing floor/default geometry.
+        """
+        try:
+            model_type = str(getattr(self.model, "model_type", "") or "")
+            if not model_type:
+                model_type = str(
+                    getattr(getattr(self.model, "config", None), "model_type", "") or ""
+                )
+            if not model_type.startswith("glm5_next"):
+                return 0
+            force = int(os.environ.get("OMLX_GLM53_WIDE_STEP_FORCE", "0") or 0)
+            if force > 0:
+                return force
+            from .custom_kernels.glm_moe_dsa import fast
+            from .custom_kernels.nax import is_nax_available
+            from .settings import get_system_memory
+
+            if (
+                fast.is_native_available()
+                and fast.has_symbol("glm_dsa_sparse_mla_attention")
+                and is_nax_available()
+                and get_system_memory() >= 64 * 1024**3
+            ):
+                return _GLM53_WIDE_PREFILL_STEP
+        except Exception:
+            logger.debug("glm5_next wide prefill probe failed", exc_info=True)
+        return 0
+
     # Default block size for ArraysCache-only hybrid models. Raise the effective
     # target to the configured/model-specific prefill step so cache ON/OFF use
     # identical forward boundaries, avoiding GatedDeltaNet recurrent-state
@@ -2949,6 +2986,7 @@ class Scheduler:
             int(self.config.prefill_step_size or 0),
             self._qwen35_prefill_floor,
             self._qwen4_wide_prefill_step,
+            self._glm53_wide_prefill_step,
         )
         if self.config.paged_cache_block_size >= target:
             return
@@ -5511,6 +5549,13 @@ class Scheduler:
                 if getattr(self, "block_aware_cache", None) is None:
                     # No block clamp runs; end on the grid that cache-ON uses.
                     size = wide - processed_tokens % wide
+            glm_wide = getattr(self, "_glm53_wide_prefill_step", 0)
+            if glm_wide and size <= glm_wide:
+                # GLM-5.3-Flash has no SSD n-gram gather to overlap, so the
+                # GLM-DSA adaptive route goes wide from the first chunk.
+                size = glm_wide
+                if getattr(self, "block_aware_cache", None) is None:
+                    size = glm_wide - processed_tokens % glm_wide
             return size
         from .patches.minimax_m3.generate_patch import (
             _prefill_step_size_for_progress as _minimax_prefill_step_size,
