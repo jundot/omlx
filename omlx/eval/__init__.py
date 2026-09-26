@@ -6,6 +6,7 @@ coding, safety, and bias categories with deterministic sampling
 for fair model comparison.
 """
 
+from .agentic import SWEBenchVerifiedBenchmark, TerminalBench4Benchmark
 from .arc import ARCChallengeBenchmark
 from .base import BaseBenchmark, BenchmarkResult, QuestionResult
 from .bbq import BBQBenchmark
@@ -24,7 +25,7 @@ from .safetybench import SafetyBenchBenchmark
 from .truthfulqa import TruthfulQABenchmark
 from .winogrande import WinograndeBenchmark
 
-BENCHMARKS: dict[str, type[BaseBenchmark]] = {
+BENCHMARKS: dict[str, type] = {
     "mmlu": MMLUBenchmark,
     "mmlu_pro": MMLUProBenchmark,
     "kmmlu": KMMLUBenchmark,
@@ -41,6 +42,8 @@ BENCHMARKS: dict[str, type[BaseBenchmark]] = {
     "livecodebench": LiveCodeBenchBenchmark,
     "bbq": BBQBenchmark,
     "safetybench": SafetyBenchBenchmark,
+    "terminalbench_4": TerminalBench4Benchmark,
+    "swebench_verified": SWEBenchVerifiedBenchmark,
 }
 
 __all__ = [
@@ -61,4 +64,6 @@ __all__ = [
     "LiveCodeBenchBenchmark",
     "BBQBenchmark",
     "SafetyBenchBenchmark",
+    "TerminalBench4Benchmark",
+    "SWEBenchVerifiedBenchmark",
 ]
