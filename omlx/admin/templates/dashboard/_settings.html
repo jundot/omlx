@@ -1,45 +1,110 @@
+{#- Section data for the in-page rail. The rail and the deep-link anchors
+    both read this one list, so a section cannot appear in the rail without
+    a matching id in the document. `badge` records what the
+    backend actually does with the section's values: `restart` = only the
+    next server start picks it up, `live` = the save request applies it
+    immediately, `none` = the section mixes both, so it carries no section
+    badge rather than a guess (the restart-only rows inside it keep their own
+    badge). -#}
+{% import "components/ui.html" as ui %}
+{% set tabs = [("global", t("settings.tab.global")),
+               ("models", t("settings.tab.models")),
+               ("integrations", t("settings.tab.integrations"))] %}
+{% set settings_sections = {
+  "global": [
+  {'id': 'settings-language', 'title': t('settings.sections.language'), 'badge': 'live'},
+  {'id': 'settings-appearance', 'title': t('settings.sections.appearance'), 'badge': 'live'},
+  {'id': 'settings-auth', 'title': t('settings.sections.auth'), 'badge': 'live'},
+  {'id': 'settings-server', 'title': t('settings.sections.server'), 'badge': 'none'},
+  {'id': 'settings-model', 'title': t('settings.sections.model'), 'badge': 'live'},
+  {'id': 'settings-resource', 'title': t('settings.sections.resource'), 'badge': 'live'},
+  {'id': 'settings-cache', 'title': t('settings.sections.cache'), 'badge': 'live'},
+  {'id': 'settings-generation', 'title': t('settings.sections.generation'), 'badge': 'live'},
+  {'id': 'settings-mcp', 'title': t('settings.sections.mcp'), 'badge': 'none'},
+  {'id': 'settings-usage', 'title': t('settings.sections.usage'), 'badge': 'live'},
+  {'id': 'settings-network', 'title': t('settings.sections.network'), 'badge': 'live'},
+  {'id': 'settings-advanced', 'title': t('settings.sections.advanced'), 'badge': 'none'},
+  ],
+  "integrations": [
+  {'id': 'settings-int-markitdown', 'title': t('settings.integrations.markitdown.section_label'), 'badge': 'live'},
+  {'id': 'settings-int-websearch', 'title': t('settings.integrations.websearch.section_label'), 'badge': 'live'},
+  ],
+  "models": [
+  {'id': 'settings-models', 'title': t('settings.sections.models'), 'badge': 'live'},
+  ],
+} %}
+{% set settings_badges = {
+  'language': 'live',
+  'appearance': 'live',
+  'auth': 'live',
+  'server': 'none',
+  'model': 'live',
+  'resource': 'live',
+  'cache': 'live',
+  'generation': 'live',
+  'mcp': 'none',
+  'usage': 'live',
+  'network': 'live',
+  'advanced': 'none',
+  'int-markitdown': 'live',
+  'int-websearch': 'live',
+  'models': 'live',
+} %}
+{% set badge_restart = ui.badge(t('settings.global.restart_badge'), tone='orange') %}
+{% set badge_live = ui.badge(t('settings.resource.live_badge'), tone='green', dot=True) %}
+{% set language_shown = true %}
+{% set appearance_shown = true %}
+{% set auth_shown = true %}
+{% set server_shown = true %}
+{% set model_shown = true %}
+{% set resource_shown = true %}
+{% set cache_shown = true %}
+{% set generation_shown = true %}
+{% set mcp_shown = true %}
+{% set usage_shown = true %}
+{% set network_shown = true %}
+{% set advanced_shown = true %}
+{% set int_markitdown_shown = true %}
+{% set int_websearch_shown = true %}
+{% set language_badge %}{{ badge_restart if settings_badges['language'] == 'restart' else (badge_live if settings_badges['language'] == 'live' else '') }}{% endset %}
+{% set appearance_badge %}{{ badge_restart if settings_badges['appearance'] == 'restart' else (badge_live if settings_badges['appearance'] == 'live' else '') }}{% endset %}
+{% set auth_badge %}{{ badge_restart if settings_badges['auth'] == 'restart' else (badge_live if settings_badges['auth'] == 'live' else '') }}{% endset %}
+{% set server_badge %}{{ badge_restart if settings_badges['server'] == 'restart' else (badge_live if settings_badges['server'] == 'live' else '') }}{% endset %}
+{% set model_badge %}{{ badge_restart if settings_badges['model'] == 'restart' else (badge_live if settings_badges['model'] == 'live' else '') }}{% endset %}
+{% set resource_badge %}{{ badge_restart if settings_badges['resource'] == 'restart' else (badge_live if settings_badges['resource'] == 'live' else '') }}{% endset %}
+{% set cache_badge %}{{ badge_restart if settings_badges['cache'] == 'restart' else (badge_live if settings_badges['cache'] == 'live' else '') }}{% endset %}
+{% set generation_badge %}{{ badge_restart if settings_badges['generation'] == 'restart' else (badge_live if settings_badges['generation'] == 'live' else '') }}{% endset %}
+{% set mcp_badge %}{{ badge_restart if settings_badges['mcp'] == 'restart' else (badge_live if settings_badges['mcp'] == 'live' else '') }}{% endset %}
+{% set usage_badge %}{{ badge_restart if settings_badges['usage'] == 'restart' else (badge_live if settings_badges['usage'] == 'live' else '') }}{% endset %}
+{% set network_badge %}{{ badge_restart if settings_badges['network'] == 'restart' else (badge_live if settings_badges['network'] == 'live' else '') }}{% endset %}
+{% set advanced_badge %}{{ badge_restart if settings_badges['advanced'] == 'restart' else (badge_live if settings_badges['advanced'] == 'live' else '') }}{% endset %}
+{% set int_markitdown_badge %}{{ badge_restart if settings_badges['int-markitdown'] == 'restart' else (badge_live if settings_badges['int-markitdown'] == 'live' else '') }}{% endset %}
+{% set int_websearch_badge %}{{ badge_restart if settings_badges['int-websearch'] == 'restart' else (badge_live if settings_badges['int-websearch'] == 'live' else '') }}{% endset %}
+{% set models_badge %}{{ badge_restart if settings_badges['models'] == 'restart' else (badge_live if settings_badges['models'] == 'live' else '') }}{% endset %}
+
+{% set settings_json = settings_sections | tojson %}
+
             <div x-show="mainTab === 'settings'" x-cloak role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
             <!-- Tab Navigation -->
-            <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
-                <button
-                    @click="setSettingsTab('global')"
-                    :class="activeTab === 'global'
-                        ? 'bg-neutral-900 text-white'
-                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
-                >
-                    {{ t('settings.tab.global') }}
-                </button>
-                <button
-                    @click="setSettingsTab('models')"
-                    :class="activeTab === 'models'
-                        ? 'bg-neutral-900 text-white'
-                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
-                >
-                    {{ t('settings.tab.models') }}
-                </button>
-                <button
-                    @click="setSettingsTab('integrations')"
-                    :class="activeTab === 'integrations'
-                        ? 'bg-neutral-900 text-white'
-                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
-                >
-                    {{ t('settings.tab.integrations') }}
-                </button>
+            <div class="page-tabs mb-6 animate-fade-in-up">
+                {{ ui.segmented(tabs, 'activeTab', "setSettingsTab('{value}')",
+                                aria_label=t('settings.sections.label')) }}
             </div>
+
+            {#- The rail's registry: one list per sub-tab, rendered here so the
+                titles come from the catalogue and the browser only has to read
+                it back (settingsInitSections). -#}
+            <script type="application/json" id="settings-sections">{{ settings_json | safe }}</script>
 
             <!-- Global Settings Tab -->
             <div x-show="activeTab === 'global'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Header -->
-                    <div class="mb-8 flex items-start justify-between gap-4">
+                    <div class="mb-8 flex items-center justify-between gap-4">
                         <div>
-                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.global.section_label') }}</h2>
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.global.heading') }}</h3>
                             <p class="text-sm text-neutral-500 mt-2">
-                                {{ t('settings.global.restart_notice') }} <span class="px-1 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
+                                {{ t('settings.global.restart_notice') }} {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }} {{ t('settings.global.restart_suffix') }}
                             </p>
                         </div>
                         <button type="button" @click="resetGlobalSettingsDefaults()"
@@ -51,17 +116,38 @@
                         </button>
                     </div>
 
-                    <!-- Settings Sections -->
-                    <div class="space-y-4">
+                    <h2 class="sr-only">{{ t('settings.sections.label') }}</h2>
+                    {#- The rail is the section list and nothing else: a heading over
+                        it and a box to filter it both competed with the list, and
+                        the browser's own find already searches the page. -#}
+                    <div class="settings-layout" x-init="settingsWatchScroll()">
+                        <nav class="settings-rail" aria-label="{{ t('settings.sections.label') }}">
+                            <div class="settings-rail__list">
+                                <template x-for="section in settingsSections" :key="section.id">
+                                    <a :href="'#' + section.id"
+                                       class="settings-rail__item"
+                                       :class="settingsActiveSection === section.id ? 'settings-rail__item--active' : ''"
+                                       :aria-current="settingsActiveSection === section.id ? 'true' : 'false'"
+                                       @click.prevent="settingsGoToSection(section.id)">
+                                        <span x-text="section.title"></span>
+                                    </a>
+                                </template>
+            </div>
+                        </nav>
+                        <div class="section-stack">
 
                         <!-- Language Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.language.section_label') }}</span>
-                                </div>
-                            </div>
+                        {% if language_shown %}
+                        {% set language_actions %}{{ language_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-language')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-language' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-language' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='globe', title=t('settings.language.section_label'), header_actions=language_actions | safe, attrs='settings-section', id="settings-language") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <label class="text-sm text-neutral-700">{{ t('settings.language.label') }}</label>
@@ -81,16 +167,62 @@
                                     </select>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
-                        <!-- Auth & Info Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="shield" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.auth.section_label') }}</span>
+                        <!-- Appearance Section -->
+{% if appearance_shown %}
+                        {% set appearance_actions %}{{ appearance_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-appearance')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-appearance' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-appearance' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='sun-moon', title=t('settings.sections.appearance'), header_actions=appearance_actions | safe, attrs='settings-section', id="settings-appearance") %}
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.sections.theme') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.sections.appearance_desc') }}</p>
+                        </div>
+                                    {{ ui.segmented([('auto', t('settings.sections.theme_auto')),
+                                                     ('light', t('settings.sections.theme_light')),
+                                                     ('dark', t('settings.sections.theme_dark'))],
+                                                    'theme',
+                                                    "setTheme('{value}')",
+                                                    aria_label=t('settings.sections.theme')) }}
+                    </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('chat.enhanced_readability') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('chat.enhanced_readability_desc') }}</p>
+                                </div>
+                                    <button type="button" role="switch"
+                                            @click="setEnhancedReadability(!enhancedReadability)"
+                                            :aria-checked="enhancedReadability ? 'true' : 'false'"
+                                            class="switch" :class="enhancedReadability ? 'switch--on' : ''">
+                                        <span class="switch__knob"></span>
+                </button>
                                 </div>
                             </div>
+                        {% endcall %}
+{% endif %}
+
+                        <!-- Auth & Info Section -->
+                        {% if auth_shown %}
+                        {% set auth_actions %}{{ auth_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-auth')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-auth' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-auth' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='shield', title=t('settings.auth.section_label'), header_actions=auth_actions | safe, attrs='settings-section', id="settings-auth") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
@@ -131,10 +263,10 @@
                                     <button type="button"
                                             @click="if (isLoopbackBindHost(globalSettings.server.host)) globalSettings.auth.skip_api_key_verification = !globalSettings.auth.skip_api_key_verification"
                                             :disabled="!isLoopbackBindHost(globalSettings.server.host)"
-                                            :class="!isLoopbackBindHost(globalSettings.server.host) ? 'bg-neutral-200 opacity-50 cursor-not-allowed' : (globalSettings.auth.skip_api_key_verification ? 'bg-black' : 'bg-neutral-200')"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="!isLoopbackBindHost(globalSettings.server.host) ? 'opacity-50 cursor-not-allowed' : (globalSettings.auth.skip_api_key_verification ? 'switch--on' : '')"
+                                            class="switch">
                                         <span :class="isLoopbackBindHost(globalSettings.server.host) && globalSettings.auth.skip_api_key_verification ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <!-- Sub Keys Section -->
@@ -178,7 +310,7 @@
                                         </div>
                                         <div x-show="subKeyError" class="text-xs text-red-500 mb-2" x-text="subKeyError"></div>
                                         <button type="button" @click="createSubKey()"
-                                                class="px-4 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 transition-colors">
+                                                class="px-4 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-accent-hover transition-colors">
                                             {{ t('settings.auth.sub_keys_create') }}
                                         </button>
                                     </div>
@@ -198,7 +330,7 @@
                                                             <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
                                                         </button>
                                                     </div>
-                                                    <div class="text-[10px] text-neutral-400 mt-1" x-text="sk.created_at ? new Date(sk.created_at).toLocaleDateString() : ''"></div>
+                                                    <div class="text-[12px] text-neutral-400 mt-1" x-text="sk.created_at ? new Date(sk.created_at).toLocaleDateString() : ''"></div>
                                                 </div>
                                                 <button type="button" @click="deleteSubKey(sk.key)"
                                                         class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors ml-2"
@@ -214,16 +346,21 @@
                                     </div>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Server Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="server" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.server.section_label') }}</span>
-                                </div>
-                            </div>
+                        {% if server_shown %}
+                        {% set server_actions %}{{ server_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-server')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-server' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-server' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='server', title=t('settings.server.section_label'), header_actions=server_actions | safe, attrs='settings-section', id="settings-server") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4"
                                      x-effect="if (showGlobalResetNotice) _mode = null"
@@ -243,7 +380,7 @@
                                      }">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.host') }}</label>
-                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}
                                     </div>
                                     <div class="flex flex-col items-end gap-1">
                                         <div class="flex items-center gap-2">
@@ -265,7 +402,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.port') }}</label>
-                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}
                                     </div>
                                     <input type="number" x-model.number="globalSettings.server.port"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
@@ -284,16 +421,21 @@
                                     </select>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Model Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.model.section_label') }}</span>
-                                </div>
-                            </div>
+                        {% if model_shown %}
+                        {% set model_actions %}{{ model_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-model')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-model' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-model' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='box', title=t('settings.model.section_label'), header_actions=model_actions | safe, attrs='settings-section', id="settings-model") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
@@ -302,10 +444,10 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.model.model_fallback = !globalSettings.model.model_fallback"
-                                            :class="globalSettings.model.model_fallback ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.model.model_fallback ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.model.model_fallback ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -315,10 +457,10 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.model.hide_helper_models = !globalSettings.model.hide_helper_models"
-                                            :class="globalSettings.model.hide_helper_models ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.model.hide_helper_models ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.model.hide_helper_models ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <div class="px-6 py-4">
@@ -357,33 +499,36 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.huggingface.hf_cache_enabled = !globalSettings.huggingface.hf_cache_enabled"
-                                            :class="globalSettings.huggingface.hf_cache_enabled ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.huggingface.hf_cache_enabled ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.huggingface.hf_cache_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Memory Management Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.resource.section_label') }}</span>
-                                </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    {{ t('settings.resource.live_badge') }}
-                                </span>
-                            </div>
+                        {% if resource_shown %}
+                        {% set resource_actions %}{{ resource_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-resource')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-resource' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-resource' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='gauge', title=t('settings.resource.section_label'), header_actions=resource_actions | safe, attrs='settings-section', id="settings-resource") %}
                             <div class="divide-y divide-neutral-100">
-                                <!-- Memory Guard + Tier -->
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                <!-- Memory Guard + Tier. `data-anchor` is what the
+                                     Logs tab's "raise memory_guard_tier" action scrolls to. -->
+                                <div data-anchor="memory-guard" class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
-                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
+                                            {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
                                         <p class="text-xs text-neutral-500 mt-1"
@@ -399,7 +544,7 @@
                                                             @click="copyWiredLimitCommand()"
                                                             :class="wiredLimitCopied ? 'text-green-500' : 'text-fg-tertiary hover:text-fg'"
                                                             class="transition-colors flex-shrink-0"
-                                                            :title="wiredLimitCopied ? 'Copied' : 'Copy'">
+                                                            :title="wiredLimitCopied ? window.t('app.copied') : window.t('app.copy')">
                                                         <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                                                     </button>
                                                 </div>
@@ -430,10 +575,10 @@
                                         </div>
                                         <button type="button"
                                                 @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
-                                                :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
-                                                class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                :class="globalSettings.memory.prefill_memory_guard ? 'switch--on' : ''"
+                                                class="switch">
                                             <span :class="globalSettings.memory.prefill_memory_guard ? 'translate-x-5' : 'translate-x-0'"
-                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                  class="switch__knob"></span>
                                         </button>
                                     </div>
                                 </div>
@@ -512,10 +657,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <div class="flex items-center gap-2">
-                                            <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label>
-                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-                                                {{ t('settings.resource.restart_badge') }}
-                                            </span>
+                                            <div class="flex items-center gap-2"><label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label> {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}</div>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.max_concurrent_requests_hint') }}</p>
                                     </div>
@@ -526,7 +668,7 @@
                                 <!-- Embedding Batch Size -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.embedding_batch_size') }}</label>
+                                        <div class="flex items-center gap-2"><label class="text-sm text-neutral-700">{{ t('settings.resource.embedding_batch_size') }}</label> {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}</div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.embedding_batch_size_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.scheduler.embedding_batch_size"
@@ -541,10 +683,10 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.scheduler.chunked_prefill = !globalSettings.scheduler.chunked_prefill"
-                                            :class="globalSettings.scheduler.chunked_prefill ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.scheduler.chunked_prefill ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.scheduler.chunked_prefill ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <!-- Prioritize Decoding During Prefill -->
@@ -555,10 +697,10 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.scheduler.decode_fairness = !globalSettings.scheduler.decode_fairness"
-                                            :class="globalSettings.scheduler.decode_fairness ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.scheduler.decode_fairness ? 'switch--on' : ''"
+                                            class="switch flex-shrink-0">
                                         <span :class="globalSettings.scheduler.decode_fairness ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <!-- Prefill Priority -->
@@ -570,14 +712,14 @@
                                     <div class="flex rounded-lg border border-neutral-200 overflow-hidden flex-shrink-0">
                                         <button type="button"
                                                 @click="globalSettings.scheduler.prefill_priority = 'context'"
-                                                :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                                :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'bg-accent text-accent-fg' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
                                                 class="px-3 py-1.5 text-xs font-medium transition-all flex items-center gap-1.5">
                                             <i data-lucide="maximize-2" class="w-3.5 h-3.5"></i>
                                             {{ t('settings.resource.prefill_priority.max_context') }}
                                         </button>
                                         <button type="button"
                                                 @click="globalSettings.scheduler.prefill_priority = 'speed'"
-                                                :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                                :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'bg-accent text-accent-fg' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
                                                 class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200 flex items-center gap-1.5">
                                             <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
                                             {{ t('settings.resource.prefill_priority.speed') }}
@@ -603,43 +745,45 @@
                                     </select>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Cache Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.cache.section_label') }}</span>
-                                </div>
-                            </div>
+                        {% if cache_shown %}
+                        {% set cache_actions %}{{ cache_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-cache')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-cache' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-cache' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='hard-drive', title=t('settings.cache.section_label'), header_actions=cache_actions | safe, attrs='settings-section', id="settings-cache") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.enabled') }}</label>
                                     </div>
                                     <button type="button" @click="globalSettings.cache.enabled = !globalSettings.cache.enabled"
-                                            :class="globalSettings.cache.enabled ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.cache.enabled ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.cache.enabled ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <div class="flex items-center gap-2">
-                                            <label class="text-sm text-neutral-700">{{ t('settings.cache.hot_cache_only') }}</label>
-                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-                                                {{ t('settings.global.restart_badge') }}
-                                            </span>
+                                            <div class="flex items-center gap-2"><label class="text-sm text-neutral-700">{{ t('settings.cache.hot_cache_only') }}</label> {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}</div>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.cache.hot_cache_only_hint') }}</p>
                                     </div>
                                     <button type="button" @click="globalSettings.cache.hot_cache_only = !globalSettings.cache.hot_cache_only"
-                                            :class="globalSettings.cache.hot_cache_only ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.cache.hot_cache_only ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.cache.hot_cache_only ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -650,16 +794,21 @@
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Sampling Defaults Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="sliders" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.generation.section_label') }}</span>
-                                </div>
-                            </div>
+                        {% if generation_shown %}
+                        {% set generation_actions %}{{ generation_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-generation')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-generation' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-generation' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='sliders', title=t('settings.generation.section_label'), header_actions=generation_actions | safe, attrs='settings-section', id="settings-generation") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
@@ -669,7 +818,9 @@
                                     <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="None"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                <!-- Max context window. `data-anchor` is what the Logs
+                                     tab's "reduce context" action scrolls to. -->
+                                <div data-anchor="context-window" class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_hint') }}</p>
@@ -729,19 +880,21 @@
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- MCP Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="plug" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.mcp.section_label') }}</span>
-                                </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-                                    {{ t('settings.mcp.restart_badge') }}
-                                </span>
-                            </div>
+                        {% if mcp_shown %}
+                        {% set mcp_actions %}{{ mcp_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-mcp')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-mcp' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-mcp' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='plug', title=t('settings.mcp.section_label'), header_actions=mcp_actions | safe, attrs='settings-section', id="settings-mcp") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <label class="text-sm text-neutral-700">{{ t('settings.mcp.config_path') }}</label>
@@ -755,26 +908,28 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.mcp.expose_tools = !globalSettings.mcp.expose_tools"
-                                            :class="globalSettings.mcp.expose_tools ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.mcp.expose_tools ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.mcp.expose_tools ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Usage History Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="history" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.usage.section_label') }}</span>
-                                </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    {{ t('settings.resource.live_badge') }}
-                                </span>
-                            </div>
+                        {% if usage_shown %}
+                        {% set usage_actions %}{{ usage_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-usage')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-usage' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-usage' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='history', title=t('settings.usage.section_label'), header_actions=usage_actions | safe, attrs='settings-section', id="settings-usage") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
@@ -783,28 +938,28 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.usage.usage_history = !globalSettings.usage.usage_history"
-                                            :class="globalSettings.usage.usage_history ? 'bg-black' : 'bg-neutral-200'"
                                             :aria-checked="globalSettings.usage.usage_history.toString()"
                                             role="switch"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="globalSettings.usage.usage_history ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            class="switch" :class="globalSettings.usage.usage_history ? 'switch--on' : ''">
+                                        <span class="switch__knob"></span>
                                     </button>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Network Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.network.section_label') }}</span>
-                                </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    {{ t('settings.resource.live_badge') }}
-                                </span>
-                            </div>
+                        {% if network_shown %}
+                        {% set network_actions %}{{ network_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-network')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-network' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-network' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='network', title=t('settings.network.section_label'), header_actions=network_actions | safe, attrs='settings-section', id="settings-network") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
@@ -839,11 +994,12 @@
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
 
                         <!-- Advanced Settings (collapsible, collapsed by default) -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden"
-                             x-data="{ advancedOpen: false }">
+{% if advanced_shown %}
+                        <div class="settings-section" id="settings-advanced" x-data="{ advancedOpen: false }">
                             <button @click="advancedOpen = !advancedOpen"
                                     class="w-full flex items-center justify-between px-6 py-4 bg-neutral-50 hover:bg-neutral-100 transition-colors cursor-pointer">
                                 <div class="flex items-center gap-3">
@@ -851,9 +1007,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.section_label') }}</span>
                                 </div>
                                 <div class="flex items-center gap-2">
-                                    <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
-                                        {{ t('settings.advanced.restart_badge') }}
-                                    </span>
+                                    {{ ui.badge(t('settings.advanced.restart_badge'), tone='orange') }}
                                     <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform duration-200"
                                        :class="advancedOpen && 'rotate-180'"></i>
                                 </div>
@@ -864,21 +1018,21 @@
                                     <div class="px-6 py-3 bg-neutral-50">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="network" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.distributed_inference') }}</span>
+                                            <span class="text-[12px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.distributed_inference') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
                                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div class="flex-1 min-w-0">
-                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.distributed_inference_enabled') }}</label>
+                                                <div class="flex items-center gap-2"><label class="text-sm text-neutral-700">{{ t('settings.advanced.distributed_inference_enabled') }}</label> {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}</div>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.distributed_inference_hint') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="globalSettings.server.distributed_inference_enabled = !globalSettings.server.distributed_inference_enabled"
-                                                    :class="globalSettings.server.distributed_inference_enabled ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    :class="globalSettings.server.distributed_inference_enabled ? 'switch--on' : ''"
+                                                    class="switch flex-shrink-0">
                                                 <span :class="globalSettings.server.distributed_inference_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                      class="switch__knob"></span>
                                             </button>
                                         </div>
                                     </div>
@@ -887,7 +1041,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="zap" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.performance') }}</span>
+                                            <span class="text-[12px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.performance') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -924,10 +1078,10 @@
                                             </div>
                                             <button type="button"
                                                     @click="globalSettings.server.preserve_mid_system_cache = !globalSettings.server.preserve_mid_system_cache"
-                                                    :class="globalSettings.server.preserve_mid_system_cache ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    :class="globalSettings.server.preserve_mid_system_cache ? 'switch--on' : ''"
+                                                    class="switch">
                                                 <span :class="globalSettings.server.preserve_mid_system_cache ? 'translate-x-5' : 'translate-x-0'"
-                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                      class="switch__knob"></span>
                                             </button>
                                         </div>
                                     </div>
@@ -936,13 +1090,13 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="hard-drive" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.cache') }}</span>
+                                            <span class="text-[12px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.cache') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
                                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div>
-                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.initial_cache_blocks') }}</label>
+                                                <div class="flex items-center gap-2"><label class="text-sm text-neutral-700">{{ t('settings.advanced.initial_cache_blocks') }}</label> {{ ui.badge(t('settings.global.restart_badge'), tone='orange') }}</div>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.initial_cache_blocks_hint') }}</p>
                                             </div>
                                             <input type="number" x-model.number="globalSettings.cache.initial_cache_blocks"
@@ -955,10 +1109,10 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.hot_cache_write_through_hint') }}</p>
                                             </div>
                                             <button type="button" @click="globalSettings.cache.hot_cache_write_through = !globalSettings.cache.hot_cache_write_through"
-                                                    :class="globalSettings.cache.hot_cache_write_through ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    :class="globalSettings.cache.hot_cache_write_through ? 'switch--on' : ''"
+                                                    class="switch">
                                                 <span :class="globalSettings.cache.hot_cache_write_through ? 'translate-x-5' : 'translate-x-0'"
-                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                      class="switch__knob"></span>
                                             </button>
                                         </div>
                                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -967,10 +1121,10 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.ane_compile_cache_hint') }}</p>
                                             </div>
                                             <button type="button" @click="globalSettings.cache.ane_compile_cache = !globalSettings.cache.ane_compile_cache"
-                                                    :class="globalSettings.cache.ane_compile_cache ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    :class="globalSettings.cache.ane_compile_cache ? 'switch--on' : ''"
+                                                    class="switch">
                                                 <span :class="globalSettings.cache.ane_compile_cache ? 'translate-x-5' : 'translate-x-0'"
-                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                      class="switch__knob"></span>
                                             </button>
                                         </div>
                                     </div>
@@ -979,7 +1133,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="database-zap" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.gdn_cache_policy') }}</span>
+                                            <span class="text-[12px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.gdn_cache_policy') }}</span>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-1.5">{{ t('settings.advanced.gdn_cache_policy_hint') }}</p>
                                     </div>
@@ -1034,7 +1188,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="upload" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.uploads') }}</span>
+                                            <span class="text-[12px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.uploads') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -1054,7 +1208,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="radio" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.streaming') }}</span>
+                                            <span class="text-[12px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.streaming') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -1074,9 +1228,12 @@
                                 </div>
                             </div>
                         </div>
+{% endif %}
 
+                            </div>
                     </div>
 
+                    <!-- Save / Restart Buttons -->
                     <!-- Save / Restart Buttons -->
                     <div class="mt-10 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-4">
                         <div class="flex flex-col gap-1 min-w-0 sm:flex-1">
@@ -1089,37 +1246,17 @@
                                 <i data-lucide="check-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
                                 <span class="line-clamp-2" x-text="saveMessage"></span>
                             </div>
-                            <!-- Save error -->
-                            <div x-show="saveError" x-cloak
-                                 x-transition:enter="transition ease-out duration-200"
-                                 x-transition:leave="transition ease-in duration-150"
-                                 class="flex items-start gap-2 text-sm text-red-600 min-w-0"
-                                 :title="saveError">
-                                <i data-lucide="alert-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
-                                <span class="line-clamp-2" x-text="saveError"></span>
-                            </div>
-                            <!-- Restart status (any non-empty message) -->
-                            <div x-show="restartServer.message" x-cloak
-                                 class="flex items-start gap-2 text-sm min-w-0"
-                                 :class="restartServer.status === 'error' ? 'text-red-600'
-                                       : restartServer.status === 'unsupported' ? 'text-amber-600'
-                                       : 'text-neutral-700'"
-                                 :title="restartServer.message">
-                                <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
-                                   data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0 mt-0.5"></i>
-                                <i x-show="restartServer.status === 'error' || restartServer.status === 'unsupported'"
-                                   data-lucide="alert-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
-                                <i x-show="restartServer.status === 'idle'"
-                                   data-lucide="check-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
-                                <span class="line-clamp-2" x-text="restartServer.message"></span>
-                            </div>
+                            <!-- Save failures and restart progress are toasts
+                                 (dashboard.js watches saveError and
+                                 restartServer.status); the success line stays
+                                 next to the button that produced it. -->
                         </div>
                         <div class="flex items-center gap-3 shrink-0">
                             <button type="button"
                                     @click="restartServerStart()"
                                     :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
                                     class="inline-flex items-center justify-center gap-2 px-6 py-3 bg-white text-neutral-700 text-sm font-semibold
-                                           border border-neutral-300 rounded-full hover:bg-neutral-50 focus:outline-none focus:ring-2
+                                           border border-neutral-300 rounded-lg hover:bg-neutral-50 focus:outline-none focus:ring-2
                                            focus:ring-neutral-300 focus:ring-offset-2 transition-all duration-200
                                            disabled:opacity-50 disabled:cursor-not-allowed">
                                 <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
@@ -1135,8 +1272,8 @@
                             <button
                                 @click="saveGlobalSettings"
                                 :disabled="saving || resettingGlobalSettings"
-                                class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
-                                       rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2
+                                class="px-8 py-3 bg-accent text-accent-fg text-sm font-semibold
+                                       rounded-lg hover:bg-accent-hover focus:outline-none focus:ring-2
                                        focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
                                        transform hover:scale-105 active:scale-95
                                        disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
@@ -1158,21 +1295,20 @@
             <!-- Integration Settings Tab -->
             <div x-show="activeTab === 'integrations'" x-cloak>
                 <div class="animate-fade-in-up">
-                    <div class="mb-8">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.integrations.section_label') }}</h2>
-                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.integrations.heading') }}</h3>
-                        <p class="text-sm text-neutral-500 mt-2">{{ t('settings.integrations.description') }}</p>
-                    </div>
+                    <div class="section-stack">
 
-                    <div class="space-y-4">
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="file-text" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.markitdown.section_label') }}</span>
-                                </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">{{ t('settings.integrations.markitdown.formats_badge') }}</span>
-                            </div>
+                        <!-- MarkItDown Section -->
+                        {% if int_markitdown_shown %}
+                        {% set int_markitdown_actions %}{{ int_markitdown_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-int-markitdown')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-int-markitdown' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-int-markitdown' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='file-text', title=t('settings.integrations.markitdown.section_label'), subtitle=t('settings.integrations.markitdown.subtitle'), header_actions=int_markitdown_actions | safe, attrs='settings-section', id="settings-int-markitdown") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
                                     <div>
@@ -1181,10 +1317,9 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.integrations.markitdown_enabled = !globalSettings.integrations.markitdown_enabled; saveIntegrationSettings().then(() => loadModels())"
-                                            :class="globalSettings.integrations.markitdown_enabled ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="globalSettings.integrations.markitdown_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            :class="globalSettings.integrations.markitdown_enabled ? 'switch--on' : ''"
+                                            class="switch">
+                                        <span class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
@@ -1196,12 +1331,11 @@
                                             @click="globalSettings.integrations.markitdown_expose_model = !globalSettings.integrations.markitdown_expose_model; saveIntegrationSettings().then(() => loadModels())"
                                             :disabled="!globalSettings.integrations.markitdown_enabled"
                                             :class="[
-                                                globalSettings.integrations.markitdown_expose_model && globalSettings.integrations.markitdown_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                globalSettings.integrations.markitdown_expose_model && globalSettings.integrations.markitdown_enabled ? 'switch--on' : '',
                                                 !globalSettings.integrations.markitdown_enabled ? 'opacity-40 cursor-not-allowed' : ''
                                             ]"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="globalSettings.integrations.markitdown_expose_model && globalSettings.integrations.markitdown_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            class="switch">
+                                        <span class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
@@ -1256,15 +1390,21 @@
                                     </select>
                                 </div>
                             </div>
-                        </div>
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
-                                    <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.websearch.section_label') }}</span>
-                                </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">{{ t('settings.integrations.websearch.providers_badge') }}</span>
-                            </div>
+                        {% endcall %}
+{% endif %}
+
+                        <!-- Web Search Section -->
+                        {% if int_websearch_shown %}
+                        {% set int_websearch_actions %}{{ int_websearch_badge }}
+                            <button type="button"
+                                    @click="settingsCopyAnchor('settings-int-websearch')"
+                                    class="settings-anchor p-1 rounded"
+                                    :class="settingsCopiedAnchor === 'settings-int-websearch' ? 'settings-anchor--done' : ''"
+                                    :title="settingsCopiedAnchor === 'settings-int-websearch' ? window.t('app.copied') : window.t('app.copy')"
+                                    aria-label="{{ t('settings.sections.copy_link') }}">
+                                <i data-lucide="link" class="w-3.5 h-3.5" aria-hidden="true"></i>
+                            </button>{% endset %}
+                        {% call ui.card(icon='globe', title=t('settings.integrations.websearch.section_label'), header_actions=int_websearch_actions | safe, attrs='settings-section', id="settings-int-websearch") %}
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
                                     <div>
@@ -1354,10 +1494,10 @@
                                     </div>
                                     <button type="button"
                                             @click="globalSettings.integrations.web_search_content_truncate = !globalSettings.integrations.web_search_content_truncate; saveIntegrationSettings()"
-                                            :class="globalSettings.integrations.web_search_content_truncate ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="globalSettings.integrations.web_search_content_truncate ? 'switch--on' : ''"
+                                            class="switch">
                                         <span :class="globalSettings.integrations.web_search_content_truncate ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                              class="switch__knob"></span>
                                     </button>
                                 </div>
                                 <div x-show="globalSettings.integrations.web_search_content_mode === 'full' && globalSettings.integrations.web_search_content_truncate"
@@ -1392,17 +1532,18 @@
                                     </button>
                                 </div>
                             </div>
-                        </div>
+                        {% endcall %}
+{% endif %}
+
                     </div>
                 </div>
             </div>
 
             <!-- Model Settings Tab -->
-            <div x-show="activeTab === 'models'" x-cloak>
+            <div x-show="activeTab === 'models'" x-cloak id="settings-models" data-settings-section>
                 <div class="animate-fade-in-up">
                     <!-- Header -->
                     <div class="mb-8">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.models.section_label') }}</h2>
                         <div class="flex items-center gap-3">
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.models.heading') }}</h3>
                             <button @click="reloadModels()"
@@ -1446,8 +1587,8 @@
                     </div>
 
                     <!-- Empty State -->
-                    <div x-show="!loadingModels && models.length === 0" class="bg-white rounded-2xl border border-neutral-200 p-12 text-center">
-                        <div class="w-16 h-16 bg-neutral-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                    <div x-show="!loadingModels && models.length === 0" class="card p-12 text-center">
+                        <div class="w-16 h-16 bg-surface-muted rounded-lg flex items-center justify-center mx-auto mb-4">
                             <i data-lucide="package-x" class="w-8 h-8 text-neutral-400"></i>
                         </div>
                         <h4 class="text-lg font-semibold text-neutral-900 mb-2">{{ t('settings.models.no_models_heading') }}</h4>
@@ -1455,37 +1596,37 @@
                     </div>
 
                     <!-- Model Table -->
-                    <div x-show="!loadingModels && models.length > 0" class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                    <div x-show="!loadingModels && models.length > 0" class="card overflow-hidden">
                         <div class="overflow-x-auto">
                         <!-- Table Header -->
                         <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
                             <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('id')">
                                 {{ t('settings.models.table.model') }}
-                                <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[12px]"></span>
                             </div>
                             <div class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
                                 {{ t('settings.models.table.type') }}
-                                <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[12px]"></span>
                             </div>
                             <div class="hidden sm:flex w-60 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
                                 {{ t('settings.models.table.size') }}
-                                <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[12px]"></span>
                             </div>
                             <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('loaded')">
                                 {{ t('settings.models.table.status') }}
-                                <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[12px]"></span>
                             </div>
                             <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
                                 {{ t('settings.models.table.pin') }}
-                                <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[12px]"></span>
                             </div>
                             <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_hidden')">
                                 {{ t('settings.models.table.visible') }}
-                                <span x-show="sortBy === 'is_hidden'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'is_hidden'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[12px]"></span>
                             </div>
                             <div class="hidden sm:flex w-14 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
                                 {{ t('settings.models.table.default') }}
-                                <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[12px]"></span>
                             </div>
                             <div class="w-10 text-center"></div>
                         </div>
@@ -1521,15 +1662,15 @@
                                                :title="model.display_name || model.id"
                                                x-text="model.display_name || model.id"></p>
                                             <span x-show="model.settings?.model_alias" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
+                                                  class="badge truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
                                             <span x-show="model.is_helper" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200"
+                                                  class="badge badge--teal"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.helper_badge')"></span>
                                             <span x-show="model.is_hidden" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200"
+                                                  class="badge"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.hidden_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.hidden_badge')"></span>
@@ -1544,8 +1685,8 @@
                                         </div>
 
                                         <!-- Type -->
-                                        <div class="hidden sm:block w-20 text-center flex-shrink-0">
-                                            <span class="px-2 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-600"
+                                        <div class="hidden sm:flex w-20 justify-center flex-shrink-0">
+                                            <span class="badge uppercase"
                                                   x-text="model.model_type || 'llm'"></span>
                                         </div>
 
@@ -1554,13 +1695,14 @@
                                             <span class="text-sm text-neutral-600" x-text="modelSizeLabel(model)"></span>
                                         </div>
 
-                                        <!-- Status -->
-                                        <div class="w-20 text-center flex-shrink-0"
+                                        <!-- Status: the same box as the switch it stands beside,
+                                             so the two share one centre line (see .badge). -->
+                                        <div class="w-20 flex justify-center flex-shrink-0"
                                              x-data="{ hover: false }"
                                              @mouseenter="hover = true" @mouseleave="hover = false">
                                             <!-- Loading state -->
                                             <template x-if="model.is_loading">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 bg-amber-100 text-amber-700">
+                                                <span class="badge badge--orange">
                                                     <svg class="w-3 h-3 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                                                         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                                         <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
@@ -1571,28 +1713,24 @@
                                             <!-- Loaded state -->
                                             <template x-if="!model.virtual && !model.is_loading && model.loaded">
                                                 <button @click="unloadModel(model.id)"
-                                                        :class="hover
-                                                            ? 'bg-red-100 text-red-700 cursor-pointer'
-                                                            : 'bg-neutral-900 text-white'"
-                                                        class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 transition-all">
-                                                    <span :class="hover ? 'bg-red-500' : 'bg-white'" class="w-1.5 h-1.5 rounded-full"></span>
+                                                        :class="hover ? 'badge--red cursor-pointer' : 'badge--green'"
+                                                        class="badge">
+                                                    <span class="badge__dot"></span>
                                                     <span x-text="hover ? window.t('settings.models.table.status_unload') : window.t('settings.models.table.status_loaded')"></span>
                                                 </button>
                                             </template>
                                             <template x-if="model.virtual && !model.is_loading && model.loaded">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 bg-neutral-900 text-white">
-                                                    <span class="w-1.5 h-1.5 rounded-full bg-white"></span>
+                                                <span class="badge badge--green">
+                                                    <span class="badge__dot"></span>
                                                     <span x-text="window.t('settings.models.table.status_loaded')"></span>
                                                 </span>
                                             </template>
                                             <!-- Ready state -->
                                             <template x-if="!model.virtual && !model.is_loading && !model.loaded">
                                                 <button @click="loadModel(model.id)"
-                                                        :class="hover
-                                                            ? 'bg-green-100 text-green-700 border-green-200 cursor-pointer'
-                                                            : 'bg-white text-neutral-500 border-neutral-200'"
-                                                        class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 border transition-all">
-                                                    <span :class="hover ? 'bg-green-500' : 'bg-neutral-400'" class="w-1.5 h-1.5 rounded-full"></span>
+                                                        :class="hover ? 'badge--green cursor-pointer' : ''"
+                                                        class="badge">
+                                                    <span class="badge__dot"></span>
                                                     <span x-text="hover ? window.t('settings.models.table.status_load') : window.t('settings.models.table.status_ready')"></span>
                                                 </button>
                                             </template>
@@ -1607,12 +1745,12 @@
                                                     @mouseleave="hideTip()"
                                                     @focus="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
                                                     @blur="hideTip()"
-                                                    :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                    :class="model.pinned ? 'switch--on' : ''"
+                                                    class="switch"
                                                 >
                                                     <span
                                                         :class="model.pinned ? 'translate-x-4' : 'translate-x-0'"
-                                                        class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                        class="switch__knob"
                                                     ></span>
                                                 </button>
                                             </template>
@@ -1630,12 +1768,12 @@
                                                     @mouseleave="hideTip()"
                                                     @focus="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
                                                     @blur="hideTip()"
-                                                    :class="!model.is_hidden ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                    :class="!model.is_hidden ? 'switch--on' : ''"
+                                                    class="switch"
                                                 >
                                                     <span
                                                         :class="!model.is_hidden ? 'translate-x-4' : 'translate-x-0'"
-                                                        class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                        class="switch__knob"
                                                     ></span>
                                                 </button>
                                             </template>
@@ -1689,85 +1827,85 @@
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <!-- 1. API-exposed profile pills -->
                                             <template x-for="profile in (model.exposed_profiles || [])" :key="profile.name">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                                <span class="chip chip--emerald"
                                                       @mouseenter="showTip($event.currentTarget, profileTooltip(profile))"
                                                       @mouseleave="hideTip()">
-                                                    <span class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
-                                                          :class="profile.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
+                                                    <span class="chip"
+                                                          :class="profile.has_engine_fields ? 'chip--amber' : 'chip--emerald'">API</span>
                                                     <span x-text="profile.api_name || profile.name"></span>
                                                 </span>
                                             </template>
                                             <!-- 2. Preset pill (cyan) if settings match a preset exactly -->
                                             <template x-if="!model.settings?.active_profile_name && matchedPreset(model.settings)">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-cyan-50 text-cyan-700 border border-cyan-200">
+                                                <span class="chip chip--cyan">
                                                     <i data-lucide="settings" class="w-3 h-3"></i>
                                                     <span x-text="matchedPreset(model.settings).display_name || matchedPreset(model.settings).name"></span>
                                                 </span>
                                             </template>
                                             <!-- 3. Per-field chips (original colors, rounded-full shape) -->
                                             <template x-if="model.settings?.max_context_window">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                                                <span class="chip chip--amber">
                                                     ctx_window: <span class="ml-1" x-text="model.settings.max_context_window"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tokens">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                                                <span class="chip chip--neutral">
                                                     max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.temperature !== null && model.settings?.temperature !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-orange-50 text-orange-700 border border-orange-200">
+                                                <span class="chip chip--orange">
                                                     temp: <span class="ml-1" x-text="model.settings.temperature"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.top_p !== null && model.settings?.top_p !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-green-50 text-green-700 border border-green-200">
+                                                <span class="chip chip--green">
                                                     top_p: <span class="ml-1" x-text="model.settings.top_p"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.top_k !== null && model.settings?.top_k !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-purple-50 text-purple-700 border border-purple-200">
+                                                <span class="chip chip--purple">
                                                     top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.min_p !== null && model.settings?.min_p !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                <span class="chip chip--indigo">
                                                     min_p: <span class="ml-1" x-text="model.settings.min_p"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-pink-50 text-pink-700 border border-pink-200">
+                                                <span class="chip chip--pink">
                                                     rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.presence_penalty !== null && model.settings?.presence_penalty !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-rose-50 text-rose-700 border border-rose-200">
+                                                <span class="chip chip--rose">
                                                     presence_penalty: <span class="ml-1" x-text="model.settings.presence_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tool_result_tokens">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-teal-50 text-teal-700 border border-teal-200">
+                                                <span class="chip chip--neutral">
                                                     tool_result_tokens: <span class="ml-1" x-text="model.settings.max_tool_result_tokens"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.reasoning_parser">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-violet-50 text-violet-700 border border-violet-200">
+                                                <span class="chip chip--neutral">
                                                     reasoning_parser: <span class="ml-1" x-text="model.settings.reasoning_parser"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.enable_thinking === true">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-sky-50 text-sky-700 border border-sky-200">
+                                                <span class="chip chip--sky">
                                                     thinking
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.force_sampling">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-red-50 text-red-700 border border-red-200">
+                                                <span class="chip chip--red">
                                                     force_sampling
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.chat_template_kwargs">
                                                 <template x-for="[k, v] in Object.entries(model.settings.chat_template_kwargs)" :key="k">
-                                                    <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                    <span class="chip chip--indigo">
                                                         <span x-text="k"></span>: <span class="ml-1" x-text="v"></span>
                                                     </span>
                                                 </template>
@@ -1783,21 +1921,22 @@
             </div>
             </div>
 
-            <dialog x-effect="showGlobalResetNotice ? $el.showModal() : $el.close()" x-cloak
+            <dialog id="global-reset-dialog"
                     class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"
                     aria-modal="true" aria-labelledby="global-reset-title" aria-describedby="global-reset-message"
                     @keydown.tab="trapDialogFocus($event)" @cancel.prevent="cancelGlobalSettingsReset()">
                 <div class="fixed inset-0 bg-black/50" @click="cancelGlobalSettingsReset()"></div>
                 <div class="flex min-h-full items-center justify-center p-4">
-                    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6" @click.stop>
+                    <div class="relative bg-surface rounded-lg shadow-popover w-full max-w-md p-6" @click.stop>
                         <h4 id="global-reset-title" class="text-lg font-bold text-neutral-900 mb-3">{{ t('settings.global.reset_title') }}</h4>
                         <p id="global-reset-message" class="text-sm text-neutral-600">{{ t('settings.global.reset_message') }}</p>
                         <div class="flex justify-end gap-3 mt-6">
                             <button type="button" autofocus @click="cancelGlobalSettingsReset()"
-                                    class="px-5 py-2.5 text-sm font-medium text-neutral-600 rounded-full hover:bg-neutral-100">{{ t('settings.global.reset_cancel') }}</button>
+                                    class="px-5 py-2.5 text-sm font-medium text-neutral-600 rounded-lg hover:bg-neutral-100">{{ t('settings.global.reset_cancel') }}</button>
                             <button type="button" @click="confirmGlobalSettingsReset()"
-                                    class="px-5 py-2.5 text-sm font-medium text-white bg-neutral-900 rounded-full hover:bg-neutral-700">{{ t('settings.global.reset_ok') }}</button>
+                                    class="px-5 py-2.5 text-sm font-medium text-white bg-neutral-900 rounded-lg hover:bg-accent-hover">{{ t('settings.global.reset_ok') }}</button>
                         </div>
                     </div>
                 </div>
             </dialog>
+

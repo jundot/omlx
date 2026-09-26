@@ -15,6 +15,7 @@
 		1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */; };
 		2BB000000000000000000001 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000001 /* Theme.swift */; };
+		2BB0000000000000000000F1 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC0000000000000000000F1 /* DesignTokens.swift */; };
 		2BB000000000000000000002 /* Squircle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000002 /* Squircle.swift */; };
 		2BB000000000000000000003 /* Glass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000003 /* Glass.swift */; };
 		2BB000000000000000000004 /* Button.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000004 /* Button.swift */; };
@@ -27,6 +28,7 @@
 		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
 		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
 		2BB00000000000000000000D /* ScreenScaffold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000D /* ScreenScaffold.swift */; };
+		2BB00000000000000000000E /* CountFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000E /* CountFormat.swift */; };
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
@@ -74,6 +76,7 @@
 		8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000005 /* ChatTemplateKwargs.swift */; };
 		8BB000000000000000000006 /* DflashByteSize.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000006 /* DflashByteSize.swift */; };
 		8BB000000000000000000007 /* SystemMetricsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000007 /* SystemMetricsPoller.swift */; };
+		8BB0000000000000000000F7 /* LogRecords.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC0000000000000000000F7 /* LogRecords.swift */; };
 		8BB000000000000000000008 /* ProfileViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000008 /* ProfileViews.swift */; };
 		8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000009 /* ProfileWorkingState.swift */; };
 		8BB00000000000000000000A /* MSTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC00000000000000000000A /* MSTaskDTO.swift */; };
@@ -128,6 +131,8 @@
 		DBB000000000000000000901 /* BenchDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000901 /* BenchDTODecodeTests.swift */; };
 		DBB000000000000000000104 /* ShellEnvWriterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000104 /* ShellEnvWriterTests.swift */; };
 		DBB000000000000000000105 /* ThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000105 /* ThemeTests.swift */; };
+		DBB0000000000000000000F5 /* LogRecordsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC0000000000000000000F5 /* LogRecordsTests.swift */; };
+		DBB0000000000000000000F6 /* LogsDrawingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC0000000000000000000F6 /* LogsDrawingTests.swift */; };
 		DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000106 /* ReleasesCheckerTests.swift */; };
 		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
 		DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000110 /* MenubarControllerModelsTests.swift */; };
@@ -135,6 +140,7 @@
 		DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000113 /* PerformanceScreenVMTests.swift */; };
 		DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000114 /* UpdateInstallerTests.swift */; };
 		DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000115 /* AppUpdaterTests.swift */; };
+		DBB000000000000000000116 /* CountFormatTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000116 /* CountFormatTests.swift */; };
 		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 /* End PBXBuildFile section */
 
@@ -160,6 +166,8 @@
 		1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntime.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcess.swift; sourceTree = "<group>"; };
 		2CC000000000000000000001 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000E /* CountFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CountFormat.swift; sourceTree = "<group>"; };
+		2CC0000000000000000000F1 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
 		2CC000000000000000000002 /* Squircle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Squircle.swift; sourceTree = "<group>"; };
 		2CC000000000000000000003 /* Glass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Glass.swift; sourceTree = "<group>"; };
 		2CC000000000000000000004 /* Button.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Button.swift; sourceTree = "<group>"; };
@@ -219,6 +227,7 @@
 		8CC000000000000000000005 /* ChatTemplateKwargs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTemplateKwargs.swift; sourceTree = "<group>"; };
 		8CC000000000000000000006 /* DflashByteSize.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DflashByteSize.swift; sourceTree = "<group>"; };
 		8CC000000000000000000007 /* SystemMetricsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsPoller.swift; sourceTree = "<group>"; };
+		8CC0000000000000000000F7 /* LogRecords.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogRecords.swift; sourceTree = "<group>"; };
 		8CC000000000000000000008 /* ProfileViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileViews.swift; sourceTree = "<group>"; };
 		8CC000000000000000000009 /* ProfileWorkingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileWorkingState.swift; sourceTree = "<group>"; };
 		8CC00000000000000000000A /* MSTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MSTaskDTO.swift; sourceTree = "<group>"; };
@@ -274,6 +283,8 @@
 		DCC000000000000000000901 /* BenchDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchDTODecodeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000104 /* ShellEnvWriterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriterTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000105 /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
+		DCC0000000000000000000F5 /* LogRecordsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogRecordsTests.swift; sourceTree = "<group>"; };
+		DCC0000000000000000000F6 /* LogsDrawingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsDrawingTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000106 /* ReleasesCheckerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesCheckerTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000110 /* MenubarControllerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerModelsTests.swift; sourceTree = "<group>"; };
@@ -281,6 +292,7 @@
 		DCC000000000000000000113 /* PerformanceScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreenVMTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000114 /* UpdateInstallerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateInstallerTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000115 /* AppUpdaterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdaterTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000116 /* CountFormatTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CountFormatTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -345,6 +357,8 @@
 				DCC000000000000000000901 /* BenchDTODecodeTests.swift */,
 				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
 				DCC000000000000000000105 /* ThemeTests.swift */,
+				DCC0000000000000000000F5 /* LogRecordsTests.swift */,
+				DCC0000000000000000000F6 /* LogsDrawingTests.swift */,
 				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
 				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
 				DCC000000000000000000110 /* MenubarControllerModelsTests.swift */,
@@ -352,6 +366,7 @@
 				DCC000000000000000000113 /* PerformanceScreenVMTests.swift */,
 				DCC000000000000000000114 /* UpdateInstallerTests.swift */,
 				DCC000000000000000000115 /* AppUpdaterTests.swift */,
+				DCC000000000000000000116 /* CountFormatTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -435,8 +450,10 @@
 			isa = PBXGroup;
 			children = (
 				2CC000000000000000000001 /* Theme.swift */,
+				2CC0000000000000000000F1 /* DesignTokens.swift */,
 				2CC000000000000000000002 /* Squircle.swift */,
 				2CC000000000000000000003 /* Glass.swift */,
+				2CC00000000000000000000E /* CountFormat.swift */,
 				2EE000000000000000000002 /* Components */,
 			);
 			path = Theme;
@@ -559,6 +576,7 @@
 				8CC000000000000000000009 /* ProfileWorkingState.swift */,
 				9CC000000000000000000006 /* PresetBundleStore.swift */,
 				8CC000000000000000000007 /* SystemMetricsPoller.swift */,
+				8CC0000000000000000000F7 /* LogRecords.swift */,
 			);
 			path = Utils;
 			sourceTree = "<group>";
@@ -697,6 +715,7 @@
 				1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */,
 				2BB000000000000000000001 /* Theme.swift in Sources */,
+				2BB0000000000000000000F1 /* DesignTokens.swift in Sources */,
 				AAD9D5252FE2848500FAEA05 /* SecurityScreenVM.swift in Sources */,
 				2BB000000000000000000002 /* Squircle.swift in Sources */,
 				2BB000000000000000000003 /* Glass.swift in Sources */,
@@ -709,6 +728,7 @@
 				2BB000000000000000000009 /* Row.swift in Sources */,
 				2BB00000000000000000000A /* SectionHeader.swift in Sources */,
 				2BB00000000000000000000D /* ScreenScaffold.swift in Sources */,
+				2BB00000000000000000000E /* CountFormat.swift in Sources */,
 				2BB00000000000000000000B /* StatusPill.swift in Sources */,
 				AAD9D5172FE283D100FAEA05 /* ServerScreenVM.swift in Sources */,
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
@@ -777,6 +797,7 @@
 				8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */,
 				8BB000000000000000000006 /* DflashByteSize.swift in Sources */,
 				8BB000000000000000000007 /* SystemMetricsPoller.swift in Sources */,
+				8BB0000000000000000000F7 /* LogRecords.swift in Sources */,
 				8BB000000000000000000008 /* ProfileViews.swift in Sources */,
 				8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */,
 				9BB000000000000000000001 /* SubKeyDTO.swift in Sources */,
@@ -795,6 +816,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */,
+				DBB0000000000000000000F5 /* LogRecordsTests.swift in Sources */,
+				DBB0000000000000000000F6 /* LogsDrawingTests.swift in Sources */,
 				DBB000000000000000000002 /* AppConfigTests.swift in Sources */,
 				DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */,
 				DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */,
@@ -823,6 +846,7 @@
 				DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */,
 				DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */,
 				DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */,
+				DBB000000000000000000116 /* CountFormatTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

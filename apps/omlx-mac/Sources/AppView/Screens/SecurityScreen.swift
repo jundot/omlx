@@ -329,7 +329,7 @@ private struct SubKeysSection: View {
                     Text(String(localized: "security.sub_keys.empty",
                                 defaultValue: "No sub keys yet.",
                                 comment: "Empty-state text shown when there are no sub-keys"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 14)
@@ -345,10 +345,10 @@ private struct SubKeysSection: View {
                                               defaultValue: "(unnamed)",
                                               comment: "Fallback display name for a sub-key with no name set")
                                      : sub.name)
-                                    .font(.omlxText(13, weight: .medium))
+                                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                     .foregroundStyle(theme.text)
                                 Text(formatCreatedAt(sub.createdAt))
-                                    .font(.omlxText(11))
+                                    .font(.omlxText(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.textTertiary)
                             }
                             Spacer(minLength: 8)

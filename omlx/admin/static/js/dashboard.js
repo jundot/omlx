@@ -101,13 +101,108 @@
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    // The palette needs a stable order and a label key per tab; the sets above
+    // only answer "is this a real tab".
+    const DASHBOARD_TAB_ORDER = [
+        ['status', 'navbar.tab.status'],
+        ['models', 'navbar.tab.models'],
+        ['settings', 'navbar.tab.settings'],
+        ['logs', 'navbar.tab.logs'],
+        ['bench', 'navbar.tab.bench'],
+        ['cluster', 'navbar.tab.cluster'],
+    ];
+    const DASHBOARD_SETTINGS_ORDER = [
+        ['global', 'settings.tab.global'],
+        ['models', 'settings.tab.models'],
+        ['integrations', 'settings.tab.integrations'],
+    ];
+    // Restart status -> toast tone. The message is already localized.
+    const RESTART_TONES = {
+        restarting: 'blue',
+        waiting: 'blue',
+        idle: 'green',
+        unsupported: 'orange',
+        error: 'red',
+    };
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
+    // Log rows mounted above and below the viewport: enough that a fast scroll
+    // never shows a gap, small enough that 10 000 lines stay cheap.
+    const LOG_OVERSCAN = 8;
+
+    // A settings section anchor, e.g. `settings-server`.
+    const SETTINGS_SECTION_ID = /^settings-[a-z][a-z-]*$/;
 
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
     const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
+
+    // The Settings tab renders its section registry as JSON (so the titles come
+    // from the catalogue); both the rail and the deep-link handler read it from
+    // there rather than keeping a second copy in JavaScript.
+    function settingsSectionsByTab() {
+        const node = document.getElementById('settings-sections');
+        if (!node) return {};
+        try {
+            return JSON.parse(node.textContent) || {};
+        } catch (error) {
+            console.error('settings sections unreadable', error);
+            return {};
+                    }
+                    }
+
+    // One status vocabulary for every model table (manager, the two download
+    // queues, the quantizer and the uploader): the status string the API reports
+    // maps to the tone the shared Badge spec paints. A table cannot invent its
+    // own colour for "failed" any more, and anything unlisted is unknown ->
+    // neutral.
+    const STATUS_TONES = {
+        // ready / resident
+        loaded: 'green', ready: 'green', resident: 'green',
+        // finished cleanly
+        completed: 'green', complete: 'green', success: 'green',
+        succeeded: 'green', done: 'green',
+        // usable but not clean
+        warning: 'orange', partial: 'orange', stalled: 'orange',
+        cancelled: 'orange', canceled: 'orange', paused: 'orange',
+        interrupted: 'orange',
+        // broken
+        failed: 'red', failure: 'red', error: 'red', crashed: 'red',
+        // in flight or queued
+        pending: 'blue', queued: 'blue', starting: 'blue',
+        downloading: 'blue', uploading: 'blue', loading: 'blue',
+        quantizing: 'blue', saving: 'blue',
+    };
+
+    // Localized labels for the statuses the console renders, including the two
+    // states a manager row can be in. A status with no key is shown verbatim.
+    const STATUS_LABELS = {
+        loaded: 'models.status.loaded',
+        loading: 'models.status.loading',
+        unloaded: 'models.status.unloaded',
+        unknown: 'models.status.unknown',
+        pending: 'models.status.pending',
+        downloading: 'models.status.downloading',
+        uploading: 'models.status.uploading',
+        quantizing: 'models.status.quantizing',
+        saving: 'models.status.saving',
+        completed: 'models.status.completed',
+        failed: 'models.status.failed',
+        cancelled: 'models.status.cancelled',
+    };
+
+    // Benchmark presets. A preset is a complete map of benchmark -> samples,
+    // where 0 means "the benchmark's own full dataset", so applying one always
+    // leaves the form with a valid, non-empty selection. `quick` is a small
+    // but meaningful read (one knowledge, commonsense and math benchmark, 100
+    // questions each); `standard` is the console's default selection; `full` is
+    // built from the catalogue so a new benchmark joins it automatically.
+    const ACC_PRESETS = {
+        quick: { mmlu: 100, arc_challenge: 100, gsm8k: 100 },
+        standard: { mmlu: 1000, truthfulqa: 0, humaneval: 0 },
+    };
+    const ACC_PRESET_NAMES = ['quick', 'standard', 'full'];
 
     function dashboard() {
         // GridStack instance and helpers stay outside the reactive Alpine state.
@@ -121,6 +216,14 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
+
+            // Settings rail: the section list is rendered into the document by
+            // the template (so its titles come from the catalogue) and read
+            // back here; `settingsSections` is the rail's contents.
+            settingsSections: [],
+            settingsActiveSection: null,
+            settingsCopiedAnchor: null,
+            _settingsScrollHandler: null,
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -378,6 +481,9 @@
             dashSaveError: '',
             dashPlacedIds: [],
             dashEditAvailable: true,
+            // False until the first /api/stats payload (or its failure) lands:
+            // the Status tab shows skeletons until then instead of zeroes.
+            statsLoaded: false,
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
@@ -385,8 +491,14 @@
             showClearHotCacheConfirm: false,
             _statsRefreshTimer: null,
 
-            // Log viewer state
-            logContent: '',
+            // Log viewer state. Everything structural (columns, aggregation,
+            // memory-guard numbers) is derived from the raw text by
+            // static/js/logs.js; only the window and the selection live here.
+            logRows: [],             // aggregated, level-filtered rows
+            logSelectedKey: '',      // row whose detail panel is open
+            logScrollTop: 0,
+            logViewportHeight: 600,
+            logRowHeight: 30,        // measured from the first rendered row
             logLines: 500,
             logRefreshInterval: 5,  // seconds, 0 = disabled
             logAutoRefresh: false,
@@ -399,6 +511,9 @@
             logLastUpdated: '',
             logMinLevel: 'TRACE',
             _logRefreshTimer: null,
+            _logRaw: '',             // the previous poll's window, for the diff
+            _logPending: '',         // text of the record still being written
+            _logRecords: [],         // parsed records, oldest first
 
             // Models sub-tab state
             modelsTab: 'manager',
@@ -447,12 +562,14 @@
             hfSearchLoading: false,
             hfSearchLoaded: false,
             hfSearchDebounceTimer: null,
-            // Search filters
+            // Search filters. The two parameter and two size filters are range
+            // sliders, so their state is a number whose 0 position means "off"
+            // (a slider has no empty value the way a text field does).
             hfSearchFiltersOpen: false,
-            hfSearchMinParams: '',
-            hfSearchMaxParams: '',
-            hfSearchMaxSize: '',
-            hfSearchMinSize: '',
+            hfSearchMinParams: 0,
+            hfSearchMaxParams: 0,
+            hfSearchMaxSize: 0,
+            hfSearchMinSize: 0,
             // Table sort state for Browse Models
             hfTableSort: 'downloads',
             hfTableSortDir: 'desc',
@@ -598,6 +715,10 @@
             benchTab: 'throughput',
             benchDropdown: false,
 
+            // Destructive-run confirmation: which benchmark run is waiting for
+            // the alert ('throughput' | 'accuracy' | 'context'), or null.
+            benchConfirm: null,
+
             // Context benchmark state
             ctxBenchModelId: '',
             ctxBenchTarget: 131072,
@@ -614,7 +735,9 @@
             accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
             accBenchmarkGroups: [
                 {
+                    key: 'knowledge',
                     name: window.t('acc_bench.benchmarks.group_knowledge'),
+                    desc: window.t('acc_bench.benchmarks.group_knowledge_desc'),
                     benchmarks: [
                         { key: 'mmlu', label: 'MMLU', desc: window.t('acc_bench.benchmarks.mmlu_desc'), fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'mmlu_pro', label: 'MMLU-Pro', desc: window.t('acc_bench.benchmarks.mmlu_pro_desc'), fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
@@ -624,7 +747,9 @@
                     ],
                 },
                 {
+                    key: 'commonsense',
                     name: window.t('acc_bench.benchmarks.group_commonsense'),
+                    desc: window.t('acc_bench.benchmarks.group_commonsense_desc'),
                     benchmarks: [
                         { key: 'hellaswag', label: 'HellaSwag', desc: window.t('acc_bench.benchmarks.hellaswag_desc'), fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'arc_challenge', label: 'ARC-C', desc: window.t('acc_bench.benchmarks.arc_desc'), fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
@@ -633,14 +758,18 @@
                     ],
                 },
                 {
+                    key: 'math',
                     name: window.t('acc_bench.benchmarks.group_math'),
+                    desc: window.t('acc_bench.benchmarks.group_math_desc'),
                     benchmarks: [
                         { key: 'gsm8k', label: 'GSM8K', desc: window.t('acc_bench.benchmarks.gsm8k_desc'), fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
                         { key: 'mathqa', label: 'MathQA', desc: window.t('acc_bench.benchmarks.mathqa_desc'), fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
                     ],
                 },
                 {
+                    key: 'coding',
                     name: window.t('acc_bench.benchmarks.group_coding'),
+                    desc: window.t('acc_bench.benchmarks.group_coding_desc'),
                     benchmarks: [
                         { key: 'humaneval', label: 'HumanEval', desc: window.t('acc_bench.benchmarks.humaneval_desc'), fullSize: 164, sizes: [30, 50, 100] },
                         { key: 'mbpp', label: 'MBPP', desc: window.t('acc_bench.benchmarks.mbpp_desc'), fullSize: 500, sizes: [30, 50, 100, 200, 300] },
@@ -648,7 +777,9 @@
                     ],
                 },
                 {
+                    key: 'safety',
                     name: window.t('acc_bench.benchmarks.group_safety'),
+                    desc: window.t('acc_bench.benchmarks.group_safety_desc'),
                     benchmarks: [
                         { key: 'bbq', label: 'BBQ', desc: window.t('acc_bench.benchmarks.bbq_desc'), fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'safetybench', label: 'SafetyBench', desc: window.t('acc_bench.benchmarks.safetybench_desc'), fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
@@ -700,6 +831,25 @@
                     this.handleMainTabChange(value);
                 });
 
+                // The log window is measured from the rendered rows, so a
+                // viewport resize (or the readability font floor) re-measures it.
+                window.addEventListener('resize', () => {
+                    this.measureLogViewport();
+                    this.measureLogRowHeight();
+                });
+
+                // The rail's section list comes from the template; load it once.
+                this.settingsInitSections();
+
+                // Every modal in the console is a flag plus a <dialog>: keep the
+                // two in step here instead of relying on each template.
+                ['showHfMirrorModal', 'showModelSettingsModal', 'showGlobalResetNotice',
+                 'benchConfirm'].forEach((flag) => {
+                    this.$watch(flag, () => this.$nextTick(() => this.syncAllDialogs()));
+                });
+                this.$watch('settingsApply.open', () => this.$nextTick(() => this.syncAllDialogs()));
+                this.$watch('activeTab', () => this.settingsInitSections());
+
                 this.$watch('globalSettings.server.host', (value) => {
                     if (!this.isLoopbackBindHost(value)) {
                         this.globalSettings.auth.skip_api_key_verification = false;
@@ -745,6 +895,41 @@
 
                 window.addEventListener('focus', () => this.refreshOpenModelSettings());
 
+                this.registerPaletteCommands();
+
+                // The four notices the console used to render inline (restart
+                // banner, settings save error, log error) now arrive as toasts:
+                // one watcher per state instead of one banner per screen.
+                this.$watch('restartServer.status', (status) => {
+                    if (status === 'idle' && !this.restartServer.message) return;
+                    this.notify({
+                        id: 'server-restart',
+                        tone: RESTART_TONES[status] || 'neutral',
+                        title: window.t('toast.server_restart'),
+                        message: this.restartServer.message,
+                    });
+                });
+
+                this.$watch('saveError', (value) => {
+                    if (!value) return;
+                    this.notify({
+                        id: 'settings-save',
+                        tone: 'red',
+                        title: window.t('toast.settings_save_failed'),
+                        message: value,
+                    });
+                });
+
+                this.$watch('logError', (value) => {
+                    if (!value) return;
+                    this.notify({
+                        id: 'log-load',
+                        tone: 'red',
+                        title: window.t('toast.log_load_failed'),
+                        message: value,
+                    });
+                });
+
                 // Pause stats polling when tab is hidden to reduce server load
                 document.addEventListener('visibilitychange', () => {
                     if (document.hidden) {
@@ -754,6 +939,117 @@
                         this.startStatsRefresh();
                     }
                 });
+
+                // A deep link into a settings section has to win over the tab
+                // the URL parameters would otherwise restore.
+                if (SETTINGS_SECTION_ID.test(window.location.hash.slice(1))) {
+                    this.settingsScrollToHash(window.location.hash.slice(1));
+                    }
+                },
+
+            // === Settings rail =============================================
+
+            /** Read the template's section list into the rail's own state. */
+            settingsInitSections() {
+                const byTab = settingsSectionsByTab();
+                this.settingsSections = byTab[this.activeTab] || [];
+                const first = this.settingsSections[0];
+                this.settingsActiveSection = first ? first.id : null;
+            },
+
+            settingsScrollToSection(sectionId) {
+                const target = document.getElementById(sectionId);
+                if (!target) return;
+                // Never scroll for a tab the reader is not looking at.
+                const panel = document.getElementById('panel-settings');
+                if (panel && !panel.getClientRects().length) return;
+                if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                    target.scrollIntoView({ block: 'start' });
+                } else {
+                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            },
+
+            /** Follow a rail click: mark it, scroll, and keep it linkable. */
+            settingsGoToSection(sectionId) {
+                this.settingsActiveSection = sectionId;
+                this.$nextTick(() => this.settingsScrollToSection(sectionId));
+                window.history.replaceState({}, '', '#' + sectionId);
+            },
+
+            /**
+             * Deep link support: a `#settings-<section>` hash selects the
+             * settings tab the section lives on and scrolls to it.
+             */
+            settingsScrollToHash(hash) {
+                const sectionId = String(hash || '').replace(/^#/, '');
+                if (!SETTINGS_SECTION_ID.test(sectionId)) return false;
+                const byTab = settingsSectionsByTab();
+                let tab = 'global';
+                for (const [name, sections] of Object.entries(byTab)) {
+                    if (sections.some((section) => section.id === sectionId)) tab = name;
+                }
+                this.mainTab = 'settings';
+                this.activeTab = tab;
+                this.settingsInitSections();
+                this.settingsActiveSection = sectionId;
+                this.$nextTick(() => this.settingsScrollToSection(sectionId));
+                return true;
+            },
+
+            /** Follow the page while it scrolls: the rail says where you are. */
+            settingsWatchScroll() {
+                this.$nextTick(() => {
+                    const panel = document.getElementById('panel-settings');
+                    if (!panel) return;
+                    if (this._settingsScrollHandler) {
+                        window.removeEventListener('scroll', this._settingsScrollHandler);
+                        window.removeEventListener('resize', this._settingsScrollHandler);
+                    }
+                    const sync = () => {
+                        // The whole page scrolls; only the settings panel's own
+                        // sections take part, and only while it is the visible tab.
+                        if (!panel.getClientRects().length) return;
+                        const offsets = [];
+                        const sections = [];
+                        for (const section of this.settingsSections) {
+                            const el = document.getElementById(section.id);
+                            if (!el || !el.getClientRects().length) continue;
+                            // Viewport-relative tops, compared against a zero
+                            // scroll position: one frame per section, whatever
+                            // the page's own scroll offset is.
+                            offsets.push(el.getBoundingClientRect().top);
+                            sections.push(section);
+                        }
+                        if (!sections.length) return;
+                        // The line is the bottom of the sticky sub-tab row: a
+                        // section clicked in the rail lands there, so the rail
+                        // marks what the reader asked for, not the one above it.
+                        const clearance = window.OMLXSettingsNav.activeClearance(
+                            document.querySelector('#panel-settings .page-tabs'),
+                            document.getElementById(sections[0].id)
+                        );
+                        this.settingsActiveSection = window.OMLXSettingsNav.activeSection(
+                            offsets, 0, sections, clearance
+                        );
+                    };
+                    this._settingsScrollHandler = sync;
+                    window.addEventListener('scroll', sync, { passive: true });
+                    window.addEventListener('resize', sync);
+                    sync();
+                });
+            },
+
+            /** Copy the deep link to a section, like the model-name button. */
+            settingsCopyAnchor(sectionId) {
+                const link = window.OMLXSettingsNav.sectionAnchor(
+                    window.location.origin, window.location.pathname, sectionId
+                );
+                this.copyToClipboard(link);
+                this.settingsCopiedAnchor = sectionId;
+                setTimeout(() => {
+                    if (this.settingsCopiedAnchor === sectionId) this.settingsCopiedAnchor = null;
+                }, 2000);
             },
 
             async handleMainTabChange(value) {
@@ -765,6 +1061,12 @@
                     this.stopStatsRefresh();
                 }
                 if (value === 'logs') {
+                    // The viewer's window needs the panel's real height, and the
+                    // panel is hidden until this tick: measure after the paint.
+                    this.$nextTick(() => {
+                        this.measureLogViewport();
+                        this.measureLogRowHeight();
+                    });
                     await this.loadLogs();
                     this.startLogRefresh();
                 } else {
@@ -805,6 +1107,10 @@
             },
 
             applyTabStateFromUrl() {
+                // A settings section anchor (`#settings-server`) is the most
+                // specific address there is, so it decides the tab pair.
+                if (this.settingsScrollToHash(window.location.hash)) return;
+
                 const params = new URLSearchParams(window.location.search);
                 const mainTab = params.get('tab');
                 const settingsTab = params.get('settingsTab');
@@ -882,13 +1188,82 @@
                 }
             },
 
+            /* --- Transient feedback and the command palette --- */
+
+            // Every notice the dashboard raises goes through the one toast
+            // implementation in static/js/ui.js; a page-local banner would be a
+            // second, differently-behaving report of the same event.
+            notify(options) {
+                if (typeof window.omlxToast === 'function') window.omlxToast(options);
+            },
+
+            // The palette asks for the commands when it opens, so `dashPlaced`
+            // and the restart state are always the current ones.
+            registerPaletteCommands() {
+                if (!window.omlxPalette || this._paletteRegistered) return;
+                this._paletteRegistered = true;
+                window.omlxPalette.register(() => this.paletteCommands());
+            },
+
+            paletteCommands() {
+                const commands = [];
+                DASHBOARD_TAB_ORDER.forEach(([tab, key]) => {
+                    if (!DASHBOARD_MAIN_TABS.has(tab)) return;
+                    if (tab === 'cluster' && !this.globalSettings.server.distributed_inference_active) return;
+                    commands.push({
+                        id: `tab-${tab}`,
+                        label: window.t(key),
+                        group: window.t('palette.group_tabs'),
+                        run: () => this.setMainTab(tab),
+                    });
+                });
+                const layout = this._dashLayoutLib();
+                (layout ? layout.BLOCK_IDS : []).forEach(id => {
+                    commands.push({
+                        id: `block-${id}`,
+                        label: window.t(`status.layout.block.${id}`),
+                        group: window.t('palette.group_blocks'),
+                        hint: this.dashPlaced(id) ? '' : window.t('palette.block_not_placed'),
+                        run: () => this.paletteJumpToBlock(id),
+                    });
+                });
+                DASHBOARD_SETTINGS_ORDER.forEach(([tab, key]) => {
+                    if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
+                    commands.push({
+                        id: `settings-${tab}`,
+                        label: window.t(key),
+                        group: window.t('palette.group_settings'),
+                        run: () => this.setSettingsTab(tab),
+                    });
+                });
+                return commands;
+            },
+
+            // "Jump to a block" lands on the block: the Status tab first, the
+            // layout editor as well when the block is not on the grid, then a
+            // scroll and a glow so the target is obvious.
+            paletteJumpToBlock(id) {
+                this.setMainTab('status');
+                if (!this.dashPlaced(id) && this.dashEditAvailable) this.startDashboardEdit();
+                this.$nextTick(() => {
+                    const element = this.dashPlaced(id)
+                        ? this._dashBlockEl(id)
+                        : document.querySelector(`.dash-tray-pill[data-block="${id}"]`);
+                    if (!element || typeof element.scrollIntoView !== 'function') return;
+                    const reduced = typeof window.omlxPrefersReducedMotion === 'function'
+                        && window.omlxPrefersReducedMotion();
+                    element.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
+                    element.classList.add('jump-hit');
+                    setTimeout(() => element.classList.remove('jump-hit'), 1200);
+                });
+            },
+
             setSettingsTab(tab) {
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
                 this.mainTab = 'settings';
                 this.syncTabStateToUrl();
             },
-
             setModelsTab(tab) {
                 if (!DASHBOARD_MODELS_TABS.has(tab)) return;
                 this.modelsTab = tab;
@@ -901,6 +1276,31 @@
                     if (!this.uploadOqModelsLoaded) this.loadUploadOqModels();
                     this.loadUploadTasks();
                 }
+            },
+
+            // === Dialogs ===
+            // `<dialog>` + x-effect did not work: the dialog element sat outside
+            // Alpine's initialised tree (it never received a scope), so
+            // showModal() was never called and the buttons did nothing. The flags
+            // stay the single source of truth; this pushes them onto the element,
+            // which is what the platform actually needs.
+            syncDialog(id, open) {
+                const dialog = document.getElementById(id);
+                if (!dialog) return;
+                try {
+                    if (open && !dialog.open) dialog.showModal();
+                    else if (!open && dialog.open) dialog.close();
+                } catch (err) {
+                    console.error('dialog ' + id + ' failed:', err);
+                }
+            },
+
+            syncAllDialogs() {
+                this.syncDialog('hf-mirror-dialog', this.showHfMirrorModal);
+                this.syncDialog('model-settings-dialog', this.showModelSettingsModal);
+                this.syncDialog('settings-apply-dialog', Boolean(this.settingsApply && this.settingsApply.open));
+                this.syncDialog('global-reset-dialog', this.showGlobalResetNotice);
+                this.syncDialog('bench-confirm-dialog', Boolean(this.benchConfirm));
             },
 
            async checkForUpdate() {
@@ -1027,6 +1427,7 @@
                         this.dashLayout = layoutLib
                             ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
                             : null;
+                        this.applyPageMeasure(this.dashLayout?.width);
                         if (dashGrid && !this.dashEditing) this.applyDashboardLayout(this.dashLayout);
                         if (
                             !this.globalSettings.server.distributed_inference_active
@@ -2368,7 +2769,7 @@
                     && recommendation.processing_tps !== undefined;
                 const speed = Number(recommendation.processing_tps || 0).toFixed(1);
                 const speedSuffix = measured
-                    ? ` · ${speed} prompt tok/s`
+                    ? ` · ${speed} prompt Tok/s`
                     : '';
                 if (!recommendation.enabled) {
                     return window.t('js.ane_tune.winner_gpu_only') + speedSuffix;
@@ -2649,6 +3050,10 @@
                 if (model) await this.openModelSettings(model, true);
             },
             async openModelSettings(model, preservingEdits = false) {
+                // Open first, load second. The sheet used to appear only after
+                // the profile and template fetches resolved, so any failure in
+                // those (a 404, a model without settings) left the button dead.
+                if (!preservingEdits) this.showModelSettingsModal = true;
                 const baseline = JSON.stringify(this.modelSettings);
                 const seq = ++this._applySeq;
                 this.profileError = '';
@@ -2673,10 +3078,22 @@
                             this.profileScope = saved;
                         }
                     } catch (e) {}
-                    await Promise.all([
+                    try {
+                await Promise.all([
                         this.loadProfilesForModel(model.id),
                         this.loadTemplates(),
-                    ]);
+    ]);
+                    } catch (err) {
+                        // The sheet is already open; say what failed instead of
+                        // leaving an empty panel behind a dead button.
+                        console.error('Failed to load model profiles/templates:', err);
+                        this.notify({
+                            id: 'model-profiles',
+                            tone: 'red',
+                            title: window.t('toast.settings_save_failed'),
+                            message: String(err && err.message ? err.message : err),
+                        });
+                    }
                     if (this.reasoningParsers.length === 0) {
                         try {
                             const resp = await fetch('/admin/api/grammar/parsers');
@@ -3242,8 +3659,8 @@
 
             settingsApplyStats(item) {
                 if (!item || item.pp_tps == null) return '';
-                const parts = [`PP ${Number(item.pp_tps).toFixed(1)} tok/s`];
-                if (item.tg_tps != null) parts.push(`TG ${Number(item.tg_tps).toFixed(1)} tok/s`);
+                const parts = [`PP ${Number(item.pp_tps).toFixed(1)} Tok/s`];
+                if (item.tg_tps != null) parts.push(`TG ${Number(item.tg_tps).toFixed(1)} Tok/s`);
                 if (item.memory_gb != null) parts.push(`${item.memory_gb} GB`);
                 if (item.quantization) parts.push(item.quantization);
                 if (item.omlx_version) parts.push(`oMLX ${item.omlx_version}`);
@@ -3393,6 +3810,18 @@
                     return window.t('modal.model_settings.ttl_global_fallback').replace('{seconds}', globalTtl);
                 }
                 return window.t('modal.model_settings.ttl_no_ttl');
+            },
+
+            // A sampling field left empty inherits the global value, so the
+            // placeholder is that value — not the word "default" and not a
+            // number baked into the template. min_p and presence_penalty have no
+            // global counterpart in the settings payload and say so instead.
+            samplingInherited(key) {
+                const value = this.globalSettings.sampling?.[key];
+                if (value === null || value === undefined || value === '') {
+                    return window.t('modal.model_settings.inherit_global_value');
+                }
+                return String(value);
             },
 
             async loadServerInfo() {
@@ -3585,10 +4014,17 @@
             _dashLayoutLib() {
                 return typeof DashboardLayout !== 'undefined' ? DashboardLayout : null;
             },
-            get dashboardWidthClass() {
+            // One measure for the whole console. Every page's frame reads
+            // --container-wide from :root, so the width chosen in the layout
+            // toolbar is the width Settings, Logs, Models and Bench get too, and
+            // it survives switching tabs.
+            applyPageMeasure(width) {
                 const lib = this._dashLayoutLib();
-                const width = this.dashEditing && this.dashDraft ? this.dashDraft.width : this.dashLayout?.width;
-                return lib ? lib.widthClass(width) : 'max-w-7xl';
+                if (!lib || typeof document === 'undefined') return;
+                document.documentElement.style.setProperty('--container-wide', lib.widthMeasure(width));
+            },
+            get dashboardWidth() {
+                return this.dashEditing && this.dashDraft ? this.dashDraft.width : this.dashLayout?.width;
             },
             get dashWidthOptions() {
                 const lib = this._dashLayoutLib();
@@ -3687,6 +4123,7 @@
                 const lib = this._dashLayoutLib();
                 if (!dashGrid || !lib) return;
                 layout = lib.normalizeLayout(layout);
+                this.applyPageMeasure(layout.width);
                 // No transition while rebuilding: the first content measurement of a
                 // freshly placed item must see its final box, not an animating one.
                 dashGrid.setAnimation(false);
@@ -3766,6 +4203,9 @@
                 const lib = this._dashLayoutLib();
                 if (!this.dashEditing || !lib || !lib.WIDTH_IDS.includes(width)) return;
                 this.dashDraft.width = width;
+                // The frame is wider before the layout is saved, so the preview
+                // shows the width the console will actually use.
+                this.applyPageMeasure(width);
                 this._dashAfterLayoutChange();
             },
             async saveDashboardLayout() {
@@ -3961,6 +4401,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.stats = { ...this.stats, ...data };
+                        this.statsLoaded = true;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -3982,6 +4423,9 @@
                     }
                 } catch (err) {
                     console.error('Failed to load stats:', err);
+                    // The attempt is over either way: a skeleton that outlives
+                    // the request would be a lie about a server that is down.
+                    this.statsLoaded = true;
                 }
             },
 
@@ -4046,12 +4490,6 @@
                 }
             },
 
-            formatNumber(num) {
-                if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
-                if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
-                return num.toLocaleString();
-            },
-
             cacheObsCumulative(stats, selectedModel) {
                 const entries = stats.runtime_cache?.models || [];
                 if (entries.length === 0) return {};
@@ -4102,12 +4540,6 @@
                 return Math.max(0, Math.round(bytes)) + ' B';
             },
 
-            formatTokenCount(n) {
-                if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-                if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
-                return String(n);
-            },
-
             formatDFlashSessionStats(totals) {
                 if (!totals || totals.requests <= 1) return '';
 
@@ -4153,7 +4585,7 @@
                 const parts = [];
                 if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
                 if (activity.document_count != null) parts.push(activity.document_count + ' docs');
-                if (activity.token_count != null) parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                if (activity.token_count != null) parts.push(window.formatCount(activity.token_count) + ' Tok');
                 if (activity.text_length != null) parts.push(activity.text_length + ' chars');
                 if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
                 if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
@@ -4192,21 +4624,112 @@
                 return Math.min(100, (mp.soft_bytes / mp.hard_bytes) * 100);
             },
 
-            get activeModelsPressureBarColor() {
-                const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return '#ef4444';
-                if (pct >= 80) return '#f97316';
-                if (pct >= 70) return '#f59e0b';
-                if (pct >= 60) return '#facc15';
-                return '#22c55e';
+            /* One gauge, three bands, measured against the hard limit — the
+               number the enforcer actually refuses a load at: green under 70 %,
+               amber to 90 %, red from 90 %, which is the three-state ramp a
+               memory gauge is read with (Apple's own memory-pressure gauge and
+               Grafana's thresholds use the same shape). The colours live in the
+               stylesheet (`--sys-green` / `--sys-orange` / `--sys-red`), so the
+               pressure bar, the watermark bar and the marks cannot drift apart. */
+            memoryTone(percent) {
+                if (percent >= 90) return 'meter--over';
+                if (percent >= 70) return 'meter--warn';
+                return 'meter--ok';
             },
 
             get activeModelsPressureBarStyle() {
-                return `width: ${this.activeModelsPressurePercent}%; height: 100%; display: block; background-color: ${this.activeModelsPressureBarColor};`;
+                return `width: ${this.activeModelsPressurePercent}%;`;
             },
 
+            get activeModelsTone() {
+                return this.memoryTone(this.activeModelsPressurePercent);
+            },
+
+            // The soft guard: a dashed mark, so it is never mistaken for the
+            // hard ceiling at the end of the same track.
             get activeModelsSoftMarkerStyle() {
-                return `left: ${this.activeModelsSoftPercent}%; width: 1px; background-color: rgba(64, 64, 64, 0.6);`;
+                return `left: ${this.activeModelsSoftPercent}%;`;
+            },
+
+            get watermarkTone() {
+                return this.memoryTone(this.memoryWatermark.actualOfLimit);
+            },
+
+            /* --- Status header / KPI cards / memory watermark --- */
+
+            // One field of the payload the KPI cards show, read through the
+            // scope toggle so the cards always agree.
+            kpiValue(field) {
+                const snapshot = this.statsScope === 'alltime' ? this.alltimeStats : this.stats;
+                return snapshot ? snapshot[field] : undefined;
+            },
+
+            // One track, scaled to the memory the machine has: what is in use, the
+            // estimate behind it, the guarded zone between the soft guard and the
+            // hard limit, and the part above the hard limit no model may use.
+            // `actualOfLimit` is the only ratio the colour reads.
+            get memoryWatermark() {
+                const pressure = this.stats?.active_models?.memory_pressure;
+                const models = this.stats?.active_models?.models || [];
+                const hard = pressure?.hard_bytes || this.stats?.active_models?.model_memory_max || 0;
+                const actual = pressure?.enabled
+                    ? pressure.current_bytes
+                    : this.stats?.active_models?.model_memory_used || 0;
+                const soft = pressure?.soft_bytes || 0;
+                const estimated = models.reduce((total, model) => total + (model.estimated_size || 0), 0);
+                const machine = this.stats?.system?.total_memory_bytes || 0;
+                const scale = Math.max(machine, hard, 1);
+                const at = (bytes) => Math.min(100, (bytes / scale) * 100);
+                return {
+                    enabled: Boolean(pressure?.enabled) && hard > 0,
+                    hard,
+                    actual,
+                    soft,
+                    estimated,
+                    actualPercent: at(actual),
+                    estimatedPercent: at(estimated),
+                    softPercent: soft ? at(soft) : 0,
+                    hardPercent: at(hard),
+                    guardWidth: soft && hard > soft ? at(hard) - at(soft) : 0,
+                    unavailableWidth: Math.max(0, 100 - at(hard)),
+                    actualOfLimit: hard ? (actual / hard) * 100 : 0,
+                };
+            },
+
+            watermarkBarStyle(percent) {
+                return `width: ${percent}%;`;
+            },
+
+            watermarkBarStyleAt(startPercent, widthPercent) {
+                return `left: ${startPercent}%; width: ${widthPercent}%;`;
+            },
+
+            watermarkMarkerStyle(percent) {
+                return `left: ${percent}%;`;
+            },
+
+            formatUptime(seconds) {
+                if (seconds == null || !isFinite(seconds)) return '—';
+                const total = Math.floor(seconds);
+                const days = Math.floor(total / 86400);
+                const hours = Math.floor((total % 86400) / 3600);
+                const minutes = Math.floor((total % 3600) / 60);
+                if (days > 0) return `${days}d ${hours}h`;
+                if (hours > 0) return `${hours}h ${minutes}m`;
+                return `${minutes}m`;
+            },
+
+            async unloadAllModels() {
+                const models = this.stats?.active_models?.models || [];
+                const loaded = models.filter(model => !model.is_loading);
+                if (!loaded.length) return;
+                if (!window.confirm(window.t('status.header.unload_all_confirm')
+                    .replace('{count}', String(loaded.length)))) {
+                    return;
+                }
+                for (const model of loaded) {
+                    await this.unloadModel(model.id);
+                }
             },
 
             activeModelsPressureLabel() {
@@ -4362,6 +4885,35 @@
                 const maxTokens = this.parseAccuracyMaxTokens();
                 if (maxTokens !== null) body.max_tokens_override = maxTokens;
                 return body;
+            },
+
+            // ===== Destructive-run confirmation =====
+
+            // Starting a benchmark loads the selected model for exclusive use:
+            // the server unloads every resident model first and interrupts
+            // in-flight requests. That is confirmed through the shared <dialog>
+            // alert. A run against an external endpoint never touches the local
+            // engine, so it keeps the direct path.
+            requestBenchConfirm(kind) {
+                if (kind === 'accuracy' && this.accExternalEnabled) return this.addToAccQueue();
+                if (kind === 'throughput' && this.benchExternalEnabled) return this.startBenchmark();
+                this.benchConfirm = kind;
+            },
+
+            benchConfirmBody() {
+                return window.t('bench.confirm.body.' + this.benchConfirm);
+            },
+
+            confirmBenchRun() {
+                const kind = this.benchConfirm;
+                this.benchConfirm = null;
+                if (kind === 'throughput') this.startBenchmark();
+                else if (kind === 'accuracy') this.addToAccQueue();
+                else if (kind === 'context') this.startContextBenchmark();
+            },
+
+            cancelBenchConfirm() {
+                this.benchConfirm = null;
             },
 
             // Benchmark functions
@@ -4540,14 +5092,36 @@
                     }
                 };
 
-                es.onerror = () => {
-                    if (this.benchRunning) {
-                        this.benchError = window.t('js.error.benchmark_connection_lost');
-                        this.benchRunning = false;
-                        this.benchProgress = null;
-                    }
+                es.onerror = async () => {
+                    // The stream also ends when the run finished or the server
+                    // restarted. Ask for the results before calling it a
+                    // connection loss, and keep the run id in the message.
                     es.close();
                     this.benchEventSource = null;
+                    if (!this.benchRunning) return;
+                    let recovered = false;
+                    if (benchId) {
+                        try {
+                            const res = await fetch(`/admin/api/bench/${benchId}/results`);
+                            if (res.ok) {
+                                const payload = await res.json();
+                                if (payload && (payload.single || payload.batch)) {
+                                    this.benchSingleResults = payload.single || this.benchSingleResults;
+                                    this.benchBatchResults = payload.batch || this.benchBatchResults;
+                                    recovered = true;
+                                }
+                            }
+                        } catch (err) {
+                            /* fall through to the error path */
+                        }
+                    }
+                        this.benchRunning = false;
+                this.benchProgress = null;
+                    if (!recovered) {
+                        this.benchError = window.t('js.error.benchmark_connection_lost')
+                            + (benchId ? ` (${benchId})` : '');
+                    }
+                    this.loadModels();
                 };
             },
 
@@ -4710,6 +5284,13 @@
                 return filtered.length ? filtered : [all[0]];
             },
 
+            // The same presets as a {value, label} list for the segmented
+            // control: the list cannot be built server-side because it depends
+            // on the selected model's native context length.
+            ctxBenchTargetChoices() {
+                return this.ctxBenchTargetOptions().map(t => ({ value: t, label: (t / 1024) + 'k' }));
+            },
+
             // Keep the selected target inside the model's reachable presets.
             ctxBenchClampTarget() {
                 const options = this.ctxBenchTargetOptions();
@@ -4856,10 +5437,10 @@
                             rpad(this.benchSingleTestLabel(r), 32),
                             pad(this.benchFmtNum(r.ttft_ms, 1), 10),
                             pad(this.benchFmtNum(r.tpot_ms, 2), 10),
-                            pad(this.benchFmtNum(r.processing_tps, 1, ' tok/s'), 12),
-                            pad(this.benchFmtNum(r.gen_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(r.processing_tps, 1, ' Tok/s'), 12),
+                            pad(this.benchFmtNum(r.gen_tps, 1, ' Tok/s'), 12),
                             pad(r.e2e_latency_s.toFixed(3), 10),
-                            pad(r.total_throughput.toFixed(1) + ' tok/s', 12),
+                            pad(r.total_throughput.toFixed(1) + ' Tok/s', 12),
                             pad(this.benchFormatMemory(r.peak_memory_bytes), 10),
                         ];
                         lines.push(row.join('  '));
@@ -4879,10 +5460,10 @@
                     if (baseline) {
                         const row = [
                             rpad('1x', 8),
-                            pad(this.benchFmtNum(baseline.gen_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(baseline.gen_tps, 1, ' Tok/s'), 12),
                             pad('1.00x', 8),
-                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
-                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' Tok/s'), 12),
+                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' Tok/s'), 12),
                             pad(this.benchFmtNum(baseline.ttft_ms, 1), 10),
                             pad(baseline.e2e_latency_s.toFixed(3), 10),
                         ];
@@ -4892,10 +5473,10 @@
                         const speedup = this.benchGetSpeedup(r);
                         const row = [
                             rpad(r.batch_size + 'x', 8),
-                            pad(this.benchFmtNum(r.tg_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(r.tg_tps, 1, ' Tok/s'), 12),
                             pad(speedup !== null ? speedup.toFixed(2) + 'x' : window.t('bench.results.text_export.not_available'), 8),
-                            pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
-                            pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(r.pp_tps, 1, ' Tok/s'), 12),
+                            pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' Tok/s'), 12),
                             pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
                             pad(r.e2e_latency_s.toFixed(3), 10),
                         ];
@@ -5118,6 +5699,80 @@
                 } catch (err) {
                     console.error('Failed to load queue status:', err);
                 }
+            },
+
+            // ===== Accuracy benchmark selection =====
+
+            // The selection a preset stands for, expanded over the catalogue:
+            // every benchmark gets an entry so the form can never end up with
+            // nothing ticked, and benchmarks the preset does not mention keep
+            // whatever sample size they already had.
+            accPresetSelection(preset) {
+                let wanted = ACC_PRESETS[preset];
+                if (preset === 'full') {
+                    wanted = Object.fromEntries(this.accBenchmarkGroups.flatMap(
+                        group => group.benchmarks.map(b => [b.key, 0])
+                    ));
+                }
+                if (!wanted) wanted = ACC_PRESETS.standard;
+
+                const benchmarks = {};
+                const sampleSizes = {};
+                for (const group of this.accBenchmarkGroups) {
+                    for (const b of group.benchmarks) {
+                        const sampled = wanted[b.key];
+                        benchmarks[b.key] = sampled !== undefined;
+                        sampleSizes[b.key] = sampled !== undefined
+                            ? sampled
+                            : (this.accSampleSizes?.[b.key] ?? b.sizes[0]);
+                    }
+                }
+                return { benchmarks, sampleSizes };
+            },
+
+            applyAccPreset(preset) {
+                const { benchmarks, sampleSizes } = this.accPresetSelection(preset);
+                this.accBenchmarks = benchmarks;
+                this.accSampleSizes = sampleSizes;
+                this.accError = '';
+            },
+
+            // Which preset the current selection is, or 'custom' when the user
+            // has hand-picked something no preset describes.
+            get accActivePreset() {
+                for (const name of ACC_PRESET_NAMES) {
+                    const { benchmarks, sampleSizes } = this.accPresetSelection(name);
+                    const matches = Object.keys(benchmarks).every(key => (
+                        !!this.accBenchmarks[key] === benchmarks[key]
+                        && Number(this.accSampleSizes[key]) === Number(sampleSizes[key])
+                    ));
+                    if (matches) return name;
+                }
+                return 'custom';
+            },
+
+            accGroupSelected(group) {
+                return group.benchmarks.filter(b => this.accBenchmarks[b.key]);
+            },
+
+            // Selected samples in a group; 0 samples means the full dataset.
+            accGroupSamples(group) {
+                return this.accGroupSelected(group).reduce(
+                    (total, b) => total + (Number(this.accSampleSizes[b.key]) || b.fullSize), 0
+                );
+            },
+
+            // The group-level "Full" option: everything in this group, all of it.
+            applyGroupFull(group) {
+                const benchmarks = { ...this.accBenchmarks };
+                const sampleSizes = { ...this.accSampleSizes };
+                for (const b of group.benchmarks) {
+                    benchmarks[b.key] = true;
+                    sampleSizes[b.key] = 0;
+                }
+                this.accBenchmarks = benchmarks;
+                this.accSampleSizes = sampleSizes;
+                this.accError = '';
             },
 
             async addToAccQueue() {
@@ -5606,29 +6261,239 @@
                 URL.revokeObjectURL(url);
             },
 
-            // Log viewer functions
-            filteredLogContent() {
-                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
-                const minIdx = LEVELS.indexOf(this.logMinLevel);
-                if (minIdx <= 0) return this.logContent;
-                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
-                let visible = true;
-                return this.logContent.split('\n').filter(line => {
-                    const m = line.match(levelRe);
-                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
-                    return visible;
-                }).join('\n');
+            // === Log viewer ===
+            // Four columns over the raw text, consecutive repeated warnings
+            // collapsed, memory-guard lines parsed into chips with their two
+            // remedies inline, and only the rows near the viewport in the DOM.
+            // The window and the level filter feed static/js/logs.js.
+
+            get logWindow() {
+                return window.OmlxLogs.visibleRange(
+                    this.logRows.length,
+                    this.logScrollTop,
+                    this.logViewportHeight,
+                    this.logRowHeight,
+                    LOG_OVERSCAN
+                );
             },
 
-            levelButtonClass(lvl) {
-                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
-                const idx = LEVELS.indexOf(lvl);
-                const minIdx = LEVELS.indexOf(this.logMinLevel);
-                // Levels at or above the minimum are all shown dark so the
-                // included range is obvious; the selected minimum keeps the ring.
-                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
-                if (idx === minIdx) return 'bg-neutral-900 text-white';
-                return 'bg-neutral-700 text-white';
+            get visibleLogRows() {
+                const frame = this.logWindow;
+                return this.logRows.slice(frame.start, frame.end);
+            },
+
+            get logSelectedRow() {
+                if (!this.logSelectedKey) return null;
+                return this.logRows.find(row => row.key === this.logSelectedKey) || null;
+            },
+
+            // One colour per level, and one level per colour — the same six the
+            // app's LogPalette draws, so a WARNING reads the same in the window
+            // and in the browser. The HIG's rule is the reason CRITICAL is not
+            // another red: a colour that means two things means neither. TRACE
+            // stays the neutral badge; it is the quietest level, not a hue.
+            logLevelTone(level) {
+                const rank = window.OmlxLogs.levelRank(level);
+                if (rank >= 5) return 'badge--purple';  // CRITICAL
+                if (rank === 4) return 'badge--red';    // ERROR
+                if (rank === 3) return 'badge--orange'; // WARNING
+                if (rank === 2) return 'badge--blue';   // INFO
+                if (rank === 1) return 'badge--teal';   // DEBUG
+                return '';                              // TRACE, and anything unknown
+            },
+
+            get logMemoryLabels() {
+                return {
+                    usage: window.t('logs.memory.usage'),
+                    watermark: window.t('logs.memory.watermark'),
+                    ceiling: window.t('logs.memory.ceiling'),
+                    peak: window.t('logs.memory.peak'),
+                };
+            },
+
+            // The occurrences behind the selected row's ×N badge, windowed: a
+            // group can hold tens of thousands of them (see logs.js).
+            get logOccurrences() {
+                return window.OmlxLogs.occurrenceWindow(
+                    this.logSelectedRow ? this.logSelectedRow.occurrences : [],
+                    window.OmlxLogs.OCCURRENCE_WINDOW
+                );
+            },
+
+            logMemoryChips(row) {
+                if (!row || !row.memory) return [];
+                return window.OmlxLogs.memoryGuardChips(row.memory, this.logMemoryLabels);
+            },
+
+            // The two remedies the guard prints, one click away from the line
+            // that suggested them.
+            get logMemoryActions() {
+                return [
+                    { anchor: 'memory-guard', label: window.t('logs.action.raise_tier') },
+                    { anchor: 'context-window', label: window.t('logs.action.reduce_context') },
+                ];
+            },
+
+            // The API returns the last N lines, so one poll appends new lines at
+            // the end *and* drops lines off the front. Matching the overlap by
+            // line (see logs.js) keeps the records and rows we already have, so
+            // the list is patched rather than rebuilt and the scroll position
+            // survives a refresh.
+            ingestLogText(text) {
+                if (!window.OmlxLogs) {
+                    this.logError = window.t('js.error.log_parser_missing');
+                    return;
+                }
+                const merged = window.OmlxLogs.mergeLogText(this._logRaw, text);
+                // A reset renumbers the records, so the previous anchor means
+                // nothing there.
+                const anchor = merged.reset ? null : this.logAnchor();
+                this._logRaw = text;
+                if (merged.reset) {
+                    this.resetLogView();
+                } else if (merged.dropped > 0) {
+                    this.dropLeadingLogRecords(merged.dropped);
+                }
+                if (merged.appended) {
+                    this._logPending += merged.appended;
+                    this.commitLogRecords();
+                }
+                this.rebuildLogRows();
+                this.restoreLogAnchor(anchor);
+            },
+
+            // The row at the top of the window, remembered across a poll so the
+            // sliding window cannot move what the reader is looking at.
+            logAnchor() {
+                const row = this.logRows[this.logWindow.start];
+                return row ? { key: row.key, index: this.logWindow.start } : null;
+            },
+
+            restoreLogAnchor(anchor) {
+                if (!anchor || this.logAutoScroll) return;
+                const index = this.logRows.findIndex(row => row.key === anchor.key);
+                if (index < 0) return;
+                const shift = (index - anchor.index) * this.logRowHeight;
+                const viewport = this.$refs.logViewport;
+                if (!shift || !viewport) return;
+                viewport.scrollTop = Math.max(0, viewport.scrollTop + shift);
+                this.logScrollTop = viewport.scrollTop;
+            },
+
+            // A row is one record plus the continuation lines that followed it,
+            // so a record is committed as soon as its text ends with a newline;
+            // whatever is left in _logPending can still grow.
+            commitLogRecords() {
+                const boundary = this._logPending.lastIndexOf('\n');
+                if (boundary < 0) return;
+                const complete = this._logPending.slice(0, boundary + 1);
+                this._logPending = this._logPending.slice(boundary + 1);
+
+                const records = window.OmlxLogs.parseLogText(complete, this._logRecords.length);
+                if (!records.length) return;
+                const previous = this._logRecords[this._logRecords.length - 1];
+                if (records[0].continuation && previous) {
+                    // We committed this record mid-traceback: the lines that
+                    // arrived with this poll belong to it, not to a new row.
+                    window.OmlxLogs.absorbContinuation(previous, records.shift());
+                }
+                for (const record of records) this._logRecords.push(record);
+            },
+
+            // Lines that fell out of the window take the records they covered
+            // with them; a record cut in half by the window edge goes too.
+            dropLeadingLogRecords(lines) {
+                let dropped = 0;
+                let seen = 0;
+                while (dropped < this._logRecords.length && seen < lines) {
+                    seen += this._logRecords[dropped].lines;
+                    dropped += 1;
+                }
+                if (dropped) this._logRecords = this._logRecords.slice(dropped);
+            },
+
+            rebuildLogRows() {
+                this.logRows = window.OmlxLogs.aggregateLogRows(
+                    this._logRecords,
+                    this.logMinLevel,
+                    this.logRows
+                );
+                if (this.logSelectedKey && !this.logRows.some(row => row.key === this.logSelectedKey)) {
+                    this.logSelectedKey = '';
+                }
+            },
+
+            resetLogView() {
+                this._logPending = '';
+                this._logRecords = [];
+                this.logRows = [];
+                this.logSelectedKey = '';
+                this.logScrollTop = 0;
+                const viewport = this.$refs.logViewport;
+                if (viewport) viewport.scrollTop = 0;
+            },
+
+            changeLogFile() {
+                // A different file shares no lines with the previous one.
+                this._logRaw = '';
+                this.resetLogView();
+                this.loadLogs();
+            },
+
+            setLogMinLevel(level) {
+                this.logMinLevel = level;
+                this.logSelectedKey = '';
+                this.rebuildLogRows();
+                this.logScrollTop = 0;
+                const viewport = this.$refs.logViewport;
+                if (viewport) viewport.scrollTop = 0;
+            },
+
+            measureLogViewport() {
+                const viewport = this.$refs.logViewport;
+                if (!viewport) return;
+                if (viewport.clientHeight) this.logViewportHeight = viewport.clientHeight;
+                this.logScrollTop = viewport.scrollTop;
+            },
+
+            // Rows are uniform, so the window can be computed instead of
+            // measured per row; the pitch still comes from a real row so the
+            // enhanced-readability font floor cannot desynchronise it.
+            measureLogRowHeight() {
+                const viewport = this.$refs.logViewport;
+                if (!viewport) return;
+                const row = viewport.querySelector('.log-row');
+                if (row && row.offsetHeight) this.logRowHeight = row.offsetHeight;
+            },
+
+            onLogScroll(event) {
+                this.logScrollTop = event.target.scrollTop;
+                if (event.target.clientHeight) this.logViewportHeight = event.target.clientHeight;
+            },
+
+            scrollLogToBottom() {
+                const viewport = this.$refs.logViewport;
+                if (!viewport) return;
+                viewport.scrollTop = viewport.scrollHeight;
+                this.logScrollTop = viewport.scrollTop;
+            },
+
+            selectLogRow(row) {
+                this.logSelectedKey = row && this.logSelectedKey !== row.key ? row.key : '';
+            },
+
+            // The guard suggests two levers; both live in Settings → Global, so
+            // the action switches there and scrolls to the section when it
+            // carries an anchor (the tab itself is the answer when it does not).
+            openLogAction(anchor) {
+                this.setSettingsTab('global');
+                this.$nextTick(() => {
+                    const target = anchor ? document.querySelector(`[data-anchor="${anchor}"]`) : null;
+                    if (!target) return;
+                    target.scrollIntoView({ block: 'center' });
+                    target.classList.add('anchor-flash');
+                    setTimeout(() => target.classList.remove('anchor-flash'), 2000);
+                });
             },
 
             async loadLogs() {
@@ -5647,20 +6512,16 @@
 
                     if (response.ok) {
                         const data = await response.json();
-                        this.logContent = data.logs;
+                        this.ingestLogText(data.logs || '');
                         this.logTotalLines = data.total_lines;
                         this.logAvailableFiles = data.available_files || ['server.log'];
                         this.logLastUpdated = new Date().toLocaleTimeString();
 
-                        // Auto-scroll to bottom
-                        if (this.logAutoScroll) {
-                            this.$nextTick(() => {
-                                const textarea = this.$refs.logTextarea;
-                                if (textarea) {
-                                    textarea.scrollTop = textarea.scrollHeight;
-                                }
-                            });
-                        }
+                        this.$nextTick(() => {
+                            this.measureLogViewport();
+                            this.measureLogRowHeight();
+                            if (this.logAutoScroll) this.scrollLogToBottom();
+                        });
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -6178,6 +7039,67 @@
                 if (model) this.openModelSettings(model);
             },
 
+            // ---- Models page: one status vocabulary, one memory cell ----
+
+            // The tone the shared Badge spec paints for a status string. Every
+            // table asks this one question, so green cannot mean two things.
+            statusTone(status) {
+                const key = String(status == null ? '' : status).toLowerCase();
+                return Object.prototype.hasOwnProperty.call(STATUS_TONES, key)
+                    ? STATUS_TONES[key]
+                    : 'neutral';
+            },
+
+            // The same status in the console's language; an unknown status is
+            // shown verbatim rather than guessed at.
+            statusLabel(status) {
+                const key = STATUS_LABELS[String(status == null ? '' : status).toLowerCase()];
+                return key ? window.t(key) : String(status == null ? '' : status);
+            },
+
+            // The manager table iterates the disk listing; the resident state
+            // only exists on the richer /api/models entry it cross-references.
+            managerModelStatus(name) {
+                const info = this.managerModelInfo(name);
+                if (!info) return 'unknown';
+                if (info.is_loading) return 'loading';
+                return info.loaded ? 'loaded' : 'unloaded';
+            },
+
+            isModelLoaded(name) {
+                return this.managerModelStatus(name) === 'loaded';
+            },
+
+            // A manager row's memory cell: the measured footprint large, the
+            // estimate it is to be read against small. actual_size is a rough
+            // phys_footprint delta captured at load time (see modelSizeLabel),
+            // so it carries the same "~" the Status tab uses and never reads as
+            // exact; a model that is not resident shows its estimate alone.
+            modelMemoryCell(name) {
+                const info = this.managerModelInfo(name) || {};
+                const measured = (!info.is_loading && info.actual_size_formatted) || '';
+                const estimate = info.estimated_size_formatted || '';
+                return {
+                    footprint: measured ? '~' + measured : (estimate || '—'),
+                    estimate: measured && estimate && estimate !== measured
+                        ? window.t('status.memory.estimated') + ' ' + estimate
+                        : '',
+                    observed: !!measured,
+                };
+            },
+
+            // A filter slider's live read-out: the magnitude under the thumb,
+            // through the shared formatter (parameters keep the SI ladder).
+            // Zero is the slider's off position, not ">= 0".
+            filterSliderLabel(kind, value) {
+                const magnitude = Number(value) || 0;
+                if (magnitude <= 0) return window.t('models.search.filter.any');
+                const measure = String(kind).endsWith('_params')
+                    ? window.formatParams(magnitude * 1e9)
+                    : magnitude + 'GB';
+                return (String(kind).startsWith('min') ? '≥ ' : '≤ ') + measure;
+            },
+
             // Theme select
             setTheme(theme) {
                 this.theme = theme;
@@ -6417,7 +7339,7 @@
                 this.stopHFRefresh();
                 this._hfRefreshTimer = setInterval(() => {
                     this.loadHFTasks();
-                }, 2000);
+                }, 500);
             },
 
             stopHFRefresh() {
@@ -6431,7 +7353,26 @@
                 const pct = Math.round(task.progress || 0);
                 const dlGB = (task.downloaded_size / (1024 ** 3)).toFixed(1);
                 const totalGB = (task.total_size / (1024 ** 3)).toFixed(1);
-                return `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
+                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
+                return `${base} \u00b7 ${this.formatSpeed(task)}`;
+            },
+
+            // Live transfer rate for a download task, e.g. "43.2 MB/s".
+            // `speed_bps` reads 0 whenever no bytes land, so this prints an
+            // explicit "0 B/s" instead of hiding the readout. The console
+            // draws it on queued and downloading rows; a terminal row keeps
+            // its progress and status and drops the rate.
+            formatSpeed(task) {
+                const bps = task.speed_bps || 0;
+                const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+                let value = bps;
+                let unit = 0;
+                while (value >= 1024 && unit < units.length - 1) {
+                    value /= 1024;
+                    unit += 1;
+                }
+                const digits = unit === 0 || value >= 100 ? 0 : 1;
+                return `${value.toFixed(digits)} ${units[unit]}`;
             },
 
             // =================================================================
@@ -6908,12 +7849,6 @@
                 return 'safe';
             },
 
-            formatDownloads(count) {
-                if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
-                if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
-                return count.toString();
-            },
-
             // Table sort helpers for Browse Models
             sortModels(list) {
                 const sortBy = this.hfTableSort;
@@ -7055,10 +7990,10 @@
             },
 
             clearHFSearchFilters() {
-                this.hfSearchMinParams = '';
-                this.hfSearchMaxParams = '';
-                this.hfSearchMaxSize = '';
-                this.hfSearchMinSize = '';
+                this.hfSearchMinParams = 0;
+                this.hfSearchMaxParams = 0;
+                this.hfSearchMaxSize = 0;
+                this.hfSearchMinSize = 0;
                 if (this.hfSearchQuery.trim()) this.immediateSearch();
             },
 
@@ -7071,14 +8006,6 @@
             immediateSearch() {
                 clearTimeout(this.hfSearchDebounceTimer);
                 this.searchHFModels();
-            },
-
-            formatParamCount(params) {
-                if (!params) return null;
-                if (params >= 1e12) return (params / 1e12).toFixed(1) + 'T';
-                if (params >= 1e9) return (params / 1e9).toFixed(1) + 'B';
-                if (params >= 1e6) return (params / 1e6).toFixed(1) + 'M';
-                return params.toString();
             },
 
             // Search history
@@ -7297,7 +8224,7 @@
                 this.stopMSRefresh();
                 this._msRefreshTimer = setInterval(() => {
                     this.loadMSTasks();
-                }, 2000);
+                }, 500);
             },
 
             stopMSRefresh() {

@@ -811,6 +811,75 @@ class TestResponsesEndpoint:
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
 
+    def test_response_endpoint_echoes_the_effective_store_flag(
+        self, client, mock_llm_engine
+    ):
+        """A client that sends nothing sees `store: true`, what actually happened.
+
+        OpenAI's Responses default is to store, so the envelope must report the
+        resolved decision rather than echo a `null` request field.
+        """
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text="Hello!",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["store"] is True
+
+        opted_out = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello", "store": False},
+        )
+        assert opted_out.status_code == 200, opted_out.text
+        assert opted_out.json()["store"] is False
+
+    def test_response_endpoint_echoes_text_format_on_the_wire(
+        self, client, mock_llm_engine
+    ):
+        """`schema_` is a Python-side name; the client must see `schema`.
+
+        The envelope echoes the request's `text`, and the alias only survives a
+        dump that asks for it — the field name leaks into the JSON otherwise.
+        """
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text="{}",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+                finished=True,
+            )
+        )
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "answer",
+                        "schema": {"type": "object"},
+                    }
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["text"]["format"]["schema"] == {"type": "object"}
+        assert "schema_" not in response.text
+
 
 class TestModelsStatusEndpoint:
     """Tests for the /v1/models/status endpoint."""

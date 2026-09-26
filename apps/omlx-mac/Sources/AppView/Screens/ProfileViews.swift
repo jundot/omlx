@@ -95,7 +95,7 @@ struct ProfileGroup: View {
                 .fill(ProfileScopeMeta.color(scope, theme: theme))
                 .frame(width: 6, height: 6)
             Text(label)
-                .font(.omlxText(10.5, weight: .heavy))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .heavy))
                 .kerning(0.7)
                 .textCase(.uppercase)
                 .foregroundStyle(theme.textSecondary)
@@ -125,7 +125,7 @@ struct ProfileGroup: View {
                                  comment: "Button in profile chip-group header that saves the working profile as a new named profile"),
                           systemImage: "plus")
                         .labelStyle(.titleAndIcon)
-                        .font(.omlxText(11, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
                 .overlay(
@@ -147,7 +147,7 @@ struct ProfileGroup: View {
                 Text(String(localized: "profile.group.empty",
                             defaultValue: "No \(ProfileScopeMeta.label(scope).lowercased()) profiles yet.",
                             comment: "Placeholder text in an empty profile chip group; placeholder is the lowercased scope name"))
-                    .font(.omlxText(11.5))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.vertical, 10)
                     .padding(.horizontal, 12)
@@ -193,7 +193,7 @@ struct ProfileGroup: View {
             if isEditing {
                 TextField("", text: $renameText)
                     .textFieldStyle(.plain)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(isActive ? .white : theme.text)
                     .fixedSize(horizontal: true, vertical: false)
                     .focused($renameFieldFocused)
@@ -214,7 +214,7 @@ struct ProfileGroup: View {
                     }
             } else {
                 Text(displayNames[name] ?? name)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(isActive ? .white : theme.text)
             }
         }
@@ -303,7 +303,7 @@ struct ActiveProfileBanner: View {
                 .frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 2) {
                 Text(titleText)
-                    .font(.omlxText(13.5, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
                     .foregroundStyle(theme.text)
                 subtitleView
             }
@@ -355,26 +355,26 @@ struct ActiveProfileBanner: View {
                 Text(String(localized: "profile.banner.working.subtitle.based_on",
                             defaultValue: "Unsaved · based on \(basedOn.name) (\(ProfileScopeMeta.label(basedOn.scope)))",
                             comment: "Profile banner subtitle for working state with a base profile; placeholders are profile name and scope label"))
-                    .font(.omlxText(11.5))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
             } else {
                 Text(String(localized: "profile.banner.working.subtitle.defaults",
                             defaultValue: "Unsaved · based on server defaults",
                             comment: "Profile banner subtitle when working profile has no named base"))
-                    .font(.omlxText(11.5))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
             }
         case .named(let scope, _):
             Text(String(localized: "profile.banner.named.subtitle",
                         defaultValue: "\(ProfileScopeMeta.label(scope)) profile · active on this model",
                         comment: "Profile banner subtitle when a named profile is active; placeholder is scope label"))
-                .font(.omlxText(11.5))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         case .defaults:
             Text(String(localized: "profile.banner.defaults.subtitle",
                         defaultValue: "Using server defaults · edit any field to start a working profile",
                         comment: "Profile banner subtitle when no profile is assigned"))
-                .font(.omlxText(11.5))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         }
     }
@@ -447,7 +447,7 @@ struct SaveAsPopover: View {
             Text(String(localized: "profile.save_as.title",
                         defaultValue: "Save current profile as",
                         comment: "Lead label inside the Save-as popover for naming a new profile"))
-                .font(.omlxText(12, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Segmented(
                 selection: $scope,
@@ -569,7 +569,7 @@ struct ProfileDetailCard: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(name)
-                        .font(.omlxText(16, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.emphasis, weight: .semibold))
                         .foregroundStyle(theme.text)
                     if isActive && !isWorking {
                         badge(text: String(localized: "profile.detail.badge.active",
@@ -596,7 +596,7 @@ struct ProfileDetailCard: View {
                         .fill(isWorking ? theme.amberDot : scopeColor)
                         .frame(width: 6, height: 6)
                     Text(subtitleText)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                 }
             }
@@ -721,7 +721,7 @@ struct ProfileDetailCard: View {
                 Text(String(localized: "profile.detail.empty",
                             defaultValue: "This profile doesn't override any settings.",
                             comment: "Placeholder text in the profile detail card when no settings are set"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 10)
@@ -775,14 +775,14 @@ struct ProfileDetailCard: View {
                     comment: "Capacity stat label: max context window"),
              s["max_context_window"].flatMap { intOf($0) }
                 .map { String(localized: "profile.detail.capacity.tokens",
-                              defaultValue: "\(fmtCtx(Double($0))) tk",
+                              defaultValue: "\(fmtCtx(Double($0))) Tok",
                               comment: "Token count rendered next to a Capacity stat; placeholder is the formatted count") }),
             (String(localized: "profile.detail.capacity.max_tokens",
                     defaultValue: "Max Tokens",
                     comment: "Capacity stat label: max output tokens"),
              s["max_tokens"].flatMap { intOf($0) }
                 .map { String(localized: "profile.detail.capacity.tokens.raw",
-                              defaultValue: "\($0) tk",
+                              defaultValue: "\($0) Tok",
                               comment: "Raw token count for max tokens; placeholder is the integer count") }),
             (String(localized: "profile.detail.capacity.ttl",
                     defaultValue: "TTL",
@@ -841,7 +841,7 @@ struct ProfileDetailCard: View {
                 let n = intOf(s["thinking_budget_tokens"]) ?? 8192
                 flagChip(label: v
                          ? String(localized: "profile.detail.behavior.thinking_budget.on",
-                                  defaultValue: "Budget · \(fmtCtx(Double(n))) tk",
+                                  defaultValue: "Budget · \(fmtCtx(Double(n))) Tok",
                                   comment: "Behavior chip when thinking budget is enabled; placeholder is the formatted token count")
                          : String(localized: "profile.detail.behavior.thinking_budget.off",
                                   defaultValue: "Thinking budget",
@@ -1014,7 +1014,7 @@ struct ProfileDetailCard: View {
             .map { String(format: "%.0f%%", $0 * 100) }
         let thresh = intOf(s["specprefill_threshold"])
             .map { String(localized: "profile.detail.acceleration.specprefill.threshold",
-                          defaultValue: "≥\(fmtCtx(Double($0))) tk",
+                          defaultValue: "≥\(fmtCtx(Double($0))) Tok",
                           comment: "SpecPrefill threshold suffix; placeholder is the formatted token count") }
         let parts = [keep, thresh].compactMap { $0 }
         return parts.isEmpty
@@ -1053,7 +1053,7 @@ struct ProfileDetailCard: View {
                         Text(String(localized: "profile.detail.expose_as_model",
                                     defaultValue: "Expose as model",
                                     comment: "Toggle on the profile detail card that publishes the profile as its own model ID"))
-                            .font(.omlxText(11.5, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                             .foregroundStyle(theme.textSecondary)
                     }
                     .toggleStyle(.switch)
@@ -1062,7 +1062,7 @@ struct ProfileDetailCard: View {
                     .controlSize(.small)
                     if exposeAsModel, let exposedModelId {
                         Text(exposedModelId)
-                            .font(.omlxMono(11))
+                            .font(.omlxMono(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textTertiary)
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -1076,7 +1076,7 @@ struct ProfileDetailCard: View {
                     Text(String(localized: "profile.detail.expose_as_model.engine_fields_hint",
                                 defaultValue: "Engine-level settings in this profile only take effect when it is applied to the base model — they don't change the exposed model.",
                                 comment: "Warning under the expose-as-model toggle when the profile carries engine-construction settings"))
-                        .font(.omlxText(10.5))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.amberDot)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1087,7 +1087,7 @@ struct ProfileDetailCard: View {
     @ViewBuilder
     private func sectionTitle(_ s: String) -> some View {
         Text(s)
-            .font(.omlxText(10, weight: .heavy))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .heavy))
             .kerning(0.9)
             .textCase(.uppercase)
             .foregroundStyle(theme.textTertiary)
@@ -1099,13 +1099,13 @@ struct ProfileDetailCard: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
                 Text(label)
-                    .font(.omlxText(10.5, weight: .heavy))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .heavy))
                     .kerning(0.6)
                     .textCase(.uppercase)
                     .foregroundStyle(theme.textSecondary)
                 Spacer(minLength: 4)
                 Text(String(format: fmt, value))
-                    .font(.omlxMono(12.5, weight: .semibold))
+                    .font(.omlxMono(DesignTokens.FontSize.aux, weight: .semibold))
                     .foregroundStyle(theme.text)
             }
             GeometryReader { geo in
@@ -1128,12 +1128,12 @@ struct ProfileDetailCard: View {
     private func stat(label: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label)
-                .font(.omlxText(10.5, weight: .heavy))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .heavy))
                 .kerning(0.6)
                 .textCase(.uppercase)
                 .foregroundStyle(theme.textSecondary)
             Text(value)
-                .font(.omlxMono(14, weight: .semibold))
+                .font(.omlxMono(DesignTokens.FontSize.body, weight: .semibold))
                 .foregroundStyle(theme.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -1148,7 +1148,7 @@ struct ProfileDetailCard: View {
                 .fill(on ? theme.greenDot : theme.text.opacity(0.18))
                 .frame(width: 6, height: 6)
             Text(label)
-                .font(.omlxText(11.5, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(on ? theme.greenDot : theme.textSecondary)
         }
         .padding(.horizontal, 9)
@@ -1171,7 +1171,7 @@ struct ProfileDetailCard: View {
     @ViewBuilder
     private func badge(text: String, fg: Color, bg: Color, border: Color? = nil) -> some View {
         Text(text)
-            .font(.omlxText(9.5, weight: .heavy))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .heavy))
             .kerning(0.7)
             .foregroundStyle(fg)
             .padding(.horizontal, 6).padding(.vertical, 2)

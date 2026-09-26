@@ -198,7 +198,7 @@ mlx-lm의 BatchGenerator를 통해 동시 요청을 처리합니다. 최대 동�
 
 ### Claude Code 최적화
 
-Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트 스케일링을 지원합니다. Claude code에 리포팅되는 토큰 수를 스케일링하여 자동 Compact가 적절한 타이밍에 트리거되고, 긴 프리필 동안 읽기 타임아웃을 방지하는 SSE keep-alive를 제공합니다.
+Claude Code에서 작은 컨텍스트 모델을 실행할 수 있도록 토큰 수를 스케일링하는 대신 모델의 실제 컨텍스트 윈도우를 기준으로 자동 Compact를 트리거하고, 긴 프리필 동안 읽기 타임아웃을 방지하는 SSE keep-alive를 제공합니다.
 
 ### 멀티 모델 서빙
 
