@@ -1305,6 +1305,65 @@ def test_show_code_instead_posts_the_best_reachable_address():
     )
 
 
+def test_bare_link_local_address_is_never_offered_for_dialing():
+    """A bare fe80::/10 address (no scope zone) is not a join candidate.
+
+    Discovery can surface a peer whose only observed address is link-local
+    IPv6 stripped of its (process-local) scope zone. Such an address can
+    never be dialed, so the picker must treat the device as having no usable
+    address and steer to Add by IP — not attempt ``[fe80::…]:port`` and fail
+    with a generic "could not reach" error. A scoped zone stays dialable
+    (pinned end-to-end in tests/test_cluster_ui_integration.py).
+    """
+
+    result = _run_wizard(
+        """
+let notified = null;
+let posted = false;
+component.notify = (level, message) => { notified = { level, message }; };
+component.apiFetch = async () => { posted = true; return {}; };
+const bareOnly = {
+  node_id: 'node-b', friendly_name: 'Node B', http_port: 8123,
+  addrs: [{ ip: 'fe80::1', if_type: 'ethernet' }],
+};
+const scoped = {
+  node_id: 'node-b', friendly_name: 'Node B', http_port: 8123,
+  addrs: [{ ip: 'fe80::1%en0', if_type: 'ethernet' }],
+};
+const mixed = {
+  node_id: 'node-b', friendly_name: 'Node B', http_port: 8123,
+  addrs: [
+    { ip: 'fe80::1', if_type: 'manual' },
+    { ip: '10.10.10.1', if_type: 'manual' },
+  ],
+};
+const upperBare = {
+  node_id: 'node-b', friendly_name: 'Node B', http_port: 8123,
+  addrs: [{ ip: 'FEB8::1', if_type: 'ethernet' }],
+};
+(async () => {
+  await component.beginJoinAsJoiner(bareOnly);
+  process.stdout.write(JSON.stringify({
+    bare: component.coordinatorAddrFor(bareOnly),
+    scoped: component.coordinatorAddrFor(scoped),
+    mixed: component.coordinatorAddrFor(mixed),
+    upperBare: component.coordinatorAddrFor(upperBare),
+    notified, posted,
+  }));
+})().catch((error) => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result["bare"] is None
+    assert result["upperBare"] is None
+    assert result["scoped"] == "[fe80::1%en0]:8123"
+    assert result["mixed"] == "10.10.10.1:8123"
+    # No request leaves the machine; the operator gets the actionable hint.
+    assert result["posted"] is False
+    assert result["notified"]["level"] == "error"
+    assert "Add by IP" in result["notified"]["message"]
+
+
 def test_expired_join_offers_start_again_not_a_dead_end():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
