@@ -263,3 +263,20 @@ def _reset_prefill_tracker():
     get_prefill_tracker().clear()
     yield
     get_prefill_tracker().clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_image_decode_cache():
+    """Keep the process-global image decode cache hermetic per test.
+
+    Any test that decodes an image leaves it cached. The memory enforcer
+    re-reads usage whenever dropping that cache frees anything, so a
+    leftover entry shifts every scripted usage sequence by one read: the
+    single-model hard-pressure test then sees its post-unload value before
+    the eviction loop and never evicts.
+    """
+    from omlx.utils.image import clear_image_decode_cache
+
+    clear_image_decode_cache()
+    yield
+    clear_image_decode_cache()
