@@ -157,6 +157,7 @@
   "status.active_models.last_token_ago": "最后 Token {age}前",
   "status.integrations.claude_code": "Claude Code",
   "status.integrations.copilot_cli": "Copilot CLI",
+  "status.integrations.dsh": "DeepSeek Harness",
   "status.integrations.hermes_agent": "Hermes Agent",
   "status.active_models.idle": "空闲",
   "status.active_models.pressure_label": "{current} / {soft} 软限制 / {hard} 硬限制",

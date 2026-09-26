@@ -553,9 +553,17 @@ def launch_command(args, extra_args: list[str] | None = None):
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
     # prompt interactively so the user's selection is honoured.
     model = args.model
+    if not model and not getattr(integration, "requires_model_selection", True):
+        # The integration registers the server's whole model catalog, so
+        # there is nothing to pick here; the optional per-tool default (or
+        # --model) only seeds the tool's own default model.
+        model = (
+            _optional_str(getattr(settings.integrations, f"{tool_name}_model", None))
+            or ""
+        )
     if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
         model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
-    elif not model:
+    elif not model and getattr(integration, "requires_model_selection", True):
         # Fetch available models from server
         try:
             resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
@@ -660,7 +668,10 @@ def launch_command(args, extra_args: list[str] | None = None):
     )
 
     # Launch
-    print(f"Launching {integration.display_name} with model {model}...")
+    if model:
+        print(f"Launching {integration.display_name} with model {model}...")
+    else:
+        print(f"Launching {integration.display_name}...")
     integration.launch(ctx)
 
 
@@ -1341,8 +1352,8 @@ Example directory structure:
         help="Launch an external tool with oMLX integration",
         description=(
             "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi) to use "
-            "the running oMLX server."
+            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
+            "Harness) to use the running oMLX server."
         ),
     )
     launch_parser.add_argument(
@@ -1350,7 +1361,7 @@ Example directory structure:
         type=str,
         help=(
             "Tool to launch: claude, copilot, codex, codex_app, opencode, "
-            "openclaw, hermes, pi, or 'list' to show available"
+            "openclaw, hermes, pi, dsh, or 'list' to show available"
         ),
     )
     launch_parser.add_argument(

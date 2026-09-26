@@ -87,6 +87,7 @@
         "hermes_model": null,
         "pi_model": null,
         "copilot_model": null,
+        "dsh_model": null,
         "openclaw_tools_profile": "coding"
     },
     "system": {

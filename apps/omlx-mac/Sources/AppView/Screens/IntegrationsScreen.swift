@@ -330,7 +330,17 @@ private struct OtherIntegrationsSection: View {
                     Task { await vm.save(.copilotModel, client: client) }
                 }),
                 modelOptions: vm.modelOptions,
-                command: vm.copilotCommand,
+                command: vm.copilotCommand
+            )
+            IntegrationRow(
+                name: String(localized: "integrations.tool.dsh",
+                             defaultValue: "DeepSeek Harness",
+                             comment: "Display name for the DeepSeek Harness (dsh) integration"),
+                modelBinding: vm.bind($vm.dshModel, save: {
+                    Task { await vm.save(.dshModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.dshCommand,
                 isLast: true
             )
         }

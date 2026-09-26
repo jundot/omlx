@@ -8111,6 +8111,30 @@
         }
       }
     },
+    "integrations.tool.dsh" : {
+      "comment" : "Display name for the DeepSeek Harness (dsh) integration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DeepSeek Harness"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DeepSeek Harness"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DeepSeek Harness"
+          }
+        }
+      }
+    },
     "integrations.tool.hermes" : {
       "comment" : "Display name for the Hermes Agent integration",
       "extractionState" : "manual",
