@@ -1187,6 +1187,8 @@
   "modal.model_settings.moe_expert_offload_fraction_label": "Resident experts",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "請輸入 5 到 95 之間的數值。",
+  "modal.model_settings.moe_expert_offload_fit_label": "Fit to memory",
+  "modal.model_settings.moe_expert_offload_no_fit": "No residency fits the memory ceiling: even the routing floor exceeds it.",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "使用模型內建的 MTP 頭，每步產生多個 token。解碼速度最快可達約 1.5 倍。（Qwen 3.5/3.6、DeepSeek-V4、GLM-5.2）",
   "modal.model_settings.mtp_depth": "Adaptive max depth",

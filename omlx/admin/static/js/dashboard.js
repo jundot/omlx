@@ -4102,6 +4102,40 @@
                 return Math.max(0, Math.round(bytes)) + ' B';
             },
 
+            // MoE expert offload: the largest whole-expert residency that fits the
+            // memory ceiling, as reported by /api/models (see
+            // EnginePool.fit_moe_offload_fraction), offered under the residency field.
+            moeOffloadFitOption() {
+                const fit = this.selectedModel?.moe_expert_offload_fit_fraction;
+                return Number.isFinite(fit) && fit > 0 && fit <= 1;
+            },
+
+            applyMoeOffloadFit() {
+                const fit = this.selectedModel?.moe_expert_offload_fit_fraction;
+                if (!Number.isFinite(fit)) return;
+                this.modelSettings.moe_expert_offload_resident_percent = Number((fit * 100).toPrecision(15));
+                this.onMoeExpertOffloadResidentPercent();
+                this.onMoeExpertOffloadResidentBlur();
+            },
+
+            moeOffloadFitLabel() {
+                const fit = this.selectedModel?.moe_expert_offload_fit_fraction;
+                if (!Number.isFinite(fit)) return '';
+                const pct = fit * 100;
+                const pctText = Number.isInteger(pct) ? String(pct) : pct.toFixed(1);
+                const bytes = this.selectedModel?.moe_expert_offload_fit_bytes;
+                const sized = Number.isFinite(bytes) && bytes > 0 ? ` \u00b7 ~${this.formatByteCount(bytes)}` : '';
+                return `${window.t('modal.model_settings.moe_expert_offload_fit_label')}: ${pctText}% resident${sized}`;
+            },
+
+            moeOffloadNoFit() {
+                const model = this.selectedModel;
+                const presets = model?.moe_expert_offload_presets;
+                if (!Array.isArray(presets) || !presets.length) return false;
+                if (Number.isFinite(model?.moe_expert_offload_fit_fraction)) return false;
+                return presets.some(p => p.fits === false);
+            },
+
             formatTokenCount(n) {
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';

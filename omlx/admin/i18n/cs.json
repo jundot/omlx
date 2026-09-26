@@ -1187,6 +1187,8 @@
   "modal.model_settings.moe_expert_offload_fraction_label": "Rezidentní experti",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "Zadejte číslo od 5 do 95.",
+  "modal.model_settings.moe_expert_offload_fit_label": "Fit to memory",
+  "modal.model_settings.moe_expert_offload_no_fit": "No residency fits the memory ceiling: even the routing floor exceeds it.",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Navrhuje několik tokenů pro krok pomocí vestavěné hlavy MTP modelu. Až ~1,5× rychlejší dekódování. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",
   "modal.model_settings.mtp_depth": "Adaptive max depth",

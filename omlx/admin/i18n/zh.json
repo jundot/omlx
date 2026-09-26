@@ -1187,6 +1187,8 @@
   "modal.model_settings.moe_expert_offload_fraction_label": "常驻专家",
   "modal.model_settings.moe_expert_offload_resident_range": "(5-95)",
   "modal.model_settings.moe_expert_offload_resident_range_error": "请输入 5 到 95 之间的数值。",
+  "modal.model_settings.moe_expert_offload_fit_label": "适配内存",
+  "modal.model_settings.moe_expert_offload_no_fit": "没有任何常驻比例能满足内存上限：即使路由下限也超出了。",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "使用模型内置 MTP 头每步预测多个 Token。解码速度提升约 1.5 倍。（Qwen 3.5/3.6、DeepSeek-V4、GLM-5.2）",
   "modal.model_settings.mtp_depth": "Adaptive max depth",

@@ -967,3 +967,174 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
         assert len(cache.slot_of) <= 64
     if length > 1:
         assert cache.misses > cache.capacity
+
+
+class TestBudgetFit:
+    """``fit_resident_fraction`` answers "the largest residency that fits"
+    with the same arithmetic admission runs, and the engine pool's fit is
+    pinned to it."""
+
+    @staticmethod
+    def _checkpoint(tmp_path, per_expert_experts=16):
+        # A stacked container (E experts) and a per-expert container, so the
+        # candidate fractions come from two expert counts.
+        glu = _make_glu(seed=11)
+        tensors = _glu_tensors(glu, "model.layers.0.mlp.experts.switch_glu")
+        for e in range(per_expert_experts):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                base = f"model.layers.1.mlp.experts.{e}.{proj}"
+                tensors[f"{base}.weight"] = mx.zeros((INTER, D // 8), dtype=mx.uint32)
+                tensors[f"{base}.scales"] = mx.zeros(
+                    (INTER, D // GROUP), dtype=mx.float16
+                )
+        tensors["model.embed_tokens.weight"] = mx.zeros((256, D), dtype=mx.float16)
+        _save_checkpoint(tmp_path, tensors)
+        return tmp_path
+
+    def test_capacity_fractions_are_whole_experts(self, tmp_path):
+        from omlx.patches.moe_expert_offload import offload_capacity_fractions
+
+        path = self._checkpoint(tmp_path)
+        fractions = offload_capacity_fractions(path)
+        expected = sorted(
+            {c / E for c in range(8, E + 1)} | {c / 16 for c in range(8, 17)}
+        )
+        assert list(fractions) == expected
+        assert fractions[0] == 8 / E and fractions[-1] == 1.0
+        # every candidate is a whole number of experts in some container
+        for f in fractions:
+            assert any(abs(n * f - round(n * f)) < 1e-9 for n in (E, 16))
+
+    def test_fit_matches_the_estimate(self, tmp_path):
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+            fit_resident_fraction,
+            offload_capacity_fractions,
+        )
+
+        path = self._checkpoint(tmp_path)
+        full = 10**9
+        assert fit_resident_fraction(path, full, 1 << 60) == 1.0
+        assert fit_resident_fraction(path, full, 0) is None
+        fractions = offload_capacity_fractions(path)
+        sizes = [estimate_offload_admission_bytes(path, full, f) for f in fractions]
+        assert sizes == sorted(sizes)  # non-decreasing in the fraction
+        assert sizes[-1] == full and sizes[0] < full
+        for budget in {*sizes, *(s - 1 for s in sizes)}:
+            fitting = [f for f, s in zip(fractions, sizes, strict=True) if s <= budget]
+            assert fit_resident_fraction(path, full, budget) == (
+                max(fitting) if fitting else None
+            )
+
+    def test_fit_without_offloadable_experts(self, tmp_path, monkeypatch):
+        from omlx.patches.moe_expert_offload import (
+            fit_resident_fraction,
+            offload_capacity_fractions,
+        )
+
+        # dense checkpoint: nothing to offload, so only the full size can fit
+        _save_checkpoint(
+            tmp_path,
+            {"model.embed_tokens.weight": mx.zeros((256, D), dtype=mx.float16)},
+        )
+        assert offload_capacity_fractions(tmp_path) == ()
+        assert fit_resident_fraction(tmp_path, 100, 100) == 1.0
+        assert fit_resident_fraction(tmp_path, 100, 99) is None
+        # kill switch: an offloadable checkpoint behaves the same way
+        path = self._checkpoint(tmp_path)
+        monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
+        assert offload_capacity_fractions(path) == ()
+        assert fit_resident_fraction(path, 100, 100) == 1.0
+        assert fit_resident_fraction(path, 100, 99) is None
+        assert fit_resident_fraction("/nonexistent", 100, 100) == 1.0
+
+    def test_layout_cache_follows_checkpoint_edits(self, tmp_path):
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+            offload_capacity_fractions,
+        )
+
+        self._checkpoint(tmp_path, per_expert_experts=16)
+        before = estimate_offload_admission_bytes(tmp_path, 10**9, 0.5)
+        assert 8 / 16 in offload_capacity_fractions(tmp_path)
+        self._checkpoint(tmp_path, per_expert_experts=24)
+        assert 8 / 24 in offload_capacity_fractions(tmp_path)
+        assert estimate_offload_admission_bytes(tmp_path, 10**9, 0.5) != before
+
+    def test_resident_draft_head_is_not_offloadable(self, tmp_path):
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+            fit_resident_fraction,
+            offload_capacity_fractions,
+        )
+
+        # Backbone experts plus an MTP draft head with a different expert
+        # count, so the head's container shows up in the candidates too.
+        glu = _make_glu(seed=11)
+        tensors = _glu_tensors(glu, "model.layers.0.mlp.experts.switch_glu")
+        tensors.update(
+            _glu_tensors(_make_glu(seed=12, e=16), "mtp.0.mlp.experts.switch_glu")
+        )
+        _save_checkpoint(tmp_path, tensors)
+        full = 10**9
+        # Scan the stripped layout first, so a cache key without the flag
+        # would hand the resident-head query the wrong layout.
+        stripped = estimate_offload_admission_bytes(tmp_path, full, 0.5)
+        resident = estimate_offload_admission_bytes(
+            tmp_path, full, 0.5, mtp_resident=True
+        )
+        assert stripped < resident < full
+        assert 8 / 16 in offload_capacity_fractions(tmp_path)
+        fractions = offload_capacity_fractions(tmp_path, mtp_resident=True)
+        assert list(fractions) == [c / E for c in range(8, E + 1)]
+        budget = resident
+        assert fit_resident_fraction(tmp_path, full, budget, mtp_resident=True) == 0.5
+        assert fit_resident_fraction(tmp_path, full, budget) > 0.5
+
+    def test_engine_pool_admission_and_fit_match_the_adapter(self, tmp_path):
+        import json
+
+        from test_engine_pool import _make_pool
+
+        from omlx.engine_pool import EngineEntry
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+            fit_resident_fraction,
+            offload_capacity_fractions,
+        )
+
+        path = self._checkpoint(tmp_path)
+        (path / "config.json").write_text(
+            json.dumps({"model_type": "olmoe", "num_experts_per_tok": 8})
+        )
+        full = 10**9
+        pool = _make_pool(ceiling=full)
+        entry = EngineEntry(
+            model_id="moe",
+            model_path=str(path),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=full,
+            config_model_type="olmoe",
+        )
+        assert pool.fit_moe_offload_fraction(entry, None, 1 << 60) == 1.0
+        assert pool.fit_moe_offload_fraction(entry, None, 0) is None
+        for fraction in offload_capacity_fractions(path):
+            settings = ModelSettings(
+                moe_expert_offload_enabled=True,
+                moe_expert_offload_resident_fraction=fraction,
+            )
+            expected = pool._entry_runtime_resident_size(entry, settings)
+            assert expected == estimate_offload_admission_bytes(path, full, fraction)
+            assert pool.moe_offload_admission_bytes(entry, None, fraction) == expected
+            # the probe never edits the caller's settings
+            untouched = ModelSettings()
+            assert pool.moe_offload_admission_bytes(entry, untouched, fraction) == (
+                expected
+            )
+            assert untouched.moe_expert_offload_enabled is False
+            for budget in (expected, expected - 1):
+                assert pool.fit_moe_offload_fraction(entry, None, budget) == (
+                    fit_resident_fraction(path, full, budget)
+                )
