@@ -508,6 +508,26 @@ class BaseEngine(ABC):
         """
         pass
 
+    def _moe_offload_model(self) -> Any:
+        """The loaded model that expert offload may have wrapped, if any."""
+        return None
+
+    def moe_offload_stats(self) -> Optional[Dict[str, Any]]:
+        """Expert offload hit/miss counters since load, or ``None``.
+
+        ``None`` when offload is off for this model or wrapped no layer.
+        """
+        settings = getattr(self, "_model_settings", None)
+        if not getattr(settings, "moe_expert_offload_enabled", False):
+            return None
+        model = self._moe_offload_model()
+        if model is None:
+            return None
+        from ..patches.moe_expert_offload import moe_offload_stats
+
+        stats = moe_offload_stats(model)
+        return stats if stats["layers"] else None
+
     @abstractmethod
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get cache statistics.

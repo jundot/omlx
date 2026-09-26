@@ -12,6 +12,7 @@ from test_deepseek_v41 import write_checkpoint
 from omlx.patches.deepseek_v41.convert import convert
 from omlx.patches.deepseek_v41.loading import load
 from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+from omlx.patches.moe_expert_offload import moe_offload_stats
 
 
 @pytest.mark.parametrize("converted", [False, True])
@@ -55,6 +56,16 @@ def test_checkpoint_offload_matches_prefill_decode_and_closes(
             mx.eval(out)
             np.testing.assert_allclose(out[0], out[1], rtol=2e-4, atol=2e-5)
         assert disk.language_model.layers[0].ffn.experts.slots.misses >= 2
+        # moe_offload_stats sums V4.1's slots like the other adapters' caches.
+        slots = [
+            layer.ffn.experts.slots
+            for layer in disk.language_model.layers
+            if isinstance(layer.ffn.experts, OffloadedExpert)
+        ]
+        stats = moe_offload_stats(disk)
+        assert stats["layers"] == len(slots) > 0
+        assert stats["hits"] == sum(s.hits for s in slots)
+        assert stats["misses"] == sum(s.misses for s in slots)
     finally:
         resident.close()
         disk.close()

@@ -358,6 +358,8 @@ class ExpertOffloadPlan:
 
 
 class _ExpertSlots:
+    moe_offload_counters = True  # summed by moe_offload_stats
+
     def __init__(self, expert, plan, prefix):
         self.expert, self.plan, self.prefix = expert, plan, prefix
         self.slot_of = {}

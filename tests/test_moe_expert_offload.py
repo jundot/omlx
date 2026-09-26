@@ -205,6 +205,21 @@ class TestApplyAndForward:
             assert bool(mx.array_equal(ref, got))
         stats = moe_offload_stats(model)
         assert stats["layers"] == 2 and stats["misses"] > 0
+        # The engine reports the same counters, and only with offload on.
+        from types import SimpleNamespace
+
+        from omlx.engine.base import BaseEngine
+
+        engine = SimpleNamespace(
+            _model_settings=SimpleNamespace(moe_expert_offload_enabled=True),
+            _moe_offload_model=lambda: model,
+        )
+        assert BaseEngine.moe_offload_stats(engine) == stats
+        engine._model_settings.moe_expert_offload_enabled = False
+        assert BaseEngine.moe_offload_stats(engine) is None
+        engine._model_settings.moe_expert_offload_enabled = True
+        engine._moe_offload_model = lambda: {"dense": nn.Linear(4, 4)}
+        assert BaseEngine.moe_offload_stats(engine) is None
 
     def test_chunked_prefill_bit_exact_below_sort_threshold(self, tmp_path):
         # 27 tokens x k=2 = 54 indices: below the sort threshold, above the

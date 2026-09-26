@@ -1014,7 +1014,11 @@ def materialize_offload_state(model) -> int:
 
 
 def moe_offload_stats(model) -> dict:
-    """Aggregate hit/miss counters over all offloaded layers."""
+    """Aggregate hit/miss counters over all offloaded layers.
+
+    Covers the common adapter and the DeepSeek V4, GLM and DeepSeek V4.1
+    adapters. Counts are cumulative since load and include prefill.
+    """
     hits = misses = layers = 0
     stack = [model]
     seen = set()
@@ -1024,7 +1028,14 @@ def moe_offload_stats(model) -> dict:
             continue
         seen.add(id(obj))
         cache = getattr(obj, "cache", None)
-        if getattr(cache, "moe_offload_cache", False):
+        if not getattr(cache, "moe_offload_cache", False):
+            # DeepSeek V4.1 keeps its counters on ``slots``; it is not a
+            # ``moe_offload_cache`` because materialize_offload_state must
+            # not walk it.
+            cache = getattr(obj, "slots", None)
+            if not getattr(cache, "moe_offload_counters", False):
+                cache = None
+        if cache is not None:
             hits += cache.hits
             misses += cache.misses
             layers += 1

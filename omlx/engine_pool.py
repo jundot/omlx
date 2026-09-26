@@ -3599,6 +3599,21 @@ class EnginePool:
         shutdown_mlx_executor()
         logger.info("Engine pool shutdown complete")
 
+    @staticmethod
+    def _moe_offload_stats(entry: EngineEntry) -> dict | None:
+        """The loaded engine's expert offload counters, or ``None``.
+
+        Monitoring must never fail on them, so any error reads as ``None``.
+        """
+        stats = getattr(entry.engine, "moe_offload_stats", None)
+        if stats is None:
+            return None
+        try:
+            return stats()
+        except Exception:
+            logger.debug("moe offload stats unavailable", exc_info=True)
+            return None
+
     def get_status(self) -> dict:
         """
         Get pool status for monitoring endpoints.
@@ -3639,6 +3654,7 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    "moe_expert_offload_stats": self._moe_offload_stats(e),
                 }
             )
         return {

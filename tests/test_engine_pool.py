@@ -2963,6 +2963,24 @@ class TestEnginePoolPrefillEviction:
 class TestEnginePoolStatusIsLoading:
     """Tests for get_status is_loading field."""
 
+    def test_get_status_reports_moe_offload_stats(self, small_mock_model_dir):
+        """Loaded engines report their offload counters; errors read as None."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        counters = {"layers": 2, "hits": 30, "misses": 10, "hit_rate": 0.75}
+        pool._entries["model-a"].engine = MagicMock(
+            moe_offload_stats=MagicMock(return_value=counters)
+        )
+        pool._entries["model-b"].engine = MagicMock(
+            moe_offload_stats=MagicMock(side_effect=RuntimeError("boom"))
+        )
+        models = {m["id"]: m for m in pool.get_status()["models"]}
+        assert models["model-a"]["moe_expert_offload_stats"] == counters
+        assert models["model-b"]["moe_expert_offload_stats"] is None
+        pool._entries["model-a"].engine = None
+        models = {m["id"]: m for m in pool.get_status()["models"]}
+        assert models["model-a"]["moe_expert_offload_stats"] is None
+
     def test_get_status_includes_is_loading(self, small_mock_model_dir):
         """Test get_status includes is_loading field."""
         pool = _make_pool(ceiling=10 * 1024**3)

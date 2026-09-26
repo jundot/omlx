@@ -1473,6 +1473,9 @@ class BatchedEngine(BaseEngine):
             stats.update(self._engine.get_stats())
         return stats
 
+    def _moe_offload_model(self) -> Any:
+        return self._model
+
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
         if self._engine:
