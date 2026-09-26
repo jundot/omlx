@@ -4,7 +4,7 @@ import SwiftUI
 @Observable
 final class IntegrationsScreenVM {
     enum Field: Sendable {
-        case claudeMode, opusModel, sonnetModel, haikuModel, contextScaling, targetContextSize
+        case claudeMode, opusModel, sonnetModel, haikuModel, desktopEnabled, contextScaling, targetContextSize
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
         case hermesModel, copilotModel
         case mcpConfig
@@ -15,6 +15,10 @@ final class IntegrationsScreenVM {
     var opusModel: String = ""
     var sonnetModel: String = ""
     var haikuModel: String = ""
+    /// Claude Desktop tier aliases (claude-opus-5 /
+    /// claude-sonnet-5 / claude-haiku-4-5-20251001) mapped onto the tier
+    /// models above.
+    var desktopEnabled: Bool = false
     var contextScaling: Bool = false
     /// Free-text editor backing for `claude_code.target_context_size`. The
     /// server stores an `int`; we keep the screen field as a string so the
@@ -72,6 +76,13 @@ final class IntegrationsScreenVM {
     /// persisted in settings, so the launcher reads them without extra flags.
     var claudeLaunchCommand: String {
         "\(cliCommandPrefix) launch claude"
+    }
+
+    /// Composed `omlx launch claude_desktop` command. Launches Claude Desktop
+    /// pointed at the oMLX gateway. Mirrors `claudeDesktopCommand` in
+    /// `omlx/admin/static/js/dashboard.js`.
+    var claudeDesktopLaunchCommand: String {
+        "\(cliCommandPrefix) launch claude_desktop"
     }
 
     /// Env-var recipe that runs the real `claude` binary directly. Mirrors
@@ -149,6 +160,7 @@ final class IntegrationsScreenVM {
                 self.opusModel       = cc.opusModel ?? ""
                 self.sonnetModel     = cc.sonnetModel ?? ""
                 self.haikuModel      = cc.haikuModel ?? ""
+                self.desktopEnabled  = cc.desktopEnabled ?? false
                 self.contextScaling  = cc.contextScalingEnabled ?? false
                 if let target = cc.targetContextSize {
                     let s = String(target)
@@ -199,6 +211,7 @@ final class IntegrationsScreenVM {
         case .opusModel:            patch.claudeCodeOpusModel = opusModel
         case .sonnetModel:          patch.claudeCodeSonnetModel = sonnetModel
         case .haikuModel:           patch.claudeCodeHaikuModel = haikuModel
+        case .desktopEnabled:       patch.claudeCodeDesktopEnabled = desktopEnabled
         case .contextScaling:       patch.claudeCodeContextScalingEnabled = contextScaling
         case .targetContextSize:
             let trimmed = targetContextSizeText.trimmingCharacters(in: .whitespaces)
