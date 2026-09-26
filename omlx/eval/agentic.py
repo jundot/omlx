@@ -63,6 +63,26 @@ def _which(name: str) -> Optional[str]:
     return shutil.which(name, path=f"{path}{os.pathsep}{extra}" if path else extra)
 
 
+# The macOS app points PYTHONHOME/PYTHONPATH at its bundled CPython 3.11 for
+# the server; inherited by Harbor's own (uv-managed 3.13) interpreter they
+# break its startup ("Failed to import encodings module").
+_HOST_PYTHON_ENV = (
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONEXECUTABLE",
+    "PYTHONSTARTUP",
+    "VIRTUAL_ENV",
+    "__PYVENV_LAUNCHER__",
+)
+
+
+def harbor_env(**overrides: str) -> dict[str, str]:
+    """Environment for the Harbor CLI, free of this interpreter's settings."""
+    env = {k: v for k, v in os.environ.items() if k not in _HOST_PYTHON_ENV}
+    env.update(overrides)
+    return env
+
+
 def resolve_harbor_command() -> list[str]:
     """Command prefix that invokes the pinned Harbor CLI."""
     if uvx := _which("uvx"):
@@ -293,12 +313,11 @@ class HarborBenchmark:
             main["platform"] = self.platform
         compose.write_text(json.dumps({"services": {"main": main}}))
         log_path = self.jobs_dir / f"{self.job_name}.log"
-        env = {
-            **os.environ,
-            "OPENAI_API_KEY": self.endpoint.api_key,
-            "OPENAI_BASE_URL": self.endpoint.base_url,
-            "PYTHONUNBUFFERED": "1",
-        }
+        env = harbor_env(
+            OPENAI_API_KEY=self.endpoint.api_key,
+            OPENAI_BASE_URL=self.endpoint.base_url,
+            PYTHONUNBUFFERED="1",
+        )
         argv = self._command(items, batch_size, compose)
         logger.info(f"{self.name}: launching Harbor job {self.job_name}")
 

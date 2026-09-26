@@ -129,6 +129,19 @@ async def test_run_maps_harbor_trials_to_results(suite, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_host_python_env_does_not_leak_into_harbor(suite, monkeypatch, tmp_path):
+    # The macOS app runs the server with PYTHONHOME/PYTHONPATH pointing at
+    # its bundled CPython; Harbor's own interpreter must not inherit them.
+    monkeypatch.setenv("FAKE_HARBOR_MODE", "ok")
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "bundled-cpython-3.11"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "bundled-resources"))
+
+    result = await suite.run(None, ITEMS)
+
+    assert result.question_results[0].predicted == "pass"
+
+
+@pytest.mark.asyncio
 async def test_harbor_failure_without_trials_raises(suite, monkeypatch):
     monkeypatch.setenv("FAKE_HARBOR_MODE", "fail")
     with pytest.raises(RuntimeError, match="Harbor exited with code 2.*boom"):
