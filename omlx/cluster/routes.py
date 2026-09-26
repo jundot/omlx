@@ -72,6 +72,7 @@ from .launch import (
     run_cluster_performance_probe,
     run_cuda_fabric_probe,
     stop_deployment_processes,
+    sweep_deployment_ssd_snapshots,
 )
 from .liveness import (
     PeerLostError,
@@ -3904,10 +3905,17 @@ async def deactivate_cluster_deployment(deployment_id: str):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail="cluster deployment not found")
+    # The deployment is gone, so its scoped SSD snapshot tree is orphaned
+    # forever (#3422). Reclaim it on every rank — best-effort, reported,
+    # never raised: the teardown itself already succeeded.
+    ssd_reclaim = await asyncio.to_thread(
+        sweep_deployment_ssd_snapshots, deployment
+    )
     return {
         "ok": True,
         "deployment_id": deployment_id,
         "stopped": True,
+        "ssd_reclaim": ssd_reclaim,
     }
 
 
