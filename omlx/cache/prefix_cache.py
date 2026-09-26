@@ -2922,6 +2922,22 @@ class BlockAwarePrefixCache(CacheManager):
             self.paged_cache.delete_block_table(request_id)
             logger.debug(f"Released cache for {request_id}")
 
+    def release_fetched_blocks(self, request_id: str) -> None:
+        """Give back block references a bare ``fetch_cache`` acquired.
+
+        ``release_cache`` frees through ``_request_tables``, which only
+        ``store_cache`` and ``fork_cache`` populate — ``fetch_cache`` does
+        not. A caller that fetched and never stored (a read-back probe that
+        only asks "would a request see this?") therefore holds a reference on
+        every matched block that ``release_cache`` will not return, and those
+        blocks stay unevictable for the life of the process.
+
+        The references live on the paged block table, so that is what this
+        frees. Safe to call when nothing was fetched: deleting a block table
+        that does not exist is a no-op.
+        """
+        self.paged_cache.delete_block_table(request_id)
+
     def clear_request_entry(self, request_id: str) -> None:
         """
         Clear request entry from tracking without freeing blocks.

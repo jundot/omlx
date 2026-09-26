@@ -145,6 +145,10 @@ class Request:
     # pollute the shared cache tiers or trigger the completion-time
     # host memcpy + disk write.
     skip_cache_store: bool = False
+    # Scheduler-owned background work rather than a user request: it has no
+    # collector, no client and no output, so the paths that fail, retry or
+    # reschedule live requests must all leave it alone. Its own owner ends it.
+    is_canonical_recovery: bool = False
     # Emit per-chunk timing diagnostics for an internal throughput benchmark.
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False

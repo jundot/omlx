@@ -14,6 +14,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import concurrent.futures
+import contextlib
 import gc
 import logging
 import os
@@ -783,6 +784,13 @@ class EngineCore:
         # asyncio.Event per refused request. Re-raise after cleanup so
         # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
+        # Announce the request before the hand-off. add_request runs on the
+        # same single-worker executor as scheduler.step(), so between here and
+        # there the scheduler's own lists say it is idle while this request
+        # already exists. Anything that uses idleness to decide it may start
+        # uninterruptible work needs to see the arrival, not the admission.
+        with contextlib.suppress(Exception):
+            self.scheduler.note_inbound_request(request_id)
         try:
             await loop.run_in_executor(
                 self._mlx_executor, self.scheduler.add_request, request
@@ -803,6 +811,10 @@ class EngineCore:
                 logger.debug(
                     f"Abort of partial insert for {request_id} failed: {abort_exc}"
                 )
+            with contextlib.suppress(Exception):
+                # Never admitted, so nothing else will ever retire the arrival
+                # marker this method published before the hand-off.
+                self.scheduler.note_request_departed(request_id)
             self._cleanup_request(request_id)
             raise
         self._wake_engine_loop()
@@ -876,6 +888,11 @@ class EngineCore:
         pending_aborts: set[str] = set()
         sched_for_filter = self.scheduler
         if sched_for_filter is not None:
+            # Background work is not a request and nothing will abort it on its
+            # own, but it does keep the scheduler non-quiescent. An unload that
+            # waits for the scheduler to drain would wait forever.
+            with contextlib.suppress(Exception):
+                sched_for_filter.cancel_canonical_recovery_work("abort_all_requests")
             pending_aborts = set(
                 getattr(sched_for_filter, "_pending_abort_ids", None) or ()
             )
