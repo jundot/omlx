@@ -84,11 +84,23 @@ Indexer 调用点 + `kernels.py::packed_index_scores` grid。
 
 ## S3 · knobs 盘点
 - `deepseek_v41_engram_ssd_offload=false`、`deepseek_v41_ced_prefill_enabled=false`
-  （Studio 现值，per-model settings，admin API 可切）。ced_prefill 是语义级
-  encoder-decoder 切分（decoder 半只 forward window 尾），长上下文潜在大头，
-  但改数值路径，需单独 A/B + 质量验收，未与 S1 混跑。
+  （Studio 现值，per-model settings，admin API 可切）。
 - affine8：v41 走 `routing.py`（非 v4 `switch_layers.py`），Studio 模型为 oQ4e
   （affine bits=4，门控 `bits in (2,3)` 不吃）——**确认吃不到，勿开**。
+
+### CED prefill A/B —— 🎯 免费午餐，但属语义级开关，留给用户验收
+`PUT /admin/api/models/{id}/settings {deepseek_v41_ced_prefill_enabled:true}` +
+重载（宽步默认同时在位，`dsv41_wide_step=8192` 锚定确认），pp=[4096,8192]×2 轮：
+
+| pp | 宽步-only 中位 | CED+宽步 轮次 | CED 中位 | CED vs 宽步 | CED vs stock |
+|---|---|---|---|---|---|
+| 4096 | 755.0 | 800.8 / 823.9 | 812.4 | **+7.6%** | **+23.6%** |
+| 8192 | 773.1 | 894.6 / 908.4 | 901.5 | **+16.6%** | **+28.8%** |
+
+分离干净（CED 每轮均高于宽步臂）。输出连贯性冒烟通过（中文问答正常）。
+**CED 改变 prefill 语义**（decoder 半仅 SWA 尾注意力，trained-in 布局但
+质量验收是产品决策）——测毕已还原 `false` 并重载出厂状态。
+用户点头即可常驻：Studio pp8192 合计 +28.8%，远超 +15% 目标线。
 
 ## 测试与基线
 - 新增 4 测（wide 首块×paged、native 门控、env force 非 NAX）+ 既有 2048 边界测试钉窄。
@@ -114,7 +126,7 @@ ssh ailab@192.168.114.162 'bash ~/ab_dsv41_wide16.sh'     # 16384 摸底
 
 Engage：ON 臂 `dsv41_wide_step=8192` + `requested_step=8192`×6；OFF 臂全 0。
 零 throttle/MemoryExceeded。**S1 完结：Studio 默认宽步生效，pp8192 +10.5%。**
-目标 +15% 未达但远非无效；playbook 内杠杆已穷尽。
+目标 +15%：宽步单杆 +10.5% 未达；叠加 S3 CED 免费午餐后 +28.8%（待用户质量验收）。
 
 ### S2 副产品线索 —— 撤回（已核实无浪费）
 复核 `kernels.py::packed_index_topk`：`block_count = min(block_count,
