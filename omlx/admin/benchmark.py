@@ -1927,7 +1927,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             "effective_qwen_floor=%s configured_block_size=%s "
             "effective_block_size=%s boundary_cache_available=%s "
             "configured_chunked_prefill=%s effective_chunked_prefill=%s "
-            "speed_priority=%s max_num_batched_tokens=%s",
+            "speed_priority=%s max_num_batched_tokens=%s "
+            "qwen4_wide_step=%s dsv41_wide_step=%s",
             getattr(configured_scheduler, "prefill_step_size", None),
             getattr(effective_scheduler, "prefill_step_size", None),
             getattr(runtime_scheduler, "_qwen35_prefill_floor", None),
@@ -1938,6 +1939,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(effective_scheduler, "chunked_prefill", None),
             getattr(effective_scheduler, "prefill_speed_priority", None),
             getattr(effective_scheduler, "max_num_batched_tokens", None),
+            getattr(runtime_scheduler, "_qwen4_wide_prefill_step", None),
+            getattr(runtime_scheduler, "_dsv41_wide_prefill_step", None),
         )
         del runtime_scheduler
 
