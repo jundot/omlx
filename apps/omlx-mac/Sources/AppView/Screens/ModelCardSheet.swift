@@ -138,13 +138,13 @@ struct ModelCardSheet: View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(target.repoId)
-                    .font(.omlxText(15, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.emphasis, weight: .semibold))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(target.source.displayName)
-                    .font(.omlxText(11, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
                     .textCase(.uppercase)
                     .kerning(0.6)
@@ -212,7 +212,7 @@ struct ModelCardSheet: View {
             activeTab = tab
         } label: {
             Text(tab.label)
-                .font(.omlxText(11.5, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                 .foregroundStyle(isSelected ? theme.text : theme.textSecondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
@@ -279,7 +279,7 @@ struct ModelCardSheet: View {
 
     private func metaChip(text: String, accent: Bool) -> some View {
         Text(text)
-            .font(.omlxText(10.5, weight: .heavy))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .heavy))
             .kerning(0.4)
             .textCase(.uppercase)
             .foregroundStyle(accent ? theme.accent : theme.textSecondary)
@@ -298,8 +298,8 @@ struct ModelCardSheet: View {
         HStack(spacing: 3) {
             Image(systemName: symbol)
                 .font(.system(size: 10, weight: .medium))
-            Text(Self.compactCount(value))
-                .font(.omlxMono(11))
+            Text(CountFormat.compact(value))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
         }
         .foregroundStyle(theme.textSecondary)
     }
@@ -314,7 +314,7 @@ struct ModelCardSheet: View {
             Text(String(localized: "downloads.card.lora_warning",
                         defaultValue: "This is a LoRA adapter. It needs a compatible base model to run — downloading on its own won't load in oMLX.",
                         comment: "Warning banner shown in the model card sheet when the repo is an adapter rather than a full model"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.text)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -343,7 +343,7 @@ struct ModelCardSheet: View {
                 Text(String(localized: "downloads.card.empty",
                             defaultValue: "This model doesn't ship a README.",
                             comment: "Empty state shown when the upstream repo has no model card"))
-                    .font(.omlxText(13))
+                    .font(.omlxText(DesignTokens.FontSize.body))
                     .foregroundStyle(theme.textSecondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -376,7 +376,7 @@ struct ModelCardSheet: View {
                     ForEach(Array(files.enumerated()), id: \.element.id) { idx, file in
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Text(file.name)
-                                .font(.omlxMono(12))
+                                .font(.omlxMono(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.text)
                                 .textSelection(.enabled)
                                 .lineLimit(1)
@@ -384,7 +384,7 @@ struct ModelCardSheet: View {
                             Spacer(minLength: 8)
                             if let s = file.sizeFormatted, !s.isEmpty {
                                 Text(s)
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.textSecondary)
                             }
                         }
@@ -425,7 +425,7 @@ struct ModelCardSheet: View {
 
     private func tagPill(_ tag: String) -> some View {
         Text(tag)
-            .font(.omlxMono(11))
+            .font(.omlxMono(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.textSecondary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
@@ -444,7 +444,7 @@ struct ModelCardSheet: View {
                 .font(.system(size: 28, weight: .light))
                 .foregroundStyle(theme.textTertiary)
             Text(message)
-                .font(.omlxText(13))
+                .font(.omlxText(DesignTokens.FontSize.body))
                 .foregroundStyle(theme.textSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -467,7 +467,7 @@ struct ModelCardSheet: View {
                         Image(systemName: "arrow.up.right.square")
                             .font(.system(size: 11))
                     }
-                    .font(.omlxText(11.5, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
                 }
                 .buttonStyle(.plain)
@@ -511,7 +511,7 @@ struct ModelCardSheet: View {
             Text(String(localized: "downloads.card.loading",
                         defaultValue: "Loading model card…",
                         comment: "Status text shown while the model README is being fetched"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -525,10 +525,10 @@ struct ModelCardSheet: View {
             Text(String(localized: "downloads.card.error",
                         defaultValue: "Couldn't load model card",
                         comment: "Title shown in the model card sheet when the fetch failed"))
-                .font(.omlxText(13, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
                 .foregroundStyle(theme.text)
             Text(message)
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
                 .multilineTextAlignment(.center)
                 .textSelection(.enabled)
@@ -558,24 +558,6 @@ struct ModelCardSheet: View {
             state = .loaded(dto)
         } catch {
             state = .failed(error.omlxDescription)
-        }
-    }
-
-    // MARK: Helpers
-
-    /// Compact-format a count for the metadata counters: 1234 → "1.2K",
-    /// 1_500_000 → "1.5M". Mirrors the HTML admin's display so the same
-    /// repos show the same numbers on both surfaces.
-    private static func compactCount(_ n: Int) -> String {
-        switch n {
-        case 1_000_000_000...:
-            return String(format: "%.1fB", Double(n) / 1_000_000_000)
-        case 1_000_000...:
-            return String(format: "%.1fM", Double(n) / 1_000_000)
-        case 1_000...:
-            return String(format: "%.1fK", Double(n) / 1_000)
-        default:
-            return String(n)
         }
     }
 }

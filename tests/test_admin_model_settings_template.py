@@ -636,7 +636,11 @@ def test_dashboard_layout_template_contract():
     assert "css/gridstack.min.css" in dashboard
     assert "js/gridstack-all.js" in dashboard
     assert "js/dashboard_layout.js" in dashboard
-    assert "dashboardWidthClass : 'max-w-7xl'" in dashboard
+    # One page frame and one measure for every tab, both on the wrapper: the
+    # Status tab's width control writes --container-wide on :root and every page
+    # reads it, so no tab carries a class of its own any more.
+    assert 'class="page-frame page-wide relative z-10"' in dashboard
+    assert "dashboardWidthClass" not in dashboard
     assert 'class="max-w-7xl mx-auto px-4' not in dashboard
 
     assert "ui_dashboard_layout" in dashboard_js
@@ -699,8 +703,8 @@ assert.deepEqual(plain(messy.blocks), [
     { id: 'applications', x: 0, y: 1, w: 24 },
 ]);
 assert.deepEqual(plain(lib.normalizeLayout({ width: 'full', blocks: [] }).blocks), []);
-assert.equal(lib.widthClass('wide'), 'max-w-[90rem]');
-assert.equal(lib.widthClass('bogus'), 'max-w-7xl');
+assert.equal(lib.widthMeasure('wide'), 'var(--measure-wide)');
+assert.equal(lib.widthMeasure('bogus'), 'var(--measure-default)');
 """
     result = subprocess.run(
         [node, "-e", script],

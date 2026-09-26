@@ -152,11 +152,11 @@ final class MenubarMetricTests: XCTestCase {
     func testFormatTpsCoversUnknownWholeAndCompactRanges() {
         XCTAssertEqual(MenubarMetricGlyph.formatTps(nil), "–")
         XCTAssertEqual(MenubarMetricGlyph.formatTps(.infinity), "–")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(-3), "0tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(0), "0tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(24.4), "24tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(999.6), "1000tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(12_345), "12.3ktk/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(-3), "0Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(0), "0Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(24.4), "24Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(999.6), "1000Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(12_345), "12.3kTok/s")
     }
 
     func testSignatureIsStableForIdenticalReadingsAndTracksEveryInput() {

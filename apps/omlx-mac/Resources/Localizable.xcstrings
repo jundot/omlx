@@ -1049,7 +1049,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Each item shows prompt-processing and token-generation speed in the menu bar. Click one for details and a live graph."
+            "value" : "Each item shows prompt-processing and Token-generation speed in the menu bar. Click one for details and a live graph."
           }
         },
         "ru" : {
@@ -4007,7 +4007,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tokens applied to Context Window"
+            "value" : "Tokens applied to Context Window"
           }
         },
         "zh-Hans" : {
@@ -4355,13 +4355,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "zh-Hans" : {
@@ -4403,13 +4403,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "zh-Hans" : {
@@ -4841,7 +4841,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prompt tokens to feed for each single-request trial"
+            "value" : "Prompt Tokens to feed for each single-request trial"
           }
         },
         "ru" : {
@@ -4913,7 +4913,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Output tokens per single-request trial"
+            "value" : "Output Tokens per single-request trial"
           }
         },
         "ru" : {
@@ -5129,13 +5129,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "zh-Hans" : {
@@ -5177,13 +5177,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "zh-Hans" : {
@@ -5297,19 +5297,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         }
       }
@@ -5465,19 +5465,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         }
       }
@@ -8430,19 +8430,523 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Lines: %lld"
+            "value" : "Lines: %@"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Строк: %lld"
+            "value" : "Строк: %@"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "行数：%lld"
+            "value" : "行数：%@"
+          }
+        }
+      }
+    },
+    "logs.detail.title" : {
+      "comment" : "Title of the card that shows one log record in full",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entry"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запись"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "記録"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "记录"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "記錄"
+          }
+        }
+      }
+    },
+    "logs.detail.close" : {
+      "comment" : "Button that closes the log record detail card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Закрыть"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "閉じる"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "닫기"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "關閉"
+          }
+        }
+      }
+    },
+    "logs.detail.lines_more" : {
+      "comment" : "Line under a capped log record body; the placeholder is how many lines are not drawn. The screen's Copy holds the whole log.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…and %@ more lines"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…и ещё %@ строк"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…残り %@ 行"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…%@줄 더"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…还有 %@ 行"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…還有 %@ 行"
+          }
+        }
+      }
+    },
+    "logs.detail.occurrences" : {
+      "comment" : "Heading above the list of times a repeated log line appeared; the placeholder is how many times",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Occurrences (%@)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Появления (%@)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "発生回数（%@ 回）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "발생 횟수 (%@회)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "出现次数（%@ 次）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "出現次數（%@ 次）"
+          }
+        }
+      }
+    },
+    "logs.detail.occurrences_more" : {
+      "comment" : "Line under the occurrence list when the list is capped; the placeholder is how many occurrences are not listed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…and %@ more"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…и ещё %@"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…ほか %@ 回"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…외 %@회"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…还有 %@ 次"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…還有 %@ 次"
+          }
+        }
+      }
+    },
+    "logs.empty.filtered" : {
+      "comment" : "Empty-state text shown when the level filter hides every log line",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No lines at this level. Lower the level filter to see more."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "На этом уровне записей нет. Понизьте минимальный уровень."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このレベルに該当する行はありません。最低レベルを下げると表示されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 수준에는 기록이 없습니다. 최소 표시 수준을 낮추면 더 볼 수 있습니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该级别下没有记录。把最低显示级别调低即可看到更多。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此等級沒有記錄。把最低顯示等級調低即可看到更多。"
+          }
+        }
+      }
+    },
+    "logs.empty.partial" : {
+      "comment" : "Empty-state text shown when the fetched log window begins in the middle of a record whose header line is above the window",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This window starts inside a log entry. Refresh to see the newest lines."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Это окно начинается внутри записи журнала. Обновите, чтобы увидеть последние строки."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この表示範囲はログエントリの途中から始まっています。更新すると最新の行が表示されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 표시 범위는 로그 항목의 중간에서 시작합니다. 새로 고치면 최신 줄을 볼 수 있습니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此窗口从一个日志条目的中间开始。刷新以查看最新日志。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此視窗從一個日誌項目的中間開始。重新整理以查看最新日誌。"
+          }
+        }
+      }
+    },
+    "logs.more_lines" : {
+      "comment" : "Button under a log record that reveals its continuation lines; the placeholder is how many lines are hidden",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≡ %@ more lines"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≡ ещё %@ строк"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≡ 残り %@ 行"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≡ %@줄 더"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≡ 还有 %@ 行"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≡ 還有 %@ 行"
+          }
+        }
+      }
+    },
+    "logs.row.autoscroll.label" : {
+      "comment" : "Row label for the switch that follows the newest log line",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto-scroll"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Автопрокрутка"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動スクロール"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 스크롤"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自动滚动"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動捲動"
+          }
+        }
+      }
+    },
+    "logs.row.level.help" : {
+      "comment" : "Tooltip on the log level filter explaining what it does",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hide everything below this level"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скрыть всё ниже этого уровня"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このレベル未満は表示しない"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 수준 미만은 숨깁니다"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "隐藏低于该级别的记录"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "隱藏低於此等級的記錄"
+          }
+        }
+      }
+    },
+    "logs.row.level.label" : {
+      "comment" : "Row label for the segmented level filter on the Logs screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Minimum level"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Минимальный уровень"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最低表示レベル"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최소 표시 수준"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最低显示级别"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最低顯示等級"
+          }
+        }
+      }
+    },
+    "logs.row.repeat.help" : {
+      "comment" : "Tooltip on the ×N badge of a repeated log line",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This line repeats; open the row to see every occurrence"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Строка повторяется; откройте её, чтобы увидеть все случаи"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この行は繰り返し出ています。行を開くとすべて表示されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 줄은 반복됩니다. 줄을 펼치면 모든 발생을 볼 수 있습니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该行重复出现，展开这一行可以看到每一次"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此行重複出現，展開這一行可以看到每一次"
           }
         }
       }
@@ -12070,7 +12574,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "≥%@ tk"
+            "value" : "≥%@ Tok"
           }
         },
         "ru" : {
@@ -12082,7 +12586,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "≥%@ tk"
+            "value" : "≥%@ Tok"
           }
         }
       }
@@ -12526,7 +13030,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Budget · %@ tk"
+            "value" : "Budget · %@ Tok"
           }
         },
         "ru" : {
@@ -12538,7 +13042,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预算 · %@ tk"
+            "value" : "预算 · %@ Tok"
           }
         }
       }
@@ -12598,7 +13102,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%@ tk"
+            "value" : "%@ Tok"
           }
         },
         "ru" : {
@@ -12610,7 +13114,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@ tk"
+            "value" : "%@ Tok"
           }
         }
       }
@@ -12622,7 +13126,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%lld tk"
+            "value" : "%lld Tok"
           }
         },
         "ru" : {
@@ -12634,7 +13138,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tk"
+            "value" : "%lld Tok"
           }
         }
       }
@@ -14470,13 +14974,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Keep multi-token prediction heads in the quantized output"
+            "value" : "Keep multi-Token prediction heads in the quantized output"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Сохранять головы multi-token prediction в квантованном результате"
+            "value" : "Сохранять головы multi-Token prediction в квантованном результате"
           }
         },
         "zh-Hans" : {
@@ -15810,7 +16314,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Validate a token to enable upload"
+            "value" : "Validate a Token to enable upload"
           }
         },
         "ru" : {
@@ -16338,7 +16842,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "HF token"
+            "value" : "HF Token"
           }
         },
         "ru" : {
@@ -18809,7 +19313,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Maximum prompt + completion tokens."
+            "value" : "Maximum prompt + completion Tokens."
           }
         },
         "ru" : {
@@ -19001,7 +19505,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Server-wide cap on generated tokens."
+            "value" : "Server-wide cap on generated Tokens."
           }
         },
         "ru" : {
@@ -19217,7 +19721,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Penalize repeated tokens."
+            "value" : "Penalize repeated Tokens."
           }
         },
         "ru" : {
@@ -20075,7 +20579,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history."
+            "value" : "Stores hourly per-model Token totals in usage.sqlite3. Turning this off keeps existing history."
           }
         },
         "ru" : {
@@ -20171,7 +20675,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models."
+            "value" : "Drafts several Tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models."
           }
         },
         "ru" : {
@@ -20243,19 +20747,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         }
       }
@@ -20267,19 +20771,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tokens"
+            "value" : "%lld Tokens"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tokens"
+            "value" : "%lld Tokens"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tokens"
+            "value" : "%lld Tokens"
           }
         }
       }
@@ -21041,7 +21545,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded."
+            "value" : "Limit thinking Tokens for reasoning models. Forces end of thinking when exceeded."
           }
         },
         "ru" : {
@@ -21089,7 +21593,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Truncate large tool results (e.g. file reads) to a token limit"
+            "value" : "Truncate large tool results (e.g. file reads) to a Token limit"
           }
         },
         "ru" : {
@@ -21233,7 +21737,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Maximum tokens per request"
+            "value" : "Maximum Tokens per request"
           }
         },
         "ru" : {
@@ -21305,7 +21809,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cap on generated tokens (empty = default)"
+            "value" : "Cap on generated Tokens (empty = default)"
           }
         },
         "ru" : {
@@ -21425,7 +21929,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Penalize tokens already present (−2 to 2)."
+            "value" : "Penalize Tokens already present (−2 to 2)."
           }
         },
         "ru" : {
@@ -21473,7 +21977,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Penalize repeated tokens (−2 to 2)."
+            "value" : "Penalize repeated Tokens (−2 to 2)."
           }
         },
         "ru" : {
@@ -21989,7 +22493,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         }
       }
@@ -22337,7 +22841,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prompts at or above this token count switch to BatchedEngine. Empty = unlimited."
+            "value" : "Prompts at or above this Token count switch to BatchedEngine. Empty = unlimited."
           }
         },
         "ru" : {
@@ -22481,7 +22985,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Attention-sink tokens always kept in the window. Empty = dflash default (0)."
+            "value" : "Attention-sink Tokens always kept in the window. Empty = dflash default (0)."
           }
         },
         "ru" : {
@@ -22961,7 +23465,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Min prompt tokens to trigger (shorter prompts use full prefill)."
+            "value" : "Min prompt Tokens to trigger (shorter prompts use full prefill)."
           }
         },
         "ru" : {
@@ -26330,7 +26834,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Note: Sub-block Cache means requests below one full block (for example <1024 tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks."
+            "value" : "Note: Sub-block Cache means requests below one full block (for example <1024 Tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks."
           }
         },
         "zh-Hans" : {
@@ -27952,7 +28456,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "00–23 hours · darker green means more tokens · repeated DST hours combine"
+            "value" : "00–23 hours · darker green means more Tokens · repeated DST hours combine"
           }
         },
         "ru" : {
@@ -27976,7 +28480,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%@ tokens"
+            "value" : "%@ Tokens"
           }
         },
         "ru" : {
@@ -28000,7 +28504,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%1$lld requests · %2$@ tok/s"
+            "value" : "%1$lld requests · %2$@ Tok/s"
           }
         },
         "ru" : {
@@ -28012,7 +28516,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%1$lld 个请求 · %2$@ tok/s"
+            "value" : "%1$lld 个请求 · %2$@ Tok/s"
           }
         }
       }
@@ -28048,7 +28552,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%1$@ %2$@:00 · %3$@ tokens"
+            "value" : "%1$@ %2$@:00 · %3$@ Tokens"
           }
         },
         "ru" : {
@@ -30238,7 +30742,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Best token generation (TG)"
+            "value" : "Best Token generation (TG)"
           }
         },
         "ko" : {

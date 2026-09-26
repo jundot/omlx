@@ -1,5 +1,5 @@
 <!-- Engine Versions -->
-<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+<div class="card overflow-hidden">
     <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
         <div class="flex items-center gap-3">
             <i data-lucide="cpu" class="w-4 h-4 text-neutral-500"></i>
@@ -13,7 +13,7 @@
                 <div class="flex items-center gap-2">
                     <template x-if="engine.commit && engine.url">
                         <a :href="engine.url" target="_blank" rel="noopener noreferrer"
-                           class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-blue-600 hover:text-blue-800 hover:bg-blue-50 transition-all"
+                           class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-neutral-700 hover:text-neutral-900 hover:bg-neutral-100 transition-all"
                            x-text="engine.commit.substring(0, 7)"></a>
                     </template>
                     <template x-if="!engine.commit">
