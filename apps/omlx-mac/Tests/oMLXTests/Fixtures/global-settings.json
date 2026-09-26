@@ -73,8 +73,6 @@
         "sub_keys": []
     },
     "claude_code": {
-        "context_scaling_enabled": false,
-        "target_context_size": 200000,
         "mode": "cloud",
         "opus_model": null,
         "sonnet_model": null,

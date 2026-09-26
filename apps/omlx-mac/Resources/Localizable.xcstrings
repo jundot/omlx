@@ -7199,54 +7199,6 @@
         }
       }
     },
-    "integrations.claude.context_scaling" : {
-      "comment" : "Row label for the Claude Code context scaling toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Context scaling"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Масштабирование контекста"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "上下文缩放"
-          }
-        }
-      }
-    },
-    "integrations.claude.context_scaling.sub" : {
-      "comment" : "Sublabel for the context scaling toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Stretch context windows for long agentic sessions"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Расширять контекстные окна для долгих агентных сессий"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "为长时间代理会话扩展上下文窗口"
-          }
-        }
-      }
-    },
     "integrations.claude.haiku" : {
       "comment" : "Row label for the Haiku model picker",
       "extractionState" : "manual",
@@ -7415,54 +7367,6 @@
         }
       }
     },
-    "integrations.claude.target_context" : {
-      "comment" : "Row label for the Claude Code target context size field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Target context size"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Целевой размер контекста"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "目标上下文大小"
-          }
-        }
-      }
-    },
-    "integrations.claude.target_context.sub" : {
-      "comment" : "Sublabel for the target context size field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Per-request context window Claude Code will scale toward"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Контекстное окно, к которому Claude Code будет масштабировать каждый запрос"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code 将缩放到的每次请求上下文窗口"
-          }
-        }
-      }
-    },
     "integrations.codex.app" : {
       "comment" : "Label for the Codex desktop app launcher command",
       "extractionState" : "extracted_with_value",
@@ -7531,30 +7435,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "$ 终端"
-          }
-        }
-      }
-    },
-    "integrations.error.target_context_invalid" : {
-      "comment" : "Integrations screen error when the target context size input is invalid",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Target context size must be a positive integer."
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Целевой размер контекста должен быть положительным целым числом."
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "目标上下文大小必须是正整数。"
           }
         }
       }
@@ -8035,30 +7915,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "将真正的 `claude` 二进制文件指向你的本地 oMLX 服务器。"
-          }
-        }
-      }
-    },
-    "integrations.target_context.apply" : {
-      "comment" : "Apply button for the Claude Code target context size field",
-      "extractionState" : "extracted_with_value",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Apply"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Применить"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "应用"
           }
         }
       }
