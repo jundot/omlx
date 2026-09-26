@@ -168,3 +168,7 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+# Fused routed-expert decode tests
+
+Run `python -m pytest -q tests/test_qwen35_moe_routed_decode.py tests/test_qwen35_moe_router.py tests/test_qwen35_moe_gate_up.py` to check the one-token routed-expert kernels. Real `Qwen3_5MoeSparseMoeBlock` instances with random 4-bit weights at the Flash-Next shape (hidden 2560, intermediate 640, top-k 10) and at hidden 1024 / intermediate 320 must match the composed body bit for bit. The other cases check that shapes where MLX would pick a different mat-vec partition, other bit widths and group sizes, top-k 8, prefill and verify rows, float16, blocks without the gate+up fusion and a kernel failure all keep the composed body.
