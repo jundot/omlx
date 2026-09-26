@@ -666,3 +666,42 @@ def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
     )
     config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
     assert planner._supports_pipeline(config) is True
+
+
+def test_planned_pipeline_accepts_the_split_argument_models_forward():
+    """Model overrides such as Qwen3.5's call ``super().pipeline(group,
+    split=None)``; the plan owns the layer ranges and refuses an explicit split."""
+    from types import SimpleNamespace
+
+    from mlx_lm.models.pipeline import PipelineMixin
+
+    from omlx.cluster.planner import (
+        PipelineAssignment,
+        PlanningError,
+        install_unequal_pipeline_plan,
+    )
+
+    class Stage(PipelineMixin):
+        def __init__(self):
+            super().__init__()
+            self.layers = ["layer-0", "layer-1", "layer-2"]
+
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    plan = [
+        PipelineAssignment(
+            node_id="node-0",
+            rank=0,
+            start_layer=0,
+            end_layer=3,
+            layer_weight_bytes=1,
+            fixed_weight_bytes=1,
+            reserve_bytes=0,
+            capacity_bytes=1,
+        )
+    ]
+    with install_unequal_pipeline_plan(plan):
+        stage = Stage()
+        stage.pipeline(group, split=None)
+        assert stage.pipeline_layers == ["layer-0", "layer-1", "layer-2"]
+        with pytest.raises(PlanningError, match="explicit pipeline split"):
+            Stage().pipeline(group, split=[3])

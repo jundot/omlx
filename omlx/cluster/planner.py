@@ -1765,7 +1765,14 @@ def install_unequal_pipeline_plan(
 
     original = PipelineMixin.pipeline
 
-    def planned_pipeline(pipeline_model: Any, group: Any) -> None:
+    def planned_pipeline(pipeline_model: Any, group: Any, split: Any = None) -> None:
+        # Qwen3.5, Qwen3-Next and Ministral 3 override ``pipeline`` and forward
+        # their ``split`` argument (default None) to the mixin. The plan owns
+        # every stage's layer range, so an explicit split is refused.
+        if split is not None:
+            raise PlanningError(
+                "an explicit pipeline split conflicts with the installed shard plan"
+            )
         apply_pipeline_assignment(pipeline_model, group, assignments)
 
     # The worker's pre-load memory guard looks for this exact contract. A
