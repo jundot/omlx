@@ -847,6 +847,139 @@ class TestImageSizeAndDownscaling:
         with pytest.raises(InvalidRequestError, match="decompression bomb detected"):
             load_image(uri)
 
+    @staticmethod
+    def _gradient_image(width, height, mode):
+        """Image with a pattern that shows filtering, orientation, and alpha."""
+        img = Image.new("RGB", (width, height))
+        img.putdata(
+            [
+                ((x * 7) % 256, (y * 5) % 256, 0 if (x // 3) % 2 else 255)
+                for y in range(height)
+                for x in range(width)
+            ]
+        )
+        if mode == "P":
+            return img.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
+        if mode == "P;transparency":
+            pal = img.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
+            pal.info["transparency"] = 0
+            return pal
+        if mode == "RGBA":
+            rgba = img.convert("RGBA")
+            rgba.putalpha(Image.linear_gradient("L").resize(img.size))
+            return rgba
+        return img.convert(mode)
+
+    @staticmethod
+    def _reference_decode(img_bytes, max_side):
+        """The previous loader: orient and convert at full size, then resize."""
+        from PIL import ImageOps
+
+        rgb = ImageOps.exif_transpose(Image.open(io.BytesIO(img_bytes)))
+        rgb = rgb.convert("RGB")
+        rgb.thumbnail((max_side, max_side), resample=Image.Resampling.LANCZOS)
+        return rgb
+
+    @pytest.mark.parametrize(
+        "mode", ["RGB", "L", "1", "P", "P;transparency", "RGBA", "LA", "I;16"]
+    )
+    @pytest.mark.parametrize("orientation", [None, 6])
+    def test_resize_first_matches_resizing_after_conversion(
+        self, monkeypatch, mode, orientation
+    ):
+        """Resizing before orientation and RGB conversion gives the same pixels."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 32)
+        img = self._gradient_image(120, 80, mode)
+        buf = io.BytesIO()
+        if orientation is None:
+            img.save(buf, format="PNG")
+        else:
+            exif = Image.Exif()
+            exif[0x0112] = orientation
+            img.save(buf, format="PNG", exif=exif)
+        img_bytes = buf.getvalue()
+
+        loaded = load_image(
+            "data:image/png;base64," + base64.b64encode(img_bytes).decode()
+        )
+        expected = self._reference_decode(img_bytes, 32)
+        assert loaded.size == expected.size
+        assert loaded.size == ((32, 21) if orientation is None else (21, 32))
+        if orientation is None:
+            assert loaded.tobytes() == expected.tobytes()
+        else:
+            # A 90-degree turn swaps the order of the two resize passes, so
+            # hard edges can round differently.
+            diff = [abs(a - b) for a, b in zip(loaded.tobytes(), expected.tobytes())]
+            assert max(diff) <= 8
+            assert sum(diff) / len(diff) < 1
+
+    def test_palette_image_is_filtered_not_sampled(self, monkeypatch):
+        """Thin lines in a palette image survive downscaling as gray, not vanish."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 64)
+        img = Image.new("L", (192, 192), 255)
+        for x in range(0, 192, 6):
+            img.paste(0, (x, 0, x + 1, 192))
+        b64 = _image_to_base64(img.convert("P"))
+
+        loaded = load_image(f"data:image/png;base64,{b64}")
+        assert loaded.size == (64, 64)
+        # NEAREST would land between the lines and return pure white.
+        assert min(loaded.convert("L").getdata()) < 240
+
+    def test_jpeg_decodes_at_reduced_scale(self, monkeypatch):
+        """JPEGs use decoder-assisted downscaling and keep EXIF orientation."""
+        from PIL import ImageFile
+
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 64)
+        decoded = []
+        original_load = ImageFile.ImageFile.load
+
+        def recording_load(image):
+            decoded.append(image.size)
+            return original_load(image)
+
+        monkeypatch.setattr(ImageFile.ImageFile, "load", recording_load)
+        ramp = Image.linear_gradient("L")
+        img = Image.merge(
+            "RGB",
+            (ramp, ramp.rotate(90), ramp.transpose(Image.Transpose.FLIP_TOP_BOTTOM)),
+        ).resize((512, 256))
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", exif=exif, quality=95)
+        img_bytes = buf.getvalue()
+
+        loaded = load_image(
+            "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode()
+        )
+        assert loaded.size == (32, 64)
+        # 1/8 DCT scaling gives exactly the 64x32 target before orientation.
+        assert decoded and set(decoded) == {(64, 32)}
+
+        expected = self._reference_decode(img_bytes, 64)
+        diff = [abs(a - b) for a, b in zip(loaded.tobytes(), expected.tobytes())]
+        assert sum(diff) / len(diff) < 8
+
+    def test_images_in_pillow_warning_range_are_downscaled(self, monkeypatch):
+        """Images between Pillow's warning and error limits still load."""
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 300)
+        monkeypatch.setattr(module, "get_max_image_side_length", lambda: 10)
+        b64 = _image_to_base64(_make_test_image(20, 20))  # 400 pixels
+
+        with pytest.warns(Image.DecompressionBombWarning):
+            loaded = load_image(f"data:image/png;base64,{b64}")
+        assert loaded.size == (10, 10)
+
     def test_extract_images_from_messages_downscales_oversized(self, monkeypatch):
         """extract_images_from_messages downscales oversized images in messages."""
         from omlx.utils import image as module
