@@ -4155,7 +4155,12 @@ class Scheduler:
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
     def _predicted_chunk_transient(
-        self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
+        self,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        gathered_core: bool = False,
+        include_kv: bool = True,
     ) -> float:
         """Predict additional memory needed for the next prefill chunk.
 
@@ -4164,29 +4169,40 @@ class Scheduler:
         DSA) use their nonlinear static profile plus observed overhead
         released from the pool. Retained overhead is already included in
         current footprint and must not be charged again.
+
+        ``include_kv=False`` leaves out the chunk's own KV growth, for callers
+        that already charge the prompt's resident KV.
         """
         if n_tokens <= 0:
             return 0.0
         per_token = 0.0
         static_per_token = 0.0
+        kv_bytes = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
+        qwen4_flat_overhead = Scheduler._prefill_flat_overhead_enabled(self)
         if self.memory_monitor is not None:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
                 n_tokens,
                 kv_len + n_tokens,
                 gathered_core=gathered_core,
             )
-            static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
             per_token = static_per_token
-        qwen4_flat_overhead = Scheduler._prefill_flat_overhead_enabled(self)
+            growth = getattr(
+                self.memory_monitor, "estimate_chunk_kv_growth_bytes", None
+            )
+            if include_kv and (qwen4_flat_overhead or growth is None):
+                kv_bytes = float(self.memory_monitor.estimate_prompt_kv_bytes(n_tokens))
+            elif include_kv:
+                kv_bytes = float(growth(kv_len, n_tokens))
         if tracker is not None:
             if qwen4_flat_overhead:
                 # Qwen4 models token-scaled work statically. Add measured
                 # overhead only after the pool releases it for reallocation.
+                static_bytes = static_per_token * n_tokens + kv_bytes
                 return (
-                    static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+                    static_bytes * self._PREFILL_TRANSIENT_SAFETY
                     + tracker.flat_overhead_charge_for(gathered_core)
                 )
             # Dense SDPA and gathered QSA have different cost curves. The
@@ -4203,15 +4219,21 @@ class Scheduler:
                 measured = last_delta_bytes / last_n_tokens
                 if measured > 0:
                     per_token = max(per_token, measured)
-        base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+        base_prediction = (
+            per_token * n_tokens + kv_bytes
+        ) * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
-            static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
-            + recent_reclaim
-        )
+            static_per_token * n_tokens + kv_bytes
+        ) * self._PREFILL_TRANSIENT_SAFETY + recent_reclaim
         return max(base_prediction, reallocation_prediction)
 
     def _admission_transient_bound(
-        self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
+        self,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        gathered_core: bool = False,
+        include_kv: bool = True,
     ) -> float:
         """Transient charge for admission and the guard's pass/abort gates.
 
@@ -4234,7 +4256,7 @@ class Scheduler:
         """
 
         bound = self._predicted_chunk_transient(
-            n_tokens, kv_len, gathered_core=gathered_core
+            n_tokens, kv_len, gathered_core=gathered_core, include_kv=include_kv
         )
         tracker = self._prefill_transient_tracker
         if tracker is not None:
@@ -5187,20 +5209,28 @@ class Scheduler:
                 requested_step,
             )
             return
+        # Track the chunk's growth net of its own KV, which the predictor adds
+        # back exactly and admission already charges as resident KV.
+        kv_growth = 0
+        if MemoryMonitor is not None and isinstance(monitor, MemoryMonitor):
+            kv_growth = int(monitor.estimate_chunk_kv_growth_bytes(kv_len, n_tokens))
+        transient = delta - kv_growth
         self._prefill_transient_tracker.update(
             n_tokens,
-            delta,
+            transient,
             floor_sample=n_tokens <= min_chunk,
             gathered_core=gathered_core,
         )
         logger.debug(
-            "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
+            "[throttle:%s] measure rid=%s n=%d kv_len=%d delta=%.2fMB kv=%.2fMB transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
             loop_label,
             request_id,
             n_tokens,
             kv_len,
             delta / 1024**2,
-            (delta / max(n_tokens, 1)) / 1024,
+            kv_growth / 1024**2,
+            transient / 1024**2,
+            (transient / max(n_tokens, 1)) / 1024,
             self._prefill_transient_tracker.bytes_per_token_for(gathered_core)
             / 1024,
             self._prefill_transient_tracker.observed_max_bytes_for(gathered_core)
@@ -10588,6 +10618,7 @@ class Scheduler:
           window layers capped at window + floor_chunk - 1, MLA override,
           measured GDN/Mamba fixed state) — the part chunking cannot reduce,
         - ``transient`` is the floor-chunk charge at the full prompt kv_len,
+          net of that chunk's own KV (already in ``kv_exact``), and
           floored by the session's observed max chunk transient (chunk
           transients are size-invariant, so the throttle cannot get under
           it by shrinking).
@@ -10631,9 +10662,10 @@ class Scheduler:
             monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
         )
         gathered_core = self._qwen4_text_gathered_pricing(text_only)
+        # kv_exact already holds the charged chunk's KV.
         transient = int(
             self._admission_transient_bound(
-                floor_chunk, kv_len, gathered_core=gathered_core
+                floor_chunk, kv_len, gathered_core=gathered_core, include_kv=False
             )
         )
         if kv_exact <= 0 and transient <= 0:

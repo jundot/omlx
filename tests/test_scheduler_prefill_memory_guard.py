@@ -773,7 +773,7 @@ def test_admission_estimate_is_the_single_formula():
         )
     )
     assert est.transient == int(
-        scheduler._admission_transient_bound(floor, pre_chunk_kv_len)
+        scheduler._admission_transient_bound(floor, pre_chunk_kv_len, include_kv=False)
     )
     assert est.estimated == est.kv_exact + est.transient
 
@@ -814,6 +814,7 @@ def test_admission_charges_full_step_under_speed_priority():
         scheduler._admission_transient_bound(
             scheduler.config.prefill_step_size,
             32767 - scheduler.config.prefill_step_size,
+            include_kv=False,
         )
     )
     # The full-step charge is strictly more conservative.
@@ -826,6 +827,58 @@ def test_admission_charges_full_step_under_speed_priority():
         )
     assert est_small is not None
     assert est_small.floor_chunk == 1023
+
+
+def test_admission_does_not_charge_measured_chunk_kv_twice():
+    """A measured chunk's delta includes the KV it wrote. Admission already
+    charges resident KV, so it must price only the rest of that growth,
+    while chunk sizing still adds the chunk's own KV."""
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    model = MagicMock()
+    model.layers = []
+    model.config = _ModelConfig(
+        num_hidden_layers=48,
+        num_key_value_heads=8,
+        num_attention_heads=16,
+        head_dim=256,
+    )
+    model.make_cache = lambda: (
+        [KVCache() for _ in range(8)]
+        + [RotatingKVCache(max_size=1024) for _ in range(40)]
+    )
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0
+        ),
+    )
+    scheduler._prefill_speed_priority = True
+    monitor = scheduler.memory_monitor
+
+    kv = int(monitor.estimate_resident_kv_bytes(2048, chunk_tokens=2048))
+    other = 884 * 1024**2
+    scheduler._record_chunk_transient(
+        2048,
+        0,
+        kv + other,
+        request_id="warmup",
+        loop_label="external",
+        kv_len=0,
+        requested_step=2048,
+    )
+
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=4097, cached_tokens=0, current=0
+    )
+    assert est is not None
+    assert est.transient == pytest.approx(other * 1.3, rel=1e-6)
+    assert scheduler._predicted_chunk_transient(2048, 0) == pytest.approx(
+        (kv + other) * 1.3, rel=1e-6
+    )
 
 
 def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(

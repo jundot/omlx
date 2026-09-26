@@ -713,6 +713,14 @@ class MemoryMonitor:
 
         return total + self._fixed_state_bytes
 
+    def estimate_chunk_kv_growth_bytes(self, kv_len: int, n_tokens: int) -> float:
+        """Resident KV a prefill chunk of ``n_tokens`` adds after ``kv_len``."""
+        if n_tokens <= 0:
+            return 0
+        return self.estimate_resident_kv_bytes(
+            kv_len + n_tokens, chunk_tokens=n_tokens
+        ) - self.estimate_resident_kv_bytes(kv_len, chunk_tokens=n_tokens)
+
     def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
         hd = self._head_dim or 0
         n_q = self._num_attention_heads or 0
