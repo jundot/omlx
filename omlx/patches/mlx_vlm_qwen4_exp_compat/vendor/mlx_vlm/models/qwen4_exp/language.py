@@ -233,6 +233,27 @@ def _append_indexer_positions(
     return mx.concatenate([cached, position_ids], axis=-1)
 
 
+def _roll_logical_prefix(x, shifts, length: int, axis: int):
+    """``dynamic_roll`` of ``x[:length]`` along ``axis``; the tail is kept.
+
+    For every position below ``length`` the gather index is exactly the one
+    ``dynamic_roll`` computes on the exact-width prefix, so the logical
+    window is bit-identical; positions at or past ``length`` map to
+    themselves and the output keeps ``x``'s full (stepped) width.
+    """
+    n = x.shape[axis]
+    if n == length:
+        return dynamic_roll(x, shifts, axis=axis)
+    if length <= 0:
+        return x
+    expand_shifts = (...,) + (None,) * (x.ndim - axis)
+    expand_indices = expand_shifts[:-1]
+    positions = mx.arange(n)[expand_indices]
+    rolled = (positions - shifts[expand_shifts]) % length
+    idx = mx.where(positions < length, rolled, positions)
+    return mx.take_along_axis(x, idx, axis=axis)
+
+
 class _QSAIndexerCache:
     """Capacity-backed raw and completed-block state shared by QSA caches.
 
@@ -633,11 +654,62 @@ class BatchQSAKVCache:
     _omlx_mtp_batch_rollback_cache = True
     _omlx_mtp_verify_attention_cache = True
 
+    # Decode appends write into a stepped backing buffer instead of
+    # concatenating the whole raw-key bank every step. Each concatenate left
+    # the previous exact-width bank in MLX's pool, where it can never satisfy
+    # a (larger) later request, so the pool grew with every page crossed.
+    index_step = 1024
+
     def __init__(self, left_padding):
         self.kv_cache = BatchKVCache(left_padding)
         self.index_keys = None
         self.index_position_ids = None
         self.index_offset = 0
+
+    # ``index_keys`` / ``index_position_ids`` keep their exact-width public
+    # meaning. Arrays assigned from outside (merge/extend/filter/state/tests)
+    # are returned unchanged, exactly like the former plain attributes; only a
+    # backing buffer this class grew itself is sliced to ``index_offset``.
+    @property
+    def index_keys(self):
+        keys = self._index_keys
+        if keys is None or not self._index_capacity_managed:
+            return keys
+        return keys[:, : self.index_offset]
+
+    @index_keys.setter
+    def index_keys(self, value):
+        self._release_index_capacity()
+        self._index_keys = value
+
+    @property
+    def index_position_ids(self):
+        positions = self._index_position_ids
+        if positions is None or not self._index_capacity_managed:
+            return positions
+        return positions[..., : self.index_offset]
+
+    @index_position_ids.setter
+    def index_position_ids(self, value):
+        self._release_index_capacity()
+        self._index_position_ids = value
+
+    def _release_index_capacity(self):
+        """Collapse a managed buffer to its logical prefix before a plain set.
+
+        Callers assign keys and positions one at a time (filter, extend,
+        state); the not-yet-assigned partner must already be exact-width.
+        """
+        if not getattr(self, "_index_capacity_managed", False):
+            self._index_capacity_managed = False
+            return
+        self._index_capacity_managed = False
+        if self._index_keys is not None:
+            self._index_keys = self._index_keys[:, : self.index_offset]
+        if self._index_position_ids is not None:
+            self._index_position_ids = self._index_position_ids[
+                ..., : self.index_offset
+            ]
 
     @property
     def keys(self):
@@ -666,15 +738,70 @@ class BatchQSAKVCache:
         return self.kv_cache.update_and_fetch(keys, values)
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
-        if self.index_keys is None:
+        cached_keys = self.index_keys
+        cached_positions = self.index_position_ids
+        if cached_keys is None:
             self.index_keys = keys
             self.index_position_ids = position_ids
-        else:
-            self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
-            self.index_position_ids = _append_indexer_positions(
-                self.index_position_ids, position_ids
+            self.index_offset = self.index_keys.shape[1]
+            return self.index_keys, self.index_position_ids
+
+        # Same rank promotion as _append_indexer_positions (it also raises on
+        # incompatible ranks), applied before the in-place write.
+        if cached_positions.ndim == 3 and position_ids.ndim == 2:
+            position_ids = mx.broadcast_to(
+                position_ids[None],
+                (cached_positions.shape[0], *position_ids.shape),
             )
-        self.index_offset = self.index_keys.shape[1]
+        elif cached_positions.ndim == 2 and position_ids.ndim == 3:
+            cached_positions = mx.broadcast_to(
+                cached_positions[None],
+                (position_ids.shape[0], *cached_positions.shape),
+            )
+        elif cached_positions.ndim != position_ids.ndim:
+            raise ValueError(
+                "QSA position IDs must be 2-D text positions or 3-D MRoPE "
+                f"positions, got cached={cached_positions.shape} and "
+                f"current={position_ids.shape}."
+            )
+        if (
+            cached_keys.dtype != keys.dtype
+            or cached_positions.dtype != position_ids.dtype
+        ):
+            # concatenate would promote; keep its exact semantics.
+            self.index_keys = mx.concatenate([cached_keys, keys], axis=1)
+            self.index_position_ids = mx.concatenate(
+                [cached_positions, position_ids], axis=-1
+            )
+            self.index_offset = self.index_keys.shape[1]
+            return self.index_keys, self.index_position_ids
+
+        start = int(cached_keys.shape[1])
+        end = start + int(keys.shape[1])
+        if (
+            not self._index_capacity_managed
+            or cached_positions.shape[:-1] != self._index_position_ids.shape[:-1]
+            or end > int(self._index_keys.shape[1])
+        ):
+            step = self.index_step
+            capacity = ((end + step - 1) // step) * step
+            new_keys = mx.zeros(
+                (cached_keys.shape[0], capacity, cached_keys.shape[-1]),
+                dtype=cached_keys.dtype,
+            )
+            new_positions = mx.zeros(
+                (*cached_positions.shape[:-1], capacity),
+                dtype=cached_positions.dtype,
+            )
+            if start:
+                new_keys[:, :start] = cached_keys
+                new_positions[..., :start] = cached_positions
+            self._index_keys = new_keys
+            self._index_position_ids = new_positions
+            self._index_capacity_managed = True
+        self._index_keys[:, start:end] = keys
+        self._index_position_ids[..., start:end] = position_ids
+        self.index_offset = end
         return self.index_keys, self.index_position_ids
 
     def prepare(self, **kwargs):
@@ -684,6 +811,23 @@ class BatchQSAKVCache:
         right_padding = getattr(self.kv_cache, "_right_padding", None)
         self.kv_cache.finalize()
         if right_padding is None or self.index_keys is None:
+            return
+        if self._index_capacity_managed:
+            # Roll only the logical prefix (identical indices to the exact-width
+            # roll) but keep the stepped width, so the result recycles the
+            # previous same-size buffer instead of allocating a new width.
+            length = self.index_offset
+            self._index_keys = _roll_logical_prefix(
+                self._index_keys, right_padding, length, axis=1
+            )
+            if self._index_position_ids.ndim == 3:
+                self._index_position_ids = _roll_logical_prefix(
+                    self._index_position_ids, right_padding[None], length, axis=2
+                )
+            else:
+                self._index_position_ids = _roll_logical_prefix(
+                    self._index_position_ids, right_padding, length, axis=1
+                )
             return
         self.index_keys = dynamic_roll(self.index_keys, right_padding, axis=1)
         if self.index_position_ids.ndim == 3:
@@ -944,6 +1088,10 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        if self._index_capacity_managed:
+            # The managed buffer is addressed by index_offset; the stale draft
+            # columns past it are overwritten by the next update_indexer.
+            return trimmed
         # Slice the physical arrays like the singleton trim does:
         # update_indexer concatenates onto them and re-derives index_offset
         # from shape[1], so stale draft columns would otherwise fossilize
@@ -980,8 +1128,8 @@ class BatchQSAKVCache:
     @property
     def nbytes(self):
         extra = 0
-        if self.index_keys is not None:
-            extra = self.index_keys.nbytes + self.index_position_ids.nbytes
+        if self._index_keys is not None:
+            extra = self._index_keys.nbytes + self._index_position_ids.nbytes
         return self.kv_cache.nbytes + extra
 
 
