@@ -88,7 +88,7 @@ Indexer 调用点 + `kernels.py::packed_index_scores` grid。
 - affine8：v41 走 `routing.py`（非 v4 `switch_layers.py`），Studio 模型为 oQ4e
   （affine bits=4，门控 `bits in (2,3)` 不吃）——**确认吃不到，勿开**。
 
-### CED prefill A/B —— 🎯 免费午餐，但属语义级开关，留给用户验收
+### CED prefill A/B —— 🎯 免费午餐，✅ 用户验收通过，Studio 常驻
 `PUT /admin/api/models/{id}/settings {deepseek_v41_ced_prefill_enabled:true}` +
 重载（宽步默认同时在位，`dsv41_wide_step=8192` 锚定确认），pp=[4096,8192]×2 轮：
 
@@ -98,9 +98,13 @@ Indexer 调用点 + `kernels.py::packed_index_scores` grid。
 | 8192 | 773.1 | 894.6 / 908.4 | 901.5 | **+16.6%** | **+28.8%** |
 
 分离干净（CED 每轮均高于宽步臂）。输出连贯性冒烟通过（中文问答正常）。
-**CED 改变 prefill 语义**（decoder 半仅 SWA 尾注意力，trained-in 布局但
-质量验收是产品决策）——测毕已还原 `false` 并重载出厂状态。
-用户点头即可常驻：Studio pp8192 合计 +28.8%，远超 +15% 目标线。
+**CED 改变 prefill 计算图**（非近似：解码器半块中间位置输出本就无消费者），
+带三道硬闸：`ced_layout_supported()` 拒不合规布局、verify 路径不走 CED
+（language.py:958）、MTP draft 捕获显式 raise（mtp.py:149）。
+贪心逐字对比（长文档总结 + KV 显存计算题，temperature=0）：计算题逐字一致，
+总结题第 34 字差一词（"请用"vs"用"，浮点重排被 argmax 放大的常态）。
+**2026-09-26 用户验收通过，Studio 常驻 `ced_prefill_enabled=true`**；
+常驻复核 pp8192=866.2 tps（+23.8% vs stock 中位）。
 
 ## 测试与基线
 - 新增 4 测（wide 首块×paged、native 门控、env force 非 NAX）+ 既有 2048 边界测试钉窄。
@@ -126,7 +130,7 @@ ssh ailab@192.168.114.162 'bash ~/ab_dsv41_wide16.sh'     # 16384 摸底
 
 Engage：ON 臂 `dsv41_wide_step=8192` + `requested_step=8192`×6；OFF 臂全 0。
 零 throttle/MemoryExceeded。**S1 完结：Studio 默认宽步生效，pp8192 +10.5%。**
-目标 +15%：宽步单杆 +10.5% 未达；叠加 S3 CED 免费午餐后 +28.8%（待用户质量验收）。
+目标 +15%：宽步单杆 +10.5% 未达；叠加 S3 CED 免费午餐后 +28.8%（已验收常驻）。
 
 ### S2 副产品线索 —— 撤回（已核实无浪费）
 复核 `kernels.py::packed_index_topk`：`block_count = min(block_count,
