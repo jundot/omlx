@@ -25,7 +25,6 @@ module.exports = {
           DEFAULT: 'var(--text-primary)',
           secondary: 'var(--text-secondary)',
           tertiary: 'var(--text-tertiary)',
-          muted: 'var(--text-muted)',
         },
         line: {
           DEFAULT: 'var(--border-faint)',
