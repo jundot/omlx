@@ -124,3 +124,25 @@ def test_mtp_path_matcher():
     assert not _is_mtp_path("layers.3.mlp.switch_mlp")
     assert not _is_mtp_path("language_model.model.layers.0.mlp.switch_mlp")
     assert not _is_mtp_path("mtp_proj.switch_mlp")
+
+
+def test_admission_and_wrapper_share_the_mtp_matcher(tmp_path, monkeypatch):
+    """Admission must price the head by the same rule the wrapper skips it."""
+    from omlx.patches import moe_expert_offload as moe
+
+    _build(tmp_path)
+    full = sum(f.stat().st_size for f in tmp_path.glob("*.safetensors"))
+    seen = []
+    real = moe._is_mtp_path
+
+    def spy(name):
+        seen.append(name)
+        return real(name)
+
+    monkeypatch.setattr(moe, "_is_mtp_path", spy)
+    streamed = moe.estimate_offload_admission_bytes(tmp_path, full, 0.25)
+    resident = moe.estimate_offload_admission_bytes(
+        tmp_path, full, 0.25, mtp_resident=True
+    )
+    assert any(n.startswith("mtp.layers.0.mlp.switch_mlp.") for n in seen)
+    assert resident > streamed

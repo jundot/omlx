@@ -1087,3 +1087,61 @@ class TestBatchedEngineSpecPrefillForwarding:
         await engine.chat(messages, is_partial=True)
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "generation_prompt_text" not in call_kwargs
+
+
+class TestBatchedEngineMoeOffloadWiring:
+    """The text engine's offload call must carry the Lightning MTP residency flag.
+
+    Admission prices the draft head as resident when MTP is on, so the wrapper
+    must keep it resident on this path too (the VLM engine already does).
+    Test adapted from @sje397's #3946.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mtp_enabled", "expected"), [(True, True), (False, False)]
+    )
+    async def test_offload_call_forwards_mtp_residency(self, mtp_enabled, expected):
+        from omlx.engine.batched import BatchedEngine
+        from omlx.model_settings import ModelSettings
+
+        seen: dict = {}
+
+        class _Abort(Exception):
+            """Unwinds start() once the call site has been observed."""
+
+        def _recorder(model, model_name, fraction, **kwargs):
+            seen["kwargs"] = kwargs
+            seen["args"] = (model_name, fraction)
+            raise _Abort
+
+        engine = BatchedEngine(
+            model_name="test-model",
+            model_settings=ModelSettings(
+                moe_expert_offload_enabled=True, mtp_enabled=mtp_enabled
+            ),
+        )
+        with (
+            patch("omlx.engine.batched.get_tokenizer_config", return_value={}),
+            patch("omlx.utils.model_loading.maybe_apply_pre_load_patches"),
+            patch(
+                "omlx.utils.model_loading.maybe_load_custom_quantization",
+                return_value=(object(), object()),
+            ),
+            patch(
+                "omlx.utils.model_loading.apply_post_load_transforms",
+                side_effect=lambda model, settings: model,
+            ),
+            patch(
+                "omlx.patches.moe_expert_offload.apply_moe_expert_offload", _recorder
+            ),
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
+        ):
+            with pytest.raises(_Abort):
+                await engine.start()
+
+        assert seen["kwargs"] == {"mtp_resident": expected}
+        assert seen["args"] == (
+            "test-model",
+            engine._model_settings.moe_expert_offload_resident_fraction,
+        )

@@ -645,7 +645,12 @@ def _resolve_model_dir(model_path: str | Path) -> Path | None:
 
 
 def _is_mtp_path(path: str) -> bool:
-    """True for modules under an embedded MTP draft head (``mtp.*`` / ``*.mtp.*``)."""
+    """True for modules or checkpoint tensors under an embedded MTP draft head.
+
+    Matches ``mtp.*`` and ``*.mtp.*`` by path segment. Shared by the wrapper
+    loop and ``estimate_offload_admission_bytes`` so admission prices exactly
+    what the wrapper keeps resident.
+    """
     return "mtp" in path.split(".")
 
 
@@ -930,13 +935,12 @@ def estimate_offload_admission_bytes(
             for name, spec in header.items():
                 if name == "__metadata__":
                     continue
-                if mtp_resident and (
-                    name.startswith("mtp.") or ".mtp." in name
-                ):
-                    # The draft head stays resident (glm5_next Lightning MTP
-                    # + offload): its slab must not be discounted here, or
-                    # admission overcommits by exactly the bytes the adapter
-                    # refuses to offload.
+                if mtp_resident and _is_mtp_path(name):
+                    # The draft head stays resident (glm5_next / qwen4_exp
+                    # Lightning MTP + offload): its slab must not be discounted
+                    # here, or admission overcommits by exactly the bytes the
+                    # adapter refuses to offload. Same matcher as the wrapper
+                    # loop, so the two cannot drift apart.
                     continue
                 b0, b1 = spec["data_offsets"]
                 m = _PER_EXPERT_PROJ_RE.match(name)
