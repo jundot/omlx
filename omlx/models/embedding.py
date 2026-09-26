@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
@@ -100,6 +100,117 @@ class MLXEmbeddingModel:
         self._remap_input_ids_to_inputs = False
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
+
+    def _is_target_qwen3_embedding(self, module: Any = None) -> bool:
+        """Check if this is a tested non-quantized Qwen3-Embedding (0.6B or 8B) model."""
+        haystack_parts = [str(self.model_name).lower()]
+
+        model_path = Path(self.model_name)
+        config_path = model_path / "config.json"
+        is_quantized = False
+
+        if config_path.is_file():
+            try:
+                with open(config_path) as fh:
+                    cfg = json.load(fh)
+                if isinstance(cfg, dict):
+                    if cfg.get("quantization"):
+                        is_quantized = True
+                    haystack_parts.append(str(cfg.get("_name_or_path", "")).lower())
+                    haystack_parts.append(str(cfg.get("model_type", "")).lower())
+                    for arch in cfg.get("architectures", []):
+                        haystack_parts.append(str(arch).lower())
+            except (OSError, ValueError):
+                pass
+
+        if module is not None:
+            mod_type = type(module)
+            haystack_parts.append(mod_type.__module__.lower())
+            haystack_parts.append(mod_type.__name__.lower())
+            cfg = getattr(module, "config", None)
+            if cfg is not None:
+                if isinstance(cfg, dict):
+                    if cfg.get("quantization"):
+                        is_quantized = True
+                    haystack_parts.append(str(cfg.get("_name_or_path", "")).lower())
+                    haystack_parts.append(str(cfg.get("model_type", "")).lower())
+                    for arch in cfg.get("architectures", []):
+                        haystack_parts.append(str(arch).lower())
+                else:
+                    if getattr(cfg, "quantization", None):
+                        is_quantized = True
+                    haystack_parts.append(str(getattr(cfg, "_name_or_path", "")).lower())
+                    haystack_parts.append(str(getattr(cfg, "model_type", "")).lower())
+                    for arch in getattr(cfg, "architectures", None) or []:
+                        haystack_parts.append(str(arch).lower())
+
+        haystack = " ".join(haystack_parts)
+
+        is_qwen3 = "qwen3" in haystack
+        is_emb = (
+            "embed" in haystack
+            or "qwen3fortextembedding" in haystack
+            or "mlx_embeddings.models.qwen3" in haystack
+        )
+        is_vl = "vl" in haystack or "qwen3_vl" in haystack or "qwen3vl" in haystack
+        is_tested_size = "0.6b" in haystack or "8b" in haystack
+
+        quant_indicators = (
+            "4bit",
+            "8bit",
+            "mxfp8",
+            "fp8",
+            "int4",
+            "int8",
+            "-q4",
+            "-q8",
+            "q4_",
+            "q8_",
+            "-oq",
+            "awq",
+            "gptq",
+            "quantized",
+        )
+        if any(q in haystack for q in quant_indicators):
+            is_quantized = True
+
+        return is_qwen3 and is_emb and (not is_vl) and is_tested_size and (not is_quantized)
+
+    def _resolve_embedding_dtype(self, module: Any = None):
+        """Target compute dtype for a loaded module, or None to leave it as-is.
+
+        Promotes bfloat16 checkpoints to float16 for tested non-quantized
+        Qwen3-Embedding models (0.6B and 8B): bf16 MLX embedding matmuls round
+        activations to bf16 and miss the 1e-3 conformance gate (measured
+        max|delta| 0.0037, vs 0.0006 for the identical weights computed in
+        fp16). Other model families and quantized variants remain unchanged.
+        """
+        if module is None or not self._is_target_qwen3_embedding(module):
+            return None
+        for _, value in tree_flatten(module.parameters()):
+            if isinstance(value, mx.array) and value.dtype == mx.bfloat16:
+                return mx.float16
+        return None
+
+    def _apply_embedding_dtype(self, module: Any) -> None:
+        """Promote bfloat16 parameters to float16 for tested Qwen3-Embedding models."""
+        target = self._resolve_embedding_dtype(module)
+        if target is None or module is None:
+            return
+        module.update(
+            tree_map(
+                lambda a: a.astype(target)
+                if isinstance(a, mx.array) and a.dtype == mx.bfloat16
+                else a,
+                module.parameters(),
+            )
+        )
+        mx.eval(module.parameters())
+        logger.info(
+            "Promoted bfloat16 parameters to %s for %s for numerical conformance",
+            target,
+            self.model_name,
+        )
 
     # Fallbacks for MLX conversions that dropped the sentence-transformers
     # metadata. Reviewed against the concrete checkpoints on the Hub: none of
@@ -266,6 +377,7 @@ class MLXEmbeddingModel:
             weights = model_instance.sanitize(weights)
             self._validate_native_weights(model_instance, weights)
             model_instance.load_weights(list(weights.items()), strict=False)
+            self._apply_embedding_dtype(model_instance)
             mx.eval(model_instance.parameters())
             # Embedding inference must be deterministic: put the model in eval
             # mode so dropout (p>0 in XLM-RoBERTa/BERT) is disabled. Without this
@@ -330,6 +442,7 @@ class MLXEmbeddingModel:
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
             patch_modernbert_attention(self.model)
+            self._apply_embedding_dtype(self.model)
 
             if hasattr(self.model, "config"):
                 config = self.model.config
