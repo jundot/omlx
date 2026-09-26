@@ -36,6 +36,8 @@ class QuestionResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     error_message: str = ""
+    # Populated only for agentic (Harbor) evaluations: the trial directory.
+    artifact_path: Optional[str] = None
 
 
 @dataclass
@@ -50,6 +52,26 @@ class BenchmarkResult:
     question_results: list[QuestionResult] = field(default_factory=list)
     category_scores: Optional[dict[str, float]] = None
     thinking_used: bool = False
+
+
+def compute_category_scores(
+    results: list[QuestionResult],
+) -> Optional[dict[str, float]]:
+    """Per-category accuracy, or None when no result carries a category."""
+    category_correct: dict[str, int] = {}
+    category_total: dict[str, int] = {}
+    for r in results:
+        if r.category is None:
+            continue
+        category_total[r.category] = category_total.get(r.category, 0) + 1
+        if r.correct:
+            category_correct[r.category] = category_correct.get(r.category, 0) + 1
+    if not category_total:
+        return None
+    return {
+        cat: category_correct.get(cat, 0) / category_total[cat]
+        for cat in sorted(category_total)
+    }
 
 
 class BaseBenchmark(ABC):
@@ -432,26 +454,7 @@ class BaseBenchmark(ABC):
 
         ordered = [results[idx] for idx in range(total)]
         correct = sum(1 for r in ordered if r.correct)
-        category_correct: dict[str, int] = {}
-        category_total: dict[str, int] = {}
-        for r in ordered:
-            if r.category is None:
-                continue
-            category_total[r.category] = category_total.get(r.category, 0) + 1
-            if r.correct:
-                category_correct[r.category] = (
-                    category_correct.get(r.category, 0) + 1
-                )
-
-        cat_scores = None
-        if category_total:
-            cat_scores = {}
-            for cat in sorted(category_total.keys()):
-                cat_scores[cat] = (
-                    category_correct.get(cat, 0) / category_total[cat]
-                    if category_total[cat] > 0
-                    else 0.0
-                )
+        cat_scores = compute_category_scores(ordered)
 
         return BenchmarkResult(
             benchmark_name=self.name,

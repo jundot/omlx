@@ -8194,6 +8194,67 @@ async def stream_accuracy_benchmark(
     )
 
 
+_AGENT_JOB_NAME = re.compile(r"^(terminalbench_4|swebench_verified)-[0-9a-f]{8}$")
+
+
+@router.get("/api/bench/accuracy/agent-logs/{job_name}/stream")
+async def stream_agent_logs(
+    job_name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stream live (or saved) Harbor agent transcripts for one agentic job."""
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from ..eval.agent_logs import AgentLogTailer
+    from .accuracy_benchmark import _agent_jobs_dir, is_agent_job_active
+
+    if not _AGENT_JOB_NAME.match(job_name):
+        raise HTTPException(status_code=400, detail="Invalid agent job name")
+    job_dir = _agent_jobs_dir() / job_name
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Agent job not found: {job_name}")
+
+    async def event_generator():
+        tailer = AgentLogTailer(job_dir)
+        # EventSource reconnects replay from scratch; reset tells the client
+        # to drop what it already has.
+        yield f"data: {json.dumps({'type': 'reset'})}\n\n"
+        idle = 0.0
+        try:
+            while True:
+                active = is_agent_job_active(job_name)
+                if not active:
+                    # Let Harbor's last writes land before the final read.
+                    await asyncio.sleep(1.0)
+                payloads = await asyncio.to_thread(
+                    tailer.poll if active else tailer.finish
+                )
+                for payload in payloads:
+                    yield f"data: {json.dumps(payload)}\n\n"
+                if not active:
+                    yield f"data: {json.dumps({'type': 'end'})}\n\n"
+                    break
+                idle = 0.0 if payloads else idle + 1.0
+                if idle >= 15.0:
+                    idle = 0.0
+                    yield ": keepalive\n\n"
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # =============================================================================
 # ANE Split Tuning API Routes (MUST be before throughput {bench_id} routes)
 # =============================================================================

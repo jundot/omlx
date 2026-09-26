@@ -1,0 +1,93 @@
+{# Agentic transcript viewer. Expects `jobName` in Alpine scope. #}
+<div class="mt-4">
+    <button type="button" @click="toggleAgentLogs(jobName)"
+            class="text-xs text-neutral-500 hover:text-neutral-700 flex items-center gap-1 transition-colors">
+        <svg class="w-3 h-3 transition-transform" :class="agentLogs[jobName]?.open ? 'rotate-90' : ''" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+        <span>{{ t('acc_bench.agent_logs.title') }}</span>
+        <span class="text-neutral-400" x-show="agentLogs[jobName]?.order.length" x-text="'· ' + agentLogCounts(jobName)"></span>
+    </button>
+
+    <div x-show="agentLogs[jobName]?.open" x-cloak class="mt-2">
+        <!-- Trial tabs -->
+        <div class="flex items-center gap-1 overflow-x-auto pb-2">
+            <template x-for="trialName in (agentLogs[jobName]?.order || [])" :key="trialName">
+                <button type="button"
+                        @click="agentLogs[jobName].active = trialName; agentLogs[jobName].userPicked = true"
+                        class="px-2.5 py-1 text-xs font-medium rounded-lg flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                        :class="agentLogs[jobName].active === trialName ? 'bg-neutral-900 text-white' : 'text-neutral-500 hover:bg-neutral-100'">
+                    <span class="w-1.5 h-1.5 rounded-full" :class="agentTrialStatusClass(agentLogs[jobName].trials[trialName].status)"></span>
+                    <span x-text="agentLogs[jobName].trials[trialName].task"></span>
+                </button>
+            </template>
+        </div>
+
+        <!-- Log pane (Logs page style) -->
+        <div class="bg-neutral-900 rounded-2xl overflow-hidden"
+             x-data="{ get trial() { const e = this.agentLogs[this.jobName]; return e && e.active ? e.trials[e.active] : null; } }">
+            <div class="flex items-center justify-between px-4 py-2 bg-neutral-800 border-b border-neutral-700">
+                <span class="text-xs text-neutral-400" x-text="agentLogs[jobName]?.active || ''"></span>
+                <span class="text-xs text-neutral-500">
+                    <span x-show="trial?.trimmed" x-text="'({{ t('acc_bench.agent_logs.trimmed') }}) '"></span>
+                    <span x-text="trial ? trial.events.length + ' events' : ''"></span>
+                </span>
+            </div>
+            <div class="h-[400px] sm:h-[600px] overflow-y-auto px-4 py-4 bg-neutral-900 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words"
+                 x-init="$el._pinned = true"
+                 @scroll="$el._pinned = $el.scrollHeight - $el.scrollTop - $el.clientHeight < 40"
+                 x-effect="trial?.events.length; agentLogs[jobName]?.active; if ($el._pinned) $nextTick(() => { $el.scrollTop = $el.scrollHeight; })">
+                <div x-show="!trial || trial.events.length === 0" class="text-neutral-500">{{ t('acc_bench.agent_logs.waiting') }}</div>
+                <template x-for="(ev, i) in (trial?.events || [])" :key="(trial?.trimmed || 0) + i">
+                    <div class="mb-3">
+                        <template x-if="ev.kind === 'user'">
+                            <div><span class="text-neutral-500">task › </span><span class="text-amber-300" x-text="ev.text"></span></div>
+                        </template>
+                        <template x-if="ev.kind === 'assistant'">
+                            <div><span class="text-neutral-500">assistant › </span><span class="text-green-400" x-text="ev.text"></span></div>
+                        </template>
+                        <template x-if="ev.kind === 'error'">
+                            <div><span class="text-neutral-500">error › </span><span class="text-red-400" x-text="ev.text"></span></div>
+                        </template>
+                        <template x-if="ev.kind === 'thinking'">
+                            <div><span class="text-neutral-500">thinking › </span><span class="text-purple-300 italic" x-text="ev.text"></span></div>
+                        </template>
+                        <template x-if="ev.kind === 'stderr'">
+                            <div class="text-neutral-500" x-text="ev.text"></div>
+                        </template>
+                        <template x-if="ev.kind === 'tool_call'">
+                            <div x-data="{ body: agentToolCallBody(ev) }">
+                                <div class="text-sky-400" x-text="'▶ ' + ev.name + (body.kind === 'diff' && body.path ? '  ' + body.path : '')"></div>
+                                <template x-if="body.kind === 'diff'">
+                                    <div class="mt-1">
+                                        <template x-for="(row, ri) in body.lines" :key="ri">
+                                            <div :class="{
+                                                     'bg-red-900/40 text-red-300': row.op === '-',
+                                                     'bg-green-900/40 text-green-300': row.op === '+',
+                                                     'text-neutral-500': row.op === ' ',
+                                                     'text-sky-400': row.op === '@',
+                                                 }"
+                                                 x-text="(row.op === '@' ? '' : row.op + ' ') + row.text"></div>
+                                        </template>
+                                    </div>
+                                </template>
+                                <template x-if="body.kind !== 'diff'">
+                                    <div class="text-sky-400" x-text="body.lines.join('\n')"></div>
+                                </template>
+                            </div>
+                        </template>
+                        <template x-if="ev.kind === 'tool_result'">
+                            <div :class="ev.is_error ? 'text-red-400' : 'text-neutral-400'">
+                                <div x-text="'◀ ' + ev.name"></div>
+                                <div x-text="agentResultLines(ev).join('\n')"></div>
+                                <template x-if="!ev.expanded && String(ev.text || '').replace(/\n$/, '').split('\n').length > 40">
+                                    <button type="button" class="text-neutral-500 hover:text-neutral-300 underline"
+                                            @click="ev.expanded = true"
+                                            x-text="window.t('acc_bench.agent_logs.more_lines').replace('{count}', String(ev.text).replace(/\n$/, '').split('\n').length - 40)"></button>
+                                </template>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+            </div>
+        </div>
+    </div>
+</div>
