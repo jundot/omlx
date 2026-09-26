@@ -20,6 +20,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
@@ -56,12 +57,25 @@ from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .canonical_recovery import (
+    DEFAULT_BUDGET_WINDOW_S,
+    MAX_BLOCKED_IDLE_STEPS,
+    MAX_CONSECUTIVE_YIELDS,
+    CanonicalRecoveryBudget,
+    CanonicalRecoveryCounters,
+    CanonicalRecoveryJob,
+    canonical_recovery_is_runnable,
+    canonical_recovery_slice_cap,
+    safe_publish_boundary,
+)
 from .decode_activity import get_decode_activity
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .foreground_arrivals import DEFAULT_TTL_S as FOREGROUND_ARRIVAL_TTL_S
+from .foreground_arrivals import get_foreground_arrivals
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
@@ -504,7 +518,9 @@ class _PrefillState:
     request: Any
     cache: list  # Accumulated prompt_cache (mutated in-place by each chunk)
     tokens_remaining: Any  # mx.array shape (1, N) — tokens not yet prefilled
-    last_token: list  # tokens[-1:] — passed to batch_generator.insert()
+    # tokens[-1:] — passed to batch_generator.insert(); empty for a
+    # canonical-recovery state, which never reaches insert()
+    last_token: list
     tokens_processed: int  # Cumulative count for boundary snapshot math
     base_size: int  # Prefix cache offset at prefill start (for alignment)
     emitted_boundaries: dict  # {request_id: int} — last emitted boundary count
@@ -519,6 +535,9 @@ class _PrefillState:
     # Tail snapshot plan, see _prefill_tail_plan.
     tail_at: int | None = None
     end_tail: bool = False
+    # Set only for a canonical state recovery: the target this state was built for, so a
+    # chunk completing after the job grew can tell that its `done` is stale.
+    canonical_recovery_target_tokens: int | None = None
 
 
 @dataclass
@@ -911,10 +930,10 @@ def _turboquant_filter_singleton(self, batch_indices):
         self.offset = 0
         self._cached_state = None
         self._cached_state_offset = -1
-        if hasattr(self, "_shadow_keys"):
-            self._shadow_keys = None
-        if hasattr(self, "_shadow_values"):
-            self._shadow_values = None
+        if hasattr(self, "_canonical_recovery_keys"):
+            self._canonical_recovery_keys = None
+        if hasattr(self, "_canonical_recovery_values"):
+            self._canonical_recovery_values = None
         return
     if n == 1:
         return
@@ -1656,6 +1675,38 @@ class SchedulerConfig:
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
     gdn_sidecar_state_dtype: str = "fp32"
 
+    # Canonical state recovery: a scheduler-owned dense re-read of a range a sparse
+    # prefill already served, run only while the scheduler is idle, publishing
+    # ordinary canonical cache state at block boundaries.
+    # Off by default: it spends foreground-capable compute and changes what the
+    # prefix cache contains, so it is opt-in per deployment.
+    canonical_state_recovery_enabled: bool = False
+    # The window the ceiling is granted in. The allowance replenishes every
+    # window, so a chunk that overran it is late by at most one window rather
+    # than locked out for the rest of the session.
+    canonical_state_recovery_budget_window_s: float = DEFAULT_BUDGET_WINDOW_S
+
+    # The process-global recovery budget, created by EnginePool before any
+    # engine loads and reaching every Scheduler through the same shallow-copy
+    # path `hot_cache_budget` uses: a scalar on this config is snapshotted per
+    # engine, an object is shared. That difference is the whole of the fix —
+    # a per-scheduler budget let M loaded engines grant M times the configured
+    # share of one accelerator.
+    canonical_recovery_budget: Any | None = None
+
+    # The ceiling, as a percentage of wall time, aggregated across every
+    # engine sharing the accelerator. There is exactly one, and it is
+    # server-level: models choose whether to recover, not how much of the
+    # machine recovery may have. A per-model ceiling would also be read off
+    # this same config, which the pool rewrites before every load, so it
+    # would be whichever model happened to load last.
+    canonical_state_recovery_global_budget_pct: float = 0.0
+
+    # Tokens per recovery *execution* slice, which is deliberately not the
+    # publication grain. 0 leaves recovery on the ordinary prefill step size,
+    # which is what made the worst foreground wait a whole cache block.
+    canonical_state_recovery_slice_tokens: int = 0
+
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
     model_path: str = ""  # Filesystem path to the model (e.g., "/cache/models--Org--Name/snapshots/abc123")
@@ -2071,6 +2122,76 @@ class Scheduler:
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
 
+        # ---- Canonical state recovery --------------------------------------------------
+        # One job per engine, single-flight: an append-only session extends the
+        # live job rather than starting a second one that would recompute the
+        # same prefix and race it to publication.
+        self._canonical_recovery_job: CanonicalRecoveryJob | None = None
+        # Snapshotted at construction, not polled. SchedulerConfig is a single
+        # object shared by every engine in the pool, so a scheduler that read
+        # these on every step would have the feature switched on and off under
+        # it whenever another model was loaded. This matches how model_name is
+        # consumed: at load time.
+        self._canonical_recovery_enabled_flag = bool(
+            getattr(self.config, "canonical_state_recovery_enabled", False)
+        )
+        # Snapshotted for the same reason, and it matters for the same reason:
+        # the slice size is what bounds how long an arriving foreground request
+        # can be blocked behind an uninterruptible recovery slice, and it is a
+        # per-model setting. Read live off the shared config, another model's
+        # load would set it for this engine too.
+        self._canonical_recovery_slice_tokens = int(
+            getattr(self.config, "canonical_state_recovery_slice_tokens", 0) or 0
+        )
+        # The budget is adopted when the pool supplied one and created
+        # privately when it did not. A bare Scheduler — tests, embedded use —
+        # has no pool and therefore no peers to share an accelerator with, so
+        # a private budget is the correct reading of the same invariant rather
+        # than a degraded one. It reads the same server-level percentage:
+        # there is one ceiling, and who owns the object does not change it.
+        self._canonical_recovery_owner_key: str = f"canonical-recovery:{_model_label}:{id(self):x}"
+        shared_budget = getattr(self.config, "canonical_recovery_budget", None)
+        if isinstance(shared_budget, CanonicalRecoveryBudget):
+            self._canonical_recovery_budget = shared_budget
+        else:
+            self._canonical_recovery_budget = CanonicalRecoveryBudget(
+                pct=float(
+                    getattr(self.config, "canonical_state_recovery_global_budget_pct", 0.0) or 0.0
+                ),
+                window_s=float(
+                    getattr(
+                        self.config,
+                        "canonical_state_recovery_budget_window_s",
+                        DEFAULT_BUDGET_WINDOW_S,
+                    )
+                    or DEFAULT_BUDGET_WINDOW_S
+                ),
+            )
+        self._canonical_recovery_budget.register(self._canonical_recovery_owner_key)
+        self._canonical_recovery_counters = CanonicalRecoveryCounters()
+        # Steps in a row with nothing to do. A recovery chunk holds the
+        # interpreter lock for its whole duration, so starting one on the first
+        # idle step leaves no window in which an arriving request can announce
+        # itself.
+        self._consecutive_idle_steps = 0
+        # Idle steps in a row on which the job was allowed to run and did not.
+        # See _canonical_recovery_note_blocked_step: this is the deadline that keeps a
+        # latent runtime state from pinning the engine loop forever.
+        self._canonical_recovery_blocked_idle_steps = 0
+        # Requests that exist but whose admission has not run yet. Admission
+        # happens on the same single-worker executor as step(), so between the
+        # HTTP layer accepting a request and add_request() running, the
+        # scheduler's own lists say "idle" while a request is already waiting.
+        # Held with a deadline rather than as a bare counter: an entry that is
+        # never admitted must expire, or the recovery job stays blocked forever
+        # (the liveness defect the earlier prototype had).
+        # Arrivals live in a process-global registry, not here: a request that
+        # reaches *any* engine in the pool has to stop recovery on all of them,
+        # and a per-scheduler dict is invisible to a peer. The registry owns the
+        # lock, because this mapping is written from the event loop and expired
+        # from each engine's executor.
+        self._canonical_recovery_inbound_ttl_s = FOREGROUND_ARRIVAL_TTL_S
+
         # DEBUG-only prefix-cache divergence probe (issue #1003): recent
         # stored cache sequences, so a miss can be traced to the exact
         # token where the new prompt diverges from what was cached.
@@ -2479,7 +2600,8 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
-    ) -> None:
+        retain_request_entry: bool = False,
+    ) -> Any:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
@@ -2554,12 +2676,24 @@ class Scheduler:
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table and self.paged_cache_manager is not None:
-                self.paged_cache_manager.release_for_eviction(block_table.block_ids)
-            if self.block_aware_cache is not None:
-                self.block_aware_cache.clear_request_entry(request_id)
+            # A caller that is still writing to this request id keeps its block
+            # table and its refs; it releases them when it finishes or is
+            # dropped. Every ordinary completion takes the branch below.
+            if not retain_request_entry:
+                if block_table and self.paged_cache_manager is not None:
+                    self.paged_cache_manager.release_for_eviction(
+                        block_table.block_ids
+                    )
+                if self.block_aware_cache is not None:
+                    self.block_aware_cache.clear_request_entry(request_id)
+            # Returned so a caller that needs to know whether anything was
+            # actually persisted can ask. The completion path ignores it; the
+            # recovery job does not, because a store that stopped at zero tokens
+            # and a store that wrote the whole prefix look identical otherwise.
+            return block_table
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+        return None
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -4909,6 +5043,7 @@ class Scheduler:
             drafter.bind_uid(request_id, uid)
 
     def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
+        self.note_request_departed(request_id)
         _mtp_priming.release_request(getattr(self, "model", None), request_id)
         drafter = _block_drafter_for(getattr(self, "model", None))
         if drafter is not None:
@@ -5528,11 +5663,20 @@ class Scheduler:
         request: "Request",
         tokens: list[int],
         existing_cache: "list[Any] | None",
+        *,
+        hold_back_last: bool = True,
     ) -> _PrefillState:
         """Initialise a _PrefillState for a non-VLM request.
 
         Performs all once-per-request setup (cache creation, boundary config,
         token splitting) without running any model forward passes.
+
+        ``hold_back_last`` keeps the final token out of the prefill so it can
+        go to ``insert()`` as the generation kickoff, which every foreground
+        request needs. A canonical-recovery state passes False: it never
+        samples and never reads ``last_token``, and holding a token back costs
+        it the whole block that token sits in whenever the range it is
+        re-reading ends exactly on a block boundary.
         """
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
@@ -5568,8 +5712,8 @@ class Scheduler:
             )
             base_size = request.cached_tokens
 
-        prefill_tokens = tokens[:-1]
-        last_token = tokens[-1:]
+        prefill_tokens = tokens[:-1] if hold_back_last else tokens
+        last_token = tokens[-1:] if hold_back_last else []
         # Build the input row on the engine stream so chunk eval graphs stay
         # single-stream (see _do_external_prefill, #2197/#2183).
         with mx.stream(self._stream):
@@ -5639,6 +5783,14 @@ class Scheduler:
             state.tokens_processed, remaining
         )
         n = min(prefill_step_size, remaining)
+        # `getattr` because this method is driven by stand-ins in the prefill
+        # memory-guard tests, and because 0 — no cap, the ordinary prefill step
+        # size — is both the default and the safe answer when the attribute is
+        # absent. The snapshot, not `self.config`: the slice size is per model
+        # and the config object is shared by every engine in the pool.
+        n = canonical_recovery_slice_cap(
+            getattr(self, "_canonical_recovery_slice_tokens", 0), state.request, n
+        )
 
         if state.tokens_processed == 0:
             Scheduler._clear_cache(self)
@@ -5792,7 +5944,7 @@ class Scheduler:
         get_prefill_tracker().update(
             state.request.request_id,
             state.tokens_processed,
-            state.total_length - 1,
+            state.total_length - len(state.last_token),
             (
                 self.config.model_name
                 if self.config.model_name
@@ -5818,7 +5970,7 @@ class Scheduler:
                     state.request.request_id,
                     n,
                     state.tokens_processed,
-                    state.total_length - 1,
+                    state.total_length - len(state.last_token),
                     current / 1024**3,
                     _soft / 1024**3,
                     _hard / 1024**3,
@@ -5834,7 +5986,7 @@ class Scheduler:
                 if current > _abort:
                     raise RuntimeError(
                         f"Memory limit exceeded during chunked prefill at "
-                        f"{state.tokens_processed}/{state.total_length - 1} tokens: "
+                        f"{state.tokens_processed}/{state.total_length - len(state.last_token)} tokens: "
                         f"{current / 1024**3:.1f}GB exceeds physical cap "
                         f"{_abort / 1024**3:.1f}GB (after reclaim)"
                     )
@@ -5842,7 +5994,7 @@ class Scheduler:
                     "Chunked prefill recovered after reclaim at %d/%d tokens "
                     "(%.1fGB <= cap %.1fGB)",
                     state.tokens_processed,
-                    state.total_length - 1,
+                    state.total_length - len(state.last_token),
                     current / 1024**3,
                     _abort / 1024**3,
                 )
@@ -8937,6 +9089,12 @@ class Scheduler:
         if request.request_id in self._prefix_cache_prepared:
             return
 
+        # Record which prefix-cache instance is serving this request. One
+        # served model can present more than one, and recovery has to know
+        # which one a restore would actually consult: state published into
+        # the other is valid, durable and unreachable.
+        if self.block_aware_cache is not None:
+            request._serving_prefix_cache_id = id(self.block_aware_cache)
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
         minimum_prefix = (
             prefix_hook(request.prompt_token_ids) if callable(prefix_hook) else 0
@@ -9143,25 +9301,32 @@ class Scheduler:
         # forwarded.  The hook is intentionally best-effort/fail-closed:
         # ordinary inference and prefix reuse stay valid if MTP is disabled,
         # the sidecar was evicted, or this model family does not support it.
-        try:
-            from .patches.mlx_lm_mtp import prompt_priming
+        # Not for a canonical-recovery request: it never decodes, so it never
+        # reads that history. Preparing it would file a plan under the synthetic
+        # id, fold head history into it on every recovery chunk, and leave it
+        # owned by an id no ordinary release path visits.
+        if not request.is_canonical_recovery:
+            try:
+                from .patches.mlx_lm_mtp import prompt_priming
 
-            prompt_priming.prepare_prefix_context(
-                self.model,
-                request_id=request.request_id,
-                prompt_tokens=request.prompt_token_ids,
-                cached_tokens=request.cached_tokens,
-                prefix_cache=self.block_aware_cache,
-                extra_keys=request.vlm_extra_keys_for_cache,
-                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
-            )
-        except Exception as exc:
-            logger.debug(
-                "MTP prefix-history preparation failed closed for %s: %s",
-                request.request_id,
-                exc,
-            )
+                prompt_priming.prepare_prefix_context(
+                    self.model,
+                    request_id=request.request_id,
+                    prompt_tokens=request.prompt_token_ids,
+                    cached_tokens=request.cached_tokens,
+                    prefix_cache=self.block_aware_cache,
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=(
+                        request.vlm_extra_key_token_start_for_cache
+                    ),
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "MTP prefix-history preparation failed closed for %s: %s",
+                    request.request_id,
+                    exc,
+                )
 
         # Trace where this prompt diverges from recently stored cache
         # sequences: one INFO line for large re-prefills (#2333/#2349
@@ -9197,6 +9362,10 @@ class Scheduler:
                 current_depth=len(self.waiting),
                 max_depth=max_waiting,
             )
+
+        # Admission has reached the executor: the request is now visible in
+        # self.waiting, so the inbound marker has done its job.
+        self.note_admitted_request(request.request_id)
 
         # Tokenize if needed
         if request.prompt_token_ids is None:
@@ -10283,7 +10452,77 @@ class Scheduler:
             or self._deferred_clear_at is not None
             or self._pending_reclaim_request
             or self._pending_pressure_clear
+            or self._has_canonical_recovery_work()
         )
+
+    def _has_canonical_recovery_work(self) -> bool:
+        """Whether an unfinished recovery job needs the engine loop to keep stepping.
+
+        Without this the recovery job can never run. The loop only calls step()
+        while has_requests() is true, so an engine that has just gone idle —
+        which is the only moment the recovery job is allowed to run at all —
+        stops stepping before the recovery job's idle-step requirement can ever
+        be met. Deferred Metal clears and enforcer reclaims are in this
+        predicate for the same reason.
+
+        This is deliberately narrow: it reports work only while a job is live
+        and has not reached its target. A finished, cancelled or dropped job
+        must not hold the loop awake, or an idle server spins forever.
+
+        A spent window is not work either. An earlier version left the
+        allowance out of this predicate on the belief that reporting no work
+        would park the loop until an unrelated request woke it, which on an
+        idle server is never. That is not what the loop does: it re-reads this
+        predicate once per ``step_interval`` whether or not it stepped last
+        time, so a job waiting for its window to replenish is picked up within
+        50 ms of the roll either way.
+
+        The difference is what happens in between. Holding the predicate true
+        makes the loop run a full scheduler step 20 times a second for a job
+        it may not serve, and those steps are not free: each one advances
+        ``_step_counter``, which gates ``gc.collect()`` and the periodic
+        process-global ``mx.clear_cache()``. A capped recovery job waiting on
+        an otherwise idle server therefore drove a process-wide buffer-pool
+        clear roughly every 26 seconds, and that pool is shared with every
+        other model the process serves.
+
+        A budget of zero percent is different in kind: it grants no service in
+        any window, so its job is not waiting, it is never going to run. That
+        one is excluded, or an idle server polls forever on a job it may not
+        serve.
+        """
+        if not self._canonical_recovery_enabled():
+            # Deliberately first, and above the live-state clause below: the
+            # retirement that clause exists to schedule happens in
+            # `_canonical_recovery_after_step`, which this same flag gates.
+            # Reporting work for a state nothing will come back for would
+            # spin an idle loop forever.
+            return False
+        job = self._canonical_recovery_job
+        if job is None or job.cancelled or job.done:
+            return False
+        if job.prefill_state is not None:
+            # A live dense state is work, whatever the job's prospects are.
+            # Freeing MLX arrays is the engine thread's job, and every reason
+            # this predicate is about to return False for — a spent window, a
+            # peer engine — is a reason that leaves the state resident with
+            # no step scheduled in which to give it back. This is a pure
+            # attribute read, so it is safe on the asyncio thread that calls
+            # `has_requests`; the freeing happens in `after_step`, on the
+            # executor. It is true for at most one more step, because that
+            # step retires the state and this clause then stops answering.
+            return True
+        if self._canonical_recovery_budget.pct <= 0:
+            return False
+        if not self._canonical_recovery_budget.allows():
+            return False
+        # Another engine working is the same kind of wait as a spent window,
+        # and gets the same treatment. Holding the predicate true through it
+        # meant a job blocked behind a peer's recovery stepped this engine
+        # twenty times a second for as long as the peer held its allowance —
+        # which, with a job that waits minutes between slices, is most of the
+        # time. The loop re-reads this within 50 ms either way.
+        return not (self._canonical_recovery_foreign_engine_busy() or self._canonical_recovery_claim_blocked())
 
     def has_pending_route_preflight_cleanup(self) -> bool:
         """Return whether finished-request memory is still being reclaimed.
@@ -10367,6 +10606,12 @@ class Scheduler:
         Returns:
             List of failed request IDs.
         """
+        # Background recovery is not a request and nothing here will end it,
+        # but it does keep has_requests() true. An engine that cannot become
+        # quiescent after an unrecoverable error never unloads and never
+        # stops stepping, so the job goes first and explicitly.
+        with suppress(Exception):
+            self.cancel_canonical_recovery_work("fail_all_requests")
         failed_ids: list[str] = []
         for request_id in list(self.running):
             failed_ids.append(request_id)
@@ -10411,6 +10656,12 @@ class Scheduler:
         # returns the last queued output).
         for request_id in list(self.requests):
             if request_id in self._inflight_store_futures:
+                continue
+            request = self.requests.get(request_id)
+            if request is not None and request.is_canonical_recovery:
+                # Scheduler-owned background work, cancelled above. It has no
+                # collector to receive a failure, and reporting it as a failed
+                # request would name an id no client ever sent.
                 continue
             failed_ids.append(request_id)
             req = self.requests.pop(request_id, None)
@@ -12079,11 +12330,20 @@ class Scheduler:
             self._throttle_notified_requests.discard(rid)
 
         for request_id in finished_ids:
+            self.note_request_departed(request_id)
             _mtp_priming.release_request(self.model, request_id)
             finished_drafter = _block_drafter_for(self.model)
             if finished_drafter is not None:
                 finished_drafter.release_request(request_id)
             request = self.running.get(request_id)
+
+            # A request that took the sparse route stores nothing, so the
+            # reusable dense prefix ends where it ended before this turn. Offer
+            # its prompt to the recovery job, which is the only thing that will
+            # advance it.
+            if request is not None:
+                with suppress(Exception):
+                    self.note_canonical_recovery_candidate(request)
 
             # Store cache for future reuse (G2-async): submit to background
             # executor so the post-finish 28GB+ memcpy doesn't block response
@@ -12676,6 +12936,13 @@ class Scheduler:
                 return
             if request.is_finished():
                 return
+            if request.is_canonical_recovery:
+                # Scheduler-owned background work is reached here because it
+                # sits in self.requests and in no queue, which is the shape
+                # this sweep exists to find. Re-prefilling it would schedule
+                # it as foreground work with nothing to emit to; its owner
+                # drops it instead, and losing its progress costs only reuse.
+                return
             seen.add(request_id)
             collected.append(request)
 
@@ -12771,6 +13038,13 @@ class Scheduler:
             if request_id in seen or request_id in self._inflight_store_futures:
                 return
             if request.is_finished():
+                return
+            if request.is_canonical_recovery:
+                # Scheduler-owned background work is reached here because it
+                # sits in self.requests and in no queue, which is the shape
+                # this sweep exists to find. Re-prefilling it would schedule
+                # it as foreground work with nothing to emit to; its owner
+                # drops it instead, and losing its progress costs only reuse.
                 return
             seen.add(request_id)
             retry_candidates.append(request)
@@ -12933,6 +13207,1123 @@ class Scheduler:
             request.request_id,
             eviction.reason,
         )
+
+    # -------------------------------------------------------------- recovery
+    # Canonical state recovery.
+    #
+    # A sparse prefill serves its request and leaves the reusable dense prefix
+    # exactly where it was: _cleanup_finished refuses to extract a cache whose
+    # specprefill_indices is set, so no checkpoint is written, and every later
+    # turn recomputes the suffix the sparse turn did not canonicalize. The
+    # recovery job is a dense re-read of that range, run as scheduler-owned
+    # work while nothing else is running, publishing through the ordinary store
+    # path so it inherits that path's locking and lifecycle rather than
+    # copying them.
+
+    def note_inbound_request(self, request_id: str) -> None:
+        """Record that a request exists before its admission runs.
+
+        Admission runs on the same single-worker executor as step(), so a
+        request accepted by the transport is invisible to the scheduler until
+        that hand-off completes. Without this the recovery job reads its own
+        lists, believes the engine idle, and starts a chunk in front of a
+        request that had already arrived.
+
+        The record is process-global, because the engine that must stand down
+        is not necessarily the engine the request arrived at.
+        """
+        get_foreground_arrivals().note_arrival(request_id)
+
+    def note_admitted_request(self, request_id: str) -> None:
+        """The engine owns this request now; restart its expiry clock.
+
+        Deliberately not a removal. Admission is exactly the point at which
+        this engine's own lists start answering, and at which every *other*
+        engine in the pool still has nothing to read: the progress tracker is
+        written after the first prefill chunk's forward, not before it. Holding
+        the marker until the request departs closes that window; on this engine
+        it is redundant with ``waiting``/``running``, which costs nothing.
+        """
+        get_foreground_arrivals().note_admission(request_id)
+
+    def note_request_departed(self, request_id: str) -> None:
+        """The request is finished, aborted, or was never admitted."""
+        get_foreground_arrivals().note_departure(request_id)
+
+    def _canonical_recovery_inbound_count(self) -> int:
+        """Foreground requests that have arrived anywhere and not departed.
+
+        The expiry is the difference between this and a bare counter. A request
+        that is counted and then never departs — cancelled in flight, rejected
+        before add_request, or lost to an exception — would otherwise block the
+        recovery job for the life of the process.
+        """
+        live, stale = get_foreground_arrivals().expire(
+            self._canonical_recovery_inbound_ttl_s
+        )
+        for rid in stale:
+            logger.debug("CanonicalRecovery: expiring stale arrival marker for %s", rid)
+        return len(live)
+
+    def _canonical_recovery_enabled(self) -> bool:
+        return bool(
+            self._canonical_recovery_enabled_flag
+            and self.block_aware_cache is not None
+            and self.config.paged_cache_block_size > 0
+        )
+
+    def note_canonical_recovery_candidate(self, request: Any) -> None:
+        """Offer a finished request's prompt to the recovery job.
+
+        Only a request that actually took the sparse route leaves debt behind,
+        so only that request creates work here. Growth is single-flight: an
+        append extends the live job, and anything that is not an append
+        replaces it, because publishing canonical state for a prefix the
+        session no longer has is the failure the placeholder rejection exists
+        to prevent.
+        """
+        if not self._canonical_recovery_enabled():
+            return
+        if self._canonical_recovery_budget.pct <= 0:
+            # The feature is on and the budget grants nothing in any window,
+            # so the job would never run. Declining here rather than queueing
+            # it keeps the prompt's whole token list from being retained for
+            # the life of the session for no possible benefit.
+            return
+        if getattr(request, "specprefill_indices", None) is None:
+            return
+        if self._model_has_unreconstructible_cache():
+            return
+
+        # Bind to the instance that served this request, and refuse the job
+        # outright when this scheduler is not that one. Publishing into a
+        # prefix cache the request never touched produces canonical state that
+        # is valid, durable and unreachable.
+        serving_cache_id = getattr(request, "_serving_prefix_cache_id", None)
+        if serving_cache_id is None or serving_cache_id != id(self.block_aware_cache):
+            logger.debug(
+                "CanonicalRecovery: declining %s, this scheduler's prefix cache did not "
+                "serve it (served=%s, here=%s)",
+                getattr(request, "request_id", "?"),
+                serving_cache_id,
+                id(self.block_aware_cache),
+            )
+            return
+
+        tokens = list(getattr(request, "prompt_token_ids", None) or [])
+        block = self.config.paged_cache_block_size
+        # Only whole blocks are publishable, so the job targets the last whole
+        # block — exactly, not one token past it. The recovery state is built
+        # with `hold_back_last=False`, so the prefill consumes every token it
+        # is given; asking for a spare token to absorb the generation kickoff
+        # was a workaround for a kickoff this job never has, and it could not
+        # work at all when the prompt ended on the boundary, because there is
+        # no token past it to ask for. That case lost half a two-block session
+        # on every idle window.
+        boundary = (len(tokens) // block) * block
+        if boundary <= 0:
+            return
+        tokens = tokens[:boundary]
+
+        job = self._canonical_recovery_job
+        if (
+            job is not None
+            and not job.cancelled
+            and len(tokens) == job.target_tokens
+            and tokens == job.tokens[: len(tokens)]
+        ):
+            # The turn grew the session but not past the next block boundary,
+            # so there is nothing new that could be published and the live
+            # job already covers everything that can be. `extend` refuses a
+            # target that did not move, and the old code read that refusal as
+            # "not an append" and destroyed the job — losing its committed
+            # prefix, its reported canonical prefix, and the append path every
+            # later turn would have taken.
+            logger.debug(
+                "CanonicalRecovery: turn adds no new publishable block, keeping the job "
+                "at %d tokens (committed %d)",
+                job.target_tokens,
+                job.committed_tokens,
+            )
+            return
+        if job is not None and not job.cancelled and job.extend(tokens):
+            logger.debug(
+                "CanonicalRecovery: extended job to %d tokens (committed %d)",
+                job.target_tokens,
+                job.committed_tokens,
+            )
+            return
+
+        if job is not None:
+            self._canonical_recovery_drop_job("replaced")
+        self._canonical_recovery_job = CanonicalRecoveryJob(
+            session_key=str(getattr(request, "request_id", "canonical-recovery")),
+            tokens=tokens,
+            target_tokens=boundary,
+            block_size=block,
+            serving_cache_id=serving_cache_id,
+            serving_cache_ref=weakref.ref(self.block_aware_cache),
+        )
+        logger.info(
+            "CanonicalRecovery: queued dense re-read of %d tokens (budget %.1f%%)",
+            boundary,
+            self._canonical_recovery_budget.pct,
+        )
+
+    def cancel_canonical_recovery_work(self, reason: str = "cancelled") -> bool:
+        """Drop any live recovery job and stop reporting recovery work.
+
+        Recovery work counts towards ``has_requests()`` so the engine loop keeps
+        stepping while a job is live. The unload path drains on the same
+        predicate, so without a way to cancel, an engine with a live recovery job
+        never becomes quiescent: the unload is queued "until active scheduler
+        work drains", it never drains, and every later request to that model is
+        refused with 409 while the pending marker is installed. Background work
+        must never be the reason a model cannot be unloaded.
+        """
+        if self._canonical_recovery_job is None:
+            return False
+        self._canonical_recovery_drop_job(reason)
+        return True
+
+    def _canonical_recovery_drop_job(self, reason: str) -> None:
+        """Release a job's cache footprint. Published blocks are not unpublished.
+
+        The dropped job's own request entry and paged blocks must go back, or a
+        cancelled job leaves block refs the cache can never reclaim. What it
+        already published stays published: it is ordinary canonical state and
+        the next request is entitled to restore from it.
+        """
+        job = self._canonical_recovery_job
+        if job is None:
+            return
+        job.cancelled = True
+        state = job.prefill_state
+        rid = self._canonical_recovery_request_id(job)
+        if state is not None:
+            job.prefill_state = None
+        self._drop_boundary_snapshots_for_request(rid)
+        self._release_paged_cache_for_request(rid)
+        # That released against the *current* prefix cache. On the one drop
+        # path where the instance changed under the job — which is the path
+        # that exists because it can — the current one never issued this
+        # request id and the bound one still holds its block references. Ask
+        # the bound one too, while it is alive; a weak reference, because a
+        # replaced cache is usually being torn down and recovery must not be
+        # the reason it stays.
+        bound_ref = getattr(job, "serving_cache_ref", None)
+        bound = bound_ref() if callable(bound_ref) else None
+        if bound is not None and bound is not self.block_aware_cache:
+            with suppress(Exception):
+                bound.release_cache(rid)
+        self.requests.pop(rid, None)
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        # The synthetic id owns no MTP prompt-priming state by design, and
+        # this is the assertion of that: whatever a model family filed under
+        # it goes back here rather than outliving the job that made it.
+        _mtp_priming.release_request(getattr(self, "model", None), rid)
+        self._canonical_recovery_job = None
+        logger.info(
+            "CanonicalRecovery: dropped job (%s) after %d/%d tokens, %d committed",
+            reason,
+            job.processed_tokens,
+            job.target_tokens,
+            job.committed_tokens,
+        )
+
+    @staticmethod
+    def _canonical_recovery_request_id(job: CanonicalRecoveryJob) -> str:
+        return f"canonical-recovery:{job.session_key}"
+
+    def _specprefill_rope_installed(self) -> bool:
+        """Whether a SpecPrefill RoPE wrapper is installed on the shared model.
+
+        `_specprefill_active_request_id` is bookkeeping and is not a reliable
+        answer to this question: `sparse_prefill` installs the wrapper in a
+        `finally` that runs before the id is ever set, and `_unwrap_rope`
+        documents a wrapper surviving between requests as an expected state
+        (#766). A dense forward taken while the wrapper is installed
+        reads another request's position offset, and the recovery job would
+        then publish positionally wrong KV as ordinary canonical state — the one
+        failure this design exists to make impossible. So ask the model.
+
+        The patch module answers, through ``is_specprefill_rope``. This used to
+        compare ``type(rope).__name__`` against two literals here, which fails
+        open on a rename: the wrapper would still be installed and this would
+        report that it was not.
+        """
+        if self._specprefill_active_request_id is not None:
+            return True
+        try:
+            from .patches.specprefill import (
+                _find_attention_layers,
+                _get_attn_module,
+                is_specprefill_rope,
+            )
+
+            layers = _find_attention_layers(self.model) or ()
+        except Exception:  # noqa: BLE001
+            # If the model cannot be inspected, the safe answer is "installed".
+            # The import is inside the guard for the same reason: a predicate
+            # this module cannot reach is not a licence to run a dense forward.
+            return True
+        for _idx, layer in layers:
+            attn = _get_attn_module(layer)
+            rope = getattr(attn, "rope", None) if attn is not None else None
+            if rope is not None and is_specprefill_rope(rope):
+                return True
+        return False
+
+    def _canonical_recovery_foreign_engine_busy(self) -> bool:
+        """Foreground work on another engine in this process.
+
+        `EnginePool` gives every model its own `Scheduler` and its own loop,
+        and they share one GPU. This scheduler's lists therefore answer "am I
+        idle", not "is the machine idle", and a recovery chunk started on the
+        strength of the first one lands on a GPU the second one is using. The
+        foreground prefill path already reads the process-global decode
+        registry for exactly this reason; recovery reads it too, and the
+        prefill tracker with it, because a recovery chunk is a prefill and a
+        foreign prefill is what it would collide with.
+
+        Every recovery entry is excluded from the prefill half, not just this
+        scheduler's own. A job holds its tracker entry from its first chunk
+        until it parks, finishes or is dropped — across every gap in between,
+        including the minutes it spends waiting for an allowance — so reading
+        a foreign recovery job as foreground made one engine stand down for
+        another's *waiting*, indefinitely and invisibly. Recovery excluding
+        recovery is not a loss of mutual exclusion: that is the budget's
+        claim, taken before a slice starts rather than inferred afterwards
+        from a side effect of chunking.
+        """
+        if self._others_decoding():
+            return True
+        with suppress(Exception):
+            if get_prefill_tracker().any_active(exclude_prefix="canonical-recovery:"):
+                return True
+        return False
+
+    def _canonical_recovery_claim_blocked(self) -> bool:
+        """Whether another engine currently holds the recovery claim."""
+        with suppress(Exception):
+            return self._canonical_recovery_budget.claim_held_by_other(self._canonical_recovery_owner_key)
+        return False
+
+    def _canonical_recovery_runnable(self) -> bool:
+        return canonical_recovery_is_runnable(
+            enabled=self._canonical_recovery_enabled(),
+            budget=self._canonical_recovery_budget,
+            # A job that has reached its target is not work. Without the
+            # `done` clause it is: the state is retired on completion, so the
+            # next idle step rebuilds it and re-reads the whole target from
+            # the last committed boundary, publishes nothing new, finishes,
+            # and does it again on the next window — all of it charged to the
+            # budget. One 8K session spent every idle window of its run
+            # re-reading the same 4,096 tokens.
+            has_job=(
+                self._canonical_recovery_job is not None
+                and not self._canonical_recovery_job.cancelled
+                and not self._canonical_recovery_job.done
+            ),
+            waiting_requests=len(self.waiting),
+            running_requests=len(self.running),
+            prefilling_requests=len(self.prefilling),
+            specprefill_active=self._specprefill_rope_installed(),
+            inbound_requests=self._canonical_recovery_inbound_count(),
+            consecutive_idle_steps=self._consecutive_idle_steps,
+            foreign_engine_busy=(
+                self._canonical_recovery_foreign_engine_busy() or self._canonical_recovery_claim_blocked()
+            ),
+        )
+
+    def _canonical_recovery_begin_state(self, job: CanonicalRecoveryJob) -> Any:
+        """Build the dense prefill state for *job*, reusing canonical state.
+
+        The recovery job restores whatever canonical prefix already exists
+        before it starts, so it re-reads only the range no checkpoint covers.
+        Without this it would recompute the whole prompt every time the job
+        restarts, which is duplicated work charged against the same budget.
+        """
+        rid = self._canonical_recovery_request_id(job)
+        # A job restarts whenever it is extended or resumed. Without dropping
+        # these two markers the prefix-cache preparation returns early, the
+        # request keeps a null prompt_cache, and the job re-reads the whole
+        # prompt from token zero with base_size 0 — charged to the same budget
+        # it is supposed to be spending on new tokens.
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        request = Request(
+            request_id=rid,
+            prompt=None,
+            prompt_token_ids=list(job.tokens),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        # The recovery job never samples and never emits a token; it exists
+        # only for what it leaves in the cache.
+        request.specprefill_indices = None
+        request._specprefill_enabled = False
+        request.is_canonical_recovery = True
+        self.requests[rid] = request
+        self._prepare_prefix_cache_for_request(request)
+        # That fetch is the serving path's own answer for this prefix, so it
+        # is also the cheapest possible re-check of what the job claims to
+        # have committed — free here, and on the background thread.
+        self._canonical_recovery_revalidate_ground(job, request)
+
+        tokens_to_process = request.remaining_tokens or list(job.tokens)
+        cache_to_use = request.prompt_cache
+        if cache_to_use is None:
+            cache_to_use = make_prompt_cache(self.model)
+        if len(tokens_to_process) < 2:
+            return None
+        # No hold-back: this state never reaches insert(), and a token held
+        # back costs the whole block it sits in when the range ends on a
+        # boundary — which, since the target *is* a boundary, is always.
+        state = self._begin_prefill(
+            request, tokens_to_process, cache_to_use, hold_back_last=False
+        )
+        # Remember which target this state was built for, so a chunk that
+        # finishes after the job was extended can tell that its `done` is stale.
+        state.canonical_recovery_target_tokens = job.target_tokens
+        job.processed_tokens = max(job.processed_tokens, request.cached_tokens or 0)
+        job.note_published(
+            safe_publish_boundary(
+                tokens_committed=request.cached_tokens or 0,
+                block_size=job.block_size,
+            )
+        )
+        return state
+
+    def _canonical_recovery_revalidate_ground(
+        self, job: CanonicalRecoveryJob, request: Request
+    ) -> None:
+        """Re-check the job's committed prefix against the cache that holds it.
+
+        Publication verifies the invariant
+
+            canonical_committed_tokens <= independently_restorable_tokens
+
+        at the moment it publishes, and `_canonical_recovery_publish` re-checks
+        it whenever a *higher* boundary comes along. Neither covers the gap in
+        between: the counter only rises, hot-cache-only eviction can drop a
+        block backing an already-published prefix, and a job that never crosses
+        another boundary never probes again.
+
+        A job resuming is exactly the point where the answer is already in
+        hand. `_prepare_prefix_cache_for_request` has just asked the serving
+        cache what it can restore for this prompt, so the check costs nothing
+        and takes no reference the probe would have to give back.
+        """
+        if self.block_aware_cache is None or self._model_has_unreconstructible_cache():
+            # No cache to be authoritative, so nothing to be authoritative
+            # about. A zero here would mean "unknown", not "gone".
+            return
+        restorable = safe_publish_boundary(
+            tokens_committed=int(getattr(request, "cached_tokens", 0) or 0),
+            block_size=job.block_size,
+        )
+        if restorable >= job.committed_tokens:
+            return
+        logger.warning(
+            "CanonicalRecovery: committed prefix of %d tokens is no longer restorable "
+            "(%d is); walking the committed boundary back and re-reading the rest",
+            job.committed_tokens,
+            restorable,
+        )
+        job.note_ground_lost(restorable)
+
+    def _canonical_recovery_step(self) -> bool:
+        """Advance the recovery job by one chunk, charging the whole step.
+
+        The timing wraps everything, not just the model forward. Restoring
+        the published prefix, extracting and storing the new boundary and
+        reading it back all run on the engine thread and all delay an
+        arriving request exactly as the forward does. Charging only the
+        forward made the reported share a lower bound on the recovery's real
+        wall cost, which for an experiment about fitting inside a budget is
+        the one number that has to be right.
+        """
+        owner = self._canonical_recovery_owner_key
+        # Before the state build, not after the first chunk. The interval
+        # between those two is the one where this engine has removed its old
+        # tracker entry and not yet written a new one, so a peer checking in
+        # it sees a process with no recovery running and starts a slice of its
+        # own. The claim is the only thing either engine can see during a
+        # slice, because a slice is otherwise opaque from outside.
+        if not self._canonical_recovery_budget.try_claim(owner):
+            return False
+        started = time.perf_counter()
+        try:
+            # Nothing in a recovery slice may fold prompt history into the
+            # MTP sidecar. The forward runs on this thread, and so does the
+            # capture hook inside it, so a thread-local suppression covers
+            # every capture site without reaching a foreground request.
+            with _mtp_priming.suppress_capture():
+                return self._canonical_recovery_step_inner()
+        finally:
+            elapsed = time.perf_counter() - started
+            self._canonical_recovery_budget.note_service(elapsed)
+            self._canonical_recovery_counters.service_s += elapsed
+            self._canonical_recovery_budget.release_claim(owner)
+
+    def _canonical_recovery_step_inner(self) -> bool:
+        """One chunk, the same grain the foreground chunked prefill uses,
+        because a chunk cannot be interrupted once it is handed to the model
+        and the budget can only be enforced between chunks."""
+        job = self._canonical_recovery_job
+        if job is None:
+            return False
+
+        if job.prefill_state is None:
+            try:
+                job.prefill_state = self._canonical_recovery_begin_state(job)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("CanonicalRecovery: could not start dense re-read: %s", e)
+                self._canonical_recovery_drop_job("start_failed")
+                return False
+            if job.prefill_state is None:
+                # Nothing to re-read: the published prefix already covers
+                # every whole block of the target. That is a job with nothing
+                # to do *yet*, not a job to destroy — destroying it forfeits
+                # the committed prefix it reports and the append path a later
+                # turn would have taken, so the next turn starts a new job and
+                # pays a full prefix reconstruct to learn what this one knew.
+                self._canonical_recovery_park_job(job, "nothing_to_do")
+                return False
+
+        state = job.prefill_state
+        try:
+            done = self._step_prefill_chunk(state)
+        except _PrefillEvictionNeeded:
+            # The adaptive throttle wants headroom before the next chunk. That
+            # is a pause, not a failure: the job keeps its state and its
+            # published prefix, and retries on a later idle step. Dropping here
+            # is what made the job lose a 12,288-token prefix to a transient
+            # memory reading. But nothing the recovery job does satisfies the
+            # throttle, so the pause is bounded — otherwise the job stays live,
+            # the loop keeps stepping to serve it, and an idle engine spins.
+            #
+            # The state goes back before the reclaim, not after. This throttle
+            # fires because predicted usage crossed a cap measured against
+            # current usage, and the job's own dense state is part of that
+            # current usage — the single largest part of it that recovery
+            # owns. Reclaiming around it, and then keeping it, is the one
+            # ordering that leaves the memory-pressure-causing allocation
+            # alive precisely when the runtime said there was not enough
+            # memory. What was published stays published; the job resumes
+            # from it.
+            self._canonical_recovery_retire_state(job, "the prefill memory throttle")
+            Scheduler._clear_cache(self)
+            self._canonical_recovery_note_yield(job, "the prefill memory throttle")
+            return False
+        except _PrefillAbortedError:
+            # Same ordering, same reason: the abort is a pause of unknown
+            # length and the state is not worth holding across it.
+            self._canonical_recovery_retire_state(job, "an aborted chunk")
+            Scheduler._clear_cache(self)
+            self._canonical_recovery_note_yield(job, "an aborted chunk")
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning("CanonicalRecovery: chunk failed, dropping job: %s", e)
+            Scheduler._clear_cache(self)
+            self._canonical_recovery_drop_job("chunk_failed")
+            return False
+
+        self._canonical_recovery_counters.chunks += 1
+        job.consecutive_yields = 0
+        job.processed_tokens = state.base_size + state.tokens_processed
+
+        if job.target_tokens > getattr(state, "canonical_recovery_target_tokens", job.target_tokens):
+            # The job was extended while this chunk was in flight. The state was
+            # built from the old token list and will report `done` at the old
+            # target, so believing it here would finish the job and leave the
+            # appended range unread until some later turn happened to extend
+            # again. Retire the state and let the next idle window rebuild it
+            # over the longer target, reusing what has been published.
+            logger.debug(
+                "CanonicalRecovery: job extended to %d during a chunk; rebuilding state",
+                job.target_tokens,
+            )
+            # Publish first. The chunk that just ran may be sitting exactly on
+            # a boundary, and that boundary is valid state for a prefix the
+            # extended job still has — `extend` verified the append. Retiring
+            # the state before publishing threw the block away and made the
+            # next window recompute it.
+            boundary = job.publishable_boundary()
+            if boundary:
+                self._canonical_recovery_publish(job, boundary, state)
+            self._canonical_recovery_retire_state(job)
+            return True
+
+        boundary = job.publishable_boundary()
+        if boundary:
+            self._canonical_recovery_publish(job, boundary, state)
+
+        if done:
+            job.note_reached_target()
+            self._canonical_recovery_finish(job)
+        return True
+
+    def _canonical_recovery_retire_state(
+        self, job: CanonicalRecoveryJob, reason: str = ""
+    ) -> None:
+        """Give back everything the live prefill state was holding.
+
+        The job survives; only its work does not. The last publish retained
+        the request entry on purpose — `retain_request_entry=not job.done`,
+        and a job that is about to be rebuilt is not done — so the entry and
+        its block references are still held here and releasing them is this
+        method's job. Without it the next `_canonical_recovery_begin_state` re-registers
+        the same request id, the block table is overwritten, and the previous
+        references are orphaned: never decremented, never evictable, filling
+        the paged cache until the memory throttle starts refusing the recovery
+        chunks outright.
+
+        The state is a materialised KV cache, not a set of references into the
+        paged pool, and it is the largest thing recovery owns: measured at
+        12 KiB per token plus a fixed 18.6 MiB of recurrent state on a small
+        hybrid model, and 64 KiB per token by arithmetic on the 64-layer
+        production geometry. `mx.get_active_memory()` falls by exactly that
+        amount the moment the reference goes. So retirement is not only
+        bookkeeping for the next rebuild; it is how recovery stops being the
+        process's largest idle allocation while it is standing down.
+        """
+        if reason and job.prefill_state is not None:
+            self._canonical_recovery_counters.states_retired += 1
+            logger.debug(
+                "CanonicalRecovery: retiring live state (%s) at %d/%d tokens, "
+                "%d committed and kept",
+                reason,
+                job.processed_tokens,
+                job.target_tokens,
+                job.committed_tokens,
+            )
+        job.prefill_state = None
+        rid = self._canonical_recovery_request_id(job)
+        self._drop_boundary_snapshots_for_request(rid)
+        self.requests.pop(rid, None)
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        self._release_paged_cache_for_request(rid)
+        # The synthetic id owns no MTP prompt-priming state by design, and
+        # this is the assertion of that: whatever a model family filed under
+        # it goes back here rather than outliving the job that made it.
+        _mtp_priming.release_request(getattr(self, "model", None), rid)
+
+    def _canonical_recovery_park_job(self, job: CanonicalRecoveryJob, reason: str) -> None:
+        """Retire a job's work without retiring the job.
+
+        The job stops being runnable — `done` is what both `_canonical_recovery_runnable`
+        and `_has_canonical_recovery_work` read — and keeps its committed prefix, its
+        session key and its identity, so a later turn extends it rather than
+        starting over. `extend` clears `reached_target`, which is what makes
+        the job runnable again.
+        """
+        logger.debug(
+            "CanonicalRecovery: parking job (%s) at %d/%d tokens, %d committed",
+            reason,
+            job.processed_tokens,
+            job.target_tokens,
+            job.committed_tokens,
+        )
+        job.note_reached_target()
+        self._canonical_recovery_retire_state(job)
+
+    def _canonical_recovery_stand_down_reason(self) -> str | None:
+        """Why a live recovery state should be given back now, if it should.
+
+        Published canonical state is durable; an in-progress dense state is
+        disposable. Between slices the job keeps that state so the next slice
+        can continue from it, and that is right while the next slice is
+        imminent. It stops being right when recovery has stood down for
+        something that is not imminent, because the state is then the largest
+        allocation in an otherwise idle engine, held for work that is not
+        going to happen soon.
+
+        Three reasons qualify, and two deliberately do not:
+
+        - foreground work anywhere in the process — a request on this engine,
+          one that has arrived and not yet been admitted, or one on a peer.
+          Recovery is the lowest-priority work in the process and must not be
+          the reason foreground allocation has less pool to draw on.
+        - a spent budget window. The window is 30 seconds and the allowance a
+          percentage of it, so a spent window is a pause of tens of seconds by
+          construction, not a gap between slices.
+        - not the two-idle-step spacing between slices. That is a single step
+          interval, and retiring across it would rebuild the state before
+          every slice.
+        - not another engine holding the recovery claim. The claim is released
+          in the `finally` of a slice, so it is held for a slice's duration.
+
+        What retirement costs is bounded and known: publication floors to a
+        block and runs after every chunk, so at most one block of dense
+        re-read is lost, and the next `_canonical_recovery_begin_state`
+        restores the published prefix through the ordinary path. What it costs
+        in time — a prefix reconstruct per resume — is not measured here, and
+        the threshold above is a policy choice rather than a measured optimum.
+        """
+        if self._canonical_recovery_local_requests():
+            return "local foreground work"
+        if self._canonical_recovery_inbound_count():
+            return "a foreground request that has arrived"
+        if self._canonical_recovery_foreign_engine_busy():
+            return "foreground work on another engine"
+        if not self._canonical_recovery_budget.allows():
+            return "a spent budget window"
+        return None
+
+    def _canonical_recovery_stand_down(self) -> bool:
+        """Retire the live state if the job has stood down for long enough.
+
+        Runs on the engine thread, from `_canonical_recovery_after_step`, and
+        nowhere else: dropping a materialised KV cache frees MLX arrays, and
+        that must not happen on the asyncio thread.
+        """
+        job = self._canonical_recovery_job
+        if job is None or job.cancelled or job.prefill_state is None:
+            return False
+        reason = self._canonical_recovery_stand_down_reason()
+        if reason is None:
+            return False
+        self._canonical_recovery_retire_state(job, reason)
+        return True
+
+    def _canonical_recovery_note_yield(self, job: CanonicalRecoveryJob, reason: str) -> None:
+        """Count a chunk that did not run, and give up after too many."""
+        self._canonical_recovery_counters.yielded_steps += 1
+        job.consecutive_yields += 1
+        if job.consecutive_yields >= MAX_CONSECUTIVE_YIELDS:
+            logger.info(
+                "CanonicalRecovery: giving up after %d consecutive yields to %s "
+                "(%d tokens committed)",
+                job.consecutive_yields,
+                reason,
+                job.committed_tokens,
+            )
+            self._canonical_recovery_drop_job("yield_limit")
+        else:
+            logger.info("CanonicalRecovery: yielding a chunk to %s", reason)
+
+    def _canonical_recovery_note_blocked_step(self) -> None:
+        """Bound how long a live job may hold the loop without being served.
+
+        The engine is idle, the window grants service, and the job still did
+        not run. Something outside the budget refused it, and the one such
+        condition this runtime can leave latent is a SpecPrefill RoPE wrapper
+        that was never cleaned up: ``_unwrap_rope`` documents the leftover
+        wrapper as an expected state (#766), ``_specprefill_rope_installed``
+        is right to refuse a dense forward under it, and nothing the recovery
+        job does will ever take it off.
+
+        The yield limit does not cover this. ``consecutive_yields`` is only
+        raised from inside a chunk and no chunk is ever reached here, so
+        without a deadline the job never runs, never finishes and never gives
+        up — on a loop that keeps stepping for it and on an engine that
+        cannot become quiescent while it is live. Recovery is allowed to lose
+        its work; it is not allowed to be the reason a model cannot unload.
+        """
+        if not self._canonical_recovery_budget.allows():
+            # The budget is the reason, which is ordinary waiting rather than
+            # a stall. `_has_canonical_recovery_work` parks the loop for that case.
+            self._canonical_recovery_blocked_idle_steps = 0
+            return
+        self._canonical_recovery_blocked_idle_steps += 1
+        if self._canonical_recovery_blocked_idle_steps < MAX_BLOCKED_IDLE_STEPS:
+            return
+        job = self._canonical_recovery_job
+        logger.warning(
+            "CanonicalRecovery: dropping job after %d idle steps it was allowed to run "
+            "and could not (%d tokens committed)",
+            self._canonical_recovery_blocked_idle_steps,
+            job.committed_tokens if job is not None else 0,
+        )
+        self._canonical_recovery_blocked_idle_steps = 0
+        self._canonical_recovery_drop_job("blocked")
+
+    def _canonical_recovery_publish(self, job: CanonicalRecoveryJob, boundary: int, state: Any) -> None:
+        """Hand a boundary-aligned canonical prefix to the ordinary store path.
+
+        Three conditions are re-checked here rather than trusted from queue
+        time, because the model, the cache and the alignment can all change
+        between a job being queued and a block being published:
+
+        - the model's cache must still be reconstructible;
+        - the boundary must be exactly where the live state sits, so the
+          stored block is the state at its own end rather than a state that
+          has already ingested tokens past it;
+        - the prefix cache must still exist.
+
+        A hybrid model's non-sliceable layers cannot be stored from the live
+        cache alone: every block but the last would get a placeholder, and a
+        later restore would walk back to nothing or be rejected outright. The
+        per-block state lives in the boundary snapshots this job's own chunks
+        captured, so the payload is assembled from those. An earlier version of
+        this method passed no snapshots, and the store stopped at zero tokens
+        while the log line above it said the prefix had been published — which
+        is why nothing below trusts the call and everything checks the result.
+        """
+        if self.block_aware_cache is None:
+            return
+        if (
+            job.serving_cache_id is not None
+            and job.serving_cache_id != id(self.block_aware_cache)
+        ):
+            # The prefix-cache instance changed under the job. Anything
+            # published now would land somewhere the serving restore path does
+            # not look, so fail closed rather than write unreachable state and
+            # count it.
+            logger.warning(
+                "CanonicalRecovery: refusing to publish, serving prefix cache changed "
+                "(bound=%s, now=%s)",
+                job.serving_cache_id,
+                id(self.block_aware_cache),
+            )
+            self._canonical_recovery_drop_job("serving_cache_changed")
+            return
+        if self._model_has_unreconstructible_cache():
+            logger.info("CanonicalRecovery: refusing to publish, cache is unreconstructible")
+            self._canonical_recovery_drop_job("unreconstructible")
+            return
+        live_tokens = state.base_size + state.tokens_processed
+        if live_tokens != boundary:
+            logger.debug(
+                "CanonicalRecovery: skipping publish, live state at %d is not the boundary %d",
+                live_tokens,
+                boundary,
+            )
+            return
+
+        rid = self._canonical_recovery_request_id(job)
+        tokens = list(job.tokens[:boundary])
+
+        override = self._get_boundary_store_override(rid, tokens)
+        logger.debug(
+            "CanonicalRecovery: publishing %d tokens from %s",
+            boundary,
+            "a boundary snapshot" if override is not None else "the live cache",
+        )
+        if override is not None:
+            # Take only the boundary-aligned token range and the snapshot
+            # provider from the override. The payload it carries is the
+            # boundary snapshot, which holds the non-sliceable layers alone —
+            # 48 of this model's 64 — and storing that as `cache_data` stamps
+            # the block `num_layers: 48`. A later restore compares that with
+            # the model's 64 and rejects the whole chain as cross-model
+            # contamination, which is how a correctly published prefix became
+            # unreadable by the serving path. The live cache sits exactly on
+            # this boundary, asserted above, so it is the same state at full
+            # width — and it is what the completion path stores.
+            tokens, _snapshot_payload, _snapshot_config, snapshots = override
+            if len(tokens) != boundary:
+                # Should not be reachable: the chunk that landed on this
+                # boundary emitted a snapshot at the same token count before it
+                # returned, so the override ends here. Asserted rather than
+                # assumed, because the argument for it spans three files and
+                # the cost of being wrong is silent corruption.
+                #
+                # Were it reachable: the override truncates to the latest
+                # block-aligned snapshot below this boundary, and leaves that
+                # snapshot out of the provider it returns — so the block the
+                # range now ends on has no snapshot of its own and takes the
+                # live state instead, under `live_state_at_true_end`. The live
+                # state is at
+                # `boundary`, not at `len(tokens)`. Storing it would hand a
+                # later restore a block whose recurrent state has already
+                # ingested tokens past its own end, which is the corruption
+                # `store_cache` refuses a placeholder rather than risk.
+                #
+                # The read-back cannot catch it: it verifies that the range is
+                # restorable, not that what restores is the right state.
+                # Declining costs one publication.
+                logger.debug(
+                    "CanonicalRecovery: boundary snapshot ends at %d, not the "
+                    "boundary %d; not publishing",
+                    len(tokens),
+                    boundary,
+                )
+                return
+            try:
+                with mx.stream(self._stream):
+                    extracted, model_cache_config = self._extract_cache_states(
+                        state.cache
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("CanonicalRecovery: could not extract state to publish: %s", e)
+                return
+            if not extracted:
+                return
+        elif self._detect_boundary_snapshot_need():
+            # Non-sliceable state with no snapshot to store it from. Publishing
+            # the live cache here would write placeholders for every block but
+            # the last, so there is nothing safe to publish yet.
+            logger.debug(
+                "CanonicalRecovery: no boundary snapshot available at %d tokens, "
+                "not publishing",
+                boundary,
+            )
+            return
+        else:
+            snapshots = None
+            try:
+                with mx.stream(self._stream):
+                    extracted, model_cache_config = self._extract_cache_states(
+                        state.cache
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("CanonicalRecovery: could not extract state to publish: %s", e)
+                return
+            if not extracted:
+                return
+
+        try:
+            with mx.stream(self._stream):
+                arrays = self._collect_arrays_from_extracted_cache(extracted)
+                if snapshots is not None:
+                    # The override returns either a {token_count: cache} mapping
+                    # or a lazy provider; the completion path iterates the
+                    # provider, so this does too rather than assuming a dict.
+                    iter_snapshots = getattr(
+                        snapshots, "iter_in_memory_extracted", None
+                    )
+                    members = (
+                        iter_snapshots()
+                        if callable(iter_snapshots)
+                        else (snapshots.values() if hasattr(snapshots, "values") else ())
+                    )
+                    for snapshot in members:
+                        arrays.extend(
+                            self._collect_arrays_from_extracted_cache(snapshot)
+                        )
+                if arrays:
+                    # FULL eval on the owner thread. The store worker slices and
+                    # views these buffers; a lazy op left for it re-dispatches to
+                    # this thread's stream index, which does not exist there.
+                    mx.eval(*arrays)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("CanonicalRecovery: could not materialize state to publish: %s", e)
+            return
+
+        try:
+            # Through the ordinary worker, which holds _mx_buffer_access_lock
+            # for its buffer access. `retain_request_entry` keeps the job's
+            # block table registered: the worker's normal tail releases the
+            # blocks for eviction and drops the request entry, which is right
+            # once at request completion and wrong at every boundary of a job
+            # that is still running. Dropping the entry makes the next publish
+            # re-serialize the whole prefix instead of appending to it, and
+            # releasing the blocks lets the prefix the job is still building on
+            # be evicted underneath it.
+            block_table = self._async_store_cache_worker(
+                rid,
+                tokens,
+                extracted,
+                model_cache_config,
+                snapshots,
+                None,
+                None,
+                None,
+                not self._bypass_hot_cache_under_pressure(),
+                retain_request_entry=not job.done,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("CanonicalRecovery: publish failed at %d tokens: %s", boundary, e)
+            return
+
+        stored = len(getattr(block_table, "block_ids", None) or []) * job.block_size
+        if stored <= job.committed_tokens:
+            # The store declined, or wrote no more than the last one did. Say so
+            # rather than recording a commit the cache cannot honour.
+            logger.warning(
+                "CanonicalRecovery: store at %d tokens persisted %d tokens; not counted",
+                boundary,
+                stored,
+            )
+            return
+
+        published = min(boundary, stored)
+
+        # The invariant this whole path exists to hold:
+        #     canonical_committed_tokens <= independently_restorable_tokens
+        # A store that reports success is not evidence of canonical
+        # publication. The counter advances only after the ordinary matching
+        # path, on the serving cache, can actually see the boundary.
+        restorable = self._canonical_recovery_readback_tokens(job, tokens)
+        if restorable < published:
+            logger.warning(
+                "CanonicalRecovery: %d tokens published but only %d are restorable by the "
+                "serving path; not counted",
+                published,
+                restorable,
+            )
+            if restorable < job.committed_tokens:
+                # Ground this job had already verified is gone. The job's own
+                # blocks are not in the hot cache's protection set — that set
+                # is built from the running and prefilling lists, and a
+                # recovery request is deliberately in neither — so under
+                # `hot_cache_only`, where an evicted block is dropped rather
+                # than demoted to SSD, a hole can open low in the published
+                # chain.
+                #
+                # Refusing the publish already keeps the counter honest about
+                # *this* boundary. It does not help with the last one:
+                # `committed_tokens` only ever rises, so every later boundary
+                # is at or below the stale watermark, every later publish is
+                # refused by this same probe, and the job would run to target
+                # spending its whole allowance to commit nothing while still
+                # reporting a prefix the cache can no longer honour. Stop, and
+                # stop claiming it.
+                #
+                # A probe that raised also lands here, because it returns 0.
+                # Dropping a background job on a serving-path lookup that
+                # raised is the cheap side of that trade.
+                logger.warning(
+                    "CanonicalRecovery: committed prefix of %d tokens is no longer "
+                    "restorable; dropping the job",
+                    job.committed_tokens,
+                )
+                self._canonical_recovery_drop_job("committed_prefix_lost")
+            return
+
+        job.note_published(published)
+        self._canonical_recovery_counters.publishes += 1
+        logger.info(
+            "CanonicalRecovery: published canonical prefix at %d tokens (store %d, "
+            "independently restorable %d)",
+            published,
+            stored,
+            restorable,
+        )
+
+    def _canonical_recovery_readback_tokens(self, job: CanonicalRecoveryJob, tokens: list[int]) -> int:
+        """Tokens the ordinary matching path can resolve for *tokens*, right now.
+
+        Uses the serving cache's own `fetch_cache`, which is the same lookup a
+        real request takes, under a throwaway request id that is released
+        immediately. It answers "would a request see this?", which is the only
+        sense in which a boundary is published.
+        """
+        cache = self.block_aware_cache
+        if cache is None or not tokens:
+            return 0
+        probe_id = f"canonical-recovery-readback:{job.session_key}"
+        try:
+            block_table, remaining = cache.fetch_cache(probe_id, list(tokens))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("CanonicalRecovery: read-back probe failed: %s", e)
+            return 0
+        finally:
+            # The probe holds a reference on every block it matched, and
+            # `release_cache` does not return them: it frees through the
+            # request table that only `store_cache` writes, and this probe
+            # deliberately never stores. Without the explicit release the
+            # blocks a recovery publishes are pinned by the very check that
+            # verifies the publish, and each boundary pins a longer chain.
+            with suppress(Exception):
+                cache.release_fetched_blocks(probe_id)
+            with suppress(Exception):
+                cache.release_cache(probe_id)
+            with suppress(Exception):
+                cache.clear_request_entry(probe_id)
+        matched = getattr(block_table, "num_tokens", 0) or 0
+        if remaining is not None:
+            matched = max(matched, len(tokens) - len(remaining))
+        return int(matched)
+
+    def _canonical_recovery_finish(self, job: CanonicalRecoveryJob) -> None:
+        logger.info(
+            "CanonicalRecovery: target reached at %d tokens, %d committed",
+            job.processed_tokens,
+            job.committed_tokens,
+        )
+        job.prefill_state = None
+        rid = self._canonical_recovery_request_id(job)
+        self._drop_boundary_snapshots_for_request(rid)
+        self.requests.pop(rid, None)
+        self._prefix_cache_prepared.discard(rid)
+        get_prefill_tracker().remove(rid)
+        # The last publish retained the request entry — `job.done` is still
+        # false at that point, because `note_reached_target` runs after the
+        # publish — so the entry and its block references are still held here
+        # and releasing them is this method's job. Without it every restart
+        # of the same request id overwrites the block table and orphans the
+        # references the previous one acquired: those blocks can never be
+        # decremented, are never evictable, and fill the paged cache until
+        # the memory throttle starts refusing the recovery chunks outright.
+        self._release_paged_cache_for_request(rid)
+        # The synthetic id owns no MTP prompt-priming state by design, and
+        # this is the assertion of that: whatever a model family filed under
+        # it goes back here rather than outliving the job that made it.
+        _mtp_priming.release_request(getattr(self, "model", None), rid)
+        # The job itself stays so a later turn can extend it rather than
+        # restart it from nothing.
+
+    def _canonical_recovery_local_requests(self) -> bool:
+        """Foreground requests this engine is holding.
+
+        Deliberately not ``has_requests()``: that predicate reports the
+        recovery job as work, so using it here would let the recovery job
+        reset its own idle counter on every step and never become runnable.
+
+        The two callers below each add one clause, and the difference between
+        them is the whole reason there are two.
+        """
+        return bool(
+            self.waiting
+            or self.prefilling
+            or self.running
+            or self._pending_async_removes
+            or self._pending_reclaim_request
+        )
+
+    def _canonical_recovery_foreground_busy(self) -> bool:
+        """Whether a dense forward would be unsafe or unwelcome right now.
+
+        Adds the RoPE wrapper, because a dense forward taken while SpecPrefill
+        has one installed reads another request's position offset.
+        """
+        return self._canonical_recovery_local_requests() or self._specprefill_rope_installed()
+
+    def _canonical_recovery_engine_has_foreground(self) -> bool:
+        """Whether something that ends is the reason recovery did not run.
+
+        Adds the waits, and deliberately *not* the RoPE wrapper: that one can
+        be left installed with no request behind it (#766), so reading it as a
+        busy engine is what let a job block on it indefinitely with nothing
+        noticing. This predicate exists to keep the stall deadline off waits
+        that resolve on their own — a request here, a peer's foreground work,
+        a peer's recovery slice.
+        """
+        return bool(
+            self._canonical_recovery_local_requests()
+            or self._canonical_recovery_inbound_count()
+            or self._canonical_recovery_foreign_engine_busy()
+            or self._canonical_recovery_claim_blocked()
+        )
+
+    def _canonical_recovery_note_step(self, did_foreground_work: bool) -> None:
+        """Count idle steps, and stand the recovery job down when work appears.
+
+        A chunk holds the interpreter for its whole duration, so starting one
+        on the first idle step leaves no window in which an arriving request
+        can announce itself. Two consecutive idle steps buy that window back
+        at a cost of one step interval per chunk.
+        """
+        job = self._canonical_recovery_job
+        live = job is not None and not job.done and not job.cancelled
+        busy = bool(
+            did_foreground_work
+            or self._canonical_recovery_foreground_busy()
+            or self._canonical_recovery_inbound_count()
+        )
+        if busy:
+            # A yield is about the job as it stands now: the engine got busy
+            # and a live job stood down for it.
+            if self._consecutive_idle_steps and live:
+                self._canonical_recovery_counters.yielded_steps += 1
+            self._consecutive_idle_steps = 0
+            return
+        self._consecutive_idle_steps += 1
 
     def step(self) -> SchedulerOutput:
         """
@@ -13227,7 +14618,69 @@ class Scheduler:
 
         self._publish_admin_snapshot()
 
+        # Progressive canonical state recovery. Last in the step on purpose: every
+        # foreground decision above has already been made, so the idle
+        # judgement below is about this step's real outcome rather than a
+        # prediction of it.
+        #
+        # Guarded, because this runs *after* step()'s own try/except. Anything
+        # escaping here leaves step() altogether, and the engine loop answers
+        # an escaped exception by calling fail_all_requests() — every live
+        # request in the batch errored, by background work that is allowed to
+        # lose nothing but its own progress.
+        if self._canonical_recovery_enabled():
+            try:
+                self._canonical_recovery_after_step(output)
+            except Exception:  # noqa: BLE001
+                logger.exception("CanonicalRecovery: step failed; dropping the job")
+                with suppress(Exception):
+                    self._canonical_recovery_drop_job("step_failed")
+
         return output
+
+    def _canonical_recovery_after_step(self, output: SchedulerOutput) -> None:
+        """Advance the recovery job, if this step left the engine idle for it.
+
+        A chunk runs only when the engine had nothing to do for two
+        consecutive steps; the second step is the window in which an arriving
+        request can announce itself, which a back-to-back slice would
+        otherwise never leave open.
+        """
+        self._canonical_recovery_note_step(bool(output.has_work))
+        if self._canonical_recovery_runnable():
+            self._canonical_recovery_blocked_idle_steps = 0
+            ran = self._canonical_recovery_step()
+            # Reset on a yield too. The two-idle-step rule exists to leave
+            # a step in which an arriving request can announce itself, and
+            # a yield that did not reset it re-entered the recovery job on
+            # the very next step — up to eight times in a row, with no such
+            # window between them.
+            self._consecutive_idle_steps = 0
+            if ran:
+                # A recovery chunk is work, so the engine loop keeps
+                # stepping rather than sleeping between chunks.
+                output.has_work = True
+        elif (
+            self._canonical_recovery_job is not None
+            and not self._canonical_recovery_job.cancelled
+            and not self._canonical_recovery_job.done
+        ):
+            # The slice is not going to run. If the reason is one that lasts,
+            # the state it was holding goes back before anything else is
+            # decided — this is the only executor-thread opportunity to free
+            # it, and `_has_canonical_recovery_work` holds the loop awake for
+            # exactly this step so that the opportunity exists even when the
+            # reason is a peer engine and this one has nothing of its own.
+            with suppress(Exception):
+                self._canonical_recovery_stand_down()
+            if self._canonical_recovery_engine_has_foreground():
+                # A busy engine is a reason, and it ends. The loop would be
+                # stepping for the foreground anyway.
+                self._canonical_recovery_blocked_idle_steps = 0
+            else:
+                self._canonical_recovery_note_blocked_step()
+        else:
+            self._canonical_recovery_blocked_idle_steps = 0
 
     def _publish_admin_snapshot(self) -> None:
         """Atomically publish a fresh admin-visible snapshot.
@@ -13283,6 +14736,21 @@ class Scheduler:
 
     def reset(self) -> None:
         """Reset the scheduler state."""
+        self.cancel_canonical_recovery_work("reset")
+        # The recovery telemetry has to go with it. Left alone, the budget's
+        # own wall clock, its window, the counters and the idle denominator
+        # all survive an engine switch, and the two service shares then splice
+        # two runs together with nothing on the wire to say so.
+        # Local telemetry only. A shared budget belongs to every engine in the
+        # pool, and discarding the service they have already spent — mid
+        # window, with the carried overshoot — would lift their ceiling every
+        # time any one engine reset. Under memory pressure the pool unloads
+        # and reloads repeatedly, so that would be most cycles.
+        if not self._canonical_recovery_budget.shared:
+            self._canonical_recovery_budget.reset()
+        self._canonical_recovery_counters = CanonicalRecoveryCounters()
+        self._consecutive_idle_steps = 0
+        self._canonical_recovery_blocked_idle_steps = 0
         _mtp_priming.clear_owned(getattr(self, "model", None))
         with suppress(Exception):
             get_decode_activity().remove(self._decode_activity_key)
@@ -13429,6 +14897,13 @@ class Scheduler:
         Flushes hot cache to SSD and closes the background writer.
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
+        self.cancel_canonical_recovery_work("shutdown")
+        # Deregister rather than reset: the share this engine was using goes
+        # back, and everything the remaining owners have spent stays spent.
+        # The carried overshoot stays on the budget too, or unloading would be
+        # a way to discharge a debt.
+        with suppress(Exception):
+            self._canonical_recovery_budget.deregister(self._canonical_recovery_owner_key)
         teardown = getattr(self, "_engine_teardown", None)
         _mtp_priming.clear_owned(getattr(self, "model", None))
         logger.info("Scheduler shutdown initiated...")

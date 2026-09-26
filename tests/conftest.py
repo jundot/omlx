@@ -252,3 +252,35 @@ def _reset_decode_activity_registry():
     get_decode_activity().clear()
     yield
     get_decode_activity().clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_foreground_arrival_registry():
+    """Keep the process-global arrival registry hermetic per test.
+
+    Same reason as the decode registry above, with a longer TTL: an arrival
+    noted in one test would otherwise read as live foreground work in every
+    test that runs within the next thirty seconds.
+    """
+    from omlx.foreground_arrivals import get_foreground_arrivals
+
+    get_foreground_arrivals().clear()
+    yield
+    get_foreground_arrivals().clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_prefill_tracker():
+    """Keep the process-global prefill tracker hermetic per test.
+
+    Unlike the two registries above it has no TTL: an entry lives until the
+    prefill completes or is aborted. A test that drives a single chunk never
+    reaches either, and its entry then reads as foreign foreground prefill to
+    every later recovery predicate in the same process — which one test that
+    is depends on how xdist distributes the files.
+    """
+    from omlx.prefill_progress import get_prefill_tracker
+
+    get_prefill_tracker().clear()
+    yield
+    get_prefill_tracker().clear()

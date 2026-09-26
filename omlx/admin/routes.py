@@ -355,6 +355,9 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: str | None = None
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
+    # Progressive canonical state recovery (dense re-read of a sparsely-served range)
+    canonical_state_recovery_enabled: bool | None = None
+    canonical_state_recovery_slice_tokens: int | None = None
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool | None = None
     dflash_draft_model: str | None = None
@@ -624,6 +627,8 @@ class GlobalSettingsRequest(BaseModel):
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
     decode_fairness: bool | None = None
+    # Aggregate ceiling on background recovery across every engine, percent.
+    canonical_state_recovery_global_budget_pct: float | None = None
 
     # Cache settings
     cache_enabled: bool | None = None
@@ -3060,6 +3065,17 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    # Canonical state recovery settings. Budget and mode are carried even when the value
+    # is falsy: 0.0 is a meaningful budget (the recovery job is admitted but never
+    # served), not an absent one.
+    if "canonical_state_recovery_enabled" in sent:
+        current_settings.canonical_state_recovery_enabled = bool(
+            request.canonical_state_recovery_enabled
+        )
+    if "canonical_state_recovery_slice_tokens" in sent:
+        current_settings.canonical_state_recovery_slice_tokens = int(
+            request.canonical_state_recovery_slice_tokens or 0
+        )
     # DFlash settings
     if "dflash_enabled" in sent:
         new_dflash_enabled = (
@@ -4604,6 +4620,9 @@ def _global_settings_response(global_settings):
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
             "decode_fairness": global_settings.scheduler.decode_fairness,
+            "canonical_state_recovery_global_budget_pct": (
+                global_settings.scheduler.canonical_state_recovery_global_budget_pct
+            ),
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -5112,6 +5131,26 @@ async def update_global_settings(
         logger.info(
             f"Decode fairness {'enabled' if enabled else 'disabled'}"
         )
+
+    # Aggregate recovery ceiling (Live). One object serves every engine, so
+    # unlike the per-scheduler settings above this reaches them all by being
+    # updated in place — and updating rather than replacing is what stops a
+    # settings change handing every engine a fresh window and a clean debt.
+    if request.canonical_state_recovery_global_budget_pct is not None:
+        pct = max(0.0, min(100.0, float(request.canonical_state_recovery_global_budget_pct)))
+        global_settings.scheduler.canonical_state_recovery_global_budget_pct = pct
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            pool_config = getattr(pool, "_scheduler_config", None)
+            if pool_config is not None:
+                pool_config.canonical_state_recovery_global_budget_pct = pct
+            configure = getattr(pool, "configure_canonical_recovery_budget", None)
+            if callable(configure):
+                configure()
+        runtime_applied.append("canonical_state_recovery_global_budget_pct")
+        logger.info(f"Aggregate recovery budget set to {pct:.1f}%")
 
     if request.hot_cache_max_size is not None:
         try:

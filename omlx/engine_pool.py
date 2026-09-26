@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from .canonical_recovery import apply_canonical_recovery_settings
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -314,6 +315,7 @@ class EnginePool:
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
         self.configure_hot_cache_budget()
+        self.configure_canonical_recovery_budget()
 
     def _distributed_deployment_for_entry(
         self, entry: EngineEntry
@@ -658,6 +660,47 @@ class EnginePool:
         """Current memory used by loaded models in bytes."""
         return self._current_model_memory
 
+    def configure_canonical_recovery_budget(self) -> None:
+        """Ensure every scheduler in the pool shares one recovery budget.
+
+        The same ownership shape as `configure_hot_cache_budget`, for the same
+        reason: a scalar on the shared scheduler config is snapshotted into
+        each engine's own copy, an object is not. Background recovery rations
+        an accelerator, and every engine in this pool has exactly one between
+        them, so the ceiling has to be one object rather than one per engine.
+
+        The object is created even at a zero percentage. A pooled scheduler
+        must adopt it either way — otherwise it falls back to a private budget
+        built from the per-model percentage, which is the arrangement that
+        granted M engines M times the cap.
+        """
+        from .canonical_recovery import DEFAULT_BUDGET_WINDOW_S, CanonicalRecoveryBudget
+
+        pct = float(
+            getattr(self._scheduler_config, "canonical_state_recovery_global_budget_pct", 0.0)
+            or 0.0
+        )
+        window_s = float(
+            getattr(
+                self._scheduler_config,
+                "canonical_state_recovery_budget_window_s",
+                DEFAULT_BUDGET_WINDOW_S,
+            )
+            or DEFAULT_BUDGET_WINDOW_S
+        )
+        current = getattr(self._scheduler_config, "canonical_recovery_budget", None)
+        if isinstance(current, CanonicalRecoveryBudget):
+            # Keep the object, and with it the window clock, the spent
+            # allowance and the carried overshoot. Replacing it on a settings
+            # change would hand every engine a fresh window, which is the
+            # thing an unload/reload cycle must not be able to buy either.
+            current.pct = pct
+            current.window_s = window_s if window_s > 0 else DEFAULT_BUDGET_WINDOW_S
+            return
+        self._scheduler_config.canonical_recovery_budget = CanonicalRecoveryBudget(
+            pct=pct, window_s=window_s, shared=True
+        )
+
     def configure_hot_cache_budget(self) -> None:
         """Ensure loaded schedulers share one process-wide hot cache budget."""
         hot_max = int(getattr(self._scheduler_config, "hot_cache_max_size", 0) or 0)
@@ -952,6 +995,14 @@ class EnginePool:
             add("specprefill_draft_model", data.get("specprefill_draft_model"))
             add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
             add("specprefill_threshold", data.get("specprefill_threshold"))
+
+        canonical_recovery_active = bool(data.get("canonical_state_recovery_enabled", False))
+        add("canonical_state_recovery_enabled", canonical_recovery_active)
+        if canonical_recovery_active:
+            add(
+                "canonical_state_recovery_slice_tokens",
+                data.get("canonical_state_recovery_slice_tokens", 0),
+            )
 
         dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
         dflash_draft = data.get("dflash_draft_model")
@@ -1509,6 +1560,15 @@ class EnginePool:
         scheduler = self._resolve_scheduler_from_engine(entry.engine)
         if scheduler is None:
             return False
+        # Scheduler-owned background work is not a request and nothing else will
+        # end it, but it does keep the scheduler non-quiescent. An unload that
+        # polls this predicate would never go ready, the pending marker would
+        # stay installed, and every later acquisition of this model would be
+        # refused. Background work yields to an unload; it never blocks one.
+        cancel_background = getattr(scheduler, "cancel_canonical_recovery_work", None)
+        if callable(cancel_background):
+            with suppress(Exception):
+                cancel_background("unload_pending")
         has_requests = getattr(scheduler, "has_requests", None)
         if callable(has_requests):
             try:
@@ -3003,6 +3063,11 @@ class EnginePool:
             # right values when it builds `SchedulerConfig` internally.
             self._scheduler_config.model_name = model_id
             self._scheduler_config.model_path = entry.model_path
+
+            # Canonical state recovery is scheduler-owned and its two per-model knobs
+            # ride the same shared scheduler config as model_name/model_path
+            # above. The ceiling is not among them: it is server-level.
+            apply_canonical_recovery_settings(self._scheduler_config, model_settings)
 
             # Native MTP forces LM-only dispatch even for VLM models. Vision
             # encoder weights are ignored because the patched mtp_forward only
