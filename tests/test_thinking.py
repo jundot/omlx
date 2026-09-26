@@ -452,3 +452,46 @@ def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
     assert parser.finish(truncated=True) == ("</thi", "")
     assert parser.finish(truncated=True) == ("", "")
+
+
+def _stream(text, *, prompt_opened=False, truncated=False):
+    """Stream text whole, one character at a time, and split at every boundary."""
+    splits = [[text], list(text)]
+    splits += [[text[:i], text[i:]] for i in range(1, len(text))]
+    for chunks in splits:
+        parser = ThinkingParser(start_in_thinking=prompt_opened)
+        parts = [parser.feed(chunk) for chunk in chunks]
+        parts.append(parser.finish(truncated=truncated))
+        yield chunks, tuple("".join(part[i] for part in parts) for i in (0, 1))
+
+
+@pytest.mark.parametrize(
+    "prompt_opened, text, expected",
+    [
+        (
+            True,
+            'ok</think>{"tag": "<think>", "n": 1}',
+            ("ok", '{"tag": "<think>", "n": 1}'),
+        ),
+        (False, "<think>r</think>Use <think> to open.", ("r", "Use <think> to open.")),
+        (False, "<think>a</think>b<think>c</think>d", ("ac", "bd")),
+    ],
+    ids=["json-string", "prose", "closed-second-block"],
+)
+def test_stream_thinking_reopened_after_close_matches_final_parse(
+    prompt_opened, text, expected
+):
+    """A <think> after the block closed stays content unless it closes again."""
+    final_content = extract_thinking(("<think>" if prompt_opened else "") + text)[1]
+    assert final_content == expected[1]
+    for chunks, streamed in _stream(text, prompt_opened=prompt_opened):
+        assert streamed == expected, chunks
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_stream_unclosed_reopened_thinking_follows_finish_reason(truncated):
+    text = "<think>a</think>b<think>c</thi"
+    expected = ("ac</thi", "b") if truncated else ("a", "b<think>c</thi")
+    assert extract_thinking(text, truncated=truncated)[1] == expected[1]
+    for chunks, streamed in _stream(text, truncated=truncated):
+        assert streamed == expected, chunks
