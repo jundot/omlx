@@ -880,3 +880,31 @@ def test_admin_validate_offload_mtp_family_gate(tmp_path, monkeypatch):
             settings,
         )
     assert error.value.status_code == 400
+
+
+def test_qwen4_exp_may_pair_offload_with_lightning_mtp():
+    """root4k keeps a stock head at the checkpoint root, so the generic
+    wrapper holds it resident by path (moe_expert_offload._is_mtp_named) and
+    validation admits the pair. Other families stay rejected."""
+    from omlx.model_settings import validate_moe_expert_offload
+
+    settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
+    validate_moe_expert_offload(settings, model_type="qwen4_exp")
+    validate_moe_expert_offload(settings, model_type="qwen4-exp")
+    # DFlash / VLM-MTP remain conflicts even for an admitted family.
+    for key in ("dflash_enabled", "vlm_mtp_enabled"):
+        with pytest.raises(ValueError, match="MoE expert offload cannot"):
+            validate_moe_expert_offload(
+                {"moe_expert_offload_enabled": True, key: True},
+                model_type="qwen4_exp",
+            )
+
+
+def test_is_mtp_named_covers_both_head_layouts():
+    from omlx.patches.moe_expert_offload import _is_mtp_named
+
+    assert _is_mtp_named("mtp")
+    assert _is_mtp_named("mtp.0.mlp.switch_mlp.gate_proj.weight")
+    assert _is_mtp_named("language_model.mtp.0.block.switch_mlp")
+    assert not _is_mtp_named("model.language_model.layers.0.mlp.switch_mlp")
+    assert not _is_mtp_named("model.layers.3.mtp_gate.weight")

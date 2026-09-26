@@ -498,8 +498,14 @@ class EnginePool:
                 fraction = settings.moe_expert_offload_resident_fraction
                 # Price expert residency before deciding whether PLE must use SSD.
                 # The entry projection consumes these adjusted estimates once.
+                # Mirror the wrapper's MTP residency: when the Lightning head
+                # is armed its experts stay resident, so the projection must
+                # not discount that slab or admission overcommits.
                 saved = estimate.checkpoint_bytes - estimate_offload_admission_bytes(
-                    entry.model_path, estimate.checkpoint_bytes, fraction
+                    entry.model_path,
+                    estimate.checkpoint_bytes,
+                    fraction,
+                    mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
                 )
                 # PLE estimates include a 5% allowance on checkpoint bytes;
                 # offloaded expert bytes must release the same allowance.

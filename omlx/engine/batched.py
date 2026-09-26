@@ -8,6 +8,7 @@ for better throughput when serving multiple concurrent requests.
 
 import asyncio
 import copy
+import functools
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -353,9 +354,18 @@ class BatchedEngine(BaseEngine):
                     0.25,
                 )
             )
+            # Lightning MTP: the draft head's experts stay resident while the
+            # backbone streams (run_in_executor takes no kwargs, so bind with
+            # partial). qwen4_exp ships its draft head at the checkpoint root;
+            # without this the wrapper streamed it like any backbone layer.
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
-                apply_moe_expert_offload,
+                functools.partial(
+                    apply_moe_expert_offload,
+                    mtp_resident=bool(
+                        getattr(self._model_settings, "mtp_enabled", False)
+                    ),
+                ),
                 self._model,
                 self._model_name,
                 fraction,

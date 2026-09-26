@@ -705,6 +705,17 @@ def _qwen35_checkpoint_prefix(store, path):
     return path
 
 
+def _is_mtp_named(path: str) -> bool:
+    """Tree path or checkpoint name of a module inside the embedded MTP head.
+
+    Matches the root-level ``mtp.<i>.*`` layout (qwen4_exp ships the head at
+    the checkpoint root, alongside ``vision_tower.*`` and ``language_model.*``)
+    and the nested ``language_model.mtp.<i>.*``, mirroring
+    ``omlx.patches.deepseek_v4.moe_offload._is_mtp_path``.
+    """
+    return path == "mtp" or path.startswith("mtp.") or ".mtp." in path
+
+
 def _resolve_store_view(
     glu: SwitchGLU, store: CheckpointExpertStore, path: str
 ) -> tuple[_GLUStoreView | None, str | None]:
@@ -782,10 +793,13 @@ def apply_moe_expert_offload(
     checkpoint does not cover them). Must run before lazy weights are
     materialized for the memory saving to exist.
 
-    ``mtp_resident`` keeps the embedded MTP draft head's experts resident
-    (glm5_next Lightning MTP + offload; see
-    ``omlx.patches.deepseek_v4.moe_offload``). Other families reject the
-    combination at validation, so only this adapter's path consumes it.
+    ``mtp_resident`` keeps the embedded MTP draft head's experts resident, so
+    every speculation step reads its experts from RAM while the backbone
+    streams. Consumed here for stock-``SwitchGLU`` families whose head is a
+    plain decoder layer (qwen4_exp Lightning MTP) and by the DeepSeek V4
+    adapter (see ``omlx.patches.deepseek_v4.moe_offload``). Families outside
+    ``model_settings.MOE_OFFLOAD_MTP_MODEL_TYPES`` reject the combination at
+    validation.
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return 0
@@ -818,7 +832,15 @@ def apply_moe_expert_offload(
         model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
     total_bytes = resident_bytes = 0
+    mtp_skipped = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
+        if mtp_resident and _is_mtp_named(path):
+            # Lightning MTP + offload keeps the draft head resident: admission
+            # prices its slab as resident (estimate_offload_admission_bytes),
+            # so offloading it here would stream bytes the fit check approved
+            # as RAM and put checkpoint reads on every draft cycle.
+            mtp_skipped += 1
+            continue
         checkpoint_path = (
             _qwen35_checkpoint_prefix(store, path) if kind == "qwen3_5_moe" else path
         )
@@ -850,6 +872,12 @@ def apply_moe_expert_offload(
         # (same reasoning as the gate/up fusion patch, #2304).
         _sync_and_clear_cache()
 
+    if mtp_skipped:
+        logger.info(
+            "moe expert offload: kept %d MTP draft-head expert blocks fully "
+            "resident (Lightning MTP + offload)",
+            mtp_skipped,
+        )
     if total_bytes:
         logger.info(
             "moe expert offload: wrapped %d layers at %.1f%% residency "
@@ -918,13 +946,11 @@ def estimate_offload_admission_bytes(
             for name, spec in header.items():
                 if name == "__metadata__":
                     continue
-                if mtp_resident and (
-                    name.startswith("mtp.") or ".mtp." in name
-                ):
-                    # The draft head stays resident (glm5_next Lightning MTP
-                    # + offload): its slab must not be discounted here, or
-                    # admission overcommits by exactly the bytes the adapter
-                    # refuses to offload.
+                if mtp_resident and _is_mtp_named(name):
+                    # The draft head stays resident (glm5_next / qwen4_exp
+                    # Lightning MTP + offload): its slab must not be discounted
+                    # here, or admission overcommits by exactly the bytes the
+                    # wrapper refuses to offload.
                     continue
                 b0, b1 = spec["data_offsets"]
                 m = _PER_EXPERT_PROJ_RE.match(name)

@@ -967,3 +967,139 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
         assert len(cache.slot_of) <= 64
     if length > 1:
         assert cache.misses > cache.capacity
+
+
+# --------------------------------------------------------------------------- #
+# Lightning MTP draft head + backbone streaming (qwen4_exp / root4k layout)
+# --------------------------------------------------------------------------- #
+
+
+class _MLPExperts(nn.Module):
+    """Routed-expert container under the ``switch_mlp`` spelling qwen4_exp
+    checkpoints use (``_Experts`` above uses ``switch_glu``)."""
+
+    def __init__(self, glu):
+        super().__init__()
+        self.switch_mlp = glu
+
+
+class _MTPHead(nn.Module):
+    """A Lightning draft head: a plain decoder layer whose routed experts are
+    the stock ``switch_mlp`` contract, so the generic wrapper can see it."""
+
+    def __init__(self, glu):
+        super().__init__()
+        self.mlp = _MLPExperts(glu)
+
+
+class _TextRootModel(nn.Module):
+    """Backbone under ``model.``, draft head at the checkpoint root — the
+    qwen4_exp layout (``mtp.<i>.mlp.switch_mlp``), not the VLM-nested one."""
+
+    def __init__(self, backbone_glus, head_glus):
+        super().__init__()
+        self.model = _MiniMoE(backbone_glus)
+        self.mtp = [_MTPHead(g) for g in head_glus]
+
+    def __call__(self, x, indices):
+        x = self.model(x, indices)
+        return x + self.mtp[0].mlp.switch_mlp(x, indices).sum(axis=-2)
+
+
+class _VLMTextModel(nn.Module):
+    def __init__(self, backbone_glus, head_glus):
+        super().__init__()
+        self.model = _MiniMoE(backbone_glus)
+        self.mtp = [_MTPHead(g) for g in head_glus]
+
+
+class _VLMTop(nn.Module):
+    def __init__(self, text):
+        super().__init__()
+        self.language_model = text
+
+
+def _root4k_checkpoint(tmp_path, prefix=""):
+    """Backbone + draft head, both stock ``SwitchGLU``, at qwen4_exp paths."""
+    backbone = _make_glu(seed=1)
+    head = _make_glu(seed=2)
+    tensors = _glu_tensors(backbone, f"{prefix}model.layers.0.experts.switch_glu")
+    tensors.update(_glu_tensors(head, f"{prefix}mtp.0.mlp.switch_mlp"))
+    _save_checkpoint(tmp_path, tensors)
+    return backbone, head, tensors
+
+
+class TestMtpResident:
+    """The generic wrapper must honour ``mtp_resident`` for stock-head
+    families, at both the text root and nested under ``language_model.``."""
+
+    def test_mtp_resident_leaves_head_unwrapped_text_root(self, tmp_path):
+        backbone, head, _ = _root4k_checkpoint(tmp_path)
+        model = _TextRootModel([backbone], [head])
+        n = apply_moe_expert_offload(model, tmp_path, 0.25, mtp_resident=True)
+        assert n == 1
+        assert isinstance(model.model.layers[0].experts.switch_glu, OffloadSwitchGLU)
+        assert isinstance(model.mtp[0].mlp.switch_mlp, SwitchGLU)
+        assert not isinstance(model.mtp[0].mlp.switch_mlp, OffloadSwitchGLU)
+        assert moe_offload_stats(model)["layers"] == 1
+
+    def test_without_mtp_resident_head_streams_like_backbone(self, tmp_path):
+        backbone, head, _ = _root4k_checkpoint(tmp_path)
+        model = _TextRootModel([backbone], [head])
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
+        assert isinstance(model.mtp[0].mlp.switch_mlp, OffloadSwitchGLU)
+
+    def test_mtp_resident_nested_under_language_model(self, tmp_path):
+        backbone, head, _ = _root4k_checkpoint(tmp_path, "language_model.")
+        model = _VLMTop(_VLMTextModel([backbone], [head]))
+        n = apply_moe_expert_offload(model, tmp_path, 0.25, mtp_resident=True)
+        assert n == 1
+        text = model.language_model
+        assert isinstance(text.model.layers[0].experts.switch_glu, OffloadSwitchGLU)
+        assert isinstance(text.mtp[0].mlp.switch_mlp, SwitchGLU)
+
+    def test_resident_head_and_streaming_backbone_still_produce_output(
+        self, tmp_path
+    ):
+        """Skipping the head must not leave it half-configured: a forward
+        through resident head + streaming backbone has to run and match the
+        un-offloaded head exactly (the head is never wrapped)."""
+        backbone, head, _ = _root4k_checkpoint(tmp_path)
+        ref = _TextRootModel([_make_glu(seed=1)], [_make_glu(seed=2)])
+        mx.random.seed(7)
+        x, i = mx.random.normal((2, 1, D)), _ri(2, 1, K)
+        expected = ref(x, i)
+        mx.eval(expected)
+        model = _TextRootModel([backbone], [head])
+        apply_moe_expert_offload(model, tmp_path, 0.25, mtp_resident=True)
+        got = model(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(expected, got))
+
+    def test_admission_estimate_excludes_text_root_head(self, tmp_path):
+        """The estimator's head exclusion is path-aware too: a root
+        ``mtp.<i>.`` slab must not be discounted when it stays resident, or
+        admission overcommits by exactly the bytes the wrapper keeps."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        _, _, tensors = _root4k_checkpoint(tmp_path)
+
+        def _bytes(pred):
+            return sum(
+                v.size * v.dtype.size for k, v in tensors.items() if pred(k)
+            )
+
+        head_bytes = _bytes(lambda k: k.startswith("mtp."))
+        backbone_bytes = _bytes(
+            lambda k: ".switch_glu." in k and not k.startswith("mtp.")
+        )
+        assert head_bytes > 0 and backbone_bytes > 0
+        full = 10**9
+        assert estimate_offload_admission_bytes(
+            tmp_path, full, 0.25, mtp_resident=True
+        ) == full - int(backbone_bytes * 0.75)
+        assert estimate_offload_admission_bytes(
+            tmp_path, full, 0.25, mtp_resident=False
+        ) == full - int((backbone_bytes + head_bytes) * 0.75)

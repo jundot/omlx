@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import logging
 import shutil
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -4482,7 +4483,9 @@ def test_qwen4_moe_savings_precede_ple_force_decision(
         ),
         patch(
             "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
-            side_effect=lambda path, size, fraction: size - 400,
+            side_effect=lambda path, size, fraction, *, mtp_resident=False: (
+                size - 400
+            ),
         ),
     ):
         _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
@@ -4671,3 +4674,76 @@ async def test_cancelled_unload_retains_marker_until_stop_finishes():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not pool._unloading_models
+
+
+class TestQwen4PleOffloadStatusMtpResidency:
+    """The Qwen4 PLE projection must price the MTP draft head as resident.
+
+    With Lightning MTP armed, the offload wrapper keeps the draft head's
+    experts resident (``apply_moe_expert_offload(..., mtp_resident=True)``), so
+    the bytes released by expert offload are smaller and the PLE residency
+    projection larger. The flag is only observable through the number handed
+    to the estimator, so the recorder is the instrument and the assertion is
+    on the projection it produces.
+    """
+
+    CHECKPOINT = 1000
+
+    @pytest.mark.parametrize(
+        ("mtp_enabled", "released"), [(True, 100), (False, 180)]
+    )
+    def test_mtp_residency_reaches_the_admission_estimate(
+        self, tmp_path, mtp_enabled, released
+    ):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=self.CHECKPOINT,
+            ple_bytes=300,
+            resident_bytes=self.CHECKPOINT,
+            mmap_bytes=700,
+        )
+        seen: list[bool] = []
+
+        def _admission(model_path, checkpoint_bytes, fraction, *, mtp_resident=False):
+            seen.append(mtp_resident)
+            # A resident head leaves less of the checkpoint free to release.
+            return checkpoint_bytes - released
+
+        entry = EngineEntry(
+            model_id="qwen4-ple",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=self.CHECKPOINT,
+            config_model_type="qwen4_exp",
+        )
+        settings = SimpleNamespace(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.25,
+            mtp_enabled=mtp_enabled,
+            qwen4_ple_ssd_offload=False,
+        )
+        pool = _make_pool()
+
+        with (
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+            patch(
+                "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
+                _admission,
+            ),
+        ):
+            _enabled, _forced, projected = pool._qwen4_ple_offload_status(
+                entry, settings, ceiling=self.CHECKPOINT * 10
+            )
+
+        assert seen == [mtp_enabled]
+        # The released bytes carry the same 5% allowance as the PLE estimates.
+        assert projected.resident_bytes == self.CHECKPOINT - int(released * 1.05)

@@ -36,7 +36,10 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 # These families keep the MTP head resident while backbone experts stream.
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
+# qwen4_exp keeps its head at the checkpoint root as ``mtp.<i>.mlp.switch_mlp``
+# with the same routed-expert layout as its backbone, so the generic wrapper
+# can hold it resident by path (see moe_expert_offload._is_mtp_named).
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
