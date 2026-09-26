@@ -4434,16 +4434,15 @@ class VLMBatchedEngine(BaseEngine):
                 cached_tokens=0,
             )
 
-        # _process_chat_messages pops these out of `kwargs`, so read them
-        # first: the SpecPrefill boundary probe must render through the same
-        # template configuration as the real prompt.
-        specprefill_ct_kwargs = kwargs.get("chat_template_kwargs")
+        # The SpecPrefill boundary probe must render through the same tools
+        # as the real prompt.
         specprefill_template_tools = (
             convert_tools_for_template(tools) if tools else None
         )
 
         loop = asyncio.get_running_loop()
-        # _process_chat_messages pops these; the tail marker needs them too.
+        # _process_chat_messages pops these; the tail marker and the
+        # SpecPrefill boundary probe need them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
         (
@@ -4466,7 +4465,7 @@ class VLMBatchedEngine(BaseEngine):
             messages,
             prompt,
             specprefill_template_tools,
-            specprefill_ct_kwargs,
+            ct_kwargs,
             kwargs,
         )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
@@ -4696,16 +4695,15 @@ class VLMBatchedEngine(BaseEngine):
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
-        # _process_chat_messages pops these out of `kwargs`, so read them
-        # first: the SpecPrefill boundary probe must render through the same
-        # template configuration as the real prompt.
-        specprefill_ct_kwargs = kwargs.get("chat_template_kwargs")
+        # The SpecPrefill boundary probe must render through the same tools
+        # as the real prompt.
         specprefill_template_tools = (
             convert_tools_for_template(tools) if tools else None
         )
 
         loop = asyncio.get_running_loop()
-        # _process_chat_messages pops these; the tail marker needs them too.
+        # _process_chat_messages pops these; the tail marker and the
+        # SpecPrefill boundary probe need them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
         (
@@ -4728,7 +4726,7 @@ class VLMBatchedEngine(BaseEngine):
             messages,
             prompt,
             specprefill_template_tools,
-            specprefill_ct_kwargs,
+            ct_kwargs,
             kwargs,
         )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
