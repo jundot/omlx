@@ -1180,6 +1180,9 @@ def _replace_cache_rows(
         for idx in range(len(gen_batch.uids))
     ]
     gen_batch.prompt_cache = _merge_row_caches(row_caches)
+    from omlx.utils.metal_sync import request_pool_reclaim
+
+    request_pool_reclaim()
 
 
 def _initial_batch_forward(gen_batch):

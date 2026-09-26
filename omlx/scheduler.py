@@ -90,6 +90,7 @@ from .utils.metal_sync import (
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
     clear_thread_streams,
+    consume_pool_reclaim_request,
 )
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -12523,6 +12524,18 @@ class Scheduler:
         if finished_ids:
             self._schedule_deferred_metal_clear()
 
+    def _schedule_hinted_pool_reclaim(self) -> None:
+        """Turn an engine-thread pool-reclaim hint into a deferred clear.
+
+        A batch cache rebuild (Lightning MTP batch activation or reconcile)
+        releases per-row copies and the replaced batch cache into MLX's pool.
+        Their exact widths are never reused by later, larger requests, so
+        reclaim them through the same deferred clear a request completion
+        uses (the #435/#557 delay still applies).
+        """
+        if consume_pool_reclaim_request():
+            self._schedule_deferred_metal_clear()
+
     def _schedule_deferred_metal_clear(self) -> None:
         """Schedule the deferred Metal cache clear for a just-ended request.
 
@@ -13197,6 +13210,7 @@ class Scheduler:
         # Periodic Metal cache cleanup
         self._step_counter += 1
         should_clear = self._should_periodic_clear_cache()
+        self._schedule_hinted_pool_reclaim()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
         if (
