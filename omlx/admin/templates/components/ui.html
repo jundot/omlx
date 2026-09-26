@@ -1,0 +1,236 @@
+{#-
+  Shared component macros — the web implementation of the specs in
+  static/css/components.css. Import once per page:
+
+      {% import "components/ui.html" as ui %}
+
+  Macros take already-localized text (call them with `t('…')`), and the Alpine
+  expressions the caller needs (`click`, `show`, `disabled`). Anything else can
+  be passed through `attrs`.
+
+  The six component specs are Button, Badge, Card, FormRow, Segmented and
+  EmptyState; the console-wide pieces (Skeleton, CommandPalette, ToastHost,
+  ShortcutOverview) are here as well so a page cannot hand-roll a second one.
+-#}
+
+{#- Button: primary = the screen's one committed action, secondary = neutral,
+    ghost = row/toolbar action, destructive = system red. -#}
+{% macro button(label, variant='secondary', size='md', icon=None, click=None,
+                show=None, disabled=None, type='button', attrs='') -%}
+<button type="{{ type }}"
+        class="btn btn--{{ variant }}{% if size == 'sm' %} btn--sm{% endif %}{% if not label %} btn--icon{% endif %}"
+        {%- if click %} @click="{{ click }}"{% endif %}
+        {%- if show %} x-show="{{ show }}" x-cloak{% endif %}
+        {%- if disabled %} :disabled="{{ disabled }}"{% endif %}
+        {{ attrs | safe }}>
+    {%- if icon %}<i data-lucide="{{ icon }}" class="w-4 h-4"></i>{% endif %}
+    {%- if label %}<span>{{ label }}</span>{% endif %}
+</button>
+{%- endmacro %}
+
+{#- Status badge. `dot` adds the round leading dot macOS uses for live state.
+    When the tone depends on runtime state, pass `tone=None` with `tone_expr`
+    (an Alpine expression resolving to a tone name) and `label_expr`; the class
+    is then bound instead of written, so the two cannot both apply. -#}
+{% macro badge(label, tone='neutral', dot=False, icon=None, show=None,
+               tone_expr=None, label_expr=None, attrs='') -%}
+<span class="badge{% if tone %} badge--{{ tone }}{% endif %}"
+      {%- if tone_expr %} :class="'badge--' + {{ tone_expr }}"{% endif %}
+      {%- if show %} x-show="{{ show }}" x-cloak{% endif %}
+      {%- if label_expr %} x-text="{{ label_expr }}"{% endif %} {{ attrs | safe }}>
+    {%- if dot %}<span class="badge__dot"></span>{% endif %}
+    {%- if icon %}<i data-lucide="{{ icon }}" class="w-3 h-3"></i>{% endif %}
+    {{- label -}}
+</span>
+{%- endmacro %}
+
+{#- Dual-value metric: the measured figure large, the figure it is to be read
+    against as a smaller line below (an estimate behind a measurement, a limit
+    behind a usage). Both are Alpine expressions so a row updates in place. -#}
+{% macro metric_dual(value_expr, secondary_expr=None, title=None, attrs='') -%}
+<div class="metric-dual {{ attrs }}"{% if title %} :title="{{ title }}"{% endif %}>
+    <span class="metric-dual__value" x-text="{{ value_expr }}"></span>
+    {%- if secondary_expr %}
+    <span class="metric-dual__secondary" x-show="{{ secondary_expr }}" x-cloak x-text="{{ secondary_expr }}"></span>
+    {%- endif %}
+</div>
+{%- endmacro %}
+
+{#- Card: a content surface with an optional header. Body is the caller block.
+
+    `title`/`subtitle` are already-localized text. When the value only exists at
+    render time (an `x-for` row), pass `title_bind`/`subtitle_bind` with the
+    Alpine expression holding it instead; the element is then filled by x-text.
+    `id` gives the card a stable anchor (the settings rail deep-links to one). -#}
+{% macro card(title=None, subtitle=None, header_actions=None, attrs='',
+              id=None, title_bind=None, subtitle_bind=None, icon=None) -%}
+{%- set body -%}{{ caller() }}{%- endset -%}
+<section class="card {{ attrs }}"{% if id %} id="{{ id }}"{% endif %}>
+    {%- if title or subtitle or title_bind or subtitle_bind or header_actions or icon %}
+    <header class="card__header">
+        <div class="card__heading">
+            {%- if icon %}<i data-lucide="{{ icon }}" class="card__icon w-4 h-4" aria-hidden="true"></i>{% endif %}
+            {%- if title or subtitle or title_bind or subtitle_bind %}
+            <div class="card__heading-text">
+                {%- if title or title_bind %}<h3 class="card__title"{% if title_bind %} x-text="{{ title_bind }}"{% endif %}>{{ title }}</h3>{% endif %}
+                {%- if subtitle or subtitle_bind %}<p class="card__subtitle"{% if subtitle_bind %} x-text="{{ subtitle_bind }}"{% endif %}>{{ subtitle }}</p>{% endif %}
+            </div>
+            {%- endif %}
+        </div>
+        {%- if header_actions %}<div class="card__actions">{{ header_actions }}</div>{% endif %}
+    </header>
+    {%- endif %}
+    <div class="card__body">{{ body }}</div>
+</section>
+{%- endmacro %}
+
+{#- Form row: label + description on the left, control (caller block) right. -#}
+{% macro form_row(label, description=None, badge=None, attrs='') -%}
+<div class="form-row {{ attrs }}">
+    <div class="form-row__label">
+        <span class="form-row__title">{{ label }}{% if badge %} {{ badge }}{% endif %}</span>
+        {%- if description %}<span class="form-row__desc">{{ description }}</span>{% endif %}
+    </div>
+    <div class="form-row__control">{{ caller() }}</div>
+</div>
+{%- endmacro %}
+
+{#- Segmented control. `items` is a list of (value, label) pairs; `active` is the
+    Alpine expression holding the current value and `setter` the expression that
+    assigns a new one ({value} is substituted). -#}
+{% macro segmented(items, active, setter, attrs='', aria_label=None) -%}
+<div class="segmented {{ attrs }}" role="tablist"{% if aria_label %} aria-label="{{ aria_label }}"{% endif %}>
+    {%- for value, label in items %}
+    <button type="button" role="tab"
+            class="segmented__item"
+            :class="{{ active }} === '{{ value }}' ? 'segmented__item--active' : ''"
+            :aria-selected="{{ active }} === '{{ value }}' ? 'true' : 'false'"
+            @click="{{ setter | replace('{value}', value) }}">{{ label }}</button>
+    {%- endfor %}
+</div>
+{%- endmacro %}
+
+{#- Segmented control over a list that only exists at render time: the caller
+    passes the Alpine collection (`source`), the fields holding each item's
+    value and label, and the expression that assigns the value. Same markup and
+    spec as `segmented`; use it when the items depend on server state (e.g. the
+    target sizes a selected model can actually reach). -#}
+{% macro segmented_each(source, active, setter, label='label', value='value',
+                        disabled=None, attrs='', aria_label=None) -%}
+<div class="segmented {{ attrs }}" role="tablist"{% if aria_label %} aria-label="{{ aria_label }}"{% endif %}>
+    <template x-for="item in {{ source }}" :key="item.{{ value }}">
+        <button type="button" role="tab"
+                class="segmented__item"
+                :class="{{ active }} === item.{{ value }} ? 'segmented__item--active' : ''"
+                :aria-selected="{{ active }} === item.{{ value }} ? 'true' : 'false'"
+                {%- if disabled %} :disabled="{{ disabled }}"{% endif %}
+                @click="{{ setter | replace('{value}', 'item.' + value) }}"
+                x-text="item.{{ label }}"></button>
+    </template>
+</div>
+{%- endmacro %}
+
+{#- Empty state: icon, one line of explanation, optional action (caller block). -#}
+{% macro empty_state(icon, title, description=None) -%}
+<div class="empty-state">
+    <span class="empty-state__icon"><i data-lucide="{{ icon }}" class="w-6 h-6"></i></span>
+    <p class="empty-state__title">{{ title }}</p>
+    {%- if description %}<p class="empty-state__desc">{{ description }}</p>{% endif %}
+    {%- if caller %}<div class="empty-state__action">{{ caller() }}</div>{% endif %}
+</div>
+{%- endmacro %}
+
+{#- Skeleton: the first-paint placeholder for a KPI row or a list of rows. It
+    holds the layout, shimmers, and is hidden from assistive tech; the payload
+    replaces it. It never shows a number of its own. -#}
+{% macro skeleton_kpis(count=4) -%}
+<div class="kpi-grid" aria-hidden="true">
+    {%- for _ in range(count) %}
+    <div class="kpi">
+        <span class="skeleton skeleton--label"></span>
+        <span class="skeleton skeleton--figure"></span>
+        <span class="skeleton skeleton--spark"></span>
+    </div>
+    {%- endfor %}
+</div>
+{%- endmacro %}
+
+{#- `variant` is 'row' (a list row) or 'table' (one more cell). -#}
+{% macro skeleton_rows(count=3, variant='row') -%}
+<div class="skeleton-stack" aria-hidden="true">
+    {%- for _ in range(count) %}
+    <div class="{{ 'skeleton-table__row' if variant == 'table' else 'skeleton-row' }}">
+        <span class="skeleton skeleton--line skeleton-row__cell"></span>
+        <span class="skeleton skeleton--cell skeleton-row__cell--short"></span>
+        <span class="skeleton skeleton--cell skeleton-row__cell--short"></span>
+        {%- if variant == 'table' %}
+        <span class="skeleton skeleton--cell skeleton-row__cell--short"></span>
+        {%- endif %}
+    </div>
+    {%- endfor %}
+</div>
+{%- endmacro %}
+
+{#- The global ⌘K palette. static/js/ui.js fills the list from the commands the
+    page registers, so the markup here is only the dialog itself. -#}
+{% macro command_palette() -%}
+<dialog id="omlx-palette" class="overlay-dialog" role="dialog" aria-modal="true"
+        aria-label="{{ t('palette.label') }}">
+    <div class="overlay-panel">
+        <div class="palette__search">
+            <i data-lucide="search" class="w-4 h-4" aria-hidden="true"></i>
+            <input id="omlx-palette-input" class="palette__input" type="text"
+                   role="combobox" aria-expanded="true" aria-controls="omlx-palette-list"
+                   aria-autocomplete="list" autocomplete="off" spellcheck="false"
+                   aria-label="{{ t('palette.label') }}"
+                   placeholder="{{ t('palette.placeholder') }}">
+            <kbd class="kbd">{{ t('chat.shortcut_key_esc') }}</kbd>
+        </div>
+        <div id="omlx-palette-list" class="palette__list" role="listbox"
+             aria-label="{{ t('palette.label') }}"></div>
+        <p id="omlx-palette-empty" class="palette__empty" hidden>{{ t('palette.empty') }}</p>
+        <div class="palette__hint">
+            <span><span aria-hidden="true">↑ ↓</span> {{ t('palette.hint_move') }}</span>
+            <span><span aria-hidden="true">↵</span> {{ t('palette.hint_run') }}</span>
+            <span><span aria-hidden="true">⌘K</span> {{ t('palette.hint_open') }}</span>
+        </div>
+    </div>
+</dialog>
+{%- endmacro %}
+
+{#- The toast stack. Each toast carries its own role/aria-live (static/js/ui.js
+    decides between status and alert), so the container must not be a live
+    region as well or every message would be announced twice. -#}
+{% macro toast_host() -%}
+<div id="omlx-toast-stack" class="toast-stack" data-omlx-toasts></div>
+{%- endmacro %}
+
+{#- Keyboard-shortcut overview. `rows` is a list of (label, [keys]) pairs and
+    must list exactly the bindings the console handles. -#}
+{% macro shortcut_overview(rows, title=None) -%}
+<dialog id="omlx-shortcuts" class="overlay-dialog" role="dialog" aria-modal="true"
+        aria-labelledby="omlx-shortcuts-title">
+    <div class="overlay-panel">
+        <header class="card__header">
+            <h2 id="omlx-shortcuts-title" class="card__title">{{ title or t('shortcuts.title') }}</h2>
+            <button type="button" class="overlay-close" data-shortcuts-close
+                    aria-label="{{ t('shortcuts.dismiss') }}">
+                <i data-lucide="x" class="w-4 h-4"></i>
+            </button>
+        </header>
+        <div class="card__body">
+            <ul class="shortcut-list">
+                {%- for label, keys in rows %}
+                <li class="shortcut-list__row">
+                    <span>{{ label }}</span>
+                    <span class="shortcut-list__keys">
+                        {%- for key in keys %}<kbd class="kbd">{{ key }}</kbd>{% endfor %}
+                    </span>
+                </li>
+                {%- endfor %}
+            </ul>
+            <p class="overlay-note">{{ t('shortcuts.note') }}</p>
+        </div>
+    </div>
+</dialog>
+{%- endmacro %}

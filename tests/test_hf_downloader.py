@@ -3,8 +3,10 @@
 
 import asyncio
 import json
+import logging
 import os
 import shutil
+import stat
 import threading
 import time
 from types import SimpleNamespace
@@ -87,6 +89,7 @@ class TestDownloadTask:
         assert task.progress == 0.0
         assert task.total_size == 0
         assert task.downloaded_size == 0
+        assert task.speed_bps == 0.0
         assert task.error == ""
         assert task.started_at == 0.0
         assert task.completed_at == 0.0
@@ -103,6 +106,7 @@ class TestDownloadTask:
             progress=45.67,
             total_size=1000000,
             downloaded_size=456700,
+            speed_bps=4534000.56,
             created_at=1700000000.0,
         )
         d = task.to_dict()
@@ -112,7 +116,12 @@ class TestDownloadTask:
         assert d["progress"] == 45.7  # rounded to 1 decimal
         assert d["total_size"] == 1000000
         assert d["downloaded_size"] == 456700
+        assert d["speed_bps"] == 4534000.6  # rounded to 1 decimal
         assert d["retry_count"] == 0
+
+    def test_to_dict_speed_defaults_to_zero(self):
+        task = DownloadTask(task_id="t", repo_id="o/m")
+        assert task.to_dict()["speed_bps"] == 0.0
 
     def test_to_dict_retry_count(self):
         task = DownloadTask(task_id="t", repo_id="o/m", retry_count=3)
@@ -3135,6 +3144,96 @@ class TestStallDetection:
         assert stalled.timeout == 0.03
         mock_abort.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_wire_activity_prevents_false_stall(
+        self, model_dir, monkeypatch
+    ):
+        """xet's fetch phase keeps the filesystem silent for minutes while
+        bytes keep arriving on the wire: wire movement alone must hold the
+        stall deadline open."""
+        import omlx.admin.hf_downloader as dl_module
+        from omlx.admin.hf_downloader import _WireCounter
+
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+        counter = _WireCounter()
+        downloader._wire_counters[task.task_id] = counter
+        frozen = _DownloadActivity()  # fetch phase: nothing lands on disk
+
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            return_value=frozen,
+        ), patch("omlx.admin.hf_downloader.abort_xet_session") as mock_abort:
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            # Well past both 0.03s deadlines, wire bytes keep flowing.
+            for _ in range(8):
+                counter.add(1_000_000)
+                await asyncio.sleep(0.01)
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert task.task_id not in downloader._stalled
+        mock_abort.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stopped_wire_reports_an_active_stall(
+        self, model_dir, monkeypatch
+    ):
+        """Wire bytes are payload activity, so once they stop against a
+        silent disk the stall must be reported as 'active' under the longer
+        deadline — not as a startup handshake hang."""
+        import omlx.admin.hf_downloader as dl_module
+        from omlx.admin.hf_downloader import _WireCounter
+
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 0.3)
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+        counter = _WireCounter()
+        downloader._wire_counters[task.task_id] = counter
+        frozen = _DownloadActivity()
+
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            return_value=frozen,
+        ), patch("omlx.admin.hf_downloader.abort_xet_session") as mock_abort:
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            for _ in range(4):  # payload past the startup window, then stops
+                counter.add(1_000_000)
+                await asyncio.sleep(0.01)
+            for _ in range(200):  # wait up to ~2s for the active deadline
+                if task.task_id in downloader._stalled:
+                    break
+                await asyncio.sleep(0.01)
+            stalled = downloader._stalled.get(task.task_id)
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert stalled is not None, "a silent wire must still stall"
+        assert stalled.phase == "active"
+        assert stalled.timeout == 0.3
+        mock_abort.assert_called_once()
+
 
 # =============================================================================
 # Xet HTTP Fallback Tests
@@ -3314,6 +3413,48 @@ class TestXetHTTPFallback:
         assert os.environ["HF_HUB_DISABLE_XET"] == "1"
         download.assert_called_once_with(repo_id="owner/model")
 
+    @pytest.mark.asyncio
+    async def test_http_fallback_starts_wire_progress_from_zero(
+        self, model_dir
+    ):
+        """The HTTP worker refetches the payload (xet's chunk cache is not
+        reusable), so fetch-phase wire bytes must not carry into the
+        restart's progress: the replacement poll gets a fresh counter."""
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+        seen: dict[str, object] = {}
+
+        def fail_xet(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            # Bytes that arrived on the wire before the transport died.
+            downloader._wire_counters["t1"].add(7_000_000)
+            raise RuntimeError(
+                "CAS service error: ReqwestMiddleware request failed "
+                "for /xet-read-token"
+            )
+
+        async def note_fallback(*_args, **_kwargs):
+            counter = downloader._wire_counters.get("t1")
+            seen["value"] = counter.value if counter is not None else None
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(self._api(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fail_xet,
+        ), patch.object(
+            downloader,
+            "_run_http_fallback",
+            new=note_fallback,
+        ):
+            await downloader._run_download(task.task_id, "secret-token")
+
+        assert seen["value"] == 0
+        assert task.status == DownloadStatus.COMPLETED
+
 
 # =============================================================================
 # Sequential Download Queue Tests
@@ -3441,6 +3582,589 @@ class TestMtimeActivityDetection:
 
         assert task.task_id not in downloader._stalled
         mock_abort.assert_not_called()
+
+
+# =============================================================================
+# Download Speed Tests
+# =============================================================================
+
+
+class TestDownloadSpeed:
+    """The poll loop must publish a live rate and clear it at terminal states."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @staticmethod
+    def _growing_activity(step=100_000):
+        """Activity scanner whose allocated blocks grow by `step` per call.
+
+        The per-file map mirrors the aggregate so the speed meter sees the
+        same growth under a single watched path.
+        """
+        state = {"allocated": 0}
+
+        def scan(_path):
+            state["allocated"] += step
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=state["allocated"],
+                allocated_size=state["allocated"],
+                latest_mtime_ns=1,
+                files={"payload": state["allocated"]},
+            )
+
+        return scan
+
+    def test_defaults_read_as_a_per_second_rate(self):
+        """The readout is "bytes per second": sample at 0.5s, average over
+        a 1s window, and never average fewer samples than the window holds."""
+        import omlx.admin.hf_downloader as dl_module
+        import omlx.admin.ms_downloader as ms_module
+
+        assert dl_module._PROGRESS_POLL_INTERVAL == 0.5
+        assert ms_module._PROGRESS_POLL_INTERVAL == 0.5
+        assert dl_module._SPEED_WINDOW == 1.0
+
+    @pytest.mark.asyncio
+    async def test_poll_reports_speed_then_zeroes_it(self, model_dir, monkeypatch):
+        """A live transfer publishes bytes/s; a terminal task publishes 0."""
+        import omlx.admin.hf_downloader as dl_module
+
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-speed",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+            total_size=10_000_000,
+        )
+        downloader._tasks[task.task_id] = task
+
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            side_effect=self._growing_activity(),
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            await asyncio.sleep(0.05)
+            observed_speed = task.speed_bps
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert observed_speed > 0, "a live download must report a rate"
+        # The poll loop's finally clause clears the rate with the task.
+        assert task.speed_bps == 0.0
+
+    @pytest.mark.asyncio
+    async def test_speed_smooths_steady_rate(self, model_dir, monkeypatch):
+        """A constant per-interval rate must be reported near its true value."""
+        import omlx.admin.hf_downloader as dl_module
+
+        interval = 0.02
+        step = 200_000
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", interval)
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-smooth",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            side_effect=self._growing_activity(step),
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            # Let several samples accumulate so the EMA settles.
+            await asyncio.sleep(0.12)
+            steady_speed = task.speed_bps
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        expected = step / interval
+        assert steady_speed > 0
+        # Order of magnitude of the true rate: smoothing must not lose it.
+        assert 0.25 * expected <= steady_speed <= 4 * expected
+
+    def test_speed_meter_forgets_stale_history_within_the_window(self):
+        """A stopped transfer must read 0 quickly, not decay forever.
+
+        This is the lag complaint: an exponential average keeps a fraction
+        of the old rate alive indefinitely, so the number trails reality.
+        The fixed window must bottom out once every sample in it is flat
+        (one poll interval after the window has passed the last byte).
+        """
+        from omlx.admin.hf_downloader import _SpeedMeter
+
+        window = 2.0
+        interval = 1.0
+        meter = _SpeedMeter(window=window)
+        t = 100.0
+        last_byte_at = t + 4 * interval  # 50 MB/s for 4 intervals, then stops
+
+        # The poll loop samples every interval whether or not bytes moved.
+        rates = []
+        for i in range(8):
+            now = t + i * interval
+            bytes_written = min(i * 50_000_000, 4 * 50_000_000)
+            rates.append(meter.add({"payload": bytes_written}, now=now))
+
+        # The last byte lands on the tick `last_byte_at` names: the meter is
+        # still reporting traffic there, and only bottoms out afterwards.
+        assert last_byte_at == t + 4 * interval
+        assert rates[4] > 0.0, "the rate must not reach 0 before the transfer stops"
+        assert rates[-1] == 0.0, "speed must reach 0 within ~window of the last byte"
+
+    def test_speed_meter_reports_true_mean_over_the_window(self):
+        """The reported rate is bytes/second over the window, not a blend."""
+        from omlx.admin.hf_downloader import _SpeedMeter
+
+        meter = _SpeedMeter(window=3.0)
+        t = 50.0
+        # Steady 10 MB/s sampled every second.
+        for i in range(6):
+            rate = meter.add({"payload": i * 10_000_000}, now=t + i * 1.0)
+        # Window spans 3s of history -> exactly the true rate.
+        assert abs(rate - 10_000_000) < 1_000_000
+
+    def test_speed_meter_survives_a_truncated_file(self):
+        """A truncated file must not poison the window with a negative
+        delta (which would freeze the display), and its refill must count
+        as real growth from the new, smaller baseline."""
+        from omlx.admin.hf_downloader import _SpeedMeter
+
+        meter = _SpeedMeter(window=2.0)
+        t = 10.0
+        meter.add({"f": 100_000_000}, now=t)  # baseline: everything is new
+        meter.add({"f": 100_000_000}, now=t + 1)  # idle at full size
+        after_shrink = meter.add({"f": 50_000_000}, now=t + 2)
+        assert after_shrink == 0.0, "a truncation is not transfer"
+        # Refill to 150M from the 50M baseline: 100M of genuine growth
+        # must surface, not be suppressed by the stale 100M size.
+        recovered = meter.add({"f": 150_000_000}, now=t + 3)
+        assert recovered > 0
+
+    def test_speed_meter_ignores_bytes_that_reappear_wholesale(self):
+        """Resume must not read the previously downloaded bytes as fresh
+        transfer. Cleanup racing the retry can make one walk come back
+        empty (temp wiped, rglob aborted); the next complete walk then
+        sees the whole tree again. The old aggregate window re-anchored on
+        the empty sample and reported the reappearance as the entire prior
+        download arriving within one window — a multi-GB/s spike for a
+        second. File-level continuity: forgotten paths start at zero."""
+        from omlx.admin.hf_downloader import _SpeedMeter
+
+        meter = _SpeedMeter(window=1.0)
+        t = 100.0
+        full = {"a": 27_000_000_000, "b": 1_000_000_000}
+        meter.add(full, now=t)  # prime: everything is new -> no growth
+        assert meter.add(dict(full), now=t + 0.5) == 0.0  # idle at full size
+        assert meter.add({}, now=t + 1.0) == 0.0  # wiped / aborted walk
+        reappeared = meter.add(dict(full), now=t + 1.5)  # tree back in full
+        assert reappeared == 0.0, "reappearing bytes are not new transfer"
+
+    def test_speed_meter_ignores_a_file_first_seen_at_full_size(self):
+        """A file moved/copied into the tree wholesale is not transfer,
+        but once it is under watch its real growth still counts."""
+        from omlx.admin.hf_downloader import _SpeedMeter
+
+        meter = _SpeedMeter(window=1.0)
+        t = 0.0
+        base = {"x": 1_000_000}
+        meter.add(dict(base), now=t)
+        assert meter.add(dict(base), now=t + 0.5) == 0.0
+        moved_in = {"x": 1_000_000, "y": 5_000_000_000}
+        assert meter.add(moved_in, now=t + 1.0) == 0.0, (
+            "first sight at full size must not count"
+        )
+        grown = {"x": 1_000_000, "y": 5_000_100_000}
+        assert meter.add(grown, now=t + 1.5) > 0, (
+            "growth of a tracked file still counts"
+        )
+
+    def test_speed_meter_prime_after_a_partial_walk_does_not_spike(self):
+        """The retry's baseline scan can abort mid-way (cleanup race).
+        A prime of nothing followed by a complete walk must read 0, not
+        the whole model's bytes divided by one poll interval."""
+        from omlx.admin.hf_downloader import _SpeedMeter
+
+        meter = _SpeedMeter(window=1.0)
+        meter.add({}, now=0.0)  # walk aborted at prime time
+        rate = meter.add({"model": 20_000_000_000}, now=0.5)
+        assert rate == 0.0
+
+    def test_only_the_transfer_bar_feeds_the_wire_counter(self):
+        """Wire bytes come from xet's network-transfer bar alone.
+
+        snapshot_download's reconstruction bar (disk bytes, has a
+        denominator), the meta file-count bar, and any default-format bar
+        must never feed the wire counter, or one payload would be counted
+        twice and the readout could show up to 2x the real rate."""
+        from huggingface_hub.utils._xet_progress_reporting import (
+            XET_BYTES_BAR_FORMAT,
+            XET_TRANSFER_BAR_FORMAT,
+        )
+        from omlx.admin.hf_downloader import _make_cancellable_tqdm as make
+
+        seen = []
+        cls = make(lambda: False, on_wire_bytes=seen.append)
+        bars = [
+            cls(  # snapshot_download's transfer bar: network bytes, no total
+                desc="Downloading bytes",
+                total=0,
+                unit="B",
+                unit_scale=True,
+                bar_format=XET_TRANSFER_BAR_FORMAT,
+                disable=True,
+            ),
+            cls(  # reconstruction bar: disk bytes, "{...}/{total_fmt}"
+                desc="Reconstructing (incomplete total...)",
+                total=0,
+                unit="B",
+                unit_scale=True,
+                bar_format=XET_BYTES_BAR_FORMAT,
+                disable=True,
+            ),
+            cls(desc="Fetching 7 files", total=7, disable=True),  # meta
+            cls(total=100, disable=True),  # default format
+        ]
+        for bar in bars:
+            bar.update(1_000_000)
+
+        assert seen == [1_000_000]
+
+    def test_cancel_still_raises_on_the_wire_bar(self):
+        """The wire hook observes the increment but must not swallow the
+        cancellation raise that unwinds the download thread."""
+        from huggingface_hub.utils._xet_progress_reporting import (
+            XET_TRANSFER_BAR_FORMAT,
+        )
+
+        seen = []
+        cls = _make_cancellable_tqdm(lambda: True, on_wire_bytes=seen.append)
+        bar = cls(bar_format=XET_TRANSFER_BAR_FORMAT, disable=True)
+
+        with pytest.raises(_DownloadCancelled):
+            bar.update(5)
+
+        assert seen == [5]
+
+    def test_wire_counter_is_thread_safe_and_ignores_junk(self):
+        """Progress callbacks fire from xet's reporting thread while the poll
+        loop reads: the accumulator must be exact under concurrency and skip
+        non-positive increments."""
+        from omlx.admin.hf_downloader import _WireCounter
+
+        counter = _WireCounter()
+
+        def spam():
+            for _ in range(500):
+                counter.add(100)
+
+        threads = [threading.Thread(target=spam) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert counter.value == 400_000
+        counter.add(0)
+        counter.add(-1)
+        assert counter.value == 400_000
+
+    def test_wire_speed_meter_window_and_settle_to_zero(self):
+        """Same window semantics as the disk meter: a live mean over the
+        window, reaching 0 within ~window of the last wire byte."""
+        from omlx.admin.hf_downloader import _WireSpeedMeter
+
+        meter = _WireSpeedMeter(window=1.0)
+        assert meter.add(0, now=0.0) == 0.0  # a prime alone is no rate
+        assert meter.add(500, now=0.5) == 1000.0  # 500B over 0.5s
+        assert meter.add(500, now=1.0) == 500.0  # averaged over the window
+        assert meter.add(500, now=1.6) == 0.0  # stopped -> settles to 0
+
+    @pytest.mark.asyncio
+    async def test_poll_shows_wire_speed_while_disk_is_idle(
+        self, model_dir, monkeypatch
+    ):
+        """xet's fetch phase pulls from the network before any disk write
+        (reconstruction blocks are >= 256MB): the readout must show the wire
+        rate while filesystem activity stays frozen, then clear to 0."""
+        import omlx.admin.hf_downloader as dl_module
+        from omlx.admin.hf_downloader import _WireCounter
+
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-wire",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+            total_size=10_000_000_000,
+        )
+        downloader._tasks[task.task_id] = task
+        counter = _WireCounter()
+        downloader._wire_counters[task.task_id] = counter
+
+        frozen = _DownloadActivity()  # no byte lands on disk during fetch
+        with patch.object(
+            downloader, "_get_download_activity", return_value=frozen
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            observed = 0.0
+            for _ in range(5):
+                counter.add(1_000_000)
+                await asyncio.sleep(0.03)
+                observed = max(observed, task.speed_bps)
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert frozen.allocated_size == 0, "precondition: the disk never moved"
+        assert observed > 0, "wire traffic must show while the disk is idle"
+        assert task.speed_bps == 0.0  # terminal tasks publish 0
+
+    @pytest.mark.asyncio
+    async def test_poll_publishes_the_larger_stage_not_the_sum(
+        self, model_dir, monkeypatch
+    ):
+        """Fetch (wire) and reconstruction (disk) are two views of one
+        payload: the published rate is the larger of the two, never their
+        sum, which would count the same bytes twice."""
+        import omlx.admin.hf_downloader as dl_module
+        from omlx.admin.hf_downloader import _WireCounter
+
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.02)
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-stage",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+            total_size=10_000_000_000,
+        )
+        downloader._tasks[task.task_id] = task
+        counter = _WireCounter()
+        downloader._wire_counters[task.task_id] = counter
+
+        disk = {"bytes": 0}
+
+        def growing_activity(_path):
+            disk["bytes"] += 2_000_000
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=disk["bytes"],
+                allocated_size=disk["bytes"],
+                latest_mtime_ns=1,
+                files={"payload": disk["bytes"]},
+            )
+
+        observed = 0.0
+        with patch.object(
+            downloader, "_get_download_activity", side_effect=growing_activity
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            start = time.monotonic()
+            for _ in range(5):
+                counter.add(2_000_000)  # same order of magnitude as the disk
+                await asyncio.sleep(0.02)
+                observed = max(observed, task.speed_bps)
+            elapsed = max(time.monotonic() - start, 1e-6)
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        stage_rate = (
+            max(disk["bytes"], 10_000_000) / elapsed
+        )  # the two stages carry comparable byte counts
+        assert observed > 0
+        assert observed <= stage_rate * 1.5, "must not exceed the larger stage"
+        assert observed < (disk["bytes"] + 10_000_000) / elapsed * 0.8, (
+            "the two stages must not be summed"
+        )
+
+
+# =============================================================================
+# Progress Reads Both Pipeline Stages (fetch = wire, reconstruction = disk)
+# =============================================================================
+
+
+class TestProgressFromWire:
+    """Reported bytes must not freeze at the small files while xet's fetch
+    phase moves the payload over the network before any disk write."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        d.mkdir()
+        return d
+
+    @pytest.mark.asyncio
+    async def test_fetch_phase_progress_follows_the_wire(
+        self, model_dir, monkeypatch
+    ):
+        import omlx.admin.hf_downloader as dl_module
+        from omlx.admin.hf_downloader import _WireCounter
+
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-wire",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+            total_size=10_000_000,
+        )
+        downloader._tasks[task.task_id] = task
+        counter = _WireCounter()
+        downloader._wire_counters[task.task_id] = counter
+
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            return_value=_DownloadActivity(),  # fetch: the disk stays silent
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            counter.add(2_500_000)
+            await asyncio.sleep(0.05)  # several poll iterations
+
+            # The wire stage leads: 25% instead of a frozen 0%.
+            assert task.downloaded_size == 2_500_000
+            assert task.progress == 25.0
+
+            # The wire may pass the size estimate (retries, protocol
+            # overhead): the report caps at the estimate, and 100% stays
+            # reserved for snapshot_download's completion write.
+            counter.add(9_500_000)
+            await asyncio.sleep(0.05)
+            assert task.downloaded_size == 10_000_000
+            assert task.progress == 99.0
+
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+    @pytest.mark.asyncio
+    async def test_resume_adds_the_wire_delta_to_the_on_disk_baseline(
+        self, model_dir, monkeypatch
+    ):
+        """A resumed download re-fetches only the missing bytes, so its wire
+        counter starts at zero while the disk already holds earlier files.
+        The report must add that delta on top of the on-disk baseline:
+        max(disk, wire) alone parks on the disk figure for the whole fetch
+        phase — the freeze this class exists to prevent."""
+        import omlx.admin.hf_downloader as dl_module
+        from omlx.admin.hf_downloader import _WireCounter
+
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-resume",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+            total_size=10_000_000,
+        )
+        downloader._tasks[task.task_id] = task
+        counter = _WireCounter()
+        downloader._wire_counters[task.task_id] = counter
+        resumed = _DownloadActivity(
+            file_count=1,
+            logical_size=6_000_000,
+            allocated_size=6_000_000,
+            latest_mtime_ns=1,
+            files={"big.safetensors": 6_000_000},
+        )
+
+        with patch.object(
+            downloader, "_get_download_activity", return_value=resumed
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            counter.add(1_000_000)
+            await asyncio.sleep(0.05)
+            assert task.downloaded_size == 7_000_000
+            assert task.progress == 70.0
+
+            counter.add(2_000_000)
+            await asyncio.sleep(0.05)
+            # The wire adds the bytes the disk has not caught up with; the
+            # on-disk reading is the floor, never regressed by stale wire
+            # bytes, and the total caps the report.
+            assert task.downloaded_size >= 8_000_000
+            assert task.progress >= 80.0
+
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+    @pytest.mark.asyncio
+    async def test_reconstruction_phase_keeps_the_disk_reading(
+        self, model_dir, monkeypatch
+    ):
+        """Once the transfer bar stops (fetch done) the disk leads: wire
+        bytes never push the report below the on-disk size."""
+        import omlx.admin.hf_downloader as dl_module
+        from omlx.admin.hf_downloader import _WireCounter
+
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-disk",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+            total_size=10_000_000,
+        )
+        downloader._tasks[task.task_id] = task
+        counter = _WireCounter()
+        counter.add(2_000_000)  # fetch delivered only part over the wire
+        downloader._wire_counters[task.task_id] = counter
+        on_disk = _DownloadActivity(
+            file_count=1,
+            logical_size=8_000_000,
+            allocated_size=8_000_000,
+            latest_mtime_ns=1,
+        )
+
+        with patch.object(
+            downloader, "_get_download_activity", return_value=on_disk
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            await asyncio.sleep(0.05)
+
+            # The wire adds the bytes the disk has not caught up with; the
+            # on-disk reading is the floor, never regressed by stale wire
+            # bytes, and the total caps the report.
+            assert task.downloaded_size >= 8_000_000
+            assert task.progress >= 80.0
+
+            task.status = DownloadStatus.COMPLETED
+            await poll
 
 
 # =============================================================================
@@ -3623,3 +4347,888 @@ class TestResolveEndpoint:
         assert r1 == r2 == "https://huggingface.co"
         # Second call was a cache hit — head() count unchanged from first probe.
         assert mock_client.head.call_count == 2
+
+
+# =============================================================================
+# Queue Persistence and Restart Resume
+# =============================================================================
+
+
+class TestQueuePersistence:
+    """The queue persists to disk and survives a restart."""
+
+    @pytest.fixture
+    def tasks_file(self, tmp_path):
+        return tmp_path / "state" / "hf_download_tasks.json"
+
+    @pytest.fixture
+    def downloader(self, tmp_path, tasks_file):
+        model_dir = tmp_path / "models"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        return HFDownloader(model_dir=str(model_dir), tasks_file=tasks_file)
+
+    @staticmethod
+    def _rows(tasks_file):
+        return json.loads(tasks_file.read_text(encoding="utf-8"))
+
+    def test_a_resumable_row_keeps_the_token_and_a_finished_one_does_not(
+        self, downloader, tasks_file
+    ):
+        """Only a row that can still be resumed needs the credential: a
+        terminal row keeps it in memory for a retry in this process but is
+        written without it, so tokens do not outlive their download."""
+        task = DownloadTask(task_id="t1", repo_id="private/model")
+        task.token = "hf_SECRET"
+        downloader._tasks["t1"] = task
+
+        downloader._persist()
+        assert self._rows(tasks_file)[0]["token"] == "hf_SECRET"
+
+        task.status = DownloadStatus.COMPLETED
+        downloader._persist()
+        assert self._rows(tasks_file)[0]["token"] == ""
+        # The credential survives in memory, so a retry in this process can
+        # still reach a gated repository.
+        assert task.token == "hf_SECRET"
+
+    def test_the_queue_file_is_owner_only_from_the_first_write(
+        self, downloader, tasks_file
+    ):
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        task.token = "hf_SECRET"
+        downloader._tasks["t1"] = task
+
+        downloader._persist()
+
+        assert stat.S_IMODE(tasks_file.stat().st_mode) == 0o600
+        assert not tasks_file.with_name(tasks_file.name + ".tmp").exists()
+
+    @pytest.mark.asyncio
+    async def test_start_download_persists_pending_row(
+        self, downloader, tasks_file
+    ):
+        async def _noop(self, task_id, hf_token):
+            return None
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            task = await downloader.start_download("owner/model")
+
+        rows = self._rows(tasks_file)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.task_id
+        assert rows[0]["repo_id"] == "owner/model"
+        assert rows[0]["status"] == DownloadStatus.PENDING.value
+
+    @pytest.mark.asyncio
+    async def test_cancel_persists_cancelled_row(self, downloader, tasks_file):
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+        downloader._persist()
+
+        with patch("omlx.admin.hf_downloader.abort_xet_session"):
+            assert await downloader.cancel_download(task.task_id) is True
+
+        rows = self._rows(tasks_file)
+        assert rows[0]["status"] == DownloadStatus.CANCELLED.value
+
+    @pytest.mark.asyncio
+    async def test_remove_task_persists_without_row(
+        self, downloader, tasks_file
+    ):
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.COMPLETED,
+        )
+        downloader._tasks[task.task_id] = task
+        downloader._persist()
+
+        assert downloader.remove_task(task.task_id) is True
+        assert self._rows(tasks_file) == []
+
+    @pytest.mark.asyncio
+    async def test_failed_run_persists_failed_row(self, downloader, tasks_file):
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_api.model_info.side_effect = Exception("boom")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.FAILED
+        rows = self._rows(tasks_file)
+        assert rows[0]["status"] == DownloadStatus.FAILED.value
+        # The repo-info fallback may rewrite the raw error into a
+        # repository-not-found style message; only persistence matters here
+        # (error round-trip is covered by the restore test below).
+        assert rows[0]["error"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_leaves_row_resumable_on_disk(
+        self, downloader, tasks_file
+    ):
+        async def _noop(self, task_id, hf_token):
+            return None
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            task = await downloader.start_download("owner/model")
+
+        task.status = DownloadStatus.DOWNLOADING
+        with patch("omlx.admin.hf_downloader.abort_xet_session"):
+            await downloader.shutdown()
+
+        # The in-memory row went CANCELLED, but shutdown must not write that:
+        # the on-disk row keeps its queued status so the next boot resumes.
+        rows = self._rows(tasks_file)
+        assert rows[0]["status"] not in (
+            DownloadStatus.CANCELLED.value,
+            DownloadStatus.FAILED.value,
+        )
+
+    @pytest.mark.asyncio
+    async def test_restore_resumes_interrupted_and_keeps_terminal(
+        self, downloader, tasks_file
+    ):
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": "done",
+                        "repo_id": "owner/done",
+                        "status": "completed",
+                        "progress": 100.0,
+                        "created_at": 100.0,
+                    },
+                    {
+                        "task_id": "fail",
+                        "repo_id": "owner/fail",
+                        "status": "failed",
+                        "error": "boom",
+                        "created_at": 200.0,
+                    },
+                    {
+                        "task_id": "live",
+                        "repo_id": "owner/live",
+                        "status": "downloading",
+                        "created_at": 300.0,
+                        "retry_count": 2,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        async def _noop(self, task_id, hf_token):
+            return None
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            await downloader.restore_tasks()
+
+        resumed = [
+            t for t in downloader._tasks.values()
+            if t.status == DownloadStatus.PENDING
+        ]
+        assert [t.repo_id for t in resumed] == ["owner/live"]
+        assert resumed[0].created_at == 300.0
+        assert resumed[0].retry_count == 2
+        # Terminal rows come back as display-only entries, error text intact.
+        assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
+        assert downloader._tasks["done"].speed_bps == 0.0
+        assert downloader._tasks["fail"].error == "boom"
+        # The rewritten queue records the resumed row as pending under its
+        # new task id (task ids are restart-scoped; rows are matched by repo).
+        live_rows = [
+            r for r in self._rows(tasks_file)
+            if r["repo_id"] == "owner/live"
+        ]
+        assert live_rows
+        assert live_rows[0]["status"] == DownloadStatus.PENDING.value
+
+    @pytest.mark.asyncio
+    async def test_restore_tolerates_missing_and_corrupt_files(
+        self, downloader, tasks_file
+    ):
+        await downloader.restore_tasks()  # missing file: no-op
+
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text("{not json", encoding="utf-8")
+        await downloader.restore_tasks()  # corrupt file: no-op, no raise
+        assert downloader._tasks == {}
+
+        tasks_file.write_text('{"not": "a list"}', encoding="utf-8")
+        await downloader.restore_tasks()
+        assert downloader._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_restore_warns_about_a_bad_row_without_its_token(
+        self, downloader, tasks_file, caplog
+    ):
+        """A row the loader cannot read is skipped, not fatal — and the row may
+        still carry the credential, so the warning leaves it out."""
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps([{
+                "task_id": "t1",
+                "status": "completed",
+                "token": "hf_SUPERSECRET",
+                # repo_id is what from_dict reads first; its absence is the
+                # KeyError this path already tolerates.
+            }]),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await downloader.restore_tasks()
+
+        assert "Skipping unpersistable download row" in caplog.text
+        assert "hf_SUPERSECRET" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_one_row_this_build_cannot_read_does_not_lose_the_queue(
+        self, downloader, tasks_file
+    ):
+        """`restore_tasks` promises never to raise, so one field a build that
+        stored it differently left behind skips that row's bookkeeping alone:
+        the rows behind it come back and the healing rewrite runs."""
+        rows = [
+            # A queue row interrupted mid-download, carrying the two fields a
+            # newer build could have changed the type of.
+            {"task_id": "live", "repo_id": "owner/live",
+             "status": DownloadStatus.DOWNLOADING.value,
+             "created_at": "2026-09-25T00:00:00", "retry_count": "x"},
+            {"task_id": "done", "repo_id": "owner/done",
+             "status": DownloadStatus.COMPLETED.value,
+             "created_at": 5.0, "retry_count": 1},
+            # A status this build does not know is failed and display-only,
+            # not a queued row this boot never starts.
+            {"task_id": "no-status", "repo_id": "owner/unknown",
+             "created_at": 7.0},
+        ]
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(json.dumps(rows), encoding="utf-8")
+
+        async def _noop(self, task_id, hf_token):
+            return None
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            await downloader.restore_tasks()
+
+        by_repo = {task.repo_id: task for task in downloader._tasks.values()}
+        assert set(by_repo) == {"owner/live", "owner/done", "owner/unknown"}
+        assert by_repo["owner/live"].status in (
+            DownloadStatus.PENDING,
+            DownloadStatus.DOWNLOADING,
+        )
+        assert by_repo["owner/live"].retry_count == 0
+        assert by_repo["owner/done"].status == DownloadStatus.COMPLETED
+        assert by_repo["owner/unknown"].status == DownloadStatus.FAILED
+
+        # The rewrite at the end of the restore ran, so the next boot reads a
+        # queue this one already healed rather than failing the same way.
+        written = {row["repo_id"]: row for row in self._rows(tasks_file)}
+        assert set(written) == set(by_repo)
+        assert written["owner/unknown"]["status"] == DownloadStatus.FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_restore_resumes_duplicate_interrupted_repo_once(
+        self, downloader, tasks_file
+    ):
+        row = {
+            "task_id": "x",
+            "repo_id": "owner/dup",
+            "status": "downloading",
+            "created_at": 100.0,
+        }
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps([dict(row, task_id="a"), dict(row, task_id="b")]),
+            encoding="utf-8",
+        )
+
+        async def _noop(self, task_id, hf_token):
+            return None
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            await downloader.restore_tasks()  # duplicate must not raise
+
+        active = [
+            t for t in downloader._tasks.values()
+            if t.status == DownloadStatus.PENDING
+        ]
+        assert len(active) == 1
+        assert active[0].repo_id == "owner/dup"
+
+    @pytest.mark.asyncio
+    async def test_row_persists_credential_but_api_never_exposes_it(
+        self, downloader, tasks_file
+    ):
+        async def _noop(self, task_id, hf_token):
+            return None
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            task = await downloader.start_download("owner/model", "hf_secret")
+
+        rows = self._rows(tasks_file)
+        assert rows[0]["token"] == "hf_secret"
+        # The queue API serves to_dict() output — a credential must never
+        # travel back to a client.
+        assert "token" not in task.to_dict()
+        assert all("token" not in row for row in downloader.get_tasks())
+        # The row is a credential store now: owner-only file.
+        if os.name != "nt":
+            assert tasks_file.stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.asyncio
+    async def test_restore_resumes_with_persisted_credential(
+        self, downloader, tasks_file
+    ):
+        """A gated download restarts with the token its request supplied."""
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": "live",
+                        "repo_id": "owner/gated",
+                        "status": "downloading",
+                        "created_at": 100.0,
+                        "token": "hf_secret",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        seen: dict = {}
+
+        async def _noop(self, task_id, hf_token):
+            seen["token"] = hf_token
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            await downloader.restore_tasks()
+        # restore only schedules the download coroutine — yield once so the
+        # patched run body actually executes before we inspect it.
+        await asyncio.sleep(0)
+
+        assert seen["token"] == "hf_secret"
+        resumed = [
+            t for t in downloader._tasks.values()
+            if t.status == DownloadStatus.PENDING
+        ]
+        assert [t.repo_id for t in resumed] == ["owner/gated"]
+        assert resumed[0].token == "hf_secret"
+        # The credential survives the restore rewrite for the next restart.
+        live_rows = [
+            r for r in self._rows(tasks_file)
+            if r["repo_id"] == "owner/gated"
+        ]
+        assert live_rows[0]["token"] == "hf_secret"
+
+    @pytest.mark.asyncio
+    async def test_restore_without_token_row_falls_back_to_empty(
+        self, downloader, tasks_file
+    ):
+        """Rows written before the token field keep hub's env/login lookup."""
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": "live",
+                        "repo_id": "owner/model",
+                        "status": "pending",
+                        "created_at": 100.0,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        seen = "unset"
+
+        async def _noop(self, task_id, hf_token):
+            nonlocal seen
+            seen = hf_token
+
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            await downloader.restore_tasks()
+        await asyncio.sleep(0)  # let the scheduled download coroutine run
+
+        assert seen == ""  # start_download maps "" to token=None for hub
+
+    @pytest.mark.asyncio
+    async def test_retry_recovers_credential_and_persists_bookkeeping(
+        self, downloader, tasks_file
+    ):
+        old = DownloadTask(
+            task_id="old",
+            repo_id="owner/gated",
+            status=DownloadStatus.FAILED,
+            token="hf_secret",
+        )
+        downloader._tasks["old"] = old
+        downloader._persist()
+
+        async def _noop(self, task_id, hf_token):
+            return None
+
+        # Retry without a token (the app sends none): the stored credential
+        # is kept instead of being wiped to "".
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            kept = await downloader.retry_download("old", "")
+        assert kept.token == "hf_secret"
+        assert kept.retry_count == 1
+        rows = {r["task_id"]: r for r in self._rows(tasks_file)}
+        assert rows[kept.task_id]["token"] == "hf_secret"
+        # The retry bookkeeping is on disk immediately, not on some later
+        # event — restarting right now must not lose the count.
+        assert rows[kept.task_id]["retry_count"] == 1
+
+        # Retry with a freshly re-entered token (the web form): the new
+        # credential replaces the stale one on disk.
+        kept.status = DownloadStatus.FAILED
+        with patch.object(HFDownloader, "_run_download", new=_noop):
+            replaced = await downloader.retry_download(kept.task_id, "hf_new")
+        assert replaced.token == "hf_new"
+        assert replaced.retry_count == 2
+        rows = {r["task_id"]: r for r in self._rows(tasks_file)}
+        assert rows[replaced.task_id]["token"] == "hf_new"
+        assert rows[replaced.task_id]["retry_count"] == 2
+
+
+# =============================================================================
+# Xet Group Capture and Cancellation
+# =============================================================================
+
+
+class TestXetGroupCancellation:
+    """Cancelling in-flight work aborts every recorded xet group."""
+
+    @pytest.fixture
+    def downloader(self, tmp_path):
+        model_dir = tmp_path / "models"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        return HFDownloader(model_dir=str(model_dir))
+
+    def setup_method(self):
+        hf_downloader_mod._xet_groups.clear()
+
+    def teardown_method(self):
+        hf_downloader_mod._xet_groups.clear()
+
+    def test_session_proxy_records_new_groups_and_delegates(self):
+        inner = MagicMock()
+        group = MagicMock()
+        group.__enter__.return_value = group
+        inner.new_file_download_group.return_value = group
+
+        proxy = hf_downloader_mod._XetSessionProxy(inner)
+        got = proxy.new_file_download_group(endpoint="ep")
+
+        inner.new_file_download_group.assert_called_once_with(endpoint="ep")
+        # hub gets a tracked wrapper; the real group is registered the moment
+        # it is created and stays registered while its `with` block is open.
+        assert isinstance(got, hf_downloader_mod._TrackedXetGroup)
+        assert list(hf_downloader_mod._xet_groups) == [group]
+        with got as entered:
+            assert entered is group
+            assert list(hf_downloader_mod._xet_groups) == [group]
+        # Settled groups leave the registry: abort would find no work there.
+        group.__exit__.assert_called_once_with(None, None, None)
+        assert list(hf_downloader_mod._xet_groups) == []
+        # Every other session attribute delegates to the real session.
+        assert proxy.status is inner.status
+
+    def test_install_is_idempotent_and_delegates(self):
+        import huggingface_hub.utils._xet as hub_xet
+
+        sentinel = object()
+        original = hub_xet.get_xet_session
+        try:
+            # Fresh un-wrapped function, so a wrapper installed by an earlier
+            # test cannot shadow this one.
+            hub_xet.get_xet_session = lambda: sentinel
+            hf_downloader_mod._install_xet_group_capture()
+            hf_downloader_mod._install_xet_group_capture()
+
+            proxy = hub_xet.get_xet_session()
+            assert isinstance(proxy, hf_downloader_mod._XetSessionProxy)
+            assert proxy._inner is sentinel
+        finally:
+            hub_xet.get_xet_session = original
+
+    def test_abort_xet_transfers_aborts_recorded_group_once(self):
+        group = MagicMock()
+        hf_downloader_mod._register_xet_group(group)
+
+        assert hf_downloader_mod._abort_xet_transfers() is True
+        group.abort.assert_called_once()
+        assert hf_downloader_mod._xet_groups == []
+        # Second call finds nothing left to abort.
+        assert hf_downloader_mod._abort_xet_transfers() is False
+        group.abort.assert_called_once()
+
+    def test_abort_xet_transfers_swallows_stale_group_errors(self):
+        group = MagicMock()
+        group.abort.side_effect = RuntimeError("stale group")
+        hf_downloader_mod._register_xet_group(group)
+
+        assert hf_downloader_mod._abort_xet_transfers() is False
+        group.abort.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_active_download_aborts_registered_group(
+        self, downloader
+    ):
+        group = MagicMock()
+        hf_downloader_mod._register_xet_group(group)
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+        active = asyncio.create_task(asyncio.sleep(10))
+        downloader._active_tasks[task.task_id] = active
+
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            assert await downloader.cancel_download(task.task_id) is True
+
+        group.abort.assert_called_once()
+        mock_abort.assert_called_once()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+    @pytest.mark.asyncio
+    async def test_cancel_pending_download_keeps_registered_group(
+        self, downloader
+    ):
+        group = MagicMock()
+        hf_downloader_mod._register_xet_group(group)
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.PENDING,
+        )
+        downloader._tasks[task.task_id] = task
+
+        with patch("omlx.admin.hf_downloader.abort_xet_session"):
+            assert await downloader.cancel_download(task.task_id) is True
+
+        group.abort.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_aborts_registered_group(self, downloader):
+        """shutdown() must stop the Rust transfer, not just flip the sigint.
+
+        The sigint flag alone can leave a reconstruction running, and the
+        interpreter would then wait for that non-daemon writer thread on
+        exit — a graceful restart mid-download has to unwind promptly.
+        """
+        group = MagicMock()
+        hf_downloader_mod._register_xet_group(group)
+
+        with patch("omlx.admin.hf_downloader.abort_xet_session"):
+            await downloader.shutdown()
+
+        group.abort.assert_called_once()
+        assert hf_downloader_mod._xet_groups == []
+
+    @pytest.mark.asyncio
+    async def test_cancel_aborts_every_concurrently_active_group(
+        self, downloader
+    ):
+        """snapshot_download shards files across hf_thread_map workers.
+
+        One xet_get() (hence one group) runs per file, concurrently, so the
+        registry holds several live groups at once and cancel must abort
+        all of them — aborting only the newest would leave the other shards
+        ghost-running.
+        """
+        inner = MagicMock()
+        groups = [MagicMock(), MagicMock()]
+        inner.new_file_download_group.side_effect = list(groups)
+        proxy = hf_downloader_mod._XetSessionProxy(inner)
+
+        for _ in range(len(groups)):  # two shard downloads open at once
+            proxy.new_file_download_group()
+        assert list(hf_downloader_mod._xet_groups) == groups
+
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+        active = asyncio.create_task(asyncio.sleep(10))
+        downloader._active_tasks[task.task_id] = active
+
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            assert await downloader.cancel_download(task.task_id) is True
+
+        for group in groups:
+            group.abort.assert_called_once()
+        assert hf_downloader_mod._xet_groups == []
+        mock_abort.assert_called_once()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+    @pytest.mark.asyncio
+    async def test_shutdown_aborts_every_concurrently_active_group(
+        self, downloader
+    ):
+        """Shutdown must reap all open shard groups, then settle cleanly.
+
+        A writer thread parked in any group's reconstruction would block
+        interpreter exit, so every live group gets aborted — and the groups'
+        later `with` exits must not trip over the cleared registry.
+        """
+        inner = MagicMock()
+        groups = [MagicMock(), MagicMock()]
+        inner.new_file_download_group.side_effect = list(groups)
+        proxy = hf_downloader_mod._XetSessionProxy(inner)
+
+        open_groups = [
+            proxy.new_file_download_group() for _ in range(len(groups))
+        ]
+        for tracked in open_groups:
+            tracked.__enter__()  # shards mid-transfer
+
+        with patch("omlx.admin.hf_downloader.abort_xet_session"):
+            await downloader.shutdown()
+
+        for group in groups:
+            group.abort.assert_called_once()
+        assert hf_downloader_mod._xet_groups == []
+
+        # The with-blocks settle after the abort without tripping anything.
+        for tracked in open_groups:
+            tracked.__exit__(None, None, None)
+        assert hf_downloader_mod._xet_groups == []
+
+    def test_group_deregisters_when_enter_fails(self):
+        """A failed CAS handshake must not leak a stale registry entry.
+
+        The `with` statement skips __exit__ when __enter__ raises, so the
+        wrapper has to unregister itself on that path.
+        """
+        inner = MagicMock()
+        group = MagicMock()
+        group.__enter__.side_effect = RuntimeError("handshake failed")
+        inner.new_file_download_group.return_value = group
+        proxy = hf_downloader_mod._XetSessionProxy(inner)
+
+        tracked = proxy.new_file_download_group()
+        with pytest.raises(RuntimeError):
+            with tracked:
+                pass
+
+        assert list(hf_downloader_mod._xet_groups) == []
+
+    def test_late_group_is_aborted_and_the_flag_dies_with_its_call(self):
+        """A group opened after the abort is stopped, a later call's is not.
+
+        abort_xet_session() only drops the session, so a snapshot_download
+        call that reached its first xet_get() after the cancel opens its
+        group on a fresh session that nothing is left to abort. The call is
+        flagged instead, and that flag has to die with the call rather than
+        catch the download that starts after it.
+        """
+        inner = MagicMock()
+        late, next_call = MagicMock(), MagicMock()
+        inner.new_file_download_group.side_effect = [late, next_call]
+        proxy = hf_downloader_mod._XetSessionProxy(inner)
+
+        def aborted_call(**kwargs):
+            # The cancel lands while this call is registered but before it has
+            # opened a group: the registry it snapshots is empty.
+            assert hf_downloader_mod._abort_xet_transfers() is False
+            proxy.new_file_download_group()
+            return []
+
+        hf_downloader_mod._tracked_snapshot_download(
+            aborted_call, lambda: False
+        )
+        late.abort.assert_called_once()
+
+        def next_download(**kwargs):
+            proxy.new_file_download_group()
+            return []
+
+        hf_downloader_mod._tracked_snapshot_download(
+            next_download, lambda: False
+        )
+        next_call.abort.assert_not_called()
+
+    def test_tracked_call_flags_itself_when_already_cancelled(self):
+        """A cancel that landed before the worker registered still stops it.
+
+        The to_thread job is submitted before its awaiter can be cancelled,
+        so by the time the worker runs the abort that cleared the (empty)
+        registry is history; the call has to notice the cancel itself.
+        """
+        inner = MagicMock()
+        group = MagicMock()
+        inner.new_file_download_group.return_value = group
+        proxy = hf_downloader_mod._XetSessionProxy(inner)
+
+        def call(**kwargs):
+            proxy.new_file_download_group()
+            return []
+
+        hf_downloader_mod._tracked_snapshot_download(call, lambda: True)
+
+        group.abort.assert_called_once()
+
+    def test_abort_reaches_only_the_call_that_was_cancelled(self):
+        """A download started while an aborted worker unwinds keeps its groups.
+
+        Task cancellation does not stop the worker, so the semaphore can be
+        released and the next download can reach its first xet_get() before
+        the cancelled one does. That next download must not inherit the
+        abort: aborting its group mid-handshake turns its xet_get() into a
+        "User cancelled" failure.
+        """
+        inner = MagicMock()
+        old_group, new_group = MagicMock(), MagicMock()
+        inner.new_file_download_group.side_effect = [new_group, old_group]
+        proxy = hf_downloader_mod._XetSessionProxy(inner)
+
+        aborted_call = hf_downloader_mod._open_xet_call()
+        new_call = hf_downloader_mod._open_xet_call()
+        hf_downloader_mod._abort_xet_call(aborted_call)
+        previous = getattr(hf_downloader_mod._xet_call_in_thread, "call", None)
+        try:
+            # The replacement download gets there first, then the cancelled
+            # worker finally reaches its own first xet_get().
+            hf_downloader_mod._mark_xet_call(new_call)
+            proxy.new_file_download_group()
+            hf_downloader_mod._mark_xet_call(aborted_call)
+            proxy.new_file_download_group()
+        finally:
+            hf_downloader_mod._mark_xet_call(previous)
+            hf_downloader_mod._close_xet_call(aborted_call)
+            hf_downloader_mod._close_xet_call(new_call)
+
+        new_group.abort.assert_not_called()
+        old_group.abort.assert_called_once()
+
+    def test_hub_per_file_workers_inherit_the_call_they_serve(self):
+        """hub opens groups on its own file workers, so they need the mark.
+
+        snapshot_download maps files across a ThreadPoolExecutor; without
+        wrapping that map the per-file threads carry no call, the late group
+        goes unattributed, and the abort that was supposed to stop it finds
+        nothing (or stops the wrong download).
+        """
+        from huggingface_hub import _snapshot_download as hub_snapshot
+        from huggingface_hub.utils.tqdm import hf_thread_map as pristine
+
+        original = hub_snapshot.hf_thread_map
+        call = hf_downloader_mod._open_xet_call()
+        previous = getattr(hf_downloader_mod._xet_call_in_thread, "call", None)
+        try:
+            hub_snapshot.hf_thread_map = pristine
+            hf_downloader_mod._install_xet_call_marking()
+            hf_downloader_mod._install_xet_call_marking()  # idempotent
+            marked = hub_snapshot.hf_thread_map
+            assert getattr(marked, "_omlx_call_marking", False)
+
+            hf_downloader_mod._mark_xet_call(call)
+
+            seen = []
+
+            def worker(_item):
+                seen.append(
+                    getattr(hf_downloader_mod._xet_call_in_thread, "call", None)
+                )
+
+            marked(worker, [1, 2], disable=True)
+
+            assert seen == [call, call]
+        finally:
+            hub_snapshot.hf_thread_map = original
+            hf_downloader_mod._mark_xet_call(previous)
+            hf_downloader_mod._close_xet_call(call)
+
+    @pytest.mark.asyncio
+    async def test_group_opened_after_cancel_is_aborted(self, downloader):
+        """A cancel that beats the call's first xet_get() must still abort it.
+
+        Task cancellation does not stop the snapshot_download worker, so the
+        worker can reach its first xet_get() after cancel_download() returned.
+        By then the registry it emptied is still empty and abort_xet_session()
+        has already replaced the session, so the group opened on that fresh
+        session must be aborted the moment it appears instead of ghost-running
+        for the life of the process.
+        """
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_info.siblings = []
+        mock_api.model_info.return_value = mock_info
+
+        group = MagicMock()
+        group.__enter__.return_value = group
+        inner = MagicMock()
+        inner.new_file_download_group.return_value = group
+
+        worker_started = threading.Event()
+        release = threading.Event()
+        group_opened = threading.Event()
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            worker_started.set()
+            assert release.wait(5), "test never released the worker"
+            # Only now does the call reach its first xet_get(): the cancel has
+            # long returned and its abort_xet_session() dropped the session.
+            hf_downloader_mod._XetSessionProxy(
+                inner
+            ).new_file_download_group(endpoint="ep")
+            group_opened.set()
+            return []
+
+        try:
+            with patch(
+                "omlx.admin.hf_downloader._get_hf_api",
+                return_value=(mock_api, None),
+            ), patch(
+                "omlx.admin.hf_downloader.snapshot_download",
+                side_effect=fake_snapshot_download,
+            ), patch(
+                "omlx.admin.hf_downloader.abort_xet_session"
+            ) as mock_abort:
+                active = asyncio.create_task(
+                    downloader._run_download(task.task_id, "")
+                )
+                downloader._active_tasks[task.task_id] = active
+                assert await asyncio.to_thread(worker_started.wait, 5)
+
+                assert await downloader.cancel_download(task.task_id) is True
+                mock_abort.assert_called_once()
+                # The abort found nothing: the call has no group open yet and
+                # the group it opens next does not exist anywhere.
+                assert hf_downloader_mod._xet_groups == []
+                group.abort.assert_not_called()
+
+                release.set()
+                await active
+                assert await asyncio.to_thread(group_opened.wait, 5)
+                group.abort.assert_called_once()
+        finally:
+            release.set()

@@ -42,13 +42,13 @@ struct TextInput: View {
             .textFieldStyle(.roundedBorder)
             // Regular weight: native macOS fields never render medium-weight
             // content, and the bolder text read as a foreign control.
-            .font(mono ? .omlxMono(13) : .omlxText(13))
+            .font(mono ? .omlxMono(DesignTokens.FontSize.body) : .omlxText(DesignTokens.FontSize.body))
             .foregroundStyle(theme.text)
             .overlay(alignment: .trailing) {
                 HStack(spacing: 0) {
                     if let suffix {
                         Text(suffix)
-                            .font(.omlxText(11))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                             .padding(.horizontal, 10)
                     }

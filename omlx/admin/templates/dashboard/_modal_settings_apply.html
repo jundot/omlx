@@ -1,17 +1,17 @@
     <!-- Settings snapshot modal: reset confirmation / omlx.ai candidates / pasted recipe -->
-    <dialog x-effect="settingsApply.open ? $el.showModal() : $el.close()" x-cloak
+    <dialog id="settings-apply-dialog"
          class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"
          role="dialog" aria-modal="true" aria-labelledby="settings-apply-modal-title"
          @keydown.tab="trapDialogFocus($event)"
          @cancel.prevent="closeSettingsApply()">
         <div class="fixed inset-0 bg-black/50" @click="closeSettingsApply()"></div>
         <div class="flex min-h-full items-center justify-center p-4">
-            <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-xl p-6" @click.stop>
+            <div class="relative bg-surface rounded-lg shadow-popover w-full max-w-xl p-6" @click.stop>
                 <div class="flex items-center justify-between mb-4">
                     <h4 id="settings-apply-modal-title" tabindex="-1" autofocus class="text-lg font-bold tracking-tight text-neutral-900" x-text="settingsApplyTitle()"></h4>
                     <button type="button" @click="closeSettingsApply()"
                             :disabled="settingsApply.phase === 'loading'"
-                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all disabled:opacity-50">
+                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50">
                         <i data-lucide="x" class="w-5 h-5"></i>
                     </button>
                 </div>
@@ -21,9 +21,9 @@
                     <p class="text-sm text-neutral-700">{{ t('modal.model_settings.actions.reset_confirm') }}</p>
                     <div class="flex items-center justify-end gap-3">
                         <button type="button" @click="closeSettingsApply()"
-                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('models.manager.delete_no') }}</button>
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">{{ t('models.manager.delete_no') }}</button>
                         <button type="button" @click="runSettingsApply()"
-                                class="px-6 py-2.5 bg-red-500 text-white text-sm font-semibold rounded-full hover:bg-red-600 transition-all">{{ t('models.manager.delete_yes') }}</button>
+                                class="px-6 py-2.5 bg-danger-fill text-danger-fg text-sm font-semibold rounded-lg hover:brightness-95 transition-all">{{ t('models.manager.delete_yes') }}</button>
                     </div>
                 </div>
 
@@ -37,10 +37,10 @@
                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-xs font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"></textarea>
                     <div class="flex items-center justify-end gap-3">
                         <button type="button" @click="closeSettingsApply()"
-                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.cancel') }}</button>
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">{{ t('modal.model_settings.cancel') }}</button>
                         <button type="button" @click="runSettingsApply()"
                                 :disabled="!settingsApply.recipeText.trim()"
-                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.apply') }}</button>
+                                class="px-6 py-2.5 bg-accent text-accent-fg text-sm font-semibold rounded-lg hover:bg-accent-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.apply') }}</button>
                     </div>
                 </div>
 
@@ -66,7 +66,7 @@
                                             <div class="text-xs text-neutral-500 mt-1" x-text="settingsApplyStats(item)"></div>
                                         </div>
                                         <button type="button" @click="applyOptimalCandidate(item.benchmark_id)"
-                                                class="flex-shrink-0 px-4 py-2 bg-neutral-900 text-white text-xs font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.apply') }}</button>
+                                                class="flex-shrink-0 px-4 py-2 bg-accent text-accent-fg text-xs font-semibold rounded-lg hover:bg-accent-hover transition-all">{{ t('modal.model_settings.actions.apply') }}</button>
                                     </div>
                                 </template>
                             </div>
@@ -74,7 +74,7 @@
                     </template>
                     <div class="flex items-center justify-end">
                         <button type="button" @click="closeSettingsApply()"
-                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.cancel') }}</button>
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">{{ t('modal.model_settings.cancel') }}</button>
                     </div>
                 </div>
 
@@ -109,7 +109,7 @@
                     </template>
                     <div class="flex items-center justify-end">
                         <button type="button" @click="closeSettingsApply()"
-                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.close') }}</button>
+                                class="px-6 py-2.5 bg-accent text-accent-fg text-sm font-semibold rounded-lg hover:bg-accent-hover transition-all">{{ t('modal.model_settings.actions.close') }}</button>
                     </div>
                 </div>
 
@@ -122,7 +122,7 @@
                        class="inline-block text-sm text-neutral-700 underline hover:text-neutral-900">{{ t('modal.model_settings.actions.none_link') }}</a>
                     <div class="flex items-center justify-end">
                         <button type="button" @click="closeSettingsApply()"
-                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.close') }}</button>
+                                class="px-6 py-2.5 bg-accent text-accent-fg text-sm font-semibold rounded-lg hover:bg-accent-hover transition-all">{{ t('modal.model_settings.actions.close') }}</button>
                     </div>
                 </div>
 
@@ -132,11 +132,11 @@
                     <p class="text-sm text-red-600 break-words" x-text="settingsApply.error"></p>
                     <div class="flex items-center justify-end gap-3">
                         <button type="button" x-show="settingsApply.mode === 'recipe'" @click="settingsApply.phase = 'input'"
-                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.actions.back') }}</button>
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">{{ t('modal.model_settings.actions.back') }}</button>
                         <button type="button" x-show="settingsApply.mode === 'optimal' && settingsApply.candidates" @click="settingsApply.phase = 'choose'"
-                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.actions.back') }}</button>
+                                class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">{{ t('modal.model_settings.actions.back') }}</button>
                         <button type="button" @click="closeSettingsApply()"
-                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 transition-all">{{ t('modal.model_settings.actions.close') }}</button>
+                                class="px-6 py-2.5 bg-accent text-accent-fg text-sm font-semibold rounded-lg hover:bg-accent-hover transition-all">{{ t('modal.model_settings.actions.close') }}</button>
                     </div>
                 </div>
             </div>

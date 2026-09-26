@@ -4,6 +4,9 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 BASE = (ROOT / "omlx/admin/templates/base.html").read_text(encoding="utf-8")
 LOGIN = (ROOT / "omlx/admin/templates/login.html").read_text(encoding="utf-8")
+# Colour tokens moved to the generated stylesheet; the contrast check follows
+# the value, not the file it used to live in.
+TOKENS = (ROOT / "omlx/admin/static/css/tokens.css").read_text(encoding="utf-8")
 
 
 def _css_color(stylesheet: str, selector: str, property_name: str) -> str:
@@ -36,15 +39,19 @@ def _contrast_ratio(first: str, second: str) -> float:
 def test_focus_ring_uses_theme_aware_two_pixel_outline():
     focus_rule = re.search(r":focus-visible\s*\{([^}]*)\}", BASE, re.DOTALL)
     assert focus_rule is not None
-    assert "outline: 2px solid var(--focus-ring-color) !important" in focus_rule.group(
-        1
+    # Both the colour and the width are tokens: one focus ring for the console,
+    # and the app reads the same two numbers.
+    assert (
+        "outline: var(--focus-ring-width) solid var(--focus-ring-color) !important"
+        in focus_rule.group(1)
     )
+    assert "outline-offset: var(--focus-ring-width)" in focus_rule.group(1)
     assert "var(--text-primary" not in focus_rule.group(1)
 
 
 def test_focus_ring_contrasts_with_login_backgrounds():
-    light_ring = _css_color(BASE, r":root", "--focus-ring-color")
-    dark_ring = _css_color(BASE, r'\[data-theme="dark"\]', "--focus-ring-color")
+    light_ring = _css_color(TOKENS, r":root", "--focus-ring-color")
+    dark_ring = _css_color(TOKENS, r'\[data-theme="dark"\]', "--focus-ring-color")
     dark_page = _css_color(LOGIN, r'\[data-theme="dark"\] body', "background-color")
     dark_control = _css_color(
         LOGIN, r'\[data-theme="dark"\] \.bg-neutral-50', "background-color"
