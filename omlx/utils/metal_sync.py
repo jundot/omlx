@@ -82,3 +82,24 @@ def _sync_and_clear_cache(stream=None):
         except RuntimeError as exc:
             exit_if_gpu_submissions_ignored(exc)
             raise
+
+
+# Engine-thread hint that a batch cache rebuild just released large buffers
+# into MLX's pool (per-row extracts + the replaced batch cache). Those exact
+# widths are never reused by later, larger requests, so the scheduler turns the
+# hint into its ordinary deferred clear (the #435/#557 delay still applies).
+# Thread-local: the hint is raised and consumed on the same engine thread.
+_pool_reclaim_hint = threading.local()
+
+
+def request_pool_reclaim() -> None:
+    """Ask the owning scheduler for a deferred Metal pool clear."""
+    _pool_reclaim_hint.pending = True
+
+
+def consume_pool_reclaim_request() -> bool:
+    """Return and reset this thread's pending pool-reclaim hint."""
+    pending = getattr(_pool_reclaim_hint, "pending", False)
+    if pending:
+        _pool_reclaim_hint.pending = False
+    return pending
