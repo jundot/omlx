@@ -208,8 +208,9 @@ class TestBlockAwarePrefixCache:
         tokens = list(range(8))  # 2 full blocks at block_size=4
         keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
         values = (keys + 100).astype(mx.float32)
-        cache_data = [{"state": (keys, values), "cache_type": "KVCache",
-                       "class_name": "KVCache"}]
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
 
         table = prefix_cache.store_cache("req-store", tokens, cache_data)
         assert table is not None
@@ -279,8 +280,8 @@ class TestBlockAwarePrefixCache:
         first_prefix_cache.release_cache("ordinary-prefix")
         first_ssd_manager.close()
 
-        restarted_prefix_cache, _, restarted_ssd_manager = (
-            self._make_ssd_prefix_cache(cache_directory)
+        restarted_prefix_cache, _, restarted_ssd_manager = self._make_ssd_prefix_cache(
+            cache_directory
         )
 
         try:
@@ -294,7 +295,7 @@ class TestBlockAwarePrefixCache:
                 promote_to_hot_cache=False,
             )
             assert restored_cache is not None
-            restored_keys, restored_values = restored_cache[0].state
+            restored_keys, restored_values = restored_cache[0].keys_and_values()
             assert restored_table.num_tokens == len(tokens)
             assert mx.array_equal(restored_keys, keys).item()
             assert mx.array_equal(restored_values, values).item()
@@ -941,11 +942,101 @@ class TestBlockAwarePrefixCacheWithSSD:
 
         assert restored is not None
         restored_cache = restored[0]
-        restored_keys, restored_values = restored_cache.kv_cache.state
+        restored_keys, restored_values = (
+            restored_cache.kv_cache.keys,
+            restored_cache.kv_cache.values,
+        )
         assert restored_keys.tolist() == keys.tolist()
         assert restored_values.tolist() == values.tolist()
         assert restored_cache.index_keys.tolist() == index_keys.tolist()
         assert restored_cache.index_offset == 8
+
+    def test_qwen4_qsa_misaligned_auxiliary_state_is_not_stored(
+        self, prefix_cache_with_ssd
+    ):
+        """A QSA block with shorter indexer state must fail closed."""
+        mx = pytest.importorskip("mlx.core")
+        keys = mx.zeros((1, 2, 8, 64))
+        values = mx.zeros((1, 2, 8, 64))
+        index_keys = mx.zeros((1, 4, 64))
+        positions = mx.zeros((1, 1, 4), dtype=mx.int32)
+
+        block = prefix_cache_with_ssd._extract_block_tensor_slice(
+            [
+                {
+                    "state": (keys, values, index_keys, positions),
+                    "cache_type": "QSAKVCache",
+                }
+            ],
+            4,
+            8,
+        )
+
+        assert block is None
+
+    def test_qwen4_qsa_sliceable_nstate_blocks_round_trip(self):
+        """Valid QSA blocks preserve K/V, index keys, and positions."""
+        mx = pytest.importorskip("mlx.core")
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        saved_by_hash = {}
+
+        def save_block(**kwargs):
+            saved_by_hash[kwargs["block_hash"]] = (
+                kwargs["cache_data"],
+                {
+                    "model_name": "test-model",
+                    "num_layers": 1,
+                    "block_size": 4,
+                    "layer_cache_types": kwargs["layer_cache_types"],
+                    "layer_meta_states": kwargs["layer_meta_states"],
+                },
+            )
+            return True
+
+        mock_ssd.save_block.side_effect = save_block
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        keys = mx.arange(1 * 2 * 8 * 64, dtype=mx.float32).reshape(1, 2, 8, 64)
+        values = keys + 1_000
+        index_keys = mx.arange(1 * 8 * 64, dtype=mx.float32).reshape(1, 8, 64)
+        positions = mx.arange(8, dtype=mx.int32).reshape(1, 1, 8)
+        mx.eval(keys, values, index_keys, positions)
+        cache_data = [
+            {
+                "state": (keys, values, index_keys, positions),
+                "cache_type": "QSAKVCache",
+                "class_name": "QSAKVCache",
+                "meta_state": (),
+            }
+        ]
+
+        block_table = cache.store_cache("req-qsa", list(range(8)), cache_data)
+
+        assert block_table is not None
+        assert len(block_table.block_ids) == 2
+
+        def load_block_with_metadata(block_hash, **kwargs):
+            return saved_by_hash.get(block_hash, (None, None))
+
+        mock_ssd.load_block_with_metadata.side_effect = load_block_with_metadata
+        restored = cache.reconstruct_cache(block_table)
+
+        assert restored is not None
+        restored_state = restored[0].state
+        assert restored_state[0].tolist() == keys.tolist()
+        assert restored_state[1].tolist() == values.tolist()
+        assert restored_state[2].tolist() == index_keys.tolist()
+        assert restored_state[3].tolist() == positions[:, 0, :].tolist()
 
 
 class TestPrefixIndexOperations:
@@ -1668,9 +1759,7 @@ class TestArraysCacheLastBlockOnly:
         assert stats.last_partial_tokens_skipped == 2
         assert stats.last_tokens_to_next_block == 2
 
-    def test_store_cache_arrayscache_partial_trailing_stores_placeholder(
-        self, mx
-    ):
+    def test_store_cache_arrayscache_partial_trailing_stores_placeholder(self, mx):
         """A1 regression: 7 tokens / block_size=4 stores 1 full block (4
         tokens) and skips 3 trailing partial tokens -- but the ArraysCache
         conv/ssm state passed in is the LIVE state after all 7 tokens, not
@@ -1792,6 +1881,207 @@ class TestArraysCacheLastBlockOnly:
         saved_conv_state, saved_ssm_state = block1_data[0]
         assert saved_conv_state.shape == conv_state.shape
         assert saved_ssm_state.shape == ssm_state.shape
+
+    def _tail_fixture(self, mx):
+        """Hybrid KVCache + ArraysCache prefix cache with a mocked SSD tier."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+        mock_ssd.has_block.return_value = False
+        mock_ssd.iter_tail_blocks.return_value = []
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        config = ModelCacheConfig.from_type_list(
+            ["KVCache", "ArraysCache"], model_name="test-model"
+        )
+        return cache, paged_cache, mock_ssd, config
+
+    @staticmethod
+    def _hybrid_state(mx, seq_len, fill):
+        return [
+            {
+                "state": (
+                    mx.full((1, 2, seq_len, 8), fill),
+                    mx.full((1, 2, seq_len, 8), fill),
+                ),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            },
+            {
+                "state": (mx.full((1, 3, 8), fill), mx.full((1, 2, 4, 8), fill)),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            },
+        ]
+
+    def test_store_cache_tail_terminal_stores_partial_block(self, mx):
+        """Tail mode keeps the trailing partial block as a short terminal block.
+
+        The tail carries the snapshot taken at its end (7) and is indexed under
+        its parent block."""
+        from omlx.cache.paged_cache import compute_block_hash
+
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        tokens = list(range(7))
+        snapshots = {
+            4: self._hybrid_state(mx, 4, 4.0),
+            7: self._hybrid_state(mx, 7, 7.0),
+        }
+
+        result = cache.store_cache(
+            "req-tail",
+            tokens,
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+
+        assert result is not None
+        assert len(result.block_ids) == 2
+        assert result.num_tokens == 7
+        full = paged_cache.allocated_blocks[result.block_ids[0]]
+        tail = paged_cache.allocated_blocks[result.block_ids[-1]]
+        assert tail.token_count == 3
+        assert tail.block_hash == compute_block_hash(
+            full.block_hash, [4, 5, 6], model_name="test-model"
+        )
+
+        assert mock_ssd.save_block.call_count == 2
+        full_call = mock_ssd.save_block.call_args_list[0].kwargs
+        tail_call = mock_ssd.save_block.call_args_list[1].kwargs
+        assert full_call["tail_terminal"] is False
+        assert full_call["parent_hash"] is None
+        assert tail_call["tail_terminal"] is True
+        assert tail_call["parent_hash"] == full.block_hash
+        assert tail_call["token_count"] == 3
+        kv_slice, arrays_state = tail_call["cache_data"]
+        assert kv_slice[0].shape[2] == 3
+        assert arrays_state[1].shape == (1, 2, 4, 8)
+        assert float(arrays_state[1][0, 0, 0, 0]) == 7.0
+
+        assert paged_cache._tail_index[full.block_hash][tail.block_hash] == 3
+        stats = cache.get_stats()
+        assert stats.tail_blocks_stored == 1
+        assert stats.partial_block_skips == 0
+        assert stats.last_partial_tokens_skipped == 0
+        # The prefix index covers the full block only.
+        assert [entry[0] for entry in cache._prefix_index.values()] == [4]
+
+    def test_store_cache_pops_fetched_tail_and_extends_on_grid(self, mx):
+        """A request that reused a tail stores its own blocks on the grid.
+
+        The fetched tail is released from the table before the new blocks
+        are laid out, so the next full block chains to the last full block
+        and the old tail stays cached for other requests."""
+        from omlx.cache.paged_cache import compute_block_hash
+
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        first = cache.store_cache(
+            "req-a",
+            list(range(7)),
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots={
+                4: self._hybrid_state(mx, 4, 4.0),
+                7: self._hybrid_state(mx, 7, 7.0),
+            },
+            _store_tail_terminal=True,
+        )
+        old_tail_hash = paged_cache.allocated_blocks[first.block_ids[-1]].block_hash
+        paged_cache.release_for_eviction(first.block_ids)
+
+        longer = list(range(11))
+        table, remaining = cache.fetch_cache("req-b", longer)
+        assert table is not None and table.num_tokens == 7
+        assert remaining == [7, 8, 9, 10]
+        assert cache.get_stats().tail_block_hits == 1
+
+        second = cache.store_cache(
+            "req-b",
+            longer,
+            self._hybrid_state(mx, 11, 11.0),
+            model_cache_config=config,
+            boundary_snapshots={
+                8: self._hybrid_state(mx, 8, 8.0),
+                11: self._hybrid_state(mx, 11, 11.0),
+            },
+            _store_tail_terminal=True,
+        )
+
+        assert second is not None and second.num_tokens == 11
+        blocks = [paged_cache.allocated_blocks[b] for b in second.block_ids]
+        assert [b.token_count for b in blocks] == [4, 4, 3]
+        assert blocks[1].block_hash == compute_block_hash(
+            blocks[0].block_hash, [4, 5, 6, 7], model_name="test-model"
+        )
+        assert blocks[2].block_hash == compute_block_hash(
+            blocks[1].block_hash, [8, 9, 10], model_name="test-model"
+        )
+        old_tail = paged_cache.cached_block_hash_to_block.get_block(old_tail_hash)
+        assert old_tail is not None and old_tail.ref_count == 0
+        assert old_tail.block_id not in second.block_ids
+        assert old_tail_hash in paged_cache._tail_index[blocks[0].block_hash]
+        assert blocks[2].block_hash in paged_cache._tail_index[blocks[1].block_hash]
+
+    def test_store_cache_tail_dedup_reuses_existing_block(self, mx):
+        """An identical tail under the same parent is reused, not re-saved."""
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        snapshots = {
+            4: self._hybrid_state(mx, 4, 4.0),
+            7: self._hybrid_state(mx, 7, 7.0),
+        }
+        first = cache.store_cache(
+            "req-a",
+            list(range(7)),
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+        second = cache.store_cache(
+            "req-c",
+            list(range(7)),
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+
+        assert second.block_ids == first.block_ids
+        assert mock_ssd.save_block.call_count == 2
+        tail = paged_cache.allocated_blocks[second.block_ids[-1]]
+        assert tail.ref_count == 2
+        assert cache.get_stats().tail_blocks_stored == 1
+
+    def test_attaching_ssd_manager_seeds_tail_index(self):
+        """Tails from earlier runs are indexed when the SSD tier is attached later."""
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1), paged_cache_manager=paged_cache
+        )
+        assert paged_cache._tail_index == {}
+
+        mock_ssd = MagicMock()
+        mock_ssd.iter_tail_blocks.return_value = [(b"parent", b"tail", 3)]
+        cache.set_paged_ssd_cache_manager(mock_ssd)
+
+        assert paged_cache._tail_index[b"parent"][b"tail"] == 3
 
     def test_store_cache_all_partial_creates_no_blocks(self, mx):
         """Tokens fewer than block_size should create no blocks."""
@@ -2434,7 +2724,7 @@ class TestArraysCacheLastBlockOnly:
         assert len(reconstructed) == 1
         layer_cache = reconstructed[0]
         if hasattr(layer_cache, "state"):
-            reconstructed_keys, reconstructed_values = layer_cache.state
+            reconstructed_keys, reconstructed_values = layer_cache.keys_and_values()
         elif isinstance(layer_cache, (list, tuple)) and len(layer_cache) == 2:
             reconstructed_keys, reconstructed_values = layer_cache
         else:
@@ -3496,8 +3786,8 @@ class TestTurboQuantFormatMismatchRecovery:
         assert result is not None
         assert isinstance(result[0], SizedArraysCache)
         assert result[0].size() == 4
-        assert len(result[0].state) == 4
-        for expected, actual in zip(states, result[0].state):
+        assert len(result[0].cache) == 4
+        for expected, actual in zip(states, result[0].cache):
             assert mx.array_equal(expected, actual).item()
 
 
@@ -4555,3 +4845,55 @@ class TestReconstructionSilentFallbackHardening:
 
         assert rebuilt is not None
         assert rebuilt.offset == self.BLOCK
+
+
+@pytest.mark.parametrize("complete_base", [True, False])
+def test_pooling_snapshot_base_after_atomic_image_prefix(tmp_path, complete_base):
+    import mlx.core as mx
+    from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+    from omlx.cache.pooling_delta import compact_pooling_cache_snapshot
+    from omlx.cache.type_handlers import CacheListHandler
+    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+    apply_deepseek_v4_patch()
+    prefix, _, ssd = TestBlockAwarePrefixCache._make_ssd_prefix_cache(tmp_path)
+    handler = CacheListHandler()
+
+    def snapshot(count):
+        rotating = RotatingKVCache(max_size=4)
+        keys = mx.ones((1, 1, count, 8))
+        rotating.update_and_fetch(keys, keys)
+        pool = PoolingCache(4)
+        pool.state = (None, None, mx.arange(count // 4 * 8).reshape(1, count // 4, 8))
+        cache = CacheList(rotating, pool)
+        return [
+            {
+                "layer_idx": 0,
+                "class_name": "CacheList",
+                "cache_type": "CacheList",
+                "state": list(handler.serialize_state(cache)),
+                "meta_state": handler.serialize_meta_state(cache),
+            }
+        ]
+
+    initial = snapshot(12)
+    compact_pooling_cache_snapshot(initial, 12, 12 if complete_base else 4)
+    final = snapshot(16)
+    delta = snapshot(16)
+    compact_pooling_cache_snapshot(delta, 16, 4)
+    try:
+        table = prefix.store_cache(
+            "image", list(range(16)), final, boundary_snapshots={12: initial, 16: delta}
+        )
+        if not complete_base:
+            assert table is None or table.num_tokens == 0
+            return
+        assert table.num_tokens == 16
+        hit, _ = prefix.fetch_cache("reuse", list(range(16)))
+        restored = prefix.reconstruct_cache(hit)
+        assert restored is not None
+        assert mx.array_equal(restored[0][1].pooled, final[0]["state"][1][2])
+        assert restored[0][0].offset == 16
+    finally:
+        ssd.close()

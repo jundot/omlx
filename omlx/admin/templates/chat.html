@@ -1212,9 +1212,9 @@
             <div x-show="messages.length === 0" class="h-full flex items-center justify-center" x-cloak>
                 <div class="text-center max-w-lg px-4">
                     <div class="flex items-center justify-center gap-3 mb-4">
-                        <img x-show="activeTheme === 'light'" src="/admin/static/logo-light.svg" alt="oMLX"
+                        <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX"
                             class="w-[60px] h-[60px]">
-                        <img x-show="activeTheme === 'dark'" src="/admin/static/logo-dark.svg" alt="oMLX"
+                        <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX"
                             class="w-[60px] h-[60px]" x-cloak>
                         <h1 class="text-2xl font-bold">{{ t('chat.welcome_heading') }}</h1>
                     </div>
@@ -2200,21 +2200,22 @@
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
-                        <option value="auto">{{ t('chat.thinking_mode.auto') }}</option>
-                        <option value="on_unlimit">{{ t('chat.thinking_mode.on_unlimited') }}</option>
-                        <option value="on_limit">{{ t('chat.thinking_mode.on_limited') }}</option>
-                        <option value="off">{{ t('chat.thinking_mode.off') }}</option>
+                        <option value="auto" :disabled="!thinkingModes().includes('auto')">{{ t('chat.thinking_mode.auto') }}</option>
+                        <option value="on_unlimit" :disabled="!thinkingModes().includes('on_unlimit')">{{ t('chat.thinking_mode.on_unlimited') }}</option>
+                        <option value="on_limit" :disabled="!thinkingModes().includes('on_limit')">{{ t('chat.thinking_mode.on_limited') }}</option>
+                        <option value="off" :disabled="!thinkingModes().includes('off')">{{ t('chat.thinking_mode.off') }}</option>
                     </select>
+                    <p x-show="currentModelInfo()?.thinking_forced" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
-                        <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                            @focus="_thinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
+                        <input type="number"
+                            :value="modelSettings.thinking_budget_tokens ?? ''"
                             @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
                             @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
                             @input="onThinkingBudgetTokensInput($event)"
                             @change="clampThinkingBudgetTokens()"
-                            placeholder="4001" min="1" step="1000"
+                            placeholder="4096" min="0" step="1024"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
                             style="color: var(--text-primary);">
                     </div>
@@ -2478,15 +2479,15 @@
             <div class="px-5 py-4 space-y-3 text-sm" style="color: var(--text-primary);">
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_send') }}</span>
-                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">Enter</kbd>
+                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_key_enter') }}</kbd>
                 </div>
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_newline') }}</span>
-                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">Shift + Enter</kbd>
+                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_shift_enter') }}</kbd>
                 </div>
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_stop') }}</span>
-                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">Esc</kbd>
+                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_key_esc') }}</kbd>
                 </div>
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_help') }}</span>
@@ -2588,8 +2589,6 @@
             _thinkingDomSeq: 0,
             _adminModelsList: null,
             _adminModelsListPromise: null,
-            _thinkingBudgetBeforeInput: null,
-            _thinkingBudgetStepping: false,
             chatSessions: {},
             messages: [],
             inputMessage: '',
@@ -2729,12 +2728,22 @@
                 };
             },
 
+            currentModelInfo() {
+                const id = this.aliasToGateway[this.currentModel] || this.currentModel;
+                return (this._adminModelsList || []).find(model => model.id === id);
+            },
+
+            thinkingModes() {
+                return this.currentModelInfo()?.thinking_modes || [];
+            },
+
             thinkingModeValue() {
-                if (this.modelSettings.enable_thinking === false) return 'off';
-                if (this.modelSettings.enable_thinking === true) {
-                    return this.modelSettings.thinking_budget_enabled ? 'on_limit' : 'on_unlimit';
-                }
-                return 'auto';
+                const s = this.modelSettings;
+                const mode = this.currentModelInfo()?.thinking_forced
+                    ? (s.thinking_budget_enabled ? 'on_limit' : 'auto')
+                    : s.enable_thinking === false ? 'off'
+                    : s.enable_thinking === true ? (s.thinking_budget_enabled ? 'on_limit' : 'on_unlimit') : 'auto';
+                return this.thinkingModes().includes(mode) ? mode : 'auto';
             },
 
             normalizeThinkingBudgetTokens(value) {
@@ -2760,29 +2769,18 @@
                 } else {
                     this.modelSettings.thinking_budget_tokens = v - step;
                 }
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
                 this.onModelSettingsChange();
             },
 
             onThinkingBudgetTokensInput(event) {
-                if (this._thinkingBudgetStepping) return;
                 const el = event.target;
-                const raw = Number(el.value);
-                const prev = Number(this._thinkingBudgetBeforeInput);
-                if (Number.isFinite(prev) && Number.isFinite(raw) && raw !== prev) {
-                    const delta = raw - prev;
-                    // Native spinners use (min + n*step); 4096 is off-grid when min=1, step=100/1024
-                    if (delta !== 0 && Math.abs(delta) < 1024) {
-                        this._thinkingBudgetStepping = true;
-                        this.modelSettings.thinking_budget_tokens = prev;
-                        this.stepThinkingBudgetTokens(delta > 0 ? 1 : -1);
-                        el.value = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetStepping = false;
-                        return;
-                    }
+                if (el.value === '') {
+                    this.modelSettings.thinking_budget_tokens = null;
+                    this.onModelSettingsChange();
+                    return;
                 }
-                this._thinkingBudgetBeforeInput = raw;
+                const raw = Number(el.value);
+                if (!Number.isFinite(raw)) return;
                 this.modelSettings.thinking_budget_tokens = raw;
                 this.onModelSettingsChange();
             },
@@ -2792,40 +2790,26 @@
                 this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
                     this.modelSettings.thinking_budget_tokens
                 );
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
             },
 
             setThinkingMode(mode) {
-                if (mode === 'on_unlimit') {
-                    this.modelSettings.enable_thinking = true;
-                    this.modelSettings.thinking_budget_enabled = false;
-                    this.modelSettings.thinking_budget_tokens = null;
-                } else if (mode === 'on_limit') {
-                    this.modelSettings.enable_thinking = true;
-                    this.modelSettings.thinking_budget_enabled = true;
-                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
-                        this.modelSettings.thinking_budget_tokens
-                    );
-                } else if (mode === 'off') {
-                    this.modelSettings.enable_thinking = false;
-                    this.modelSettings.thinking_budget_enabled = false;
-                    this.modelSettings.thinking_budget_tokens = null;
-                } else {
-                    this.modelSettings.enable_thinking = null;
-                    this.modelSettings.thinking_budget_enabled = false;
-                    this.modelSettings.thinking_budget_tokens = null;
-                }
+                if (!this.thinkingModes().includes(mode)) return;
+                this.modelSettings.enable_thinking = mode === 'auto' ? null : mode !== 'off';
+                this.modelSettings.thinking_budget_enabled = mode === 'on_limit';
+                this.modelSettings.thinking_budget_tokens = mode === 'on_limit'
+                    ? this.normalizeThinkingBudgetTokens(this.modelSettings.thinking_budget_tokens) : null;
                 this.onModelSettingsChange();
             },
 
             captureSessionModelSettings() {
-                if (this.modelSettings.thinking_budget_enabled) {
-                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
-                        this.modelSettings.thinking_budget_tokens
+                const modelSettings = this.cloneData(this.modelSettings);
+                if (modelSettings.thinking_budget_enabled) {
+                    modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                        modelSettings.thinking_budget_tokens
                     );
                 }
                 return {
-                    modelSettings: this.cloneData(this.modelSettings),
+                    modelSettings,
                     speculativeEngine: this.speculativeEngine,
                     speculativeDraftModel: this.speculativeDraftModel,
                 };
@@ -3409,13 +3393,12 @@
                 for (const key of scalarKeys) {
                     if (s[key] != null) gen[key] = s[key];
                 }
-                if (s.enable_thinking === true) {
-                    gen.chat_template_kwargs = { enable_thinking: true };
-                    if (s.thinking_budget_enabled) {
-                        gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
-                    }
-                } else if (s.enable_thinking === false) {
-                    gen.chat_template_kwargs = { enable_thinking: false };
+                const mode = this.thinkingModeValue();
+                if (mode !== 'auto' && !this.currentModelInfo()?.thinking_forced) {
+                    gen.chat_template_kwargs = { enable_thinking: mode !== 'off' };
+                }
+                if (mode === 'on_limit') {
+                    gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
                 }
                 return Object.keys(gen).length ? gen : null;
             },
@@ -4441,12 +4424,6 @@
     loadAudioFile(file) {
         if (!this.isSupportedAudioFile(file)) {
             alert(window.t('chat.error.invalid_audio_type'));
-            return;
-        }
-        // Mirrors MAX_AUDIO_UPLOAD_BYTES on the server
-        const maxMb = 100;
-        if (file.size > maxMb * 1024 * 1024) {
-            alert(window.t('chat.error.audio_too_large').replace('{max}', maxMb));
             return;
         }
         const id = `aud_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -5668,7 +5645,10 @@
                 }
                 const errorText = await response.text();
                 let detail = null;
-                try { detail = JSON.parse(errorText)?.detail; } catch (e) { }
+                try {
+                    const payload = JSON.parse(errorText);
+                    detail = payload?.error?.message || payload?.detail;
+                } catch (e) { }
                 throw new Error(
                     (typeof detail === 'string' && detail) || errorText || `Error: ${response.status}`
                 );

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import importlib
 import io
 import json
@@ -272,7 +273,7 @@ def test_tiny_text_prefill_decode_and_batch_match():
     assert type(sparse_cache[1]).__name__ == "PoolingCache"
 
     generate = importlib.import_module("mlx_lm.generate")
-    batch_cache = generate._make_cache(model, [0, 0], None)
+    batch_cache = generate._merge_caches([model.make_cache(), model.make_cache()])
     batch_tokens = mx.concatenate([prompt, prompt], axis=0)
     batch_logits = model(batch_tokens, cache=batch_cache).logits
     left_logits = model(prompt, cache=model.make_cache()).logits
@@ -282,6 +283,51 @@ def test_tiny_text_prefill_decode_and_batch_match():
     assert type(batch_cache[1][1]).__name__ == "BatchPoolingCache"
     assert mx.allclose(batch_logits[:1], left_logits, atol=3e-4).item()
     assert mx.allclose(batch_logits[1:], right_logits, atol=3e-4).item()
+
+
+@pytest.mark.parametrize("batch_size,block_size", [(1, 2), (2, 4), (3, 8), (4, 2)])
+def test_short_verify_keeps_latent_kv_and_matches_decode(
+    batch_size, block_size, monkeypatch
+):
+    from mlx_lm.models.mla import MultiLinear
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    mx.random.seed(937)
+    config = _tiny_config()
+    config.text_config.index_topk = 64
+    model = LanguageModel(config.text_config, config)
+    prompt = mx.arange(batch_size * 12).reshape(batch_size, 12) % 100
+    row_caches = []
+    for row in range(batch_size):
+        row_cache = model.make_cache()
+        mx.eval(model(prompt[row : row + 1, row:], cache=row_cache).logits)
+        row_caches.append(row_cache)
+    cache = [type(rows[0]).merge(rows) for rows in zip(*row_caches)]
+    reference_cache = copy.deepcopy(cache)
+    block = mx.arange(batch_size * block_size).reshape(batch_size, block_size) + 32
+    attention = model.model.layers[1].self_attn
+    projections = []
+    original = MultiLinear.__call__
+
+    def traced(self, x, *args, **kwargs):
+        if self is attention.embed_q or self is attention.unembed_out:
+            projections.append(x.shape[-2])
+        return original(self, x, *args, **kwargs)
+
+    monkeypatch.setattr(MultiLinear, "__call__", traced)
+    verified = model(block, cache=cache).logits
+    mx.eval(verified)
+    # Project the short query/output block, never all cached keys and values.
+    assert projections == [block_size, block_size]
+    sequential = mx.concatenate(
+        [
+            model(block[:, i : i + 1], cache=reference_cache).logits
+            for i in range(block_size)
+        ],
+        axis=1,
+    )
+    mx.eval(sequential)
+    assert mx.allclose(verified, sequential, atol=3e-4, rtol=3e-4).item()
 
 
 def test_variable_length_batch_matches_single_request_greedy_tokens():
@@ -490,6 +536,114 @@ def test_sanitize_and_oq_keep_sensitive_parameters_in_fp32():
         config_dict,
         oq_level=4,
     ) == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+
+def test_sanitize_remaps_quantized_forget_gate_sidecars():
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    prefix = "language_model.model.layers.0.self_attn."
+    weights = {
+        prefix + "f_a_proj.weight": mx.ones((32, 32)),
+        prefix + "f_a_proj.scales": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_a_proj.biases": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_b_proj.weight": mx.ones((32, 32)),
+        prefix + "f_b_proj.scales": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_b_proj.biases": mx.ones((2,), dtype=mx.bfloat16),
+    }
+    sanitized = model.sanitize(dict(weights))
+    gate = prefix + "forget_gate."
+    for proj in ("f_a_proj", "f_b_proj"):
+        for part in ("weight", "scales", "biases"):
+            assert gate + proj + "." + part in sanitized
+    assert not any(
+        key.startswith(prefix + "f_") and ".forget_gate." not in key
+        for key in sanitized
+    )
+
+
+@pytest.mark.parametrize("text_only", [False, True])
+@pytest.mark.parametrize("preserve_mtp", [False, True])
+def test_oq_roundtrip_with_nextn_weights(tmp_path, monkeypatch, text_only, preserve_mtp):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models import glm5_next
+    from mlx_vlm.utils import load_model
+
+    from omlx.oq import quantize_oq_streaming
+    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+    from tests.test_glm5_next_mtp import TINY_TEXT_CONFIG
+
+    glm5_next_vlm_runtime.apply()
+    config = _tiny_config(with_vision=True)
+    text = copy.deepcopy(TINY_TEXT_CONFIG)
+    text.update(
+        num_hidden_layers=2,
+        qk_nope_head_dim=64,
+        v_head_dim=64,
+        index_head_dim=64,
+        layer_types=["linear_attention", "deepseek_sparse_attention"],
+        mlp_layer_types=["dense", "dense"],
+    )
+    text["linear_attn_config"].update(kda_layers=[0], full_attn_layers=[1])
+    config.text_config = glm5_next.TextConfig.from_dict(text)
+    model = glm5_next.Model(config)
+    weights = dict(tree_flatten(model.parameters()))
+    for prefix in (
+        "language_model.model.layers.1.self_attn.",
+        "language_model.mtp.0.block.self_attn.",
+    ):
+        wk = weights.pop(prefix + "embed_q.weight").swapaxes(-1, -2)
+        wv = weights.pop(prefix + "unembed_out.weight")
+        weights[prefix + "kv_b_proj.weight"] = mx.concatenate([wk, wv], axis=1).reshape(
+            -1, text["kv_lora_rank"]
+        )
+    raw = {}
+    for key, value in weights.items():
+        key = key.replace("language_model.model.", "model.language_model.")
+        key = key.replace("language_model.lm_head.", "lm_head.")
+        key = key.replace("vision_model.", "model.visual.")
+        key = key.replace(
+            "language_model.mtp.0.block.", "model.language_model.layers.2."
+        )
+        key = key.replace(
+            "language_model.mtp.0.norm.",
+            "model.language_model.layers.2.shared_head.norm.",
+        )
+        key = key.replace("language_model.mtp.0.", "model.language_model.layers.2.")
+        key = key.replace(".forget_gate.", ".")
+        raw[key] = value.astype(mx.bfloat16)
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = _tiny_config_dict(with_vision=True)
+    payload.update(text_config=text, eos_token_id=[2])
+    (source / "config.json").write_text(json.dumps(payload))
+    mx.save_safetensors(str(source / "model.safetensors"), raw)
+    tokens = mx.array([[1, 3, 4, 5, 6, 7, 8, 9]], dtype=mx.int32)
+    monkeypatch.setattr("omlx.oq._load_calibration_data", lambda *a, **kw: tokens)
+    monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
+    output = tmp_path / "output"
+    quantize_oq_streaming(
+        str(source),
+        str(output),
+        4,
+        text_only=text_only,
+        preserve_mtp=preserve_mtp,
+        sensitivity_map_override={0: 1, 1: 1},
+        enhanced=True,
+        imatrix_num_samples=1,
+        imatrix_seq_length=8,
+    )
+    loaded = load_model(output, lazy=True, strict=True)
+    params = dict(tree_flatten(loaded.parameters()))
+    assert any(".mtp." in key for key in params) == preserve_mtp
+    assert (loaded.vision_model is None) == text_only
+    assert mx.isfinite(loaded(mx.array([[1, 3, 4]])).logits).all().item()
+    if preserve_mtp:
+        lm = loaded.language_model
+        result = lm(tokens, return_hidden=True)
+        draft = lm.mtp_forward(result.hidden_states[-1], tokens)
+        assert mx.isfinite(draft).all().item()
 
 
 def test_vector_gate_kernel_matches_reference_with_padding_mask():
@@ -713,3 +867,250 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
     mx.eval(actual, reference)
 
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkeypatch):
+    """FP32 projections must produce FP16 inputs at native attention boundaries."""
+    import mlx_vlm.models.glm5_next.language as lang
+
+    text = lang.TextConfig(
+        model_type="glm5_next_text",
+        vocab_size=128,
+        hidden_size=4096,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        n_shared_experts=None,
+        n_routed_experts=None,
+        routed_scaling_factor=1.0,
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_rope_head_dim=0,
+        v_head_dim=256,
+        qk_nope_head_dim=256,
+        mla_use_nope=True,
+        num_experts_per_tok=2,
+        first_k_dense_replace=99,
+        max_position_embeddings=8192,
+        rms_norm_eps=1e-5,
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=32,
+        layer_types=["deepseek_sparse_attention"],
+        mlp_layer_types=["dense"],
+        linear_attn_config={
+            "num_heads": 2,
+            "head_dim": 32,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+        },
+        index_kpool=4,
+        hc_mult=2,
+        hc_sinkhorn_iters=2,
+    )
+    attn = lang.Glm5NextSparseAttention(text)
+
+    seen = []
+
+    def spy_sma(q_latent, q_pe, kv_latent, k_pe, topk_indices, scale, **kw):
+        seen.append(
+            ("sparse_mla", *(t.dtype for t in (q_latent, q_pe, kv_latent, k_pe)))
+        )
+        # Native sparse MLA returns latent-width output [B, H, L, 512].
+        return mx.zeros(
+            q_latent.shape[:2] + (q_latent.shape[2], 512), dtype=q_latent.dtype
+        )
+
+    def spy_eba(q, k, v, topk_indices, scale, **kw):
+        seen.append(("exact_block", *(t.dtype for t in (q, k, v))))
+        return mx.zeros(q.shape, dtype=q.dtype)
+
+    monkeypatch.setattr(lang, "sparse_mla_attention", spy_sma)
+    monkeypatch.setattr(lang, "exact_block_token_attention", spy_eba)
+    monkeypatch.setattr(lang, "q8_vup_flat", lambda *a, **k: None)
+
+    x = mx.random.normal((1, 4096, 4096), dtype=mx.float32)
+    out = attn(x, mask=None, cache=None)
+    mx.eval(out)
+    sma = [s for s in seen if s[0] == "sparse_mla"]
+    assert sma, "Kv>=4096 must attempt the native sparse MLA route"
+    assert all(dt == mx.float16 for dt in sma[0][1:]), (
+        f"native sparse MLA received {sma[0][1:]}, expected fp16"
+    )
+
+    seen.clear()
+    x = mx.random.normal((1, 2500, 4096), dtype=mx.float32)
+    out = attn(x, mask=None, cache=None)
+    mx.eval(out)
+    eba = [s for s in seen if s[0] == "exact_block"]
+    assert eba, "2048<Kv<4096 must attempt the native exact-block route"
+    assert all(dt == mx.float16 for dt in eba[0][1:]), (
+        f"native exact-block received {eba[0][1:]}, expected fp16"
+    )
+
+
+def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
+    """Use fused v-up only for matching dtypes and preserve FP32 scales otherwise."""
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat
+
+    if not fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+
+    from mlx_lm.models.mla import QuantizedMultiLinear
+
+    x = mx.random.normal((1, 64, 32, 512), dtype=mx.float16)
+    mx.eval(x)
+
+    # Use 8-bit affine weights with FP32 scales and biases.
+    proj = QuantizedMultiLinear(512, 256, 64, group_size=64, bits=8, mode="affine")
+    assert proj.scales.dtype == mx.float32
+    # Must NOT raise the native dtype-mismatch; returns None to fall back.
+    assert q8_vup_flat(x, proj, key_length=32768) is None
+    # The fallback projection preserves the fp32 contract (promotes to fp32).
+    out = proj(x)
+    mx.eval(out)
+    assert out.dtype == mx.float32
+
+    # Matching FP16 scales must still use the fused kernel.
+    proj16 = QuantizedMultiLinear(
+        512, 256, 64, group_size=64, bits=8, mode="affine"
+    )
+    proj16.scales = proj16.scales.astype(mx.float16)
+    proj16.biases = proj16.biases.astype(mx.float16)
+    mx.eval(proj16.scales, proj16.biases)
+    fused = q8_vup_flat(x, proj16, key_length=32768)
+    mx.eval(fused)
+    assert fused is not None and fused.dtype == mx.float16
+    # Fused result matches the tolerant quantized-matmul reference layout.
+    ref = proj16(x).transpose(0, 2, 1, 3).reshape(1, 32, -1)
+    mx.eval(ref)
+    assert float(mx.max(mx.abs(fused - ref.astype(mx.float16))).item()) <= 0.125
+
+
+def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatch):
+    """Verify native sparse MLA output can feed an FP32-scale projection at 32K."""
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat, sparse_mla_attention
+
+    if not fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+
+    from mlx_lm.models.mla import QuantizedMultiLinear
+
+    B, H, L, Kv, topk = 1, 64, 32, 32768, 2048
+    mx.random.seed(0)
+    q = mx.random.normal((B, H, L, 512), dtype=mx.float16)
+    q_pe = mx.zeros((B, H, L, 64), dtype=mx.float16)
+    kv = mx.random.normal((B, 1, Kv, 512), dtype=mx.float16)
+    k_pe = mx.zeros((B, 1, Kv, 64), dtype=mx.float16)
+    idx = mx.broadcast_to(
+        mx.arange(topk, dtype=mx.uint32)[None, None, None, :], (B, 1, L, topk)
+    )
+    mx.eval(q, q_pe, kv, k_pe, idx)
+
+    out = sparse_mla_attention(q, q_pe, kv, k_pe, idx, 1.0 / (256**0.5))
+    mx.eval(out)
+    assert out.dtype == mx.float16, "native sparse-MLA must return fp16"
+
+    proj = QuantizedMultiLinear(512, 256, 64, group_size=64, bits=8, mode="affine")
+    assert proj.scales.dtype == mx.float32
+    # The exact call that used to raise must now fall back, not crash.
+    assert q8_vup_flat(out, proj, key_length=Kv) is None
+    residual = proj(out)
+    mx.eval(residual)
+    assert residual.shape == (B, H, L, 256) and residual.dtype == mx.float32, (
+        "v-up fallback must preserve the fp32 residual contract"
+    )
+
+
+def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
+    """Prefill releases layer intermediates and cached buffers; decode stays lazy."""
+    import mlx_vlm.models.glm5_next.language as lang
+
+    text = _tiny_config().text_config
+    model = lang.Glm5NextModel(text)
+
+    calls = []
+    clears = []
+    real_eval = mx.eval
+    real_clear = mx.clear_cache
+
+    def spy(*args, **kw):
+        calls.append(sum(len(a) if isinstance(a, (tuple, list)) else 1 for a in args))
+        return real_eval(*args, **kw)
+
+    def clear_spy(**kw):
+        clears.append(1)
+        return real_clear(**kw)
+
+    monkeypatch.setattr(lang.mx, "eval", spy)
+    monkeypatch.setattr(lang.mx, "clear_cache", clear_spy)
+
+    ids = mx.zeros((1, 256), dtype=mx.int32)
+    out = model(ids)
+    real_eval(out)
+    assert len(calls) >= text.num_hidden_layers, (
+        f"prefill width must eval the stream per layer, got {len(calls)} eval calls"
+        f" for {text.num_hidden_layers} layers"
+    )
+    # Layer-specific buffer sizes can accumulate in the allocator pool.
+    assert len(clears) >= text.num_hidden_layers, (
+        f"prefill must clear the allocator pool per layer, got {len(clears)}"
+        f" clears for {text.num_hidden_layers} layers"
+    )
+
+    calls.clear()
+    clears.clear()
+    decode = mx.zeros((1, 1), dtype=mx.int32)
+    out = model(decode)
+    real_eval(out)
+    assert len(calls) < text.num_hidden_layers, (
+        "decode width must stay lazy (no per-layer eval)"
+    )
+    assert not clears, "decode width must not clear the pool per layer"
+
+
+def test_patch_overrides_site_packages_glm5_next_copy():
+    """The vendor module must replace an already imported upstream module."""
+    import sys
+    from pathlib import Path
+
+    import mlx_vlm.models
+
+    pkg = "mlx_vlm.models.glm5_next"
+    vendor_str = str(compat._VENDOR_MLX_VLM)
+
+    saved_modules = {
+        n: sys.modules.pop(n)
+        for n in list(sys.modules)
+        if n == pkg or n.startswith(pkg + ".")
+    }
+    saved_path = list(mlx_vlm.models.__path__)
+    for p in [p for p in list(mlx_vlm.models.__path__) if vendor_str in p]:
+        mlx_vlm.models.__path__.remove(p)
+    applied = compat._APPLIED
+    compat._APPLIED = False
+    try:
+        # Server state: discovery imported the site-packages copy BEFORE the
+        # patch ran, so the package is cached in sys.modules already.
+        import mlx_vlm.models.glm5_next.language as early
+
+        assert vendor_str not in str(early.__file__)
+        assert compat.apply_mlx_vlm_glm5_next_compat_patch() is True
+        import mlx_vlm.models.glm5_next.language as lang
+
+        assert str(Path(lang.__file__).resolve()).startswith(
+            str(Path(vendor_str).resolve())
+        ), f"patch did not override: {lang.__file__}"
+        src = Path(lang.__file__).read_text()
+        assert "native_dtype" in src, "vendor language.py fix missing"
+        assert "clear_cache" in src, "vendor eval backpressure missing"
+    finally:
+        for n in [n for n in list(sys.modules) if n == pkg or n.startswith(pkg + ".")]:
+            del sys.modules[n]
+        sys.modules.update(saved_modules)
+        mlx_vlm.models.__path__[:] = saved_path
+        compat._APPLIED = applied

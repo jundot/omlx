@@ -1174,6 +1174,32 @@ class TestChatCompletionEndpoint:
 
         assert response.status_code == 200
 
+    def test_zero_thinking_budget_does_not_enable_template_thinking(
+        self, client, mock_llm_engine
+    ):
+        """Zero is forwarded as a clamp, not as a request to turn thinking on."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        mock_llm_engine.chat = chat
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking_budget": 0,
+            },
+        )
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs[0]["thinking_budget"] == 0
+        assert "enable_thinking" not in recorded_chat_kwargs[0].get(
+            "chat_template_kwargs", {}
+        )
+
     def test_chat_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine
     ):
@@ -2437,3 +2463,47 @@ class TestJsonOutputParsing:
         data = response.json()
         output_text = data["output"][0]["content"][0]["text"]
         assert "Hello" in output_text
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
+    mock_llm_engine.chat = AsyncMock(
+        return_value=MockGenerationOutput(
+            text="<think>unfinished", finish_reason="length"
+        )
+    )
+    body = {"model": "test-model", "max_tokens": 64}
+    if api == "responses":
+        body["input"] = "Reply OK"
+    else:
+        body["messages"] = [{"role": "user", "content": "Reply OK"}]
+    response = client.post(f"/v1/{api}", json=body)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    if api == "chat/completions":
+        message = data["choices"][0]["message"]
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        assert data["choices"][0]["finish_reason"] == "length"
+    elif api == "messages":
+        content = "".join(b["text"] for b in data["content"] if b["type"] == "text")
+        reasoning = "".join(
+            b["thinking"] for b in data["content"] if b["type"] == "thinking"
+        )
+        assert data["stop_reason"] == "max_tokens"
+    else:
+        content = "".join(
+            b["text"]
+            for item in data["output"]
+            if item["type"] == "message"
+            for b in item["content"]
+            if b["type"] == "output_text"
+        )
+        reasoning = "".join(
+            b["text"]
+            for item in data["output"]
+            if item["type"] == "reasoning"
+            for b in item["summary"]
+        )
+    assert content == ""
+    assert reasoning == "unfinished"

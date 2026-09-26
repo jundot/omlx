@@ -55,6 +55,8 @@ def _has_cli_overrides(args) -> bool:
         "log_level",
         "sse_keepalive_mode",
         "max_audio_upload_size",
+        "max_image_upload_size",
+        "max_image_side_length",
         "max_concurrent_requests",
         "embedding_batch_size",
         "memory_guard",
@@ -78,6 +80,82 @@ def _has_cli_overrides(args) -> bool:
 
     # --no-cache is the only persistable boolean flag with a False default.
     return bool(getattr(args, "no_cache", False))
+
+
+def _migrate_saved_network_auth(settings, args) -> None:
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from .utils.network import is_valid_bind_host, network_auth_error
+
+    if getattr(args, "host", None) is not None or os.environ.get("OMLX_HOST"):
+        return
+    path = settings.base_path / "settings.json"
+    if not path.exists():
+        return
+    host = settings.server.host
+    if not isinstance(host, str) or not all(
+        is_valid_bind_host(part.strip()) for part in host.split(",")
+    ):
+        return
+    if not network_auth_error(
+        host, settings.auth.api_key, settings.auth.skip_api_key_verification
+    ):
+        return
+
+    settings.server.host = "127.0.0.1"
+    if settings.validate():
+        settings.server.host = host
+        return
+
+    message = (
+        f"The saved server address ({host}) was changed to 127.0.0.1 because "
+        "API key authentication is required for access from other devices. "
+        "The server is now limited to this Mac. Your other settings and models "
+        "have been preserved. To allow access from other devices, set an API "
+        "key and enable authentication in Settings, then change the server address."
+    )
+    notice_path = os.environ.get("OMLX_STARTUP_NOTICE_PATH")
+    if not notice_path:
+        warning = message.replace("was changed", "will be changed").replace(
+            "is now limited", "will be limited"
+        )
+        print(f"Warning: {warning}", flush=True)
+        try:
+            input("Press Enter to continue, or Ctrl+C to cancel. ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nStartup canceled. Settings have not been changed.", flush=True)
+            raise SystemExit(1) from None
+
+    # Preserve unknown settings and avoid persisting environment overrides.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("server", {})["host"] = settings.server.host
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(data, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    if notice_path:
+        print(f"Warning: {message}", flush=True)
+
+        notice = Path(notice_path)
+        temporary = notice.with_suffix(".tmp")
+        try:
+            temporary.write_text(message, encoding="utf-8")
+            os.replace(temporary, notice)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def serve_command(args):
@@ -183,6 +261,11 @@ def serve_command(args):
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
+    try:
+        _migrate_saved_network_auth(settings, args)
+    except (OSError, ValueError) as error:
+        print(f"Configuration error: {error}")
+        sys.exit(1)
     errors = settings.validate()
     if errors:
         for error in errors:
@@ -290,15 +373,21 @@ def serve_command(args):
         scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
         # Determine cache max size: CLI arg > settings (with auto resolution)
         if paged_ssd_cache_dir:
-            if args.paged_ssd_cache_max_size:
+            if (
+                args.paged_ssd_cache_max_size
+                and args.paged_ssd_cache_max_size.lower() != "auto"
+            ):
                 # CLI argument specified explicitly
                 cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
             else:
-                # Use settings value (handles "auto" -> 10% of SSD capacity)
+                # Resolve the initial automatic budget from disk space and existing cache.
                 cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(
                     settings.base_path
                 )
             scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
+            scheduler_config.paged_ssd_cache_auto_size = (
+                args.paged_ssd_cache_max_size or settings.cache.ssd_cache_max_size
+            ).lower() == "auto"
         else:
             scheduler_config.paged_ssd_cache_max_size = 0
             cache_max_size_bytes = 0
@@ -328,6 +417,8 @@ def serve_command(args):
             print("Mode: Multi-model serving (continuous batching + paged SSD cache)")
             # Format cache size for display
             cache_max_size_display = f"{cache_max_size_bytes / (1024**3):.1f}GB"
+            if scheduler_config.paged_ssd_cache_auto_size:
+                cache_max_size_display = f"auto, current limit {cache_max_size_display}"
             print(
                 f"paged SSD cache: {paged_ssd_cache_dir} (max: {cache_max_size_display})"
             )
@@ -497,15 +588,12 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"Install: {integration.install_hint}")
         sys.exit(1)
 
-    # If the model was chosen interactively (no --model and no explicit tier flags),
-    # use the picked model for all tiers instead of letting settings-based tier
-    # models override the user's selection.
-    if args.model is None and not (
-        cli_opus_model or cli_sonnet_model or cli_haiku_model
-    ):
-        opus_model = None
-        sonnet_model = None
-        haiku_model = None
+    # Tier precedence: explicit tier flag > saved claude_code tier setting >
+    # the model picked (or auto-selected) above. The picker only chooses the
+    # default model; tiers configured on the Claude Code settings page keep
+    # their role, otherwise the three persisted selections would be silently
+    # replaced by one model on every interactive launch (#3543). Roles without
+    # a saved model fall back to the picked model in the integration.
 
     # Enforce Claude Code's model requirements after all interactive,
     # automatic, and explicit model paths have resolved. The picker also marks
@@ -542,6 +630,18 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
+    context_window = model_info.get("max_context_window")
+    if tool_name == "claude":
+        # Claude's context overrides are process-wide, including tier switches
+        # and subagents. Do not advertise more than any configured model allows.
+        context_windows = [
+            info["max_context_window"]
+            for model_id in (model, opus_model, sonnet_model, haiku_model)
+            if (info := models_status_map.get(model_id, {}))
+            and isinstance(info.get("max_context_window"), int)
+            and info["max_context_window"] > 0
+        ]
+        context_window = min(context_windows) if context_windows else None
     ctx = IntegrationContext(
         host=connect_host,
         port=port,
@@ -550,7 +650,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         opus_model=opus_model if tool_name == "claude" else None,
         sonnet_model=sonnet_model if tool_name == "claude" else None,
         haiku_model=haiku_model if tool_name == "claude" else None,
-        context_window=model_info.get("max_context_window"),
+        context_window=context_window,
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),
@@ -1080,6 +1180,21 @@ Example directory structure:
         "in settings.json (built-in default: 100MB). Uploads are buffered "
         "in memory, so this is also a per-request RAM cap",
     )
+    serve_parser.add_argument(
+        "--max-image-upload-size",
+        type=str,
+        default=None,
+        help="Maximum image payload size for VLM inputs (e.g. '50MB', '100MB'). "
+        "Overrides the value in settings.json (built-in default: 50MB).",
+    )
+    serve_parser.add_argument(
+        "--max-image-side-length",
+        type=int,
+        default=None,
+        help="Maximum side length in pixels for VLM input images. Images exceeding "
+        "this limit are downscaled preserving aspect ratio (built-in default: 2048, "
+        "0 to disable).",
+    )
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
@@ -1217,7 +1332,7 @@ Example directory structure:
         "--api-key",
         type=str,
         default=None,
-        help="API key for authentication (optional)",
+        help="API key for authentication (required for non-loopback binds)",
     )
 
     # Launch command

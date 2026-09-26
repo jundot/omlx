@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +120,11 @@ def preflight_text_remote_code(
 
 
 def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
-    """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    """Forward the configured trust setting to the model and tokenizer loaders."""
+    kwargs["tokenizer_config"] = {
+        **(kwargs.get("tokenizer_config") or {}),
+        "trust_remote_code": trust_remote_code,
+    }
     preflight_text_remote_code(
         path_or_repo,
         tokenizer_config=kwargs.get("tokenizer_config"),
@@ -168,6 +173,21 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 variant = _VLM_TEXT_PREFIX + key
             if variant not in quant and variant not in extras:
                 extras[variant] = val
+            # Mirror the glm5_next sanitize() renames for per-tensor quant
+            # overrides: nn.quantize matches the runtime module paths, so an
+            # unmapped key would fall back to the global bit recipe.
+            for cand in (key, variant):
+                fg = None
+                if ".hc_attn_" in cand:
+                    fg = cand.replace(".hc_attn_", ".attn_hc.")
+                elif ".hc_ffn_" in cand:
+                    fg = cand.replace(".hc_ffn_", ".ffn_hc.")
+                elif ".self_attn." in cand:
+                    head, tail = cand.split(".self_attn.", 1)
+                    if tail.split(".", 1)[0] in ("f_a_proj", "f_b_proj", "A_log", "dt_bias"):
+                        fg = f"{head}.self_attn.forget_gate.{tail}"
+                if fg and fg not in quant and fg not in extras:
+                    extras[fg] = val
             # Laguna router overrides: published checkpoints key the
             # per-layer quantization spec by ``mlp.gate``, but the model's
             # actual module-tree path is ``mlp.gate.proj`` (the router is
@@ -349,6 +369,18 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_mimo_mxfp4_quant(cfg: dict) -> dict:
+    """Keep official MiMo MXFP4 experts packed during model loading."""
+    if cfg.get("model_type") not in {"mimo_v2", "mimo_v2_flash"} or isinstance(
+        cfg.get("quantization"), dict
+    ):
+        return cfg
+    qc = cfg.get("quantization_config") or {}
+    if qc.get("store_dtype") == "mxfp4":
+        cfg["quantization"] = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -369,10 +401,51 @@ def _patch_mlx_lm_load_config() -> None:
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
+        normalize_mimo_mxfp4_quant(cfg)
         return cfg
 
     _lu.load_config = _patched
     _MLX_LM_LOAD_CONFIG_PATCHED = True
+
+
+def _checkpoint_has_t5_weights(model_path: str | Path) -> bool:
+    """Detect t5 packing from tensor headers without materializing weights."""
+    import safetensors
+
+    weights = {}
+    scales = {}
+    for shard in sorted(Path(model_path).glob("*.safetensors")):
+        with safetensors.safe_open(str(shard), framework="numpy") as f:
+            for key in f.keys():
+                if key.endswith(".weight"):
+                    tensor = f.get_slice(key)
+                    if tensor.get_dtype() == "U8":
+                        weights[key[:-7]] = tensor.get_shape()
+                elif key.endswith(".scales"):
+                    scales[key[:-7]] = f.get_slice(key).get_shape()
+
+    for prefix, shape in weights.items():
+        scale_shape = scales.get(prefix)
+        if (
+            len(shape) == 2
+            and scale_shape is not None
+            and len(scale_shape) == 2
+            and shape[0] == scale_shape[0]
+            and scale_shape[1] > 0
+            and shape[1] in (13 * scale_shape[1], 26 * scale_shape[1])
+        ):
+            return True
+    return False
+
+
+def _config_model_type(model_path: str | Path) -> str | None:
+    """The checkpoint's declared ``model_type``, or None when unreadable."""
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    value = config.get("model_type") if isinstance(config, dict) else None
+    return value if isinstance(value, str) else None
 
 
 def maybe_apply_pre_load_patches(
@@ -400,7 +473,7 @@ def maybe_apply_pre_load_patches(
       declares ``model_type == "glm_moe_dsa"``. Required because pinned
       mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
       checkpoints whose shared DSA layers carry no indexer weights.
-    - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
+    - Lightning MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
     - mlx-vlm side MTP runtime + nested-visual patches when ``for_vlm`` is
@@ -416,11 +489,39 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    Both patches inject modules into ``sys.modules`` and replace mlx-lm
-    internals; gating keeps non-affected models at zero cost.
-
     Safe to call repeatedly; the patches are idempotent.
     """
+    from ..model_settings import validate_moe_expert_offload
+
+    if model_settings is not None:
+        validate_moe_expert_offload(
+            {
+                "moe_expert_offload_resident_fraction": getattr(
+                    model_settings, "moe_expert_offload_resident_fraction", 0.25
+                ),
+                **{
+                    key: getattr(model_settings, key, False)
+                    for key in (
+                        "moe_expert_offload_enabled",
+                        "mtp_enabled",
+                        "vlm_mtp_enabled",
+                        "dflash_enabled",
+                    )
+                },
+            },
+            model_type=_config_model_type(model_name),
+        )
+
+    if (
+        getattr(model_settings, "moe_expert_offload_enabled", False)
+        and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+    ):
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        supported, reason = moe_offload_compatibility(model_name)
+        if not supported:
+            raise ValueError(reason)
+
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
@@ -464,7 +565,8 @@ def maybe_apply_pre_load_patches(
     # wrapper chain bypasses us entirely.
     quant_cfg = config.get("quantization") or {}
     quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    if quant_bits in (1, 2):
+    # Ordinary 2-bit affine checkpoints do not need the t5 loading shim.
+    if quant_bits == 1 or (quant_bits == 2 and _checkpoint_has_t5_weights(model_name)):
         try:
             from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
         except Exception as e:
@@ -496,7 +598,21 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
-    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
+    if for_vlm and model_type in {"moondream1", "moondream2"}:
+        from ..patches.moondream2_compat import apply_moondream2_compat_patch
+
+        if apply_moondream2_compat_patch():
+            logger.info("Moondream2 compatibility patch applied for %s", model_name)
+
+    if model_type == "deepseek_v41":
+        from ..patches.deepseek_v41 import apply_patch
+
+        apply_patch()
+    if (
+        isinstance(model_type, str)
+        and model_type.startswith("deepseek_v4")
+        and not model_type.startswith("deepseek_v41")
+    ):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
 
         if apply_deepseek_v4_patch():
@@ -508,11 +624,11 @@ def maybe_apply_pre_load_patches(
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
 
-    if model_type == "mimo_v2":
+    if model_type in {"mimo_v2", "mimo_v2_flash"}:
         from ..patches.mimo_v2 import apply_mimo_v2_patch
 
         if apply_mimo_v2_patch():
-            logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
+            logger.info("MiMo V2 text pre-load patch applied for %s", model_name)
 
     if model_type == "bailing_hybrid":
         from ..patches.bailing_hybrid import apply_bailing_hybrid_patch
@@ -527,6 +643,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_laguna_patch():
             logger.info("Laguna pre-load patch applied for %s", model_name)
+
+    if model_type == "k2_horizon":
+        from ..patches.k2_horizon import apply_k2_horizon_patch
+
+        if apply_k2_horizon_patch():
+            logger.info("K2 Horizon pre-load patch applied for %s", model_name)
 
     if model_type == "hy_v3":
         from ..patches.hy_v3 import apply_hy_v3_patch
@@ -549,7 +671,6 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
-
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if not for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
@@ -649,14 +770,18 @@ def maybe_apply_pre_load_patches(
 
         set_mtp_active(mtp_active)
         depth = (
-            getattr(model_settings, "mtp_num_draft_tokens", None)
+            getattr(model_settings, "mtp_adaptive_max_depth", None)
             if model_settings is not None
             else None
         )
+        fixed = getattr(model_settings, "mtp_fixed_depth", None)
         # Qwen4-Exp uses the same adaptive draft-depth controller as the
         # general Lightning MTP path.  A single MTP hidden layer can be
         # chained autoregressively, so default to the validated max depth 3.
-        set_mtp_depth(int(depth) if depth else 3)
+        if fixed:
+            set_mtp_depth(int(fixed), fixed=True)
+        else:
+            set_mtp_depth(int(depth) if depth else 3)
         if mtp_active and not apply_mlx_lm_mtp_patch():
             logger.warning(
                 "Qwen4-Exp Lightning MTP dispatch patch failed for %s; "
@@ -702,7 +827,12 @@ def maybe_apply_pre_load_patches(
     # correctly, but Model.__init__ skips ``self.mtp = MTPModule(args)``;
     # the resulting model is indistinguishable from a stock model that
     # never had MTP heads.
-    if _is_mtp_compatible(config, model_type):
+    # The batched DFlash drafter rides the Lightning MTP verify path, so its
+    # patches are installed even when the checkpoint declares no MTP heads.
+    dflash_batched = for_vlm and dflash_batched_supported(
+        model_type, "vlm"
+    ) and dflash_batched_requested(model_settings)
+    if _is_mtp_compatible(config, model_type) or dflash_batched:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
@@ -714,15 +844,26 @@ def maybe_apply_pre_load_patches(
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
-            # mtp_num_draft_tokens is the MAX draft depth; an adaptive
+            # mtp_adaptive_max_depth is the MAX draft depth; an adaptive
             # controller picks 1..max per sequence from rolling accept/latency
             # estimates, so prose/chat settles at 1 and predictable text
-            # climbs. Set it to 1 for a fixed depth-1 cycle. Note: depth >= 2
+            # climbs. mtp_fixed_depth skips the controller and drafts exactly
+            # that many tokens every cycle. Note: depth >= 2
             # verify forwards route through the verify-shape qmm kernels
             # (M >= 3), whose numerics can diverge from the unrouted path at
             # bf16 tail-ULP level.
-            depth = getattr(model_settings, "mtp_num_draft_tokens", None)
-            if depth:
+            depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
+            fixed = getattr(model_settings, "mtp_fixed_depth", None)
+            if fixed:
+                set_mtp_depth(int(fixed), fixed=True)
+            elif (
+                model_type == "qwen3_5"
+                and (text_config or config).get("hidden_size") == 5120
+                and (text_config or config).get("num_hidden_layers") == 64
+            ):
+                # Qwen 27B keeps an adaptive ceiling of at least four tokens.
+                set_mtp_depth(max(4, int(depth or 4)))
+            elif depth:
                 set_mtp_depth(int(depth))
             elif model_type.startswith("nemotron_h"):
                 # The stock nemotron_h head is depth-1 trained; the adaptive
@@ -743,6 +884,10 @@ def maybe_apply_pre_load_patches(
                 set_mtp_depth(
                     int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
                 )
+            elif model_type == "qwen3_5" and _nax_available():
+                # The M5 packed verify kernels keep a 5-row verify close to
+                # a 4-row one on dense Qwen, so depth 4 pays there.
+                set_mtp_depth(4)
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
@@ -821,7 +966,7 @@ def maybe_apply_pre_load_patches(
                             "weights to bind)",
                             model_name,
                         )
-                if apply_mlx_vlm_mtp_runtime_patch():
+                if apply_mlx_vlm_mtp_runtime_patch(model_type):
                     if not has_mtp_weights:
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s "
@@ -914,17 +1059,17 @@ def maybe_apply_pre_load_patches(
         try:
             from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
         except Exception as e:
-            logger.debug("bonsai qmv patch import failed: %s", e)
+            logger.debug("1/2-bit affine decode optimization import failed: %s", e)
         else:
             if apply_bonsai_qmv_patch():
                 logger.info(
-                    "Bonsai %d-bit qmv decode patch applied for %s",
+                    "%d-bit affine decode optimization enabled for %s",
                     quant_bits,
                     model_name,
                 )
             else:
                 logger.debug(
-                    "Bonsai qmv patch skipped for %s "
+                    "1/2-bit affine decode optimization skipped for %s "
                     "(native extension not available; stock mlx fallback active)",
                     model_name,
                 )
@@ -1073,22 +1218,52 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     LLM, and vision is silently dropped (issue #1426).
 
     Reads ``model.safetensors.index.json`` when present (no shard I/O).
-    Falls back to the first safetensors shard's metadata header. Returns
-    False when neither resolves — callers treat that as "no MTP weights"
-    (the conservative choice: skip MTPModule attachment).
+    Falls back to safetensors metadata headers, including MiMo's separate
+    ``mtp/model_mtp.safetensors`` sidecar. If neither contains MTP weights,
+    callers skip attaching the MTP module.
     """
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
-    return _checkpoint_weight_prefix(model_path, prefixes) is not None
+    if _checkpoint_weight_prefix(model_path, prefixes) is not None:
+        return True
+    return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
+
+
+_DFLASH_BATCHED_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe")
+
+
+def dflash_batched_supported(model_type: str | None, engine_type: str | None) -> bool:
+    """True when DFlash runs as a block drafter inside the batched VLM engine.
+
+    Other DFlash targets (gemma4, laguna, muse, mlx-lm text loads) keep the
+    single-stream DFlashEngine.
+    """
+    return engine_type == "vlm" and model_type in _DFLASH_BATCHED_MODEL_TYPES
+
+
+def dflash_batched_requested(model_settings: Any | None) -> bool:
+    return bool(
+        model_settings is not None
+        and getattr(model_settings, "dflash_enabled", False)
+        and getattr(model_settings, "dflash_draft_model", None)
+    )
+
+
+def _nax_available() -> bool:
+    try:
+        from ..custom_kernels.nax import is_nax_available
+    except ImportError:
+        return False
+    return bool(is_nax_available())
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
-    """Decide whether the native MTP patch can be applied to this model.
+    """Decide whether the Lightning MTP patch can be applied to this model.
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
-    fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
-    only). The model also has to declare MTP heads in the config; otherwise
-    the patch is a no-op.
+    fork PR 15), MiMo V2/2.6 Flash, GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids
+    (nemotron_h) and Gemma 4 merged-assistant checkpoints (gemma4 and
+    gemma4_unified, VLM path only). The model also has to declare MTP heads in
+    the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -1098,8 +1273,10 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+        or model_type in ("mimo_v2", "mimo_v2_flash")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "glm5_next"
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
@@ -1118,10 +1295,16 @@ def load_text_model(
         if model_settings is not None
         else False
     )
+    load_kwargs = {}
+    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
+    if mtp_sidecar.is_file():
+        load_kwargs["model_config"] = {"omlx_mtp_sidecar": str(mtp_sidecar)}
+        logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
     return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,
         trust_remote_code=trust_remote_code,
+        **load_kwargs,
     )
 
 

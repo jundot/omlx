@@ -30,6 +30,7 @@ EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "au
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
+    "deepseek_v41",
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_vl",
@@ -86,7 +87,11 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 # Remove a family once mlx-vlm provides its multimodal implementation.
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "mimo_v2",
+    "mimo_v2_flash",
 }
+
+_MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
+_MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
@@ -165,6 +170,8 @@ VLM_ARCHITECTURES = {
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
+    "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }
 
 # Known embedding model types from mlx-embeddings
@@ -426,6 +433,21 @@ def _is_unsupported_model(model_path: Path) -> bool:
     return normalized in UNSUPPORTED_MODEL_TYPES or model_type in UNSUPPORTED_MODEL_TYPES
 
 
+def _model_name_hint(model_path: Path) -> str:
+    """
+    Return the lowercased name used by the directory-name heuristics.
+
+    HF Hub cache snapshots live at ``models--Org--Name/snapshots/<commit>``,
+    so their directory name is a commit hash. Use the repo name there,
+    otherwise the model directory name.
+    """
+    if model_path.parent.name == "snapshots":
+        decoded = _decode_hf_cache_model_id(model_path.parent.parent)
+        if decoded is not None:
+            return decoded[1].rsplit("/", 1)[-1].lower()
+    return model_path.name.lower()
+
+
 def _is_causal_lm_reranker(model_path: Path) -> bool:
     """
     Heuristic check for CausalLM models fine-tuned as rerankers.
@@ -435,7 +457,7 @@ def _is_causal_lm_reranker(model_path: Path) -> bool:
     scoring. We detect them by checking the model directory name for "reranker"
     or "rerank" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "reranker" in name_lower or "rerank" in name_lower
 
 
@@ -448,7 +470,7 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     weights. We detect them by checking the model directory name for "embedding"
     or "embed" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "embedding" in name_lower or "embed" in name_lower
 
 
@@ -553,14 +575,15 @@ def _has_vision_subconfig(config: dict) -> bool:
     """
     Return True if ``config`` carries evidence of a vision sub-config.
 
-    Three keys cover the conventions in the wild:
+    Vision configuration conventions:
 
+    - ``vision_n_layers`` - DeepSeek V4 uses a positive layer count.
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
       ``llava_qwen2``.
 
-    All three are non-empty checks: text-only quants of VLM families can
+    The nested configurations use non-empty checks: text-only quants of VLM families can
     leave an empty ``vision_config: {}`` stub behind after stripping the
     vision tower (#2385), and key presence alone would misclassify them
     as VLM.
@@ -569,7 +592,11 @@ def _has_vision_subconfig(config: dict) -> bool:
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        bool(config.get("vision_config"))
+        (
+            config.get("model_type") == "deepseek_v4"
+            and (config.get("vision_n_layers") or 0) > 0
+        )
+        or bool(config.get("vision_config"))
         or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )
@@ -678,10 +705,18 @@ def detect_model_type(model_path: Path) -> ModelType:
         )
 
     if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        has_mimo_vision = (
+            normalized_type in {"mimo_v2", "mimo_v2_flash"}
+            and (model_path / _MIMO_VISION_SIDECAR).is_file()
+            and (model_path / _MIMO_OMNIMODAL_CONFIG).is_file()
+        )
+        if has_mimo_vision:
+            logger.info("%s detected with MiMo omnimodal vision sidecar", model_type)
+            return "vlm"
         if _has_vision_subconfig(config):
             logger.warning(
-                "%s carries multimodal configuration, but the available mlx-lm "
-                "implementation is text-only; using the LLM engine",
+                "%s carries multimodal configuration, but no supported vision "
+                "sidecar is present; using the LLM engine",
                 model_type,
             )
         return "llm"
@@ -1407,13 +1442,72 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
     return is_helper_model_config(config)
 
 
+def _is_deepseek_v41_loadable_config(config) -> bool:
+    """Recognize official, oMLX-converted, and declared affine V4.1 checkpoints.
+
+    This also admits checkpoints without MLX shard metadata or repo names.
+    False leaves generic discovery heuristics in control; it does not reject loading.
+    """
+    if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
+        return False
+    spec = config.get("omlx_deepseek_v41")
+    if isinstance(spec, dict):
+        return spec.get("version") == 1
+    if spec is not None:
+        return False
+    quantization = config.get("quantization")
+    if quantization is None:
+        return True
+    if not isinstance(quantization, dict):
+        return False
+    bits = quantization.get("bits")
+    group_size = quantization.get("group_size")
+    if quantization.get("mode", "affine") != "affine":
+        return False
+    if not _declared_int(bits) or not _declared_int(group_size):
+        return False
+    # `source_quantization_spec` rejects a non-affine per-module override too.
+    return not any(
+        isinstance(entry, dict) and entry.get("mode", "affine") != "affine"
+        for entry in quantization.values()
+    )
+
+
+def _declared_int(value) -> bool:
+    """JSON booleans are ints in Python; a declared width/group is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
     if not _is_model_dir(model_dir):
         return False
+    try:
+        config = json.loads((model_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    if (
+        isinstance(config, dict)
+        and config.get("model_type") == "k2_horizon"
+        and not config.get("model_file")
+    ):
+        try:
+            from .patches.k2_horizon.checkpoint import checkpoint_files
+
+            checkpoint_files(model_dir)
+            return True
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
+            return False
     if not list(model_dir.glob("model*.safetensors")):
         logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
         return False
+    if _is_deepseek_v41_loadable_config(config):
+        logger.info(
+            "Treating HF cache model as MLX-compatible DeepSeek V4.1 checkpoint: "
+            f"{source_repo_id}"
+        )
+        return True
     if _safetensors_has_mlx_metadata(model_dir):
         return True
 
@@ -1433,6 +1527,33 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
 
     logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
     return False
+
+
+def _gemma4_text_only_wants_vlm_engine(config: dict) -> bool:
+    """True for a text-only gemma4 whose merged MTP head only mlx-vlm drives."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type != "gemma4":
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return _has_merged_mtp_head(config)
+
+
+def _has_merged_mtp_head(config: dict) -> bool:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    return isinstance(text_config.get("mtp_assistant_config"), dict)
+
+
+def _gemma4_text_only_prefers_llm_engine(config: dict) -> bool:
+    """True for a text-only Gemma 4 with no MTP head; mlx-lm serves it cheaper."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in ("gemma4", "gemma4_unified"):
+        return False
+    if _has_vision_subconfig(config) or config.get("audio_config") is not None:
+        return False
+    return not _has_merged_mtp_head(config)
 
 
 def _register_model(
@@ -1491,14 +1612,37 @@ def _register_model(
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
         is_helper = False
+        # The routing below reads this even when config.json does not parse.
+        _config: dict = {}
         try:
             import json
             with open(model_dir / "config.json") as f:
-                _config = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _config = loaded
             config_model_type = _config.get("model_type", "")
             is_helper = is_helper_model_config(_config)
         except Exception:
             pass
+
+        # Keep text-only capability metadata when selecting the VLM MTP engine.
+        if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
+            engine_type = "vlm"
+            logger.info(
+                "%s is text-only Gemma 4 with a merged MTP head; serving it "
+                "on the VLM engine, which can drive that head",
+                model_id,
+            )
+        elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
+            # Integrations use model_type to advertise image support.
+            engine_type = "batched"
+            model_type = "llm"
+            text_only_size = 0
+            logger.info(
+                "%s is text-only Gemma 4 with no merged MTP head; serving it "
+                "on the LLM engine, which carries less overhead",
+                model_id,
+            )
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)

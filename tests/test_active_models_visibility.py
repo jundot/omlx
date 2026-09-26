@@ -591,7 +591,7 @@ def test_active_models_surfaces_dflash_guardrail_stats():
 def test_dflash_dashboard_localizes_metrics_and_shows_session_fallbacks():
     root = Path(__file__).resolve().parents[1]
     template = (
-        root / "omlx/admin/templates/dashboard/_status.html"
+        root / "omlx/admin/templates/dashboard/blocks/_active_models.html"
     ).read_text(encoding="utf-8")
     dashboard_js = (root / "omlx/admin/static/js/dashboard.js").read_text(
         encoding="utf-8"

@@ -5,10 +5,12 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
-    const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
+    // The API accepts fractions outside the UI range.
+    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 5;
+    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 95;
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -44,6 +46,10 @@
         'qwen35_ane_prefill_cpu_gdn_fraction',
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
+        'moe_expert_offload_enabled',
+        'moe_expert_offload_resident_fraction',
+        'qwen35_oq_a8_enabled',
+        'qwen35_oq_a8_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -65,6 +71,9 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'mtp_adaptive_max_depth',
+        'mtp_fixed_depth',
+        'qwen35_ane_prefill_shared_fraction',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -101,6 +110,11 @@
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
     function dashboard() {
+        // GridStack instance and helpers stay outside the reactive Alpine state.
+        let dashGrid = null;
+        let dashObserver = null;
+        let dashRefitFrame = null;
+        let dashRefitTimer = null;
         return {
             // Theme
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
@@ -121,13 +135,14 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, qwen4_gdn_decode_wide_proj: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
+                usage: { usage_history: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
@@ -154,7 +169,7 @@
                     web_search_content_truncate: true,
                     web_search_content_max_chars: 20000,
                 },
-                ui: { language: 'en' },
+                ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -239,9 +254,14 @@
                 qwen35_ane_prefill_cpu_gdn_fraction: 0,
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
+                moe_expert_offload_enabled: false,
+                moe_expert_offload_resident_fraction: 0.25,
+                qwen35_oq_a8_enabled: false,
+                qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
@@ -338,186 +358,6 @@
             serverAliases: [],
             selectedAlias: '',
 
-            // Distributed cluster prototype
-            clusterStatus: null,
-            clusterLoading: false,
-            clusterError: '',
-            // Connection failures outlive plan invalidation. Automatic memory,
-            // model and fabric refreshes rebuild the plan in the background;
-            // treating that as permission to unmount an SSH error made the
-            // whole page jump on every retry.
-            clusterConnectionError: '',
-            clusterRouteTo: '',
-            clusterWorkerRunning: false,
-            clusterWorkerResult: null,
-            clusterCollectiveRunning: false,
-            clusterCollectiveResult: null,
-            clusterPipelineRunning: false,
-            clusterPipelineResult: null,
-            clusterPlanMode: 'estimate',
-            clusterPlanModelSizeGiB: 300,
-            clusterPlanLayerCount: 80,
-            clusterPlanModelPath: '',
-            clusterPlanModelSource: '127.0.0.1',
-            clusterPlanModelSourcePython: '',
-            clusterTargetContextTokens: 8192,
-            // Automatic follows the highest context the current model, split,
-            // and per-Mac memory allowances can safely serve. Manual keeps a
-            // deliberately lower choice until it no longer fits.
-            clusterContextMode: 'auto',
-            clusterPlanTensorParallelSize: 1,
-            clusterPeerHealth: null,
-            clusterPeerHealthLoading: false,
-            // Server-owned incident feed. Polls merge by id and never delete:
-            // the only paths that change a row are new server records (via the
-            // since cursor) and an explicit dismissal round-trip.
-            clusterIncidents: [],
-            _clusterIncidentSeq: 0,
-            _clusterIncidentsById: null,
-            _clusterIncidentEpoch: '',
-            clusterStagingResult: null,
-            clusterStagingLoading: false,
-            clusterGuidance: null,
-            clusterLastGoodConfig: null,
-            clusterShowAdvanced: false,
-            clusterActivationProgress: '',
-            clusterCatalogue: null,
-            clusterCatalogueLoading: false,
-            clusterCatalogueError: '',
-            clusterModelInventory: null,
-            clusterModelInventoryLoading: false,
-            clusterModelInventoryError: '',
-            clusterCatalogueDir: '~/.omlx/models',
-            clusterModelSearch: '',
-            // The normal cluster flow is deliberately small: confirm the two
-            // Macs, choose a downloaded model, start. The planner and link
-            // diagnostics remain available without competing with that path.
-            clusterShowModelPicker: false,
-            clusterShowSetupDetails: false,
-            clusterDiagnosticsLoading: false,
-            clusterLinkStatus: null,
-            clusterLinkStatusLoading: false,
-            clusterLinkSetupLoading: false,
-            // One "Copied!" affordance for every block of commands the page
-            // shows, keyed by panel. A second flag per panel is how two copy
-            // buttons drift apart.
-            clusterCommandsCopied: {},
-            clusterTransports: null,
-            clusterTransportsLoading: false,
-            clusterTransportsError: '',
-            clusterAutoconfigure: null,
-            clusterAutoconfigureLoading: false,
-            clusterAutoconfigureError: '',
-            clusterAutoconfigurePrefer: 'speed',
-            clusterStrategy: 'auto',
-            clusterStrategyOptions: [
-                { key: 'auto', label: 'Automatic',
-                  summary: 'Pick the best split for this model and link',
-                  detail: 'Uses tensor parallelism when the model can be split evenly and the link is fast enough, otherwise falls back to pipeline stages.' },
-                { key: 'tensor', label: 'Tensor — faster responses',
-                  summary: 'Every accelerator works on every token',
-                  detail: 'Splits every layer across the selected accelerators so they compute each token together. Needs a verified fast link and a model whose attention heads divide evenly.' },
-                { key: 'pipeline', label: 'Pipeline — bigger models',
-                  summary: 'Each accelerator holds different layers',
-                  detail: 'Gives each accelerator a slice of the layers, so a model too large for one device fits across several. Works on slower links when the model supports pipeline execution.' },
-            ],
-            clusterPlanNodes: [
-                { key: 1, node_id: 'this-mac', capacity_gib: 128, reserve_gib: 8, role: 'workstation' },
-                { key: 2, node_id: 'peer-mac', capacity_gib: 256, reserve_gib: 8, role: 'headless' },
-            ],
-            clusterNodeRoles: [],
-            clusterRoleTooltip: '',
-            clusterMemoryLimitsManual: false,
-            clusterMemoryAllowancesGiB: {},
-            _clusterMemoryAllowancesLoaded: false,
-            clusterBudgetsLoading: false,
-            clusterBudgetsError: '',
-            // Legacy two-node split value retained for stored dashboard state.
-            // New plans use one soft target per node so the same control works
-            // for two, three, or more Macs.
-            clusterSplitGiB: null,
-            clusterWeightTargetsGiB: {},
-            clusterSplitBusy: false,
-            clusterPlan: null,
-            clusterPlanLoading: false,
-            clusterPlanError: '',
-            _clusterPlanSignature: '',
-            _clusterAutoPlanKey: '',
-            _clusterPlanRevision: 0,
-            _clusterNodeKey: 2,
-            _clusterDefaultsApplied: false,
-            clusterPeerSsh: '',
-            // Every discovered worker selected for the automatic cluster.
-            // clusterPeerSsh remains the first worker for the legacy pair
-            // diagnostics, while planning and activation use this full list.
-            clusterSelectedPeers: [],
-            clusterLocalIp: '',
-            clusterPeerIp: '',
-            // Both addresses are read off the live interfaces of both Macs.
-            // Typing over them is allowed and remembered, because a person who
-            // knows their fabric should not be argued with — but a typed
-            // address is the field that took a launch down, so it is never the
-            // default.
-            clusterIpsOverridden: false,
-            clusterFabric: null,
-            clusterFabricLoading: false,
-            clusterFabricError: '',
-            clusterCudaFabricVerificationLoading: '',
-            clusterCudaFabricVerificationError: '',
-            clusterCudaFabricVerifications: {},
-            clusterKeychainStoring: false,
-            clusterExecutionProfile: 'balanced',
-            clusterAutoTune: true,
-            clusterSamplingRankOnly: true,
-            clusterAsyncOverlap: true,
-            clusterCacheAffinity: true,
-            clusterMaxKvSize: '',
-            clusterRingConnectionsPerIp: 2,
-            clusterPeerProbeLoading: false,
-            clusterPeerProbe: null,
-            // Hardware belongs to a peer, not to its position in the ring.
-            // Keep every probe so three-or-more Mac clusters can render the
-            // real chip and physical memory for every selected worker.
-            clusterPeerProbes: {},
-            clusterShowPeerAdvanced: false,
-            clusterDiscoveryLoading: false,
-            clusterDiscoveredPeers: null,
-            clusterDiscoveryWarning: '',
-            _clusterKnownNodesHydrated: false,
-            _clusterKnownNodesNeedsSync: false,
-            clusterPairingToken: null,
-            clusterPairingTokenLoading: false,
-            clusterPairingSecret: '',
-            clusterPairingSecretCopied: false,
-            clusterJoinControllerIp: '',
-            clusterJoinCommand: '',
-            clusterJoinId: '',
-            clusterJoinExpiresAt: 0,
-            clusterJoinKeys: [],
-            clusterJoinedNodes: [],
-            clusterJoinLoading: false,
-            clusterJoinError: '',
-            clusterSshKey: null,
-            clusterSshKeyLoading: false,
-            clusterSshKeyGenerating: false,
-            clusterExchangeToken: null,
-            clusterExchangeTokenLoading: false,
-            clusterExchangeTokenCopied: false,
-            clusterPeerExchangeToken: '',
-            clusterKeyExchangeLoading: false,
-            clusterKeyExchangeResult: null,
-            clusterDeployments: [],
-            clusterDeploymentsError: '',
-            clusterActivationLoading: false,
-            clusterActivationResult: null,
-            // What automatic tuning proposed after measuring the fabric. The
-            // signed placement still wins when the proposal moves layers.
-            clusterPlanChanges: null,
-            clusterDeactivatingId: '',
-            _clusterRefreshTimer: null,
-            _clusterActivationProgressTimer: null,
-            _clusterDiscoveryRefreshCounter: 0,
-
             // Server-restart state machine (driven by Settings > Server > Restart).
             // status transitions: idle → restarting → waiting → idle (success)
             //                   |                   |
@@ -530,6 +370,14 @@
             },
 
             statsScope: 'session',
+            // Dashboard block layout (see dashboard_layout.js)
+            dashLayout: null,
+            dashDraft: null,
+            dashEditing: false,
+            dashSaving: false,
+            dashSaveError: '',
+            dashPlacedIds: [],
+            dashEditAvailable: true,
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
@@ -766,44 +614,44 @@
             accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
             accBenchmarkGroups: [
                 {
-                    name: 'Knowledge',
+                    name: window.t('acc_bench.benchmarks.group_knowledge'),
                     benchmarks: [
-                        { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: 'Hard knowledge · 14 subjects (10-way)', fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu', label: 'MMLU', desc: window.t('acc_bench.benchmarks.mmlu_desc'), fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: window.t('acc_bench.benchmarks.mmlu_pro_desc'), fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
                 {
-                    name: 'Commonsense & Reasoning',
+                    name: window.t('acc_bench.benchmarks.group_commonsense'),
                     benchmarks: [
-                        { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'hellaswag', label: 'HellaSwag', desc: window.t('acc_bench.benchmarks.hellaswag_desc'), fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'arc_challenge', label: 'ARC-C', desc: window.t('acc_bench.benchmarks.arc_desc'), fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'winogrande', label: 'Winogrande', desc: window.t('acc_bench.benchmarks.winogrande_desc'), fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'truthfulqa', label: 'TruthfulQA', desc: window.t('acc_bench.benchmarks.truthfulqa_desc'), fullSize: 817, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Math',
+                    name: window.t('acc_bench.benchmarks.group_math'),
                     benchmarks: [
-                        { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'mathqa', label: 'MathQA', desc: 'Quantitative reasoning · 5-way', fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
+                        { key: 'gsm8k', label: 'GSM8K', desc: window.t('acc_bench.benchmarks.gsm8k_desc'), fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'mathqa', label: 'MathQA', desc: window.t('acc_bench.benchmarks.mathqa_desc'), fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
                     ],
                 },
                 {
-                    name: 'Coding',
+                    name: window.t('acc_bench.benchmarks.group_coding'),
                     benchmarks: [
-                        { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
-                        { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'humaneval', label: 'HumanEval', desc: window.t('acc_bench.benchmarks.humaneval_desc'), fullSize: 164, sizes: [30, 50, 100] },
+                        { key: 'mbpp', label: 'MBPP', desc: window.t('acc_bench.benchmarks.mbpp_desc'), fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'livecodebench', label: 'LiveCodeBench', desc: window.t('acc_bench.benchmarks.livecodebench_desc'), fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Safety & Alignment',
+                    name: window.t('acc_bench.benchmarks.group_safety'),
                     benchmarks: [
-                        { key: 'bbq', label: 'BBQ', desc: 'Social bias · 11 categories', fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'safetybench', label: 'SafetyBench', desc: 'Safety · 7 categories', fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'bbq', label: 'BBQ', desc: window.t('acc_bench.benchmarks.bbq_desc'), fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'safetybench', label: 'SafetyBench', desc: window.t('acc_bench.benchmarks.safetybench_desc'), fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
             ],
@@ -852,6 +700,12 @@
                     this.handleMainTabChange(value);
                 });
 
+                this.$watch('globalSettings.server.host', (value) => {
+                    if (!this.isLoopbackBindHost(value)) {
+                        this.globalSettings.auth.skip_api_key_verification = false;
+                    }
+                });
+
                 // When the user returns to this browser tab after looking
                 // elsewhere, re-check whether a different bench just started
                 // in another tab. Fires the banner without requiring an
@@ -889,17 +743,15 @@
                     this.applyTabStateFromUrl();
                 });
 
+                window.addEventListener('focus', () => this.refreshOpenModelSettings());
+
                 // Pause stats polling when tab is hidden to reduce server load
                 document.addEventListener('visibilitychange', () => {
                     if (document.hidden) {
                         this.stopStatsRefresh();
-                        this.stopClusterRefresh();
                     } else if (this.mainTab === 'status') {
                         this.loadStats();
                         this.startStatsRefresh();
-                    } else if (this.mainTab === 'cluster') {
-                        this.refreshClusterExperience();
-                        this.startClusterRefresh();
                     }
                 });
             },
@@ -908,6 +760,7 @@
                 if (value === 'status') {
                     await this.loadStats();
                     this.startStatsRefresh();
+                    this.$nextTick(() => this.ensureDashboardGrid());
                 } else {
                     this.stopStatsRefresh();
                 }
@@ -948,24 +801,6 @@
                     await this.loadBenchState();
                     await this.loadAccState();
                     await this.loadCtxBenchState();
-                }
-                if (value === 'cluster') {
-                    // Render remembered Macs before Bonjour pays its discovery
-                    // timeout. Cached nodes are display hints only: the live
-                    // peer probe below still gates planning and activation.
-                    this.loadClusterKnownNodes();
-                    await Promise.all([
-                        this.clusterStatus ? Promise.resolve() : this.loadClusterStatus(),
-                        this.loadClusterDeployments(),
-                        this.loadClusterJoinStatus(),
-                        this.clusterDiscoveredPeers === null
-                            ? this.discoverClusterPeers()
-                            : Promise.resolve(),
-                    ]);
-                    await this.initializeClusterSetup();
-                    this.startClusterRefresh();
-                } else {
-                    this.stopClusterRefresh();
                 }
             },
 
@@ -1015,6 +850,38 @@
                 this.syncTabStateToUrl();
             },
 
+            handleMainTabKeydown(event) {
+                if (!event.target.matches('[role="tab"]')
+                    || event.altKey || event.ctrlKey || event.metaKey) return;
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'))
+                    .filter(tab => !tab.disabled && tab.getClientRects().length);
+                const index = tabs.indexOf(event.target);
+                if (index < 0) return;
+                event.preventDefault();
+                let next;
+                if (event.key === 'Home') next = 0;
+                else if (event.key === 'End') next = tabs.length - 1;
+                else next = (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                this.modelsDropdown = this.settingsDropdown = this.benchDropdown = false;
+                tabs[next].focus();
+                tabs[next].click();
+            },
+
+            trapDialogFocus(event) {
+                const dialog = event.currentTarget;
+                const controls = Array.from(dialog.querySelectorAll(
+                    'a[href], button, input, select, textarea, [tabindex]'
+                )).filter(el => el.tabIndex >= 0 && !el.matches(':disabled')
+                    && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                const index = controls.indexOf(document.activeElement);
+                if (!controls.length || (event.shiftKey ? index <= 0 : index === controls.length - 1)) {
+                    event.preventDefault();
+                    const target = event.shiftKey ? controls.at(-1) : controls[0];
+                    (target || dialog.querySelector('[autofocus]')).focus();
+                }
+            },
+
             setSettingsTab(tab) {
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
@@ -1036,5529 +903,7 @@
                 }
             },
 
-            async clusterResponseError(response, fallback) {
-                const payload = await response.json().catch(() => ({}));
-                const message = this.clusterErrorMessage(payload.detail, fallback);
-                // Fetch recovery steps for the failure the user is about to see.
-                // Fire-and-forget: guidance is an improvement on the raw message,
-                // never a precondition for showing it.
-                this.explainClusterError(message);
-                return message;
-            },
-
-            clusterErrorMessage(detail, fallback = 'Something went wrong') {
-                if (!Array.isArray(detail)) {
-                    if (detail && typeof detail === 'object') {
-                        return detail.msg || detail.message || JSON.stringify(detail);
-                    }
-                    return String(detail || fallback);
-                }
-                const messages = detail.map(item => {
-                    if (!item || typeof item !== 'object') return String(item);
-                    const location = Array.isArray(item.loc)
-                        ? item.loc.filter(part => part !== 'body').join('.')
-                        : '';
-                    const message = item.msg || item.message || JSON.stringify(item);
-                    return location ? `${location}: ${message}` : message;
-                });
-                return messages.filter(Boolean).join(', ') || fallback;
-            },
-
-            clusterDisplayedError() {
-                return this.clusterConnectionError || this.clusterError;
-            },
-
-            async explainClusterError(message) {
-                this.clusterGuidance = null;
-                if (!message) return;
-                try {
-                    const response = await fetch('/admin/api/cluster/guidance', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message: String(message).slice(0, 4096) }),
-                    });
-                    if (response.ok) {
-                        this.clusterGuidance = await response.json();
-                    }
-                } catch (error) {
-                    // Leaving guidance null just falls back to the raw message.
-                }
-            },
-
-            dismissClusterGuidance() {
-                this.clusterGuidance = null;
-            },
-
-            async openClusterPairingSetup() {
-                this.clusterShowSetupDetails = true;
-                this.clusterShowPeerAdvanced = true;
-                if (!this.clusterSshKey) await this.loadClusterSshKey();
-                await this.$nextTick();
-                const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
-                document.querySelector('[data-cluster-ssh-setup]')?.scrollIntoView({
-                    behavior: reduced ? 'auto' : 'smooth',
-                    block: 'center',
-                });
-            },
-
-            clusterJoinSuggestedIp() {
-                const explicit = String(this.clusterJoinControllerIp || '').trim();
-                if (explicit) return explicit;
-                const detected = String(this.clusterLocalIp || '').trim();
-                if (detected) return detected;
-                const browserHost = String(window.location.hostname || '').trim();
-                if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(browserHost)
-                    && !browserHost.startsWith('127.')) {
-                    return browserHost;
-                }
-                return '';
-            },
-
-            clusterJoinLanWarning() {
-                const host = String(window.location.hostname || '').toLowerCase();
-                if (!['localhost', '127.0.0.1', '::1'].includes(host)) return '';
-                return 'This dashboard is open through localhost. Enter the Studio LAN IP, '
-                    + 'and make sure Server host is set to 0.0.0.0 in Settings before running '
-                    + 'the command on a CUDA box.';
-            },
-
-            clusterJoinCommandState() {
-                if (!this.clusterJoinId) return null;
-                return (this.clusterJoinKeys || []).find(
-                    item => item.join_id === this.clusterJoinId
-                ) || null;
-            },
-
-            clusterJoinCommandUsable() {
-                const state = this.clusterJoinCommandState();
-                return Boolean(
-                    this.clusterJoinCommand
-                    && state?.status === 'pending'
-                    && Number(state.expires_at || this.clusterJoinExpiresAt) * 1000 > Date.now()
-                );
-            },
-
-            clusterJoinCommandStatusLabel() {
-                if (!this.clusterJoinCommand) return '';
-                const state = this.clusterJoinCommandState();
-                if (state?.status === 'used') return 'Used · worker is finishing setup';
-                const remaining = Math.ceil(
-                    (Number(state?.expires_at || this.clusterJoinExpiresAt) * 1000 - Date.now())
-                    / 60000
-                );
-                if (!state || remaining <= 0) return 'Expired · generate a new command';
-                return `Single use · expires in ${remaining} min`;
-            },
-
-            clusterJoinedAtLabel(node) {
-                const timestamp = Number(node?.joined_at || 0) * 1000;
-                if (!timestamp) return 'Joined';
-                return `Joined ${new Date(timestamp).toLocaleString()}`;
-            },
-
-            async loadClusterJoinStatus() {
-                try {
-                    const response = await fetch('/admin/api/cluster/join-status', {
-                        cache: 'no-store',
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(
-                            response,
-                            'Could not read CUDA worker enrollment status',
-                        ));
-                    }
-                    const result = await response.json();
-                    const previousIds = new Set(
-                        (this.clusterJoinedNodes || []).map(node => node.node_id)
-                    );
-                    const nodes = Array.isArray(result.nodes) ? result.nodes : [];
-                    const discovered = new Map(
-                        (this.clusterDiscoveredPeers || []).map(peer => [peer.ssh, peer])
-                    );
-                    const selected = new Map(
-                        (this.clusterSelectedPeers || []).map(peer => [peer.ssh, peer])
-                    );
-                    nodes.forEach(node => {
-                        const peer = {
-                            ...discovered.get(node.ssh),
-                            ssh: node.ssh,
-                            name: node.hostname || node.node_id,
-                            service: 'oMLX CUDA Worker',
-                            transport: 'detecting',
-                            accelerator: 'cuda',
-                            accelerator_vendor: 'nvidia',
-                            python_executable: node.python_executable || '',
-                            addresses: node.addresses || [],
-                            enrolled: true,
-                            cached: false,
-                        };
-                        discovered.set(peer.ssh, peer);
-                        // A newly completed GUI enrollment joins the active pool
-                        // once. Manual de-selection later in this browser session
-                        // is respected and polling will not add it back.
-                        if (!previousIds.has(node.node_id) && !selected.has(peer.ssh)) {
-                            selected.set(peer.ssh, peer);
-                        }
-                    });
-                    this.clusterJoinKeys = Array.isArray(result.join_keys)
-                        ? result.join_keys
-                        : [];
-                    this.clusterJoinedNodes = nodes;
-                    this.clusterDiscoveredPeers = [...discovered.values()];
-                    this.clusterSelectedPeers = [...selected.values()];
-                    if (!this.clusterPeerSsh && this.clusterSelectedPeers.length) {
-                        this.clusterPeerSsh = this.clusterSelectedPeers[0].ssh;
-                    }
-                    if (nodes.some(node => !previousIds.has(node.node_id))) {
-                        this._clusterKnownNodesNeedsSync = true;
-                        // A newly joined node changes the topology, so its
-                        // budgets should be measured once on the next setup pass.
-                        this._clusterBudgetsMeasured = false;
-                        this.saveClusterKnownNodes();
-                    }
-                    this.clusterJoinError = result.load_error || '';
-                } catch (error) {
-                    this.clusterJoinError = error?.message
-                        || 'Could not read CUDA worker enrollment status';
-                }
-            },
-
-            async revokeClusterJoinCommand() {
-                const joinId = String(this.clusterJoinId || '').trim();
-                if (!joinId) return true;
-                try {
-                    const response = await fetch(
-                        `/admin/api/cluster/join-keys/${encodeURIComponent(joinId)}`,
-                        { method: 'DELETE' },
-                    );
-                    if (!response.ok && response.status !== 404) {
-                        throw new Error(await this.clusterResponseError(
-                            response,
-                            'Could not revoke the join command',
-                        ));
-                    }
-                } catch (error) {
-                    this.clusterJoinError = error?.message
-                        || 'Could not revoke the join command';
-                    return false;
-                }
-                this.clusterJoinCommand = '';
-                this.clusterJoinId = '';
-                this.clusterJoinExpiresAt = 0;
-                await this.loadClusterJoinStatus();
-                return true;
-            },
-
-            async generateClusterCudaJoinCommand() {
-                if (this.clusterJoinLoading) return;
-                const controllerIp = this.clusterJoinSuggestedIp();
-                if (!controllerIp) {
-                    this.clusterJoinError = 'Enter the Studio LAN IPv4 address first.';
-                    return;
-                }
-                this.clusterJoinControllerIp = controllerIp;
-                this.clusterJoinLoading = true;
-                this.clusterJoinError = '';
-                if (
-                    this.clusterJoinId
-                    && this.clusterJoinCommandState()?.status === 'pending'
-                ) {
-                    const revoked = await this.revokeClusterJoinCommand();
-                    if (!revoked) {
-                        this.clusterJoinLoading = false;
-                        return;
-                    }
-                } else {
-                    // A claimed command owns a live installation session. Do
-                    // not revoke it merely because the user is enrolling the
-                    // second CUDA box.
-                    this.clusterJoinCommand = '';
-                    this.clusterJoinId = '';
-                    this.clusterJoinExpiresAt = 0;
-                }
-                try {
-                    const secure = window.location.protocol === 'https:';
-                    const port = Number(window.location.port)
-                        || (secure ? 443 : 80);
-                    const response = await fetch('/admin/api/cluster/join-keys', {
-                        method: 'POST',
-                        cache: 'no-store',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            controller_ip: controllerIp,
-                            controller_port: port,
-                            scheme: secure ? 'https' : 'http',
-                            ttl_seconds: 1800,
-                        }),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(
-                            response,
-                            'Could not generate the CUDA join command',
-                        ));
-                    }
-                    const result = await response.json();
-                    this.clusterJoinCommand = result.command || '';
-                    this.clusterJoinId = result.join_id || '';
-                    this.clusterJoinExpiresAt = Number(result.expires_at || 0);
-                    this.clusterJoinKeys = [
-                        ...(this.clusterJoinKeys || []).filter(
-                            item => item.join_id !== result.join_id
-                        ),
-                        result,
-                    ];
-                } catch (error) {
-                    this.clusterJoinError = error?.message
-                        || 'Could not generate the CUDA join command';
-                } finally {
-                    this.clusterJoinLoading = false;
-                }
-            },
-
-            async loadClusterStatus() {
-                if (this.clusterLoading) return;
-                this.clusterLoading = true;
-                this.clusterError = '';
-                // Status polling is unrelated to an in-flight peer login. Keep
-                // that login's recovery steps mounted until it succeeds or the
-                // user changes the peer.
-                if (!this.clusterConnectionError) this.dismissClusterGuidance();
-                this.loadRememberedClusterConfig();
-                try {
-                    const params = new URLSearchParams();
-                    const routeTo = this.clusterRouteTo.trim();
-                    if (routeTo) params.set('route_to', routeTo);
-                    const query = params.toString();
-                    const response = await fetch(`/admin/api/cluster/status${query ? `?${query}` : ''}`);
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Failed to load cluster status'));
-                    }
-                    this.clusterStatus = await response.json();
-                    if (!this._clusterDefaultsApplied) {
-                        this.useLocalClusterNode(0);
-                        this.clusterPlanNodes[0].role = 'workstation';
-                        this._clusterDefaultsApplied = true;
-                    }
-                } catch (error) {
-                    this.clusterError = error?.message || 'Failed to load cluster status';
-                } finally {
-                    this.clusterLoading = false;
-                }
-            },
-
-            async loadClusterRuntime() {
-                if (!this.clusterStatus) return;
-                try {
-                    const response = await fetch('/admin/api/cluster/runtime');
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (response.ok) {
-                        this.clusterStatus.runtime_jobs = await response.json();
-                    }
-                } catch (_) {
-                    // The full status refresh remains the visible error path.
-                }
-            },
-
-            async downloadClusterDiagnostics() {
-                if (this.clusterDiagnosticsLoading) return;
-                this.clusterDiagnosticsLoading = true;
-                try {
-                    const response = await fetch('/admin/api/cluster/diagnostics');
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(
-                            response,
-                            'Could not build the diagnostic report',
-                        ));
-                    }
-                    const report = await response.json();
-                    const blob = new Blob(
-                        [JSON.stringify(report, null, 2) + '\n'],
-                        { type: 'application/json' },
-                    );
-                    const link = document.createElement('a');
-                    const stamp = new Date().toISOString().replaceAll(':', '-');
-                    const url = URL.createObjectURL(blob);
-                    link.href = url;
-                    link.download = `omlx-cluster-diagnostics-${stamp}.json`;
-                    document.body.appendChild(link);
-                    link.click();
-                    link.remove();
-                    URL.revokeObjectURL(url);
-                } catch (error) {
-                    this.clusterError = error?.message || 'Could not build the diagnostic report';
-                    await this.explainClusterError(this.clusterError);
-                } finally {
-                    this.clusterDiagnosticsLoading = false;
-                }
-            },
-
-            clusterActivationProgressFromRuntime() {
-                const jobs = (this.clusterStatus?.runtime_jobs?.jobs || [])
-                    .filter(job => job.live);
-                if (!jobs.length) return 'Checking compatibility…';
-                const validating = jobs.filter(
-                    job => job.load_stage === 'validating'
-                ).length;
-                const ready = jobs.filter(job => job.phase === 'ready').length;
-                const worldSize = Math.max(
-                    ...jobs.map(job => Number(job.world_size) || 1),
-                    1,
-                );
-                if (ready === worldSize) return 'Running readiness test…';
-                if (validating) {
-                    return `Validating loaded ranks · ${ready}/${worldSize} ready`;
-                }
-                const loadMemory = jobs.reduce(
-                    (total, job) => total + Number(job.load_memory_bytes || 0),
-                    0,
-                );
-                const memoryLabel = loadMemory > 0
-                    ? ` · ${this.formatClusterGiB(loadMemory)} in use`
-                    : '';
-                const fixedJobs = jobs.filter(
-                    job => job.load_stage === 'materializing_fixed'
-                );
-                if (fixedJobs.length) {
-                    return `Preparing embeddings and shared weights · ${ready}/${worldSize} ranks ready${memoryLabel}`;
-                }
-                const layerJobs = jobs.filter(
-                    job => Number(job.layers_total || 0) > 0
-                );
-                if (layerJobs.length) {
-                    const layerTotal = layerJobs.reduce(
-                        (total, job) => total + Number(job.layers_total || 0),
-                        0,
-                    );
-                    const layersLoaded = layerJobs.reduce(
-                        (total, job) => total + Math.min(
-                            Number(job.layers_loaded || 0),
-                            Number(job.layers_total || 0),
-                        ),
-                        0,
-                    );
-                    const percent = layerTotal > 0
-                        ? Math.min(100, Math.floor((layersLoaded / layerTotal) * 100))
-                        : 0;
-                    const action = layerJobs.some(
-                        job => job.load_stage === 'tensor_sharding'
-                    ) ? 'Sharding model layers' : 'Loading model layers';
-                    return `${action} · ${percent}% · ${ready}/${worldSize} ranks ready${memoryLabel}`;
-                }
-                return `Loading model weights · ${ready}/${worldSize} ranks ready${memoryLabel}`;
-            },
-
-            startClusterActivationProgress() {
-                this.stopClusterActivationProgress();
-                this.clusterActivationProgress = 'Checking compatibility…';
-                const refresh = async () => {
-                    await this.loadClusterRuntime();
-                    if (this.clusterActivationLoading) {
-                        this.clusterActivationProgress =
-                            this.clusterActivationProgressFromRuntime();
-                    }
-                };
-                refresh();
-                this._clusterActivationProgressTimer = setInterval(refresh, 750);
-            },
-
-            stopClusterActivationProgress() {
-                if (this._clusterActivationProgressTimer) {
-                    clearInterval(this._clusterActivationProgressTimer);
-                    this._clusterActivationProgressTimer = null;
-                }
-            },
-
-            startClusterRefresh() {
-                this.stopClusterRefresh();
-                if (document.hidden || this.mainTab !== 'cluster') return;
-                this._clusterDiscoveryRefreshCounter = 0;
-                this._clusterRefreshTimer = setInterval(
-                    () => this.refreshClusterExperience(),
-                    2000,
-                );
-            },
-
-            stopClusterRefresh() {
-                if (this._clusterRefreshTimer) {
-                    clearInterval(this._clusterRefreshTimer);
-                    this._clusterRefreshTimer = null;
-                }
-            },
-
-            // Runtime stays live every two seconds. Discovery repeats every ten
-            // seconds even after the first worker appears, so three- and
-            // four-node clusters grow automatically when another Mac starts.
-            async refreshClusterExperience() {
-                await this.loadClusterRuntime();
-                await this.loadClusterIncidents();
-                this._clusterDiscoveryRefreshCounter += 1;
-                if (this._clusterDiscoveryRefreshCounter < 5) return;
-                this._clusterDiscoveryRefreshCounter = 0;
-                await Promise.all([
-                    this.discoverClusterPeers(),
-                    this.loadClusterJoinStatus(),
-                ]);
-                await this.initializeClusterSetup({ preview: false });
-            },
-
-            // Monotonic merge: the ?since= cursor means the server only ever
-            // sends records this browser has not seen, and the merge below
-            // only adds or updates Map entries — nothing on the poll path can
-            // delete a row, so no refresh can wipe error state (#8). The only
-            // removal is an explicit dismissal, which round-trips through the
-            // server so it also survives reloads.
-            async loadClusterIncidents() {
-                try {
-                    const since = this._clusterIncidentSeq || 0;
-                    const response = await fetch(`/admin/api/cluster/incidents?since=${since}`);
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) return;
-                    const payload = await response.json();
-                    // The epoch names the seq numbering. A corrupt-log reset
-                    // restarts seq at 1 under a new epoch; keeping the old
-                    // cursor there would silence the feed for this tab
-                    // forever, so restart the merge from scratch.
-                    if (payload.epoch && payload.epoch !== this._clusterIncidentEpoch) {
-                        if (this._clusterIncidentEpoch) {
-                            this._clusterIncidentSeq = 0;
-                            this._clusterIncidentsById = null;
-                        }
-                        this._clusterIncidentEpoch = payload.epoch;
-                    }
-                    const incidents = Array.isArray(payload.incidents) ? payload.incidents : [];
-                    if (!this._clusterIncidentsById) this._clusterIncidentsById = new Map();
-                    for (const incident of incidents) {
-                        if (incident && incident.id) {
-                            this._clusterIncidentsById.set(incident.id, incident);
-                        }
-                    }
-                    if (typeof payload.latest_seq === 'number' && payload.latest_seq > since) {
-                        this._clusterIncidentSeq = payload.latest_seq;
-                    }
-                    this.clusterIncidents = Array.from(this._clusterIncidentsById.values())
-                        .sort((a, b) => (b.seq || 0) - (a.seq || 0));
-                } catch (error) {
-                    // A failed poll must leave the existing incident state alone.
-                }
-            },
-
-            async dismissClusterIncident(incidentId) {
-                if (!incidentId) return;
-                try {
-                    const response = await fetch(
-                        `/admin/api/cluster/incidents/${encodeURIComponent(incidentId)}/dismiss`,
-                        { method: 'POST' },
-                    );
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) return;
-                    // Reflect the server's decision locally: the record keeps
-                    // its seq, so the cursor will not re-send it — update the
-                    // merged copy rather than waiting for a full reload.
-                    const existing = this._clusterIncidentsById
-                        ? this._clusterIncidentsById.get(incidentId)
-                        : null;
-                    if (existing && !existing.dismissed_at) {
-                        existing.dismissed_at = Date.now() / 1000;
-                        this.clusterIncidents = Array.from(this._clusterIncidentsById.values())
-                            .sort((a, b) => (b.seq || 0) - (a.seq || 0));
-                    }
-                } catch (error) {
-                    // Leave the row visible; dismissal is retryable.
-                }
-            },
-
-            clusterActiveIncidents() {
-                return (this.clusterIncidents || []).filter((incident) => !incident.dismissed_at);
-            },
-
-            clusterIncidentAge(ts) {
-                if (!ts) return '';
-                const seconds = Math.max(0, Math.floor(Date.now() / 1000 - ts));
-                if (seconds < 60) return `${seconds}s ago`;
-                if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-                if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-                return `${Math.floor(seconds / 86400)}d ago`;
-            },
-
-            // The error-banner X posts a dismissal for the matching incident
-            // (when one exists) instead of only blanking client state, so the
-            // dismissal is server-owned and holds across browser reloads.
-            async dismissClusterErrorBanner() {
-                const displayed = this.clusterDisplayedError();
-                this.clusterError = '';
-                this.clusterConnectionError = '';
-                this.dismissClusterGuidance();
-                if (!displayed) return;
-                const match = this.clusterActiveIncidents().find(
-                    (incident) => incident.message === displayed,
-                );
-                if (match) await this.dismissClusterIncident(match.id);
-            },
-
-            async runClusterWorkerSmoke() {
-                if (this.clusterWorkerRunning) return;
-                this.clusterWorkerRunning = true;
-                this.clusterWorkerResult = null;
-                this.clusterError = '';
-                try {
-                    const response = await fetch('/admin/api/cluster/worker-smoke?timeout=5', {
-                        method: 'POST',
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Worker check failed'));
-                    }
-                    this.clusterWorkerResult = await response.json();
-                } catch (error) {
-                    this.clusterError = error?.message || 'Worker check failed';
-                } finally {
-                    this.clusterWorkerRunning = false;
-                }
-            },
-
-            async runClusterCollectiveSmoke() {
-                if (this.clusterCollectiveRunning) return;
-                this.clusterCollectiveRunning = true;
-                this.clusterCollectiveResult = null;
-                this.clusterError = '';
-                try {
-                    const response = await fetch('/admin/api/cluster/collective-smoke?timeout=20', {
-                        method: 'POST',
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'MLX collective check failed'));
-                    }
-                    this.clusterCollectiveResult = await response.json();
-                } catch (error) {
-                    this.clusterError = error?.message || 'MLX collective check failed';
-                } finally {
-                    this.clusterCollectiveRunning = false;
-                }
-            },
-
-            async runClusterPipelineSmoke() {
-                if (this.clusterPipelineRunning) return;
-                this.clusterPipelineRunning = true;
-                this.clusterPipelineResult = null;
-                this.clusterError = '';
-                try {
-                    const response = await fetch('/admin/api/cluster/pipeline-smoke?timeout=30', {
-                        method: 'POST',
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Pipeline graph check failed'));
-                    }
-                    this.clusterPipelineResult = await response.json();
-                } catch (error) {
-                    this.clusterError = error?.message || 'Pipeline graph check failed';
-                } finally {
-                    this.clusterPipelineRunning = false;
-                }
-            },
-
-            async loadClusterDeployments() {
-                this.loadClusterPeerHealth();
-                this.clusterDeploymentsError = '';
-                try {
-                    const response = await fetch('/admin/api/cluster/deployments');
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Could not load deployments'));
-                    }
-                    const payload = await response.json();
-                    this.clusterDeployments = payload.deployments || [];
-                    this.clusterDeploymentsError = payload.load_error || '';
-                } catch (error) {
-                    this.clusterDeploymentsError = error?.message || 'Could not load deployments';
-                }
-            },
-
-            // A probe that failed keeps failing until someone installs keys or
-            // plugs a cable back in. Retrying every ten seconds regardless
-            // spams both Macs' SSH logs; back off instead, and let a manual
-            // action or a completed pairing resume immediately.
-            clusterProbeBackoffActive() {
-                return Date.now() < Number(this._clusterProbeHoldUntilMs || 0);
-            },
-
-            resetClusterProbeBackoff() {
-                this._clusterProbeFailureCount = 0;
-                this._clusterProbeHoldUntilMs = 0;
-            },
-
-            _escalateClusterProbeBackoff() {
-                const failures = Number(this._clusterProbeFailureCount || 0) + 1;
-                this._clusterProbeFailureCount = failures;
-                const delay = Math.min(60000, 10000 * 2 ** (failures - 1));
-                this._clusterProbeHoldUntilMs = Date.now() + delay;
-            },
-
-            async probeClusterPeer() {
-                if (this.clusterPeerProbeLoading) return;
-                const ssh = this.clusterPeerSsh.trim();
-                if (!ssh) {
-                    this.clusterError = 'Enter the worker SSH name first';
-                    return;
-                }
-                this.clusterPeerProbeLoading = true;
-                this.clusterPeerProbe = null;
-                try {
-                    const request = { ssh };
-                    if (this.clusterLocalIp.trim()) request.route_to = this.clusterLocalIp.trim();
-                    const response = await fetch('/admin/api/cluster/peer-probe', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(request),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Peer probe failed'));
-                    }
-                    const result = await response.json();
-                    // Keep the previous actionable failure mounted while an
-                    // automatic retry is in flight. Clearing it before SSH
-                    // answers made the whole page jump every ten seconds.
-                    this.clusterError = '';
-                    this.clusterConnectionError = '';
-                    this.dismissClusterGuidance();
-                    this.resetClusterProbeBackoff();
-                    this.clusterPeerProbe = result;
-                    this.clusterPeerProbes = {
-                        ...(this.clusterPeerProbes || {}),
-                        [ssh]: result,
-                    };
-                    this.saveClusterKnownNodes();
-                    const status = result.status || {};
-                    const node = status.node || {};
-                    if (result.bootstrap_required) {
-                        // Repeat what the probe measured. This used to assert
-                        // "not installed" for every bootstrap_required result,
-                        // including peers whose runtime it merely could not
-                        // check — which is what surfaced the wrong guidance in
-                        // #2680.
-                        const measured = (result.runtime_mismatches || [])
-                            .find((entry) => Boolean(entry));
-                        this.clusterConnectionError =
-                            `${node.hostname || ssh} is online, but `
-                            + (measured || 'its oMLX worker runtime is not installed yet.');
-                        this.explainClusterError(this.clusterConnectionError);
-                    }
-                    if (this.clusterPlanNodes[1]) {
-                        const planned = this.clusterPlanNodes[1];
-                        const previousId = String(planned.ssh || '').trim() === ssh
-                            ? planned.node_id
-                            : '';
-                        const deployedId = (this.clusterDeployments?.[0]?.hosts || [])
-                            .find(host => host.ssh === ssh)?.node_id;
-                        const sshHostname = ssh.split('@').pop();
-                        planned.ssh = ssh;
-                        planned.node_id = this.clusterNodeId(
-                            deployedId,
-                            previousId,
-                            node.hostname,
-                            sshHostname,
-                            'worker-1',
-                        );
-                        const exactCapacity = Number(
-                            node.admission_ceiling_bytes
-                            || node.recommended_working_set_bytes
-                            || 0
-                        );
-                        if (exactCapacity > 0) {
-                            this.clusterPlanNodes[1].capacity_gib = Number(
-                                (exactCapacity / (1024 ** 3)).toFixed(2)
-                            );
-                            this.clusterPlanNodes[1].capacity_bytes = exactCapacity;
-                        }
-                    }
-                    await this.$nextTick();
-                    this.invalidateClusterPlan();
-                    // Now that both ends are known, ask them where they answer
-                    // rather than leaving two addresses to be typed.
-                    await this.loadClusterFabric();
-                } catch (error) {
-                    const message = error?.message || 'Peer probe failed';
-                    this.clusterError = message;
-                    this.clusterConnectionError = message;
-                    this._escalateClusterProbeBackoff();
-                } finally {
-                    this.clusterPeerProbeLoading = false;
-                }
-            },
-
-            async loadClusterPeerHardware() {
-                const peers = this.clusterWorkerPeers();
-                if (!peers.length) return;
-                const probes = { ...(this.clusterPeerProbes || {}) };
-                if (this.clusterPeerProbe && this.clusterPeerSsh.trim()) {
-                    probes[this.clusterPeerSsh.trim()] = this.clusterPeerProbe;
-                }
-                await Promise.all(peers.map(async peer => {
-                    const ssh = String(peer?.ssh || '').trim();
-                    // Browser-cached hardware is a display hint only. It
-                    // intentionally omits runtime paths and must not suppress
-                    // the live probe needed to launch a heterogeneous host.
-                    if (
-                        !ssh
-                        || (probes[ssh]?.status?.node && !probes[ssh]?.cached)
-                    ) return;
-                    try {
-                        const request = { ssh };
-                        if (this.clusterLocalIp.trim()) {
-                            request.route_to = this.clusterLocalIp.trim();
-                        }
-                        const response = await fetch('/admin/api/cluster/peer-probe', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(request),
-                        });
-                        if (!response.ok) return;
-                        probes[ssh] = await response.json();
-                    } catch (error) {
-                        // Hardware identity is progressive enhancement. A peer
-                        // health or launch check will surface an actual outage.
-                        console.debug(`Could not read hardware for ${ssh}`, error);
-                    }
-                }));
-                this.clusterPeerProbes = probes;
-                this.saveClusterKnownNodes();
-            },
-
-            async discoverClusterPeers() {
-                if (this.clusterDiscoveryLoading) return;
-                this.clusterDiscoveryLoading = true;
-                this.clusterDiscoveryWarning = '';
-                try {
-                    const response = await fetch('/admin/api/cluster/discover');
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Peer discovery failed'));
-                    }
-                    const result = await response.json();
-                    const remembered = this.clusterDiscoveredPeers || [];
-                    const merged = new Map(
-                        remembered.map(peer => [
-                            peer.ssh,
-                            { ...peer, cached: true },
-                        ])
-                    );
-                    (result.peers || []).forEach(peer => {
-                        merged.set(peer.ssh, { ...merged.get(peer.ssh), ...peer, cached: false });
-                    });
-                    this.clusterDiscoveredPeers = [...merged.values()];
-                    this.clusterDiscoveryWarning = result.warning || '';
-                    this.saveClusterKnownNodes();
-                    if (result.pairing_token) {
-                        this.clusterPairingToken = result.pairing_token;
-                    }
-                } catch (error) {
-                    if (this.clusterDiscoveredPeers === null) {
-                        this.clusterDiscoveredPeers = [];
-                    }
-                    this.clusterDiscoveryWarning = error?.message || 'Peer discovery failed';
-                } finally {
-                    this.clusterDiscoveryLoading = false;
-                }
-            },
-
-            syncClusterNodesFromPeers() {
-                // Don't let a background status poll rebuild the node set (and
-                // reset selections / invalidate the plan) while an activation is
-                // in flight — startCluster() runs a multi-step autoconfigure →
-                // stage → activate sequence and a mid-flight resync can discard
-                // its own in-progress proposal.
-                if (this.clusterAutoconfigureLoading
-                    || this.clusterActivationLoading
-                    || this.clusterLinkSetupLoading) {
-                    // Report the skip so callers holding a pending-sync flag
-                    // keep it armed for the next tick instead of dropping it.
-                    return false;
-                }
-                this.clusterModelInventory = null;
-                this.clusterCatalogue = null;
-                const gib = 1024 ** 3;
-                const localCapacityBytes = Number(
-                    this.clusterStatus?.node?.admission_ceiling_bytes
-                    || this.clusterStatus?.node?.recommended_working_set_bytes
-                    || 0
-                );
-                const localCapacity = localCapacityBytes / gib;
-                const existing = new Map(
-                    (this.clusterPlanNodes || []).map(node => [node.node_id, node])
-                );
-                const existingBySsh = new Map(
-                    (this.clusterPlanNodes || [])
-                        .filter(node => String(node.ssh || '').trim())
-                        .map(node => [String(node.ssh).trim(), node])
-                );
-                const deployedBySsh = new Map(
-                    (this.clusterDeployments?.[0]?.hosts || [])
-                        .filter(host => String(host.ssh || '').trim())
-                        .map(host => [String(host.ssh).trim(), host])
-                );
-                const localName = this.clusterNodeId(
-                    deployedBySsh.get('127.0.0.1')?.node_id,
-                    existingBySsh.get('127.0.0.1')?.node_id,
-                    this.clusterStatus?.node?.hostname,
-                    'this-mac',
-                );
-                const local = existingBySsh.get('127.0.0.1')
-                    || existing.get(localName)
-                    || this.clusterPlanNodes?.[0]
-                    || {};
-                const nodes = [{
-                    ...local,
-                    key: local.key || 1,
-                    node_id: localName,
-                    ssh: '127.0.0.1',
-                    capacity_gib: localCapacity > 0
-                        ? Number(localCapacity.toFixed(2))
-                        : Number(local.capacity_gib || 0),
-                    capacity_bytes: localCapacityBytes > 0
-                        ? localCapacityBytes
-                        : Number(local.capacity_bytes || 0),
-                    reserve_gib: Number(local.reserve_gib || 0),
-                    role: local.role || 'workstation',
-                    accelerator: this.clusterStatus?.node?.accelerator || 'metal',
-                    accelerator_vendor:
-                        this.clusterStatus?.node?.accelerator_vendor || 'apple',
-                    memory_kind: this.clusterStatus?.node?.memory_kind || 'unified',
-                    fabric_kind: this.clusterStatus?.node?.fabric_kind || '',
-                    fabric_group_id:
-                        this.clusterStatus?.node?.fabric_group_id || '',
-                    fabric_verified: Boolean(
-                        this.clusterStatus?.node?.fabric_verified
-                    ),
-                    python_executable:
-                        this.clusterStatus?.runtime?.python_executable || '',
-                }];
-                this.clusterWorkerPeers().forEach((peer, index) => {
-                    const previousBySsh = existingBySsh.get(peer.ssh);
-                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
-                    const sshHostname = String(peer.ssh || '').trim().split('@').pop();
-                    const nodeId = this.clusterNodeId(
-                        deployedBySsh.get(peer.ssh)?.node_id,
-                        peer.node_id,
-                        previousBySsh?.node_id,
-                        peer.name,
-                        hardware.hostname,
-                        sshHostname,
-                        `worker-${index + 1}`,
-                    );
-                    const namedPrevious = existing.get(nodeId);
-                    const previous = previousBySsh
-                        || (
-                            namedPrevious && !String(namedPrevious.ssh || '').trim()
-                                ? namedPrevious
-                                : {}
-                        );
-                    const peerRuntime = this.clusterPeerProbes?.[peer.ssh]?.status?.runtime || {};
-                    const exactCapacityBytes = Number(
-                        hardware.admission_ceiling_bytes
-                        || peer.admission_ceiling_bytes
-                        || previous.capacity_bytes
-                        || 0
-                    );
-                    const displayCapacityBytes = exactCapacityBytes || Number(
-                        hardware.recommended_working_set_bytes
-                        || peer.recommended_working_set_bytes
-                        || 0
-                    );
-                    nodes.push({
-                        ...previous,
-                        key: previous.key || (index + 2),
-                        node_id: nodeId,
-                        ssh: peer.ssh,
-                        // Unknown is shown as unknown. The old 64 - 8 GiB
-                        // placeholder became a confident-looking “56 GiB
-                        // usable” warning whenever SSH had not answered yet.
-                        capacity_gib: displayCapacityBytes > 0
-                            ? Number((displayCapacityBytes / gib).toFixed(2))
-                            : 0,
-                        capacity_bytes: exactCapacityBytes,
-                        reserve_gib: displayCapacityBytes > 0
-                            ? Number(previous.reserve_gib || 0)
-                            : 0,
-                        role: 'headless',
-                        accelerator: hardware.accelerator
-                            || peer.accelerator
-                            || 'metal',
-                        accelerator_vendor: hardware.accelerator_vendor
-                            || peer.accelerator_vendor
-                            || 'apple',
-                        memory_kind: hardware.memory_kind
-                            || peer.memory_kind
-                            || 'unified',
-                        fabric_kind: hardware.fabric_kind
-                            || peer.fabric_kind
-                            || '',
-                        fabric_group_id: hardware.fabric_group_id
-                            || peer.fabric_group_id
-                            || '',
-                        fabric_verified: Boolean(
-                            hardware.fabric_verified || peer.fabric_verified
-                        ),
-                        python_executable: peerRuntime.python_executable
-                            || peer.python_executable
-                            || previous.python_executable
-                            || '',
-                    });
-                });
-                const connectxCandidates = nodes.filter(node => (
-                    node.accelerator === 'cuda'
-                    && node.fabric_kind === 'connectx-7'
-                    && !node.fabric_group_id
-                ));
-                if (connectxCandidates.length === 2) {
-                    connectxCandidates.forEach(node => {
-                        node.fabric_group_id = 'connectx-7-auto-pair';
-                        node.fabric_verified = false;
-                    });
-                }
-                // Only invalidate a built plan when the node set actually
-                // changed. The 2s/10s cluster status poll calls this on every
-                // tick; invalidating unconditionally nulled clusterPlan and its
-                // signature, which dead-buttoned "Activate manual plan"
-                // (clusterActivationReady requires a non-null plan whose
-                // signature still matches) and erased error banners every poll.
-                // #2721 stopped the poll from POSTing /plan but left this
-                // client-side wipe in place.
-                const nodesChanged =
-                    JSON.stringify(nodes)
-                    !== JSON.stringify(this.clusterPlanNodes ?? []);
-                this.clusterPlanNodes = nodes;
-                this._clusterNodeKey = Math.max(
-                    this._clusterNodeKey,
-                    ...nodes.map(node => Number(node.key) || 0),
-                );
-                this.normalizeClusterTensorParallelSize();
-                if (nodesChanged) {
-                    this.invalidateClusterPlan();
-                }
-                return true;
-            },
-
-            // Turn every unambiguous fast-link discovery into the default
-            // cluster. A deployment remains authoritative on restart; without
-            // one, all RDMA peers are selected instead of forcing a three-Mac
-            // user to choose one and silently ignore the rest.
-            async initializeClusterSetup({ preview = true } = {}) {
-                const deployment = (this.clusterDeployments || [])[0] || null;
-                if (
-                    this._clusterKnownNodesNeedsSync
-                    && this.clusterStatus
-                    && this.clusterWorkerPeers().length
-                ) {
-                    // Clear the flag only when the sync actually ran: it
-                    // skips itself during activation loads, and dropping the
-                    // flag on a skipped run lost the joining node until the
-                    // next join event re-armed it.
-                    if (this.syncClusterNodesFromPeers() === true) {
-                        this._clusterKnownNodesNeedsSync = false;
-                    }
-                }
-                if (!this.clusterWorkerPeers().length) {
-                    const deployedPeers = (deployment?.hosts || []).filter(
-                        host => !['127.0.0.1', 'localhost', '::1'].includes(host.ssh)
-                    );
-                    const discovered = this.clusterDiscoveredPeers || [];
-                    const fastPeers = discovered.filter(
-                        peer => peer.rdma_available || peer.transport === 'rdma'
-                    );
-                    const omlxPeers = discovered.filter(
-                        peer => peer.service === 'oMLX Distributed'
-                    );
-                    const automaticPeers = fastPeers.length
-                        ? fastPeers
-                        : (omlxPeers.length
-                            ? omlxPeers
-                            : (discovered.length === 1 ? discovered : []));
-                    const preferred = deployedPeers.length
-                        ? deployedPeers.map(host =>
-                            discovered.find(peer => peer.ssh === host.ssh)
-                            || { ssh: host.ssh, name: host.node_id })
-                        : automaticPeers;
-                    if (preferred.length) {
-                        this.clusterSelectedPeers = preferred;
-                        this.clusterPeerSsh = preferred[0].ssh;
-                        this.syncClusterNodesFromPeers();
-                        if (!this.clusterProbeBackoffActive()) {
-                            await this.probeClusterPeer();
-                            await this.loadClusterTransports();
-                        }
-                    }
-                } else if (!this.clusterPeerProbe
-                        && !this.clusterProbeBackoffActive()) {
-                    await this.probeClusterPeer();
-                    await this.loadClusterTransports();
-                }
-                await this.loadClusterPeerHardware();
-                // The first synchronization can run before SSH answers. Apply
-                // the now-live accelerator identity, ConnectX membership, and
-                // per-host Python paths before memory/model API requests.
-                if (this.clusterWorkerPeers().length) {
-                    this.syncClusterNodesFromPeers();
-                }
-                // A remembered peer skips the selection branch above on page
-                // reload. Its budgets still need to be measured: keeping the
-                // old 8 GiB form defaults here made the workstation look as if
-                // it could safely donate almost all of its memory.
-                // While the probe is backing off after failures, budgets would
-                // fail over the same SSH path, so they wait for the same hold.
-                if (this.clusterWorkerPeers().length
-                        && !this.clusterProbeBackoffActive()
-                        && !this._clusterBudgetsMeasured) {
-                    await this.measureClusterBudgets();
-                }
-
-                if (!this.clusterModelInventory
-                    && !this.clusterModelInventoryLoading) {
-                    await this.loadClusterModelInventory();
-                }
-                if (!this.clusterPlanModelPath.trim()) {
-                    let path = deployment?.model || '';
-                    let source = '127.0.0.1';
-                    let targetContext = null;
-                    let targetContextMode = null;
-                    if (!path) {
-                        try {
-                            const saved = window.localStorage.getItem(
-                                'omlx.cluster.selectedModel'
-                            ) || '';
-                            try {
-                                const parsed = JSON.parse(saved);
-                                path = parsed.model_path || '';
-                                source = parsed.model_source || source;
-                                targetContext = Number(
-                                    parsed.target_context_tokens || 0
-                                ) || null;
-                                targetContextMode =
-                                    parsed.context_mode
-                                    || (targetContext ? 'manual' : null);
-                            } catch (_) {
-                                // Older builds stored only the path.
-                                path = saved;
-                            }
-                        } catch (_) {
-                            path = '';
-                        }
-                    }
-                    const candidates = this.clusterModelCandidates();
-                    const model = candidates.find(
-                        item => item.model_path === path
-                            && (!source || item.model_source === source)
-                    ) || candidates.find(
-                        item => item.model_path === path
-                    ) || candidates.find(item => item.is_default);
-                    if (model) {
-                        this.selectClusterModel(
-                            model,
-                            targetContext,
-                            targetContextMode,
-                        );
-                    }
-                }
-                if (this.clusterPeerSsh.trim()
-                    && this.clusterModelCandidates().length
-                    && !this.clusterCatalogue
-                    && !this.clusterCatalogueLoading) {
-                    await this.loadClusterCatalogue();
-                }
-                if (!this.clusterPlanModelPath.trim()) {
-                    const recommended = this.clusterRecommendedModels()[0] || null;
-                    if (recommended) this.selectClusterModel(recommended);
-                }
-                this.normalizeClusterTensorParallelSize();
-                if (preview) await this.previewClusterWeightBalance();
-            },
-
-            // 2-second "Copied!" affordance on the exchange token, matching
-            // the wired-limit copy button. Reset by the same setTimeout so
-            // rapid clicks are harmless.
-            copyClusterExchangeToken() {
-                if (!this.clusterExchangeToken) return;
-                this.copyToClipboard(this.clusterExchangeToken);
-                this.clusterExchangeTokenCopied = true;
-                setTimeout(() => { this.clusterExchangeTokenCopied = false; }, 2000);
-            },
-
-            generateClusterPairingSecret() {
-                const bytes = new Uint8Array(18);
-                window.crypto.getRandomValues(bytes);
-                this.clusterPairingSecret = Array.from(
-                    bytes,
-                    value => value.toString(16).padStart(2, '0'),
-                ).join('');
-                // Tokens are bound to the secret that authenticated them.
-                this.clusterPairingToken = null;
-                this.clusterExchangeToken = null;
-                this.clusterPairingSecretCopied = false;
-            },
-
-            copyClusterPairingSecret() {
-                if (this.clusterPairingSecret.length < 16) return;
-                this.copyToClipboard(this.clusterPairingSecret);
-                this.clusterPairingSecretCopied = true;
-                setTimeout(() => {
-                    this.clusterPairingSecretCopied = false;
-                }, 2000);
-            },
-
-            async generatePairingToken() {
-                if (this.clusterPairingTokenLoading || this.clusterPairingSecret.length < 16) return;
-                this.clusterPairingTokenLoading = true;
-                try {
-                    const response = await fetch('/admin/api/cluster/pairing-token', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ shared_secret: this.clusterPairingSecret }),
-                    });
-                    if (response.ok) {
-                        const result = await response.json();
-                        this.clusterPairingToken = result.pairing_token;
-                    }
-                } catch (error) {
-                    console.error('Pairing token generation failed:', error);
-                } finally {
-                    this.clusterPairingTokenLoading = false;
-                }
-            },
-
-            async verifyPairingToken(token) {
-                try {
-                    const response = await fetch('/admin/api/cluster/verify-pairing-token', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            token: token,
-                            shared_secret: this.clusterPairingSecret,
-                        }),
-                    });
-                    if (response.ok) {
-                        const result = await response.json();
-                        return result.valid;
-                    }
-                } catch (error) {
-                    console.error('Pairing token verification failed:', error);
-                }
-                return false;
-            },
-
-            async loadClusterSshKey() {
-                if (this.clusterSshKeyLoading) return;
-                this.clusterSshKeyLoading = true;
-                try {
-                    const response = await fetch('/admin/api/cluster/ssh-key');
-                    if (response.ok) {
-                        this.clusterSshKey = await response.json();
-                    } else {
-                        this.clusterSshKey = { available: false };
-                    }
-                } catch (error) {
-                    this.clusterSshKey = { available: false, error: error.message };
-                }
-                this.clusterSshKeyLoading = false;
-            },
-
-            async generateClusterSshKey() {
-                if (this.clusterSshKeyGenerating) return;
-                const overwrite = Boolean(this.clusterSshKey?.available);
-                if (overwrite && !window.confirm(
-                    'Regenerating this key disconnects every paired worker. '
-                    + 'You will need to exchange keys again on every Mac. Continue?'
-                )) return;
-                this.clusterSshKeyGenerating = true;
-                try {
-                    const endpoint = '/admin/api/cluster/ssh-key/generate'
-                        + (overwrite ? '?overwrite=true' : '');
-                    const response = await fetch(endpoint, {
-                        method: 'POST',
-                    });
-                    if (response.ok) {
-                        this.clusterSshKey = await response.json();
-                        this.clusterExchangeToken = null;
-                        this.clusterPeerExchangeToken = '';
-                        this.clusterKeyExchangeResult = null;
-                        if (overwrite) this.invalidateClusterPeer(true);
-                        this.showNotification(
-                            overwrite
-                                ? 'SSH key regenerated. Pair every worker again before reconnecting.'
-                                : 'SSH key generated successfully',
-                            'success'
-                        );
-                    } else {
-                        const error = await response.json();
-                        this.showNotification('SSH key generation failed: ' + (error.detail || 'Unknown error'), 'error');
-                    }
-                } catch (error) {
-                    this.showNotification('SSH key generation failed: ' + error.message, 'error');
-                }
-                this.clusterSshKeyGenerating = false;
-            },
-
-            async generateKeyExchangeToken(nodeId) {
-                if (this.clusterExchangeTokenLoading || this.clusterPairingSecret.length < 16) return;
-                this.clusterExchangeTokenLoading = true;
-                try {
-                    const response = await fetch('/admin/api/cluster/ssh-key/exchange-token', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            node_id: nodeId || '',
-                            shared_secret: this.clusterPairingSecret,
-                        }),
-                    });
-                    if (response.ok) {
-                        const result = await response.json();
-                        this.clusterExchangeToken = result.exchange_token;
-                    } else {
-                        const error = await response.json();
-                        this.showNotification('Key exchange token generation failed: ' + (error.detail || 'Unknown error'), 'error');
-                    }
-                } catch (error) {
-                    this.showNotification('Key exchange token generation failed: ' + error.message, 'error');
-                }
-                this.clusterExchangeTokenLoading = false;
-            },
-
-            async exchangeKeysWithPeer(exchangeToken) {
-                const token = (exchangeToken || '').trim();
-                if (!token || this.clusterKeyExchangeLoading || this.clusterPairingSecret.length < 16) return;
-                this.clusterKeyExchangeLoading = true;
-                try {
-                    const response = await fetch('/admin/api/cluster/ssh-key/exchange', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            exchange_token: token,
-                            shared_secret: this.clusterPairingSecret,
-                        }),
-                    });
-                    if (response.ok) {
-                        this.clusterKeyExchangeResult = await response.json();
-                        this.clusterPeerExchangeToken = '';
-                        this.showNotification('SSH keys exchanged successfully', 'success');
-                        // Pairing just changed what a probe would find; retry
-                        // now rather than waiting out the failure hold.
-                        this.resetClusterProbeBackoff();
-                        // Reload SSH key info
-                        await this.loadClusterSshKey();
-                    } else {
-                        const error = await response.json();
-                        this.showNotification('Key exchange failed: ' + (error.detail || 'Unknown error'), 'error');
-                    }
-                } catch (error) {
-                    this.showNotification('Key exchange failed: ' + error.message, 'error');
-                } finally {
-                    this.clusterKeyExchangeLoading = false;
-                }
-            },
-
-            async storeClusterKeyInKeychain() {
-                this.clusterKeychainStoring = true;
-                try {
-                    const response = await fetch('/admin/api/cluster/ssh-key/store-keychain', {
-                        method: 'POST',
-                    });
-                    if (response.ok) {
-                        const result = await response.json();
-                        if (result.stored) {
-                            this.showNotification('Key fingerprint stored in macOS Keychain', 'success');
-                        } else {
-                            this.showNotification('Keychain storage unavailable on this system', 'warning');
-                        }
-                    } else {
-                        const error = await response.json();
-                        this.showNotification('Keychain storage failed: ' + (error.detail || 'Unknown error'), 'error');
-                    }
-                } catch (error) {
-                    this.showNotification('Keychain storage failed: ' + error.message, 'error');
-                }
-                this.clusterKeychainStoring = false;
-            },
-
-            async selectClusterDiscoveredPeer(peer) {
-                this.invalidateClusterPeer(true);
-                // A deliberate click outranks the automatic retry hold.
-                this.resetClusterProbeBackoff();
-                this.clusterSelectedPeers = [peer];
-                this.clusterPeerSsh = peer.ssh;
-                this.syncClusterNodesFromPeers();
-                await this.probeClusterPeer();
-                await this.loadClusterTransports();
-                await this.measureClusterBudgets();
-                await this.loadClusterModelInventory();
-                await this.loadClusterCatalogue();
-            },
-
-            invalidateClusterPlan() {
-                this.clusterPlan = null;
-                this.clusterPlanError = '';
-                // Setup failures only describe the exact model, context,
-                // topology and memory budgets that produced them. Once any
-                // planning input changes, keeping that failure visible makes
-                // the new selection look rejected before it has even been
-                // checked (for example, a 128k refusal labelled as an 8k
-                // refusal after the context button was changed).
-                this.clusterAutoconfigureError = '';
-                this.clusterError = '';
-                this.clusterActivationResult = null;
-                this.clusterPlanChanges = null;
-                this._clusterPlanSignature = '';
-                this._clusterPlanRevision =
-                    Number(this._clusterPlanRevision || 0) + 1;
-            },
-
-            invalidateClusterPeer(clearNetwork = false) {
-                this.clusterPeerProbe = null;
-                if (this.clusterError === this.clusterConnectionError) {
-                    this.clusterError = '';
-                }
-                this.clusterConnectionError = '';
-                this.dismissClusterGuidance();
-                if (clearNetwork) {
-                    this.clusterPeerProbes = {};
-                    // A different peer is a different fabric: its addresses and
-                    // its RDMA matrix say nothing about the new one.
-                    this.clusterPeerIp = '';
-                    this.clusterFabric = null;
-                    this.clusterFabricError = '';
-                    this.clusterIpsOverridden = false;
-                }
-                // A different peer is a different machine: its budgets must be
-                // re-measured once (the recurring poll skips already-measured
-                // topologies to avoid jitter).
-                this._clusterBudgetsMeasured = false;
-                this.invalidateClusterPlan();
-            },
-
-            // Is every rank still answering? A collective cannot proceed
-            // without all of them, so a peer that has gone away should show as a
-            // stated failure rather than a request that never returns.
-            async loadClusterPeerHealth() {
-                if (this.clusterPeerHealthLoading) return;
-                const peers = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ].filter(Boolean);
-                if (peers.length < 2) { this.clusterPeerHealth = null; return; }
-                this.clusterPeerHealthLoading = true;
-                try {
-                    const query = new URLSearchParams({
-                        hosts: peers.join(','),
-                        deployment_id: (this.clusterDeployments[0] || {}).deployment_id || '',
-                    });
-                    const response = await fetch(
-                        `/admin/api/cluster/peer-health?${query}`
-                    );
-                    if (response.status === 401) { window.location.href = '/admin'; return; }
-                    if (response.ok) this.clusterPeerHealth = await response.json();
-                } catch (error) {
-                    this.clusterPeerHealth = null;
-                } finally {
-                    this.clusterPeerHealthLoading = false;
-                }
-            },
-
-            // Copy only the weight files this Mac's layers need. A pipeline rank
-            // loads its own layers, but the files holding them must be on local
-            // disk — and copying the whole model to every Mac wastes most of the
-            // transfer (24 of 76 shards for a 78-layer model split 56/22).
-            async stageClusterModel(proposal = null) {
-                if (this.clusterStagingLoading) return;
-                const configured = proposal || this.clusterAutoconfigure;
-                const staging = configured && configured.staging;
-                if (!staging || staging.ready) return;
-                if (!configured.activation) {
-                    this.clusterError = 'Automatic setup did not return a staging plan.';
-                    return false;
-                }
-                this.clusterStagingLoading = true;
-                this.clusterStagingResult = null;
-                this.clusterActivationProgress = 'Preparing model files…';
-                try {
-                    const response = await fetch('/admin/api/cluster/stage', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            activation: configured.activation,
-                        }),
-                    });
-                    if (response.status === 401) { window.location.href = '/admin'; return; }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Staging failed'));
-                    }
-                    let job = await response.json();
-                    this.clusterStagingResult = job;
-                    while (!['completed', 'failed'].includes(job.status)) {
-                        const nodes = Object.values(job.nodes || {});
-                        const complete = nodes.reduce(
-                            (sum, node) => sum + Number(node.files_completed || 0), 0
-                        );
-                        const total = nodes.reduce(
-                            (sum, node) => sum + Number(node.files_total || 0), 0
-                        );
-                        this.clusterActivationProgress = total
-                            ? `Copying model files · ${complete} of ${total}`
-                            : 'Checking model files on each worker…';
-                        await new Promise(resolve => setTimeout(resolve, 500));
-                        const status = await fetch(
-                            `/admin/api/cluster/stage/${encodeURIComponent(job.job_id)}`
-                        );
-                        if (status.status === 401) {
-                            window.location.href = '/admin';
-                            return false;
-                        }
-                        if (!status.ok) {
-                            throw new Error(await this.clusterResponseError(
-                                status, 'Could not read staging progress'
-                            ));
-                        }
-                        job = await status.json();
-                        this.clusterStagingResult = job;
-                    }
-                    if (job.status !== 'completed' || !job.ready) {
-                        throw new Error(job.error || 'Model staging failed');
-                    }
-                    await this.autoconfigureCluster();
-                    return true;
-                } catch (error) {
-                    this.clusterError = error?.message || 'Staging failed';
-                    return false;
-                } finally {
-                    this.clusterStagingLoading = false;
-                    this.clusterActivationProgress = '';
-                }
-            },
-
-            clusterStagingNodes() {
-                return Object.values(this.clusterStagingResult?.nodes || {});
-            },
-
-            clusterStagingNodeProgress(node) {
-                if (node.status === 'ready') return 'Ready';
-                if (node.status === 'failed') return node.error || 'Copy failed';
-                const copied = Number(node.bytes_completed || 0) / (1024 ** 3);
-                const total = Number(node.bytes_total || 0) / (1024 ** 3);
-                if (total > 0) {
-                    return `${copied.toFixed(1)} of ${total.toFixed(1)} GiB`;
-                }
-                return node.status === 'copying' ? 'Checking files…' : 'Waiting';
-            },
-
-            formatClusterStaging(node) {
-                const gib = b => (b / (1024 ** 3)).toFixed(1) + ' GiB';
-                return `${node.missing_files} of ${node.required_files} files still needed `
-                     + `(${gib(node.missing_bytes)}) — saves ${gib(node.saved_bytes)} vs copying the whole model`;
-            },
-
-            // Probe the fabric on its own, without planning anything. Fills the
-            // server-side cache that peer discovery reads, so the peer list can
-            // show transports without paying for SSH on its own request path.
-            loadRememberedClusterConfig() {
-                this.loadClusterKnownNodes();
-                this.loadClusterMemoryAllowances();
-                try {
-                    const raw = window.localStorage.getItem('omlx.cluster.lastGoodConfig');
-                    if (!raw) return null;
-                    const saved = JSON.parse(raw);
-                    this.clusterLastGoodConfig = saved.activation || null;
-                    return saved;
-                } catch (error) {
-                    return null;
-                }
-            },
-
-            loadClusterKnownNodes() {
-                if (this._clusterKnownNodesHydrated) return;
-                this._clusterKnownNodesHydrated = true;
-                try {
-                    let saved = null;
-                    const raw = window.localStorage.getItem('omlx.cluster.knownNodes');
-                    if (raw) saved = JSON.parse(raw);
-                    if (!saved?.peers?.length) {
-                        // Older builds already remembered the last safe
-                        // activation. Reuse only its host identities, never its
-                        // approval or runtime result.
-                        const lastGoodRaw = window.localStorage.getItem(
-                            'omlx.cluster.lastGoodConfig'
-                        );
-                        const lastGood = lastGoodRaw ? JSON.parse(lastGoodRaw) : null;
-                        const hosts = lastGood?.activation?.hosts || [];
-                        const peers = hosts.filter(host => ![
-                            '127.0.0.1',
-                            'localhost',
-                            '::1',
-                        ].includes(host.ssh)).map(host => ({
-                            ssh: host.ssh,
-                            name: host.node_id || host.ssh,
-                            service: 'oMLX Distributed',
-                            transport: 'detecting',
-                            cached: true,
-                        }));
-                        if (peers.length) {
-                            saved = {
-                                peers,
-                                selected_ssh: peers.map(peer => peer.ssh),
-                                hardware: {},
-                            };
-                        }
-                    }
-                    const peers = (saved?.peers || []).filter(peer => (
-                        typeof peer?.ssh === 'string'
-                        && /^[A-Za-z0-9._@-]{1,255}$/.test(peer.ssh)
-                    )).slice(0, 64).map(peer => ({ ...peer, cached: true }));
-                    if (!peers.length) return;
-                    this.clusterDiscoveredPeers = peers;
-                    const bySsh = new Map(peers.map(peer => [peer.ssh, peer]));
-                    const selected = (saved.selected_ssh || [])
-                        .map(ssh => bySsh.get(ssh))
-                        .filter(Boolean);
-                    this.clusterSelectedPeers = selected.length ? selected : [peers[0]];
-                    this.clusterPeerSsh = this.clusterSelectedPeers[0].ssh;
-                    const probes = { ...(this.clusterPeerProbes || {}) };
-                    Object.entries(saved.hardware || {}).forEach(([ssh, node]) => {
-                        if (!bySsh.has(ssh) || !node || typeof node !== 'object') return;
-                        probes[ssh] = {
-                            cached: true,
-                            status: {
-                                node: {
-                                    hostname: String(node.hostname || '').slice(0, 255),
-                                    chip_name: String(node.chip_name || '').slice(0, 255),
-                                    physical_memory_bytes: Number(
-                                        node.physical_memory_bytes || 0
-                                    ),
-                                    recommended_working_set_bytes: Number(
-                                        node.recommended_working_set_bytes || 0
-                                    ),
-                                    admission_ceiling_bytes: Number(
-                                        node.admission_ceiling_bytes || 0
-                                    ),
-                                },
-                            },
-                        };
-                    });
-                    this.clusterPeerProbes = probes;
-                    this._clusterKnownNodesNeedsSync = true;
-                } catch (error) {
-                    // A corrupt browser hint is ignored; live discovery remains
-                    // the source of truth and will replace it.
-                }
-            },
-
-            saveClusterKnownNodes() {
-                try {
-                    const cacheable = peer => ({
-                        ssh: String(peer?.ssh || '').trim(),
-                        name: String(peer?.name || '').slice(0, 255),
-                        service: String(peer?.service || '').slice(0, 128),
-                        transport: String(peer?.transport || 'detecting').slice(0, 32),
-                        rdma_available: Boolean(peer?.rdma_available),
-                        link_speed_gbps: Number(peer?.link_speed_gbps) || null,
-                        recommended_working_set_bytes: Number(
-                            peer?.recommended_working_set_bytes || 0
-                        ),
-                        admission_ceiling_bytes: Number(
-                            peer?.admission_ceiling_bytes || 0
-                        ),
-                        physical_memory_bytes: Number(
-                            peer?.physical_memory_bytes || 0
-                        ),
-                        chip_name: String(peer?.chip_name || '').slice(0, 255),
-                    });
-                    const peers = (this.clusterDiscoveredPeers || [])
-                        .filter(peer => (
-                            typeof peer?.ssh === 'string'
-                            && /^[A-Za-z0-9._@-]{1,255}$/.test(peer.ssh)
-                        ))
-                        .slice(0, 64)
-                        .map(cacheable);
-                    if (!peers.length) return;
-                    const hardware = {};
-                    peers.forEach(peer => {
-                        const node = this.clusterPeerProbes?.[peer.ssh]?.status?.node;
-                        if (!node) return;
-                        hardware[peer.ssh] = {
-                            hostname: node.hostname || '',
-                            chip_name: node.chip_name || '',
-                            physical_memory_bytes: Number(
-                                node.physical_memory_bytes || 0
-                            ),
-                            recommended_working_set_bytes: Number(
-                                node.recommended_working_set_bytes || 0
-                            ),
-                            admission_ceiling_bytes: Number(
-                                node.admission_ceiling_bytes || 0
-                            ),
-                        };
-                    });
-                    window.localStorage.setItem(
-                        'omlx.cluster.knownNodes',
-                        JSON.stringify({
-                            version: 1,
-                            saved_at: new Date().toISOString(),
-                            peers,
-                            selected_ssh: this.clusterWorkerPeers()
-                                .map(peer => peer.ssh),
-                            hardware,
-                        })
-                    );
-                } catch (error) {
-                    // Caching is a speed optimization. Discovery and the live
-                    // compatibility probe remain fully functional without it.
-                }
-            },
-
-            loadClusterMemoryAllowances() {
-                if (this._clusterMemoryAllowancesLoaded) return;
-                this._clusterMemoryAllowancesLoaded = true;
-                try {
-                    const raw = window.localStorage.getItem(
-                        'omlx.cluster.memoryAllowances'
-                    );
-                    if (!raw) return;
-                    const saved = JSON.parse(raw);
-                    const source = saved?.allowances_gib || {};
-                    this.clusterMemoryAllowancesGiB = Object.fromEntries(
-                        Object.entries(source).filter(([, value]) => (
-                            Number.isFinite(Number(value)) && Number(value) > 0
-                        )).map(([nodeId, value]) => [nodeId, Number(value)])
-                    );
-                    this.clusterMemoryLimitsManual =
-                        Object.keys(this.clusterMemoryAllowancesGiB).length > 0;
-                } catch (error) {
-                    this.clusterMemoryAllowancesGiB = {};
-                    this.clusterMemoryLimitsManual = false;
-                }
-            },
-
-            saveClusterMemoryAllowances() {
-                try {
-                    const allowances = this.clusterMemoryAllowancesGiB || {};
-                    if (!Object.keys(allowances).length) {
-                        window.localStorage.removeItem(
-                            'omlx.cluster.memoryAllowances'
-                        );
-                        return;
-                    }
-                    window.localStorage.setItem(
-                        'omlx.cluster.memoryAllowances',
-                        JSON.stringify({
-                            version: 1,
-                            allowances_gib: allowances,
-                        })
-                    );
-                } catch (error) {
-                    // Private browsing may refuse persistence. The in-memory
-                    // ceiling must still remain authoritative for this session.
-                }
-            },
-
-            clusterManualMemoryAllowanceGiB(nodeId) {
-                const key = String(nodeId || '').trim();
-                const allowances = this.clusterMemoryAllowancesGiB || {};
-                if (!Object.prototype.hasOwnProperty.call(allowances, key)) {
-                    return null;
-                }
-                const value = Number(allowances[key]);
-                return Number.isFinite(value) && value > 0 ? value : null;
-            },
-
-            // Is the fabric actually usable? Device presence is not readiness,
-            // and each failure state has a different fix — one of which needs
-            // admin rights we do not have, so it has to be shown, not hidden.
-            async loadClusterLinkStatus() {
-                if (this.clusterLinkStatusLoading) return this.clusterLinkStatus;
-                const hosts = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ].filter(Boolean);
-                if (hosts.length < 2) {
-                    this.clusterLinkStatus = null;
-                    return null;
-                }
-                this.clusterLinkStatusLoading = true;
-                try {
-                    const query = new URLSearchParams({ hosts: hosts.join(',') });
-                    const response = await fetch(
-                        `/admin/api/cluster/link-status?${query}`
-                    );
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (response.ok) {
-                        this.clusterLinkStatus = await response.json();
-                    }
-                } catch (error) {
-                    this.clusterLinkStatus = null;
-                } finally {
-                    this.clusterLinkStatusLoading = false;
-                }
-                return this.clusterLinkStatus;
-            },
-
-            // The fast path is product setup, not a terminal prerequisite.
-            // macOS owns the password dialog; this request contains only the
-            // paired hosts and cannot smuggle command text to the server.
-            async prepareClusterLink() {
-                if (this.clusterLinkSetupLoading) return false;
-                const hosts = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ].filter(Boolean);
-                if (hosts.length < 2) return false;
-                const pairs = [];
-                const seen = new Set();
-                for (const link of (this.clusterTransports?.transports || [])) {
-                    if (!['thunderbolt', 'rdma'].includes(link.kind)) continue;
-                    const endpoints = [link.source_node_id, link.peer_node_id];
-                    if (endpoints.some(host => !hosts.includes(host))) continue;
-                    const key = [...endpoints].sort().join('\u0000');
-                    if (seen.has(key)) continue;
-                    seen.add(key);
-                    pairs.push(endpoints);
-                }
-                if (!pairs.length && hosts.length === 2) {
-                    pairs.push([hosts[0], hosts[1]]);
-                }
-                if (!pairs.length) {
-                    this.clusterAutoconfigureError =
-                        'oMLX could not identify the physical links between these Macs.';
-                    return false;
-                }
-                this.clusterLinkSetupLoading = true;
-                this.clusterAutoconfigureError = '';
-                this.clusterActivationProgress = 'Waiting for macOS approval…';
-                try {
-                    for (let index = 0; index < pairs.length; index += 1) {
-                        this.clusterActivationProgress =
-                            `Preparing link ${index + 1} of ${pairs.length}…`;
-                        const response = await fetch('/admin/api/cluster/link-setup', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ hosts: pairs[index] }),
-                        });
-                        if (response.status === 401) {
-                            window.location.href = '/admin';
-                            return false;
-                        }
-                        if (!response.ok) {
-                            throw new Error(await this.clusterResponseError(
-                                response, 'Could not configure the Thunderbolt link'
-                            ));
-                        }
-                        this.clusterLinkStatus = await response.json();
-                    }
-                    await this.loadClusterLinkStatus();
-                    await this.loadClusterFabric();
-                    return this.clusterLinkStatus.ready === true;
-                } catch (error) {
-                    this.clusterAutoconfigureError = error?.message
-                        || 'Could not configure the Thunderbolt link';
-                    return false;
-                } finally {
-                    this.clusterLinkSetupLoading = false;
-                    this.clusterActivationProgress = '';
-                }
-            },
-
-            clusterModelInventoryHosts() {
-                const localName = this.clusterStatus?.node?.hostname || 'This Mac';
-                const plannedBySsh = new Map(
-                    (this.clusterPlanNodes || [])
-                        .filter(node => String(node?.ssh || '').trim())
-                        .map(node => [String(node.ssh).trim(), node])
-                );
-                return [
-                    {
-                        node_id: localName,
-                        ssh: '127.0.0.1',
-                        python_executable:
-                            this.clusterStatus?.runtime?.python_executable || undefined,
-                    },
-                    ...this.clusterWorkerPeers().map((peer, index) => {
-                        const planned = plannedBySsh.get(peer.ssh) || {};
-                        const runtime = this.clusterPeerProbes?.[peer.ssh]
-                            ?.status?.runtime || {};
-                        return {
-                            node_id: this.clusterFriendlyMacName(
-                            peer.name || peer.ssh,
-                            `Worker ${index + 1}`,
-                        ),
-                        ssh: peer.ssh,
-                            python_executable: planned.python_executable
-                                || runtime.python_executable
-                                || undefined,
-                        };
-                    }),
-                ];
-            },
-
-            async loadClusterModelInventory() {
-                if (this.clusterModelInventoryLoading) return;
-                const hosts = this.clusterModelInventoryHosts();
-                if (!hosts.length) return;
-                this.clusterModelInventoryLoading = true;
-                this.clusterModelInventoryError = '';
-                try {
-                    const response = await fetch('/admin/api/cluster/models', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ hosts }),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(
-                            response, 'Could not read models from the cluster'
-                        ));
-                    }
-                    this.clusterModelInventory = await response.json();
-                    const errors = this.clusterModelInventory?.errors || [];
-                    this.clusterModelInventoryError = errors
-                        .map(item => `${item.node_id}: ${item.detail}`)
-                        .join(' · ');
-                } catch (error) {
-                    this.clusterModelInventoryError =
-                        error?.message || 'Could not read models from the cluster';
-                } finally {
-                    this.clusterModelInventoryLoading = false;
-                }
-            },
-
-            clusterAllModels() {
-                const inventory = this.clusterModelInventory?.models;
-                return Array.isArray(inventory) && inventory.length
-                    ? inventory
-                    : (this.models || []).map(model => ({
-                        ...model,
-                        model_source: '127.0.0.1',
-                        source_node_id:
-                            this.clusterStatus?.node?.hostname || 'This Mac',
-                        locations: [{
-                            node_id: this.clusterStatus?.node?.hostname || 'This Mac',
-                            ssh: '127.0.0.1',
-                            model_path: model.model_path,
-                            estimated_size: model.estimated_size || 0,
-                        }],
-                        location_count: 1,
-                    }));
-            },
-
-            clusterModelCandidates() {
-                const query = String(this.clusterModelSearch || '').trim().toLowerCase();
-                return this.clusterAllModels()
-                    .filter(model => {
-                        if (!model?.model_path) return false;
-                        if (!['llm', 'vlm', null, undefined].includes(model.model_type)) {
-                            return false;
-                        }
-                        if (!query) return true;
-                        return `${model.id} ${model.model_path} ${model.model_type || ''} ${this.clusterModelHostsLabel(model)}`
-                            .toLowerCase()
-                            .includes(query);
-                    });
-            },
-
-            clusterModelHostsLabel(model) {
-                const names = (model?.locations || [])
-                    .map(location => this.clusterFriendlyMacName(location.node_id))
-                    .filter(Boolean);
-                if (!names.length) {
-                    return model?.source_node_id
-                        ? `On ${this.clusterFriendlyMacName(model.source_node_id)}`
-                        : 'On this Mac';
-                }
-                if (names.length === 1) return `On ${names[0]}`;
-                if (names.length === this.clusterModelInventoryHosts().length) {
-                    return 'On every Mac';
-                }
-                return `On ${names.join(' + ')}`;
-            },
-
-            // The server catalogue is already ordered by the strongest model
-            // this exact pair can run. Keep that signal ahead of incidental
-            // repository naming, then fold in the choices the user made in
-            // the regular oMLX model manager.
-            clusterModelOptions() {
-                const fitOrder = new Map(
-                    (this.clusterCatalogue?.models || []).map(
-                        (fit, index) => [fit.model_path, index]
-                    )
-                );
-                const score = model => {
-                    const fit = this.clusterCatalogueFit(model.model_path);
-                    if (fit?.fits === false) return -1000000;
-                    let value = 0;
-                    if (fit?.fits) {
-                        value += 100000 - ((fitOrder.get(model.model_path) || 0) * 1000);
-                    }
-                    if (model.model_path === this.clusterPlanModelPath.trim()) value += 600;
-                    if (model.is_default) value += 500;
-                    if (model.is_favorite) value += 400;
-                    if (model.loaded) value += 300;
-                    if (!this.clusterCatalogue) {
-                        value += Math.min(Number(model.estimated_size || 0) / (1024 ** 3), 250);
-                    }
-                    return value;
-                };
-                return this.clusterModelCandidates()
-                    .sort((left, right) => {
-                        const difference = score(right) - score(left);
-                        if (difference) return difference;
-                        return this.clusterModelDisplayName(left).localeCompare(
-                            this.clusterModelDisplayName(right)
-                        );
-                    });
-            },
-
-            clusterRecommendedModels() {
-                if (String(this.clusterModelSearch || '').trim()) return [];
-                const options = this.clusterModelOptions();
-                const hasFitData = Boolean((this.clusterCatalogue?.models || []).length);
-                return options
-                    .filter(model => {
-                        const fit = this.clusterCatalogueFit(model.model_path);
-                        return hasFitData ? fit?.fits === true : true;
-                    })
-                    .slice(0, 3);
-            },
-
-            clusterModelGroupLabel(index) {
-                if (String(this.clusterModelSearch || '').trim()) {
-                    return index === 0 ? 'Search results' : '';
-                }
-                const recommended = this.clusterRecommendedModels().length;
-                if (!recommended) return index === 0 ? 'All models' : '';
-                if (index === 0) return 'Recommended for this pool';
-                if (index === recommended) return 'All other models';
-                return '';
-            },
-
-            clusterModelDisplayName(model) {
-                const raw = String(model?.display_name || model?.id || 'Unnamed model');
-                const parts = raw.split('/');
-                return parts[parts.length - 1] || raw;
-            },
-
-            clusterModelOwner(model) {
-                const raw = String(model?.display_name || model?.id || '');
-                const parts = raw.split('/');
-                return parts.length > 1 ? parts.slice(0, -1).join('/') : '';
-            },
-
-            clusterModelFailureLabel(fit) {
-                if (!fit || fit.fits !== false) return '';
-                if (fit.failure_kind === 'single_node_only' && fit.standalone_node_id) {
-                    return `${this.clusterFriendlyMacName(fit.standalone_node_id)} only`;
-                }
-                if (fit.failure_kind === 'cannot_split') return 'Cannot split';
-                if (fit.failure_kind === 'model_unreadable') return 'Needs attention';
-                return 'Does not fit';
-            },
-
-            clusterModelFailureDetail(model) {
-                const fit = this.clusterCatalogueFit(model?.model_path);
-                return fit?.fits === false ? String(fit.reason || '') : '';
-            },
-
-            clusterModelContextLabel(model) {
-                const fit = this.clusterCatalogueFit(model?.model_path);
-                const tokens = Number(fit?.max_context_tokens || 0);
-                return fit?.fits === true && tokens > 0
-                    ? `Up to ${this.clusterTokens(tokens)} context`
-                    : '';
-            },
-
-            clusterModelTargetContext(model, requested = null) {
-                const declared = Number(model?.model_context_length || 8192);
-                const target = Number(requested || declared || 8192);
-                const fit = this.clusterCatalogueFit(model?.model_path);
-                const maximum = Number(fit?.max_context_tokens || 0);
-                return fit?.fits === true && maximum > 0
-                    ? Math.min(target, maximum)
-                    : target;
-            },
-
-            clusterContextMaximumTokens() {
-                const model = this.clusterSelectedModel();
-                if (!model) return 0;
-                const fit = this.clusterCatalogueFit(model.model_path);
-                const declared = Number(
-                    fit?.declared_context_tokens
-                    || model.model_context_length
-                    || 0
-                );
-                const maximum = Number(fit?.max_context_tokens || 0);
-                if (fit?.fits !== true || maximum <= 0) {
-                    // Catalogue assessment is asynchronous. Until it arrives,
-                    // retain the last known-safe choice (8k on first use)
-                    // instead of flashing the model's raw native ceiling and
-                    // a false "does not fit" error.
-                    const safePending = Number(
-                        this.clusterTargetContextTokens || 8192
-                    );
-                    return Math.max(1, Math.min(
-                        safePending,
-                        declared > 0 ? declared : 8192,
-                        1_048_576,
-                    ));
-                }
-                return Math.max(1, Math.min(
-                    declared > 0 ? declared : 1_048_576,
-                    maximum,
-                    1_048_576,
-                ));
-            },
-
-            clusterContextOptions() {
-                const model = this.clusterSelectedModel();
-                if (!model) return [];
-                const ceiling = this.clusterContextMaximumTokens();
-                const current = Number(this.clusterTargetContextTokens || 8192);
-                const presets = [
-                    8192,
-                    32768,
-                    65536,
-                    131072,
-                    262144,
-                    524288,
-                    current,
-                    ceiling,
-                ];
-                return [...new Set(
-                    presets
-                        .map(value => Math.round(Number(value)))
-                        .filter(value => Number.isFinite(value) && value > 0 && value <= ceiling)
-                )].sort((left, right) => left - right);
-            },
-
-            async clusterSetAutomaticContext() {
-                const model = this.clusterSelectedModel();
-                if (!model) return;
-                const target = this.clusterContextMaximumTokens();
-                if (!Number.isFinite(target) || target <= 0) return;
-                const changed = target !== Number(this.clusterTargetContextTokens)
-                    || this.clusterContextMode !== 'auto';
-                this.clusterContextMode = 'auto';
-                this.clusterTargetContextTokens = target;
-                if (!changed) return;
-                this.clusterMaxKvSize = '';
-                try {
-                    window.localStorage.setItem(
-                        'omlx.cluster.selectedModel',
-                        JSON.stringify({
-                            model_path: model.model_path,
-                            model_source:
-                                model.model_source || this.clusterPlanModelSource || '127.0.0.1',
-                            target_context_tokens: target,
-                            context_mode: 'auto',
-                        })
-                    );
-                } catch (_) {
-                    // A private session can still use automatic context now.
-                }
-                this.clusterAutoconfigure = null;
-                this._clusterAutoPlanKey = '';
-                this.invalidateClusterPlan();
-                await this.previewClusterWeightBalance();
-            },
-
-            async clusterSetTargetContext(tokens) {
-                const model = this.clusterSelectedModel();
-                if (!model) return;
-                const target = this.clusterModelTargetContext(
-                    model,
-                    Math.round(Number(tokens)),
-                );
-                if (!Number.isFinite(target) || target <= 0) return;
-                if (
-                    target === Number(this.clusterTargetContextTokens)
-                    && this.clusterContextMode === 'manual'
-                ) return;
-                this.clusterContextMode = 'manual';
-                this.clusterTargetContextTokens = target;
-                this.clusterMaxKvSize = '';
-                try {
-                    window.localStorage.setItem(
-                        'omlx.cluster.selectedModel',
-                        JSON.stringify({
-                            model_path: model.model_path,
-                            model_source:
-                                model.model_source || this.clusterPlanModelSource || '127.0.0.1',
-                            target_context_tokens: target,
-                            context_mode: 'manual',
-                        })
-                    );
-                } catch (_) {
-                    // A private session can still use the selected context now.
-                }
-                // A context change alters every rank's KV reservation. Never
-                // leave the previous autoconfigure result visible as though it
-                // described the new selection.
-                this.clusterAutoconfigure = null;
-                this._clusterAutoPlanKey = '';
-                this.invalidateClusterPlan();
-                await this.previewClusterWeightBalance();
-            },
-
-            clusterContextMemorySummary() {
-                const plan = this.clusterWeightPlan();
-                if (!plan?.assignments?.length) return null;
-                const assignments = plan.assignments || [];
-                const weightBytes = assignments.reduce(
-                    (sum, item) => sum
-                        + Number(item.layer_weight_bytes || 0)
-                        + Number(item.fixed_weight_bytes || 0),
-                    0,
-                );
-                const kvBytes = assignments.reduce(
-                    (sum, item) => sum + Number(item.kv_cache_bytes || 0),
-                    0,
-                );
-                const usableBytes = assignments.reduce(
-                    (sum, item) => sum + Math.max(
-                        0,
-                        Number(item.capacity_bytes || 0)
-                            - Number(item.reserve_bytes || 0),
-                    ),
-                    0,
-                );
-                return {
-                    targetTokens: Number(
-                        plan.cluster?.target_context_tokens
-                        || this.clusterTargetContextTokens
-                        || 8192
-                    ),
-                    weightBytes,
-                    kvBytes,
-                    usedBytes: weightBytes + kvBytes,
-                    usableBytes,
-                    headroomBytes: Math.max(0, usableBytes - weightBytes - kvBytes),
-                };
-            },
-
-            clusterContextMemoryNodes() {
-                const plan = this.clusterWeightPlan();
-                const quickNodes = this.clusterQuickNodes();
-                return [...(plan?.assignments || [])]
-                    .sort((left, right) => Number(left.rank) - Number(right.rank))
-                    .map((assignment, index) => {
-                        const weightBytes = Number(assignment.layer_weight_bytes || 0)
-                            + Number(assignment.fixed_weight_bytes || 0);
-                        const kvBytes = Number(assignment.kv_cache_bytes || 0);
-                        const usableBytes = Math.max(
-                            1,
-                            Number(assignment.capacity_bytes || 0)
-                                - Number(assignment.reserve_bytes || 0),
-                        );
-                        const usedBytes = weightBytes + kvBytes;
-                        return {
-                            ...assignment,
-                            hardwareLabel: this.clusterNodeHardwareLabel(
-                                quickNodes[Number(assignment.rank)] || {
-                                    name: assignment.node_id,
-                                }
-                            ),
-                            weightBytes,
-                            kvBytes,
-                            usedBytes,
-                            usableBytes,
-                            headroomBytes: Math.max(0, usableBytes - usedBytes),
-                            weightPercent: Math.max(
-                                0,
-                                Math.min(100, weightBytes / usableBytes * 100),
-                            ),
-                            kvPercent: Math.max(
-                                0,
-                                Math.min(
-                                    100 - (weightBytes / usableBytes * 100),
-                                    kvBytes / usableBytes * 100,
-                                ),
-                            ),
-                            layerLabel: Number(assignment.tensor_parallel_size || 1) > 1
-                                ? `all layers · tensor ${Number(assignment.tensor_parallel_rank || 0) + 1}/${assignment.tensor_parallel_size}`
-                                : `layers ${assignment.start_layer}–${assignment.end_layer}`,
-                            index,
-                        };
-                    });
-            },
-
-            clusterContextStatusText() {
-                if (this.clusterPlanLoading || this.clusterAutoconfigureLoading) {
-                    return 'Calculating the exact split…';
-                }
-                if (this.clusterPlanError || this.clusterAutoconfigureError) {
-                    return `Does not fit at ${this.clusterTokens(
-                        this.clusterTargetContextTokens
-                    )} — choose a smaller context or allow more memory.`;
-                }
-                const summary = this.clusterContextMemorySummary();
-                if (!summary) return 'Checking model weights and KV cache…';
-                if (
-                    Number(summary.targetTokens)
-                    !== Number(this.clusterTargetContextTokens)
-                ) {
-                    return 'Updating the memory split…';
-                }
-                return `${this.clusterGiB(summary.usedBytes)} reserved across `
-                    + `${summary.usableBytes > 0
-                        ? this.clusterGiB(summary.usableBytes)
-                        : 'the cluster'} allowed`;
-            },
-
-            clusterModelBadge(model) {
-                const fit = this.clusterCatalogueFit(model?.model_path);
-                if (fit?.fits === false) return this.clusterModelFailureLabel(fit);
-                if (model?.model_path === this.clusterPlanModelPath.trim()) return 'Selected';
-                const recommended = this.clusterRecommendedModels();
-                const recommendedIndex = recommended.findIndex(
-                    item => item.model_path === model?.model_path
-                );
-                if (recommendedIndex === 0) return 'Best for this pool';
-                if (fit?.nodes_required > 1) {
-                    return `Uses ${fit.nodes_required} devices`;
-                }
-                if (model?.is_favorite) return 'Favourite';
-                if (model?.loaded) return 'Loaded';
-                if (model?.is_default) return 'Default';
-                if (recommendedIndex > 0) return 'Recommended';
-                return '';
-            },
-
-            clusterModelBadgeTone(model) {
-                const badge = this.clusterModelBadge(model);
-                const fit = this.clusterCatalogueFit(model?.model_path);
-                if (model?.model_path === this.clusterPlanModelPath.trim()) {
-                    return 'bg-white/10 text-white';
-                }
-                if (fit?.failure_kind === 'single_node_only') {
-                    return 'bg-amber-100 text-amber-800';
-                }
-                if (fit?.fits === false) return 'bg-neutral-200 text-neutral-600';
-                if (badge.startsWith('Uses ')) return 'bg-purple-50 text-purple-700';
-                if (badge === 'Favourite') return 'bg-amber-50 text-amber-700';
-                return 'bg-blue-50 text-blue-700';
-            },
-
-            clusterSelectedModelFitLabel() {
-                const model = this.clusterSelectedModel();
-                if (!model) return '';
-                const fit = this.clusterCatalogueFit(model.model_path);
-                if (fit?.fits === false) return this.clusterModelFailureLabel(fit);
-                if (fit?.nodes_required > 1) {
-                    return `Uses ${fit.nodes_required} devices`;
-                }
-                if (this.clusterRecommendedModels()[0]?.model_path === model.model_path) {
-                    return 'Best for this pool';
-                }
-                if (fit?.fits) return 'Fits easily';
-                return '';
-            },
-
-            clusterSelectedModel() {
-                const path = this.clusterPlanModelPath.trim();
-                const source = this.clusterPlanModelSource || '127.0.0.1';
-                const candidates = this.clusterAllModels();
-                return candidates.find(model =>
-                    model.model_path === path
-                    && (model.model_source || '127.0.0.1') === source
-                ) || candidates.find(model => model.model_path === path) || null;
-            },
-
-            clusterPythonExecutableForSsh(ssh) {
-                const target = String(ssh || '').trim();
-                if (!target) return '';
-                if (['127.0.0.1', 'localhost', '::1', 'local'].includes(target)) {
-                    return this.clusterStatus?.runtime?.python_executable || '';
-                }
-                const planned = (this.clusterPlanNodes || []).find(
-                    node => String(node?.ssh || '').trim() === target
-                );
-                if (planned?.python_executable) return planned.python_executable;
-                return this.clusterPeerProbes?.[target]?.status?.runtime
-                    ?.python_executable || '';
-            },
-
-            selectClusterModel(
-                model,
-                requestedContext = null,
-                requestedContextMode = null,
-            ) {
-                if (!model?.model_path) return;
-                this.clusterPlanMode = 'model';
-                this.clusterPlanModelPath = model.model_path;
-                this.clusterPlanModelSource =
-                    model.model_source || '127.0.0.1';
-                this.clusterPlanModelSourcePython =
-                    model.model_source_python
-                    || model.python_executable
-                    || this.clusterPythonExecutableForSsh(
-                        this.clusterPlanModelSource
-                    );
-                const fit = this.clusterCatalogueFit(model.model_path);
-                if (fit?.fits === true) {
-                    const tensorSize = this.clusterFitTensorParallelSize(fit);
-                    if (this.clusterTensorParallelOptions().includes(tensorSize)) {
-                        // The catalogue arrived at this topology using the
-                        // same fit planner. Preview that proven topology rather
-                        // than defaulting every model to pipeline-only — an
-                        // architecture with tensor support but no pipeline
-                        // path otherwise displayed a false refusal.
-                        this.clusterPlanTensorParallelSize = tensorSize;
-                    }
-                }
-                this.clusterContextMode =
-                    requestedContextMode === 'manual' ? 'manual' : 'auto';
-                const pendingAutomaticContext = Number(
-                    requestedContext || 8192
-                );
-                this.clusterTargetContextTokens =
-                    this.clusterContextMode === 'auto'
-                        ? (
-                            fit?.fits === true
-                            && Number(fit.max_context_tokens || 0) > 0
-                                ? this.clusterContextMaximumTokens()
-                                : Math.max(1, Math.min(
-                                    pendingAutomaticContext,
-                                    Number(model.model_context_length || 8192),
-                                    1_048_576,
-                                ))
-                        )
-                        : this.clusterModelTargetContext(
-                            model,
-                            Number(
-                                requestedContext
-                                || model.model_context_length
-                                || 8192
-                            ),
-                        );
-                // The model-adjacent context picker is the single source of
-                // truth. Clear the retired advanced override so an old value
-                // cannot make the runtime cache differ from the visible plan.
-                this.clusterMaxKvSize = '';
-                this.clusterAutoconfigure = null;
-                this.clusterCatalogueError = '';
-                this.clusterShowModelPicker = false;
-                this.clusterWeightTargetsGiB = {};
-                this.invalidateClusterPlan();
-                try {
-                    window.localStorage.setItem(
-                        'omlx.cluster.selectedModel',
-                        JSON.stringify({
-                            model_path: model.model_path,
-                            model_source: this.clusterPlanModelSource,
-                            model_source_python:
-                                this.clusterPlanModelSourcePython || undefined,
-                            target_context_tokens:
-                                this.clusterTargetContextTokens,
-                            context_mode: this.clusterContextMode,
-                        })
-                    );
-                } catch (_) {
-                    // Remembering the picker is a convenience only.
-                }
-                // On first load the catalogue has not yet selected the
-                // architecture's viable tensor degree. The initializer will
-                // preview immediately after that fit result arrives.
-                if (this.clusterCatalogue) this.previewClusterWeightBalance();
-            },
-
-            clusterCatalogueFit(modelPath) {
-                return (this.clusterCatalogue?.models || []).find(
-                    fit => fit.model_path === modelPath
-                ) || null;
-            },
-
-            clusterTensorParallelOptions() {
-                const nodes = Math.max(1, this.clusterPlanNodes.length);
-                return nodes > 1 ? [1, nodes] : [1];
-            },
-
-            // The catalogue fit is the FEWEST-node plan: a model that fits one
-            // Mac reports tensor_parallel_size=1 even when two Macs are wired.
-            // Adopting that 1 into a 2-node plan builder made every preview a
-            // pipeline plan, which 400s for architectures without the MLX-LM
-            // pipeline forward path. Translate the fit into the topology valid
-            // for the nodes actually configured.
-            clusterFitTensorParallelSize(fit) {
-                const nodes = Math.max(1, this.clusterPlanNodes.length);
-                const fitted = Number(fit?.tensor_parallel_size || 1);
-                if (Number(fit?.nodes_required || 1) >= nodes) return fitted;
-                // Force full tensor only when the architecture actually
-                // supports it — both flags can be false (unsplittable), and
-                // tp=nodes there turns the accurate "cannot combine Macs"
-                // refusal into a confusing heads-divisibility error.
-                if (
-                    fit?.supports_pipeline === false
-                    && fit?.supports_tensor_parallel === true
-                ) return nodes;
-                // Pipeline is possible too: keep whatever is selected.
-                return Number(this.clusterPlanTensorParallelSize) || 1;
-            },
-
-            normalizeClusterTensorParallelSize() {
-                const options = this.clusterTensorParallelOptions();
-                const current = Number(this.clusterPlanTensorParallelSize);
-                // Snap an out-of-range value to the largest available degree
-                // (tensor parallelism) rather than 1 (pipeline) — several
-                // architectures (VLMs) support tensor but not the MLX-LM
-                // pipeline forward path, so 1 would make the only valid plan
-                // fail. This must also fire when the cluster genuinely shrank
-                // to one node (options === [1]); leaving a stale multi-way
-                // size there sends /plan a world size that cannot divide. The
-                // transient-poll wipe this used to cause is prevented
-                // upstream: the poll skips resync mid-activation and only
-                // rebuilds the node set when it actually changed.
-                if (!options.includes(current)) {
-                    this.clusterPlanTensorParallelSize =
-                        options[options.length - 1];
-                    this.invalidateClusterPlan();
-                }
-                // tp=1 on a multi-node cluster means pipeline. For a model whose
-                // architecture cannot pipeline the only valid multi-node plan is
-                // full tensor; leaving 1 here guarantees a 400 from /plan on
-                // every preview.
-                const fit = this.clusterCatalogueFit(
-                    this.clusterPlanModelPath.trim()
-                );
-                if (
-                    options.length > 1
-                    && Number(this.clusterPlanTensorParallelSize) === 1
-                    && fit?.fits === true
-                    && fit.supports_pipeline === false
-                    && fit.supports_tensor_parallel === true
-                ) {
-                    this.clusterPlanTensorParallelSize =
-                        options[options.length - 1];
-                    this.invalidateClusterPlan();
-                }
-            },
-
-            clusterLiveJobs() {
-                return (this.clusterStatus?.runtime_jobs?.jobs || []).filter(job => job.live);
-            },
-
-            clusterPrimaryDeployment() {
-                const selected = this.clusterPlanModelPath.trim();
-                return (this.clusterDeployments || []).find(
-                    deployment => deployment.model === selected
-                ) || (this.clusterDeployments || [])[0] || null;
-            },
-
-            clusterQuickStatus() {
-                const selected = this.clusterSelectedModel();
-                const deployment = this.clusterPrimaryDeployment();
-                const liveJobs = this.clusterLiveJobs();
-                const error = this.clusterAutoconfigureError
-                    || this.clusterError
-                    || this.clusterDeploymentsError;
-
-                if (this.clusterDeactivatingId) {
-                    return {
-                        key: 'stopping',
-                        label: 'Stopping…',
-                        detail: 'The workers are finishing their current work safely.',
-                        tone: 'blue',
-                        busy: true,
-                    };
-                }
-                if (this.clusterActivationLoading) {
-                    return {
-                        key: 'starting',
-                        label: this.clusterActivationProgress || 'Preparing model…',
-                        detail: `oMLX is starting the model on ${this.clusterQuickNodes().length} devices.`,
-                        tone: 'blue',
-                        busy: true,
-                    };
-                }
-                if (this.clusterAutoconfigureLoading || this.clusterLinkSetupLoading) {
-                    return {
-                        key: 'preparing',
-                        label: this.clusterLinkSetupLoading
-                            ? 'Connecting the workers…'
-                            : 'Preparing the model…',
-                        detail: 'Connection, memory, and model split checks are automatic.',
-                        tone: 'blue',
-                        busy: true,
-                    };
-                }
-                if (deployment) {
-                    const deployedModel = this.clusterAllModels().find(
-                        model => model.model_path === deployment.model
-                    );
-                    const name = deployedModel
-                        ? this.clusterModelDisplayName(deployedModel)
-                        : String(deployment.model || 'The selected model').split('/').pop();
-                    if (liveJobs.length) {
-                        return {
-                            key: 'running',
-                            label: `Running on ${this.clusterQuickNodes().length} devices`,
-                            detail: `${name} is loaded and available through oMLX.`,
-                            tone: 'green',
-                            busy: false,
-                        };
-                    }
-                    return {
-                        key: 'stopped',
-                        label: 'Cluster is stopped',
-                        detail: `${name} is configured but its weights are not loaded.`,
-                        tone: 'amber',
-                        busy: false,
-                    };
-                }
-                if (error) {
-                    return {
-                        key: 'error',
-                        label: 'Needs attention',
-                        detail: 'oMLX kept the cluster stopped. Open the message below for the fix.',
-                        tone: 'red',
-                        busy: false,
-                    };
-                }
-                if (!this.clusterPeerSsh.trim()) {
-                    return {
-                        key: 'finding',
-                        label: 'Finding workers…',
-                        detail: 'Keep every worker awake and connected to the cluster network.',
-                        tone: 'blue',
-                        busy: this.clusterDiscoveryLoading,
-                    };
-                }
-                if (this.clusterPeerProbeLoading
-                    || this.clusterFabricLoading
-                    || this.clusterLinkStatusLoading
-                    || !this.clusterPeerProbe) {
-                    return {
-                        key: 'checking',
-                        label: 'Checking the connection…',
-                        detail: 'oMLX is confirming every worker and the fastest shared links.',
-                        tone: 'blue',
-                        busy: true,
-                    };
-                }
-                // Strictly false, not merely not-true: a payload that predates
-                // the runtime fields carries no verdict, and rendering it red
-                // would invent a measurement nobody took.
-                if (this.clusterPeerProbe.runtime_compatible === false) {
-                    const mismatches = Array.isArray(
-                        this.clusterPeerProbe.runtime_mismatches
-                    ) ? this.clusterPeerProbe.runtime_mismatches.filter(Boolean) : [];
-                    // bootstrap_required means oMLX is absent or unverifiable on
-                    // that Mac, not that two runtimes disagree. The two need
-                    // different actions, so they must not share a headline.
-                    if (this.clusterPeerProbe.bootstrap_required) {
-                        return {
-                            key: 'bootstrap',
-                            label: 'Worker runtime setup needed',
-                            detail: this.clusterConnectionError
-                                || mismatches[0]
-                                || 'This worker is reachable, but its oMLX runtime could not be verified.',
-                            tone: 'amber',
-                            busy: false,
-                        };
-                    }
-                    return {
-                        key: 'runtime-mismatch',
-                        label: 'Worker runtime mismatch',
-                        detail: mismatches.join(' · ')
-                            || 'The worker runtime differs from this Mac.',
-                        tone: 'red',
-                        busy: false,
-                    };
-                }
-                if (this.clusterPeerProbe.runtime_compatible !== true) {
-                    return {
-                        key: 'runtime-unverified',
-                        label: 'Worker runtime not verified',
-                        detail: 'This worker is reachable, but oMLX could not verify its runtime yet.',
-                        tone: 'amber',
-                        busy: false,
-                    };
-                }
-                if (this.clusterCatalogueLoading && !selected) {
-                    return {
-                        key: 'choosing',
-                        label: 'Choosing a model…',
-                        detail: 'oMLX is checking which downloaded models fit this accelerator pool.',
-                        tone: 'blue',
-                        busy: true,
-                    };
-                }
-                if (!selected) {
-                    return {
-                        key: 'model',
-                        label: 'Choose a model',
-                        detail: 'Pick a recommendation or search all downloaded models.',
-                        tone: 'amber',
-                        busy: false,
-                    };
-                }
-                const selectedFit = this.clusterCatalogueFit(selected.model_path);
-                if (selectedFit?.fits === false) {
-                    return {
-                        key: 'model',
-                        label: selectedFit.failure_kind === 'single_node_only'
-                            ? `${this.clusterFriendlyMacName(
-                                selectedFit.standalone_node_id
-                            )} only`
-                            : (selectedFit.failure_kind === 'cannot_split'
-                                ? 'Cannot combine these devices'
-                                : 'Choose another model'),
-                        detail: selectedFit.reason
-                            || 'The selected model cannot run with this cluster configuration.',
-                        tone: 'amber',
-                        busy: false,
-                    };
-                }
-                return {
-                    key: 'ready',
-                    label: 'Ready',
-                    detail: 'Every worker and the selected model passed the setup checks.',
-                    tone: 'green',
-                    busy: false,
-                };
-            },
-
-            clusterQuickStatusTone() {
-                return {
-                    green: 'bg-green-50 text-green-700 border border-green-200',
-                    red: 'bg-red-50 text-red-700 border border-red-200',
-                    blue: 'bg-blue-50 text-blue-700 border border-blue-200',
-                    amber: 'bg-amber-50 text-amber-700 border border-amber-200',
-                }[this.clusterQuickStatus().tone]
-                    || 'bg-neutral-50 text-neutral-600 border border-neutral-200';
-            },
-
-            clusterPrimaryActionDisabled() {
-                const selected = this.clusterSelectedModel();
-                const rejected = selected
-                    && this.clusterCatalogueFit(selected.model_path)?.fits === false;
-                const stopping = this.clusterPrimaryDeployment()
-                    && this.clusterLiveJobs().length;
-                return Boolean(
-                    this.clusterDeactivatingId
-                    || this.clusterActivationLoading
-                    || this.clusterAutoconfigureLoading
-                    || this.clusterLinkSetupLoading
-                    || this.clusterPeerProbeLoading
-                    || this.clusterFabricLoading
-                    || this.clusterLinkStatusLoading
-                    || (this.clusterDiscoveryLoading && !this.clusterPeerSsh.trim())
-                    || (rejected && !stopping)
-                );
-            },
-
-            clusterPrimaryBlockReason() {
-                // Why the primary button will not act, in words. A disabled
-                // button with no reason cost an hour of "it just seems to not
-                // launch": the catalogue had rejected the plan and nothing
-                // said so.
-                if (this.clusterDeactivatingId) return 'Stopping the current deployment…';
-                if (this.clusterActivationLoading) return 'Activation is already running.';
-                const busy = [
-                    ['clusterAutoconfigureLoading', 'measuring the workers'],
-                    ['clusterLinkSetupLoading', 'setting up the link'],
-                    ['clusterPeerProbeLoading', 'probing the worker'],
-                    ['clusterFabricLoading', 'reading the fabric'],
-                    ['clusterLinkStatusLoading', 'checking the link'],
-                ].find(([flag]) => this[flag]);
-                if (busy) return `Still ${busy[1]} — wait a moment, then try again.`;
-                if (this.clusterDiscoveryLoading && !this.clusterPeerSsh.trim()) {
-                    return 'Still discovering workers on the network.';
-                }
-                const selected = this.clusterSelectedModel();
-                const fit = selected
-                    ? this.clusterCatalogueFit(selected.model_path)
-                    : null;
-                if (fit?.fits === false && !(this.clusterPrimaryDeployment() && this.clusterLiveJobs().length)) {
-                    return `This plan cannot launch — ${fit.reason || fit.summary || 'the catalogue rejected it'}. Adjust the split or memory settings.`;
-                }
-                return '';
-            },
-
-            clusterPrimaryActionLabel() {
-                if (this.clusterDeactivatingId) return 'Stopping…';
-                if (this.clusterActivationLoading) {
-                    return this.clusterActivationProgress || 'Starting on every worker…';
-                }
-                if (this.clusterLinkSetupLoading) return 'Connecting the workers…';
-                if (this.clusterAutoconfigureLoading) return 'Preparing the model…';
-                if (this.clusterPrimaryDeployment() && this.clusterLiveJobs().length) {
-                    return 'Stop';
-                }
-                if (!this.clusterAllModels().length) return 'Get a model';
-                if (!this.clusterPeerSsh.trim()) {
-                    return this.clusterDiscoveryLoading
-                        ? 'Finding workers…'
-                        : 'Find workers';
-                }
-                const model = this.clusterSelectedModel();
-                if (!model) return 'Choose a model';
-                if (this.clusterCatalogueFit(model.model_path)?.fits === false) {
-                    return 'Choose a cluster-compatible model';
-                }
-                if (this.clusterError || this.clusterAutoconfigureError) {
-                    return `Retry ${this.clusterModelDisplayName(model)} setup`;
-                }
-                return `Start ${this.clusterModelDisplayName(model)} on ${this.clusterQuickNodes().length} devices`;
-            },
-
-            async runClusterPrimaryAction() {
-                if (this.clusterPrimaryActionDisabled()) {
-                    // Never swallow a click: say what is blocking, in the same
-                    // banner server errors use.
-                    const reason = this.clusterPrimaryBlockReason();
-                    if (reason) this.clusterError = reason;
-                    return;
-                }
-                const deployment = this.clusterPrimaryDeployment();
-                if (deployment && this.clusterLiveJobs().length) {
-                    await this.deactivateClusterDeployment(deployment.deployment_id);
-                    await this.loadClusterRuntime();
-                    this.clusterActivationResult = null;
-                    return;
-                }
-                if (!this.clusterAllModels().length) {
-                    this.setMainTab('models');
-                    return;
-                }
-                if (!this.clusterPeerSsh.trim()) {
-                    this._clusterDiscoveryRefreshCounter = 0;
-                    await this.discoverClusterPeers();
-                    await this.initializeClusterSetup();
-                    return;
-                }
-                if (!this.clusterSelectedModel()) {
-                    if (!this.clusterCatalogue && !this.clusterCatalogueLoading) {
-                        await this.loadClusterCatalogue();
-                    }
-                    this.clusterShowModelPicker = true;
-                    return;
-                }
-                await this.startCluster();
-            },
-
-            clusterNodeId(...candidates) {
-                const pattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-                for (const candidate of candidates) {
-                    const value = String(candidate || '').trim();
-                    if (pattern.test(value)) return value;
-                }
-                return '';
-            },
-
-            clusterFriendlyMacName(name, fallback = 'Mac') {
-                let value = String(name || '').trim().replace(/\.local$/i, '');
-                value = value.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
-                if (!value) return fallback;
-                value = value.replace(/\bmacbook\b/i, 'MacBook');
-                if (/^(?:omlx\s+on\s+)?(?:mac\s+)?studio$/i.test(value)) {
-                    return 'Mac Studio';
-                }
-                return value;
-            },
-
-            clusterNodeHardwareLabel(node) {
-                if (Number(node?.memberCount || 0) > 1) {
-                    const members = Number(node.memberCount);
-                    const memory = Number(node.physicalMemory || 0) / (1024 ** 3);
-                    const parts = [
-                        `${members}× ${node.accelerator === 'cuda' ? 'NVIDIA CUDA' : 'accelerator'} ${node.fabricVerified ? 'verified pair' : 'pair'}`,
-                    ];
-                    if (node.chip) parts.push(node.chip);
-                    if (memory > 0) parts.push(`${Math.round(memory)} GB pooled`);
-                    return parts.join(' · ');
-                }
-                const parts = [
-                    this.clusterFriendlyMacName(node?.name || node?.ssh, 'Mac'),
-                ];
-                const chip = String(node?.chip || '')
-                    .trim()
-                    .replace(/^Apple\s+/i, '');
-                if (chip) parts.push(chip);
-                const physicalBytes = Number(node?.physicalMemory || 0);
-                const physicalGiB = Number(node?.physicalGiB || 0);
-                const memoryGiB = physicalBytes > 0
-                    ? physicalBytes / (1024 ** 3)
-                    : physicalGiB;
-                if (Number.isFinite(memoryGiB) && memoryGiB > 0) {
-                    parts.push(`${Math.round(memoryGiB)} GB`);
-                }
-                return parts.join(' · ');
-            },
-
-            // Kept as a compatibility seam for extensions that used the old
-            // Mac-only helper. New UI code calls clusterNodeHardwareLabel.
-            clusterMacHardwareLabel(node) {
-                return this.clusterNodeHardwareLabel(node);
-            },
-
-            clusterNodeRankLabel(node) {
-                const ranks = Array.isArray(node?.ranks) && node.ranks.length
-                    ? node.ranks
-                    : [Number(node?.rank || 0)];
-                const rankLabel = ranks.length > 1
-                    ? `R${Math.min(...ranks)}–R${Math.max(...ranks)}`
-                    : `R${ranks[0]}`;
-                if (node?.local) return `Coordinator · ${rankLabel}`;
-                if (ranks.length > 1) {
-                    return `${node?.fabricVerified ? 'Verified CUDA pair' : 'CUDA pair'} · ${rankLabel}`;
-                }
-                return `Worker · ${rankLabel}`;
-            },
-
-            clusterWorkerPeers() {
-                const selected = this.clusterSelectedPeers || [];
-                if (selected.length) return selected;
-                const ssh = this.clusterPeerSsh.trim();
-                if (!ssh) return [];
-                const discovered = (this.clusterDiscoveredPeers || []).find(
-                    peer => peer.ssh === ssh
-                );
-                return [discovered || { ssh, name: this.clusterPeerDisplayName() }];
-            },
-
-            clusterQuickNodes() {
-                const localHardware = this.clusterStatus?.node || {};
-                const plannedBySsh = new Map(
-                    (this.clusterPlanNodes || [])
-                        .filter(node => String(node?.ssh || '').trim())
-                        .map(node => [String(node.ssh).trim(), node])
-                );
-                const localPlan = plannedBySsh.get('127.0.0.1')
-                    || this.clusterPlanNodes?.[0]
-                    || {};
-                const local = {
-                    rank: 0,
-                    name: this.clusterFriendlyMacName(
-                        this.clusterStatus?.node?.hostname,
-                        'This Mac',
-                    ),
-                    ssh: '127.0.0.1',
-                    local: true,
-                    connected: true,
-                    online: true,
-                    chip: this.clusterStatus?.node?.chip_name || '',
-                    memory: Number(
-                        this.clusterStatus?.node?.recommended_working_set_bytes || 0
-                    ),
-                    physicalMemory: Number(
-                        this.clusterStatus?.node?.physical_memory_bytes || 0
-                    ),
-                    accelerator: localHardware.accelerator || 'metal',
-                    acceleratorVendor: localHardware.accelerator_vendor || 'apple',
-                    memoryKind: localHardware.memory_kind || 'unified',
-                    fabricKind: localPlan.fabric_kind || localHardware.fabric_kind || '',
-                    fabricGroup: localPlan.fabric_group_id || localHardware.fabric_group_id || '',
-                    fabricVerified: Boolean(
-                        localPlan.fabric_verified || localHardware.fabric_verified
-                    ),
-                };
-                const nodes = [local, ...this.clusterWorkerPeers().map((peer, index) => {
-                    const ssh = String(peer?.ssh || '').trim();
-                    const planned = plannedBySsh.get(ssh) || {};
-                    const probe = this.clusterPeerProbes?.[ssh]
-                        || (index === 0 ? this.clusterPeerProbe : null);
-                    const hardware = probe?.status?.node || {};
-                    const compatible = Boolean(probe?.runtime_compatible);
-                    return {
-                        rank: index + 1,
-                        name: this.clusterFriendlyMacName(
-                            hardware.hostname || peer.name || ssh,
-                            `Worker ${index + 1}`,
-                        ),
-                        ssh,
-                        local: false,
-                        connected: Boolean(
-                            peer.rdma_available
-                            || (peer.transport && peer.transport !== 'detecting')
-                            || probe?.ssh_reachable
-                            || compatible
-                        ),
-                        online: (
-                            this.clusterPeerHealth?.peers?.find(
-                                item => Number(item.rank) === index + 1
-                            )?.healthy
-                        ) ?? Boolean(
-                            peer.rdma_available
-                            || (peer.transport && peer.transport !== 'detecting')
-                            || probe?.ssh_reachable
-                            || compatible
-                        ),
-                        chip: hardware.chip_name || peer.chip_name || '',
-                        memory: Number(
-                            hardware.recommended_working_set_bytes
-                            || peer.recommended_working_set_bytes
-                            || 0
-                        ),
-                        physicalMemory: Number(
-                            hardware.physical_memory_bytes
-                            || peer.physical_memory_bytes
-                            || 0
-                        ),
-                        accelerator: hardware.accelerator
-                            || peer.accelerator
-                            || 'metal',
-                        acceleratorVendor: hardware.accelerator_vendor
-                            || peer.accelerator_vendor
-                            || 'apple',
-                        memoryKind: hardware.memory_kind
-                            || peer.memory_kind
-                            || 'unified',
-                        fabricKind: planned.fabric_kind
-                            || hardware.fabric_kind
-                            || peer.fabric_kind
-                            || '',
-                        fabricGroup: planned.fabric_group_id
-                            || hardware.fabric_group_id
-                            || peer.fabric_group_id
-                            || '',
-                        fabricVerified: Boolean(
-                            planned.fabric_verified
-                            || hardware.fabric_verified
-                            || peer.fabric_verified
-                        ),
-                        transport: peer.transport,
-                        link_speed_gbps: peer.link_speed_gbps,
-                    };
-                })];
-                // Two ConnectX-capable workers with no explicit name are the
-                // common dual-Spark topology. Show them as one candidate pair,
-                // but keep fabricVerified false until the direct-link probe
-                // passes. Larger fabrics require an explicit group ID so
-                // unrelated CUDA nodes are never silently collapsed together.
-                const implicitConnectx = nodes.filter(node => (
-                    node.accelerator === 'cuda'
-                    && node.fabricKind === 'connectx-7'
-                    && !node.fabricGroup
-                ));
-                if (implicitConnectx.length === 2) {
-                    implicitConnectx.forEach(node => {
-                        node.fabricGroup = 'connectx-7-auto-pair';
-                    });
-                }
-                return nodes;
-            },
-
-            clusterLogicalNodes() {
-                const logical = [];
-                const groups = new Map();
-                const physical = this.clusterQuickNodes();
-                const candidateGroups = new Map();
-                physical.forEach(node => {
-                    if (!node.fabricGroup) return;
-                    const members = candidateGroups.get(node.fabricGroup) || [];
-                    members.push(node);
-                    candidateGroups.set(node.fabricGroup, members);
-                });
-                const eligibleGroups = new Set(
-                    [...candidateGroups.entries()]
-                        .filter(([, members]) => (
-                            members.length >= 2
-                            && members.every(item => item.accelerator === 'cuda')
-                        ))
-                        .map(([group]) => group)
-                );
-                physical.forEach(node => {
-                    if (!node.fabricGroup || !eligibleGroups.has(node.fabricGroup)) {
-                        logical.push({ ...node, ranks: [node.rank], memberCount: 1 });
-                        return;
-                    }
-                    let composite = groups.get(node.fabricGroup);
-                    if (!composite) {
-                        composite = {
-                            ...node,
-                            name: 'CUDA fabric pair',
-                            local: false,
-                            ranks: [],
-                            members: [],
-                            memberCount: 0,
-                            memory: 0,
-                            physicalMemory: 0,
-                        };
-                        groups.set(node.fabricGroup, composite);
-                        logical.push(composite);
-                    }
-                    composite.ranks.push(node.rank);
-                    composite.members.push(node);
-                    composite.memberCount += 1;
-                    composite.memory += Number(node.memory || 0);
-                    composite.physicalMemory += Number(node.physicalMemory || 0);
-                    composite.connected = composite.members.every(item => item.connected);
-                    composite.online = composite.members.every(item => item.online);
-                    composite.fabricVerified = composite.members.every(
-                        item => item.fabricVerified
-                    );
-                    composite.chip = composite.members
-                        .map(item => String(item.chip || '').replace(/^NVIDIA\s+/i, ''))
-                        .filter(Boolean)
-                        .filter((value, index, values) => values.indexOf(value) === index)
-                        .join(' + ');
-                    const verification = (this.clusterCudaFabricVerifications || {})[
-                        this.clusterCudaFabricVerificationKey(composite)
-                    ];
-                    if (verification?.verified) {
-                        composite.fabricVerified = true;
-                        composite.fabricVerification = verification;
-                        composite.name = 'Verified CUDA pair';
-                    }
-                });
-                return logical;
-            },
-
-            clusterCudaFabricVerificationKey(node) {
-                return (node?.members || [])
-                    .map(member => String(member?.ssh || '').trim())
-                    .filter(Boolean)
-                    .sort()
-                    .join('|');
-            },
-
-            clusterCanVerifyCudaSupernode(node) {
-                return Boolean(
-                    Number(node?.memberCount || 0) === 2
-                    && node?.accelerator === 'cuda'
-                    && (node.members || []).every(member => member.online)
-                    && !this.clusterActivationLoading
-                    && !this.clusterNeuralFabricJob()?.live
-                );
-            },
-
-            clusterCudaFabricRateLabel(node) {
-                const result = node?.fabricVerification
-                    || (this.clusterCudaFabricVerifications || {})[
-                        this.clusterCudaFabricVerificationKey(node)
-                    ];
-                const rate = Number(result?.payload_bytes_per_second || 0);
-                return rate > 0
-                    ? `${(rate / (1024 ** 3)).toFixed(1)} GiB/s NCCL`
-                    : '';
-            },
-
-            async verifyCudaSupernode(node) {
-                const key = this.clusterCudaFabricVerificationKey(node);
-                if (!key || this.clusterCudaFabricVerificationLoading) return false;
-                if (!this.clusterCanVerifyCudaSupernode(node)) {
-                    this.clusterCudaFabricVerificationError =
-                        'Both CUDA workers must be online before the direct link can be verified.';
-                    return false;
-                }
-                this.clusterCudaFabricVerificationLoading = key;
-                this.clusterCudaFabricVerificationError = '';
-                try {
-                    const response = await fetch('/admin/api/cluster/cuda-fabric/verify', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            hosts: node.members.map(member => ({
-                                node_id: member.name || member.ssh,
-                                ssh: member.ssh,
-                            })),
-                        }),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return false;
-                    }
-                    if (!response.ok) {
-                        throw new Error(
-                            await this.clusterResponseError(
-                                response,
-                                'ConnectX verification failed'
-                            )
-                        );
-                    }
-                    const result = await response.json();
-                    this.clusterCudaFabricVerifications = {
-                        ...this.clusterCudaFabricVerifications,
-                        [key]: result,
-                    };
-                    if (!result.verified) {
-                        this.clusterCudaFabricVerificationError = result.reason
-                            || 'NCCL ran, but the direct link was slower than expected.';
-                        return false;
-                    }
-                    const memberSsh = new Set(node.members.map(member => member.ssh));
-                    this.clusterPlanNodes.forEach(planNode => {
-                        if (!memberSsh.has(String(planNode.ssh || '').trim())) return;
-                        planNode.fabric_kind = 'connectx-7';
-                        planNode.fabric_group_id = result.group_id;
-                        planNode.fabric_verified = true;
-                    });
-                    this.invalidateClusterPlan();
-                    return true;
-                } catch (error) {
-                    this.clusterCudaFabricVerificationError = error?.message
-                        || 'ConnectX verification failed';
-                    return false;
-                } finally {
-                    this.clusterCudaFabricVerificationLoading = '';
-                }
-            },
-
-            async ensureCudaSupernodesVerified() {
-                const candidates = this.clusterLogicalNodes().filter(node => (
-                    node.memberCount === 2
-                    && node.accelerator === 'cuda'
-                ));
-                for (const node of candidates) {
-                    if (!await this.verifyCudaSupernode(node)) return false;
-                }
-                return true;
-            },
-
-            async prepareCudaSupernodesForActivation({ rebuildPlan = false } = {}) {
-                const planRevision = Number(this._clusterPlanRevision || 0);
-                if (
-                    typeof this.ensureCudaSupernodesVerified === 'function'
-                    && !await this.ensureCudaSupernodesVerified()
-                ) {
-                    const message = this.clusterCudaFabricVerificationError
-                        || 'Verify the CUDA direct link before starting the cluster.';
-                    if (rebuildPlan) this.clusterPlanError = message;
-                    else this.clusterAutoconfigureError = message;
-                    return false;
-                }
-                if (
-                    rebuildPlan
-                    && Number(this._clusterPlanRevision || 0) !== planRevision
-                ) {
-                    await this.runClusterPlan();
-                    if (!this.clusterActivationReady()) {
-                        this.clusterPlanError = this.clusterPlanError
-                            || 'Rebuild the plan after verifying the CUDA direct link.';
-                        return false;
-                    }
-                }
-                return true;
-            },
-
-            clusterNeuralFabricJob() {
-                const jobs = this.clusterStatus?.runtime_jobs?.jobs || [];
-                return jobs.find(job => job.live) || null;
-            },
-
-            clusterNeuralFabricMode() {
-                const job = this.clusterNeuralFabricJob();
-                if (this.clusterDeactivatingId) return 'stopping';
-                if (
-                    this.clusterActivationLoading
-                    || (job?.live && job.phase !== 'ready')
-                ) {
-                    return 'loading';
-                }
-                const activeRequests = Number(job?.metrics?.active_requests || 0);
-                if (activeRequests > 0) {
-                    const request = job?.metrics?.last_request;
-                    if (
-                        request?.prefill_progress?.active
-                        || request?.ttft_seconds === null
-                        || request?.ttft_seconds === undefined
-                    ) {
-                        return 'prefill';
-                    }
-                    if (Number(request?.completion_tokens || 0) > 0) {
-                        return 'decode';
-                    }
-                    const batch = job?.metrics?.pipeline?.last_batch;
-                    if (Number(batch?.generation_responses || 0) > 0) return 'decode';
-                    if (Number(batch?.prompt_responses || 0) > 0) return 'prefill';
-                    return 'inference';
-                }
-                if (job?.live && job.phase === 'ready') return 'ready';
-                if (
-                    this.clusterAutoconfigureError
-                    || this.clusterError
-                    || this.clusterDeploymentsError
-                ) {
-                    return 'attention';
-                }
-                if (this.clusterQuickNodes().length > 1) return 'connected';
-                return 'discovering';
-            },
-
-            clusterNeuralFabricLabel() {
-                return {
-                    stopping: 'Draining requests safely',
-                    loading: 'Loading model across the ring',
-                    prefill: 'Prefilling prompt across every rank',
-                    decode: 'Decoding tokens across every rank',
-                    inference: 'Ranks are processing a live request',
-                    ready: 'Cluster ready for requests',
-                    attention: 'Cluster needs attention',
-                    connected: 'Workers connected and standing by',
-                    discovering: 'Looking for another worker',
-                }[this.clusterNeuralFabricMode()] || 'Cluster standing by';
-            },
-
-            clusterNeuralFabricFiring() {
-                return ['loading', 'prefill', 'decode', 'inference'].includes(
-                    this.clusterNeuralFabricMode()
-                );
-            },
-
-            clusterNeuralFabricNodes() {
-                const nodes = this.clusterLogicalNodes();
-                const job = this.clusterNeuralFabricJob();
-                const assignments = job?.assignments || [];
-                const ranks = job?.ranks || [];
-                const memoryNodes = this.clusterMemoryNodes();
-                const positions = nodes.length === 1
-                    ? [{ x: 50, y: 50 }]
-                    : (nodes.length === 2
-                        ? [{ x: 21, y: 50 }, { x: 79, y: 50 }]
-                        : nodes.map((_, index) => {
-                            const angle = (-Math.PI / 2)
-                                + ((Math.PI * 2 * index) / nodes.length);
-                            return {
-                                x: 50 + (Math.cos(angle) * 36),
-                                y: 50 + (Math.sin(angle) * 34),
-                            };
-                        }));
-                return nodes.map((node, index) => {
-                    const memberRanks = Array.isArray(node.ranks)
-                        ? node.ranks.map(Number)
-                        : [Number(node.rank)];
-                    const memberAssignments = assignments.filter(
-                        item => memberRanks.includes(Number(item.rank))
-                    );
-                    const memberRuntimeRanks = ranks.filter(
-                        item => memberRanks.includes(Number(item.rank))
-                    );
-                    const measured = memberRuntimeRanks.reduce(
-                        (total, rank) => total + Number(rank?.measured_weight_bytes || 0),
-                        0
-                    );
-                    const planned = memberAssignments.reduce(
-                        (total, assignment) => total + Number(assignment?.planned_weight_bytes || 0),
-                        0
-                    );
-                    const capacity = memberAssignments.reduce(
-                        (total, assignment) => total + Number(assignment?.capacity_bytes || 0),
-                        0
-                    );
-                    const available = memberRanks
-                        .reduce(
-                            (total, rank) => total + Number(
-                                memoryNodes[rank]?.usableGiB || 0
-                            ),
-                            0
-                        )
-                        || (Number(node.memory || 0) / (1024 ** 3));
-                    let memoryLabel = available > 0
-                        ? `${this.clusterMemoryGiBLabel(available)} usable`
-                        : 'Memory not measured';
-                    if (capacity > 0) {
-                        memoryLabel = `${this.formatClusterGiB(measured || planned)} / `
-                            + `${this.formatClusterGiB(capacity)}`;
-                    }
-                    const working = this.clusterNeuralFabricFiring()
-                        && Boolean(job?.live || this.clusterActivationLoading);
-                    return {
-                        ...node,
-                        ...positions[index],
-                        memoryLabel,
-                        working,
-                        state: working
-                            ? (this.clusterNeuralFabricMode() === 'loading'
-                                ? 'Loading'
-                                : 'Firing')
-                            : (job?.live && job.phase === 'ready'
-                                ? 'Ready'
-                                : (node.online ? 'Online' : 'Checking')),
-                    };
-                });
-            },
-
-            clusterNeuralFabricEdges() {
-                const nodes = this.clusterNeuralFabricNodes();
-                if (nodes.length < 2) return [];
-                if (nodes.length === 2) {
-                    return [
-                        {
-                            key: '0-1',
-                            path: `M ${nodes[0].x} ${nodes[0].y} `
-                                + `C 38 21, 62 21, ${nodes[1].x} ${nodes[1].y}`,
-                            reverse: false,
-                        },
-                        {
-                            key: '1-0',
-                            path: `M ${nodes[1].x} ${nodes[1].y} `
-                                + `C 62 79, 38 79, ${nodes[0].x} ${nodes[0].y}`,
-                            reverse: true,
-                        },
-                    ];
-                }
-                return nodes.map((node, index) => {
-                    const next = nodes[(index + 1) % nodes.length];
-                    return {
-                        key: `${node.rank}-${next.rank}`,
-                        path: `M ${node.x} ${node.y} L ${next.x} ${next.y}`,
-                        reverse: index % 2 === 1,
-                    };
-                });
-            },
-
-            clusterNeuralFabricRingPath() {
-                return this.clusterNeuralFabricEdges()
-                    .map(edge => edge.path)
-                    .join(' ');
-            },
-
-            clusterNeuralFabricProfiles() {
-                return (this.clusterNeuralFabricJob()?.performance_profiles || [])
-                    .filter(profile => profile && typeof profile === 'object');
-            },
-
-            clusterNeuralFabricLatencySeconds() {
-                const values = this.clusterNeuralFabricProfiles()
-                    .map(profile => Number(profile.collective_latency_seconds))
-                    .filter(value => Number.isFinite(value) && value > 0);
-                return values.length ? Math.max(...values) : null;
-            },
-
-            clusterNeuralFabricBandwidthBytes() {
-                const values = this.clusterNeuralFabricProfiles()
-                    .map(profile => Number(
-                        profile.collective_bandwidth_bytes_per_second
-                    ))
-                    .filter(value => Number.isFinite(value) && value > 0);
-                return values.length ? Math.min(...values) : null;
-            },
-
-            clusterNeuralFabricLinkCapacityGbps() {
-                const values = this.clusterQuickNodes()
-                    .slice(1)
-                    .map(node => Number(node.link_speed_gbps))
-                    .filter(value => Number.isFinite(value) && value > 0);
-                if (values.length) return Math.min(...values);
-                const labels = [
-                    this.clusterLinkStatus?.link_label,
-                    ...(
-                        this.clusterStatus?.transport?.thunderbolt?.ports || []
-                    ).filter(port => port.peer_connected).map(port => port.speed),
-                ];
-                const parsed = labels.map(label => {
-                    const match = String(label || '').match(
-                        /(\d+(?:\.\d+)?)\s*Gb\/s/i
-                    );
-                    return match ? Number(match[1]) : null;
-                }).filter(value => Number.isFinite(value) && value > 0);
-                return parsed.length ? Math.min(...parsed) : null;
-            },
-
-            formatClusterLatency(seconds) {
-                const value = Number(seconds);
-                if (!Number.isFinite(value) || value <= 0) return '—';
-                if (value < 0.001) return `${Math.round(value * 1_000_000)} µs`;
-                if (value < 1) return `${(value * 1000).toFixed(
-                    value < 0.01 ? 2 : 1
-                )} ms`;
-                return `${value.toFixed(2)} s`;
-            },
-
-            clusterNeuralFabricMetrics() {
-                const job = this.clusterNeuralFabricJob();
-                const latency = this.clusterNeuralFabricLatencySeconds();
-                const bandwidth = this.clusterNeuralFabricBandwidthBytes();
-                const linkCapacity = this.clusterNeuralFabricLinkCapacityGbps();
-                const lastRequest = job?.metrics?.last_request;
-                const requestActive = Number(
-                    job?.metrics?.active_requests || 0
-                ) > 0;
-                const completionTokens = Math.max(
-                    0,
-                    Number(lastRequest?.completion_tokens || 0),
-                );
-                const hasFirstToken = (
-                    lastRequest?.ttft_seconds !== null
-                    && lastRequest?.ttft_seconds !== undefined
-                    && completionTokens > 0
-                );
-                const prefillProgress = lastRequest?.prefill_progress;
-                const promptTokens = Math.max(
-                    0,
-                    Number(lastRequest?.prompt_tokens || 0),
-                );
-                const cachedTokens = Math.min(
-                    promptTokens,
-                    Math.max(0, Number(lastRequest?.cached_tokens || 0)),
-                );
-                const uncachedTokens = Math.max(0, promptTokens - cachedTokens);
-                const prefillTotal = Math.max(
-                    0,
-                    Number(prefillProgress?.total ?? uncachedTokens),
-                );
-                const prefillProcessed = Math.min(
-                    prefillTotal,
-                    Math.max(0, Number(prefillProgress?.processed || 0)),
-                );
-                const prefillActive = (
-                    requestActive
-                    && !hasFirstToken
-                    && Boolean(prefillProgress?.active ?? true)
-                );
-                const livePrefillAverage = Number(
-                    prefillProgress?.average_speed
-                    || lastRequest?.prefill_tps
-                    || prefillProgress?.speed
-                    || 0
-                );
-                const livePrefillRecent = Number(
-                    prefillProgress?.speed || livePrefillAverage || 0
-                );
-                const rawPrefillEta = prefillProgress?.eta;
-                const prefillEta = rawPrefillEta === null
-                    || rawPrefillEta === undefined
-                    ? null
-                    : Number(rawPrefillEta);
-                const prefillDetail = [];
-                if (livePrefillAverage > 0) {
-                    prefillDetail.push(
-                        `${this.formatClusterRate(livePrefillAverage)} avg`
-                    );
-                }
-                if (
-                    livePrefillRecent > 0
-                    && (
-                        livePrefillAverage <= 0
-                        || Math.abs(livePrefillRecent - livePrefillAverage)
-                            / livePrefillAverage > 0.05
-                    )
-                ) {
-                    prefillDetail.push(
-                        `${this.formatClusterRate(livePrefillRecent)} now`
-                    );
-                }
-                if (Number.isFinite(prefillEta) && prefillEta >= 0) {
-                    prefillDetail.push(`${this.formatDurationShort(prefillEta)} left`);
-                }
-                if (cachedTokens > 0) {
-                    prefillDetail.push(`${this.formatClusterCount(cachedTokens)} cached`);
-                }
-                const resident = job
-                    ? this.clusterRuntimeResidentWeights(job)
-                    : 0;
-                const capacity = job
-                    ? this.clusterRuntimeCapacity(job)
-                    : this.clusterCombinedUsableMemoryGiB() * (1024 ** 3);
-                return [
-                    {
-                        key: 'latency',
-                        label: 'Ring latency',
-                        value: this.formatClusterLatency(latency),
-                        detail: latency
-                            ? 'Latest startup probe · slowest hop'
-                            : 'Measured when the cluster starts',
-                        tone: 'violet',
-                    },
-                    {
-                        key: 'link',
-                        label: bandwidth ? 'Collective throughput' : 'Link capacity',
-                        value: bandwidth
-                            ? this.formatClusterBandwidth(bandwidth)
-                            : (linkCapacity ? `${linkCapacity} Gb/s` : '—'),
-                        detail: bandwidth
-                            ? '1 MiB all-reduce · startup probe · slowest rank'
-                            : (linkCapacity
-                                ? 'Negotiated speed · not measured throughput'
-                                : 'Waiting for link measurement'),
-                        tone: 'cyan',
-                    },
-                    {
-                        key: 'prefill',
-                        label: 'Prompt prefill',
-                        value: prefillActive
-                            ? (
-                                prefillTotal > 0
-                                    ? `${this.formatClusterCount(prefillProcessed)} / `
-                                        + `${this.formatClusterCount(prefillTotal)}`
-                                    : 'Preparing…'
-                            )
-                            : this.formatClusterRate(lastRequest?.prefill_tps),
-                        detail: prefillActive
-                            ? (prefillDetail.join(' · ') || 'Preparing prompt…')
-                            : (
-                                lastRequest
-                                    ? `${this.formatClusterCount(uncachedTokens)} new`
-                                        + (cachedTokens > 0
-                                            ? ` · ${this.formatClusterCount(cachedTokens)} cached`
-                                            : '')
-                                    : 'No request yet'
-                            ),
-                        progress: prefillActive && prefillTotal > 0
-                            ? prefillProcessed / prefillTotal
-                            : null,
-                        tone: 'blue',
-                    },
-                    {
-                        key: 'decode',
-                        label: 'Token decode',
-                        value: !hasFirstToken
-                            ? '—'
-                            : (
-                                completionTokens > 1
-                                    ? this.formatClusterRate(lastRequest?.decode_tps)
-                                    : 'Measuring…'
-                            ),
-                        detail: prefillActive
-                            ? 'Starts after prefill'
-                            : (
-                                requestActive && hasFirstToken
-                                    ? `${this.formatClusterCount(completionTokens)} generated · live`
-                                    : (
-                                        lastRequest
-                                            ? `${this.formatClusterCount(completionTokens)} generated`
-                                            : 'No request yet'
-                                    )
-                            ),
-                        progress: null,
-                        tone: 'green',
-                    },
-                    {
-                        key: 'memory',
-                        label: job ? 'Resident memory' : 'Model memory',
-                        value: job
-                            ? `${this.formatClusterGiB(resident)} / `
-                                + `${this.formatClusterGiB(capacity)}`
-                            : `${this.formatClusterGiB(capacity)} ready`,
-                        detail: job
-                            ? 'Weights resident / cluster capacity'
-                            : 'Usable across detected accelerators',
-                        tone: 'amber',
-                    },
-                ];
-            },
-
-            clusterNeuralFabricAriaLabel() {
-                const metrics = this.clusterNeuralFabricMetrics();
-                const latency = metrics.find(metric => metric.key === 'latency');
-                const link = metrics.find(metric => metric.key === 'link');
-                return `Neural fabric with ${this.clusterLogicalNodes().length} visual groups `
-                    + `and ${this.clusterQuickNodes().length} execution ranks. `
-                    + `${this.clusterNeuralFabricLabel()}. `
-                    + `Ring latency ${latency?.value || 'not measured'}. `
-                    + `${link?.label || 'Link'} ${link?.value || 'not measured'}.`;
-            },
-
-            clusterMemoryNodes() {
-                const quickNodes = this.clusterQuickNodes();
-                return (this.clusterPlanNodes || [])
-                    .slice(0, quickNodes.length)
-                    .map((budget, index) => {
-                        const quick = quickNodes[index] || {};
-                        const capacityGiB = Math.max(
-                            0,
-                            Number(budget.capacity_gib || 0),
-                        );
-                        const reserveGiB = Math.max(
-                            0,
-                            Number(budget.reserve_gib || 0),
-                        );
-                        const measuredAutomaticReserve = Number(
-                            budget.automatic_reserve_gib
-                        );
-                        const automaticReserveGiB = (
-                            Number.isFinite(measuredAutomaticReserve)
-                            && measuredAutomaticReserve >= 0
-                        )
-                            ? Math.min(capacityGiB, measuredAutomaticReserve)
-                            : Math.min(capacityGiB, reserveGiB);
-                        return {
-                            budget,
-                            nodeId: budget.node_id || `device-${index}`,
-                            name: quick.name || budget.node_id || `Device ${index + 1}`,
-                            chip: quick.chip || '',
-                            accelerator: quick.accelerator || 'metal',
-                            acceleratorVendor: quick.acceleratorVendor || 'apple',
-                            memoryKind: quick.memoryKind || 'unified',
-                            fabricKind: quick.fabricKind || '',
-                            fabricGroup: quick.fabricGroup || '',
-                            physicalMemory: Number(quick.physicalMemory || 0),
-                            capacityGiB,
-                            reserveGiB,
-                            usableGiB: Math.max(0, capacityGiB - reserveGiB),
-                            automaticReserveGiB,
-                            minGiB: Math.min(capacityGiB, 4),
-                            physicalGiB: Math.max(
-                                0,
-                                Number(quick.physicalMemory || 0) / (1024 ** 3)
-                            ),
-                        };
-                    });
-            },
-
-            clusterMemoryAllowanceNodes() {
-                return this.clusterMemoryNodes().filter(
-                    node => node.capacityGiB > 0
-                );
-            },
-
-            clusterMemoryAllowanceCustomized() {
-                return this.clusterMemoryAllowanceNodes().some(
-                    node => this.clusterManualMemoryAllowanceGiB(node.nodeId) !== null
-                );
-            },
-
-            clusterSetMemoryAllowance(node, requestedGiB) {
-                if (!node?.budget) return;
-                const capacity = Math.max(0, Number(node.capacityGiB || 0));
-                const minimum = Math.min(capacity, Math.max(0, Number(node.minGiB || 0)));
-                const allowed = Math.min(
-                    capacity,
-                    Math.max(minimum, Number(requestedGiB || 0))
-                );
-                node.budget.reserve_gib = Number((capacity - allowed).toFixed(2));
-                this.clusterMemoryAllowancesGiB = {
-                    ...(this.clusterMemoryAllowancesGiB || {}),
-                    [node.nodeId]: Number(allowed.toFixed(2)),
-                };
-                // The user sets a safety ceiling; layer placement remains an
-                // automatic planner decision within those ceilings.
-                this.clusterMemoryLimitsManual = true;
-                this.saveClusterMemoryAllowances();
-                this.clusterWeightTargetsGiB = {};
-                this.clusterCatalogue = null;
-                this.invalidateClusterPlan();
-            },
-
-            async clusterMemoryAllowanceChanged() {
-                this.clusterCatalogue = null;
-                await this.loadClusterCatalogue();
-                await this.previewClusterWeightBalance();
-            },
-
-            clusterResetMemoryAllowances() {
-                const nodes = this.clusterMemoryAllowanceNodes();
-                this.clusterMemoryAllowancesGiB = {};
-                nodes.forEach(node => {
-                    node.budget.reserve_gib = Number(
-                        node.automaticReserveGiB.toFixed(2)
-                    );
-                });
-                this.clusterMemoryLimitsManual = false;
-                this.saveClusterMemoryAllowances();
-                this.clusterWeightTargetsGiB = {};
-                this.invalidateClusterPlan();
-                this.clusterMemoryAllowanceChanged();
-            },
-
-            clusterMemoryGiBLabel(value) {
-                const gib = Math.max(0, Number(value || 0));
-                return `${Number.isInteger(gib) ? gib : gib.toFixed(1)} GiB`;
-            },
-
-            clusterCombinedUsableMemoryGiB() {
-                return this.clusterMemoryNodes().reduce(
-                    (total, node) => total + node.usableGiB,
-                    0
-                );
-            },
-
-            clusterCombinedPhysicalMemoryGiB() {
-                return this.clusterMemoryNodes().reduce(
-                    (total, node) => total + node.physicalGiB,
-                    0
-                );
-            },
-
-            clusterCombinedMemoryLabel() {
-                const physical = this.clusterCombinedPhysicalMemoryGiB();
-                const usable = this.clusterCombinedUsableMemoryGiB();
-                return `${this.clusterMemoryGiBLabel(usable)} model-usable of `
-                    + `${this.clusterMemoryGiBLabel(physical)} installed`;
-            },
-
-            clusterCombinedMemoryBreakdown() {
-                return this.clusterMemoryNodes()
-                    .map(node => `${node.name} ${this.clusterMemoryGiBLabel(node.usableGiB)}`)
-                    .join(' + ');
-            },
-
-            clusterPairTitle() {
-                const nodes = this.clusterQuickNodes();
-                if (nodes.length === 1) return `${nodes[0].name} · finding workers`;
-                const logical = this.clusterLogicalNodes();
-                const mixed = new Set(nodes.map(node => node.accelerator)).size > 1;
-                if (nodes.length === 2 && !mixed) {
-                    return `${nodes[0].name} + ${nodes[1].name}`;
-                }
-                return `${logical.length} visual group${logical.length === 1 ? '' : 's'} · `
-                    + `${nodes.length} execution rank${nodes.length === 1 ? '' : 's'}`;
-            },
-
-            clusterDeviceCountLabel() {
-                const devices = this.clusterQuickNodes().length;
-                const units = this.clusterLogicalNodes().length;
-                return units === devices
-                    ? `${devices} device${devices === 1 ? '' : 's'}`
-                    : `${units} visual groups · ${devices} execution ranks`;
-            },
-
-            clusterPeerDisplayName() {
-                const hostname = this.clusterPeerProbe?.status?.node?.hostname;
-                if (hostname) return hostname;
-                const ssh = this.clusterPeerSsh.trim();
-                const discovered = (this.clusterDiscoveredPeers || []).find(
-                    peer => peer.ssh === ssh
-                );
-                return discovered?.name || (ssh ? ssh.replace(/\.local$/i, '') : 'Connected Mac');
-            },
-
-            clusterPeerConnected() {
-                return Boolean(
-                    this.clusterStatus?.transport?.thunderbolt?.peer_connected
-                    || this.clusterFabric?.link?.ok
-                    || this.clusterPeerProbe?.runtime_compatible
-                );
-            },
-
-            clusterEffectiveTransportState() {
-                if (
-                    !this.clusterIpsOverridden
-                    && this.clusterFabric?.backend === 'jaccl'
-                    && this.clusterFabric?.rdma?.ok
-                ) {
-                    return 'rdma_ready';
-                }
-                if (this.clusterPeerConnected()) return 'peer_linked_config_pending';
-                return this.clusterStatus?.transport?.state || 'unknown';
-            },
-
-            clusterConnectionLabel() {
-                if (this.clusterIpsOverridden) return 'Manual TCP route';
-                const physical = (
-                    this.clusterStatus?.transport?.thunderbolt?.ports || []
-                ).find(port => port.peer_connected);
-                if (physical?.speed) return physical.speed;
-                if (
-                    this.clusterFabric?.backend === 'jaccl'
-                    && this.clusterFabric?.rdma?.ok
-                ) return 'Thunderbolt RDMA';
-                return this.clusterPeerConnected() ? 'Direct link' : 'Not connected';
-            },
-
-            clusterFriendlyConnectionLabel() {
-                if (this.clusterFabricLoading || this.clusterLinkStatusLoading) {
-                    return 'Checking Thunderbolt…';
-                }
-                if (this.clusterIpsOverridden) {
-                    return 'TCP ring · manual addresses';
-                }
-                const classified = String(this.clusterLinkStatus?.link_label || '').trim();
-                if (classified) return classified.replace(' at ', ' · ');
-                const ssh = this.clusterPeerSsh.trim();
-                const discovered = (this.clusterDiscoveredPeers || []).find(
-                    peer => peer.ssh === ssh
-                );
-                const speed = Number(discovered?.link_speed_gbps || 0);
-                if (speed >= 80) return `Thunderbolt 5 · ${speed} Gb/s`;
-                if (speed >= 40) return `Thunderbolt 4 · ${speed} Gb/s`;
-                if (
-                    this.clusterFabric?.backend === 'jaccl'
-                    && this.clusterFabric?.rdma?.ok
-                ) return 'Thunderbolt RDMA';
-                const physical = (
-                    this.clusterStatus?.transport?.thunderbolt?.ports || []
-                ).find(port => port.peer_connected);
-                if (physical?.speed) return `Thunderbolt · ${physical.speed}`;
-                return this.clusterPeerConnected()
-                    ? 'Direct connection'
-                    : 'Connecting automatically…';
-            },
-
-            clusterVisibleWarnings() {
-                const warnings = this.clusterStatus?.warnings || [];
-                if (this.clusterEffectiveTransportState() !== 'rdma_ready') {
-                    return warnings;
-                }
-                return warnings.filter(
-                    warning => !/no Thunderbolt peer is connected/i.test(warning)
-                );
-            },
-
-            clusterTopologySummary() {
-                const count = this.clusterQuickNodes().length;
-                if (count === 1) {
-                    return `${this.clusterStatus?.node?.hostname || 'This Mac'} · coordinator`;
-                }
-                const link = this.clusterIpsOverridden
-                    ? 'TCP ring · manual addresses'
-                    : (this.clusterFabric?.backend === 'jaccl'
-                        ? 'Thunderbolt RDMA'
-                        : (this.clusterTransports?.transports?.[0]
-                            ? this.clusterTransportLabel(this.clusterTransports.transports[0])
-                            : 'direct link'));
-                return `${count} devices · ${this.clusterStatus?.node?.hostname || 'This device'} coordinates · ${count - 1} workers · ${link}`;
-            },
-
-            clusterCatalogueModels() {
-                return this.clusterAllModels()
-                    .filter(model => model?.model_path)
-                    .map(model => ({
-                        id: model.id || this.clusterModelDisplayName(model),
-                        model_path: model.model_path,
-                        model_source: model.model_source || '127.0.0.1',
-                        model_source_python:
-                            model.model_source_python
-                            || model.python_executable
-                            || this.clusterPythonExecutableForSsh(
-                                model.model_source || '127.0.0.1'
-                            )
-                            || undefined,
-                        source_node_id: model.source_node_id || '',
-                        model_context_length:
-                            model.model_context_length || null,
-                    }));
-            },
-
-            clusterCatalogueInputsReady() {
-                const peers = this.clusterWorkerPeers();
-                if (!peers.length) return false;
-                if (
-                    this.clusterPeerProbeLoading
-                    || this.clusterBudgetsLoading
-                    || this.clusterFabricLoading
-                ) return false;
-                if ((this.clusterPlanNodes || []).length !== peers.length + 1) {
-                    return false;
-                }
-                const probes = this.clusterPeerProbes || {};
-                if (peers.some(peer => {
-                    const probe = probes[String(peer?.ssh || '').trim()];
-                    return !probe?.status?.node || probe.cached === true;
-                })) {
-                    return false;
-                }
-                return (this.clusterPlanNodes || []).every(
-                    node => Number(node.capacity_bytes || 0) > 0
-                );
-            },
-
-            clusterCatalogueRequestKey(models = null) {
-                return JSON.stringify({
-                    nodes: this.clusterNodePayloads(),
-                    models: models || this.clusterCatalogueModels(),
-                    execution_profile: this.clusterExecutionProfile,
-                });
-            },
-
-            // Answer "what can these Macs actually run" before anything is
-            // staged. The server plans each model with the real planner, so a
-            // model listed as fitting is one that will load. A catalogue made
-            // from placeholder peer memory is not a verdict: wait for every
-            // probe and discard any response whose input snapshot went stale.
-            async loadClusterCatalogue() {
-                if (this.clusterCatalogueLoading) return;
-                if (!this.clusterCatalogueInputsReady()) {
-                    this.clusterCatalogue = null;
-                    this.clusterCatalogueError = '';
-                    return;
-                }
-                if (!this.clusterModelInventory) {
-                    await this.loadClusterModelInventory();
-                }
-                if (!this.clusterCatalogueInputsReady()) return;
-                const models = this.clusterCatalogueModels();
-                if (!models.length) {
-                    this.clusterCatalogueError = 'No downloaded MLX models were found.';
-                    return;
-                }
-                const requestKey = this.clusterCatalogueRequestKey(models);
-                this.clusterCatalogueLoading = true;
-                this.clusterCatalogueError = '';
-                this.clusterCatalogue = null;
-                try {
-                    const nodes = this.clusterNodePayloads();
-                    const response = await fetch('/admin/api/cluster/catalogue', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            nodes,
-                            models,
-                            execution_profile: this.clusterExecutionProfile,
-                        }),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    const body = await response.json();
-                    if (
-                        !this.clusterCatalogueInputsReady()
-                        || requestKey !== this.clusterCatalogueRequestKey()
-                    ) return;
-                    if (!response.ok) {
-                        this.clusterCatalogueError = this.clusterErrorMessage(
-                            body.detail,
-                            'Could not read that folder.',
-                        );
-                        return;
-                    }
-                    this.clusterCatalogue = body;
-                    const selected = this.clusterSelectedModel();
-                    if (selected) {
-                        const fit = this.clusterCatalogueFit(selected.model_path);
-                        const tensorSize = this.clusterFitTensorParallelSize(fit);
-                        if (
-                            fit?.fits === true
-                            && this.clusterTensorParallelOptions().includes(tensorSize)
-                        ) {
-                            this.clusterPlanTensorParallelSize = tensorSize;
-                        }
-                        this.clusterTargetContextTokens =
-                            this.clusterContextMode === 'auto'
-                                ? this.clusterContextMaximumTokens()
-                                : this.clusterModelTargetContext(
-                                    selected,
-                                    this.clusterTargetContextTokens,
-                                );
-                    }
-                } catch (error) {
-                    if (
-                        this.clusterCatalogueInputsReady()
-                        && requestKey === this.clusterCatalogueRequestKey()
-                    ) {
-                        this.clusterCatalogueError = String(error);
-                    }
-                } finally {
-                    this.clusterCatalogueLoading = false;
-                    if (
-                        this.clusterCatalogueInputsReady()
-                        && requestKey !== this.clusterCatalogueRequestKey()
-                    ) {
-                        await this.loadClusterCatalogue();
-                    }
-                }
-            },
-
-            clusterCatalogueSize(bytes) {
-                return `${(Number(bytes) / (1024 ** 3)).toFixed(1)} GiB`;
-            },
-
-            // Every block of commands the cluster page shows copies through
-            // here, so a blocking error always comes with its fix attached and
-            // the affordance behaves the same wherever it appears.
-            copyClusterCommands(key, commands) {
-                const lines = (commands || []).filter(Boolean);
-                if (!lines.length) return;
-                this.copyToClipboard(lines.join('\n'));
-                this.clusterCommandsCopied = { ...this.clusterCommandsCopied, [key]: true };
-                setTimeout(() => {
-                    this.clusterCommandsCopied = { ...this.clusterCommandsCopied, [key]: false };
-                }, 2000);
-            },
-
-            // Where each Mac answers, read from both ends. An address is true
-            // until macOS renumbers the port behind it, so it is discovered on
-            // demand and never remembered between sessions.
-            async loadClusterFabric() {
-                if (this.clusterFabricLoading) return;
-                const hosts = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ].filter(Boolean);
-                if (hosts.length < 2) {
-                    this.clusterFabricError = 'Add a worker before reading its addresses.';
-                    return;
-                }
-                this.clusterFabricLoading = true;
-                this.clusterFabricError = '';
-                try {
-                    const query = new URLSearchParams({ hosts: hosts.join(',') });
-                    const response = await fetch(`/admin/api/cluster/fabric?${query}`);
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(
-                            response, 'Could not read the addresses between these workers'
-                        ));
-                    }
-                    this.adoptClusterFabric(await response.json());
-                } catch (error) {
-                    this.clusterFabricError = error?.message
-                        || 'Could not read the addresses between these workers';
-                } finally {
-                    this.clusterFabricLoading = false;
-                }
-            },
-
-            // The discovered addresses win unless someone has typed over them.
-            //
-            // Only a reading taken in the order this page posts is adopted: the
-            // RDMA matrix is indexed by rank, so entry [i][j] read against
-            // another ordering is the path to a different Mac. Rank placement
-            // is free to order the hosts its own way, and mapping one onto the
-            // other by position is how a rank ends up dialling itself.
-            adoptClusterFabric(fabric) {
-                if (!fabric) return;
-                const expected = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ];
-                const actual = (fabric.hosts || []).map(item => item.host);
-                if (actual.length !== expected.length
-                    || actual.some((host, index) => host !== expected[index])) {
-                    this.loadClusterFabric();
-                    return;
-                }
-                this.clusterFabric = fabric;
-                if (!fabric.ok) {
-                    // No shared address is a blocking error whose fix is a
-                    // command needing administrator rights. Link status is what
-                    // emits those, so bring it up rather than leaving the page
-                    // stating a problem it will not help with.
-                    this.loadClusterLinkStatus();
-                }
-                if (this.clusterIpsOverridden) return;
-                const [local, peer] = fabric.hosts;
-                if (local.ips?.length) {
-                    this.clusterLocalIp = local.ips[0];
-                    if (!this.clusterJoinControllerIp.trim()) {
-                        this.clusterJoinControllerIp = this.clusterLocalIp;
-                    }
-                }
-                if (peer.ips?.length) this.clusterPeerIp = peer.ips[0];
-                this.invalidateClusterPlan();
-            },
-
-            useDiscoveredClusterAddresses() {
-                this.clusterIpsOverridden = false;
-                if (this.clusterFabric) this.adoptClusterFabric(this.clusterFabric);
-                else this.loadClusterFabric();
-            },
-
-            // Backend is a consequence of the cable, never a preference: the
-            // fabric reader is the only thing that may name one, and it falls
-            // back to the TCP ring out loud rather than by accident.
-            get clusterBackend() {
-                // A typed address is not enough evidence to construct a JACCL
-                // device matrix. Honour the override, but keep it on the TCP
-                // ring until the server has verified that exact path as RDMA.
-                if (this.clusterIpsOverridden) return 'ring';
-                return this.clusterFabric?.backend || 'ring';
-            },
-
-            async loadClusterTransports() {
-                if (this.clusterTransportsLoading) return;
-                const hosts = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ].filter(Boolean);
-                if (hosts.length < 2) {
-                    this.clusterTransportsError = 'Add a peer before detecting the link';
-                    return;
-                }
-                this.clusterTransportsLoading = true;
-                this.clusterTransportsError = '';
-                try {
-                    const query = new URLSearchParams({ hosts: hosts.join(',') });
-                    const response = await fetch(
-                        `/admin/api/cluster/transports?${query}`
-                    );
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(
-                            await this.clusterResponseError(response, 'Link detection failed')
-                        );
-                    }
-                    this.clusterTransports = await response.json();
-                    await this.loadClusterLinkStatus();
-                    await this.loadClusterFabric();
-                } catch (error) {
-                    this.clusterTransportsError = error?.message || 'Link detection failed';
-                } finally {
-                    this.clusterTransportsLoading = false;
-                }
-            },
-
-            clusterTransportLabel(transport) {
-                const version = transport.tb_version || transport.kind;
-                const speed = transport.link_speed_gbps
-                    ? ` · ${transport.link_speed_gbps} Gb/s`
-                    : '';
-                return `${version}${speed}`;
-            },
-
-            // Ask the server to work out the transport, parallelism split,
-            // backend and preflight result from the peers we already know.
-            // This remains useful on its own for advanced/manual planning;
-            // startCluster() composes it with activation behind one click.
-            async autoconfigureCluster() {
-                if (this.clusterAutoconfigureLoading) return null;
-                const requestRevision = Number(this._clusterPlanRevision || 0);
-                const measuredNodes =
-                    this.clusterAutoconfigure?.activation?.nodes || [];
-                const performanceByNode = new Map(
-                    measuredNodes
-                        .filter(node => node?.node_id && node?.performance)
-                        .map(node => [node.node_id, node.performance])
-                );
-                this.clusterAutoconfigureLoading = true;
-                this.clusterAutoconfigureError = '';
-                this.clusterAutoconfigure = null;
-                try {
-                    const nodes = this.clusterNodePayloads().map(node => ({
-                        ...node,
-                        ...(performanceByNode.has(node.node_id)
-                            ? { performance: performanceByNode.get(node.node_id) }
-                            : {}),
-                    }));
-                    const hosts = this.clusterClusterHostsPayload();
-                    const body = {
-                        nodes,
-                        hosts,
-                        // `split_gib` used to be posted here and silently
-                        // dropped — ClusterAutoconfigureRequest never declared
-                        // it. The split now travels where the planner reads
-                        // it, as `max_weight_bytes` on the node itself.
-                        execution_profile: this.clusterExecutionProfile,
-                        prefer: this.clusterAutoconfigurePrefer,
-                        strategy: this.clusterStrategy,
-                        // Hand-entered addresses are an explicit routing
-                        // decision. Rediscovery here would replace them just
-                        // before activation and could put the collective back
-                        // on an unrelated mDNS/default route.
-                        detect_transports:
-                            hosts.length > 0 && !this.clusterIpsOverridden,
-                        auto_tune: this.clusterAutoTune,
-                        // Measure before staging so the signed layer placement
-                        // is the fast one. A post-staging re-plan can only report
-                        // a better split because the needed shards may be absent.
-                        measure_performance: this.clusterAutoTune,
-                        sampling_rank_only: this.clusterSamplingRankOnly,
-                        async_overlap: this.clusterAsyncOverlap,
-                        cache_affinity: this.clusterCacheAffinity,
-                        max_kv_size: this.clusterMaxKvSize === ''
-                            ? null
-                            : Number(this.clusterMaxKvSize),
-                        target_context_tokens: Number(
-                            this.clusterTargetContextTokens || 8192
-                        ),
-                        ring_connections_per_ip: Number(
-                            this.clusterRingConnectionsPerIp
-                        ),
-                    };
-                    if (this.clusterPlanMode === 'model') {
-                        body.model_path = this.clusterPlanModelPath.trim();
-                        body.model_source =
-                            this.clusterPlanModelSource || '127.0.0.1';
-                        if (this.clusterPlanModelSourcePython) {
-                            body.model_source_python =
-                                this.clusterPlanModelSourcePython;
-                        }
-                    } else {
-                        body.model_size_bytes = Math.round(
-                            Number(this.clusterPlanModelSizeGiB) * (1024 ** 3)
-                        );
-                        body.layer_count = Number(this.clusterPlanLayerCount);
-                    }
-                    const response = await fetch('/admin/api/cluster/autoconfigure', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(body),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(
-                            await this.clusterResponseError(response, 'Autoconfigure failed')
-                        );
-                    }
-                    const result = await response.json();
-                    // A memory, model or context change invalidates an
-                    // in-flight proposal. Never let its late response restore
-                    // the old refusal (or, worse, make the old activation
-                    // launchable under the new labels).
-                    if (
-                        requestRevision
-                        !== Number(this._clusterPlanRevision || 0)
-                    ) {
-                        return null;
-                    }
-                    this.clusterAutoconfigure = result;
-                    // Remember the last proposal that was ready to activate, so
-                    // the next visit is genuinely one click.
-                    if (result.ready_to_activate) {
-                        try {
-                            window.localStorage.setItem(
-                                'omlx.cluster.lastGoodConfig',
-                                JSON.stringify({
-                                    saved_at: new Date().toISOString(),
-                                    summary: result.summary,
-                                    backend: result.backend,
-                                    tensor_parallel_size: result.tensor_parallel_size,
-                                    activation: result.activation,
-                                })
-                            );
-                            this.clusterLastGoodConfig = result.activation;
-                        } catch (error) {
-                            // Private browsing or a full quota: remembering is a
-                            // convenience, never a requirement.
-                        }
-                    }
-                    // Adopt the server's choices so the manual controls agree
-                    // with what the proposal says. The backend rides in on the
-                    // fabric rather than on its own, so the addresses it was
-                    // decided from are the addresses activation posts.
-                    this.adoptClusterFabric(result.fabric);
-                    this.clusterPlanTensorParallelSize = result.tensor_parallel_size;
-                    this.invalidateClusterPlan();
-                    this.clusterPlan = result.plan || null;
-                    if (this.clusterPlan) {
-                        this._clusterPlanSignature =
-                            this.clusterCurrentPlanSignature();
-                    }
-                    return result;
-                } catch (error) {
-                    if (
-                        requestRevision
-                        !== Number(this._clusterPlanRevision || 0)
-                    ) {
-                        return null;
-                    }
-                    this.clusterAutoconfigureError = error?.message || 'Autoconfigure failed';
-                    return null;
-                } finally {
-                    this.clusterAutoconfigureLoading = false;
-                }
-            },
-
-            // The normal product path. Autoconfigure is the safety boundary:
-            // only its launch-ready response can reach /deployments, and the
-            // activation object is posted byte-for-byte as the server shaped
-            // it. A blocker therefore stops before any rank process starts.
-            async startCluster() {
-                if (this.clusterLinkSetupLoading
-                    || this.clusterAutoconfigureLoading
-                    || this.clusterActivationLoading) {
-                    return;
-                }
-                this.clusterError = '';
-                this.clusterActivationResult = null;
-                if (this.clusterPlanMode !== 'model'
-                    || !this.clusterPlanModelPath.trim()) {
-                    this.clusterAutoconfigureError =
-                        'Choose a downloaded model before starting the cluster.';
-                    return;
-                }
-                if (!this.clusterPeerSsh.trim()) {
-                    this.clusterAutoconfigureError =
-                        'Choose a worker before starting the cluster.';
-                    return;
-                }
-                if (!await this.prepareCudaSupernodesForActivation()) return;
-                const linkStatus = await this.loadClusterLinkStatus();
-                if (linkStatus?.setup_available) {
-                    const ready = await this.prepareClusterLink();
-                    if (!ready) return;
-                }
-                if (!this.clusterLocalIp.trim() || !this.clusterPeerIp.trim()) {
-                    await this.loadClusterFabric();
-                }
-                if (!this.clusterLocalIp.trim() || !this.clusterPeerIp.trim()) {
-                    this.clusterAutoconfigureError =
-                        this.clusterFabricError
-                        || 'The workers do not have a shared cluster address yet.';
-                    return;
-                }
-                let proposal = await this.autoconfigureCluster();
-                if (!proposal) return;
-                if (proposal.fabric_ready === false) {
-                    this.clusterAutoconfigureError = proposal.fabric_blocker
-                        || 'The workers do not have a verified cluster route yet.';
-                    return;
-                }
-                if (proposal.staging && !proposal.staging.ready) {
-                    const staged = await this.stageClusterModel(proposal);
-                    if (!staged) return;
-                    proposal = await this.autoconfigureCluster();
-                    if (!proposal) return;
-                }
-                if (!proposal.ready_to_activate) {
-                    this.clusterAutoconfigureError = proposal.staging?.error
-                        || (proposal.staging && !proposal.staging.ready
-                            ? 'The model files could not be prepared on every worker.'
-                            : proposal.preflight)
-                        || 'Resolve the setup checks below, then try Start Cluster again.';
-                    return;
-                }
-                if (!proposal.activation || typeof proposal.activation !== 'object') {
-                    this.clusterAutoconfigureError =
-                        'Automatic setup did not return a safe activation request.';
-                    return;
-                }
-                await this.activateClusterProposal(proposal.activation);
-            },
-
-            async activateClusterProposal(activation) {
-                this.clusterActivationLoading = true;
-                this.clusterActivationResult = null;
-                this.clusterPlanChanges = null;
-                this.clusterError = '';
-                this.startClusterActivationProgress();
-                try {
-                    const response = await fetch('/admin/api/cluster/deployments', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(activation),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(
-                            await this.clusterResponseError(response, 'Activation failed')
-                        );
-                    }
-                    this.clusterActivationResult = await response.json();
-                    this.clusterPlanChanges =
-                        this.clusterActivationResult.plan_changes || null;
-                    if (this.clusterActivationResult.plan) {
-                        this.clusterPlan = this.clusterActivationResult.plan;
-                    }
-                    this.clusterActivationProgress = 'Ready · canary passed';
-                    await this.loadClusterRuntime();
-                    await this.loadClusterDeployments();
-                } catch (error) {
-                    this.clusterError = error?.message || 'Activation failed';
-                } finally {
-                    this.stopClusterActivationProgress();
-                    this.clusterActivationProgress = '';
-                    this.clusterActivationLoading = false;
-                }
-            },
-
-            clusterCurrentPlanSignature() {
-                return JSON.stringify({
-                    mode: this.clusterPlanMode,
-                    model: this.clusterPlanMode === 'model'
-                        ? {
-                            path: this.clusterPlanModelPath.trim(),
-                            source: this.clusterPlanModelSource || '127.0.0.1',
-                        }
-                        : {
-                            size_gib: Number(this.clusterPlanModelSizeGiB),
-                            layer_count: Number(this.clusterPlanLayerCount),
-                        },
-                    // Built from the payload activation actually posts, so a
-                    // control that changes the plan cannot leave a stale one
-                    // approved. Clicking Workstation used to be invisible
-                    // here: the plan stayed "fresh" while the role it was
-                    // built from no longer matched the one being sent.
-                    nodes: this.clusterNodePayloads(),
-                    execution_profile: this.clusterExecutionProfile,
-                    tensor_parallel_size: Number(this.clusterPlanTensorParallelSize),
-                    target_context_tokens: Number(
-                        this.clusterTargetContextTokens || 8192
-                    ),
-                });
-            },
-
-            addClusterPlanNode() {
-                this._clusterNodeKey += 1;
-                this.clusterPlanNodes.push({
-                    key: this._clusterNodeKey,
-                    node_id: `node-${this.clusterPlanNodes.length + 1}`,
-                    capacity_gib: 64,
-                    reserve_gib: 8,
-                    // Named, not left undefined: the payload sends 'headless'
-                    // either way, and a node with no role leaves both buttons
-                    // unlit while the server plans it as one of them.
-                    role: 'headless',
-                });
-                this.normalizeClusterTensorParallelSize();
-                this.invalidateClusterPlan();
-            },
-
-            removeClusterPlanNode(index) {
-                if (this.clusterPlanNodes.length <= 1) return;
-                this.clusterPlanNodes.splice(index, 1);
-                this.normalizeClusterTensorParallelSize();
-                this.invalidateClusterPlan();
-            },
-
-            useLocalClusterNode(index) {
-                if (!this.clusterStatus || !this.clusterPlanNodes[index]) return;
-                const gib = 1024 ** 3;
-                const exactCapacity = Number(
-                    this.clusterStatus.node.admission_ceiling_bytes
-                    || this.clusterStatus.node.recommended_working_set_bytes
-                    || 0
-                );
-                this.clusterPlanNodes[index].node_id = this.clusterNodeId(
-                    this.clusterStatus.node.hostname,
-                    'this-mac',
-                );
-                this.clusterPlanNodes[index].capacity_gib = Number(
-                    (exactCapacity / gib).toFixed(2)
-                );
-                this.clusterPlanNodes[index].capacity_bytes = exactCapacity;
-                this.invalidateClusterPlan();
-            },
-
-            // Every endpoint that plans gets the *same* node objects. /plan and
-            // /deployments used to build their own: activation's copy carried
-            // only node_id, capacity and reserve, so `role` fell back to
-            // headless and `max_weight_bytes` to "planner, balance freely" —
-            // the Workstation button and the split slider reached the preview
-            // and nothing that launched. Building the payload once is what
-            // makes that class of drift impossible rather than merely fixed.
-            // `validate` is off by default because this is also what the
-            // staleness signature is built from, and that runs inside an Alpine
-            // binding on every render — a throw there would take the panel down
-            // rather than disable a button.
-            clusterNodePayloads({ validate = false } = {}) {
-                const gib = 1024 ** 3;
-                return this.clusterPlanNodes.map((node, index) => {
-                    const nodeId = String(node.node_id || '').trim();
-                    const capacityGiB = Number(node.capacity_gib);
-                    const reserveGiB = Number(node.reserve_gib);
-                    const measuredCapacityBytes = Number(node.capacity_bytes || 0);
-                    const capacityBytes = Number.isFinite(measuredCapacityBytes)
-                        && measuredCapacityBytes > 0
-                        ? Math.round(measuredCapacityBytes)
-                        : Math.round(capacityGiB * gib);
-                    const manualAllowance = (
-                        typeof this.clusterManualMemoryAllowanceGiB === 'function'
-                    )
-                        ? this.clusterManualMemoryAllowanceGiB(nodeId)
-                        : null;
-                    if (validate) {
-                        if (!nodeId) throw new Error(`Rank ${index} needs a node name`);
-                        if (!Number.isFinite(capacityGiB) || capacityGiB <= 0) {
-                            throw new Error(`Rank ${index} needs a positive memory budget`);
-                        }
-                        if (!Number.isFinite(reserveGiB) || reserveGiB < 0 || reserveGiB >= capacityGiB) {
-                            throw new Error(`Rank ${index} reserve must be smaller than its budget`);
-                        }
-                    }
-                    const measuredAutomaticReserveBytes = Number(
-                        node.automatic_reserve_bytes || 0
-                    );
-                    const reserveBytes = manualAllowance !== null
-                        ? Math.max(
-                            0,
-                            capacityBytes - Math.round(
-                                Math.min(
-                                    capacityBytes / gib,
-                                    Number(manualAllowance),
-                                ) * gib
-                            ),
-                        )
-                        : (
-                            Number.isFinite(measuredAutomaticReserveBytes)
-                            && measuredAutomaticReserveBytes > 0
-                                ? Math.round(measuredAutomaticReserveBytes)
-                                : Math.round(reserveGiB * gib)
-                        );
-                    const payload = {
-                        node_id: nodeId,
-                        // Do not round a measured ceiling through the display's
-                        // GiB value. A 0.3 GiB drift here was enough for the GUI
-                        // to approve a stage the rank correctly refused.
-                        capacity_bytes: capacityBytes,
-                        reserve_bytes: reserveBytes,
-                        manual_memory_limit: manualAllowance !== null,
-                        role: node.role || 'headless',
-                        memory_guard_tier:
-                            this.globalSettings?.memory?.memory_guard_tier || 'balanced',
-                    };
-                    if (node.accelerator) payload.accelerator = node.accelerator;
-                    if (node.fabric_kind) payload.fabric_kind = node.fabric_kind;
-                    if (node.fabric_group_id) {
-                        payload.fabric_group_id = node.fabric_group_id;
-                    }
-                    if (node.fabric_verified) payload.fabric_verified = true;
-                    const target = Number(
-                        (this.clusterWeightTargetsGiB || {})[nodeId]
-                    );
-                    if (Number.isFinite(target) && target > 0) {
-                        // Measured memory and a Workstation role may reduce the
-                        // safe ceiling after the slider was moved. Keep the
-                        // preference inside the budget activation will use.
-                        const usableGiB = Math.max(0, capacityGiB - reserveGiB);
-                        payload.target_weight_bytes = Math.round(
-                            Math.min(target, usableGiB) * gib
-                        );
-                    } else if (
-                        index === 0
-                        && this.clusterSplitGiB !== null
-                        && this.clusterPlanNodes.length === 2
-                    ) {
-                        payload.max_weight_bytes = Math.round(
-                            Number(this.clusterSplitGiB) * gib
-                        );
-                    }
-                    return payload;
-                });
-            },
-
-            // Give the simple page an automatic, read-only split preview.
-            // This only inspects model metadata and invokes the planner; ranks
-            // are launched exclusively by the explicit Start action.
-            async previewClusterWeightBalance() {
-                if (
-                    this.clusterPlanLoading
-                    || this.clusterAutoconfigureLoading
-                    || this.clusterActivationLoading
-                    || this.clusterWeightPlan()
-                    || this.clusterPlanNodes.length < 2
-                    || (this.clusterPlanMode === 'model'
-                        && !this.clusterPlanModelPath.trim())
-                ) {
-                    return;
-                }
-                const key = this.clusterCurrentPlanSignature();
-                if (key === this._clusterAutoPlanKey) return;
-                this._clusterAutoPlanKey = key;
-                await this.runClusterPlan();
-            },
-
-            async runClusterPlan() {
-                if (this.clusterPlanLoading) return;
-                const requestRevision = Number(this._clusterPlanRevision || 0);
-                this.clusterPlanLoading = true;
-                // Keep the prior split visible while a slider re-plans. The
-                // signature guard still prevents activating that stale plan.
-                this.clusterPlanError = '';
-                this.clusterActivationResult = null;
-                this.clusterPlanChanges = null;
-                try {
-                    const gib = 1024 ** 3;
-                    const nodes = this.clusterNodePayloads({ validate: true });
-
-                    const request = {
-                        nodes,
-                        execution_profile: this.clusterExecutionProfile,
-                        // Sent because the planner branches on it: without it
-                        // /plan defaulted to 1 and previewed an unequal
-                        // pipeline while activation, carrying the size the
-                        // one-click setup chose, deployed a hybrid plan.
-                        tensor_parallel_size: Number(this.clusterPlanTensorParallelSize),
-                        target_context_tokens: Number(
-                            this.clusterTargetContextTokens || 8192
-                        ),
-                    };
-                    if (this.clusterPlanMode === 'model') {
-                        const path = this.clusterPlanModelPath.trim();
-                        if (!path) throw new Error('Enter a downloaded model directory');
-                        request.model_path = path;
-                        request.model_source =
-                            this.clusterPlanModelSource || '127.0.0.1';
-                        if (this.clusterPlanModelSourcePython) {
-                            request.model_source_python =
-                                this.clusterPlanModelSourcePython;
-                        }
-                    } else {
-                        const modelSizeGiB = Number(this.clusterPlanModelSizeGiB);
-                        const layerCount = Number(this.clusterPlanLayerCount);
-                        if (!Number.isFinite(modelSizeGiB) || modelSizeGiB <= 0) {
-                            throw new Error('Enter a positive model weight size');
-                        }
-                        if (!Number.isInteger(layerCount) || layerCount <= 0) {
-                            throw new Error('Enter a positive whole-number layer count');
-                        }
-                        request.model_size_bytes = Math.round(modelSizeGiB * gib);
-                        request.layer_count = layerCount;
-                    }
-
-                    const response = await fetch('/admin/api/cluster/plan', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(request),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Could not build shard plan'));
-                    }
-                    const result = await response.json();
-                    if (
-                        requestRevision
-                        !== Number(this._clusterPlanRevision || 0)
-                    ) {
-                        return;
-                    }
-                    this.clusterPlan = result;
-                    this._clusterPlanSignature = this.clusterCurrentPlanSignature();
-                } catch (error) {
-                    if (
-                        requestRevision
-                        !== Number(this._clusterPlanRevision || 0)
-                    ) {
-                        return;
-                    }
-                    this.clusterPlanError = error?.message || 'Could not build shard plan';
-                } finally {
-                    this.clusterPlanLoading = false;
-                }
-            },
-
-            async loadClusterNodeRoles() {
-                if (this.clusterNodeRoles.length) return;
-                try {
-                    const response = await fetch('/admin/api/cluster/node-roles');
-                    if (response.ok) {
-                        this.clusterNodeRoles = (await response.json()).roles || [];
-                    }
-                } catch (error) { /* tooltips are optional; planning is not */ }
-            },
-
-            clusterRoleDetail(key) {
-                return (this.clusterNodeRoles.find(r => r.key === key) || {}).detail || '';
-            },
-
-            clusterRoleSummary(key) {
-                return (this.clusterNodeRoles.find(r => r.key === key) || {}).summary || '';
-            },
-
-            // Ask each Mac what it can actually offer. Installed RAM overstates
-            // a MacBook by ~20 GiB because the GPU cannot address it all, and a
-            // plan built on that number is refused at load.
-            async measureClusterBudgets() {
-                if (this.clusterBudgetsLoading) return;
-                const hosts = this.clusterBudgetHostsPayload();
-                if (!hosts.length) {
-                    this.clusterBudgetsError = 'Add a worker first.';
-                    return;
-                }
-                this.clusterBudgetsLoading = true;
-                this.clusterBudgetsError = '';
-                try {
-                    const roles = {};
-                    this.clusterPlanNodes.forEach(node => {
-                        roles[String(node.node_id || '').trim()] = node.role || 'headless';
-                    });
-                    const response = await fetch('/admin/api/cluster/node-budgets', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ hosts, roles }),
-                    });
-                    const body = await response.json();
-                    if (!response.ok) {
-                        this.clusterBudgetsError = this.clusterErrorMessage(
-                            body.detail,
-                            'Could not measure the workers.',
-                        );
-                        return;
-                    }
-                    const gib = 1024 ** 3;
-                    let changed = false;
-                    (body.nodes || []).forEach(measured => {
-                        const node = this.clusterPlanNodes.find(
-                            n => String(n.node_id || '').trim() === measured.node_id
-                        );
-                        if (!node || !measured.capacity_bytes) return;
-                        const capacityGiB = Number(
-                            (measured.capacity_bytes / gib).toFixed(2)
-                        );
-                        const automaticReserveGiB = Number(
-                            (measured.reserve_bytes / gib).toFixed(2)
-                        );
-                        const manualAllowedGiB =
-                            this.clusterManualMemoryAllowanceGiB(measured.node_id);
-                        const reserveGiB = manualAllowedGiB === null
-                            ? automaticReserveGiB
-                            : Math.max(
-                                0,
-                                capacityGiB - Math.min(capacityGiB, manualAllowedGiB)
-                            );
-                        // The admission ceiling is derived from live memory
-                        // pressure and wobbles by a few hundred MiB between
-                        // polls. Re-planning the whole catalogue for that wobble
-                        // emptied the model list and reset the topology controls
-                        // every ten seconds. Only a drift that could change a
-                        // plan invalidates anything.
-                        const drift = (a, b) =>
-                            Math.abs(Number(a || 0) - b) > 0.5;
-                        if (
-                            !drift(node.capacity_gib, capacityGiB)
-                            && !drift(node.reserve_gib, reserveGiB)
-                            && !drift(node.automatic_reserve_gib, automaticReserveGiB)
-                        ) {
-                            node.measured = measured.summary;
-                            return;
-                        }
-                        changed = true;
-                        node.capacity_gib = capacityGiB;
-                        node.reserve_gib = reserveGiB;
-                        node.automatic_reserve_gib = automaticReserveGiB;
-                        node.capacity_bytes = Number(measured.capacity_bytes);
-                        node.automatic_reserve_bytes = Number(
-                            measured.reserve_bytes
-                        );
-                        node.measured = measured.summary;
-                    });
-                    if (changed) {
-                        this.clusterCatalogue = null;
-                        this.invalidateClusterPlan();
-                    }
-                    // Budgets are now known for this topology. The recurring
-                    // discovery poll must not re-measure them: the peer's live
-                    // admission ceiling wobbles by more than the drift guard on
-                    // a busy Mac, and re-measuring every 10 s emptied the model
-                    // list and reset the topology controls (visible jitter).
-                    // A peer or node change resets this flag (see
-                    // invalidateClusterPeer / the join-status merge); an
-                    // explicit peer selection re-measures directly.
-                    this._clusterBudgetsMeasured = true;
-                } catch (error) {
-                    this.clusterBudgetsError = String(error);
-                } finally {
-                    this.clusterBudgetsLoading = false;
-                }
-            },
-
-            clusterBudgetHostsPayload() {
-                const nodes = this.clusterPlanNodes || [];
-                const sshHosts = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ];
-                if (nodes.length < 2 || sshHosts.length !== nodes.length) return [];
-                return nodes.map((node, rank) => ({
-                    node_id: String(node.node_id || '').trim(),
-                    ssh: sshHosts[rank],
-                    ...(node.python_executable
-                        ? { python_executable: node.python_executable }
-                        : {}),
-                }));
-            },
-
-            clusterClusterHostsPayload() {
-                const nodes = this.clusterPlanNodes;
-                const sshHosts = [
-                    '127.0.0.1',
-                    ...this.clusterWorkerPeers().map(peer => peer.ssh),
-                ];
-                if (nodes.length < 2 || sshHosts.length !== nodes.length) return [];
-                const fabricHosts = this.clusterFabric?.hosts || [];
-                const useDiscoveredFabric = !this.clusterIpsOverridden;
-                return nodes.map((node, rank) => {
-                    const ssh = sshHosts[rank];
-                    const fabric = fabricHosts.find(item => item.host === ssh);
-                    const fallbackIp = rank === 0
-                        ? this.clusterLocalIp.trim()
-                        : (rank === 1 ? this.clusterPeerIp.trim() : '');
-                    return {
-                        node_id: String(node.node_id || '').trim(),
-                        ssh,
-                        ips: useDiscoveredFabric && fabric?.ips?.length
-                            ? [...fabric.ips]
-                            : (fallbackIp ? [fallbackIp] : []),
-                        rdma: useDiscoveredFabric ? (fabric?.rdma || []) : [],
-                        ...(node.python_executable
-                            ? { python_executable: node.python_executable }
-                            : {}),
-                    };
-                });
-            },
-
-            clusterPinnedAssignment() {
-                return (this.clusterWeightPlan()?.assignments || [])
-                    .find(item => item.rank === 0) || null;
-            },
-
-            clusterPinnedWeightGiB() {
-                const item = this.clusterPinnedAssignment();
-                if (!item) return 0;
-                return ((item.layer_weight_bytes || 0) + (item.fixed_weight_bytes || 0))
-                    / (1024 ** 3);
-            },
-
-            clusterSplitAvailable() {
-                const plan = this.clusterWeightPlan();
-                const selected = this.clusterSelectedModel();
-                const fit = selected
-                    ? this.clusterCatalogueFit(selected.model_path)
-                    : null;
-                return Boolean(
-                    plan
-                    && Number(plan.tensor_parallel_size || 1) === 1
-                    && (plan.assignments || []).length >= 2
-                    // The generic memory planner can divide any layer list,
-                    // but mlx-lm cannot execute a pipeline for every model
-                    // architecture. Never show an adjustable multi-Mac split
-                    // that activation will correctly refuse.
-                    && fit?.splittable !== false
-                );
-            },
-
-            clusterWeightPlan() {
-                return this.clusterPlan || this.clusterAutoconfigure?.plan || null;
-            },
-
-            clusterWeightNodes() {
-                const plan = this.clusterWeightPlan();
-                const budgets = new Map(
-                    (this.clusterPlanNodes || []).map(
-                        node => [String(node.node_id || '').trim(), node]
-                    )
-                );
-                return [...(plan?.assignments || [])]
-                    .sort((left, right) => left.rank - right.rank)
-                    .map((assignment, index) => {
-                        const budget = budgets.get(assignment.node_id)
-                            || this.clusterPlanNodes[index]
-                            || {};
-                        const actualGiB = (
-                            Number(assignment.layer_weight_bytes || 0)
-                            + Number(assignment.fixed_weight_bytes || 0)
-                        ) / (1024 ** 3);
-                        return {
-                            ...assignment,
-                            budget,
-                            actualGiB,
-                            usableGiB: Math.max(
-                                0,
-                                Number(budget.capacity_gib || 0)
-                                - Number(budget.reserve_gib || 0)
-                            ),
-                        };
-                    });
-            },
-
-            clusterWeightTargetGiB(node) {
-                const selected = Number(
-                    this.clusterWeightTargetsGiB[node?.node_id]
-                );
-                return Number.isFinite(selected) && selected > 0
-                    ? selected
-                    : Number(node?.actualGiB || 0);
-            },
-
-            clusterWeightTargetsCustomized() {
-                return Object.values(this.clusterWeightTargetsGiB || {})
-                    .some(value => Number.isFinite(Number(value)) && Number(value) > 0);
-            },
-
-            clusterWeightMinimumGiB() {
-                const model = this.clusterWeightPlan()?.model || {};
-                const fixed = Number(model.fixed_weight_bytes || 0) / (1024 ** 3);
-                const layers = (model.layer_weight_bytes || [])
-                    .map(value => Number(value) / (1024 ** 3))
-                    .filter(value => Number.isFinite(value) && value > 0);
-                return fixed + (layers.length ? Math.min(...layers) : 0.25);
-            },
-
-            clusterWeightTotalGiB() {
-                return this.clusterWeightNodes().reduce(
-                    (total, node) => total + Number(node.actualGiB || 0),
-                    0
-                );
-            },
-
-            clusterWeightBounds(node) {
-                const nodes = this.clusterWeightNodes();
-                const total = this.clusterWeightTotalGiB();
-                const minimum = this.clusterWeightMinimumGiB();
-                const others = nodes.filter(item => item.node_id !== node?.node_id);
-                const othersMinimum = others.length * minimum;
-                const othersMaximum = others.reduce(
-                    (sum, item) => sum + item.usableGiB,
-                    0
-                );
-                const min = Math.max(
-                    minimum,
-                    total - othersMaximum
-                );
-                const max = Math.min(
-                    Number(node?.usableGiB || total),
-                    total - othersMinimum
-                );
-                return {
-                    min: Number(Math.max(0.25, min).toFixed(2)),
-                    max: Number(Math.max(min, max).toFixed(2)),
-                    step: 0.5,
-                };
-            },
-
-            clusterSplitBounds() {
-                const first = this.clusterWeightNodes()[0] || {};
-                return this.clusterWeightBounds(first);
-            },
-
-            clusterSetWeightTarget(node, requested) {
-                const nodes = this.clusterWeightNodes();
-                if (nodes.length < 2 || !node) return;
-                const targets = Object.fromEntries(
-                    nodes.map(item => [
-                        item.node_id,
-                        this.clusterWeightTargetGiB(item),
-                    ])
-                );
-                const bounds = this.clusterWeightBounds(node);
-                const previous = targets[node.node_id];
-                const desired = Math.min(
-                    bounds.max,
-                    Math.max(bounds.min, Number(requested))
-                );
-                const delta = desired - previous;
-                targets[node.node_id] = desired;
-                const others = nodes.filter(item => item.node_id !== node.node_id);
-                const capacity = others.map(item => {
-                    const current = targets[item.node_id];
-                    const itemBounds = this.clusterWeightBounds(item);
-                    return {
-                        item,
-                        current,
-                        room: delta > 0
-                            ? Math.max(0, current - itemBounds.min)
-                            : Math.max(0, itemBounds.max - current),
-                    };
-                });
-                const available = capacity.reduce(
-                    (sum, entry) => sum + entry.room,
-                    0
-                );
-                if (available > 0 && delta !== 0) {
-                    capacity.forEach(entry => {
-                        const share = Math.min(
-                            entry.room,
-                            Math.abs(delta) * (entry.room / available)
-                        );
-                        targets[entry.item.node_id] = entry.current
-                            + (delta > 0 ? -share : share);
-                    });
-                }
-                this.clusterWeightTargetsGiB = Object.fromEntries(
-                    Object.entries(targets).map(([key, value]) => [
-                        key,
-                        Number(Number(value).toFixed(2)),
-                    ])
-                );
-            },
-
-            clusterPlanModelTotalGiB() {
-                const gib = 1024 ** 3;
-                if (this.clusterWeightPlan()?.model) {
-                    const model = this.clusterWeightPlan().model;
-                    const layers = (model.layer_weight_bytes || []).reduce((a, b) => a + b, 0);
-                    return (layers + (model.fixed_weight_bytes || 0)) / gib;
-                }
-                return Number(this.clusterPlanModelSizeGiB) || 0;
-            },
-
-            // Replan as the slider moves. Coalesced so a drag issues one
-            // request per settled position rather than one per pixel.
-            clusterSplitChanged() {
-                if (this._clusterSplitTimer) clearTimeout(this._clusterSplitTimer);
-                this._clusterSplitTimer = setTimeout(() => {
-                    this.runClusterPlan();
-                }, 250);
-            },
-
-            clusterResetSplit() {
-                this.clusterSplitGiB = null;
-                this.clusterWeightTargetsGiB = {};
-                this.clusterSplitChanged();
-            },
-
-            clusterWeightColor(index) {
-                return [
-                    '#818cf8',
-                    '#14b8a6',
-                    '#38bdf8',
-                    '#a78bfa',
-                    '#f59e0b',
-                    '#34d399',
-                ][Number(index) % 6];
-            },
-
-            clusterGiB(bytes) {
-                return `${(Number(bytes || 0) / (1024 ** 3)).toFixed(1)} GiB`;
-            },
-
-            clusterTokens(count) {
-                const value = Number(count || 0);
-                if (!value) return 'unknown';
-                if (value >= 1024 && value % 1024 === 0) {
-                    return `${(value / 1024).toLocaleString()}k`;
-                }
-                if (value >= 1000) return `${Math.round(value / 1000).toLocaleString()}k`;
-                return value.toLocaleString();
-            },
-
-            // What share of the model each node carries, for the bar.
-            clusterSplitPercent(assignment) {
-                const total = this.clusterWeightTotalGiB() * (1024 ** 3);
-                if (!total) return 0;
-                const held = (assignment.layer_weight_bytes || 0)
-                    + (assignment.fixed_weight_bytes || 0);
-                return Math.max(2, Math.round((held / total) * 100));
-            },
-
-            // What the server actually held back on this node, read off the
-            // plan rather than recomputed here. A role's reserve rule lives on
-            // one side only — restating it in JavaScript is how the number in
-            // the card and the number in the plan drift apart.
-            clusterPlannedReserveGiB(nodeId) {
-                const item = (this.clusterPlan?.assignments || []).find(
-                    entry => entry.node_id === String(nodeId || '').trim()
-                );
-                if (!item) return null;
-                return Number(item.reserve_bytes || 0) / (1024 ** 3);
-            },
-
-            clusterPlanAssignmentsByLayer() {
-                if (!this.clusterWeightPlan()?.assignments) return [];
-                return [...this.clusterWeightPlan().assignments].sort(
-                    (left, right) => left.start_layer - right.start_layer
-                );
-            },
-
-            // The four things that must be true, in order, before a cluster can
-            // serve. Each returns 'done' | 'active' | 'todo' so the stepper can
-            // show where the user actually is rather than a wall of controls.
-            get clusterSteps() {
-                const paired = Boolean(
-                    this.clusterPeerProbe && this.clusterPeerProbe.runtime_compatible
-                );
-                const linked = Boolean(
-                    this.clusterTransports || this.clusterAutoconfigure
-                );
-                const planned = Boolean(
-                    this.clusterAutoconfigure && this.clusterAutoconfigure.ready_to_activate
-                );
-                const liveJobs = (this.clusterStatus?.runtime_jobs?.jobs || [])
-                    .filter(job => job.live);
-                const running = liveJobs.length > 0;
-                const configured = (this.clusterDeployments || []).length;
-
-                const state = (done, isActive) =>
-                    done ? 'done' : (isActive ? 'active' : 'todo');
-
-                return [
-                    {
-                        key: 'pair',
-                        title: 'Connect the workers',
-                        hint: paired
-                            ? this.clusterPeerProbe.status.node.hostname
-                            : 'Find a peer and exchange keys',
-                        state: state(paired, true),
-                    },
-                    {
-                        key: 'link',
-                        title: 'Check the link',
-                        hint: this.clusterAutoconfigure
-                            ? this.clusterAutoconfigure.link
-                            : (linked ? 'Detected' : 'Thunderbolt, Ethernet or RDMA'),
-                        state: state(linked, paired),
-                    },
-                    {
-                        key: 'plan',
-                        title: 'Split the model',
-                        hint: this.clusterAutoconfigure
-                            ? this.clusterAutoconfigure.summary
-                            : 'Choose a model and set up automatically',
-                        state: state(planned, linked),
-                    },
-                    {
-                        key: 'run',
-                        title: 'Activate',
-                        hint: running
-                            ? `${liveJobs.length} running`
-                            : (configured
-                                ? `${configured} configured · stopped`
-                                : 'Start serving across the cluster'),
-                        state: state(running, planned),
-                    },
-                ];
-            },
-
-            get clusterCurrentStep() {
-                const active = this.clusterSteps.find(step => step.state === 'active');
-                return active ? active.key : 'run';
-            },
-
-            // Every reason a peer would refuse to serve this model, each with
-            // the command that fixes it where one exists. Empty until a setup
-            // run has actually asked the peers.
-            get clusterPreflightBlockers() {
-                return this.clusterAutoconfigure?.preflight_issues || [];
-            },
-
-            // One identity per issue, shared by the list key and the copy
-            // affordance so two panels cannot disagree about which is which.
-            clusterIssueKey(issue) {
-                return `${issue.node_id}/${issue.kind}/${issue.detail}`;
-            },
-
-            // A plan built before the last change to a control that changes it.
-            // Activation refuses these server-side too; saying so here is what
-            // stops the refusal being a mystery.
-            clusterPlanIsStale() {
-                return Boolean(this.clusterPlan)
-                    && this._clusterPlanSignature !== this.clusterCurrentPlanSignature();
-            },
-
-            clusterActivationReady() {
-                const maxKvSize = this.clusterMaxKvSize === ''
-                    ? null
-                    : Number(this.clusterMaxKvSize);
-                const connections = Number(this.clusterRingConnectionsPerIp);
-                const hosts = this.clusterClusterHostsPayload();
-                if (
-                    this.clusterActivationLoading
-                    || this.clusterPlanMode !== 'model'
-                    || !this.clusterPlan
-                    || this.clusterPlanNodes.length < 2
-                    || hosts.length !== this.clusterPlanNodes.length
-                    || hosts.some(host => !host.ips?.length)
-                    || !this.clusterPlanModelPath.trim()
-                    || this._clusterPlanSignature !== this.clusterCurrentPlanSignature()
-                    // A peer that cannot import what this model needs dies mid
-                    // load, after every other rank has paid for its weights.
-                    || this.clusterPreflightBlockers.length > 0
-                    || (maxKvSize !== null && (
-                        !Number.isInteger(maxKvSize) || maxKvSize <= 0
-                    ))
-                    || (
-                        this.clusterBackend === 'ring'
-                        && (
-                            !Number.isInteger(connections)
-                            || connections < 1
-                            || connections > 32
-                        )
-                    )
-                ) {
-                    return false;
-                }
-                // A non-ring backend is only ever named by the fabric reader,
-                // and only when it derived a full RDMA matrix — so this asserts
-                // what activation is about to post rather than a device name
-                // someone remembered.
-                if (this.clusterBackend !== 'ring') {
-                    return Boolean(this.clusterFabric?.rdma?.ok);
-                }
-                return true;
-            },
-
-            async activateClusterDeployment() {
-                if (!this.clusterActivationReady()) return;
-                if (!await this.prepareCudaSupernodesForActivation({
-                    rebuildPlan: true,
-                })) return;
-                this.clusterActivationLoading = true;
-                this.clusterActivationResult = null;
-                this.clusterPlanChanges = null;
-                this.clusterError = '';
-                this.startClusterActivationProgress();
-                try {
-                    const nodes = this.clusterNodePayloads();
-                    const hosts = this.clusterClusterHostsPayload();
-                    const response = await fetch('/admin/api/cluster/deployments', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_path: this.clusterPlanModelPath.trim(),
-                            model_source:
-                                this.clusterPlanModelSource || '127.0.0.1',
-                            model_source_python:
-                                this.clusterPlanModelSourcePython || undefined,
-                            backend: this.clusterBackend,
-                            nodes,
-                            hosts,
-                            preflight: true,
-                            execution_profile: this.clusterExecutionProfile,
-                            auto_tune: this.clusterAutoTune,
-                            sampling_rank_only: this.clusterSamplingRankOnly,
-                            async_overlap: this.clusterAsyncOverlap,
-                            cache_affinity: this.clusterCacheAffinity,
-                            max_kv_size: this.clusterMaxKvSize === ''
-                                ? null
-                                : Number(this.clusterMaxKvSize),
-                            ring_connections_per_ip: this.clusterBackend === 'ring'
-                                ? Number(this.clusterRingConnectionsPerIp)
-                                : null,
-                            tensor_parallel_size: Number(this.clusterPlanTensorParallelSize),
-                            target_context_tokens: Number(
-                                this.clusterTargetContextTokens || 8192
-                            ),
-                            // The plan on screen, named. The server refuses to
-                            // activate anything else, so a payload that has
-                            // drifted from the preview fails loudly here
-                            // instead of quietly launching a different split.
-                            approved_placement: this.clusterPlan?.placement_signature || '',
-                        }),
-                    });
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Activation failed'));
-                    }
-                    this.clusterActivationResult = await response.json();
-                    // The server may report a faster candidate, but it keeps
-                    // the signed/staged placement if that candidate moves
-                    // layers. Surface the measurement without claiming it ran.
-                    this.clusterPlanChanges = this.clusterActivationResult.plan_changes || null;
-                    if (this.clusterActivationResult.plan) {
-                        this.clusterPlan = this.clusterActivationResult.plan;
-                    }
-                    this.clusterActivationProgress = 'Ready · canary passed';
-                    await this.loadClusterRuntime();
-                    await this.loadClusterDeployments();
-                } catch (error) {
-                    this.clusterError = error?.message || 'Activation failed';
-                } finally {
-                    this.stopClusterActivationProgress();
-                    this.clusterActivationProgress = '';
-                    this.clusterActivationLoading = false;
-                }
-            },
-
-            async deactivateClusterDeployment(deploymentId) {
-                if (this.clusterDeactivatingId) return;
-                this.clusterDeactivatingId = deploymentId;
-                this.clusterError = '';
-                try {
-                    const response = await fetch(
-                        `/admin/api/cluster/deployments/${encodeURIComponent(deploymentId)}`,
-                        { method: 'DELETE' },
-                    );
-                    if (response.status === 401) {
-                        window.location.href = '/admin';
-                        return;
-                    }
-                    if (!response.ok) {
-                        throw new Error(await this.clusterResponseError(response, 'Deactivation failed'));
-                    }
-                    await this.loadClusterDeployments();
-                } catch (error) {
-                    this.clusterError = error?.message || 'Deactivation failed';
-                } finally {
-                    this.clusterDeactivatingId = '';
-                }
-            },
-
-            formatClusterGiB(bytes) {
-                const value = Number(bytes);
-                if (!Number.isFinite(value)) return '—';
-                return `${(value / (1024 ** 3)).toFixed(2)} GiB`;
-            },
-
-            formatClusterSeconds(seconds) {
-                const value = Number(seconds);
-                if (!Number.isFinite(value)) return '—';
-                return value < 1 ? `${Math.round(value * 1000)} ms` : `${value.toFixed(2)} s`;
-            },
-
-            formatClusterRate(rate) {
-                const value = Number(rate);
-                if (!Number.isFinite(value) || value < 0) return '—';
-                if (value >= 1000) return `${(value / 1000).toFixed(1)}k tok/s`;
-                return `${value.toFixed(value >= 100 ? 0 : 1)} tok/s`;
-            },
-
-            formatClusterCount(count) {
-                const value = Number(count);
-                if (!Number.isFinite(value) || value < 0) return '—';
-                return Math.round(value).toLocaleString();
-            },
-
-            formatClusterPercent(value) {
-                const numeric = Number(value);
-                if (!Number.isFinite(numeric) || numeric < 0) return '—';
-                return `${Math.round(numeric * 100)}%`;
-            },
-
-            formatClusterBandwidth(bytesPerSecond) {
-                const value = Number(bytesPerSecond);
-                if (!Number.isFinite(value) || value <= 0) return '—';
-                return `${(value / (1024 ** 3)).toFixed(2)} GiB/s`;
-            },
-
-            clusterRuntimeProfile(job) {
-                return (job?.performance_profiles || []).find(
-                    profile => profile.rank === job.rank
-                ) || null;
-            },
-
-            clusterRuntimePrimaryJob() {
-                const jobs = this.clusterStatus?.runtime_jobs?.jobs || [];
-                return jobs.find(job => job.live)
-                    || [...jobs].sort(
-                        (left, right) => String(right.updated_at || '')
-                            .localeCompare(String(left.updated_at || ''))
-                    )[0]
-                    || null;
-            },
-
-            clusterRuntimePhaseLabel(job) {
-                if (job?.live && job.phase === 'ready') return 'Cluster ready';
-                if (job?.live) return 'Loading cluster';
-                if (['peer_lost', 'launcher_lost', 'failed'].includes(job?.phase)) {
-                    return 'Cluster stopped';
-                }
-                return 'Previous cluster run';
-            },
-
-            clusterRuntimeAssignments(job) {
-                return [...(job?.assignments || [])].sort(
-                    (left, right) => left.start_layer - right.start_layer
-                );
-            },
-
-            clusterRuntimeRankStatus(job, assignment) {
-                return (job?.ranks || []).find(
-                    rank => Number(rank.rank) === Number(assignment?.rank)
-                ) || null;
-            },
-
-            clusterRuntimeResidentWeights(job) {
-                const ranks = job?.ranks || [];
-                if (ranks.length) {
-                    return ranks.reduce(
-                        (total, rank) =>
-                            total + Number(rank.measured_weight_bytes || 0),
-                        0,
-                    );
-                }
-                return Number(job?.measured_weight_bytes || 0);
-            },
-
-            clusterRuntimeCapacity(job) {
-                return (job?.assignments || []).reduce(
-                    (total, assignment) =>
-                        total + Number(assignment.capacity_bytes || 0),
-                    0,
-                );
-            },
-
-            clusterPublicEndpoint() {
-                return `${window.location.origin}/v1`;
-            },
-
-            clusterLiveLauncher() {
-                const job = this.clusterNeuralFabricJob();
-                if (!job) return null;
-                return (this.clusterStatus?.runtime_jobs?.launchers || []).find(
-                    launcher => launcher.deployment_id === job.deployment_id
-                ) || null;
-            },
-
-            clusterLiveModelId() {
-                return this.clusterLiveLauncher()?.model_id
-                    || this.clusterActivationResult?.api?.model
-                    || this.clusterLiveModelName();
-            },
-
-            clusterLiveModelName() {
-                const job = this.clusterNeuralFabricJob();
-                const deployment = (this.clusterDeployments || []).find(
-                    item => item.deployment_id === job?.deployment_id
-                ) || this.clusterPrimaryDeployment();
-                const modelPath = deployment?.model || this.clusterPlanModelPath;
-                const model = this.clusterAllModels().find(
-                    item => item.model_path === modelPath
-                ) || this.clusterSelectedModel();
-                if (model) return this.clusterModelDisplayName(model);
-                const parts = String(modelPath || job?.deployment_id || 'Cluster model')
-                    .split('/');
-                return parts[parts.length - 1] || 'Cluster model';
-            },
-
-            clusterRuntimeLayerCount(job) {
-                const assignments = job?.assignments || [];
-                return assignments.reduce(
-                    (maximum, assignment) => Math.max(maximum, assignment.end_layer || 0),
-                    0,
-                );
-            },
-
-            clusterStateLabel(state) {
-                return {
-                    unavailable: 'Unavailable',
-                    disabled: 'RDMA disabled',
-                    enabled_no_peer: 'Ready · no peer',
-                    peer_linked_config_pending: 'Peer linked · setup pending',
-                    rdma_ready: 'Thunderbolt RDMA ready',
-                }[state] || String(state || 'Unknown').replaceAll('_', ' ');
-            },
-
-            clusterTransportTone(state) {
-                if (state === 'rdma_ready') {
-                    return 'bg-green-50 text-green-700 border border-green-200';
-                }
-                if (state === 'peer_linked_config_pending') {
-                    return 'bg-blue-50 text-blue-700 border border-blue-200';
-                }
-                if (state === 'enabled_no_peer') {
-                    return 'bg-amber-50 text-amber-700 border border-amber-200';
-                }
-                return 'bg-neutral-100 text-neutral-600 border border-neutral-200';
-            },
-
-            clusterTransportIconTone(state) {
-                if (state === 'rdma_ready') return 'bg-green-50 text-green-700';
-                if (state === 'peer_linked_config_pending') return 'bg-blue-50 text-blue-700';
-                if (state === 'enabled_no_peer') return 'bg-amber-50 text-amber-700';
-                return 'bg-neutral-100 text-neutral-500';
-            },
-
-            async checkForUpdate() {
+           async checkForUpdate() {
                 try {
                     const resp = await fetch('/admin/api/update-check');
                     if (resp.ok) {
@@ -6583,7 +928,72 @@
                 }
             },
 
+            loadingGlobalSettings: false,
+            resettingGlobalSettings: false,
+            showGlobalResetNotice: false,
+            globalResetSnapshot: null,
+            globalDefaultsPending: false,
+
+            async resetGlobalSettingsDefaults() {
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
+                this.resettingGlobalSettings = true;
+                this.saveSuccess = false;
+                this.saveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings/defaults');
+                    if (!response.ok) throw new Error('Failed to load defaults');
+                    const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
+                    const s = this.globalSettings;
+                    for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
+                        'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
+                        for (const key of Object.keys(s[section])) {
+                            if (['base_path', 'model_dirs', 'model_dir', 'effective_model_dirs',
+                                'ssd_cache_dir', 'config_path', 'hf_cache_path', 'ca_bundle',
+                                'api_key', 'api_key_set', 'sub_keys', 'endpoint',
+                                'distributed_inference_active'].includes(key)) continue;
+                            if (Object.hasOwn(defaults[section], key)) {
+                                s[section][key] = defaults[section][key];
+                            }
+                        }
+                    }
+                    this.idleTimeoutValue = s.idle_timeout.idle_timeout_seconds == null
+                        ? '' : String(s.idle_timeout.idle_timeout_seconds);
+                    this.cachePercent = this.parseCacheToPercent(
+                        s.cache.ssd_cache_max_size, s.system.ssd_total_bytes);
+                    this.hotCachePercent = this.parseHotCacheToPercent(
+                        s.cache.hot_cache_max_size, s.system.total_memory_bytes);
+                    s.ui.language = defaults.ui.language;
+                    this.globalDefaultsPending = true;
+                    this.showGlobalResetNotice = true;
+                } catch (err) {
+                    this.saveError = window.t('settings.global.reset_failed');
+                } finally {
+                    this.resettingGlobalSettings = false;
+                }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
+            },
+
             async loadGlobalSettings() {
+                this.loadingGlobalSettings = true;
                 try {
                     const response = await fetch('/admin/api/global-settings');
                     if (response.ok) {
@@ -6603,6 +1013,7 @@
                             cache: { ...this.globalSettings.cache, ...data.cache },
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
+                            usage: { ...this.globalSettings.usage, ...data.usage },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             network: { ...this.globalSettings.network, ...data.network },
                             auth: { ...this.globalSettings.auth, ...data.auth },
@@ -6611,7 +1022,12 @@
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
-                        this.globalSettings.ui = data.ui || { language: 'en' };
+                        this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
+                        const layoutLib = this._dashLayoutLib();
+                        this.dashLayout = layoutLib
+                            ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
+                            : null;
+                        if (dashGrid && !this.dashEditing) this.applyDashboardLayout(this.dashLayout);
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -6636,8 +1052,6 @@
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
                         );
-                        // Sync the cache string value from percent
-                        this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
                         this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
@@ -6652,10 +1066,42 @@
                     }
                 } catch (err) {
                     console.error('Failed to load global settings:', err);
+                } finally {
+                    this.loadingGlobalSettings = false;
                 }
             },
 
+            isLoopbackBindHost(value) {
+                const hosts = String(value || '')
+                    .split(',')
+                    .map(host => host.trim().toLowerCase())
+                    .filter(Boolean);
+                if (hosts.length === 0) return false;
+                return hosts.every(host => {
+                    if (host.replace(/\.+$/, '') === 'localhost') return true;
+                    if (!host.includes(':')) {
+                        const parts = host.split('.');
+                        return parts.length === 4 && parts[0] === '127'
+                            && parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part)
+                                && Number(part) <= 255);
+                    }
+                    // Normalize IPv6, including expanded and IPv4-mapped forms.
+                    // A scope ID does not change whether an address is loopback.
+                    const [address, scope, extra] = host.split('%');
+                    if (extra !== undefined || scope === '') return false;
+                    if (!/^[0-9a-f:.]+$/.test(address)) return false;
+                    try {
+                        const normalized = new URL(`http://[${address}]/`).hostname;
+                        return normalized === '[::1]'
+                            || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalized);
+                    } catch {
+                        return false;
+                    }
+                });
+            },
+
             async saveGlobalSettings() {
+                if (this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -6663,23 +1109,32 @@
                 // Validate required fields
                 const errors = [];
                 const s = this.globalSettings;
-                if (!s.server.host) errors.push('Host');
-                if (!s.server.port) errors.push('Port');
-                if (!s.server.max_audio_upload_size) errors.push('Maximum Audio Upload Size');
-                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
-                if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
-                if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
-                if (!s.sampling.max_context_window) errors.push('Max Context Window');
-                if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (!s.server.host) errors.push(window.t('settings.server.host'));
+                if (!s.server.port) errors.push(window.t('settings.server.port'));
+                if (!s.server.max_audio_upload_size) errors.push(window.t('settings.advanced.max_audio_upload_size'));
+                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push(window.t('js.error.model_directory'));
+                if (!s.scheduler.max_concurrent_requests) errors.push(window.t('settings.resource.max_concurrent_requests'));
+                if (!s.scheduler.embedding_batch_size) errors.push(window.t('settings.resource.embedding_batch_size'));
+                if (!s.cache.ssd_cache_max_size) errors.push(window.t('js.error.max_cache_size'));
+                if (!s.sampling.max_context_window) errors.push(window.t('js.error.max_context_window'));
+                if (!s.sampling.max_tokens) errors.push(window.t('settings.generation.max_tokens'));
                 if (s.cache.gdn_snapshot_storage === 'ssd_sidecar' && s.cache.hot_cache_only) {
-                    errors.push('GDN SSD sidecar requires Hot Cache Only to be disabled');
+                    errors.push(window.t('js.error.gdn_sidecar_hot_cache_conflict'));
                 }
 
                 if (errors.length > 0) {
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
                     this.saving = false;
                     return;
+                }
+
+                if (!this.isLoopbackBindHost(s.server.host)) {
+                    s.auth.skip_api_key_verification = false;
+                    if (!s.auth.api_key && !s.auth.api_key_set) {
+                        this.saveError = window.t('js.error.api_key_required_network');
+                        this.saving = false;
+                        return;
+                    }
                 }
 
                 // Validate API key if provided
@@ -6701,12 +1156,14 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            ...(this.globalDefaultsPending ? { ui_language: s.ui.language } : {}),
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            qwen4_gdn_decode_wide_proj: this.globalSettings.server.qwen4_gdn_decode_wide_proj,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -6742,6 +1199,7 @@
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
                             mcp_expose_tools: this.globalSettings.mcp.expose_tools,
+                            usage_history: this.globalSettings.usage.usage_history,
                             hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
@@ -6756,11 +1214,15 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.saveSuccess = true;
-                        this.saveMessage = data.message || 'Settings saved successfully';
+                        this.saveMessage = data.message || window.t('js.success.settings_saved');
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
+                        if (this.globalDefaultsPending) {
+                            this.globalDefaultsPending = false;
+                            window.location.reload();
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -6972,6 +1434,7 @@
                 const isDiffusion = !!ms.is_diffusion_model;
 
                 for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
+                    if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
                     if (k === 'thinking_budget_enabled') {
@@ -7098,13 +1561,35 @@
                 if (description) lines.push(description);
                 return lines.join('\n');
             },
+            matchingProfileTemplate(profile) {
+                if (!profile?.source_template) return null;
+                const template = this.templates.find(t => t.name === profile.source_template);
+                if (!template) return null;
+                const canonical = value => {
+                    if (Array.isArray(value)) return value.map(canonical);
+                    if (value && typeof value === 'object') {
+                        return Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])]));
+                    }
+                    return value;
+                };
+                return JSON.stringify(canonical(profile.settings || {})) === JSON.stringify(canonical(template.settings || {}))
+                    ? template : null;
+            },
+            get visibleModelProfiles() {
+                return this.profiles.filter(p => p.expose_as_model || !this.matchingProfileTemplate(p));
+            },
+            get activeTemplateName() {
+                const profile = this.profiles.find(p => p.name === this.activeProfileName);
+                return this.matchingProfileTemplate(profile)?.name || null;
+            },
             async loadProfilesForModel(modelId) {
+                const seq = this._applySeq;
                 this.profiles = [];
                 try {
                     const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/profiles`);
                     if (r.ok) {
                         const data = await r.json();
-                        this.profiles = data.profiles || [];
+                        if (seq === this._applySeq) this.profiles = data.profiles || [];
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -7188,6 +1673,12 @@
 
             showTip(el, text) {
                 if (!text) return;
+                // A tooltip must share the dialog's top layer to remain visible.
+                const tooltip = this.$refs.floatingTooltip;
+                const container = el.closest('dialog') || this.$root;
+                if (tooltip.parentElement !== container) {
+                    Alpine.mutateDom(() => container.appendChild(tooltip));
+                }
                 const rect = el.getBoundingClientRect();
                 this.tip = {
                     visible: true,
@@ -7205,13 +1696,6 @@
                     .toLowerCase()
                     .replace(/-/g, '_');
                 return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
-            },
-
-            isQwen35AnePrefillModel(model) {
-                const modelType = String(model?.config_model_type || '')
-                    .toLowerCase()
-                    .replace(/-/g, '_');
-                return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
             },
 
             isDiffusionUnsupportedProfileField(field) {
@@ -7276,6 +1760,18 @@
             dflashDraftModelCandidates() {
                 return this.draftModelCandidates((model) => this.isDflashDraftModel(model));
             },
+
+            aneFractionOptions(current, presets) {
+                const options = (presets || []).map(value => ({value,
+                    label: value.toLocaleString(undefined, {style: 'percent', maximumFractionDigits: 0})}));
+                if (!options.some(option => option.value === current)) {
+                    options.unshift({value: current, label: current.toLocaleString(undefined,
+                        {style: 'percent', maximumFractionDigits: 2})});
+                }
+                return options;
+            },
+
+
 
             vlmMtpDraftModelCandidates() {
                 return this.draftModelCandidates(
@@ -7378,6 +1874,18 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    deepseek_v41_ced_prefill_enabled:
+                        s.deepseek_v41_ced_prefill_enabled === true,
+                    deepseek_v41_ced_prefill_supported:
+                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
+                    deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
+                        || s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_requested:
+                        s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_supported:
+                        model?.deepseek_v41_engram_ssd_offload_supported === true,
+                    deepseek_v41_engram_ssd_offload_forced:
+                        model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -7390,10 +1898,17 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
+                    moe_expert_offload_resident_touched: false,
+                    moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
+                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
+                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
-                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
+                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53,
                     qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
                     qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
                     qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
@@ -7434,10 +1949,13 @@
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
+                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '3',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
+                    qwen35_ane_prefill_shared_fraction: s.qwen35_ane_prefill_shared_fraction ?? 1,
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
@@ -7445,6 +1963,40 @@
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
                 };
+            },
+
+            moeExpertOffloadResidentInvalid() {
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                return (
+                    !Number.isFinite(percent)
+                    || percent < MOE_EXPERT_OFFLOAD_MIN_PERCENT
+                    || percent > MOE_EXPERT_OFFLOAD_MAX_PERCENT
+                );
+            },
+
+            onMoeExpertOffloadResidentBlur() {
+                // Preserve untouched API values outside the UI range.
+                if (!this.modelSettings.moe_expert_offload_resident_touched) return;
+                if (this.moeExpertOffloadResidentInvalid()) {
+                    const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                    this.modelSettings.moe_expert_offload_resident_percent = Math.min(
+                        MOE_EXPERT_OFFLOAD_MAX_PERCENT,
+                        Math.max(
+                            MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                            Number.isFinite(percent) ? percent : MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                        ),
+                    );
+                }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            onMoeExpertOffloadResidentPercent() {
+                // Defer clamping until blur so partial input remains editable.
+                this.modelSettings.moe_expert_offload_resident_touched = true;
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                if (!this.moeExpertOffloadResidentInvalid()) {
+                    this.modelSettings.moe_expert_offload_resident_fraction = Number((percent / 100).toPrecision(15));
+                }
             },
 
             _resetPresetApplicableFields() {
@@ -7533,11 +2085,13 @@
                 return slug || 'profile';
             },
             async createProfile() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 if (!this.selectedModel) return;
                 this.profileError = '';
                 const displayName = (this.newProfile.display_name || '').trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const apiName = (this.newProfile.api_name || this.slugifyProfileApiName(displayName)).trim();
@@ -7554,6 +2108,7 @@
                     description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
+                    expose_as_model: !!this.newProfile.expose_as_model,
                 };
                 try {
                     const r = await fetch(
@@ -7562,6 +2117,9 @@
                           body: JSON.stringify(body) }
                     );
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
+                        await this.applyProfileToForm(data.profile);
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
@@ -7570,23 +2128,26 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save profile';
+                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
                 }
             },
-            async applyProfileToForm(profile) {
+            async applyProfileToForm(profile, fromTemplate = false) {
+                const modelId = this.selectedModel?.id;
+                if (!modelId) return;
                 const seq = ++this._applySeq;
                 this.profileError = '';
                 try {
                     const r = await fetch(
-                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
+                        `/admin/api/models/${encodeURIComponent(modelId)}/${fromTemplate ? "profile-templates" : "profiles"}/${encodeURIComponent(profile.name)}/apply`,
                         { method: 'POST' }
                     );
-                    if (seq !== this._applySeq) return;  // superseded by a newer click
+                    if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;  // superseded by a newer click
                     if (r.ok) {
                         const data = await r.json();
+                        if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;
                         const activeName = data.settings?.active_profile_name || profile.name;
                         const settings = {
                             ...(data.settings || {}),
@@ -7601,14 +2162,16 @@
                         }
                         this.activeProfileName = activeName;
                         this.profilesDrift = false;
+                        this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                         // Update the models list so the profile badge reflects the change
-                        const m = this.models.find(m => m.id === this.selectedModel.id);
+                        const m = this.models.find(m => m.id === modelId);
                         if (m) m.settings = { ...settings };
+                        await this.loadProfilesForModel(modelId);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to apply profile';
+                        this.profileError = data.detail || window.t('js.error.apply_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7616,48 +2179,7 @@
                 }
             },
             async applyTemplateToForm(template) {
-                // Check if a profile with this template's name already exists
-                const existingProfile = this.profiles.find(p => p.name === template.name);
-
-                if (existingProfile) {
-                    // Global templates are the source of truth in this scope.
-                    const updatedProfile = await this.updateProfile(existingProfile.name, {
-                        settings: template.settings,
-                        source_template: template.name,
-                    });
-                    if (updatedProfile) {
-                        await this.applyProfileToForm(updatedProfile);
-                    }
-                } else {
-                    // Create a new profile from the template
-                    const body = {
-                        name: template.name,
-                        display_name: template.display_name,
-                        api_name: this.slugifyProfileApiName(template.display_name || template.name),
-                        description: template.description || null,
-                        settings: template.settings,
-                        source_template: template.name,
-                    };
-                    
-                    try {
-                        const r = await fetch(
-                            `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
-                            { method: 'POST', headers: {'Content-Type': 'application/json'},
-                              body: JSON.stringify(body) }
-                        );
-                        if (r.ok) {
-                            // Reload profiles first to include the new one
-                            await this.loadProfilesForModel(this.selectedModel.id);
-                            // Find the newly created profile in the refreshed list
-                            const newProfile = this.profiles.find(p => p.name === template.name);
-                            if (newProfile) {
-                                await this.applyProfileToForm(newProfile);
-                            }
-                        }
-                    } catch (e) {
-                        console.error('Failed to create profile from template:', e);
-                    }
-                }
+                await this.applyProfileToForm(template, true);
             },
             async deleteProfile(name) {
                 if (!this.selectedModel) return;
@@ -7687,7 +2209,7 @@
                 const description = (p._editDescription ?? p.description ?? '').trim();
                 const exposeAsModel = !!(p._editExposeAsModel ?? p.expose_as_model);
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 if (!this.isValidProfileName(apiName)) {
@@ -7702,10 +2224,13 @@
                 };
                 return this.updateProfile(p.name, patch);
             },
-            updateProfileSettingsFromForm(p) {
-                return this.updateProfile(p.name, {
+            async updateProfileSettingsFromForm(p) {
+                const updated = await this.updateProfile(p.name, {
                     settings: this.formValuesForProfile(),
                 });
+                if (updated && this.activeProfileName === p.name) {
+                    await this.applyProfileToForm(updated);
+                }
             },
             async updateProfile(name, patch) {
                 // patch: { new_name?, display_name?, api_name?, description?, expose_as_model?, settings?, also_save_as_template? }
@@ -7730,17 +2255,19 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update profile';
+                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
                 }
             },
             async createTemplate() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 this.profileError = '';
                 const displayName = this.newTemplate.display_name.trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const autoId = 't-' + Date.now().toString(36) + '-' +
@@ -7759,14 +2286,17 @@
                         body: JSON.stringify(body),
                     });
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
                         await this.loadTemplates();
+                        await this.applyTemplateToForm(data.template);
                         this.showNewTemplateForm = false;
                         this.newTemplate = { name: '', display_name: '', description: '' };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save template';
+                        this.profileError = data.detail || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7782,12 +2312,17 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        const active = this.profiles.find(p => p.name === this.activeProfileName);
+                        if (patch.settings && active?.source_template === name) {
+                            const template = this.templates.find(t => t.name === name);
+                            if (template) await this.applyTemplateToForm(template);
+                        }
                         this.editingTemplate = null;
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update template';
+                        this.profileError = data.detail || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7801,6 +2336,7 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        if (this.selectedModel) await this.loadProfilesForModel(this.selectedModel.id);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -7831,57 +2367,64 @@
                 const measured = recommendation.processing_tps !== null
                     && recommendation.processing_tps !== undefined;
                 const speed = Number(recommendation.processing_tps || 0).toFixed(1);
-                const speedup = Number(recommendation.speedup_percent || 0);
-                const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
                 const speedSuffix = measured
-                    ? ` · ${speed} prompt tok/s · ${speedupText}`
+                    ? ` · ${speed} prompt tok/s`
                     : '';
                 if (!recommendation.enabled) {
-                    return `GPU only${speedSuffix}`;
+                    return window.t('js.ane_tune.winner_gpu_only') + speedSuffix;
+                }
+                if (recommendation.backend === 'k2') {
+                    return window.t('js.ane_tune.winner_ane_dense')
+                        .replace('{mlp}', Math.round(recommendation.mlp_fraction * 100))
+                        .replace('{shared}', Math.round(recommendation.shared_fraction * 100))
+                        + speedSuffix;
                 }
                 const parts = [
-                    `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
+                    (recommendation.fused_down
+                        ? window.t('js.ane_tune.fused_mlp')
+                        : window.t('js.ane_tune.mlp')
+                    ).replace(
+                        '{pct}',
+                        Math.round(Number(recommendation.mlp_fraction) * 100),
+                    ),
                 ];
                 if (recommendation.gdn_enabled) {
                     parts.push(
-                        `GDN ${Math.round(Number(recommendation.gdn_fraction) * 100)}%`
+                        window.t('js.ane_tune.gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.gdn_fraction) * 100),
+                        )
                     );
                 } else {
-                    parts.push('GDN off');
+                    parts.push(window.t('modal.model_settings.ane_gdn_off'));
                 }
                 if (recommendation.cpu_enabled) {
                     parts.push(
-                        `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
-                        `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
-                        `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
+                        window.t('js.ane_tune.cpu_gate').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_down').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_down_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100),
+                        ),
                     );
                 }
                 if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
                     parts.push(
-                        `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
+                        window.t('js.ane_tune.pad_tails').replace(
+                            '{n}',
+                            Number(recommendation.tail_padding_min_tokens),
+                        )
                     );
                 }
-                return `${parts.join(' · ')}${speedSuffix}`;
-            },
-
-            aneTuningResultText(result) {
-                if (result?.processing_tps === null
-                    || result?.processing_tps === undefined) {
-                    if (result?.latency_ms !== null
-                        && result?.latency_ms !== undefined) {
-                        return `${Number(result.latency_ms).toFixed(2)} ms`;
-                    }
-                    // Keep unfinished rows visible but leave their result cell
-                    // blank, including the candidate that stopped the run.
-                    return '';
-                }
-                const speed = Number(result.processing_tps).toFixed(1);
-                if (result.speedup_percent === null
-                    || result.speedup_percent === undefined) {
-                    return speed;
-                }
-                const speedup = Number(result.speedup_percent);
-                return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
+                return window.t('js.ane_tune.winner_parts')
+                    .replace('{parts}', parts.join(' · '))
+                    + speedSuffix;
             },
 
             _scheduleANETuningPoll() {
@@ -7942,7 +2485,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to start ANE tuning.');
+                        throw new Error(data.detail || window.t('js.error.start_ane_tuning_failed'));
                     }
                     this.aneTuning.tuningId = data.tuning_id;
                     this.aneTuning.total = Number(data.total || 0);
@@ -7966,11 +2509,11 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to read ANE tuning progress.');
+                        throw new Error(data.detail || window.t('js.error.read_ane_tuning_progress_failed'));
                     }
                     if (this.aneTuning.tuningId !== tuningId) return;
                     if (!data.termination_reason && data.status === 'error') {
-                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
+                        data.termination_reason = data.error || data.message || window.t('js.error.ane_tuning_failed');
                     }
                     this.aneTuning.status = data;
                     this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
@@ -8004,7 +2547,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to cancel ANE tuning.');
+                        throw new Error(data.detail || window.t('js.error.cancel_ane_tuning_failed'));
                     }
                     await this.pollANETuning();
                 } catch (error) {
@@ -8020,42 +2563,47 @@
                 const patch = {
                     qwen35_ane_prefill_enabled: !!recommendation.enabled,
                     qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
-                    qwen35_ane_prefill_tail_padding_min_tokens: Number(
-                        recommendation.tail_padding_min_tokens || 0
-                    ),
                 };
                 if (recommendation.enabled) {
                     patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
-                    patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
-                    patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
-                    if (recommendation.gdn_enabled) {
-                        patch.qwen35_ane_prefill_gdn_fraction = Number(
-                            recommendation.gdn_fraction
-                        );
+                }
+                if (recommendation.backend === 'k2') {
+                    if (recommendation.enabled) {
+                        patch.qwen35_ane_prefill_shared_fraction = Number(recommendation.shared_fraction);
                     }
-                    patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
-                    patch.qwen35_ane_prefill_cpu_fraction = Number(
-                        recommendation.cpu_fraction || 0
-                    );
-                    patch.qwen35_ane_prefill_cpu_down_fraction = Number(
-                        recommendation.cpu_down_fraction || 0
-                    );
-                    patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
-                        recommendation.cpu_gdn_fraction || 0
-                    );
-                    if (recommendation.cpu_threads !== null
-                        && recommendation.cpu_threads !== undefined) {
-                        patch.qwen35_ane_prefill_cpu_threads = Number(
-                            recommendation.cpu_threads
+                } else {
+                    patch.qwen35_ane_prefill_tail_padding_min_tokens = Number(recommendation.tail_padding_min_tokens || 0);
+                    if (recommendation.enabled) {
+                        patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
+                        patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
+                        if (recommendation.gdn_enabled) {
+                            patch.qwen35_ane_prefill_gdn_fraction = Number(
+                                recommendation.gdn_fraction
+                            );
+                        }
+                        patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
+                        patch.qwen35_ane_prefill_cpu_fraction = Number(
+                            recommendation.cpu_fraction || 0
                         );
-                    }
-                    if (recommendation.cpu_shared_resource !== null
-                        && recommendation.cpu_shared_resource !== undefined) {
-                        patch.qwen35_ane_prefill_cpu_shared_resource =
-                            !!recommendation.cpu_shared_resource;
+                        patch.qwen35_ane_prefill_cpu_down_fraction = Number(
+                            recommendation.cpu_down_fraction || 0
+                        );
+                        patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
+                            recommendation.cpu_gdn_fraction || 0
+                        );
+                        if (recommendation.cpu_threads !== null
+                            && recommendation.cpu_threads !== undefined) {
+                            patch.qwen35_ane_prefill_cpu_threads = Number(
+                                recommendation.cpu_threads
+                            );
+                        }
+                        if (recommendation.cpu_shared_resource !== null
+                            && recommendation.cpu_shared_resource !== undefined) {
+                            patch.qwen35_ane_prefill_cpu_shared_resource =
+                                !!recommendation.cpu_shared_resource;
+                        }
                     }
                 }
-
                 this.aneTuning.applying = true;
                 this.aneTuning.error = '';
                 try {
@@ -8073,7 +2621,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to apply ANE tuning result.');
+                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -8088,7 +2636,21 @@
                 }
             },
 
-            async openModelSettings(model) {
+            async refreshOpenModelSettings() {
+                if (!this.showModelSettingsModal || !this.selectedModel) return;
+                const modelId = this.selectedModel.id;
+                const baseline = this._modelSettingsBaseline;
+                if (JSON.stringify(this.modelSettings) !== baseline) return;
+                if (this.showNewProfileForm || this.showNewTemplateForm || this.editingProfile || this.editingTemplate) return;
+                await this.loadModels();
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId
+                    || JSON.stringify(this.modelSettings) !== baseline) return;
+                const model = this.models.find(m => m.id === modelId);
+                if (model) await this.openModelSettings(model, true);
+            },
+            async openModelSettings(model, preservingEdits = false) {
+                const baseline = JSON.stringify(this.modelSettings);
+                const seq = ++this._applySeq;
                 this.profileError = '';
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
@@ -8123,6 +2685,10 @@
                         } catch (_) { /* network error */ }
                     }
                 }
+                if (seq !== this._applySeq) return;
+                if (preservingEdits && (!this.showModelSettingsModal
+                    || this.selectedModel?.id !== model.id
+                    || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
@@ -8133,6 +2699,7 @@
                 } else {
                     this.computeDrift();
                 }
+                this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
             },
 
@@ -8160,77 +2727,98 @@
                 }
             },
 
+            isQwenOqA8Model(model) {
+                const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
+                return ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
+            },
+
+            validateQwenOqA8Settings() {
+                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+                // Both wrap the same MLP call, so the combination silently
+                // disables one of them. Caught here so the modal explains it
+                // instead of surfacing the server's 400.
+                if (this.modelSettings.qwen35_ane_prefill_enabled) {
+                    return window.t('js.error.ane_oq_a8_conflict');
+                }
+                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                if (!Number.isInteger(minTokens) || minTokens < 1) {
+                    return window.t('js.error.oq_a8_min_tokens_positive');
+                }
+                return null;
+            },
+
             validateQwenAneSettings() {
-                if (!this.modelSettings.qwen35_ane_prefill_enabled) return null;
+                if (!this.modelSettings.qwen35_ane_prefill_enabled
+                    || this.selectedModel?.ane_prefill_backend !== 'qwen') return null;
 
                 const integer = (value, label, minimum) => {
                     if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
+                        return window.t('js.error.field_required').replace('{field}', label);
                     }
                     const number = Number(value);
-                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
-                    if (number < minimum) return `${label} must be at least ${minimum}.`;
+                    if (!Number.isInteger(number)) return window.t('js.error.field_integer').replace('{field}', label);
+                    if (number < minimum) return window.t('js.error.field_min').replace('{field}', label).replace('{min}', minimum);
                     return null;
                 };
                 const fraction = (value, label, minimum, maximum) => {
                     if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
+                        return window.t('js.error.field_required').replace('{field}', label);
                     }
                     const number = Number(value);
-                    if (!Number.isFinite(number)) return `${label} must be a number.`;
+                    if (!Number.isFinite(number)) return window.t('js.error.field_number').replace('{field}', label);
                     if (number < minimum || number > maximum) {
-                        return `${label} must be between ${minimum} and ${maximum}.`;
+                        return window.t('js.error.field_range').replace('{field}', label).replace('{min}', minimum).replace('{max}', maximum);
                     }
                     return null;
                 };
 
                 const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
-                let error = integer(sequenceLength, 'ANE prompt block', 1024);
+                let error = integer(sequenceLength, window.t('js.error.field.ane_prompt_block'), 1024);
                 if (!error && sequenceLength % 64 !== 0) {
-                    error = 'ANE prompt block must be a multiple of 64.';
+                    error = window.t('js.error.ane_prompt_block_multiple');
                 }
                 if (error) return error;
                 error = integer(
                     this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
-                    'ANE tail padding threshold',
+                    window.t('js.error.field.ane_tail_padding'),
                     0,
                 );
                 if (error) return error;
                 if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
-                    return 'ANE tail padding threshold must be less than the prompt block.';
+                    return window.t('js.error.ane_tail_padding_lt_prompt_block');
                 }
-                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, window.t('js.error.field.mlp_ane_fraction'), 0.05, 0.90);
                 if (error) return error;
-                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, window.t('js.error.field.ane_mlp_layers'), 1);
                 if (error) return error;
 
                 if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, 'CPU MLP fraction', 0, 0.25);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, window.t('js.error.field.cpu_mlp_fraction'), 0, 0.25);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, window.t('js.error.field.cpu_mlp_down_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, 'CPU GDN fraction', 0, 0.50);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, window.t('js.error.field.cpu_gdn_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
+                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, window.t('js.error.field.cpu_workers'), 0);
                     if (error) return error;
                     if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
-                        return 'CPU worker count must be between 0 and 64.';
+                        return window.t('js.error.cpu_workers_range');
                     }
                     if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
                         + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
-                        return 'MLP ANE and CPU fractions must total less than 1.0.';
+                        return window.t('js.error.mlp_ane_cpu_total');
                     }
                 }
 
                 if (this.modelSettings.qwen35_ane_prefill_gdn) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, window.t('js.error.field.gdn_ane_fraction'), 0.05, 0.90);
                     if (error) return error;
                     if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
                         && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
                         + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
-                        return 'GDN ANE and CPU fractions must total less than 1.0.';
+                        return window.t('js.error.gdn_ane_cpu_total');
                     }
-                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, window.t('js.error.field.ane_gdn_layers'), 0);
                     if (error) return error;
                 }
                 return null;
@@ -8238,6 +2826,12 @@
 
             async saveModelSettings() {
                 if (!this.selectedModel) return;
+
+                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
+                if (qwenOqA8ValidationError) {
+                    alert(qwenOqA8ValidationError);
+                    return;
+                }
 
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
@@ -8297,9 +2891,15 @@
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
-                                enable_thinking: this.modelSettings.enable_thinking,
+                                enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                deepseek_v41_ced_prefill_enabled:
+                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
+                                deepseek_v41_engram_ssd_offload:
+                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
+                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
+                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -8319,6 +2919,10 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
+                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
+                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
+                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
                                 // Validation only runs when the feature is enabled, so a
                                 // blank numeric input must fall back to the server default
@@ -8327,7 +2931,7 @@
                                 qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
                                     : 0,
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
                                 qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
                                 qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
@@ -8405,6 +3009,11 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
+                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
+                                    : null,
+                                mtp_fixed_depth: null,
+                                qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -8469,6 +3078,8 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    mtp_adaptive_max_depth: null,
+                                    mtp_fixed_depth: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
@@ -8506,6 +3117,162 @@
                 }
             },
 
+            // Snapshot actions in the settings modal header. All three go
+            // through server endpoints that decode, validate and persist, so
+            // the form is rebuilt from the returned settings.
+            openSettingsApply(mode) {
+                this.settingsApply = {
+                    open: true,
+                    mode,
+                    phase: mode === 'recipe' ? 'input' : (mode === 'reset' ? 'confirm' : 'loading'),
+                    recipeText: '',
+                    result: null,
+                    candidates: null,
+                    error: '',
+                };
+                if (mode === 'optimal') this.loadOptimalCandidates();
+            },
+
+            closeSettingsApply() {
+                if (this.settingsApply.phase === 'loading') return;
+                this.settingsApply.open = false;
+            },
+
+            async _settingsActionRequest(method, path, body) {
+                if (!this.selectedModel) return null;
+                const url = `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings/${path}`;
+                const init = { method };
+                if (body !== undefined) {
+                    init.headers = { 'Content-Type': 'application/json' };
+                    init.body = JSON.stringify(body);
+                }
+                this.settingsApply.phase = 'loading';
+                this.settingsApply.error = '';
+                try {
+                    const response = await fetch(url, init);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return null;
+                    }
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.phase = 'error';
+                        return null;
+                    }
+                    return data;
+                } catch (err) {
+                    console.error('Settings snapshot request failed:', err);
+                    this.settingsApply.error = window.t('js.error.settings_apply_failed');
+                    this.settingsApply.phase = 'error';
+                    return null;
+                }
+            },
+
+            async loadOptimalCandidates() {
+                const data = await this._settingsActionRequest('GET', 'optimal');
+                if (!data) return;
+                this.settingsApply.result = data;
+                if (!data.found) {
+                    this.settingsApply.phase = 'none';
+                    return;
+                }
+                this.settingsApply.candidates = data;
+                this.settingsApply.phase = 'choose';
+            },
+
+            async applyOptimalCandidate(benchmarkId) {
+                const data = await this._settingsActionRequest('POST', 'optimal', { benchmark_id: benchmarkId });
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            async runSettingsApply() {
+                const mode = this.settingsApply.mode;
+                const data = mode === 'recipe'
+                    ? await this._settingsActionRequest('POST', 'recipe', { recipe: this.settingsApply.recipeText.trim() })
+                    : await this._settingsActionRequest('POST', 'reset');
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            settingsApplyTitle() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.apply_title_recipe');
+                return window.t('modal.model_settings.actions.apply_title_optimal');
+            },
+
+            settingsApplyLoadingText() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.loading_reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.loading_recipe');
+                return this.settingsApply.candidates
+                    ? window.t('modal.model_settings.actions.loading_apply')
+                    : window.t('modal.model_settings.actions.loading_optimal');
+            },
+
+            settingsApplyDoneText() {
+                const mode = this.settingsApply.mode;
+                const result = this.settingsApply.result;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.done_reset');
+                if (result && result.changed === false) return window.t('modal.model_settings.actions.no_change');
+                return mode === 'recipe'
+                    ? window.t('modal.model_settings.actions.done_recipe')
+                    : window.t('modal.model_settings.actions.done_optimal');
+            },
+
+            settingsApplyGroups() {
+                const c = this.settingsApply.candidates;
+                if (!c) return [];
+                return [
+                    { key: 'pp', label: window.t('modal.model_settings.actions.group_pp'), items: c.by_pp || [] },
+                    { key: 'tg', label: window.t('modal.model_settings.actions.group_tg'), items: c.by_tg || [] },
+                ].filter(g => g.items.length);
+            },
+
+            settingsApplyJson() {
+                const result = this.settingsApply.result;
+                return result && result.applied ? JSON.stringify(result.applied, null, 2) : '';
+            },
+
+            settingsApplyStats(item) {
+                if (!item || item.pp_tps == null) return '';
+                const parts = [`PP ${Number(item.pp_tps).toFixed(1)} tok/s`];
+                if (item.tg_tps != null) parts.push(`TG ${Number(item.tg_tps).toFixed(1)} tok/s`);
+                if (item.memory_gb != null) parts.push(`${item.memory_gb} GB`);
+                if (item.quantization) parts.push(item.quantization);
+                if (item.omlx_version) parts.push(`oMLX ${item.omlx_version}`);
+                if (item.created_at) parts.push(String(item.created_at).slice(0, 10));
+                return parts.join(' · ');
+            },
+
+            async _applySettingsResponse(data) {
+                if (data.settings && this.selectedModel) {
+                    this.modelSettings = this.buildModelSettingsState(this.selectedModel, data.settings);
+                    this.activeProfileName = data.settings.active_profile_name || null;
+                    if (!this.modelSettings.is_diffusion_model) this.computeDrift();
+                }
+                await this.loadModels();
+                if (this.selectedModel) {
+                    const fresh = (this.models || []).find(m => m.id === this.selectedModel.id);
+                    if (fresh) this.selectedModel = fresh;
+                }
+                if (data.requires_reload) {
+                    if (data.auto_reloaded) {
+                        alert(window.t('js.info.model_settings_auto_reloaded'));
+                    } else if (data.auto_unloaded) {
+                        alert(window.t('js.info.model_settings_auto_unloaded'));
+                    } else {
+                        alert(window.t('js.info.model_type_reload_required'));
+                    }
+                }
+            },
+
             async loadGenerationDefaults() {
                 if (!this.selectedModel) return;
                 this.loadingGenDefaults = true;
@@ -8540,7 +3307,7 @@
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
                         this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
-                        this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
+                        this.modelSettings.qwen35_ane_prefill_fraction = this.selectedModel?.ane_prefill_default_fraction ?? 0.53;
                         this.modelSettings.qwen35_ane_prefill_max_layers = 64;
                         this.modelSettings.qwen35_ane_prefill_dual_ane = true;
                         this.modelSettings.qwen35_ane_prefill_gdn = true;
@@ -8573,6 +3340,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
+                        this.modelSettings.mtp_adaptive_max_depth = '3';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -8813,6 +3581,219 @@
                 }
             },
 
+            // ---- Dashboard block layout ----
+            _dashLayoutLib() {
+                return typeof DashboardLayout !== 'undefined' ? DashboardLayout : null;
+            },
+            get dashboardWidthClass() {
+                const lib = this._dashLayoutLib();
+                const width = this.dashEditing && this.dashDraft ? this.dashDraft.width : this.dashLayout?.width;
+                return lib ? lib.widthClass(width) : 'max-w-7xl';
+            },
+            get dashWidthOptions() {
+                const lib = this._dashLayoutLib();
+                if (!lib) return [];
+                return lib.WIDTH_IDS.map(id => ({ id, label: window.t(`status.layout.width_${id}`) }));
+            },
+            get dashTrayEmpty() {
+                const lib = this._dashLayoutLib();
+                return !!lib && this.dashPlacedIds.length >= lib.BLOCK_IDS.length;
+            },
+            dashPlaced(id) {
+                return this.dashPlacedIds.includes(id);
+            },
+            _dashBlockEl(id) {
+                return this.$refs.dashGrid?.querySelector(`.dash-block[data-block="${id}"]`) || null;
+            },
+            // Creates the grid the first time the status tab is visible; GridStack
+            // needs a measurable width. Later calls only refit block heights.
+            ensureDashboardGrid() {
+                const lib = this._dashLayoutLib();
+                if (!lib || typeof GridStack === 'undefined' || this.mainTab !== 'status') return;
+                if (dashGrid) {
+                    this.refitDashboardBlocks();
+                    return;
+                }
+                const el = this.$refs.dashGrid;
+                if (!el || !el.offsetWidth) return;
+                dashGrid = GridStack.init({
+                    column: lib.COLUMNS,
+                    cellHeight: 8,
+                    margin: 12,
+                    sizeToContent: true,
+                    float: false,
+                    animate: true,
+                    minRow: 1,
+                    disableDrag: true,
+                    disableResize: true,
+                    acceptWidgets: '.dash-tray-pill',
+                    draggable: { handle: '.dash-block-handle', appendTo: 'body' },
+                    resizable: { handles: 'e, w, se' },
+                    columnOpts: {
+                        columnMax: lib.COLUMNS,
+                        breakpointForWindow: true,
+                        breakpoints: [{ w: 752, c: 1, layout: 'list' }],
+                    },
+                }, el);
+                dashGrid.on('dropped', (event, previous, node) => this._onDashTrayDrop(node));
+                dashGrid.on('dragstop resizestop', () => this.refitDashboardBlocks());
+                GridStack.setupDragIn('.dash-tray-pill', { appendTo: 'body', helper: 'clone' });
+                if (typeof ResizeObserver !== 'undefined') {
+                    dashObserver = new ResizeObserver(() => this.refitDashboardBlocks());
+                    el.querySelectorAll('.dash-block-body').forEach(body => dashObserver.observe(body));
+                }
+                const narrow = window.matchMedia('(max-width: 751.98px)');
+                const syncNarrow = () => {
+                    this.dashEditAvailable = !narrow.matches;
+                    if (narrow.matches && this.dashEditing) this.cancelDashboardEdit();
+                };
+                narrow.addEventListener('change', syncNarrow);
+                syncNarrow();
+                this.applyDashboardLayout(this.dashLayout || lib.defaultLayout());
+            },
+            // Block heights follow their content (stats polling, x-show toggles).
+            // GridStack measures the item's current box, which is still mid-transition
+            // right after a move or resize, so run a second pass once it settles.
+            refitDashboardBlocks() {
+                if (!dashGrid || this.mainTab !== 'status') return;
+                const run = () => {
+                    if (!dashGrid || !this.$refs.dashGrid?.offsetWidth) return;
+                    dashGrid.getGridItems().forEach(item => dashGrid.resizeToContent(item));
+                };
+                if (!dashRefitFrame) {
+                    dashRefitFrame = requestAnimationFrame(() => {
+                        dashRefitFrame = null;
+                        run();
+                    });
+                }
+                clearTimeout(dashRefitTimer);
+                dashRefitTimer = setTimeout(run, 400);
+            },
+            _dashPark(el) {
+                dashGrid.removeWidget(el, false, false);
+                el.classList.add('dash-block-parked');
+            },
+            _dashPlace(id, pos) {
+                const lib = this._dashLayoutLib();
+                const el = this._dashBlockEl(id);
+                if (!el || el.gridstackNode) return null;
+                el.classList.remove('dash-block-parked');
+                dashGrid.makeWidget(el, { id, x: pos.x, y: pos.y, w: pos.w, h: 1, minW: lib.MIN_W });
+                dashGrid.resizeToContent(el);
+                if (!this.dashPlacedIds.includes(id)) this.dashPlacedIds = [...this.dashPlacedIds, id];
+                return el;
+            },
+            applyDashboardLayout(layout) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib) return;
+                layout = lib.normalizeLayout(layout);
+                // No transition while rebuilding: the first content measurement of a
+                // freshly placed item must see its final box, not an animating one.
+                dashGrid.setAnimation(false);
+                dashGrid.getGridItems().forEach(item => this._dashPark(item));
+                this.dashPlacedIds = [];
+                // Heights come from content, so saved y values only encode order. Pack
+                // each block under the tallest block already occupying its columns;
+                // a later block inserted at an occupied row would push earlier ones down.
+                const bottoms = new Array(lib.COLUMNS).fill(0);
+                [...layout.blocks]
+                    .sort((a, b) => a.y - b.y || a.x - b.x)
+                    .forEach(block => {
+                        const y = Math.max(...bottoms.slice(block.x, block.x + block.w));
+                        const el = this._dashPlace(block.id, { x: block.x, y, w: block.w });
+                        const h = el?.gridstackNode?.h || 1;
+                        for (let c = block.x; c < block.x + block.w; c++) bottoms[c] = y + h;
+                    });
+                dashGrid.setAnimation(true);
+                this.refitDashboardBlocks();
+            },
+            collectDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                const blocks = dashGrid.save(false).map(n => ({ id: n.id, x: n.x, y: n.y, w: n.w }));
+                return lib.normalizeLayout({ version: 1, width: this.dashDraft?.width, blocks });
+            },
+            _onDashTrayDrop(node) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib || !node?.el) return;
+                const id = node.el.dataset.block;
+                const pos = { x: node.x, y: node.y, w: node.w };
+                // The dropped element is GridStack's clone of the tray pill.
+                dashGrid.removeWidget(node.el, true, false);
+                if (!lib.BLOCK_IDS.includes(id) || !this.dashEditing) return;
+                this._dashPlace(id, pos);
+                this.refitDashboardBlocks();
+            },
+            dashRemoveBlock(id) {
+                const el = this._dashBlockEl(id);
+                if (!dashGrid || !this.dashEditing || !el?.gridstackNode) return;
+                this._dashPark(el);
+                this.dashPlacedIds = this.dashPlacedIds.filter(placed => placed !== id);
+                dashGrid.compact();
+            },
+            _dashAfterLayoutChange() {
+                this.$nextTick(() => {
+                    dashGrid?.onResize();
+                    this.refitDashboardBlocks();
+                });
+            },
+            startDashboardEdit() {
+                if (!dashGrid || !this.dashLayout || !this.dashEditAvailable || this.dashEditing) return;
+                this.dashDraft = { width: this.dashLayout.width };
+                this.dashSaveError = '';
+                this.dashEditing = true;
+                dashGrid.enable();
+                this._dashAfterLayoutChange();
+            },
+            cancelDashboardEdit() {
+                if (!this.dashEditing) return;
+                this.dashEditing = false;
+                this.dashDraft = null;
+                this.dashSaveError = '';
+                if (dashGrid) {
+                    dashGrid.disable();
+                    this.applyDashboardLayout(this.dashLayout);
+                }
+                this._dashAfterLayoutChange();
+            },
+            resetDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib) return;
+                this.dashDraft.width = 'default';
+                this.applyDashboardLayout(lib.defaultLayout());
+                this._dashAfterLayoutChange();
+            },
+            setDashboardWidth(width) {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib || !lib.WIDTH_IDS.includes(width)) return;
+                this.dashDraft.width = width;
+                this._dashAfterLayoutChange();
+            },
+            async saveDashboardLayout() {
+                if (!dashGrid || !this.dashEditing || this.dashSaving) return;
+                const layout = this.collectDashboardLayout();
+                this.dashSaving = true;
+                this.dashSaveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_dashboard_layout: layout }),
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    this.dashLayout = layout;
+                    this.globalSettings.ui.dashboard_layout = layout;
+                    this.dashEditing = false;
+                    this.dashDraft = null;
+                    dashGrid.disable();
+                    this._dashAfterLayoutChange();
+                } catch (err) {
+                    console.error('Failed to save dashboard layout:', err);
+                    this.dashSaveError = window.t('status.layout.save_failed');
+                } finally {
+                    this.dashSaving = false;
+                }
+            },
+
             _launchCmd(tool) {
                 const raw = this.stats.cli_prefix || 'omlx';
                 const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
@@ -8850,6 +3831,11 @@
 
             get piCommand() {
                 return this._launchCmd('pi');
+            },
+
+            get markitdownOcrModelMissing() {
+                const id = this.globalSettings.integrations.markitdown_pdf_processing_engine;
+                return id !== 'markitdown' && !(this.models || []).some(model => model.id === id);
             },
 
             get markitdownOcrModels() {
@@ -9160,7 +4146,7 @@
 
             formatActivityAge(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '';
-                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+                return window.t('status.active_models.last_token_ago').replace('{age}', this.formatDurationShort(seconds));
             },
 
             formatActivityMetadata(activity) {
@@ -9228,7 +4214,10 @@
                 if (!mp || !mp.enabled || !mp.hard_bytes) {
                     return window.t('status.active_models.enforcer_disabled');
                 }
-                return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
+                return window.t('status.active_models.pressure_label')
+                    .replace('{current}', this.formatSizeBytes(mp.current_bytes))
+                    .replace('{soft}', this.formatSizeBytes(mp.soft_bytes))
+                    .replace('{hard}', this.formatSizeBytes(mp.hard_bytes));
             },
 
             modelSizeLabel(model) {
@@ -9245,9 +4234,25 @@
                     return estimated;
                 }
                 if (!estimated || estimated === actual) {
-                    return `~${actual} obs`;
+                    return window.t('status.active_models.size_observed')
+                        .replace('{size}', actual);
                 }
-                return `~${actual} obs / ${estimated} est`;
+                return window.t('status.active_models.size_observed_estimated')
+                    .replace('{size}', actual)
+                    .replace('{estimated}', estimated);
+            },
+
+            clusterBadgeLabel(cluster) {
+                if (!cluster) return '';
+                const tensor = window.t('cluster.badge.tensor') + '×' + (cluster.tensor_parallel_size || 1);
+                const pipeline = window.t('cluster.badge.pipeline') + '×' + (cluster.pipeline_stages || 1);
+                let strategy = tensor;
+                if (cluster.strategy === 'pipeline') {
+                    strategy = pipeline;
+                } else if (cluster.strategy === 'hybrid') {
+                    strategy = tensor + '+' + pipeline;
+                }
+                return window.t('cluster.badge.label') + ' · ' + strategy;
             },
 
             copyToClipboard(text) {
@@ -9489,7 +4494,7 @@
                             this.benchUploading = true;
                             this.benchProgress = {
                                 phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
+                                message: window.t('bench.uploading_community'),
                                 current: 0,
                                 total: 0,
                             };
@@ -9755,9 +4760,14 @@
                 const requested = this.benchRequestedPp(result);
                 const actual = result?.pp;
                 if (requested !== actual) {
-                    return `pp${actual} (requested pp${requested})/tg${result.tg}`;
+                    return window.t('bench.results.test.requested')
+                        .replace('{actual}', actual)
+                        .replace('{requested}', requested)
+                        .replace('{tg}', result.tg);
                 }
-                return `pp${actual}/tg${result.tg}`;
+                return window.t('bench.results.test.plain')
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
             },
 
             benchBatchPromptSummary() {
@@ -9769,9 +4779,14 @@
                 const minimum = result.prompt_tokens_min ?? result.pp;
                 const maximum = result.prompt_tokens_max ?? result.pp;
                 const actual = minimum === maximum
-                    ? `actual pp${minimum}`
-                    : `actual pp${minimum}-${maximum}`;
-                return `requested pp${requested} / ${actual} / tg${result.tg}`;
+                    ? window.t('bench.results.batch.actual_pp').replace('{pp}', minimum)
+                    : window.t('bench.results.batch.actual_pp_range')
+                        .replace('{min}', minimum)
+                        .replace('{max}', maximum);
+                return window.t('bench.results.batch.requested_summary')
+                    .replace('{requested}', requested)
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
             },
 
             // Unmeasured metrics (tpot_ms/gen_tps/tg_tps, plus ttft/pp when
@@ -9802,24 +4817,39 @@
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
 
-                lines.push('oMLX - LLM inference, optimized for your Mac');
+                lines.push(
+                    window.t('bench.results.text_export.title')
+                        .replace('{tagline}', window.t('app.tagline'))
+                );
                 lines.push('https://github.com/jundot/omlx');
                 if (this.benchRunExternal) {
-                    lines.push(`Benchmark Model: ${this.benchRunExternal.model} @ ${this.benchRunExternal.base_url}`);
-                    lines.push('Engine: External OpenAI-compatible endpoint');
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model_endpoint')
+                            .replace('{model}', () => this.benchRunExternal.model)
+                            .replace('{url}', () => this.benchRunExternal.base_url)
+                    );
+                    lines.push(window.t('bench.results.text_export.engine_external'));
                 } else {
-                    lines.push(`Benchmark Model: ${this.benchModelId}`);
-                    lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model')
+                            .replace('{model}', () => this.benchModelId)
+                    );
+                    lines.push(this.benchForceLmEngine
+                        ? window.t('bench.results.text_export.engine_force_lm')
+                        : window.t('bench.results.text_export.engine_auto'));
                 }
-                lines.push(`Context: ${this.benchContextLabel(this.benchContextProfile)}`);
+                lines.push(
+                    window.t('bench.results.text_export.context')
+                        .replace('{context}', this.benchContextLabel(this.benchContextProfile))
+                );
                 lines.push('='.repeat(80));
 
                 // Single Request Results
                 if (this.benchSingleResults.length > 0) {
                     lines.push('');
-                    lines.push('Single Request Results');
+                    lines.push(window.t('bench.results.single.section_label'));
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Test', 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad('Throughput', 12), pad('Peak Mem', 10)];
+                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
                     lines.push(hdr.join('  '));
                     for (const r of this.benchSingleResults) {
                         const row = [
@@ -9844,7 +4874,7 @@
                     lines.push(`${title}`);
                     lines.push(subtitle);
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Batch', 8), pad('tg TPS', 12), pad('Speedup', 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
+                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('tg TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
                     lines.push(hdr.join('  '));
                     if (baseline) {
                         const row = [
@@ -9863,7 +4893,7 @@
                         const row = [
                             rpad(r.batch_size + 'x', 8),
                             pad(this.benchFmtNum(r.tg_tps, 1, ' tok/s'), 12),
-                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : 'N/A', 8),
+                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : window.t('bench.results.text_export.not_available'), 8),
                             pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
@@ -9874,7 +4904,7 @@
                 };
 
                 buildBatchText(
-                    'Continuous Batching',
+                    window.t('bench.results.batch.title'),
                     this.benchBatchPromptSummary(),
                     this.benchBatchResults
                 );
@@ -10130,7 +5160,7 @@
                     });
                     if (!resp.ok) {
                         const err = await resp.json();
-                        throw new Error(err.detail || 'Failed to add to queue');
+                        throw new Error(err.detail || window.t('js.error.add_to_queue_failed'));
                     }
                     const data = await resp.json();
                     this.accQueue = data.queue || [];
@@ -10331,11 +5361,11 @@
                 const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
 
                 let lines = [];
-                lines.push('Intelligence Benchmark Comparison');
+                lines.push(window.t('acc_bench.results.comparison_title'));
                 lines.push('');
 
                 // Header row
-                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
+                let header = rpad('', benchWidth) + rpad(window.t('acc_bench.results.text_export.mode'), modeW) + rpad(window.t('acc_bench.results.text_export.sampled'), sampledW);
                 for (const m of models) header += pad(m, modelWidth);
                 lines.push(header);
                 lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
@@ -10347,7 +5377,9 @@
                     const total = sample?.total || 0;
                     const full = fullSizes[b] || 0;
                     const isFull = total >= full;
-                    const mode = isFull ? 'Full' : 'Sample';
+                    const mode = isFull
+                        ? window.t('acc_bench.results.text_export.full')
+                        : window.t('acc_bench.results.text_export.sample');
                     const sampledStr = isFull ? String(full) : (total + '/' + full);
 
                     let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
@@ -10360,11 +5392,14 @@
 
                 // Detail section per model
                 lines.push('');
-                lines.push('--- Detail ---');
+                lines.push(window.t('acc_bench.results.text_export.detail'));
                 for (const m of models) {
                     lines.push('');
-                    lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
+                    lines.push(
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', () => m)
+                    );
+                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
                     lines.push('-'.repeat(62));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
@@ -10373,20 +5408,24 @@
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
                             pad(r.time_s, 10) +
-                            pad(r.thinking_used ? 'Yes' : 'No', 8)
+                            pad(r.thinking_used
+                                ? window.t('acc_bench.results.text_export.yes')
+                                : window.t('acc_bench.results.text_export.no'), 8)
                         );
                         if (r.external) {
                             lines.push(
-                                `  Valid responses: ${r.valid_response_count}/${r.total}` +
-                                ` (${(r.valid_response_rate * 100).toFixed(1)}%)` +
-                                ` · Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%` +
-                                ` · Empty: ${r.empty_content_count}` +
-                                ` · Truncated: ${r.truncated_count}` +
-                                ` · Timeout: ${r.timeout_count}` +
-                                ` · HTTP: ${r.http_error_count}` +
-                                ` · Connection: ${r.connection_error_count}` +
-                                ` · Invalid: ${r.invalid_response_count}` +
-                                ` · Parse: ${r.parse_error_count}`
+                                window.t('acc_bench.results.text_export.external_detail')
+                                    .replace('{valid}', r.valid_response_count)
+                                    .replace('{total}', r.total)
+                                    .replace('{rate}', (r.valid_response_rate * 100).toFixed(1))
+                                    .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1))
+                                    .replace('{empty}', r.empty_content_count)
+                                    .replace('{truncated}', r.truncated_count)
+                                    .replace('{timeout}', r.timeout_count)
+                                    .replace('{http}', r.http_error_count)
+                                    .replace('{connection}', r.connection_error_count)
+                                    .replace('{invalid}', r.invalid_response_count)
+                                    .replace('{parse}', r.parse_error_count)
                             );
                         }
                     }
@@ -10470,31 +5509,88 @@
                     mime = 'text/csv';
                 } else {
                     const lines = [
-                        `Model: ${r.model_id}`,
-                        `Benchmark: ${r.benchmark.toUpperCase()}`,
-                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
-                        `Time: ${r.time_s}s`,
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', () => r.model_id),
+                        window.t('acc_bench.results.text_export.benchmark_line')
+                            .replace('{benchmark}', () => r.benchmark.toUpperCase()),
+                        window.t('acc_bench.results.text_export.accuracy_line')
+                            .replace('{accuracy}', (r.accuracy * 100).toFixed(1))
+                            .replace('{correct}', r.correct)
+                            .replace('{total}', r.total),
+                        window.t('acc_bench.results.text_export.time_line')
+                            .replace('{seconds}', r.time_s),
                         '',
                     ];
                     if (r.external) {
                         lines.splice(4, 0,
-                            `Valid responses: ${r.valid_response_count}/${r.total} (${(r.valid_response_rate * 100).toFixed(1)}%)`,
-                            `Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%`,
-                            `Empty: ${r.empty_content_count}; Truncated: ${r.truncated_count}; Timeout: ${r.timeout_count}; HTTP errors: ${r.http_error_count}; Connection errors: ${r.connection_error_count}; Invalid responses: ${r.invalid_response_count}; Parse errors: ${r.parse_error_count}`
+                            window.t('acc_bench.results.text_export.valid_responses_line')
+                                .replace('{valid}', r.valid_response_count)
+                                .replace('{total}', r.total)
+                                .replace('{rate}', (r.valid_response_rate * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.valid_answer_accuracy_line')
+                                .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.external_summary')
+                                .replace('{empty}', r.empty_content_count)
+                                .replace('{truncated}', r.truncated_count)
+                                .replace('{timeout}', r.timeout_count)
+                                .replace('{http}', r.http_error_count)
+                                .replace('{connection}', r.connection_error_count)
+                                .replace('{invalid}', r.invalid_response_count)
+                                .replace('{parse}', r.parse_error_count)
                         );
                     }
                     for (const q of qr) {
                         const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
-                        lines.push(`--- Q${q.id} [${label}] ---`);
-                        if (q.category) lines.push(`Category: ${q.category}`);
-                        if (r.external && q.finish_reason) lines.push(`Finish reason: ${q.finish_reason}`);
-                        if (r.external && (q.reasoning_fields_nonempty || []).length) lines.push(`Reasoning fields: ${q.reasoning_fields_nonempty.join(', ')}`);
-                        if (r.external && q.error_message) lines.push(`Error: ${q.error_message}`);
-                        lines.push(`Question: ${q.question || ''}`);
-                        lines.push(`Expected: ${q.expected}`);
-                        lines.push(`Predicted: ${q.predicted}`);
-                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
-                        lines.push(`Time: ${q.time_s}s`);
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_header')
+                                .replace('{id}', q.id)
+                                .replace('{label}', () => label)
+                        );
+                        if (q.category) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.category_line')
+                                    .replace('{category}', () => q.category)
+                            );
+                        }
+                        if (r.external && q.finish_reason) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.finish_reason_line')
+                                    .replace('{reason}', () => q.finish_reason)
+                            );
+                        }
+                        if (r.external && (q.reasoning_fields_nonempty || []).length) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.reasoning_fields_line')
+                                    .replace('{fields}', () => q.reasoning_fields_nonempty.join(', '))
+                            );
+                        }
+                        if (r.external && q.error_message) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.error_line')
+                                    .replace('{error}', () => q.error_message)
+                            );
+                        }
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_line')
+                                .replace('{question}', () => q.question || '')
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.expected_line')
+                                .replace('{expected}', () => q.expected)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.predicted_line')
+                                .replace('{predicted}', () => q.predicted)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.raw_response_line')
+                                .replace('{response}', () => q.raw_response
+                                    || window.t('acc_bench.results.text_export.empty_value'))
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.time_line')
+                                .replace('{seconds}', q.time_s)
+                        );
                         lines.push('');
                     }
                     content = lines.join('\n');
@@ -10841,7 +5937,10 @@
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
                 const val = this.globalSettings.cache?.ssd_cache_max_size;
-                if (val && val !== 'auto') {
+                if (val === 'auto') {
+                    return Math.round((this.globalSettings.cache.ssd_cache_auto_size_bytes || 0) / 1024 ** 3);
+                }
+                if (val) {
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }
@@ -11146,7 +6245,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || 'Failed to save'));
+                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -11194,7 +6293,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
                         this.hfError = window.t('js.error.start_download_connection');
                     }
@@ -11272,7 +6371,7 @@
                         this.startHFRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Retry failed';
+                        this.hfError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -11385,15 +6484,15 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}${this.oqEnhanced ? 'e' : ''}`;
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
                     } else {
-                        this.oqError = data.detail || 'Failed to start quantization';
+                        this.oqError = data.detail || window.t('js.error.start_quantization_failed');
                     }
                 } catch (err) {
-                    this.oqError = 'Connection error. Server may be unavailable.';
+                    this.oqError = window.t('js.error.connection_error');
                 } finally {
                     this.oqStarting = false;
                 }
@@ -11516,6 +6615,19 @@
                 return model?.model_type || '';
             },
 
+            oqAvailableLevels() {
+                return this.oqSelectedModelType() === 'deepseek_v41'
+                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+            },
+
+            oqApplyModelPolicy() {
+                if (this.oqSelectedModelType() !== 'deepseek_v41') return;
+                if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
+                this.oqDtype = 'bfloat16';
+                this.oqTextOnly = false;
+                if (this.oqLevel === 4) this.oqSensitivityModelPath = '';
+            },
+
             oqLevelLabel(level) {
                 return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
             },
@@ -11612,7 +6724,7 @@
                         this.uploadTokenValidated = false;
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadTokenValidating = false;
                 }
@@ -11665,15 +6777,15 @@
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         this.uploadModalOpen = false;
-                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        this.uploadSuccess = window.t('models.uploader.upload_queued').replace('{name}', this.uploadModalModelName);
                         await this.loadUploadTasks();
                         this.startUploadRefresh();
                         setTimeout(() => { this.uploadSuccess = ''; }, 5000);
                     } else {
-                        this.uploadError = data.detail || 'Failed to start upload';
+                        this.uploadError = data.detail || window.t('js.error.start_upload_failed');
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadStarting = false;
                 }
@@ -11765,14 +6877,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to load recommended models';
+                        this.hfError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to load recommended models:', err);
@@ -11925,14 +7037,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Search failed';
+                        this.hfError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Search failed:', err);
@@ -12003,14 +7115,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to fetch model info';
+                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to fetch model info:', err);
@@ -12099,7 +7211,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
                         this.msError = window.t('js.error.start_download_connection');
                     }
@@ -12160,7 +7272,7 @@
                         this.startMSRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Retry failed';
+                        this.msError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -12217,14 +7329,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to load recommended models';
+                        this.msError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to load MS recommended models:', err);
@@ -12282,14 +7394,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Search failed';
+                        this.msError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('MS search failed:', err);
@@ -12344,14 +7456,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to fetch model info';
+                        this.msError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to fetch MS model info:', err);

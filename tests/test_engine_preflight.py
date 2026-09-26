@@ -14,12 +14,14 @@ the exception into HTTP 400. We exercise the contract by:
 """
 
 import concurrent.futures
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from omlx.exceptions import PrefillMemoryExceededError
+from omlx.engine.base import _run_scheduler_preflight_with_cleanup_retry
 from omlx.scheduler import Scheduler
 
 _TINY_PNG_DATA_URI = (
@@ -132,6 +134,7 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
     """
     engine = engine_cls.__new__(engine_cls)
     engine._loaded = True
+    engine._model_name = "test-model"
     engine._enable_thinking = None
     engine._prefill_eviction_callback = None
 
@@ -181,10 +184,12 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
 
@@ -229,6 +234,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
         request_id="req-next",
+        text_only=True,
     )
     evict.assert_not_awaited()
 
@@ -247,6 +253,50 @@ def test_scheduler_route_preflight_cleanup_signal():
 
     scheduler._deferred_clear_at = None
     assert scheduler.has_pending_route_preflight_cleanup() is False
+
+
+def test_scheduler_reports_stale_route_preflight_usage(monkeypatch):
+    scheduler = _make_scheduler()
+    assert scheduler.route_preflight_usage_is_stale() is True
+
+    import omlx.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+    scheduler.refresh_route_preflight_usage()
+
+    assert scheduler.route_preflight_usage_is_stale() is False
+    assert scheduler._last_mlx_active_memory_at <= time.monotonic()
+
+
+@pytest.mark.asyncio
+async def test_stale_idle_preflight_refreshes_before_eviction():
+    scheduler = MagicMock()
+    stale_rejection = SimpleNamespace(request_id="req-stale", stale_usage=True)
+    scheduler.preflight_eviction_request.side_effect = [stale_rejection, None]
+    scheduler.has_pending_route_preflight_cleanup.return_value = False
+    evict = AsyncMock()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        await _run_scheduler_preflight_with_cleanup_retry(
+            scheduler,
+            num_prompt_tokens=60_000,
+            request_id="req-stale",
+            eviction_callback=evict,
+            executor=executor,
+            text_only=True,
+        )
+    finally:
+        executor.shutdown(wait=True)
+
+    assert scheduler.preflight_eviction_request.call_count == 2
+    scheduler.refresh_route_preflight_usage.assert_called_once_with()
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=60_000,
+        request_id="req-stale",
+        text_only=True,
+    )
+    evict.assert_not_awaited()
 
 
 def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch):
@@ -339,7 +389,7 @@ async def test_preflight_completion_raises_for_oversize_prompt(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
-    """Each image-bearing content part must add
+    """Each decoded image must add
     ``_IMAGE_TOKEN_UPPER_BOUND_FALLBACK`` to the prompt size the scheduler sees,
     so image-heavy borderline requests can't slip past."""
     from omlx.engine.vlm import _IMAGE_TOKEN_UPPER_BOUND_FALLBACK, VLMBatchedEngine
@@ -365,7 +415,10 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
                     "type": "image_url",
                     "image_url": {"url": _TINY_PNG_DATA_URI},
                 },
-                {"type": "image", "source": {}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _TINY_PNG_DATA_URI},
+                },
                 {"type": "text", "text": "world"},
             ],
         }

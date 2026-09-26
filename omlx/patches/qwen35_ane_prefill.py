@@ -36,6 +36,9 @@ _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionar
 # all slices into one multi-procedure program per ANE instance and bypass this
 # fallback-only budget.
 _ANE_RESIDENT_PROGRAM_LIMIT = 120
+# Shared shape limits for compilation validation and scheduler guidance.
+_ANE_MIN_SEQUENCE_LENGTH = 1024
+_ANE_SEQUENCE_LENGTH_ALIGNMENT = 64
 # First retry cap for split procedure banks after a monolithic bank fails to
 # load. Program-create maps a bank's whole weight blob into the owning ANE's
 # ~4 GiB device address window, so single-die chips reject two monolithic
@@ -320,9 +323,13 @@ def configure_qwen35_ane_prefill_scheduler(
     sequence_length: int,
 ) -> bool:
     """Keep normal wide prompt chunks; projection backends tile internally."""
-    if sequence_length < 1024 or sequence_length % 64:
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
         raise ValueError(
-            "ANE prefill sequence_length must be a multiple of 64 >= 1024"
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
         )
     config = getattr(scheduler, "config", None)
     if config is None:
@@ -337,15 +344,36 @@ def configure_qwen35_ane_prefill_scheduler(
         # configured step or the qwen35 floor.
         delivered_cap = min(delivered_cap, block_size) if delivered_cap else block_size
     if delivered_cap and sequence_length > delivered_cap:
-        logger.warning(
-            "Qwen ANE prefill sequence_length=%d exceeds the delivered prefill "
-            "chunk width (~%d tokens). Chunks narrower than the compiled shape "
-            "cannot tile onto it, so the ANE will compile but never execute. "
-            "Set sequence_length=%d or smaller.",
-            sequence_length,
-            delivered_cap,
-            delivered_cap,
-        )
+        # Round down so the recommended shape passes alignment validation.
+        usable = (
+            delivered_cap // _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        ) * _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        if usable < _ANE_MIN_SEQUENCE_LENGTH:
+            usable = 0
+        if usable:
+            logger.warning(
+                "Qwen ANE prefill sequence_length=%d exceeds the delivered "
+                "prefill chunk width (~%d tokens). Chunks narrower than the "
+                "compiled shape require eligible tail padding to execute on "
+                "ANE. Set sequence_length=%d or a smaller valid shape to "
+                "use unpadded tiles.",
+                sequence_length,
+                delivered_cap,
+                usable,
+            )
+        else:
+            logger.warning(
+                "Qwen ANE prefill chunk width (~%d tokens) is below the "
+                "minimum ANE sequence length (%d). These chunks require "
+                "eligible tail padding to execute on ANE; changing "
+                "sequence_length alone cannot provide an unpadded tile. "
+                "For unpadded tiles, raise the effective prefill chunk width "
+                "to at least %d (capped by the paged cache block size with "
+                "block-aware caching).",
+                delivered_cap,
+                _ANE_MIN_SEQUENCE_LENGTH,
+                _ANE_MIN_SEQUENCE_LENGTH,
+            )
     logger.info(
         "Qwen ANE prefill preserving scheduler chunks; projection tile=%d "
         "(step=%d, floor=%d)",
@@ -2074,45 +2102,19 @@ def _wrap_class(cls: type) -> None:
 
 
 def _install_dispatch() -> bool:
-    global _VLM_GDN_HOOK_INSTALLED, _VLM_HOOK_INSTALLED
+    from omlx.patches.qwen35_q4_mlp import (
+        apply_qwen35_vlm_gdn_projection_hook,
+        register_qwen35_lm_gdn_prefill_backend,
+    )
+
+    register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
     installed = False
     try:
         vlm = importlib.import_module("mlx_vlm.models.qwen3_5.language")
-        register = getattr(vlm, "register_qwen3_5_mlp_prefill_backend", None)
-        register_gdn = getattr(vlm, "register_qwen3_5_gdn_prefill_backend", None)
-        cls = getattr(vlm, "Qwen3_5MLP", None)
-        if cls is not None and getattr(cls, "_omlx_q4_mlp_patched", False):
-            # The exact q4 MLP patch replaces __call__ and therefore bypasses
-            # mlx-vlm's inner registration hook. Wrap that dispatcher so ANE
-            # gets first refusal and the q4 implementation remains fallback.
-            _wrap_class(cls)
-            installed = True
-        elif callable(register):
-            if not _VLM_HOOK_INSTALLED:
-                register(_backend)
-                _VLM_HOOK_INSTALLED = True
-            installed = True
-        else:
-            if cls is not None:
-                _wrap_class(cls)
-                installed = True
-        if callable(register_gdn) and not _VLM_GDN_HOOK_INSTALLED:
-            register_gdn(_gdn_backend)
-            _VLM_GDN_HOOK_INSTALLED = True
-        elif not _VLM_GDN_HOOK_INSTALLED:
-            target_linears = getattr(vlm, "_target_verify_linears", None)
-            if callable(target_linears):
-
-                def ane_target_linears(linears, x, target_verify=False):
-                    gdn = _GDN_MODULES.get(id(linears[0])) if linears else None
-                    if gdn is not None:
-                        output = _gdn_backend(gdn, x, target_verify)
-                        if output is not None:
-                            return output
-                    return target_linears(linears, x, target_verify)
-
-                vlm._target_verify_linears = ane_target_linears
-                _VLM_GDN_HOOK_INSTALLED = True
+        if vlm.Qwen3_5MLP is not None:
+            _wrap_class(vlm.Qwen3_5MLP)
+        apply_qwen35_vlm_gdn_projection_hook()
+        installed = True
     except Exception:
         logger.debug("mlx-vlm Qwen ANE dispatch hook unavailable", exc_info=True)
 
@@ -2121,17 +2123,6 @@ def _install_dispatch() -> bool:
         cls = getattr(lm, "MLP", None)
         if cls is not None:
             _wrap_class(cls)
-            installed = True
-        from omlx.patches.qwen35_q4_mlp import (
-            register_qwen35_lm_gdn_prefill_backend,
-        )
-
-        # The mlx-lm GDN implementation does not use mlx-vlm's
-        # _target_verify_linears helper.  Its q4 compatibility wrapper owns
-        # the projection call site, so register there on every install.  The
-        # assignment is deliberately idempotent and avoids stale process-wide
-        # hook state across VLM -> LLM fallback and model reloads.
-        register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
         installed = True
     except Exception:
         logger.debug("mlx-lm Qwen ANE dispatch hook unavailable", exc_info=True)
@@ -3133,8 +3124,14 @@ def enable_qwen35_ane_prefill(
     Returns the number of marked dense Qwen MLP modules. A return value of zero
     is a safe no-op for other model families and unsupported runtimes.
     """
-    if sequence_length < 1024 or sequence_length % 64:
-        raise ValueError("ANE prefill sequence_length must be a multiple of 64 >= 1024")
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
+        raise ValueError(
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
+        )
     if not 0.05 <= fraction <= 0.90:
         raise ValueError("ANE prefill fraction must be between 0.05 and 0.90")
     if max_layers < 1:
@@ -3562,8 +3559,9 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
     prefill needs back once the KV cache has grown into the guard's sizing
     target. Latches every sliced module through the existing per-module
     failure flags first (so the dispatch sites fall back to stock GPU compute
-    and never lazily recompile), then drops the state references; the native
-    models free their programs and mapped blobs when the last reference dies.
+    and never lazily recompile), then drops the state references and clears the
+    per-module state caches that hold the same objects; the native models free
+    their programs and mapped blobs when the last reference dies.
     Idempotent, and scoped to this engine instance: the next load of the
     model rebuilds the banks from its settings.
 
@@ -3587,6 +3585,12 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             setattr(module, failed_attr, True)
             setattr(module, state_attr, None)
             modules_released += 1
+        # Clear cached references too, including states no longer attached.
+        # Loading has finished and the engine step loop is paused for release.
+        for cache_attr in ("_omlx_ane_prefill_cache", "_omlx_ane_gdn_cache"):
+            cache = getattr(module, cache_attr, None)
+            if cache:
+                cache.clear()
     if modules_released:
         # Zero (not delete) the status counters and set the shed marker:
         # attempted=True/configured=False alone is indistinguishable from a

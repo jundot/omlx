@@ -1,0 +1,969 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for MoE expert offloading (omlx/patches/moe_expert_offload.py).
+
+Assertion policy (measured against the pinned mlx-lm, see module docstring):
+decode and unsorted/chunked prefill are BIT-EXACT at any residency; the
+sorted prefill kernel is presentation-invariant at real model dimensions, so
+full-residency prefill is bit-exact there too. Where partial residency
+legitimately chunks below the sort threshold, the sorted and unsorted
+gather_qmm kernels differ by ~4e-3 absolute (measured at gemma-26B geometry,
+output magnitude ~5), so those cases assert a rounding-scale tolerance —
+head-room for kernel choice, not for wrong experts, which show as O(1).
+"""
+
+import threading
+
+import pytest
+
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
+pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+
+if HAS_MLX:
+    from omlx.patches.moe_expert_offload import (
+        CheckpointExpertStore,
+        OffloadSwitchGLU,
+        _io_pool,
+        _shutdown_io_pool,
+        apply_moe_expert_offload,
+        moe_offload_stats,
+    )
+
+# toy geometry: E large enough that a 25% fraction clears the capacity floor
+E, D, INTER, K, GROUP = 32, 64, 32, 2, 32
+
+
+def _make_glu(seed=0, e=E, d=D, inter=INTER, group=GROUP):
+    mx.random.seed(seed)
+    glu = SwitchGLU(d, inter, e)
+    nn.quantize(glu, group_size=group, bits=4)
+    return glu
+
+
+def _glu_tensors(glu, prefix):
+    out = {}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        lin = getattr(glu, proj)
+        for field in ("weight", "scales", "biases"):
+            if lin.get(field) is not None:
+                out[f"{prefix}.{proj}.{field}"] = lin[field]
+    return out
+
+
+def _save_checkpoint(tmp_path, tensors):
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    return tmp_path
+
+
+class _Experts(nn.Module):
+    def __init__(self, glu):
+        super().__init__()
+        self.switch_glu = glu
+
+
+class _Layer(nn.Module):
+    def __init__(self, glu):
+        super().__init__()
+        self.experts = _Experts(glu)
+
+
+class _MiniMoE(nn.Module):
+    def __init__(self, glus):
+        super().__init__()
+        self.layers = [_Layer(g) for g in glus]
+
+    def __call__(self, x, indices):
+        for layer in self.layers:
+            x = x + layer.experts.switch_glu(x, indices).sum(axis=-2)
+        return x
+
+
+def _ri(*shape, e=E):
+    return mx.random.randint(0, e, shape)
+
+
+class TestCheckpointExpertStore:
+    def test_fetch_matches_source_rows(self, tmp_path):
+        glu = _make_glu()
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        store = CheckpointExpertStore(tmp_path)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(glu, proj)
+            for field in ("weight", "scales"):
+                name = f"layers.0.experts.switch_glu.{proj}.{field}"
+                assert store.has(name)
+                assert store.spec(name)[0] == tuple(lin[field].shape)
+                for e in (0, 1, E - 1):
+                    got, want = store.fetch_expert(name, e), lin[field][e]
+                    mx.eval(got, want)
+                    assert got.dtype == want.dtype
+                    assert bool(mx.array_equal(got, want))
+
+    def test_bf16_roundtrip(self, tmp_path):
+        glu = _make_glu()
+        scales = glu.gate_proj["scales"].astype(mx.bfloat16)
+        _save_checkpoint(tmp_path, {"t.scales": scales})
+        store = CheckpointExpertStore(tmp_path)
+        got = store.fetch_expert("t.scales", 3)
+        mx.eval(got)
+        assert got.dtype == mx.bfloat16
+        assert bool(mx.array_equal(got.view(mx.uint16), scales[3].view(mx.uint16)))
+
+    def test_multi_shard(self, tmp_path):
+        glu = _make_glu()
+        t = _glu_tensors(glu, "layers.0.experts.switch_glu")
+        names = sorted(t)
+        mx.save_safetensors(
+            str(tmp_path / "model-00001-of-00002.safetensors"),
+            {k: t[k] for k in names[:3]},
+        )
+        mx.save_safetensors(
+            str(tmp_path / "model-00002-of-00002.safetensors"),
+            {k: t[k] for k in names[3:]},
+        )
+        store = CheckpointExpertStore(tmp_path)
+        for k in names:
+            assert store.has(k)
+            assert bool(mx.array_equal(store.fetch_expert(k, 2), t[k][2]))
+
+    def test_empty_dir_is_falsy(self, tmp_path):
+        assert not CheckpointExpertStore(tmp_path)
+
+
+class TestApplyAndForward:
+    def _wrapped_model(self, tmp_path, n_layers=2, fraction=0.25):
+        glus = [_make_glu(seed=i) for i in range(n_layers)]
+        tensors = {}
+        for i, g in enumerate(glus):
+            tensors.update(_glu_tensors(g, f"layers.{i}.experts.switch_glu"))
+        _save_checkpoint(tmp_path, tensors)
+        model = _MiniMoE(glus)
+        return model, glus
+
+    def test_apply_wraps_all_covered_layers(self, tmp_path):
+        model, _ = self._wrapped_model(tmp_path)
+        n = apply_moe_expert_offload(model, tmp_path, resident_fraction=0.25)
+        assert n == 2
+        for layer in model.layers:
+            assert isinstance(layer.experts.switch_glu, OffloadSwitchGLU)
+            assert layer.experts.switch_glu.cache.capacity == 8  # 25% of 32
+
+    def test_materialize_reaches_every_cache_the_module_walk_cannot(self):
+        """The caches' slot maps and resident slots live on plain attributes,
+        invisible to materialize_lazy_state's module walk; left lazy they stay
+        bound to the loader thread's stream and the first request from an
+        inference thread dies with "There is no Stream(gpu, N) in current
+        thread" (reproduced live on the VLM path). The helper must find every
+        wrapped layer and leave its arrays evaluated."""
+        import threading
+
+        from omlx.patches.moe_expert_offload import materialize_offload_state
+
+        holder = {}
+
+        def _build(tmp):
+            model, _ = self._wrapped_model(tmp)
+            apply_moe_expert_offload(model, tmp, resident_fraction=0.25)
+            assert materialize_offload_state(model) == 2
+            holder["model"] = model
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            loader = threading.Thread(target=_build, args=(Path(tmp),))
+            loader.start()
+            loader.join()
+            # a DIFFERENT thread reads the materialized state — exactly the
+            # loader-thread/inference-thread split that crashed the VLM path
+            glu = holder["model"].layers[0].experts.switch_glu
+            x = mx.random.normal((1, 1, D))
+            idx = _ri(1, 1, K, e=E)
+            out = glu(x, idx)
+            mx.eval(out)
+
+    def test_decode_bit_exact_at_partial_residency(self, tmp_path):
+        model, _ = self._wrapped_model(tmp_path)
+        cases = [
+            (mx.random.normal((1, 1, D)), _ri(1, 1, K)),
+            (mx.random.normal((4, 1, D)), _ri(4, 1, K)),
+        ]
+        refs = [model(x, i) for x, i in cases]
+        mx.eval(*refs)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
+        for (x, i), ref in zip(cases, refs):
+            got = model(x, i)
+            mx.eval(got)
+            assert bool(mx.array_equal(ref, got))
+        stats = moe_offload_stats(model)
+        assert stats["layers"] == 2 and stats["misses"] > 0
+
+    def test_chunked_prefill_bit_exact_below_sort_threshold(self, tmp_path):
+        # 27 tokens x k=2 = 54 indices: below the sort threshold, above the
+        # 8-slot working set -> the chunking path runs and stays bit-exact.
+        model, _ = self._wrapped_model(tmp_path)
+        x, i = mx.random.normal((3, 9, D)), _ri(3, 9, K)
+        ref = model(x, i)
+        mx.eval(ref)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        got = model(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+
+    def test_over_capacity_prefill_installs_each_expert_once(self, tmp_path):
+        """Above the sort threshold and over capacity, the prefill is chunked
+        on expert boundaries: every distinct expert is fetched exactly once
+        per call, however many tokens route to it. The token-chunked path
+        fetched an expert again in every chunk that touched it."""
+        model, _ = self._wrapped_model(tmp_path, n_layers=1)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        glu = model.layers[0].experts.switch_glu
+        fetched = []
+        inner = glu.cache.disk.plan
+
+        def spy(proj, field, e):
+            if proj == "gate_proj" and field == "weight":
+                fetched.append(e)
+            return inner(proj, field, e)
+
+        glu.cache.disk.plan = spy
+        # 2 x 60 tokens x k=2 = 240 routes: sorted kernel, ~all 32 experts
+        x, i = mx.random.normal((2, 60, D)), _ri(2, 60, K)
+        distinct = set(i.reshape(-1).tolist())
+        assert len(distinct) > glu.cache.capacity  # the path under test
+        out = glu(x, i)
+        mx.eval(out)
+        assert sorted(fetched) == sorted(distinct)  # once each, none twice
+        assert glu.cache.misses == len(distinct)
+        assert len(glu.cache.slot_of) <= glu.cache.capacity
+
+    def test_over_capacity_prefill_matches_resident(self, tmp_path):
+        """Route order is restored and every route meets its own expert:
+        rounding-scale agreement with the resident model above the sort
+        threshold (kernel batching differs), and bit-exact below it, where
+        both sides run the unsorted kernel."""
+        model, glus = self._wrapped_model(tmp_path, n_layers=1)
+        above = (mx.random.normal((2, 60, D)), _ri(2, 60, K))
+        below = (mx.random.normal((3, 9, D)), _ri(3, 9, K))
+        ref_above, ref_below = model(*above), model(*below)
+        mx.eval(ref_above, ref_below)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        cache = model.layers[0].experts.switch_glu.cache
+        got_above = model(*above)
+        mx.eval(got_above)
+        assert cache.misses > cache.capacity  # went over capacity
+        assert mx.allclose(got_above, ref_above, rtol=1e-4, atol=1e-5).item()
+        got_below = model(*below)
+        mx.eval(got_below)
+        assert bool(mx.array_equal(ref_below, got_below))
+
+    def test_prefill_padding_preserves_small_chunk_kernel(self, tmp_path):
+        glu = _make_glu(seed=42, d=128, inter=128)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        x = mx.random.normal((2, 31, 128)).astype(mx.bfloat16)
+        # Each eight-expert chunk has 31 routes; padding to 32 would select QMM.
+        indices = mx.array(
+            [group * 8 + route % 8 for group in range(4) for route in range(31)]
+        ).reshape(2, 31, 2)
+        expected = glu(x, indices)
+        mx.eval(expected)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        actual = model.layers[0].experts.switch_glu(x, indices)
+        mx.eval(actual)
+        assert mx.array_equal(actual, expected).item()
+
+    def test_padded_prefill_on_concurrent_streams(self, tmp_path, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from omlx.patches import moe_expert_offload as offload
+
+        glu = _make_glu(seed=42)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        models = [_MiniMoE([glu]), _MiniMoE([glu])]
+        x = mx.random.normal((2, 257, D))
+        indices = _ri(2, 257, K)
+        expected = x + glu(x, indices).sum(axis=-2)
+        mx.eval(x, indices, expected)
+        for model in models:
+            apply_moe_expert_offload(model, tmp_path, 0.25)
+            offload.materialize_offload_state(model)
+
+        def unexpected_clear(*args, **kwargs):
+            pytest.fail("Offloaded forward must not clear the global Metal pool")
+
+        monkeypatch.setattr(offload, "_sync_and_clear_cache", unexpected_clear)
+        monkeypatch.setattr(mx, "clear_cache", unexpected_clear)
+        barrier = threading.Barrier(2)
+
+        def run(model):
+            stream = mx.new_stream(mx.gpu)
+            try:
+                with mx.stream(stream):
+                    for _ in range(4):
+                        barrier.wait(timeout=20)
+                        actual = model(x, indices)
+                        mx.eval(actual)
+                        assert mx.allclose(
+                            actual, expected, rtol=1e-4, atol=1e-5
+                        ).item()
+                return str(stream)
+            finally:
+                mx.synchronize(stream)
+                mx.clear_streams()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            streams = list(pool.map(run, models))
+        assert len(set(streams)) == 2
+
+    def test_batch_invariance(self, tmp_path):
+        model, _ = self._wrapped_model(tmp_path, n_layers=1)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        glu = model.layers[0].experts.switch_glu
+        rows = [(mx.random.normal((1, 1, D)), _ri(1, 1, K)) for _ in range(3)]
+        singles = [glu(x, i) for x, i in rows]
+        batched = glu(
+            mx.concatenate([r[0] for r in rows]), mx.concatenate([r[1] for r in rows])
+        )
+        mx.eval(*singles, batched)
+        for j in range(3):
+            assert bool(mx.array_equal(batched[j], singles[j][0]))
+
+    def test_skips_uncovered_layer(self, tmp_path):
+        glus = [_make_glu(seed=0), _make_glu(seed=1)]
+        # checkpoint covers only layer 0
+        _save_checkpoint(tmp_path, _glu_tensors(glus[0], "layers.0.experts.switch_glu"))
+        model = _MiniMoE(glus)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        assert isinstance(model.layers[0].experts.switch_glu, OffloadSwitchGLU)
+        assert type(model.layers[1].experts.switch_glu) is SwitchGLU
+
+    def test_skips_non_quantized(self, tmp_path):
+        mx.random.seed(9)
+        glu = SwitchGLU(D, INTER, E)  # float — unsupported in v1
+        _save_checkpoint(
+            tmp_path,
+            {
+                f"layers.0.experts.switch_glu.{p}.weight": getattr(glu, p)["weight"]
+                for p in ("gate_proj", "up_proj", "down_proj")
+            },
+        )
+        assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
+
+    def test_mixed_bit_projections(self, tmp_path):
+        """oQ-style mixed quantization: 4-bit gate/up over an 8-bit down
+        projection. Each projection must use its own group_size/bits/mode —
+        inheriting gate_proj's parameters breaks gather_qmm on the others."""
+        mx.random.seed(13)
+        glu = SwitchGLU(D, INTER, E)
+        glu.gate_proj = glu.gate_proj.to_quantized(group_size=32, bits=4)
+        glu.up_proj = glu.up_proj.to_quantized(group_size=32, bits=4)
+        glu.down_proj = glu.down_proj.to_quantized(group_size=32, bits=8)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        xp, ip = mx.random.normal((3, 9, D)), _ri(3, 9, K)
+        ref_d, ref_p = model(x, i), model(xp, ip)
+        mx.eval(ref_d, ref_p)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        cache = model.layers[0].experts.switch_glu.cache
+        assert cache.qparams["gate_proj"] == (32, 4, "affine")
+        assert cache.qparams["down_proj"] == (32, 8, "affine")
+        got_d, got_p = model(x, i), model(xp, ip)
+        mx.eval(got_d, got_p)
+        assert bool(mx.array_equal(ref_d, got_d))
+        assert bool(mx.array_equal(ref_p, got_p))
+
+    def test_per_expert_checkpoint_layout(self, tmp_path):
+        """OLMoE/Qwen2-MoE-style checkpoints store one tensor per expert
+        under the GLU's parent; sanitize() stacks them at load so the
+        stacked names never exist in the file. The store view must detect
+        the layout and stay bit-exact through it."""
+        glu = _make_glu(seed=5)
+        tensors = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(glu, proj)
+            for field in ("weight", "scales", "biases"):
+                if lin.get(field) is None:
+                    continue
+                for e in range(E):
+                    tensors[f"layers.0.mlp.experts.{e}.{proj}.{field}"] = lin[field][e]
+        _save_checkpoint(tmp_path, tensors)
+
+        class _MLP(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.switch_mlp = g
+
+        class _OlmoeLayer(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.mlp = _MLP(g)
+
+        class _OlmoeModel(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.layers = [_OlmoeLayer(g)]
+
+        model = _OlmoeModel(glu)
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        ref = glu(x, i)
+        mx.eval(ref)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        wrapped = model.layers[0].mlp.switch_mlp
+        assert isinstance(wrapped, OffloadSwitchGLU)
+        got = wrapped(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+
+    def test_per_expert_layout_with_missing_expert_skips(self, tmp_path):
+        """A per-expert checkpoint missing any single expert tensor must
+        skip the layer — every expert is verified, not just expert 0."""
+        glu = _make_glu(seed=6)
+        tensors = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(glu, proj)
+            for field in ("weight", "scales", "biases"):
+                if lin.get(field) is None:
+                    continue
+                for e in range(E):
+                    tensors[f"layers.0.mlp.experts.{e}.{proj}.{field}"] = lin[field][e]
+        del tensors[f"layers.0.mlp.experts.{E - 2}.up_proj.scales"]
+        _save_checkpoint(tmp_path, tensors)
+
+        class _MLP(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.switch_mlp = g
+
+        class _OlmoeLayer(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.mlp = _MLP(g)
+
+        class _OlmoeModel(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.layers = [_OlmoeLayer(g)]
+
+        assert apply_moe_expert_offload(_OlmoeModel(glu), tmp_path, 0.25) == 0
+
+    def test_skips_unknown_dtype(self, tmp_path):
+        """A checkpoint field in an unrecognized storage format must skip the
+        layer at coverage time, not KeyError at the first cache miss."""
+        import json as _json
+        import struct as _struct
+
+        glus = [_make_glu(seed=0)]
+        _save_checkpoint(tmp_path, _glu_tensors(glus[0], "layers.0.experts.switch_glu"))
+        # Rewrite one field's header dtype tag to something unsupported.
+        # data_offsets are relative to the data section, so a resized header
+        # keeps them valid.
+        p = tmp_path / "model.safetensors"
+        raw = p.read_bytes()
+        n = _struct.unpack("<Q", raw[:8])[0]
+        header = _json.loads(raw[8 : 8 + n])
+        header["layers.0.experts.switch_glu.up_proj.scales"]["dtype"] = "F64"
+        new_header = _json.dumps(header).encode()
+        p.write_bytes(_struct.pack("<Q", len(new_header)) + new_header + raw[8 + n :])
+        assert apply_moe_expert_offload(_MiniMoE(glus), tmp_path, 0.25) == 0
+
+    def test_vlm_class_name_matching(self, tmp_path):
+        """mlx-vlm ships its own SwitchGLU class: discovery must match by
+        name/contract, not identity, or the default VLM-served path (Gemma 4)
+        silently never offloads. Simulated with a distinct class object that
+        carries the same name."""
+        base = _make_glu(seed=7)
+        real = type(base)
+        ns = {
+            k: v for k, v in vars(real).items() if k not in ("__dict__", "__weakref__")
+        }
+        VlmSwitchGLU = type("SwitchGLU", (nn.Module,), ns)
+        glu = VlmSwitchGLU.__new__(VlmSwitchGLU)
+        glu.__dict__.update(base.__dict__)
+        dict.update(glu, base)
+        assert not isinstance(glu, real) and type(glu).__name__ == "SwitchGLU"
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        ref = model(x, i)
+        mx.eval(ref)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        got = model(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+
+    def test_admission_estimate(self, tmp_path):
+        """Offload-aware admission: expert bytes scale by the resident
+        fraction; non-expert bytes are untouched; failures fall back to the
+        plain size."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        glu = _make_glu(seed=8)
+        # switch_mlp, not switch_glu: matching is by stacked 3-D proj shape,
+        # not by any particular container name.
+        tensors = _glu_tensors(glu, "layers.0.mlp.switch_mlp")
+        tensors["lm_head.weight"] = mx.zeros((256, D), dtype=mx.float32)
+        _save_checkpoint(tmp_path, tensors)
+        expert_bytes = sum(
+            v.size * v.dtype.size for k, v in tensors.items() if ".switch_mlp." in k
+        )
+        full = 10**9
+        est = estimate_offload_admission_bytes(tmp_path, full, 0.25)
+        assert est == full - int(expert_bytes * 0.75)
+        # minimum-eight capacity floor: at fraction 0.05 the runtime still
+        # keeps 8 of 32 experts resident, so savings cap at 75%, not 95%
+        est_tiny = estimate_offload_admission_bytes(tmp_path, full, 0.05)
+        assert est_tiny == full - int(expert_bytes * (1 - 8 / E))
+        # unknown path -> conservative fallback
+        assert estimate_offload_admission_bytes("/nonexistent", full, 0.25) == full
+
+    def test_admission_estimate_unsupported_layouts(self, tmp_path):
+        """Layouts the wrapper rejects must discount nothing: the estimate
+        may never promise savings that wrap zero layers (reported on the
+        carry PR: a w1/w2/w3 checkpoint estimated at 44% of full size)."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        # Mixtral-style renamed projections, per-expert layout
+        tensors = {}
+        for e in range(4):
+            for proj in ("w1", "w2", "w3"):
+                tensors[f"layers.0.mlp.experts.{e}.{proj}.weight"] = mx.zeros(
+                    (INTER, D), dtype=mx.float16
+                )
+        tensors["lm_head.weight"] = mx.zeros((256, D), dtype=mx.float32)
+        _save_checkpoint(tmp_path, tensors)
+        full = 10**6
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
+
+    def test_admission_estimate_per_expert_requires_every_expert(self, tmp_path):
+        """One complete expert must not vouch for the rest: the wrapper
+        verifies every expert's tensors, so a container with any incomplete
+        expert wraps zero layers and must discount nothing (reported: 1
+        complete + 31 gate-only experts estimated at 97% of full size)."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        tensors = {}
+        prefix = "layers.0.mlp"
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            tensors[f"{prefix}.experts.0.{proj}.weight"] = mx.zeros(
+                (INTER, D // 8), dtype=mx.uint32
+            )
+            tensors[f"{prefix}.experts.0.{proj}.scales"] = mx.zeros(
+                (INTER, D // GROUP), dtype=mx.float16
+            )
+        for e in range(1, 32):
+            tensors[f"{prefix}.experts.{e}.gate_proj.weight"] = mx.zeros(
+                (INTER, D // 8), dtype=mx.uint32
+            )
+        _save_checkpoint(tmp_path, tensors)
+        full = 10**6
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
+
+    def test_admission_estimate_per_expert_complete_discounts(self, tmp_path):
+        """Control: a fully-complete per-expert container discounts with the
+        capacity floor (16 experts at 0.25 -> capacity 8 -> 50% resident)."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        tensors = {}
+        prefix = "layers.0.mlp"
+        for e in range(16):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                tensors[f"{prefix}.experts.{e}.{proj}.weight"] = mx.zeros(
+                    (INTER, D // 8), dtype=mx.uint32
+                )
+                tensors[f"{prefix}.experts.{e}.{proj}.scales"] = mx.zeros(
+                    (INTER, D // GROUP), dtype=mx.float16
+                )
+        _save_checkpoint(tmp_path, tensors)
+        expert_bytes = sum(v.size * v.dtype.size for v in tensors.values())
+        full = 10**6
+        est = estimate_offload_admission_bytes(tmp_path, full, 0.25)
+        assert est == full - int(expert_bytes * (1 - 8 / 16))
+
+    def test_admission_estimate_unquantized_discounts_nothing(self, tmp_path):
+        """No scales -> the wrapper skips the layer -> no discount."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        tensors = {
+            f"layers.0.mlp.switch_mlp.{proj}.weight": mx.zeros(
+                (E, INTER, D), dtype=mx.float16
+            )
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        }
+        _save_checkpoint(tmp_path, tensors)
+        full = 10**6
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
+
+    def test_kill_switch(self, tmp_path, monkeypatch):
+        model, _ = self._wrapped_model(tmp_path)
+        monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
+        assert type(model.layers[0].experts.switch_glu) is SwitchGLU
+
+    def test_idempotent_second_apply_is_noop(self, tmp_path):
+        model, _ = self._wrapped_model(tmp_path)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
+        # OffloadSwitchGLU is not `type(...) is SwitchGLU`; nothing to rewrap
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
+
+
+class TestParallelFetch:
+    """Misses are read off the calling thread; the cache state is not.
+
+    The pool only produces bytes: slots, LRU order, eviction victims and the
+    counters are still mutated serially on the calling thread, so a parallel
+    run must be indistinguishable from a serial one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_pool(self):
+        _shutdown_io_pool()
+        yield
+        _shutdown_io_pool()
+
+    def _wrap(self, tmp_path, glu, workers, monkeypatch, fraction=0.25):
+        if workers is None:
+            monkeypatch.delenv("OMLX_MOE_OFFLOAD_IO_WORKERS", raising=False)
+        else:
+            monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", workers)
+        _shutdown_io_pool()
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, fraction) == 1
+        return model, model.layers[0].experts.switch_glu.cache
+
+    def test_parallel_fetch_matches_serial_slots(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=3)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(21)
+        calls = [(mx.random.normal((2, 3, D)), _ri(2, 3, K)) for _ in range(5)]
+
+        def run(workers):
+            model, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            outs = [model(x, i) for x, i in calls]
+            mx.eval(*outs)
+            return cache, outs
+
+        serial, out_serial = run("1")
+        parallel, out_parallel = run("16")
+
+        assert parallel.misses > parallel.capacity  # the pool actually ran
+        assert bool(mx.array_equal(serial.map, parallel.map))
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for a, b in zip(serial.resident[proj], parallel.resident[proj]):
+                assert (a is None) == (b is None)
+                if a is not None:
+                    assert bool(mx.array_equal(a, b))
+        for a, b in zip(out_serial, out_parallel):
+            assert bool(mx.array_equal(a, b))
+
+    def test_ensure_preserves_lru_order_and_counters(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=4)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(11)
+        # 12 indices per call over 8 slots: every call evicts, repeatedly
+        seq = [_ri(6, K) for _ in range(12)]
+
+        def run(workers):
+            _, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            assert cache.capacity == 8
+            for i in seq:
+                cache.ensure(i)
+            return cache
+
+        serial, parallel = run("1"), run("12")
+        assert list(serial.slot_of.items()) == list(parallel.slot_of.items())
+        assert serial.free == parallel.free
+        assert (serial.hits, serial.misses) == (parallel.hits, parallel.misses)
+        assert serial.misses > serial.capacity
+
+    @pytest.mark.parametrize("workers", ["0", "-4", "abc", "1", None])
+    def test_io_workers_env_degenerate_values(self, tmp_path, monkeypatch, workers):
+        glu = _make_glu(seed=5)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        ref = glu(x, i)
+        mx.eval(ref)
+        model, _ = self._wrap(tmp_path, glu, workers, monkeypatch)
+        got = model.layers[0].experts.switch_glu(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+        assert (_io_pool() is None) is (workers is not None)
+
+    @pytest.mark.parametrize("workers", ["1", "4"])
+    @pytest.mark.parametrize("full", [False, True])
+    def test_read_failure_preserves_cache_for_retry(
+        self, tmp_path, monkeypatch, workers, full
+    ):
+        glu = _make_glu(seed=8)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        _, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+        if full:
+            cache.ensure(mx.arange(cache.capacity))
+        before = list(cache.slot_of.items()), list(cache.free), cache.map.tolist()
+        expert = cache.capacity
+        plan = cache.disk.plan("gate_proj", "weight", expert)
+        read = CheckpointExpertStore.read
+
+        def fail_read(current):
+            if current == plan:
+                raise OSError("injected read failure")
+            return read(current)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CheckpointExpertStore, "read", staticmethod(fail_read))
+            with pytest.raises(OSError, match="injected read failure"):
+                cache.ensure(mx.array([expert]))
+        assert (list(cache.slot_of.items()), cache.free, cache.map.tolist()) == before
+        cache.ensure(mx.array([expert]))
+        slot = cache.slot_of[expert]
+        for name in cache.projs:
+            for field, actual in zip(
+                ("weight", "scales", "biases"), cache.resident[name]
+            ):
+                assert bool(
+                    mx.array_equal(actual[slot], getattr(glu, name)[field][expert])
+                )
+
+    def test_partial_write_failure_releases_slot(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=9)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        cache.ensure(mx.arange(cache.capacity))
+        victim = next(iter(cache.slot_of))
+        expert = cache.capacity
+        plan = cache.disk.plan("gate_proj", "scales", expert)
+        convert = CheckpointExpertStore.to_mx
+
+        def fail_convert(current, raw):
+            if current == plan:
+                raise ValueError("injected conversion failure")
+            return convert(current, raw)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CheckpointExpertStore, "to_mx", staticmethod(fail_convert))
+            with pytest.raises(ValueError, match="injected conversion failure"):
+                cache.ensure(mx.array([expert]))
+        assert expert not in cache.slot_of and victim not in cache.slot_of
+        assert cache.map[expert].item() == cache.map[victim].item() == -1
+        assert len(cache.free) == 1
+        cache.ensure(mx.array([expert, victim]))
+        for e in (expert, victim):
+            slot = cache.slot_of[e]
+            assert bool(
+                mx.array_equal(
+                    cache.resident["gate_proj"][0][slot], glu.gate_proj.weight[e]
+                )
+            )
+
+    def test_single_expert_window_keeps_reads_on_pool(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=10)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "1")
+        _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        read = CheckpointExpertStore.read
+        threads = []
+
+        def record(current):
+            threads.append(threading.current_thread())
+            return read(current)
+
+        monkeypatch.setattr(CheckpointExpertStore, "read", staticmethod(record))
+        cache.ensure(mx.arange(4))
+        assert len(threads) == 4 * 9
+        assert all(t is not threading.current_thread() for t in threads)
+
+    def test_store_reads_are_thread_safe(self, tmp_path):
+        glu = _make_glu(seed=6)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        store = CheckpointExpertStore(tmp_path)
+        name = "layers.0.experts.switch_glu.gate_proj.weight"
+        raws = {}
+
+        def read(e):
+            raws[e] = CheckpointExpertStore.read(store.plan_expert(name, e))
+
+        threads = [threading.Thread(target=read, args=(e,)) for e in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(raws) == 8
+        for e, raw in raws.items():  # mx stays on this thread
+            got = CheckpointExpertStore.to_mx(store.plan_expert(name, e), raw)
+            assert bool(mx.array_equal(got, glu.gate_proj["weight"][e]))
+
+    def test_prefetch_batching_bounds_inflight(self, tmp_path, monkeypatch):
+        """The pipeline may not hold more than a batch of experts' payloads:
+        that bound is the only thing standing between reading ahead and
+        buffering a whole layer's expert table in host memory."""
+        glu = _make_glu(seed=7)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "4")
+        real_read, real_to_mx = CheckpointExpertStore.read, CheckpointExpertStore.to_mx
+        lock = threading.Lock()
+        live = {"now": 0, "peak": 0}
+
+        def counting_read(plan):  # a payload exists from here ...
+            raw = real_read(plan)
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            return raw
+
+        def counting_to_mx(plan, raw):  # ... until it becomes an array
+            with lock:
+                live["now"] -= 1
+            return real_to_mx(plan, raw)
+
+        monkeypatch.setattr(CheckpointExpertStore, "read", staticmethod(counting_read))
+        monkeypatch.setattr(
+            CheckpointExpertStore, "to_mx", staticmethod(counting_to_mx)
+        )
+        _, cache = self._wrap(tmp_path, glu, "8", monkeypatch)
+        assert _io_pool() is not None
+        mx.random.seed(5)
+        for _ in range(6):
+            cache.ensure(_ri(8, K))
+        assert cache.misses > cache.capacity
+        assert live["peak"] <= 4 * 9  # batch x tensors per expert
+        assert live["now"] == 0  # nothing left holding bytes
+
+
+@pytest.mark.slow
+class TestRealGeometry:
+    """gemma-26B expert geometry: where the sorted kernel is presentation-
+    invariant, so even the sorted prefill path is bit-exact."""
+
+    E, D, INTER, K, GROUP = 128, 2816, 704, 8, 64
+
+    @pytest.fixture(scope="class")
+    def setup(self, tmp_path_factory):
+        tmp = tmp_path_factory.mktemp("real_geom")
+        glu = _make_glu(seed=42, e=self.E, d=self.D, inter=self.INTER, group=self.GROUP)
+        _save_checkpoint(tmp, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        return tmp, glu
+
+    def _fresh(self, setup, fraction):
+        tmp, glu = setup
+        model = _MiniMoE([glu])
+        n = apply_moe_expert_offload(model, tmp, fraction)
+        assert n == 1
+        return model, model.layers[0].experts.switch_glu, glu
+
+    def test_sorted_prefill_bit_exact_at_full_residency(self, setup):
+        _, wrapped, glu = self._fresh(setup, 1.0)
+        x = mx.random.normal((2, 40, self.D))
+        i = _ri(2, 40, self.K, e=self.E)
+        ref, got = glu(x, i), wrapped(x, i)
+        mx.eval(ref, got)
+        assert bool(mx.array_equal(ref, got))
+
+    def test_quarter_residency_rounding_bounded(self, setup):
+        _, wrapped, glu = self._fresh(setup, 0.25)
+        x = mx.random.normal((2, 64, self.D))
+        i = _ri(2, 64, self.K, e=self.E)
+        ref, got = glu(x, i), wrapped(x, i)
+        mx.eval(ref, got)
+        assert float(mx.abs(ref - got).max()) < 2e-2
+
+    def test_decode_bit_exact_at_quarter_residency(self, setup):
+        _, wrapped, glu = self._fresh(setup, 0.25)
+        x = mx.random.normal((8, 1, self.D))
+        i = _ri(8, 1, self.K, e=self.E)
+        ref, got = glu(x, i), wrapped(x, i)
+        mx.eval(ref, got)
+        assert bool(mx.array_equal(ref, got))
+
+
+def test_capacity_uses_checkpoint_routing_top_k(tmp_path):
+    import json
+
+    glu = _make_glu()
+    _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 10}))
+    model = _MiniMoE([glu])
+    apply_moe_expert_offload(model, tmp_path, .125)
+    wrapped = model.layers[0].experts.switch_glu
+    assert wrapped.cache.capacity == 10
+    x = mx.random.normal((1, 1, D))
+    indices = mx.arange(10).reshape(1, 1, 10)
+    np_result = wrapped(x, indices)
+    reference = glu(x, indices)
+    mx.eval(np_result, reference)
+    assert bool(mx.array_equal(np_result, reference))
+
+
+@pytest.mark.parametrize("length,batch", [(1, 1), (32, 1), (8, 2)])
+def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
+    """Exercise Qwen4-Exp's actual MoE block, including its shared expert."""
+    import copy
+    import json
+    from types import SimpleNamespace
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import Qwen3_5MoeSparseMoeBlock
+
+    mx.random.seed(42)
+    config = SimpleNamespace(
+        hidden_size=64,
+        moe_intermediate_size=64,
+        shared_expert_intermediate_size=64,
+        num_experts=512,
+        num_experts_per_tok=10,
+    )
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    layer = nn.Module()
+    layer.mlp = Qwen3_5MoeSparseMoeBlock(config)
+    model.language_model.model.layers = [layer]
+    nn.quantize(layer.mlp.switch_mlp, group_size=32, bits=4)
+    reference = copy.deepcopy(layer.mlp)
+    _save_checkpoint(
+        tmp_path,
+        _glu_tensors(
+            layer.mlp.switch_mlp, "language_model.model.layers.0.mlp.switch_mlp"
+        ),
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": vars(config),
+            }
+        )
+    )
+    assert apply_moe_expert_offload(model, tmp_path, 0.125) == 1
+    cache = layer.mlp.switch_mlp.cache
+    assert cache.capacity == 64
+    for _ in range(5):
+        x = mx.random.normal((batch, length, 64))
+        expected, actual = reference(x), layer.mlp(x)
+        mx.eval(expected, actual)
+        assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-5).item()
+        assert len(cache.slot_of) <= 64
+    if length > 1:
+        assert cache.misses > cache.capacity

@@ -16,10 +16,13 @@ from omlx.admin.routes import GlobalSettingsRequest
 from omlx.settings import GlobalSettings
 from omlx.utils.network import (
     detect_server_aliases,
+    is_loopback_bind,
+    is_loopback_bind_host,
     is_valid_alias,
     is_valid_bind_host,
     is_valid_hostname,
     is_valid_ip,
+    network_auth_error,
 )
 
 # =============================================================================
@@ -37,6 +40,8 @@ def _make_global_settings(
     gs.server.log_level = "info"
     gs.server.server_aliases = list(server_aliases or [])
     gs.server.preserve_mid_system_cache = True
+    gs.auth.api_key = None
+    gs.auth.skip_api_key_verification = False
     # Validation is invoked at the end of update_global_settings; return no errors.
     gs.validate.return_value = []
     gs.save.return_value = None
@@ -46,6 +51,13 @@ def _make_global_settings(
 @contextmanager
 def _patched_global_settings(gs):
     """Patch the module-level _get_global_settings getter without disturbing others."""
+    if isinstance(gs, MagicMock):
+        if not isinstance(gs.server.host, str):
+            gs.server.host = "127.0.0.1"
+        if not isinstance(gs.auth.api_key, (str, type(None))):
+            gs.auth.api_key = None
+        if not isinstance(gs.auth.skip_api_key_verification, bool):
+            gs.auth.skip_api_key_verification = False
     original = admin_routes._get_global_settings
     admin_routes._get_global_settings = lambda: gs
     try:
@@ -69,6 +81,54 @@ class TestNetworkValidation:
     def test_valid_ipv6(self):
         assert is_valid_ip("::1")
         assert is_valid_ip("fe80::1")
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "localhost",
+            "LOCALHOST.",
+            "127.0.0.1",
+            "127.42.0.9",
+            "::1",
+            "::ffff:127.0.0.1",
+        ],
+    )
+    def test_recognizes_loopback_bind_hosts(self, host):
+        assert is_loopback_bind_host(host)
+
+    @pytest.mark.parametrize(
+        "host",
+        ["0.0.0.0", "::", "192.168.1.10", "host.local", "example.com", ""],
+    )
+    def test_rejects_non_loopback_bind_hosts(self, host):
+        assert not is_loopback_bind_host(host)
+
+    def test_network_bind_requires_api_key(self):
+        error = network_auth_error("0.0.0.0", None, False)
+
+        assert error is not None
+        assert "API key is required" in error
+
+    def test_mixed_bind_list_requires_api_key(self):
+        error = network_auth_error("127.0.0.1,192.168.1.10", None, False)
+
+        assert error is not None
+        assert "API key is required" in error
+
+    def test_authenticated_network_bind_is_allowed(self):
+        assert network_auth_error("0.0.0.0", "secret-key", False) is None
+
+    def test_loopback_bind_requires_every_configured_host_to_be_loopback(self):
+        assert is_loopback_bind("127.0.0.1, ::1")
+        assert not is_loopback_bind("127.0.0.1, 192.168.1.10")
+        assert not is_loopback_bind("")
+
+    def test_auth_bypass_is_loopback_only(self):
+        assert network_auth_error("127.0.0.1,::1", None, True) is None
+        error = network_auth_error("0.0.0.0", "secret-key", True)
+
+        assert error is not None
+        assert "cannot be skipped" in error
 
     def test_rejects_unspecified_ipv4(self):
         """0.0.0.0 parses as a valid IP but is not routable as an alias."""
@@ -428,6 +488,104 @@ class TestUpdateGlobalSettingsAliases:
             )
 
         assert gs.server.server_aliases == []
+
+
+class TestUpdateGlobalSettingsNetworkAuth:
+    """Network-facing binds cannot be saved without enforced authentication."""
+
+    def test_rejects_network_bind_without_api_key_before_mutation(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="0.0.0.0")
+
+        with (
+            _patched_global_settings(gs),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "API key is required" in exc_info.value.detail
+        assert gs.server.host == "127.0.0.1"
+        gs.save.assert_not_called()
+
+    def test_accepts_api_key_and_network_bind_in_one_update(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="0.0.0.0", api_key="secret-key")
+        server_state = SimpleNamespace(api_key=None)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(omlx.server, "_server_state", server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.server.host == "0.0.0.0"
+        assert gs.auth.api_key == "secret-key"
+        assert server_state.api_key == "secret-key"
+        gs.save.assert_called_once()
+
+    def test_rejects_auth_bypass_on_network_bind_before_mutation(self):
+        gs = _make_global_settings(host="0.0.0.0")
+        gs.auth.api_key = "secret-key"
+        request = GlobalSettingsRequest(skip_api_key_verification=True)
+
+        with (
+            _patched_global_settings(gs),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "cannot be skipped" in exc_info.value.detail
+        assert gs.auth.skip_api_key_verification is False
+        gs.save.assert_not_called()
+
+    def test_rejects_auth_bypass_until_loopback_restart(self):
+        gs = _make_global_settings(host="0.0.0.0")
+        gs.auth.api_key = "secret-key"
+        server_state = SimpleNamespace(
+            global_settings=gs,
+            bind_host="0.0.0.0",
+        )
+        request = GlobalSettingsRequest(
+            host="127.0.0.1",
+            skip_api_key_verification=True,
+        )
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(admin_routes, "_get_server_state", lambda: server_state),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "running server" in exc_info.value.detail
+        assert gs.server.host == "0.0.0.0"
+        assert gs.auth.skip_api_key_verification is False
+        gs.save.assert_not_called()
+
+    def test_allows_auth_bypass_on_loopback(self):
+        gs = _make_global_settings(host="127.0.0.1, ::1")
+        request = GlobalSettingsRequest(skip_api_key_verification=True)
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.auth.skip_api_key_verification is True
+        gs.save.assert_called_once()
 
 
 class TestUpdateGlobalSettingsHotCache:
@@ -1024,3 +1182,124 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         assert gs.cache.gdn_ssd_pending_max_size == "512MB"
         assert gs.cache.gdn_sidecar_state_dtype == "fp32"
         gs.save.assert_not_called()
+
+
+def test_global_defaults_ignore_overrides_and_do_not_write(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.server.port = 9123
+    gs.memory.prefill_memory_guard = False
+    gs.cache.ssd_cache_max_size = "321GB"
+    gs.auth.api_key = "keep-key"
+    gs.model.model_dirs = [str(tmp_path / "models")]
+    gs.save()
+    original = (tmp_path / "settings.json").read_bytes()
+    monkeypatch.setenv("OMLX_PORT", "9456")
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    app.dependency_overrides[admin_routes.require_admin] = lambda: True
+    with _patched_global_settings(gs), TestClient(app) as client:
+        response = client.get("/admin/api/global-settings/defaults")
+    assert response.status_code == 200
+    data = response.json()
+    defaults = GlobalSettings()
+    assert data["server"]["port"] == defaults.server.port
+    assert data["memory"]["prefill_memory_guard"] is True
+    assert data["cache"]["ssd_cache_max_size"] == "auto"
+    assert data["sampling"] == defaults.sampling.to_dict()
+    assert data["auth"]["api_key"] == ""
+    assert gs.server.port == 9123
+    assert gs.auth.api_key == "keep-key"
+    assert gs.model.model_dirs == [str(tmp_path / "models")]
+    assert (tmp_path / "settings.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("cache_size", ["auto", "1536MB"])
+def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
+    from omlx.scheduler import SchedulerConfig
+    from omlx.server import _server_state
+
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.save = MagicMock()
+    gs.cache.ssd_cache_max_size = cache_size
+    pool = MagicMock()
+    pool._scheduler_config = SchedulerConfig()
+    pool.get_loaded_model_ids.return_value = ["loaded-model"]
+    pool._unload_engine = AsyncMock()
+
+    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
+        data = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        payload = dict(data["cache"])
+        payload["cache_enabled"] = payload.pop("enabled")
+        payload.pop("gdn_ssd_split_enabled")
+        payload.pop("ane_compile_cache")
+        result = asyncio.run(
+            admin_routes.update_global_settings(
+                GlobalSettingsRequest(**payload), is_admin=True
+            )
+        )
+        assert "cache" not in result["runtime_applied"]
+        pool._unload_engine.assert_not_awaited()
+        assert gs.cache.ssd_cache_dir is None
+        assert gs.cache.ssd_cache_max_size == cache_size
+
+        payload["initial_cache_blocks"] = 512
+        result = asyncio.run(
+            admin_routes.update_global_settings(
+                GlobalSettingsRequest(**payload), is_admin=True
+            )
+        )
+        assert "cache" in result["runtime_applied"]
+        pool._unload_engine.assert_awaited_once_with("loaded-model")
+        assert pool._scheduler_config.paged_ssd_cache_auto_size == (
+            cache_size == "auto"
+        )
+        assert pool._scheduler_config.initial_cache_blocks == 512
+
+
+@pytest.mark.parametrize("alias, split", [("ssd", True), ("hot", False)])
+def test_gdn_storage_alias_only_rebuilds_on_policy_change(alias, split):
+    gs = GlobalSettings()
+    gs.save = MagicMock()
+    gs.cache.gdn_ssd_split_enabled = split
+    request = GlobalSettingsRequest(gdn_snapshot_storage=alias)
+
+    with (
+        _patched_global_settings(gs),
+        patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            new_callable=AsyncMock,
+            return_value=(True, "applied"),
+        ) as apply_cache,
+    ):
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+        apply_cache.assert_not_awaited()
+        gs.cache.gdn_ssd_split_enabled = not split
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+        apply_cache.assert_awaited_once()
+        assert gs.cache.gdn_ssd_split_enabled is split
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_qwen4_decode_setting_updates_future_model_loads(enabled):
+    from omlx.scheduler import SchedulerConfig
+    from omlx.server import _server_state
+
+    gs = _make_global_settings()
+    gs.server.qwen4_gdn_decode_wide_proj = not enabled
+    pool = SimpleNamespace(
+        _scheduler_config=SchedulerConfig(qwen4_gdn_decode_wide_proj=not enabled)
+    )
+    request = GlobalSettingsRequest(qwen4_gdn_decode_wide_proj=enabled)
+    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+    assert result["success"] is True
+    assert "qwen4_gdn_decode_wide_proj" not in result["runtime_applied"]
+    assert gs.server.qwen4_gdn_decode_wide_proj is enabled
+    assert pool._scheduler_config.qwen4_gdn_decode_wide_proj is enabled
+    gs.save.assert_called_once()

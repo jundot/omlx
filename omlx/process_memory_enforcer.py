@@ -41,6 +41,7 @@ import mlx.core as mx
 from . import settings as _settings
 from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
+from .utils.image import clear_image_decode_cache
 from .utils.proc_memory import get_phys_footprint
 
 if TYPE_CHECKING:
@@ -723,6 +724,28 @@ class ProcessMemoryEnforcer:
             return self._get_hard_limit_bytes()
         return self._get_static_ceiling()
 
+    def get_residency_ceiling(self) -> int:
+        """Stable ceiling for *where weights live*, not for admitting a load.
+
+        Admission must respect memory free right now — overcommitting thrashes
+        the machine. Choosing whether a model's PLE table stays resident or
+        falls back to mmap is a throughput call, and the instantaneous ceiling
+        is actively wrong for it: engine_pool asks right after the previous
+        model unloaded, before the OS has returned its pages, so ``dynamic``
+        dips and a table that fits gets pushed to SSD for the rest of that
+        engine's life. Measured on a model swap here: 35.3 -> 14.1 tok/s.
+
+        Uses only the two components that don't move with instantaneous
+        pressure. Returns 0 when the guard is off, like the other accessors.
+        """
+        breakdown = self._get_ceiling_breakdown()
+        candidates = [
+            value
+            for value in (breakdown["static"], breakdown["metal_cap"])
+            if value > 0
+        ]
+        return min(candidates) if candidates else 0
+
     def get_admission_soft_target(self) -> int:
         """Soft watermark that pre-load admission evicts down to (#2319).
 
@@ -1215,6 +1238,7 @@ class ProcessMemoryEnforcer:
                     # executor without a Scheduler, so an unresolvable
                     # scheduler is their normal shape, not a wrapper break.
                     # Warning here reads as a guard regression (#2312).
+                    engine.set_memory_soft_limit(soft_limit)
                     continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
@@ -1261,10 +1285,6 @@ class ProcessMemoryEnforcer:
             # the distinction to point at the right knob.
             scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
-            # Marks the guard state as trustworthy: until this is set the
-            # sdpa256 route treats _prefill_memory_guard=False as "unknown"
-            # and keeps its memory-safe tiled default (#2283).
-            scheduler._memory_limits_propagated = True
             scheduler._admission_paused = admission_paused
             scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
@@ -1463,6 +1483,12 @@ class ProcessMemoryEnforcer:
         current = self._current_usage_bytes()
         soft = int(ceiling * self._soft_threshold)
         hard = int(ceiling * self._hard_threshold)
+        # Reclaim decoded CPU images before pausing admission or evicting
+        # models. Request-owned references may remain, so remeasure usage.
+        if current >= soft:
+            dropped_images = await asyncio.to_thread(clear_image_decode_cache)
+            if dropped_images:
+                current = self._current_usage_bytes()
         prev_level = self._pressure_level
         emergency = self._is_emergency_pressure(current, ceiling)
 
@@ -1633,9 +1659,17 @@ class ProcessMemoryEnforcer:
                                 "hard memory pressure",
                                 abort_requested=True,
                             )
-                            await self._engine_pool._unload_pending_if_idle_locked(
-                                busy_victim
+                            unloaded = (
+                                await self._engine_pool._unload_pending_if_idle_locked(
+                                    busy_victim
+                                )
                             )
+                            if not unloaded:
+                                # Not drained yet: schedule the poller, mirroring
+                                # request_unload's own fallback, or the latch never clears.
+                                self._engine_pool._schedule_pending_unload_locked(
+                                    busy_victim
+                                )
                         logger.warning(
                             "Hard memory pressure: requested abort/unload for "
                             "'%s' (aborted=%d)",

@@ -36,6 +36,7 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 
 from __future__ import annotations
 
+import importlib
 import logging
 import weakref
 from typing import Any
@@ -63,6 +64,10 @@ def apply() -> bool:
         logger.debug(f"mlx_vlm.qwen3_5 not importable for MTP runtime: {e}")
         return False
 
+    from . import qwen35_verify_attention, qwen35_verify_linear
+
+    qwen35_verify_linear.apply()
+    qwen35_verify_attention.apply(q35_lang)
     _patch_text_config(q35_config)
     _register_mtp_classes_for_vlm(q35_lang)
     _patch_vlm_language_model(q35_lang)
@@ -71,10 +76,43 @@ def apply() -> bool:
     # too; the function is idempotent so calling it twice is safe.
     _patch_vlm_model_adapter()
     _patch_vlm_outer_model_load_weights()
+    _patch_batch_cache_padding_identity()
 
     _APPLIED = True
     logger.info("mlx-vlm Qwen3.5 (dense) runtime MTP patch applied")
     return True
+
+
+def _patch_batch_cache_padding_identity() -> None:
+    """Refresh Qwen's padding metadata after ragged finalization.
+
+    Qwen keys it by array identity, so in-place updates require rebinding.
+    """
+    for module_name in ("mlx_lm.models.cache", "mlx_vlm.models.cache"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:
+            logger.debug(f"{module_name} not importable: {e}")
+            continue
+        for name in ("BatchKVCache", "BatchRotatingKVCache", "BatchQuantizedKVCache"):
+            cls = getattr(module, name, None)
+            if cls is None or getattr(cls, "_omlx_padding_rebind_patched", False):
+                continue
+            original_finalize = cls.finalize
+
+            def finalize(self, _original=original_finalize):
+                padding_pending = (
+                    getattr(self, "_right_padding", None) is not None
+                    or getattr(self, "_lengths", None) is not None
+                )
+                before = getattr(self, "left_padding", None)
+                _original(self)
+                after = getattr(self, "left_padding", None)
+                if padding_pending and isinstance(after, mx.array) and after is before:
+                    self.left_padding = mx.array(after)
+
+            cls.finalize = finalize
+            cls._omlx_padding_rebind_patched = True
 
 
 def _patch_vlm_outer_model_load_weights() -> None:
@@ -116,9 +154,8 @@ def _remap_root_mtp_weights(model: Any, weights: Any) -> Any:
 
     Some third-party MLX Qwen VLM checkpoints use canonical
     ``language_model.*`` paths for the backbone but retain the MTP head at
-    root ``mtp.*``. mlx-vlm skips ``Model.sanitize`` for MLX-format shards,
-    so the normal sanitizer remap never runs and strict loading rejects the
-    head. Only rewrite when the runtime MTP module is actually attached.
+    root ``mtp.*``. Direct load_weights callers also need the canonical path.
+    Only rewrite when the runtime MTP module is attached.
     """
     language_model = getattr(model, "language_model", None)
     if language_model is None or getattr(language_model, "mtp", None) is None:
@@ -281,8 +318,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             return original_init(self, args, config)
         original_init(self, args, config)
         # Attach MTPModule when the config declares MTP heads so mlx-vlm's
-        # load_weights (which skips Model.sanitize for is_mlx_format
-        # checkpoints) can place the persisted mtp.* tensors. Whether MTP
+        # load_weights can place the persisted mtp.* tensors. Whether MTP
         # speculative decode is actually invoked at inference time is gated
         # downstream by ``mlx_lm_mtp.batch_generator._is_mtp_eligible``,
         # which checks the per-instance ``_omlx_mtp_decode_enabled`` marker.
@@ -292,6 +328,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         # Qwen3.6 UD MLX builds, issue #1426) don't fail strict load_weights
         # with "Missing N parameters" and silently downgrade to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
+        self._omlx_mtp_multi_request = True
         attach_enabled = bool(is_mtp_attach_enabled())
         self._omlx_mtp_decode_enabled = bool(
             n_mtp > 0 and attach_enabled and is_mtp_active()
@@ -302,10 +339,12 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             # Depth-k chained drafting works on this path: mtp_forward
             # supports return_hidden below, and rollback uses mlx-vlm's
             # stock rollback_speculative_cache (native partial accepts).
-            from ..mlx_lm_mtp import get_mtp_depth
+            from ..mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
+            self._omlx_mtp_batch_rollback = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             # Prompt-priming capture runs inside the inner Qwen3_5Model
             # forward, which has no reference back to this LanguageModel
             # (the mtp module / make_mtp_cache live here). A weakref avoids
@@ -330,14 +369,36 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
         if not return_hidden:
+            drafter = getattr(self, "_omlx_drafter", None)
+            scope = getattr(drafter, "scope_uids", None)
+            if (
+                scope
+                and inputs is not None
+                and inputs.ndim == 2
+                and inputs.shape[0] == len(scope)
+                and inputs.shape[1] == 1
+                and kwargs.get("capture_layer_ids") is None
+            ):
+                # An ordinary decode step while a block drafter is attached:
+                # keep the committed token in the drafter context.
+                out = original_call(
+                    self,
+                    inputs,
+                    inputs_embeds,
+                    mask,
+                    cache,
+                    capture_layer_ids=list(drafter.target_layer_ids),
+                    **kwargs,
+                )
+                drafter.observe(scope, out.hidden_states)
+                return out
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
 
         # Passing any non-None ``capture_layer_ids`` makes stock
         # ``LanguageModel.__call__`` allocate ``hidden_sink`` AND ``gdn_sink``,
-        # both of which the MTP cycle needs. Pop any existing value from kwargs
-        # to avoid "got multiple values for keyword argument" when the caller
-        # already passed capture_layer_ids.
-        kwargs.pop("capture_layer_ids", None)
+        # both of which the MTP cycle needs. Caller layers (block drafters)
+        # are merged with the head's last layer into one capture request.
+        requested = list(kwargs.pop("capture_layer_ids", None) or [])
         last_layer_idx = len(self.model.layers) - 1
         out = original_call(
             self,
@@ -345,15 +406,19 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             inputs_embeds,
             mask,
             cache,
-            capture_layer_ids=[last_layer_idx],
+            capture_layer_ids=sorted({*requested, last_layer_idx}),
+            speculative_verify=True,
             **kwargs,
         )
         from mlx_vlm.models.base import LanguageModelOutput
 
-        hidden_pre_norm = out.hidden_states[0]
+        # Stock capture order is ascending layer index. Return the caller's
+        # layers in the order requested, then the head's last-layer hidden.
+        by_layer = dict(zip(sorted({*requested, last_layer_idx}), out.hidden_states))
+        hidden_states = [by_layer[i] for i in requested] + [by_layer[last_layer_idx]]
         return LanguageModelOutput(
             logits=out.logits,
-            hidden_states=[hidden_pre_norm],
+            hidden_states=hidden_states,
             gdn_states=out.gdn_states,
             shared_kv_states={} if return_shared_kv else None,
         )

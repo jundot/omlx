@@ -182,7 +182,7 @@ checklist.
 
 ### Vision-Language Models
 
-Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
+Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. MiMo V2.6 checkpoints with bundled sidecars also accept sampled-frame video and 24 kHz audio. oQ conversion of official MiMo V2.6 checkpoints preserves image and audio support. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
 
 ### Tiered KV Cache (Hot + Cold)
 
@@ -260,7 +260,7 @@ One-click benchmarking from the admin panel. Measures prefill (PP) and text gene
 
 ### macOS Menubar App
 
-Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and built-in auto-update.
+Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes [local usage history](docs/usage-analytics.md) with per-model totals and an hourly heatmap, persistent serving stats (survives restarts), auto-restart on crash, and built-in auto-update.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
@@ -281,7 +281,7 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 
 ### Tool Calling & Structured Output
 
-Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected via mlx-lm's built-in tool parsers:
+Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected:
 
 | Model Family | Format |
 |---|---|
@@ -291,6 +291,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
 | MiniMax | Namespaced `<minimax:tool_call>` |
 | Mistral | `[TOOL_CALLS]` |
+| IFM K2 Horizon | XML or JSON inside `<ifm\|tool_calls>`. Requires `omlx[grammar]` |
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
@@ -354,9 +355,18 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 # API key authentication
 omlx serve --model-dir ~/models --api-key your-secret-key
 # Localhost-only: skip verification via admin panel global settings
+
+# Network access requires authentication
+OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
 ```
 
-All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
+
+
+Most settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. The existing `skip_api_key_verification` option remains restricted to loopback-only binds.
+
+For keyless inference, stop oMLX, manually set `auth.allow_unauthenticated_inference` to `true` in `settings.json`, and restart. It defaults to `false` and has no UI toggle. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. On network binds, keep a main API key configured and `skip_api_key_verification` set to `false`; management endpoints still require authentication.
 
 <details>
 <summary>Architecture</summary>
@@ -435,5 +445,5 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating

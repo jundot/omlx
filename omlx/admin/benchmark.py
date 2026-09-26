@@ -344,6 +344,10 @@ _UPLOADED_SETTING_FIELDS = (
     "turboquant_kv_enabled",
     "turboquant_kv_bits",
     "turboquant_skip_last",
+    "qwen35_oq_a8_enabled",
+    "qwen35_oq_a8_min_tokens",
+    "moe_expert_offload_enabled",
+    "moe_expert_offload_resident_fraction",
     "specprefill_enabled",
     "specprefill_draft_model",
     "specprefill_keep_pct",
@@ -357,13 +361,16 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_max_ctx",
     "dflash_in_memory_cache",
     "dflash_in_memory_cache_max_entries",
+    "dflash_in_memory_cache_max_bytes",
     "dflash_ssd_cache",
+    "dflash_ssd_cache_max_bytes",
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
-    "mtp_num_draft_tokens",
+    "mtp_adaptive_max_depth",
+    "mtp_fixed_depth",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -371,6 +378,7 @@ _UPLOADED_SETTING_FIELDS = (
     "qwen35_ane_prefill_sequence_length",
     "qwen35_ane_prefill_tail_padding_min_tokens",
     "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_shared_fraction",
     "qwen35_ane_prefill_fused_down",
     "qwen35_ane_prefill_max_layers",
     "qwen35_ane_prefill_dual_ane",
@@ -393,7 +401,9 @@ _PATH_VALUED_SETTING_FIELDS = frozenset(
     }
 )
 
-_MAX_UPLOADED_SETTINGS_BYTES = 4096
+# omlx.ai accepts up to 8192 bytes; the margin leaves room for the
+# benchmark_context label that is prepended at upload time.
+_MAX_UPLOADED_SETTINGS_BYTES = 6144
 
 
 def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
@@ -1262,6 +1272,7 @@ async def _run_external_batch_test(
 
 
 OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
+OMLX_AI_BEST_URL = f"{OMLX_AI_API_URL}/best"
 
 # The leaderboard accepts model_name up to 150 characters.
 _MAX_MODEL_NAME_LEN = 150
@@ -1928,6 +1939,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(effective_scheduler, "prefill_speed_priority", None),
             getattr(effective_scheduler, "max_num_batched_tokens", None),
         )
+        del runtime_scheduler
 
         for pp_len in single_prompt_lengths:
             current_test += 1

@@ -7,6 +7,7 @@ Note: Configuration validation tests are in test_config.py.
 """
 
 import argparse
+import json
 import socket
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx._version import __version__
+from omlx.cli import _migrate_saved_network_auth
+from omlx.settings import GlobalSettings
 
 
 class TestCLIModule:
@@ -753,8 +756,8 @@ class TestLaunchCommandFunction:
         assert "Using model: only-32k" in output
         assert "Cannot launch Claude Code with model 'only-32k'" in output
 
-    def test_launch_command_shows_picker_and_clears_saved_tiers(self):
-        """Bare `omlx launch claude` shows the picker and ignores saved tier models."""
+    def test_launch_command_shows_picker_and_keeps_saved_tiers(self):
+        """Bare `omlx launch claude` shows the picker for the default model and keeps the saved tier models (#3543)."""
         from omlx.cli import launch_command
 
         integration = MagicMock()
@@ -813,9 +816,9 @@ class TestLaunchCommandFunction:
         integration.select_model.assert_called_once()
         ctx = integration.launch.call_args.args[0]
         assert ctx.model == "sonnet-local"
-        assert ctx.opus_model is None
-        assert ctx.sonnet_model is None
-        assert ctx.haiku_model is None
+        assert ctx.opus_model == "opus-local"
+        assert ctx.sonnet_model == "sonnet-local"
+        assert ctx.haiku_model == "haiku-local"
         assert ctx.api_key == "saved-key"
 
     def test_launch_command_claude_cli_tiers_override_saved_settings(self):
@@ -1054,6 +1057,27 @@ class TestServeCommandFunctions:
 
         assert result.returncode != 0
         assert "embedding_batch_size" in result.stdout
+        assert not (tmp_path / "settings.json").exists()
+
+    def test_network_bind_without_api_key_exits_before_persisting(self, tmp_path):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "omlx.cli",
+                "serve",
+                "--base-path",
+                str(tmp_path),
+                "--host",
+                "0.0.0.0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.returncode != 0
+        assert "API key is required" in result.stdout
         assert not (tmp_path / "settings.json").exists()
 
     def test_invalid_memory_guard_gb_is_not_persisted(self, tmp_path):
@@ -1353,3 +1377,272 @@ class TestCLIDocstrings:
         assert (
             "multi-model" in result.stdout.lower() or "server" in result.stdout.lower()
         )
+
+
+class TestLaunchClaudeTierPrecedence:
+    def _run(
+        self, *, args_model, settings_tiers, cli_tiers=None, picked="picked-model"
+    ):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+        integration.select_model.return_value = picked
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {"id": m, "max_context_window": 131072}
+                for m in (
+                    "picked-model",
+                    "other-model",
+                    "opus-cfg",
+                    "sonnet-cfg",
+                    "haiku-cfg",
+                    "opus-flag",
+                )
+            ]
+        }
+
+        # Third request: the interactive path lists /v1/models before the picker.
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [
+                {"id": m["id"], "model_type": "llm"}
+                for m in status_response.json.return_value["models"]
+            ]
+        }
+
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(**settings_tiers),
+        )
+        cli_tiers = cli_tiers or {}
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key=None,
+            model=args_model,
+            tools_profile="coding",
+            opus_model=cli_tiers.get("opus_model"),
+            sonnet_model=cli_tiers.get("sonnet_model"),
+            haiku_model=cli_tiers.get("haiku_model"),
+        )
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+        integration.launch.assert_called_once()
+        return integration.launch.call_args.args[0]
+
+    def test_interactive_pick_keeps_saved_tier_models(self):
+        """The picker chooses the default model; the persisted tiers keep their roles (#3543)."""
+        ctx = self._run(
+            args_model=None,
+            settings_tiers={
+                "opus_model": "opus-cfg",
+                "sonnet_model": "sonnet-cfg",
+                "haiku_model": "haiku-cfg",
+            },
+        )
+        assert ctx.model == "picked-model"
+        assert (ctx.opus_model, ctx.sonnet_model, ctx.haiku_model) == (
+            "opus-cfg",
+            "sonnet-cfg",
+            "haiku-cfg",
+        )
+
+    def test_explicit_tier_flag_overrides_saved_setting(self):
+        ctx = self._run(
+            args_model="picked-model",
+            settings_tiers={
+                "opus_model": "opus-cfg",
+                "sonnet_model": "sonnet-cfg",
+                "haiku_model": "haiku-cfg",
+            },
+            cli_tiers={"opus_model": "opus-flag"},
+        )
+        assert ctx.opus_model == "opus-flag"
+        assert (ctx.sonnet_model, ctx.haiku_model) == ("sonnet-cfg", "haiku-cfg")
+
+    def test_without_saved_tiers_the_picked_model_is_used(self):
+        ctx = self._run(
+            args_model=None,
+            settings_tiers={
+                "opus_model": None,
+                "sonnet_model": None,
+                "haiku_model": None,
+            },
+        )
+        assert ctx.model == "picked-model"
+        assert (ctx.opus_model, ctx.sonnet_model, ctx.haiku_model) == (None, None, None)
+
+    @pytest.mark.parametrize(
+        "windows, expected_window",
+        [
+            ((131072, 49152, 65536, 65536), "49152"),
+            ((131072, 65536, 49152, 65536), "49152"),
+            ((131072, 65536, 65536, 49152), "49152"),
+            ((49152, 131072, 131072, 131072), "49152"),
+            ((131072, 131072, 131072, 131072), "131072"),
+            ((131072, None, None, None), "131072"),
+            ((None, 49152, 65536, 65536), "49152"),
+            ((None, None, None, None), None),
+        ],
+    )
+    def test_launch_passes_initial_model_and_shared_context_limit(
+        self, windows, expected_window
+    ):
+        from omlx.cli import launch_command
+        from omlx.integrations.claude import ClaudeCodeIntegration
+
+        integration = ClaudeCodeIntegration()
+        model_ids = ("picked-model", "opus-cfg", "sonnet-cfg", "haiku-cfg")
+        models = [
+            {"id": model_id, "max_context_window": window, "model_type": "llm"}
+            for model_id, window in zip(model_ids, windows)
+        ]
+        responses = [MagicMock(), MagicMock(), MagicMock()]
+        responses[1].json.return_value = {"models": models}
+        responses[2].json.return_value = {"data": models}
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(
+                opus_model="opus-cfg",
+                sonnet_model="sonnet-cfg",
+                haiku_model="haiku-cfg",
+            ),
+        )
+        args = argparse.Namespace(
+            tool="claude", host=None, port=None, api_key=None, model=None
+        )
+        with (
+            patch("requests.get", side_effect=responses),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch.object(integration, "is_installed", return_value=True),
+            patch.object(integration, "select_model", return_value="picked-model"),
+            patch.object(integration, "_find_claude_binary", return_value="claude"),
+            patch.dict("os.environ", {"ANTHROPIC_MODEL": "old-model"}, clear=True),
+            patch("omlx.integrations.claude.os.execvpe") as execute,
+        ):
+            launch_command(args, extra_args=["--resume", "session-id"])
+
+        execute.assert_called_once()
+        binary, argv, env = execute.call_args.args
+        assert binary == "claude"
+        assert argv == [
+            "claude",
+            "--disallowedTools",
+            "LSP",
+            "--settings",
+            '{"useAutoModeDuringPlan":false}',
+            "--resume",
+            "session-id",
+        ]
+        assert env["ANTHROPIC_MODEL"] == "picked-model"
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "opus-cfg"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sonnet-cfg"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-cfg"
+        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-cfg"
+        assert env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == expected_window
+        assert env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected_window
+
+
+class TestSavedNetworkAuthMigration:
+    @pytest.fixture(autouse=True)
+    def setup_migration(self, tmp_path, monkeypatch):
+        for name in ("OMLX_HOST", "OMLX_API_KEY", "OMLX_STARTUP_NOTICE_PATH"):
+            monkeypatch.delenv(name, raising=False)
+        self.path = tmp_path / "settings.json"
+        self.data = {
+            "server": {"host": "0.0.0.0"},
+            "auth": {"api_key": "existing-key", "skip_api_key_verification": True},
+            "custom": {"preserve": True},
+        }
+        self.args = argparse.Namespace(host=None)
+        with patch("builtins.input", return_value="") as self.prompt:
+            yield
+
+    def load(self):
+        return GlobalSettings.load(base_path=str(self.path.parent))
+
+    def write_settings(self):
+        self.path.write_text(json.dumps(self.data))
+        return self.path.read_bytes()
+
+    @pytest.mark.parametrize("api_key,skip", [("existing-key", True), (None, False)])
+    def test_saved_unsafe_host_is_migrated_once(self, capsys, api_key, skip):
+        self.data["auth"].update(api_key=api_key, skip_api_key_verification=skip)
+        self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        _migrate_saved_network_auth(self.load(), self.args)
+        self.prompt.assert_called_once()
+        assert "Enter" in self.prompt.call_args.args[0]
+        self.data["server"]["host"] = "127.0.0.1"
+        assert json.loads(self.path.read_text()) == self.data
+        assert settings.server.host == "127.0.0.1"
+        assert "enable authentication" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "case", ["cli", "env", "authenticated", "loopback", "invalid"]
+    )
+    def test_non_migration_cases_preserve_settings(self, monkeypatch, case):
+        if case == "cli":
+            self.args.host = "0.0.0.0"
+        elif case == "env":
+            monkeypatch.setenv("OMLX_HOST", "0.0.0.0")
+        elif case == "authenticated":
+            self.data["auth"]["skip_api_key_verification"] = False
+        elif case == "loopback":
+            self.data["server"]["host"] = "127.0.0.1,::1"
+        else:
+            self.data["server"]["port"] = -1
+        before = self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        self.prompt.assert_not_called()
+        assert self.path.read_bytes() == before
+        assert settings.server.host == self.data["server"]["host"]
+
+    def test_app_receives_notice_without_cli_prompt(self, tmp_path, monkeypatch):
+        notice = tmp_path / "notice.txt"
+        monkeypatch.setenv("OMLX_STARTUP_NOTICE_PATH", str(notice))
+        self.write_settings()
+        _migrate_saved_network_auth(self.load(), self.args)
+        self.prompt.assert_not_called()
+        assert "127.0.0.1" in notice.read_text()
+
+    @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt])
+    def test_canceled_migration_preserves_settings(self, interruption):
+        before = self.write_settings()
+        self.prompt.side_effect = interruption
+        with pytest.raises(SystemExit):
+            _migrate_saved_network_auth(self.load(), self.args)
+        assert self.path.read_bytes() == before
+
+    def test_inference_opt_in_keeps_authenticated_network_bind(self):
+        self.data["auth"].update(
+            skip_api_key_verification=False, allow_unauthenticated_inference=True
+        )
+        before = self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        self.prompt.assert_not_called()
+        assert self.path.read_bytes() == before
+        assert settings.server.host == "0.0.0.0"
+        assert settings.validate() == []

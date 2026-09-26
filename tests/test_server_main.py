@@ -77,6 +77,97 @@ def test_main_reaches_uvicorn_with_model_dir(module_entry):
     uvicorn_run.assert_called_once()
 
 
+def test_main_defaults_to_loopback(module_entry):
+    _, uvicorn_run = module_entry
+    assert uvicorn_run.call_args.kwargs["host"] == "127.0.0.1"
+
+
+def test_main_rejects_network_bind_without_api_key(monkeypatch, tmp_path, capsys):
+    from omlx import server
+    from omlx.settings import reset_settings
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "omlx-base"))
+    monkeypatch.delenv("OMLX_API_KEY", raising=False)
+    reset_settings()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    argv = [
+        "omlx.server",
+        "--model-dir",
+        str(model_dir),
+        "--host",
+        "0.0.0.0",
+    ]
+
+    try:
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(server, "init_server") as init_server,
+            patch("uvicorn.run") as uvicorn_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            server.main()
+
+        assert exc_info.value.code == 1
+        assert "API key is required" in capsys.readouterr().out
+        init_server.assert_not_called()
+        uvicorn_run.assert_not_called()
+    finally:
+        reset_settings()
+
+
+def test_main_accepts_network_bind_with_api_key(monkeypatch, tmp_path):
+    from omlx import server
+    from omlx.settings import reset_settings
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "omlx-base"))
+    monkeypatch.delenv("OMLX_API_KEY", raising=False)
+    reset_settings()
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    argv = [
+        "omlx.server",
+        "--model-dir",
+        str(model_dir),
+        "--host",
+        "0.0.0.0",
+        "--api-key",
+        "test-key",
+    ]
+
+    try:
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(server, "init_server") as init_server,
+            patch("mlx.core.set_cache_limit"),
+            patch("uvicorn.run") as uvicorn_run,
+        ):
+            server.main()
+
+        init_server.assert_called_once()
+        assert init_server.call_args.kwargs["api_key"] == "test-key"
+        assert uvicorn_run.call_args.kwargs["host"] == "0.0.0.0"
+    finally:
+        reset_settings()
+
+
+def test_init_server_rejects_network_bind_without_api_key(tmp_path):
+    from omlx import server
+    from omlx.settings import GlobalSettings
+
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.server.host = "0.0.0.0"
+
+    with pytest.raises(ValueError, match="API key is required"):
+        server.init_server(
+            model_dirs=str(tmp_path),
+            api_key=None,
+            global_settings=settings,
+        )
+
+
 def test_main_wires_global_settings(module_entry):
     # The admin routes resolve settings via _server_state.global_settings;
     # None here is what turned the API-key setup form into a 500 (#2282).
@@ -90,7 +181,7 @@ def test_admin_api_key_setup_succeeds(module_entry):
     from fastapi.testclient import TestClient
 
     server, _ = module_entry
-    client = TestClient(server.app)
+    client = TestClient(server.app, client=("127.0.0.1", 50000))
     resp = client.post(
         "/admin/api/setup-api-key",
         json={"api_key": "test-key-1234", "api_key_confirm": "test-key-1234"},

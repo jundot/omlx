@@ -14,6 +14,8 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+import weakref
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +30,12 @@ from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededErro
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
+
+
+@pytest.fixture(autouse=True)
+def _mock_explicit_gc(monkeypatch):
+    # These engines use mock models. Real reclamation is covered in test_engine_teardown.
+    monkeypatch.setattr("gc.collect", lambda: 0)
 
 
 class TestEngineConfig:
@@ -629,6 +637,38 @@ class TestEngineCoreGetStats:
 class TestEngineCoreClose:
     """Tests for EngineCore.close()."""
 
+    def test_close_releases_vlm_drafter_target_with_retained_scheduler(
+        self, mock_model, mock_tokenizer
+    ):
+        from omlx.speculative.vlm_mtp import VLMMTPDrafter
+
+        class Target:
+            def project(self, hidden):
+                return hidden
+
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler = engine.scheduler
+        target = Target()
+        target_ref = weakref.ref(target)
+        drafter = VLMMTPDrafter(
+            SimpleNamespace(_greedy_argmax_fn=target.project), "mtp", "/draft"
+        )
+        drafter_ref = weakref.ref(drafter)
+        scheduler.set_vlm_mtp_drafter(drafter)
+        del target, drafter
+
+        try:
+            scheduler.reset()
+            assert target_ref() is not None
+            assert drafter_ref() is not None
+            engine.close()
+            assert engine.scheduler is None
+            assert target_ref() is None
+            assert drafter_ref() is None
+        finally:
+            scheduler.set_vlm_mtp_drafter(None)
+            engine.close()
+
     def test_close_releases_model(self, mock_model, mock_tokenizer):
         """Test close() releases model ownership."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -671,43 +711,8 @@ class TestEngineCoreClose:
             ):
                 engine.close()
 
-            future.result.assert_called_once_with(timeout=60.0)
-            assert "Engine teardown timed out after 60s" in fatal.call_args.args[0]
-
-    def test_close_fatal_exits_when_compile_cache_clear_times_out(
-        self, mock_model, mock_tokenizer
-    ):
-        """A stuck MLX compile-cache clear is also fatal."""
-        with patch("omlx.engine_core.get_registry") as mock_registry:
-            mock_registry.return_value.acquire.return_value = True
-
-            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
-            engine._mlx_executor.shutdown(wait=False)
-
-            ok_future = MagicMock()
-            ok_future.result.return_value = None
-            timeout_future = MagicMock()
-            timeout_future.result.side_effect = concurrent.futures.TimeoutError
-            executor = MagicMock()
-            executor.submit.side_effect = [
-                ok_future,
-                ok_future,
-                ok_future,
-                timeout_future,
-            ]
-            engine._mlx_executor = executor
-
-            with (
-                patch(
-                    "omlx.engine_core.compile_cache_clear_available", return_value=True
-                ),
-                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
-                pytest.raises(SystemExit),
-            ):
-                engine.close()
-
-            timeout_future.result.assert_called_once_with(timeout=60.0)
-            assert "MLX compile cache" in fatal.call_args.args[0]
+            assert 0 < future.result.call_args.kwargs["timeout"] <= 120.0
+            assert "while running shutdown" in fatal.call_args.args[0]
 
 
 class TestEngineCoreGetCacheStats:
@@ -828,6 +833,47 @@ class TestEngineCoreGenerateCancellation:
 
 class TestEngineCoreErrorPropagation:
     """Tests for error propagation from engine loop to requests."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message, terminal",
+        [
+            ("kIOGPUCommandBufferCallbackErrorSubmissionsIgnored", True),
+            ("kIOGPUCommandBufferCallbackErrorTimeout", False),
+            ("Memory limit exceeded during prefill", False),
+        ],
+    )
+    async def test_engine_loop_gpu_error_policy(
+        self, mock_model, mock_tokenizer, message, terminal
+    ):
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        engine._running = True
+
+        def recover():
+            engine._running = False
+            return []
+
+        try:
+            with (
+                patch.object(engine.scheduler, "has_requests", return_value=True),
+                patch.object(engine, "_step_burst", side_effect=RuntimeError(message)),
+                patch.object(
+                    engine.scheduler, "fail_all_requests", side_effect=recover
+                ) as recovery,
+                patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            ):
+                if terminal:
+                    with pytest.raises(SystemExit):
+                        await engine._engine_loop()
+                    fatal.assert_called_once()
+                    recovery.assert_not_called()
+                else:
+                    await engine._engine_loop()
+                    fatal.assert_not_called()
+                    recovery.assert_called_once()
+        finally:
+            engine._running = False
+            engine.close()
 
     @pytest.mark.asyncio
     async def test_error_output_propagates_to_collector(
@@ -1383,6 +1429,23 @@ class TestEngineCoreAbortAllRequests:
 class TestGlobalMLXExecutor:
     """Tests for the global MLX executor singleton (issue #85)."""
 
+    def test_shutdown_reclaims_on_worker_before_executor_exit(self):
+        import omlx.engine_core as engine_core
+
+        executor = MagicMock()
+        future = MagicMock()
+        executor.submit.return_value = future
+
+        with patch.object(engine_core, "_global_mlx_executor", executor):
+            engine_core.shutdown_mlx_executor()
+            assert engine_core._global_mlx_executor is None
+
+        executor.submit.assert_called_once_with(
+            engine_core._final_global_mlx_thread_reclaim
+        )
+        future.result.assert_called_once_with(timeout=60.0)
+        executor.shutdown.assert_called_once_with(wait=False)
+
     def test_get_mlx_executor_returns_singleton(self):
         """get_mlx_executor() must always return the same executor instance."""
         from omlx.engine_core import get_mlx_executor
@@ -1551,23 +1614,20 @@ class TestEngineCoreCloseReleasesSSDManager:
             manager.close.assert_called_once()
             assert scheduler.paged_ssd_cache_manager is None
 
-    def test_manager_closed_when_executor_fallback_raises(
+    def test_executor_rejection_does_not_run_mlx_teardown_on_caller(
         self, mock_model, mock_tokenizer
     ):
-        with patch("omlx.engine_core.get_registry") as mock_registry:
-            mock_registry.return_value.acquire.return_value = True
-            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
-
-            scheduler = engine.scheduler
-            manager = MagicMock()
-            scheduler.paged_ssd_cache_manager = manager
-            scheduler.shutdown = MagicMock(side_effect=ValueError("boom"))
-            engine._mlx_executor.shutdown(wait=True)
-
-            engine.close()  # must not raise
-
-            manager.close.assert_called_once()
-            assert scheduler.paged_ssd_cache_manager is None
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler = engine.scheduler
+        scheduler.shutdown = MagicMock()
+        engine._mlx_executor.shutdown(wait=True)
+        with (
+            patch("omlx.engine_core.fatal_exit", side_effect=SystemExit),
+            pytest.raises(SystemExit),
+        ):
+            engine.close()
+        scheduler.shutdown.assert_not_called()
+        assert not engine._closed
 
     def test_manager_closed_on_normal_close(self, mock_model, mock_tokenizer):
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -1630,6 +1690,190 @@ class TestStepBurst:
             assert len(outs) == 4
             assert engine.scheduler.step.call_count == 4
         finally:
+            engine.close()
+
+    @pytest.mark.parametrize("first_tokens", [[11], [11, 12, 13]])
+    def test_first_generated_chunk_ends_burst(
+        self, mock_model, mock_tokenizer, first_tokens
+    ):
+        """Release ordinary and multi-token first chunks before further decode."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        first = SchedulerOutput(
+            has_work=True,
+            outputs=[
+                RequestOutput(
+                    request_id="a",
+                    new_token_ids=first_tokens,
+                    completion_tokens=len(first_tokens),
+                )
+            ],
+        )
+        later = SchedulerOutput(
+            has_work=True,
+            outputs=[
+                RequestOutput(
+                    request_id="a",
+                    new_token_ids=[14],
+                    completion_tokens=len(first_tokens) + 1,
+                )
+            ],
+        )
+        try:
+            engine.scheduler.step = MagicMock(side_effect=[first, later, later, later])
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == [first]
+            assert engine.scheduler.step.call_count == 1
+        finally:
+            engine.close()
+
+    def test_prefill_without_tokens_can_continue_to_first_chunk(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prefill-only steps must not count as the first generated chunk."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        prefill = SchedulerOutput(has_work=True)
+        first = SchedulerOutput(
+            has_work=True,
+            outputs=[
+                RequestOutput(request_id="a", new_token_ids=[11], completion_tokens=1)
+            ],
+        )
+        try:
+            engine.scheduler.step = MagicMock(
+                side_effect=[
+                    prefill,
+                    first,
+                    SchedulerOutput(has_work=True),
+                    SchedulerOutput(has_work=True),
+                ]
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == [prefill, first]
+            assert engine.scheduler.step.call_count == 2
+        finally:
+            engine.close()
+
+    def test_new_request_first_chunk_preserves_other_outputs(
+        self, mock_model, mock_tokenizer
+    ):
+        """A late joiner ends the burst without dropping the existing row."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        steps = [
+            SchedulerOutput(
+                has_work=True,
+                outputs=[
+                    RequestOutput(
+                        request_id="a", new_token_ids=[count], completion_tokens=count
+                    )
+                ],
+            )
+            for count in (9, 10, 11)
+        ]
+        steps[1].outputs.append(
+            RequestOutput(request_id="b", new_token_ids=[21], completion_tokens=1)
+        )
+        steps[2].outputs.append(
+            RequestOutput(request_id="b", new_token_ids=[22], completion_tokens=2)
+        )
+        try:
+            engine.scheduler.running = {"a": object(), "b": object()}
+            engine.scheduler.step = MagicMock(side_effect=steps + [steps[-1]])
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == steps[:2]
+            assert engine.scheduler.step.call_count == 2
+            engine.scheduler.has_requests.return_value = False
+            assert engine._step_burst() == steps[2:]
+        finally:
+            engine.close()
+
+    def test_later_chunks_retain_burst_and_token_order(
+        self, mock_model, mock_tokenizer
+    ):
+        """Only the first chunk yields early; later chunks still reach the cap."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        steps = [
+            SchedulerOutput(
+                has_work=True,
+                outputs=[
+                    RequestOutput(
+                        request_id="a", new_token_ids=[count], completion_tokens=count
+                    )
+                ],
+            )
+            for count in range(2, 7)
+        ]
+        try:
+            engine.scheduler.step = MagicMock(side_effect=steps)
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert engine._step_burst() == steps[:4]
+            assert engine.scheduler.step.call_count == 4
+        finally:
+            engine.close()
+
+    def test_empty_token_output_does_not_end_burst(self, mock_model, mock_tokenizer):
+        """A terminal/control output with zero tokens is not a first chunk."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(
+                    has_work=True,
+                    outputs=[RequestOutput(request_id="a", finished=True)],
+                )
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+
+            assert len(engine._step_burst()) == 4
+            assert engine.scheduler.step.call_count == 4
+        finally:
+            engine.close()
+
+    @pytest.mark.asyncio
+    async def test_first_chunk_reaches_collector_before_next_decode(
+        self, mock_model, mock_tokenizer
+    ):
+        """Exercise the executor/event-loop boundary, not just burst contents."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        collector = RequestOutputCollector()
+        engine._output_collectors["a"] = collector
+        finished = engine._finished_events["a"] = asyncio.Event()
+        first = RequestOutput(
+            request_id="a", new_token_ids=[11], new_text="one", completion_tokens=1
+        )
+        last = RequestOutput(
+            request_id="a",
+            new_token_ids=[12],
+            new_text=" two",
+            completion_tokens=2,
+            finished=True,
+            finish_reason="length",
+        )
+        steps = [first, last]
+        first_delivered_before_next_step = []
+
+        def step():
+            output = steps.pop(0)
+            if output is last:
+                first_delivered_before_next_step.append(collector.output is first)
+            return SchedulerOutput(has_work=True, outputs=[output])
+
+        try:
+            engine.scheduler.step = MagicMock(side_effect=step)
+            engine.scheduler.has_requests = lambda: bool(steps)
+            await engine.start()
+            await asyncio.wait_for(finished.wait(), timeout=2.0)
+
+            assert first_delivered_before_next_step == [True]
+            combined = collector.get_nowait()
+            assert combined.new_token_ids == [11, 12]
+            assert combined.new_text == "one two"
+            assert combined.finished
+            assert engine.scheduler.step.call_count == 2
+        finally:
+            await engine.stop()
             engine.close()
 
     def test_breaks_when_no_requests(self, mock_model, mock_tokenizer):

@@ -443,10 +443,11 @@ def _patch_language_model(inkling_lang: Any) -> None:
         if self._omlx_mtp_decode_enabled:
             import weakref
 
-            from ..mlx_lm_mtp import get_mtp_depth
+            from ..mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = min(int(get_mtp_depth()), n_mtp)
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             # No per-cycle clone: provisional draft rows append to the
             # persistent per-block caches and the next fold trims them
             # (vLLM re-prefill equivalent). The generator's

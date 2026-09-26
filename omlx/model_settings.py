@@ -6,9 +6,11 @@ flags, and metadata.
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
+import tempfile
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -32,6 +34,84 @@ SETTINGS_VERSION = 1
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
+
+# These families keep the MTP head resident while backbone experts stream.
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
+
+
+def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
+    fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not 0 < fraction <= 1
+    ):
+        raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
+    if not settings.get("moe_expert_offload_enabled"):
+        return
+    # VLM MTP and DFlash have no offload-aware draft path at all.
+    if any(settings.get(key) for key in ("vlm_mtp_enabled", "dflash_enabled")):
+        raise ValueError(
+            "MoE expert offload cannot be combined with Lightning MTP, "
+            "VLM MTP, or DFlash; disable speculative decoding first."
+        )
+    # Settings can load before the checkpoint family is known.
+    if settings.get("mtp_enabled") and model_type is not None:
+        family = model_type.replace("-", "_").lower()
+        if family not in MOE_OFFLOAD_MTP_MODEL_TYPES:
+            raise ValueError(
+                "MoE expert offload cannot be combined with Lightning MTP, "
+                "VLM MTP, or DFlash; disable speculative decoding first."
+            )
+
+
+def ane_prefill_backend(model_type: str | None) -> str | None:
+    """Select the ANE implementation from model metadata."""
+    model_type = (model_type or "").lower().replace("-", "_")
+    if model_type == "k2_horizon":
+        return "k2"
+    if model_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
+        return "qwen"
+    return None
+
+
+def ane_prefill_fraction(value: float | None, model_type: str | None) -> float:
+    """Resolve an unset split without changing an explicitly saved fraction."""
+    if value is not None:
+        return value
+    return 1 / 3 if ane_prefill_backend(model_type) == "k2" else 0.53
+
+
+def validate_ane_prefill(settings: dict, model_type: str | None) -> None:
+    """Validate common controls against the selected backend's limits."""
+    backend = ane_prefill_backend(model_type)
+    if settings.get("qwen35_ane_prefill_enabled") and backend is None:
+        raise ValueError("ANE prefill is unavailable for this model.")
+    width = settings.get("qwen35_ane_prefill_sequence_length", 2048)
+    minimum, alignment = (32, 32) if backend == "k2" else (1024, 64)
+    if type(width) is not int or width < minimum or width % alignment:
+        raise ValueError(
+            f"ANE prompt block must be a multiple of {alignment} and at least {minimum}."
+        )
+    fraction = ane_prefill_fraction(
+        settings.get("qwen35_ane_prefill_fraction"), model_type
+    )
+    valid_fraction = 0 < fraction <= 1 if backend == "k2" else 0.05 <= fraction <= 0.90
+    if not valid_fraction:
+        bounds = "in (0, 1]" if backend == "k2" else "between 0.05 and 0.90"
+        raise ValueError(f"MLP ANE fraction must be {bounds}.")
+    shared = settings.get("qwen35_ane_prefill_shared_fraction", 1.0)
+    if shared is None or not 0 <= shared <= 1:
+        raise ValueError("ANE shared fraction must be in [0, 1].")
+    if backend == "k2" and settings.get("qwen35_ane_prefill_enabled"):
+        for name in (
+            "dflash_enabled",
+            "specprefill_enabled",
+            "mtp_enabled",
+            "vlm_mtp_enabled",
+        ):
+            if settings.get(name, False):
+                raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
 
 
 def vlm_mtp_processor_conflicts(data: dict) -> list:
@@ -79,6 +159,25 @@ def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
     resolved = dict(data)
     resolved["vlm_mtp_enabled"] = False
     return resolved, conflicts
+
+
+def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
+    """Clear ``qwen35_oq_a8_enabled`` when ANE prefill is also on.
+
+    Both wrap ``Qwen3_5MLP.__call__`` and claim the same projections, so
+    enabling both leaves whichever patched last in charge -- with the other
+    silently inert. ANE prefill wins because it is the older setting and the
+    one a saved profile is more likely to have been tuned around. Used for
+    dicts that predate the exclusivity rule so ``__post_init__`` does not
+    reject the whole blob.
+    """
+    if not (data.get("qwen35_oq_a8_enabled") and data.get("qwen35_ane_prefill_enabled")):
+        return data, []
+    resolved = dict(data)
+    resolved["qwen35_oq_a8_enabled"] = False
+    return resolved, ["qwen35_ane_prefill_enabled"]
+
+
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -114,14 +213,14 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
-        qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
-            ANE/GPU prompt processing.
-        qwen35_ane_prefill_sequence_length: Exact flattened token count routed
-            through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
+            supported model. Model metadata selects the implementation.
+        qwen35_ane_prefill_sequence_length: Compiled ANE prompt block size.
         qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
             projection block padded to the compiled ANE shape (zero disables).
         qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
-            across the ANE instances.
+            across the ANE instances (None = backend default).
+        qwen35_ane_prefill_shared_fraction: Shared-expert MLP share where supported.
         qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
             into each dual-ANE/CPU hidden-channel branch.
         qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
@@ -142,11 +241,28 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
+        qwen35_oq_a8_enabled: Route eligible Qwen3.5/3.6/3.8 prefill matmuls
+            through the oQ mixed-bit INT8-activation (QxA8) tensor kernels.
+            Prefill only, and only a speed-up on hardware with native INT8
+            tensor operations -- M5-series and newer. On anything older the
+            kernels do not load and the setting is refused. Decode is
+            unaffected. Changes numerics: activations are quantized to INT8.
+            Mutually exclusive with qwen35_ane_prefill_enabled.
+        qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
+        moe_expert_offload_enabled: Stream MoE expert weights from the
+            checkpoint on demand instead of keeping them all resident (fits
+            models larger than memory; costs decode speed). Requires reload.
+        moe_expert_offload_resident_fraction: Fraction of each layer's experts
+            kept resident (0 < f <= 1, default 0.25).
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
-        dflash_enabled: Enable DFlash speculative decoding.
+        dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family VLM
+            targets draft inside the batched engine (Lightning MTP verify path
+            with greedy or sampled acceptance, continuous batching); other
+            targets use the single-stream DFlash engine, which alone honours
+            the max_ctx, cache, window, sink and verify_mode settings below.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_enabled: Enable draft model quantization.
         dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
@@ -220,8 +336,16 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    deepseek_v41_engram_ssd_offload: bool = False
+    # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
+    # last window-size tokens; decoder global KV is the encoder-final
+    # projection already produced by the midpoint CSA2 layer.
+    deepseek_v41_ced_prefill_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    )
+    cache_reasoning_output: Optional[bool] = (
+        None  # Cache <think> output for the next turn (None = auto: when history keeps it)
     )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
@@ -238,13 +362,15 @@ class ModelSettings:
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
 
-    # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
+    # Shared ANE/GPU prefill controls retain the original Qwen setting names.
+    # Backend-specific controls apply only to models that support them.
     # Off by default because the fixed-shape ANE models add load-time/runtime
     # cache memory and rely on undocumented AppleNeuralEngine interfaces.
     qwen35_ane_prefill_enabled: bool = False
     qwen35_ane_prefill_sequence_length: int = 2048
     qwen35_ane_prefill_tail_padding_min_tokens: int = 0
-    qwen35_ane_prefill_fraction: float = 0.53
+    qwen35_ane_prefill_fraction: Optional[float] = None  # Backend default
+    qwen35_ane_prefill_shared_fraction: float = 1.0
     qwen35_ane_prefill_fused_down: bool = False
     qwen35_ane_prefill_max_layers: int = 64
     qwen35_ane_prefill_dual_ane: bool = True
@@ -257,6 +383,25 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
+
+    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8.
+    #
+    # Off by default because it is an accuracy decision, not just a speed one:
+    # activations are quantized to INT8 per row, which the W4/W5A16 path does
+    # not do. On M5 the Q4 GEMM measures 42 TOP/s against 23 for the shipping
+    # NAX path -- about 1.66x on an MLP block at 2048 tokens, and about 1.4x
+    # on end-to-end prompt processing, which is the figure the UI quotes
+    # because only part of prefill is routed.
+    #
+    # The kernel reads the checkpoint's own packed weight stream, so a routed
+    # projection costs no extra weight memory and the module's arrays stay
+    # readable by the decode path.
+    qwen35_oq_a8_enabled: bool = False
+    qwen35_oq_a8_min_tokens: int = 128
+
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool = False
+    moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
@@ -296,16 +441,20 @@ class ModelSettings:
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
-    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
-    # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
-    # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash.
+    # Lightning MTP uses the embedded head for single and concurrent requests.
+    # Equal-depth rows share target verification when supported by the backbone;
+    # each request keeps its own acceptance, draft history and cache frontier.
+    # Mutually exclusive with DFlash.
     mtp_enabled: bool = False
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
-    # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
-    # An adaptive controller picks 1..max per sequence from rolling
-    # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
-    mtp_num_draft_tokens: Optional[int] = None
+    # Qwen 27B enforces a minimum adaptive ceiling of 4.
+    # None = model-specific default (4 for dense Qwen3.5-family on M5, else 3
+    # for DeepSeek-V4 and Qwen3.5/3.6). An adaptive controller picks 1..max
+    # per sequence from rolling acceptance/latency estimates.
+    mtp_adaptive_max_depth: Optional[int] = None
+    # Draft exactly this many tokens every cycle, with no adaptive controller.
+    # Takes precedence over mtp_adaptive_max_depth; None = adaptive.
+    mtp_fixed_depth: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
@@ -339,6 +488,18 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
+            raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
+        # Both accelerate the same Qwen3.5 prefill projections by wrapping
+        # Qwen3_5MLP.__call__, so enabling both leaves whichever patched last
+        # in charge and the other silently inert -- with different numerics
+        # depending on which won. Rejected at construction time so the clash
+        # surfaces in the admin UI / API rather than as a silent no-op.
+        if self.qwen35_oq_a8_enabled and self.qwen35_ane_prefill_enabled:
+            raise ValueError(
+                "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
+                "both be True; choose one Qwen3.5 prefill accelerator per model"
+            )
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is
@@ -380,6 +541,7 @@ class ModelSettings:
                     "require per-request logits processors, which the "
                     "vlm_mtp decode path does not apply"
                 )
+        validate_moe_expert_offload(self.to_dict())
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -442,10 +604,122 @@ class ModelSettingsManager:
         # Ensure base directory exists
         self.base_path.mkdir(parents=True, exist_ok=True)
 
-        # Load existing settings
+        # Repair raw references before normal loading can normalize old records.
+        self._repair_profile_references()
         self._load()
         self._load_profiles()
         self._load_templates()
+
+    def _repair_profile_references(self) -> None:
+        """Detach missing references without changing saved settings or IDs."""
+        originals = {}
+        documents = {}
+        try:
+            for path, key, version in (
+                (self.settings_file, "models", SETTINGS_VERSION),
+                (self.profiles_file, "profiles", PROFILES_VERSION),
+                (self.templates_file, "templates", TEMPLATES_VERSION),
+            ):
+                if path.exists():
+                    originals[path] = path.read_bytes()
+                    document = json.loads(originals[path])
+                else:
+                    document = {"version": version, key: {}}
+                if (
+                    not isinstance(document, dict)
+                    or document.get("version", 1) != version
+                ):
+                    raise ValueError(f"Unsupported profile storage format: {path.name}")
+                records = document.get(key, {})
+                if not isinstance(records, dict) or any(
+                    not isinstance(record, dict) for record in records.values()
+                ):
+                    raise ValueError(f"Invalid profile records: {path.name}")
+                documents[path] = document
+
+            profiles = documents[self.profiles_file].get("profiles", {})
+            templates = documents[self.templates_file].get("templates", {})
+            settings = documents[self.settings_file].get("models", {})
+            detached = cleared = 0
+            for model_profiles in profiles.values():
+                for profile in model_profiles.values():
+                    if not isinstance(profile, dict):
+                        raise ValueError("Invalid model profile record")
+                    source = profile.get("source_template")
+                    if source is not None and source not in templates:
+                        profile["source_template"] = None
+                        detached += 1
+            for model_id, model_settings in settings.items():
+                active = model_settings.get("active_profile_name")
+                if active is not None and active not in profiles.get(model_id, {}):
+                    model_settings["active_profile_name"] = None
+                    cleared += 1
+        except (OSError, ValueError, TypeError) as error:
+            logger.warning("Skipped profile reference repair: %s", error)
+            return
+
+        changed = []
+        if detached:
+            changed.append(self.profiles_file)
+        if cleared:
+            changed.append(self.settings_file)
+        if not changed:
+            return
+
+        digest = hashlib.sha256()
+        for path, content in originals.items():
+            digest.update(path.name.encode("utf-8") + b"\0")
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        backup = self.base_path / f"profile-reference-backup-{digest.hexdigest()}"
+        written = []
+        try:
+            backup.mkdir(exist_ok=True)
+            for path, content in originals.items():
+                target = backup / path.name
+                if not target.exists():
+                    self._write_profile_repair(target, content)
+                if target.read_bytes() != content:
+                    raise OSError(f"Profile backup does not match original: {target}")
+            for path in changed:
+                content = json.dumps(
+                    documents[path], indent=2, ensure_ascii=False
+                ).encode("utf-8")
+                self._write_profile_repair(path, content)
+                written.append(path)
+        except OSError:
+            try:
+                for path in written:
+                    self._write_profile_repair(path, originals[path])
+            except OSError:
+                logger.exception(
+                    "Profile reference repair rollback failed; recover originals from %s",
+                    backup,
+                )
+                raise
+            logger.exception("Profile reference repair failed; original files retained")
+            return
+        logger.info(
+            "Repaired profile references: %d detached copies, %d cleared active references; backup: %s",
+            detached,
+            cleared,
+            backup,
+        )
+
+    @staticmethod
+    def _write_profile_repair(path: Path, content: bytes) -> None:
+        """Replace one raw document atomically, including when rolling back."""
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _load(self) -> None:
         """Load settings from the JSON file.
@@ -486,6 +760,17 @@ class ModelSettingsManager:
                         "to re-enable vlm_mtp.",
                         model_id,
                         ", ".join(conflicts),
+                    )
+                model_data, prefill_conflicts = resolve_qwen35_prefill_conflicts(
+                    model_data
+                )
+                if prefill_conflicts:
+                    logger.warning(
+                        "Model '%s': qwen35_oq_a8_enabled disabled on load; it "
+                        "cannot be combined with %s. Unset that setting to "
+                        "re-enable the oQ A8 prefill kernels.",
+                        model_id,
+                        ", ".join(prefill_conflicts),
                     )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
@@ -835,6 +1120,7 @@ class ModelSettingsManager:
         # vlm_mtp base model would make __post_init__ raise on this
         # request-time merge; drop vlm_mtp for the merged view instead.
         merged, _ = resolve_vlm_mtp_conflicts(merged)
+        merged, _ = resolve_qwen35_prefill_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def _runtime_settings_with_profile_locked(
@@ -844,6 +1130,7 @@ class ModelSettingsManager:
         merged = base.to_dict() if base is not None else {}
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
         merged, _ = resolve_vlm_mtp_conflicts(merged)
+        merged, _ = resolve_qwen35_prefill_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
@@ -1187,27 +1474,9 @@ class ModelSettingsManager:
 
             settings_snapshot = copy.deepcopy(self._settings)
 
-            current = self._settings.get(model_id)
-            if current is None:
-                current = ModelSettings()
-            # Universal fields: the profile is authoritative — absent keys
-            # reset to ModelSettings defaults. Model-specific fields keep
-            # additive overlay so preset/template chips (materialized as
-            # universal-only profiles) never disturb engine settings.
-            merged = {
-                k: v
-                for k, v in current.to_dict().items()
-                if k not in UNIVERSAL_FIELDS_SET
-            }
-            merged.update(filter_profile_fields(profile_settings))
-            merged["active_profile_name"] = name
-            if settings_sanitizer is not None:
-                settings_sanitizer(merged)
-            # Keep persistent profile application consistent with request-time
-            # profile overlays: output-shaping settings win over the speed-only
-            # VLM MTP toggle when the merged settings need logits processors.
-            merged, _ = resolve_vlm_mtp_conflicts(merged)
-            new_settings = ModelSettings.from_dict(merged)
+            new_settings = self._applied_profile_settings_locked(
+                model_id, name, profile_settings, settings_sanitizer
+            )
             self._settings[model_id] = new_settings
             try:
                 self._save()
@@ -1215,6 +1484,109 @@ class ModelSettingsManager:
                 self._settings = settings_snapshot
                 raise
             return ModelSettings.from_dict(new_settings.to_dict())
+
+    def _applied_profile_settings_locked(
+        self,
+        model_id: str,
+        name: str,
+        profile_settings: dict[str, Any],
+        settings_sanitizer: Callable[[dict[str, Any]], None] | None,
+    ) -> ModelSettings:
+        current = self._settings.get(model_id)
+        if current is None:
+            current = ModelSettings()
+        # Universal fields: the profile is authoritative — absent keys
+        # reset to ModelSettings defaults. Model-specific fields keep
+        # additive overlay so preset/template chips (materialized as
+        # universal-only profiles) never disturb engine settings.
+        merged = {
+            k: v for k, v in current.to_dict().items() if k not in UNIVERSAL_FIELDS_SET
+        }
+        overlay = filter_profile_fields(profile_settings)
+        merged.update(overlay)
+        # A profile that sets the Lightning MTP toggle also owns the depth
+        # choice; no fixed depth there selects adaptive depth.
+        if "mtp_enabled" in overlay and "mtp_fixed_depth" not in overlay:
+            merged["mtp_fixed_depth"] = None
+        merged["active_profile_name"] = name
+        if settings_sanitizer is not None:
+            settings_sanitizer(merged)
+        # Keep persistent profile application consistent with request-time
+        # profile overlays: output-shaping settings win over the speed-only
+        # VLM MTP toggle when the merged settings need logits processors.
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
+        merged, _ = resolve_qwen35_prefill_conflicts(merged)
+        new_settings = ModelSettings.from_dict(merged)
+        return new_settings
+
+    def apply_template(
+        self,
+        model_id: str,
+        template_name: str,
+        settings_sanitizer: Callable[[dict[str, Any]], None] | None = None,
+    ) -> ModelSettings | None:
+        """Apply the latest template without replacing an unrelated model profile."""
+        with self._lock:
+            template = self._templates.get(template_name)
+            if template is None:
+                return None
+            per_model = self._profiles.get(model_id, {})
+            copies = [
+                p
+                for p in per_model.values()
+                if p.get("source_template") == template_name
+            ]
+            active = self._settings.get(model_id)
+            profile = next(
+                (
+                    p
+                    for p in copies
+                    if active and p["name"] == active.active_profile_name
+                ),
+                copies[0] if copies else None,
+            )
+            now = utcnow().isoformat()
+            if profile is None:
+                name = self._dedupe_profile_api_name(template_name, set(per_model))
+                profile = {
+                    "name": name,
+                    "api_name": self._allocate_profile_api_name_locked(
+                        per_model,
+                        None,
+                        display_name=template["display_name"],
+                        internal_name=name,
+                    ),
+                    "created_at": now,
+                    "expose_as_model": False,
+                }
+            else:
+                profile = dict(profile)
+            profile.update(
+                display_name=template["display_name"],
+                description=template.get("description"),
+                source_template=template_name,
+                settings=filter_universal_fields(template.get("settings", {})),
+                updated_at=now,
+            )
+            applied = self._applied_profile_settings_locked(
+                model_id, profile["name"], profile["settings"], settings_sanitizer
+            )
+            profiles_snapshot = copy.deepcopy(self._profiles)
+            settings_snapshot = copy.deepcopy(self._settings)
+            self._profiles.setdefault(model_id, {})[profile["name"]] = profile
+            self._settings[model_id] = applied
+            profiles_saved = False
+            try:
+                self._save_profiles()
+                profiles_saved = True
+                self._save()
+            except Exception:
+                self._profiles = profiles_snapshot
+                self._settings = settings_snapshot
+                if profiles_saved:
+                    self._save_profiles()
+                raise
+            return ModelSettings.from_dict(applied.to_dict())
 
     # ==================== Templates ====================
 
@@ -1352,19 +1724,48 @@ class ModelSettingsManager:
             if settings is not None:
                 template["settings"] = filter_universal_fields(settings)
             template["updated_at"] = utcnow().isoformat()
+            templates_snapshot = copy.deepcopy(self._templates)
+            profiles_snapshot = copy.deepcopy(self._profiles)
             if target != name:
                 del self._templates[name]
+                for profiles in self._profiles.values():
+                    for profile in profiles.values():
+                        if profile.get("source_template") == name:
+                            profile["source_template"] = target
             self._templates[target] = template
-            self._save_templates()
+            self._save_template_references(templates_snapshot, profiles_snapshot)
             return dict(template)
 
     def delete_template(self, name: str) -> bool:
         with self._lock:
             if name not in self._templates:
                 return False
+            templates_snapshot = copy.deepcopy(self._templates)
+            profiles_snapshot = copy.deepcopy(self._profiles)
             del self._templates[name]
-            self._save_templates()
+            for profiles in self._profiles.values():
+                for profile in profiles.values():
+                    if profile.get("source_template") == name:
+                        profile["source_template"] = None
+            self._save_template_references(templates_snapshot, profiles_snapshot)
             return True
+
+    def _save_template_references(
+        self, templates_snapshot: dict, profiles_snapshot: dict
+    ) -> None:
+        profiles_changed = self._profiles != profiles_snapshot
+        profiles_saved = False
+        try:
+            if profiles_changed:
+                self._save_profiles()
+                profiles_saved = True
+            self._save_templates()
+        except Exception:
+            self._templates = templates_snapshot
+            self._profiles = profiles_snapshot
+            if profiles_saved:
+                self._save_profiles()
+            raise
 
 
 def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:
@@ -1419,7 +1820,7 @@ def merge_chat_template_kwargs(
       1. ``settings.chat_template_kwargs``
       2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
       3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
-      4. thinking budget activation when ``enable_thinking`` is still unset
+      4. positive thinking budget activation when ``enable_thinking`` is still unset
       5. the model's preserve-thinking default when it is supported and unset
     """
     merged = merge_chat_template_request_kwargs(settings, request_ct_kwargs)
@@ -1431,7 +1832,11 @@ def merge_chat_template_kwargs(
         and settings.thinking_budget_tokens
     ):
         thinking_budget = settings.thinking_budget_tokens
-    if thinking_budget is not None and "enable_thinking" not in merged:
+    if (
+        thinking_budget is not None
+        and thinking_budget > 0
+        and "enable_thinking" not in merged
+    ):
         merged["enable_thinking"] = True
 
     if (

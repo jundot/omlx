@@ -131,8 +131,10 @@ QwenQAffineNaxVariant qwen_q_affine_nax_variant(int variant) {
       return {/* bm = */ 64, /* bk = */ 32, /* bn = */ 64, 2, 2};
     case 5:
       return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 64, 4, 1};
-    case 6:
-      return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 64, 1, 4};
+    // (64, 64, 64, wm=1, wn=4) was variant 6: a 16-column per-simdgroup N
+    // tile that returns wrong output on M5 Max / mlx 0.32.2 (max abs err 5-8
+    // against stock at every shape and bit width; the other tiles match
+    // exactly). Rejected rather than kept as an opt-in footgun.
     default: {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm NAX variant " << variant << ".";
@@ -744,7 +746,8 @@ class Qwen35MoeWeightedSumPrimitive : public Primitive {
       return true;
     }
     const int topk = scores.shape(-1);
-    if ((topk != 6 && topk != 8) || x_sorted.shape(0) != scores.size() ||
+    if ((topk != 6 && topk != 8 && topk != 10) ||
+        x_sorted.shape(0) != scores.size() ||
         inv_order.size() != scores.size()) {
       return true;
     }
@@ -831,7 +834,7 @@ class Qwen35MoeWeightedSumPrimitive : public Primitive {
 } // namespace
 
 bool is_nax_available() {
-  // Mirror of mlx::core::metal::is_nax_available() (mlx v0.32.0 device.cpp),
+  // Mirror of mlx::core::metal::is_nax_available() (mlx v0.32.2 device.cpp),
   // which libmlx does not export: macOS >= 26.2 and applegpu gen >= 17
   // ('p'-suffix parts need gen >= 18).
   static bool available = []() {
@@ -855,6 +858,41 @@ bool is_nax_available() {
     return gen >= (suffix == 'p' ? 18 : 17);
   }();
   return available;
+}
+
+namespace {
+
+// metal::Device keeps its buffer caps private and has no setter. An explicit
+// instantiation may name a private member, so these tags hand out pointers to
+// the two fields; a renamed field fails to compile instead of misbehaving.
+template <typename Tag, typename Tag::type Member>
+struct DeviceField {
+  friend typename Tag::type field(Tag) {
+    return Member;
+  }
+};
+
+struct OpsPerBuffer {
+  using type = int metal::Device::*;
+  friend type field(OpsPerBuffer);
+};
+
+struct MbPerBuffer {
+  using type = int metal::Device::*;
+  friend type field(MbPerBuffer);
+};
+
+template struct DeviceField<OpsPerBuffer, &metal::Device::max_ops_per_buffer_>;
+template struct DeviceField<MbPerBuffer, &metal::Device::max_mb_per_buffer_>;
+
+} // namespace
+
+std::tuple<int, int> set_command_buffer_caps(int ops, int mb) {
+  auto& d = metal::device(mlx::core::Device::gpu);
+  auto previous = d.get_max_ops_mb_per_buffer();
+  d.*field(OpsPerBuffer{}) = ops;
+  d.*field(MbPerBuffer{}) = mb;
+  return previous;
 }
 
 bool nax_qmm_kernels_built() {

@@ -79,6 +79,28 @@ def apply_min_p(
     return mx.where(tokens_to_remove, -float("inf"), logprobs)
 
 
+# The k largest entries of a row lie in the k chunks with the largest maxima,
+# so ranking V / chunk maxima and k * chunk candidates finds them exactly.
+# MLX argpartition sorts the whole row, which costs more at vocab scale.
+_TOP_K_CHUNK = 128
+
+
+def top_k_indices(values: mx.array, k: int) -> mx.array:
+    """Indices of the ``k`` largest entries along the last axis, unordered."""
+    vocab = values.shape[-1]
+    if k > 64 or vocab % _TOP_K_CHUNK or vocab < 64 * _TOP_K_CHUNK:
+        return mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k]
+    lead = values.shape[:-1]
+    blocks = values.reshape(-1, vocab // _TOP_K_CHUNK, _TOP_K_CHUNK)
+    best = mx.argpartition(-blocks.max(axis=-1), kth=k - 1, axis=-1)[:, :k]
+    cand = mx.take_along_axis(blocks, best[:, :, None], axis=1)
+    pick = mx.argpartition(-cand.reshape(-1, k * _TOP_K_CHUNK), kth=k - 1, axis=-1)[
+        :, :k
+    ]
+    chunk = mx.take_along_axis(best, pick // _TOP_K_CHUNK, axis=-1)
+    return (chunk * _TOP_K_CHUNK + pick % _TOP_K_CHUNK).reshape(*lead, k)
+
+
 def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
     """Top-k filtering — keep only the ``top_k`` highest-probability tokens."""
     vocab_size = logprobs.shape[-1]
@@ -87,11 +109,34 @@ def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
             f"`top_k` has to be an integer in the (0, {vocab_size}] interval,"
             f" but is {top_k}."
         )
-    mask_idx = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[..., top_k:]
-    masked_logprobs = mx.put_along_axis(
-        logprobs, mask_idx, mx.array(-float("inf"), logprobs.dtype), axis=-1
+    keep = top_k_indices(logprobs, top_k)
+    out = mx.full(logprobs.shape, -float("inf"), dtype=logprobs.dtype)
+    return mx.put_along_axis(
+        out, keep, mx.take_along_axis(logprobs, keep, axis=-1), axis=-1
     )
-    return masked_logprobs
+
+
+def apply_top_p_top_k(logprobs: mx.array, top_p: float, top_k: int) -> mx.array:
+    """``apply_top_k(apply_top_p(logprobs, top_p), top_k)`` without a vocab sort.
+
+    Top-p keeps a prefix of the descending order and top-k keeps the first k
+    survivors, so only the k highest tokens can remain. For those, the top-p
+    test needs the mass of higher-ranked tokens, which are also among the k.
+    ``logprobs`` must be normalized over the vocabulary.
+    """
+    vocab_size = logprobs.shape[-1]
+    if top_k >= vocab_size:
+        return apply_top_p(logprobs, top_p)
+    idx = top_k_indices(logprobs, top_k)
+    vals = mx.take_along_axis(logprobs, idx, axis=-1).astype(mx.float32)
+    order = mx.argsort(-vals, axis=-1)
+    vals = mx.take_along_axis(vals, order, axis=-1)
+    idx = mx.take_along_axis(idx, order, axis=-1)
+    probs = mx.exp(vals)
+    mass_above = mx.cumsum(probs, axis=-1) - probs
+    vals = mx.where(mass_above < top_p, vals, -float("inf"))
+    out = mx.full(logprobs.shape, -float("inf"), dtype=logprobs.dtype)
+    return mx.put_along_axis(out, idx, vals.astype(logprobs.dtype), axis=-1)
 
 
 def apply_xtc(
@@ -148,25 +193,62 @@ def make_sampler(
         sampler = lambda x: mx.argmax(x, axis=-1)
     else:
         sampling_methods = []
-        if top_p > 0 and top_p < 1.0:
-            sampling_methods.append(lambda x: apply_top_p(x, top_p))
-        if min_p != 0.0:
-            sampling_methods.append(
-                lambda x: apply_min_p(x, min_p, min_tokens_to_keep)
-            )
-        if xtc_probability > 0.0:
-            sampling_methods.append(
-                lambda x: apply_xtc(
-                    x, xtc_probability, xtc_threshold, xtc_special_tokens
+        if 0 < top_p < 1.0 and top_k > 0 and min_p == 0.0 and xtc_probability <= 0.0:
+            sampling_methods.append(lambda x: apply_top_p_top_k(x, top_p, top_k))
+        else:
+            if top_p > 0 and top_p < 1.0:
+                sampling_methods.append(lambda x: apply_top_p(x, top_p))
+            if min_p != 0.0:
+                sampling_methods.append(
+                    lambda x: apply_min_p(x, min_p, min_tokens_to_keep)
                 )
-            )
-        if top_k > 0:
-            sampling_methods.append(lambda x: apply_top_k(x, top_k))
+            if xtc_probability > 0.0:
+                sampling_methods.append(
+                    lambda x: apply_xtc(
+                        x, xtc_probability, xtc_threshold, xtc_special_tokens
+                    )
+                )
+            if top_k > 0:
+                sampling_methods.append(lambda x: apply_top_k(x, top_k))
 
         def sampler(logprobs: mx.array) -> mx.array:
             for method in sampling_methods:
                 logprobs = method(logprobs)
             return categorical_sampling(logprobs, temp)
+
+    if temp > 0 and xtc_probability == 0:
+
+        def sampling_logits(logprobs: mx.array):
+            for method in sampling_methods:
+                logprobs = method(logprobs)
+            return logprobs * (1 / temp)
+
+        def sample_with_logprobs(logprobs: mx.array, *, rowwise: bool = False):
+            # Draft sampling and its acceptance density share the same filters.
+            scaled = sampling_logits(logprobs)
+            if rowwise:
+                token = mx.concatenate(
+                    [
+                        mx.random.categorical(scaled[row : row + 1])
+                        for row in range(scaled.shape[0])
+                    ]
+                )
+            else:
+                token = mx.random.categorical(scaled)
+            density = scaled.astype(mx.float32)
+            density = density - mx.logsumexp(density, axis=-1, keepdims=True)
+            return token, density
+
+        sampler._mtp_sampling_logits = sampling_logits
+        sampler.sample_with_logprobs = sample_with_logprobs
+        if 0 < top_p < 1 or min_p > 0 or top_k > 0:
+            sampler._mtp_batch_sampling_key = (
+                temp,
+                top_p,
+                min_p,
+                min_tokens_to_keep,
+                top_k,
+            )
 
     # Expose sampling params on the returned callable so downstream code
     # (e.g. MTP acceptance check) can rebuild the filtered distribution
@@ -177,4 +259,5 @@ def make_sampler(
     sampler.min_p = min_p
     sampler.top_k = top_k
     sampler.min_tokens_to_keep = min_tokens_to_keep
+    sampler.xtc_probability = xtc_probability
     return sampler

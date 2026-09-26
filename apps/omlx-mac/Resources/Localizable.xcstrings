@@ -1,6 +1,437 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "settings.button.reset_defaults" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset Defaults"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값으로 초기화"
+          }
+        }
+      }
+    },
+    "settings.reset_defaults.help" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Restore default values. Paths and API keys are kept. Click Apply to save."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값을 불러옵니다. 경로와 API 키는 유지됩니다. Apply를 눌러 저장하세요."
+          }
+        }
+      }
+    },
+    "settings.reset_defaults.title" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings Reset"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 초기화"
+          }
+        }
+      }
+    },
+    "settings.reset_defaults.message" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings have been reset to defaults. Click Apply to save the changes."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정값을 초기화했습니다. Apply를 눌러야 저장됩니다."
+          }
+        }
+      }
+    },
+    "app.command.close_window" : {
+      "comment" : "App menu command that hides all windows and drops the Dock icon",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close Window"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭窗口"
+          }
+        }
+      }
+    },
+    "common.app_name" : {
+      "comment" : "Product name used as the app logo accessibility label and the About screen title",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX"
+          }
+        }
+      }
+    },
+    "common.copy.help" : {
+      "comment" : "Tooltip on the code chip explaining that clicking copies the value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Click to copy"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点击复制"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.menu" : {
+      "comment" : "Menu label for hardware overrides in the ANE split tuner",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tuner overrides"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "调优覆盖"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_offload" : {
+      "comment" : "ANE tuner override: allow offloading work to the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow CPU offload"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 卸载"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_gate" : {
+      "comment" : "ANE tuner override: allow the gate and up projections on the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow CPU gate/up"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 门控/上投影"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_down" : {
+      "comment" : "ANE tuner override: allow the down projection on the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow CPU down projection"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 下投影"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_ane_gdn" : {
+      "comment" : "ANE tuner override: allow GDN layers on the ANE",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow GDN on ANE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 ANE 运行 GDN"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_gdn" : {
+      "comment" : "ANE tuner override: allow GDN layers on the CPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow GDN on CPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 运行 GDN"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.allow_cpu_shared" : {
+      "comment" : "ANE tuner override: allow performance-aware CPU scheduling",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow performance-aware CPU scheduling"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许 CPU 性能感知调度"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.use_result" : {
+      "comment" : "Button that applies the ANE tuner recommendation",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use result"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用结果"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.tune_again" : {
+      "comment" : "Button that re-runs the ANE split tuner",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tune again"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新调优"
+          }
+        }
+      }
+    },
+    "settings.experimental.qwen_ane.tuner.tune_for_mac" : {
+      "comment" : "Button that starts ANE split tuning for the current Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tune for this Mac"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "为这台 Mac 调优"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.label" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2 ANE Prompt Processing"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка промпта K2 на ANE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2 ANE 提示词处理"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.sub" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использует ANE для предзаполнения плотных MLP и общих экспертов. Внимание и декодирование остаются на GPU. Применяется после перезагрузки модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用 ANE 处理稠密与共享专家 MLP 的预填充。注意力和解码仍在 GPU 上。重新加载后生效。"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.dense" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dense MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Плотные MLP на ANE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 上的稠密 MLP"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.shared" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Shared MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Общие MLP на ANE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 上的共享 MLP"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.tuner.sub": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLP 重みが 8 ビット以下のモデルで長いプロンプトの処理を任意で調整します。結果はバッチ処理性能を予測するものではありません。目安は 3 分ですが、読み込みや後処理で長くなる場合があります。テストなしで ANE を有効にできます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MLP 가중치가 8비트 이하인 모델의 긴 프롬프트 처리를 선택적으로 조정합니다. 결과는 배치 처리 성능을 예측하지 않습니다. 약 3분이 목표이며 로딩과 정리에 더 걸릴 수 있습니다. 테스트 없이 ANE를 켤 수 있습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Необязательная настройка обработки длинных промптов с весами MLP до восьми бит включительно. Результаты не предсказывают производительность пакетной обработки. Около трёх минут; загрузка и очистка могут занять больше времени. ANE можно включить без теста."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选调优：针对 MLP 权重为 8 位及以下的模型处理长提示词。结果不代表批处理性能。目标约三分钟，加载和清理可能需要更久。无需测试即可启用 ANE。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "選用調校：針對 MLP 權重為 8 位元及以下的模型處理長提示詞。結果不代表批次處理效能。目標約三分鐘，載入和清理可能需要更久。無需測試即可啟用 ANE。"
+          }
+        }
+      }
+    },
     "" : {
       "localizations" : {
         "ru" : {
@@ -655,6 +1086,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "菜单栏模型库"
+          }
+        }
+      }
+    },
+    "appearance.row.enhanced_readability" : {
+      "comment" : "Appearance row label for the enhanced readability toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enhanced Readability"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повышенная читаемость"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "增强可读性"
+          }
+        }
+      }
+    },
+    "appearance.row.enhanced_readability.sub" : {
+      "comment" : "Appearance row sublabel for the enhanced readability toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Raise low-contrast text to the primary color for higher readability."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повышает малоконтрастный текст до основного цвета для лучшей читаемости."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将低对比度文本提升为主色以获得更高的可读性。"
+          }
+        }
+      }
+    },
+    "appearance.section.readability" : {
+      "comment" : "Appearance screen section header for readability settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Readability"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Читаемость"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可读性"
           }
         }
       }
@@ -2292,7 +2795,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CMMLU (中文)"
+            "value" : "CMMLU（中文）"
           }
         }
       }
@@ -2316,7 +2819,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "JMMLU (日语)"
+            "value" : "JMMLU（日语）"
           }
         }
       }
@@ -2340,7 +2843,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "KMMLU (韩语)"
+            "value" : "KMMLU（韩语）"
           }
         }
       }
@@ -3492,7 +3995,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "结果反映基准测试时的可用内存和内存保护级别；对任一重大更改后请重新运行。"
+            "value" : "结果反映基准测试时的可用内存和内存防护层级；两者任一发生重大变化后，请重新运行。"
           }
         }
       }
@@ -3510,7 +4013,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "个 token 已应用到上下文窗口"
+            "value" : "个 Token 已应用到上下文窗口"
           }
         }
       }
@@ -3864,7 +4367,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "提示词处理 TPS"
           }
         }
       }
@@ -3912,7 +4415,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "生成 TPS"
           }
         }
       }
@@ -4350,7 +4853,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每次单请求试验要输入的提示 token 数"
+            "value" : "每次单请求试验要输入的提示 Token 数"
           }
         }
       }
@@ -4422,7 +4925,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "每次单请求试验的输出 token 数"
+            "value" : "每次单请求试验的输出 Token 数"
           }
         }
       }
@@ -4638,7 +5141,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "提示词处理 TPS"
           }
         }
       }
@@ -4686,7 +5189,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "生成 TPS"
           }
         }
       }
@@ -4758,7 +5261,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "TTFT (ms)"
+            "value" : "TTFT（毫秒）"
           }
         }
       }
@@ -6003,7 +6506,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "https://hf-mirror.com  （空 = huggingface.co）"
+            "value" : "https://hf-mirror.com（空 = huggingface.co）"
           }
         }
       }
@@ -6147,7 +6650,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "https://modelscope.cn  （空 = ModelScope 默认值）"
+            "value" : "https://modelscope.cn（空 = ModelScope 默认值）"
           }
         }
       }
@@ -6315,7 +6818,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ModelScope"
+            "value" : "魔搭社区"
           }
         }
       }
@@ -6483,7 +6986,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已排队"
+            "value" : "排队中"
           }
         }
       }
@@ -8491,7 +8994,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "与 oMLX 对话"
+            "value" : "与 oMLX 聊天"
           }
         }
       }
@@ -8755,7 +9258,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "全部时间"
+            "value" : "累计"
           }
         }
       }
@@ -9187,7 +9690,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "没有已加载的模型"
+            "value" : "尚未加载模型"
           }
         }
       }
@@ -9995,7 +10498,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "初始缓存块"
+            "value" : "初始缓存块数"
           }
         }
       }
@@ -10103,19 +10606,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cold-spillover ceiling. \"auto\" = 10% of SSD capacity."
+            "value" : "Cold-spillover ceiling. \"auto\" = 50% of the sum of free space and existing SSD cache."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Предел холодного spillover. \"auto\" = 10% емкости SSD."
+            "value" : "Предел холодного spillover. \"auto\" = 50% суммы свободного места и существующего SSD-кэша."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "冷溢出上限。'auto' = SSD 容量的 10%。"
+            "value" : "冷溢出上限。'auto' = 可用空间与现有 SSD 缓存之和的 50%。"
           }
         }
       }
@@ -10955,7 +11458,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "嵌入批处理大小"
+            "value" : "Embedding 批大小"
           }
         }
       }
@@ -12083,7 +12586,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大 Token"
+            "value" : "最大 Token 数"
           }
         }
       }
@@ -12395,7 +12898,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -12659,7 +13162,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%1$@ 配置文件 · 设置: %2$lld"
+            "value" : "%1$@ 配置文件 · 设置：%2$lld"
           }
         }
       }
@@ -12683,7 +13186,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置文件"
+            "value" : "配置档"
           }
         }
       }
@@ -12755,7 +13258,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "聊天模板 · 覆盖: %lld"
+            "value" : "聊天模板 · 覆盖：%lld"
           }
         }
       }
@@ -12779,7 +13282,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "强制 CT · 键: %lld"
+            "value" : "强制 CT · 键：%lld"
           }
         }
       }
@@ -13211,7 +13714,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "标准 oQ 的功能"
+            "value" : "标准 oQ 的作用"
           }
         }
       }
@@ -13307,7 +13810,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "为敏感层和保护张量分配更高位，同时保持目标每位权重预算在硬上限之下。"
+            "value" : "为敏感层和保护张量分配更高的位宽，同时保持目标每位权重预算在硬上限之下。"
           }
         }
       }
@@ -13595,7 +14098,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "加权量化误差。"
+            "value" : "对量化误差加权。"
           }
         }
       }
@@ -13619,7 +14122,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在仿射量化期间，oQe 通过最小化 sum(importance * (weight - dequantized_weight)^2) 来选择缩放/偏移候选，而不是简单的未加权 MSE。"
+            "value" : "在仿射量化期间，oQe 通过最小化 sum(importance * (weight - dequantized_weight)^2) 来选择 scale/bias 候选，而非普通的未加权 MSE。"
           }
         }
       }
@@ -13691,7 +14194,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "位分配"
+            "value" : "位宽分配"
           }
         }
       }
@@ -13835,7 +14338,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "相同 oQ 计划"
+            "value" : "相同的 oQ 方案"
           }
         }
       }
@@ -13979,7 +14482,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在量化输出中保留多 token 预测头"
+            "value" : "在量化输出中保留多 Token 预测头"
           }
         }
       }
@@ -14147,7 +14650,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Imatrix 缓存路径"
+            "value" : "imatrix 缓存路径"
           }
         }
       }
@@ -14267,7 +14770,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "重用 imatrix 缓存"
+            "value" : "复用 imatrix 缓存"
           }
         }
       }
@@ -14291,7 +14794,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用兼容的缓存 imatrix（如果可用）；否则收集新的。"
+            "value" : "可用时使用兼容的已缓存 imatrix；否则重新收集。"
           }
         }
       }
@@ -14339,7 +14842,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "当量化张量没有匹配的 imatrix 条目时失败，而不是回退到标准 oQ。"
+            "value" : "当量化张量没有匹配的 imatrix 条目时报错，而不是回退到标准 oQ。"
           }
         }
       }
@@ -14363,7 +14866,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用 imatrix 校准按激活重要性加权仿射量化。"
+            "value" : "使用 imatrix 校准，按激活重要性加权仿射量化。"
           }
         }
       }
@@ -17930,6 +18433,12 @@
             "state" : "translated",
             "value" : "0.0.0.0 & :: (все сети)"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "0.0.0.0 & ::（所有网络）"
+          }
         }
       }
     },
@@ -18606,25 +19115,25 @@
       }
     },
     "server.profile.pin_in_memory.note" : {
-      "comment" : "Note marking Pin in memory as per-model only",
+      "comment" : "Note explaining where to configure Pin in memory",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Per-model only."
+            "value" : "Per-model only - see Models > [model] > Advanced."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Только для модели."
+            "value" : "Только для модели — см. Модели → [модель] → Дополнительно."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅每个模型。"
+            "value" : "仅每个模型 — 参见 模型 → [模型] → 高级。"
           }
         }
       }
@@ -19511,6 +20020,78 @@
         }
       }
     },
+    "server.section.usage" : {
+      "comment" : "Section heading for the local usage history switch in Server screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage History"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史"
+          }
+        }
+      }
+    },
+    "server.row.usage_history" : {
+      "comment" : "Row label for the switch that records local hourly usage history",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Record usage history"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Записывать историю использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "记录使用历史"
+          }
+        }
+      }
+    },
+    "server.row.usage_history.sub" : {
+      "comment" : "Sublabel explaining the usage history switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохраняет почасовые итоги токенов по моделям в usage.sqlite3. При отключении существующая история сохраняется."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 usage.sqlite3 中存储各模型每小时的 Token 总量。关闭后会保留现有历史。"
+          }
+        }
+      }
+    },
     "server.section.storage" : {
       "comment" : "Section heading for storage rows in Server screen",
       "extractionState" : "manual",
@@ -19603,6 +20184,102 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "使用模型内置的 MTP 头，每步生成多个 Token。支持的模型解码速度最高可提升约 1.5 倍。"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.depth.label" : {
+      "comment" : "Row label for the Lightning MTP draft depth picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive max depth"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive max depth"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive max depth"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.depth.sub" : {
+      "comment" : "Sublabel for the Lightning MTP draft depth picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.depth.adaptive" : {
+      "comment" : "Default Lightning MTP adaptive maximum draft depth",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3 tokens (Default)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3 tokens (Default)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3 tokens (Default)"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.depth.option" : {
+      "comment" : "Lightning MTP depth option; placeholder is the maximum draft token count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tokens"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tokens"
           }
         }
       }
@@ -19722,7 +20399,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "参数: %lld"
+            "value" : "参数：%lld"
           }
         }
       }
@@ -20072,6 +20749,12 @@
             "state" : "translated",
             "value" : "Required because resident loading exceeds the configured model-memory limit."
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "必需，因为常驻加载超出了配置的模型内存上限。"
+          }
         }
       }
     },
@@ -20084,6 +20767,12 @@
             "state" : "translated",
             "value" : "SSD N-gram Offload (Qwen4 only)"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD N-gram 卸载（仅 Qwen4）"
+          }
         }
       }
     },
@@ -20095,6 +20784,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将 PLE N-gram 表保留在 SSD 上以节省内存。上下文变化后预填充可能变慢。"
           }
         }
       }
@@ -20574,7 +21269,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大 Token"
+            "value" : "最大 Token 数"
           }
         }
       }
@@ -20646,7 +21341,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -21294,7 +21989,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "自适应"
+            "value" : "3 tokens (Default)"
           }
         }
       }
@@ -21438,7 +22133,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "激活位"
+            "value" : "激活位宽"
           }
         }
       }
@@ -21462,7 +22157,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "组大小"
+            "value" : "分组大小"
           }
         }
       }
@@ -21486,7 +22181,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "权重位"
+            "value" : "权重位宽"
           }
         }
       }
@@ -21534,7 +22229,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "为草稿模型启用量化（权重、激活位和组大小）。"
+            "value" : "为草稿模型启用量化（权重位宽、激活位宽和分组大小）。"
           }
         }
       }
@@ -21954,19 +22649,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Block-diffusion speculative decoding. Single-stream only (requests run one at a time)."
+            "value" : "Block-diffusion speculative decoding."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Block-diffusion speculative decoding. Только single-stream (запросы выполняются по одному)."
+            "value" : "Block-diffusion speculative decoding."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "块扩散推测性解码。仅单流（请求逐个运行）。"
+            "value" : "块扩散推测性解码。"
           }
         }
       }
@@ -22014,7 +22709,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "验证器算法。\"自适应\"在接受率下降时缩小块大小；\"关闭\"禁用推测验证。"
+            "value" : "验证器算法。“自适应”在接受率下降时缩小块大小；“关闭”禁用推测验证。"
           }
         }
       }
@@ -22458,19 +23153,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Multi-token prediction for vision-language models via an assistant drafter."
+            "value" : "External drafter (Gemma 4 assistant or Qwen MTP) speeds up single requests."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Multi-token prediction для vision-language моделей через assistant drafter."
+            "value" : "Внешний драфтер (ассистент Gemma 4 или Qwen MTP) ускоряет одиночные запросы."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "通过助手起草器为视觉语言模型进行多 Token 预测。"
+            "value" : "使用外部起草器（Gemma 4 assistant 或 Qwen MTP）加速单个请求。"
           }
         }
       }
@@ -22662,7 +23357,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "重排器"
+            "value" : "重排序"
           }
         }
       }
@@ -23046,7 +23741,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "配置文件"
+            "value" : "配置档"
           }
         }
       }
@@ -23406,7 +24101,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最小 P"
+            "value" : "Min P"
           }
         }
       }
@@ -23675,6 +24370,47 @@
         }
       }
     },
+    "settings.k2.thinking_hint" : {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 uses reasoning effort. Use Thinking Budget to limit reasoning."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 は推論の強度を使用します。「Thinking Budget」で推論を制限できます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2는 추론 강도를 사용합니다. Thinking Budget으로 추론을 제한하세요."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 использует уровень рассуждения. Используйте «Бюджет thinking», чтобы ограничить рассуждение."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 使用推理强度。可通过“思考预算”限制推理。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "K2 使用推理強度。可透過「Thinking Budget」限制推理。"
+          }
+        }
+      }
+    },
     "settings.vlm_mtp.conflict.dflash" : {
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on",
       "extractionState" : "manual",
@@ -23842,7 +24578,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "准确度"
+            "value" : "准确率"
           }
         },
         "zh-Hant" : {
@@ -23924,7 +24660,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "下载器"
+            "value" : "下载"
           }
         },
         "zh-Hant" : {
@@ -24312,7 +25048,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仪表盘"
+            "value" : "服务器"
           }
         },
         "zh-Hant" : {
@@ -24353,7 +25089,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "服务统计"
+            "value" : "状态"
           }
         },
         "zh-Hant" : {
@@ -25126,7 +25862,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "内存条目"
+            "value" : "RAM 条目"
           }
         }
       }
@@ -25819,7 +26555,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充处理"
+            "value" : "提示词处理"
           }
         }
       }
@@ -26677,6 +27413,654 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%1$@ · 构建 %2$@"
+          }
+        }
+      }
+    },
+    "status.usage.heading" : {
+      "comment" : "Section header for the local usage history panel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage History"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史"
+          }
+        }
+      }
+    },
+    "status.usage.subtitle" : {
+      "comment" : "Subtitle under the usage history header describing data scope",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local aggregates · server local time · 400-day retention"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Локальные агрегаты · локальное время сервера · хранение 400 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "本地聚合 · 服务器本地时间 · 保留 400 天"
+          }
+        }
+      }
+    },
+    "status.usage.range" : {
+      "comment" : "Picker label for the usage history time range",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Time range"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Период"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "时间范围"
+          }
+        }
+      }
+    },
+    "status.usage.range.today" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Today"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сегодня"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "今天"
+          }
+        }
+      }
+    },
+    "status.usage.range.yesterday" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Yesterday"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вчера"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "昨天"
+          }
+        }
+      }
+    },
+    "status.usage.range.7d" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "7 Days"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "7 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "7 天"
+          }
+        }
+      }
+    },
+    "status.usage.range.30d" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 Days"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 天"
+          }
+        }
+      }
+    },
+    "status.usage.range.90d" : {
+      "comment" : "Usage history range option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "90 Days"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "90 дней"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "90 天"
+          }
+        }
+      }
+    },
+    "status.usage.range.month" : {
+      "comment" : "Usage history range option for the current calendar month",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This Month"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Этот месяц"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "本月"
+          }
+        }
+      }
+    },
+    "status.usage.model" : {
+      "comment" : "Picker label for the usage history model filter",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型"
+          }
+        }
+      }
+    },
+    "status.usage.all_models" : {
+      "comment" : "Usage history model filter option that includes every model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All Models"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "所有模型"
+          }
+        }
+      }
+    },
+    "status.usage.empty" : {
+      "comment" : "Shown when the selected usage history range has no recorded requests",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No recorded usage in this range. History begins after upgrading."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "В этом периоде нет записей об использовании. История ведётся с момента обновления."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此范围内没有使用记录。历史记录自升级后开始。"
+          }
+        }
+      }
+    },
+    "status.usage.delayed" : {
+      "comment" : "Warning shown when usage history storage is degraded but data is still displayed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "History may be incomplete: storage is delayed or the pending buffer overflowed."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История может быть неполной: запись задерживается или буфер ожидания переполнен."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "历史记录可能不完整：存储延迟或待处理缓冲区已溢出。"
+          }
+        }
+      }
+    },
+    "status.usage.unavailable" : {
+      "comment" : "Error shown when the usage history endpoint cannot be reached",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage history is unavailable. Inference continues normally."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования недоступна. Инференс продолжает работать."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史不可用。推理正常继续。"
+          }
+        }
+      }
+    },
+    "status.usage.disabled" : {
+      "comment" : "Shown on the Status screen when usage history recording is switched off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage history is off. Turn it on in Server settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования отключена. Включите её в настройках сервера."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史已关闭。请在服务器设置中开启。"
+          }
+        }
+      }
+    },
+    "status.usage.open_settings" : {
+      "comment" : "Button that jumps from the Status screen to the usage history switch on the Server screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open Server Settings"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть настройки сервера"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开服务器设置"
+          }
+        }
+      }
+    },
+    "status.usage.tile.requests" : {
+      "comment" : "Usage history tile label for request count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Requests"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запросы"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请求"
+          }
+        }
+      }
+    },
+    "status.usage.tile.total" : {
+      "comment" : "Usage history tile label for prompt plus output tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Total Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Всего токенов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token 总数"
+          }
+        }
+      }
+    },
+    "status.usage.tile.prompt" : {
+      "comment" : "Usage history tile label for prompt tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Токены промпта"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提示 Token"
+          }
+        }
+      }
+    },
+    "status.usage.tile.output" : {
+      "comment" : "Usage history tile label for generated tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Output Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выходные токены"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "输出 Token"
+          }
+        }
+      }
+    },
+    "status.usage.tile.cached" : {
+      "comment" : "Usage history tile label for prompt tokens served from cache",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cached Tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Кэшированные токены"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已缓存 Token"
+          }
+        }
+      }
+    },
+    "status.usage.heatmap.title" : {
+      "comment" : "Heading above the usage history day/hour heatmap",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token Usage by Day and Hour"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использование токенов по дням и часам"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按日期和小时的 Token 使用量"
+          }
+        }
+      }
+    },
+    "status.usage.heatmap.note" : {
+      "comment" : "Legend text under the usage heatmap heading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "00–23 hours · darker green means more tokens · repeated DST hours combine"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Часы 00–23 · чем темнее зелёный, тем больше токенов · повторные часы при переводе времени объединяются"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "00–23 时 · 绿色越深表示 Token 越多 · 夏令时重复的小时会合并"
+          }
+        }
+      }
+    },
+    "status.usage.row.tokens" : {
+      "comment" : "Per-model total token count; placeholder is a compact number",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%@ tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ токенов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ Token"
+          }
+        }
+      }
+    },
+    "status.usage.row.requests_speed" : {
+      "comment" : "Per-model request count and output speed; placeholders are a count and a formatted tokens-per-second value",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld requests · %2$@ tok/s"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld запросов · %2$@ ток/с"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld 个请求 · %2$@ tok/s"
+          }
+        }
+      }
+    },
+    "status.usage.row.detail" : {
+      "comment" : "Per-model breakdown sublabel; placeholders are compact prompt, output, and cached token counts",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Prompt %1$@ · output %2$@ · cached %3$@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Промпт %1$@ · вывод %2$@ · кэш %3$@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提示 %1$@ · 输出 %2$@ · 已缓存 %3$@"
+          }
+        }
+      }
+    },
+    "status.usage.heatmap.cell" : {
+      "comment" : "Tooltip and accessibility label for one heatmap cell; placeholders are the date, the two-digit hour, and a formatted token count",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ %2$@:00 · %3$@ tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ %2$@:00 · %3$@ токенов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ %2$@:00 · %3$@ Token"
           }
         }
       }
@@ -28140,7 +29524,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "没有可用的模型"
+            "value" : "暂无可用模型"
           }
         },
         "zh-Hant" : {
@@ -28573,6 +29957,492 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Библиотека"
+          }
+        }
+      }
+    },
+    "common.close" : {
+      "comment" : "Generic close button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "닫기"
+          }
+        }
+      }
+    },
+    "settings.actions.reset" : {
+      "comment" : "Header button that returns every setting of the model to its default",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset defaults"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값으로 초기화"
+          }
+        }
+      }
+    },
+    "settings.actions.optimal" : {
+      "comment" : "Header button that lists the best omlx.ai benchmark settings for this device and model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply optimal settings"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최적 설정 적용"
+          }
+        }
+      }
+    },
+    "settings.actions.recipe" : {
+      "comment" : "Header button that opens the paste-a-recipe sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply custom recipe"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커스텀 레시피 적용"
+          }
+        }
+      }
+    },
+    "settings.actions.reset.confirm_title" : {
+      "comment" : "Confirmation dialog title before resetting all model settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset every setting of this model?"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 모델의 모든 설정을 초기화할까요?"
+          }
+        }
+      }
+    },
+    "settings.actions.reset.confirm_message" : {
+      "comment" : "Body text inside the reset-settings confirmation dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling, acceleration, pinned/default flags, aliases and the display name all return to their defaults."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "샘플링, 가속, 고정/기본 모델 플래그, 별칭, 표시 이름이 모두 기본값으로 돌아갑니다."
+          }
+        }
+      }
+    },
+    "settings.actions.reset.confirm_button" : {
+      "comment" : "Destructive button inside the reset-settings confirmation dialog",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초기화"
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.title" : {
+      "comment" : "Title of the paste-a-recipe sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply custom recipe"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커스텀 레시피 적용"
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.hint" : {
+      "comment" : "Hint explaining where a settings recipe can be copied from",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Paste a recipe copied from the Recipe row of a benchmark detail page on omlx.ai."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "omlx.ai 벤치마크 상세 페이지의 Recipe 행에서 복사한 레시피를 붙여넣으세요."
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.applying" : {
+      "comment" : "Progress text while a pasted recipe is being applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applying the recipe..."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "레시피를 적용하는 중..."
+          }
+        }
+      }
+    },
+    "settings.apply.recipe.apply" : {
+      "comment" : "Primary button of the paste-a-recipe sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용"
+          }
+        }
+      }
+    },
+    "settings.apply.optimal.loading" : {
+      "comment" : "Progress text while omlx.ai candidates are fetched",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fetching the best benchmark results from omlx.ai..."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "omlx.ai에서 최고의 벤치마크 결과를 가져오는 중..."
+          }
+        }
+      }
+    },
+    "settings.apply.optimal.applying" : {
+      "comment" : "Progress text while a chosen benchmark snapshot is applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applying the benchmark settings..."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "벤치마크 설정을 적용하는 중..."
+          }
+        }
+      }
+    },
+    "settings.apply.choose.hint" : {
+      "comment" : "Hint above the benchmark candidate list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pick a benchmark result to apply its settings. Rows are the best matches for this chip and model with the same or less memory, at a 4k prompt."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용할 벤치마크 결과를 고르세요. 같은 칩·같은 모델에서 내 메모리 이하 구성의 4k 프롬프트 최고 결과입니다."
+          }
+        }
+      }
+    },
+    "settings.apply.choose.group_pp" : {
+      "comment" : "Label above the candidates ranked by prompt processing speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Best prompt processing (PP)"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PP 우선 (프롬프트 처리)"
+          }
+        }
+      }
+    },
+    "settings.apply.choose.group_tg" : {
+      "comment" : "Label above the candidates ranked by token generation speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Best token generation (TG)"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TG 우선 (토큰 생성)"
+          }
+        }
+      }
+    },
+    "settings.apply.result.title_recipe" : {
+      "comment" : "Title of the result sheet after applying a pasted recipe",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Custom recipe applied"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커스텀 레시피 적용 결과"
+          }
+        }
+      }
+    },
+    "settings.apply.result.title_optimal" : {
+      "comment" : "Title of the optimal-settings sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optimal settings from omlx.ai"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "omlx.ai 최적 설정"
+          }
+        }
+      }
+    },
+    "settings.apply.result.none_title" : {
+      "comment" : "Headline when omlx.ai has no benchmark for the current device and model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No benchmark result matches this device and model."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "벤치마크에 동일한 사양과 모델의 결과가 없네요."
+          }
+        }
+      }
+    },
+    "settings.apply.result.none_body" : {
+      "comment" : "Guidance shown when no matching benchmark exists",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Find a similar model on the community benchmarks and apply its recipe with Apply custom recipe."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비슷한 모델의 설정을 찾아서 커스텀 레시피를 적용해 보세요!"
+          }
+        }
+      }
+    },
+    "settings.apply.result.open_search" : {
+      "comment" : "Link button that opens the omlx.ai performance leaderboard",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open community benchmarks"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "커뮤니티 벤치마크 열기"
+          }
+        }
+      }
+    },
+    "settings.apply.result.no_change" : {
+      "comment" : "Result line when the snapshot equals the current settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings already matched; nothing changed."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미 같은 설정이라 변경된 항목이 없습니다."
+          }
+        }
+      }
+    },
+    "settings.apply.result.done_recipe" : {
+      "comment" : "Result line after a pasted recipe was applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The settings below were applied from the recipe!"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "레시피의 아래 설정으로 적용되었습니다!"
+          }
+        }
+      }
+    },
+    "settings.apply.result.done_optimal" : {
+      "comment" : "Result line after a chosen benchmark snapshot was applied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The settings below were applied from the selected benchmark!"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택한 벤치마크의 아래 설정으로 적용되었습니다!"
+          }
+        }
+      }
+    },
+    "settings.apply.result.skipped" : {
+      "comment" : "Label above the list of features the server dropped while applying a snapshot",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Skipped on this machine"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 머신에서 제외된 기능"
+          }
+        }
+      }
+    },
+    "settings.apply.result.applied" : {
+      "comment" : "Label above the JSON of the applied settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applied settings"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용된 설정"
+          }
+        }
+      }
+    },
+    "settings.apply.result.reload_note" : {
+      "comment" : "Note shown when applied settings only take effect at model load",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The model will use the new settings after its next load."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다음 로드부터 새 설정이 적용됩니다."
           }
         }
       }

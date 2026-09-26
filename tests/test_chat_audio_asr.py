@@ -47,6 +47,18 @@ class TestChatAsrTemplate:
         assert "handleAudioSelect(" in template
         assert "loadAudioFile(" in template
 
+    def test_audio_upload_uses_server_limit_and_openai_error_message(self, template):
+        load_start = template.index("    loadAudioFile(file) {")
+        load_end = template.index("    removeAudio() {", load_start)
+        load_audio = template[load_start:load_end]
+        assert "file.size >" not in load_audio
+        assert "const maxMb = 100" not in load_audio
+
+        stream_start = template.index("    async streamTranscription(")
+        stream_end = template.index("    // ===== Realtime microphone", stream_start)
+        stream_transcription = template[stream_start:stream_end]
+        assert "payload?.error?.message || payload?.detail" in stream_transcription
+
     def test_transcriptions_endpoint_used(self, template):
         assert "/v1/audio/transcriptions" in template
 

@@ -44,11 +44,24 @@ def unwrap_tokenizer(tokenizer):
     return tokenizer
 
 
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def resolve_vocab_size(model: Any) -> int | None:
     """Extract vocab_size from a model's config/args, handling nested configs.
 
-    Tries ``model.config.vocab_size``, then ``model.args.vocab_size``,
-    then ``text_config.vocab_size`` for VLM composite models (e.g. Qwen3.5).
+    For a composite (VLM) config the nested ``text_config.vocab_size`` wins
+    over the top-level ``vocab_size``: the language model's embedding and
+    ``lm_head`` are sized from the text config, while the top-level field
+    is often a dataclass placeholder that the checkpoint's ``config.json``
+    never sets (mlx-vlm's Qwen3-VL ``ModelConfig`` defaults it to 32000
+    against a 151936-token text vocabulary). Sizing the grammar bitmask
+    from that placeholder misaligns the mask with the logits, and every
+    sampled token is rejected until ``max_tokens`` (#3550). Falls back to
+    ``model.config.vocab_size`` / ``model.args.vocab_size`` for plain LLMs.
 
     Args:
         model: An MLX model object (LLM, VLM, or any object with config/args).
@@ -62,15 +75,17 @@ def resolve_vocab_size(model: Any) -> int | None:
         config = getattr(model, attr, None)
         if config is None:
             continue
-        vs = getattr(config, "vocab_size", None)
-        if isinstance(vs, int):
-            return vs
         text_cfg = getattr(config, "text_config", None)
         if isinstance(text_cfg, dict):
-            vs = text_cfg.get("vocab_size")
+            nested = _positive_int(text_cfg.get("vocab_size"))
         elif text_cfg is not None:
-            vs = getattr(text_cfg, "vocab_size", None)
-        if isinstance(vs, int):
+            nested = _positive_int(getattr(text_cfg, "vocab_size", None))
+        else:
+            nested = None
+        if nested is not None:
+            return nested
+        vs = _positive_int(getattr(config, "vocab_size", None))
+        if vs is not None:
             return vs
     return None
 
@@ -536,6 +551,12 @@ def _is_laguna_model(model_name: str) -> bool:
     return config is not None and config.get("model_type") == "laguna"
 
 
+def _is_k2_horizon_model(model_name: str) -> bool:
+    """Return True only for a local checkpoint declaring ``model_type: k2_horizon``."""
+    config = _read_json_file(Path(model_name) / "config.json")
+    return config is not None and config.get("model_type") == "k2_horizon"
+
+
 def _is_mistral_common_model(model_name: str) -> bool:
     """True for local model dirs transformers would route to MistralCommonBackend.
 
@@ -593,6 +614,11 @@ def get_tokenizer_config(
             "Laguna detected: enabling the Mistral tokenizer regex fix and "
             "the laguna tool parser"
         )
+
+    if _is_k2_horizon_model(model_name):
+        # Register IFM markers that mlx-lm's parser detection does not recognize.
+        config.setdefault("tool_parser_type", "k2_horizon")
+        logger.debug("K2 Horizon detected: setting tool_parser_type to k2_horizon")
 
     if _is_mistral_common_model(model_name):
         # MistralCommonBackend renders chat templates whose output cannot be

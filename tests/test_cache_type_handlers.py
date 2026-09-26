@@ -381,7 +381,8 @@ class TestMiniMaxM3CacheHandlers:
             meta_state="7",
         )
 
-        assert restored.kv_cache.state == (keys, values)
+        assert restored.kv_cache.keys is keys
+        assert restored.kv_cache.values is values
         assert restored.index_keys is index_keys
         assert restored.index_offset == 12
 
@@ -424,7 +425,7 @@ class TestMiniMaxM3CacheHandlers:
         assert batch.index_offset == 6
         for row, length in enumerate((4, 6)):
             extracted = batch.extract(row)
-            row_keys, row_values = extracted.kv_cache.state
+            row_keys, row_values = extracted.kv_cache.keys_and_values()
             assert row_keys.shape[2] == length
             assert row_values.shape[2] == length
             assert extracted.index_keys.shape[2] == length
@@ -727,8 +728,8 @@ class TestArraysCacheHandler:
         restored = handler.deserialize_state(elements)
 
         assert isinstance(restored, SizedArraysCache)
-        assert len(restored.state) == 4
-        for expected, actual in zip(elements, restored.state):
+        assert len(restored.cache) == 4
+        for expected, actual in zip(elements, restored.cache):
             assert mx.array_equal(expected, actual).item()
 
     def test_state_keys(self, handler):
@@ -1049,18 +1050,6 @@ class TestCacheTypeRegistry:
         assert "BufferedRotatingKVCache" in names
         assert "ArraysCache" in names
 
-    def test_register_handler(self):
-        """Test registering a custom handler."""
-
-        class CustomHandler(KVCacheHandler):
-            pass
-
-        custom = CustomHandler()
-        # This would override the existing handler
-        # Just verify registration works without error
-        CacheTypeRegistry.register(custom)
-
-
 class TestCacheListHandler:
     """Tests for CacheListHandler."""
 
@@ -1341,3 +1330,28 @@ class TestCacheListHandlerWithMLX:
         assert cache is not None
         assert hasattr(cache, "caches")
         assert len(cache.caches) == 2
+
+
+@pytest.mark.parametrize("module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"])
+def test_chunked_cache_restore_preserves_absolute_position_and_next_update(module):
+    mx = pytest.importorskip("mlx.core")
+    from importlib import import_module
+
+    from mlx_lm.models.cache import ChunkedKVCache
+
+    cache = import_module(module).ChunkedKVCache(4)
+    keys = mx.arange(12, dtype=mx.float32).reshape(1, 1, 6, 2)
+    cache.update_and_fetch(keys, keys + 100)
+    cache.maybe_trim_front()
+    handler = CacheTypeRegistry.get_handler_for_object(cache)
+    restored = handler.deserialize_state(
+        handler.serialize_state(cache), handler.serialize_meta_state(cache)
+    )
+    assert isinstance(restored, ChunkedKVCache)
+    assert (restored.offset, restored.start_position, restored.chunk_size) == (6, 2, 4)
+    next_keys = mx.full((1, 1, 1, 2), 20.0)
+    expected = cache.update_and_fetch(next_keys, next_keys + 100)
+    actual = restored.update_and_fetch(next_keys, next_keys + 100)
+    assert all(mx.array_equal(a, b) for a, b in zip(actual, expected))
+    restored.maybe_trim_front()
+    assert (restored.offset, restored.start_position) == (7, 3)

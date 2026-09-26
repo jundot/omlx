@@ -69,6 +69,8 @@ JS_DEPS = {
     # KaTeX 0.16.9 (MIT)
     "js/katex.min.js": "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js",
     "js/katex-auto-render.min.js": "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js",
+    # GridStack 13.3.0 (MIT) - dashboard layout grid, bundle includes drag and drop
+    "js/gridstack-all.js": "https://cdn.jsdelivr.net/npm/gridstack@13.3.0/dist/gridstack-all.js",
 }
 
 # =========================================================================
@@ -80,6 +82,8 @@ CSS_DEPS = {
     "css/hljs-github-dark.min.css": "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css",
     # KaTeX CSS (MIT) - references fonts/ relative path
     "css/katex.min.css": "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css",
+    # GridStack CSS (MIT) - v12+ derives column widths from CSS variables
+    "css/gridstack.min.css": "https://cdn.jsdelivr.net/npm/gridstack@13.3.0/dist/gridstack.min.css",
 }
 
 
