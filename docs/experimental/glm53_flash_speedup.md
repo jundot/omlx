@@ -93,4 +93,51 @@ python -m pytest -q tests/test_mlx_vlm_glm5_next_compat.py
   含 S<3 状态滚动边界）、端到端等价（logits/conv 态/递归态/续 decode）、
   分块不变量、eligibility 门控、MTP runtime 存活。compat 50/50、
   MTP+scheduler 451/451、ruff 干净。
-- 待办 P4：verify 路径（packed_linear/moe_verify_gather）接线评估。
+- 部署（Studio）：正式代码以 `git diff 3f2d07e8..ba0dec48` 全量补丁应用于
+  Mac Studio `~/omlx`（工作树干净，可 `git checkout .` 原子回退）。Studio 测试
+  闸门 501/501（scheduler+compat+MTP，venv mlx 0.32.2）。Studio 为 M3 Ultra
+  非 NAX：P2 宽步不 engage（NAX-gated），4096 floor 生效；本次 A/B 实测
+  P1+P3。旧代码 live 基线（2026-09-25 上午，重启前）：pp1024=912.7 /
+  pp4096=1032.0 / pp8192=1287.5 tps。A/B：`~/ab_glm53_port.sh`
+  （OFF=两个 kill-switch 关，ON=默认；ROUNDS=2，pp=1024/4096/8192 tg=128，
+  中位数对比）。
+- **基线勘误（live A/B 后）**：memory.md 中 pp4096≈1032/1287 的"GLM 基线"实为
+  Qwen3.8-Flash-Next-oQ8e-mtp 的日志（ane-config 行核对）；GLM-5.3-Flash 在本机
+  的真实历史基线为 pp1024≈357 / pp4096≈440 / pp8192≈415 tps（09-24 多轮 +
+  本次 OFF 组吻合 <0.5%）。
+- **Studio live A/B（OFF=双 kill-switch，ON=默认，2 轮中位数，2026-09-26 02:25-02:33）**：
+  pp1024 359.1→354.2（-1.4%，噪声区）；pp4096 441.5→448.1（**+1.5%**）；
+  pp8192 414.9→439.1（**+5.8%**，两轮 ON 均高于两轮 OFF）。ON 组 engage 日志
+  确认 KDA 融合生效；chunk 明细：pp8192 首块 9566→8924ms（-6.7%）、次块
+  9986→9617ms（-3.7%）。
+- HC 融合无需移植：GLM 的 `deepseek_v4/hyper_connection.py` 已自带 fused
+  sinkhorn+collapse Metal kernel + `@mx.compile` expand（供体 hc_fused 非空白区）。
+- 追加实验：**非 NAX 强制宽步实测成功**（`OMLX_GLM53_WIDE_STEP_FORCE=8192`，
+  scheduler env 覆盖，默认关；commit 5036bbc5）。requested_step=8192 确认生效，
+  2 轮干净分离（02:52-02:55）：
+
+  | pp | OFF | ON(P1+P3) | WIDE(+8192) | 累计 vs OFF |
+  |---|---|---|---|---|
+  | 1024 | 359.1 | 354.2 | **370.3** | **+3.1%** |
+  | 4096 | 441.5 | 448.1 | **453.2** | **+2.6%** |
+  | 8192 | 414.9 | 439.1 | **450.2** | **+8.5%** |
+
+  宽步在 P1+P3 之上再叠 +2.5%（pp8192）——早期 8192 回滚（+0.8%）是在没有
+  dense-prefix 摊薄首块成本的旧形态下测的，新形态下成立。生产形态：Studio 以
+  `OMLX_GLM53_WIDE_STEP_FORCE=8192` 常驻。
+- **阶段结论（vs 20-30% 目标）**：三层叠加实测 +8.5%（pp8192）/+2.6%（pp4096）/
+  +3.1%（pp1024），可复现。供体 20-30% 的主体增益来自 NAX tensor units 与宽步
+  MoE GEMM 的硬件路径，非 NAX M3 Ultra 上无对应接线面；剩余瓶颈为 MoE/MLA
+  kernel 本体（需全新 kernel 设计，非移植范畴）。
+
+- P4 调研结论（verify 路径接线）：**无适用接线面**。
+  ① `qwen35_packed_linear`：`enabled()` 门控要求模块名含 qwen3_5/qwen35 且
+  **不含 moe**、4-bit、M5/NAX tensor units——GLM-5.3-Flash 是 oQ8 MoE、Studio
+  非 NAX，三重排除。② `moe_verify_gather`：仅由 `qwen35_moe_gate_up.fused_switch`
+  调用，`_FAMILY_TOKENS`（qwen3_5/qwen3_6/qwen4_exp/laguna/hy_v3）不含
+  glm5_next；GLM MoE 走自家 affine-block gather（`glm5-next-affine8`，
+  bit-exact、实测 pp8192 +1.6%），其权重布局与 gather_qmm 不同，移植
+  expert-order 调度 = 新 kernel 设计而非接线，且供体自身收益量级有限。
+  ③ verify-qmm mma 已全局生效；dspark verify 本就绕过 verify-qmm。
+  结论：P4 以“不适用”关闭；若日后做 affine 布局的 expert-order verify kernel，
+  另立实验。
