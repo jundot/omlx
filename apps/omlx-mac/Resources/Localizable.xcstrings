@@ -20890,6 +20890,54 @@
         }
       }
     },
+    "settings.advanced.system_one_rereads.label" : {
+      "comment" : "Row label for the System One re-read toggle (diffusion models)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Re-read uncertain System One answers"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Перечитывать неуверенные ответы System One"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "System One 答案不确定时补读"
+          }
+        }
+      }
+    },
+    "settings.advanced.system_one_rereads.sub" : {
+      "comment" : "Sublabel for the System One re-read toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "When an answer is uncertain, read it three more times with fresh noise and average, as djev does. Off reads once: about half the latency, with the same JevBench accuracy."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если ответ неуверенный, читает его ещё три раза с новым шумом и усредняет, как djev. Если выключено, одно чтение: задержка примерно вдвое меньше при той же точности на JevBench."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "答案不确定时换新噪声再读 3 次并取平均（djev 的策略）。关闭后只读 1 次：延迟约减半，JevBench 准确率不变。"
+          }
+        }
+      }
+    },
     "settings.advanced.pin_memory.label" : {
       "comment" : "Row label for the pin-in-memory toggle",
       "extractionState" : "manual",

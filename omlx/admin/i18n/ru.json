@@ -1213,6 +1213,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Принудительная выборка",
   "modal.model_settings.force_sampling_hint": "Переопределять параметры выборки запроса заданными значениями",
+  "modal.model_settings.system_one_rereads": "Перечитывать неуверенные ответы System One",
+  "modal.model_settings.system_one_rereads_hint": "Если ответ неуверенный, читает его ещё три раза с новым шумом и усредняет, как djev. Если выключено, одно чтение: задержка примерно вдвое меньше при той же точности на JevBench.",
   "modal.model_settings.trust_remote_code": "Доверять удаленному коду",
   "modal.model_settings.trust_remote_code_hint": "Позволяет репозиторию модели выполнять произвольный Python-код при загрузке. Включайте только для доверенных авторов.",
   "modal.model_settings.chat_template_kwargs": "Параметры шаблона чата",

@@ -234,6 +234,7 @@
                 min_p: null,
                 presence_penalty: null,
                 force_sampling: false,
+                system_one_rereads_enabled: null,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
@@ -1866,6 +1867,10 @@
                     min_p: s.min_p ?? null,
                     presence_penalty: s.presence_penalty ?? null,
                     force_sampling: s.force_sampling || false,
+                    // Only diffusion models read System One requests.
+                    system_one_rereads_enabled: isDiffusion
+                        ? s.system_one_rereads_enabled !== false
+                        : null,
                     enable_thinking: s.enable_thinking ?? null,
                     thinking_default: model?.thinking_default ?? null,
                     qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
@@ -2011,6 +2016,7 @@
                 ms.repetition_penalty = null;
                 ms.presence_penalty = null;
                 ms.force_sampling = false;
+                if (ms.is_diffusion_model) ms.system_one_rereads_enabled = true;
                 ms.max_context_window = null;
                 ms.max_tokens = null;
                 ms.reasoning_parser = null;
@@ -3023,6 +3029,9 @@
                                     ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
+                                system_one_rereads_enabled: isDiffusion
+                                    ? this.modelSettings.system_one_rereads_enabled
+                                    : undefined,
                             };
                             if (isDiffusion) {
                                 Object.assign(payload, {
@@ -3290,6 +3299,9 @@
                         this.modelSettings.min_p = null;
                         this.modelSettings.presence_penalty = null;
                         this.modelSettings.force_sampling = false;
+                        if (this.modelSettings.is_diffusion_model) {
+                            this.modelSettings.system_one_rereads_enabled = true;
+                        }
                         this.modelSettings.reasoning_parser = null;
                         this.modelSettings.guided_grammar_enabled = false;
                         this.modelSettings.guided_grammar = '';

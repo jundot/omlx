@@ -133,6 +133,7 @@ enum ProfileSettingsKey {
     static let reasoningParser = "reasoning_parser"
     static let maxToolResultTokens = "max_tool_result_tokens"
     static let forceSampling = "force_sampling"
+    static let systemOneRereadsEnabled = "system_one_rereads_enabled"
     static let isPinned = "is_pinned"
     static let chatTemplateKwargs = "chat_template_kwargs"
     static let forcedCtKwargs = "forced_ct_kwargs"

@@ -1213,6 +1213,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Force Sampling",
   "modal.model_settings.force_sampling_hint": "Override request sampling parameters with configured values",
+  "modal.model_settings.system_one_rereads": "Re-read uncertain System One answers",
+  "modal.model_settings.system_one_rereads_hint": "When an answer is uncertain, read it three more times with fresh noise and average, as djev does. Off reads once: about half the latency, with the same JevBench accuracy.",
   "modal.model_settings.trust_remote_code": "Trust Remote Code",
   "modal.model_settings.trust_remote_code_hint": "Lets the model repo run arbitrary Python at load. Only enable for trusted publishers.",
   "modal.model_settings.chat_template_kwargs": "Chat Template Kwargs",

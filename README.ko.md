@@ -274,7 +274,10 @@ OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 �
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 텍스트 임베딩 |
 | `POST /v1/rerank` | 문서 리랭킹 |
+| `POST /v1/systemone` | System One 타입 판단 (TypeSafe API) |
 | `GET /v1/models` | 사용 가능한 모델 목록 |
+
+`POST /v1/systemone`은 DiffusionGemma에서 [TypeSafe의 System One API](https://docs.typesafe.ai/api)(OpenAPI 0.2.0)를 구현합니다. `state`와 타입이 지정된 `noul`(예/아니오), `choice`, `score` 질문을 보내면 각 답변이 모델 분포에서 직접 읽은 보정된 확률로 반환됩니다. 모델이 텍스트를 생성하지 않으므로 답변이 스키마를 벗어나지 않습니다. `model`에는 DiffusionGemma 모델 ID를 지정하세요. TypeSafe SDK를 그대로 사용하려면 `TYPESAFE_BASE_URL`을 oMLX로 지정하고 해당 모델에 SDK 기본 모델인 별칭 `jev-latest`를 설정하세요. `GET /v1/models`는 OpenAI 형식을 유지하므로 SDK의 모델 목록 기능은 지원되지 않습니다. 판독 결과가 불확실하면 oMLX는 djev처럼 새 노이즈로 3번 더 판독해 평균을 냅니다. 모델 설정에서 「불확실한 System One 답변 재판독」을 끄면 1번만 판독하며 지연 시간이 약 절반으로 줄어듭니다.
 
 ### Tool calling & 구조화된 출력
 

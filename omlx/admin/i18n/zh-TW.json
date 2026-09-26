@@ -1213,6 +1213,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "強制取樣",
   "modal.model_settings.force_sampling_hint": "以設定值覆蓋請求中的取樣參數",
+  "modal.model_settings.system_one_rereads": "System One 答案不確定時補讀",
+  "modal.model_settings.system_one_rereads_hint": "答案不確定時換新雜訊再讀 3 次並取平均（djev 的策略）。關閉後只讀 1 次：延遲約減半，JevBench 準確率不變。",
   "modal.model_settings.trust_remote_code": "信任遠端程式碼",
   "modal.model_settings.trust_remote_code_hint": "允許模型儲存庫在載入時執行任意 Python 程式碼。請僅對信任的發佈者啟用。",
   "modal.model_settings.chat_template_kwargs": "對話範本參數（Kwargs）",

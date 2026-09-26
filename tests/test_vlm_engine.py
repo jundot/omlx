@@ -743,6 +743,103 @@ class TestVLMDiffusionLane:
         assert outputs[-1].finished is True
         assert outputs[-1].finish_reason == "stop"
 
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prompt_len, chunked", [(3, False), (2049, True)])
+    async def test_read_session_prefills_once(self, prompt_len, chunked):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        model = FakeDiffusionReadModel()
+        engine._vlm_model = model
+        prompt = list(range(prompt_len))
+        canvas = [5, 6, 7, 8, 9, 0, 0, 0]
+        slots = [(1, [3, 4]), (3, [10, 11, 12])]
+
+        async with engine.diffusion_read_session(prompt) as session:
+            assert engine._diffusion_active_requests == 1
+            first = await session.read(canvas, slots, [11], top_k=4)
+            more = await session.read(canvas, slots, [22, 11], top_k=4)
+
+        assert model.prefills == [(prompt, chunked)]
+        assert engine._diffusion_active_requests == 0
+        reads = first + more
+        assert len(reads) == len(model.canvases) == 3
+        for noised in model.canvases:
+            # Only the slots are refilled, each with a token from the vocab.
+            untouched = [t for i, t in enumerate(noised) if i not in (1, 3)]
+            assert untouched == [5, 7, 9, 0, 0, 0]
+            assert all(0 <= noised[pos] < model.VOCAB for pos, _ in slots)
+        assert model.canvases[0] == model.canvases[2] != model.canvases[1]
+        for noised, read in zip(model.canvases, reads):
+            logits = model.logits(mx.array([noised]))[0]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            for (pos, labels), got in zip(slots, read):
+                row = logprobs[pos].tolist()
+                fourth = sorted(row, reverse=True)[3]
+                others = set(got) - set(labels)
+                assert set(labels) <= set(got)
+                assert len(others) <= 4 and all(row[t] >= fourth - 1e-6 for t in others)
+                for token, logprob in got.items():
+                    assert logprob == pytest.approx(row[token], abs=1e-5)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.asyncio
+    async def test_read_session_frees_the_lane_after_an_error(self):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._vlm_model = FakeDiffusionReadModel()
+        with pytest.raises(ValueError, match="caller failed"):
+            async with engine.diffusion_read_session([1, 2]):
+                raise ValueError("caller failed")
+        assert engine._diffusion_active_requests == 0
+        assert not engine._diffusion_lock.locked()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required")
+    @pytest.mark.asyncio
+    async def test_read_session_requires_a_diffusion_model(self):
+        engine = _make_loaded_engine(model_type="gemma4")
+        with pytest.raises(RuntimeError, match="not a diffusion model"):
+            async with engine.diffusion_read_session([1]):
+                pass
+
+
+class FakeDiffusionReadModel:
+    """A diffusion decoder whose logits at each canvas position depend only on
+    that position's token, so tests can recompute the expected read."""
+
+    VOCAB = 32
+
+    def __init__(self):
+        self.config = SimpleNamespace(
+            text_config=SimpleNamespace(vocab_size=self.VOCAB)
+        )
+        self.prefills = []
+        self.canvases = []
+
+    def make_cache(self):
+        return [SimpleNamespace(state=mx.zeros((1,)))]
+
+    def diffusion_prefill_cache(
+        self, input_ids, *, cache, prefill_step_size, chunk_prefill
+    ):
+        self.prefills.append((input_ids[0].tolist(), chunk_prefill))
+        return cache
+
+    def diffusion_decoder_masks(self, canvas_ids, cache, decoder_attention_mask):
+        return "masks"
+
+    def diffusion_decoder_logits(
+        self, canvas_ids, cache=None, decoder_attention_mask=None
+    ):
+        assert decoder_attention_mask == "masks"
+        self.canvases.append(canvas_ids[0].tolist())
+        return self.logits(canvas_ids)
+
+    @classmethod
+    def logits(cls, canvas_ids):
+        tokens = canvas_ids[0].astype(mx.float32)[:, None]
+        return ((mx.arange(cls.VOCAB)[None] * (tokens + 1)) % 7)[None]
+
 
 # ---------------------------------------------------------------------------
 # TestInjectToolCalling

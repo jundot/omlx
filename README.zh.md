@@ -237,7 +237,10 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 文本嵌入 |
 | `POST /v1/rerank` | 文档重排序 |
+| `POST /v1/systemone` | System One 类型化决策（TypeSafe API） |
 | `GET /v1/models` | 列出可用模型 |
+
+`POST /v1/systemone` 在 DiffusionGemma 上实现 [TypeSafe 的 System One API](https://docs.typesafe.ai/api)（OpenAPI 0.2.0）。发送 `state` 和带类型的 `noul`（是/否）、`choice`、`score` 问题，每个答案都以直接从模型分布读出的校准概率返回。模型不生成文本，因此答案不会偏离 schema。将 `model` 设为 DiffusionGemma 模型 ID。若要原样使用 TypeSafe SDK，把 `TYPESAFE_BASE_URL` 指向 oMLX，并为该模型设置别名 `jev-latest`（SDK 的默认模型）。`GET /v1/models` 保持 OpenAI 格式，因此不支持 SDK 的模型列表功能。读取结果不确定时，oMLX 会像 djev 一样换新噪声再读 3 次并取平均；在模型设置中关闭「System One 答案不确定时补读」即可只读 1 次，延迟约减半。
 
 ### 工具调用与结构化输出
 

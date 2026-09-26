@@ -263,6 +263,9 @@ final class ModelSettingsScreenVM {
     /// "disabled").
     var toolResultLimitTokens: String = "4096"
     var forceSampling: Bool = false
+    /// Diffusion models only: re-read uncertain System One answers with
+    /// more noise draws (djev's policy); off reads once.
+    var systemOneRereadsEnabled: Bool = true
     var isPinned: Bool = false
     var isFavorite: Bool = false
 
@@ -600,6 +603,7 @@ final class ModelSettingsScreenVM {
                     self.toolResultLimitTokens = "4096"
                 }
                 self.forceSampling = s?.forceSampling ?? false
+                self.systemOneRereadsEnabled = s?.systemOneRereadsEnabled ?? true
                 self.isPinned = s?.isPinned ?? false
                 self.isFavorite = s?.isFavorite ?? false
                 self.trustRemoteCode = s?.trustRemoteCode ?? false
@@ -1251,6 +1255,11 @@ final class ModelSettingsScreenVM {
             out[ProfileSettingsKey.maxToolResultTokens] = AnyCodable(
                 limitToolResults ? (Int(toolResultLimitTokens) ?? 4096) : 0
             )
+        }
+
+        // Universal — System One reads, which only diffusion models serve
+        if isDiffusion {
+            putBool(ProfileSettingsKey.systemOneRereadsEnabled, systemOneRereadsEnabled)
         }
 
         // Universal — chat template kwargs. AnyCodable's encode walks a

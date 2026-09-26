@@ -1213,6 +1213,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Forcer l'échantillonnage",
   "modal.model_settings.force_sampling_hint": "Remplacez les paramètres d'échantillonnage de la requête par les valeurs configurées",
+  "modal.model_settings.system_one_rereads": "Relire les réponses System One incertaines",
+  "modal.model_settings.system_one_rereads_hint": "Quand une réponse est incertaine, la relit trois fois avec un nouveau bruit et fait la moyenne, comme djev. Désactivé : une seule lecture, environ deux fois moins de latence, même précision sur JevBench.",
   "modal.model_settings.trust_remote_code": "Faire confiance au code distant",
   "modal.model_settings.trust_remote_code_hint": "Permet au dépôt du modèle d'exécuter du Python arbitraire au chargement. Activez uniquement pour les éditeurs de confiance.",
   "modal.model_settings.chat_template_kwargs": "Chat Template Kwargs",

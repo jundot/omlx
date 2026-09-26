@@ -1213,6 +1213,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "강제 샘플링",
   "modal.model_settings.force_sampling_hint": "설정된 값으로 요청의 샘플링 파라미터를 덮어씁니다",
+  "modal.model_settings.system_one_rereads": "불확실한 System One 답변 재판독",
+  "modal.model_settings.system_one_rereads_hint": "답변이 불확실하면 새 노이즈로 3번 더 판독해 평균을 냅니다(djev 방식). 끄면 1번만 판독하며 지연 시간이 약 절반으로 줄고 JevBench 정확도는 같습니다.",
   "modal.model_settings.trust_remote_code": "원격 코드 신뢰",
   "modal.model_settings.trust_remote_code_hint": "모델 저장소의 임의 Python 코드 실행을 허용합니다. 신뢰하는 게시자에만 사용하세요.",
   "modal.model_settings.chat_template_kwargs": "채팅 템플릿 피라미터 설정",

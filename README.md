@@ -277,7 +277,10 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | Text embeddings |
 | `POST /v1/rerank` | Document reranking |
+| `POST /v1/systemone` | System One typed decisions (TypeSafe API) |
 | `GET /v1/models` | List available models |
+
+`POST /v1/systemone` implements [TypeSafe's System One API](https://docs.typesafe.ai/api) (OpenAPI 0.2.0) on DiffusionGemma. Send a `state` with typed `noul` (yes/no), `choice` and `score` questions, and each answer comes back as calibrated probabilities read directly from the model's distribution. The model generates no text, so an answer cannot go off-schema. Set `model` to a DiffusionGemma model ID. To use the TypeSafe SDKs unchanged, point `TYPESAFE_BASE_URL` at oMLX and give that model the alias `jev-latest`, the SDKs' default model. `GET /v1/models` keeps its OpenAI shape, so the SDKs' model listing is not supported. When a read is uncertain, oMLX reads it three more times with fresh noise and averages the results, as djev does. Turn off *Re-read uncertain System One answers* in the model settings to read once instead, for about half the latency.
 
 ### Tool Calling & Structured Output
 

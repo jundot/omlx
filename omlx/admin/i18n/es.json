@@ -1213,6 +1213,8 @@
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Forzar Muestreo",
   "modal.model_settings.force_sampling_hint": "Sobrescribir parámetros de muestreo de la solicitud con valores configurados",
+  "modal.model_settings.system_one_rereads": "Releer respuestas inciertas de System One",
+  "modal.model_settings.system_one_rereads_hint": "Cuando una respuesta es incierta, la vuelve a leer tres veces con ruido nuevo y promedia, como djev. Desactivado: una sola lectura, aproximadamente la mitad de latencia, con la misma precisión en JevBench.",
   "modal.model_settings.trust_remote_code": "Confiar en Código Remoto",
   "modal.model_settings.trust_remote_code_hint": "Permite que el repositorio del modelo ejecute Python arbitrario al cargar. Habilitar solo para editores de confianza.",
   "modal.model_settings.chat_template_kwargs": "Kwargs de la Plantilla de Chat",
