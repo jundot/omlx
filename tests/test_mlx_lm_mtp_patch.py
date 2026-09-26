@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import gc
 import json
 from types import SimpleNamespace
 
@@ -3113,6 +3114,41 @@ def test_singleton_rollback_requires_successful_cache_recovery(
         assert cache.keys[0, 0, : cache.offset, 0].tolist() == list(range(1, 10))
 
 
+@pytest.mark.parametrize("cache_only", [True, False])
+def test_cache_only_head_drafts_before_backbone_rollback(monkeypatch, cache_only):
+    events = []
+
+    class RejectDrafts(CountingModel):
+        def __call__(self, inputs, *args, **kwargs):
+            events.append("verify")
+            return super().__call__(inputs, *args, **kwargs)
+
+        def mtp_forward(self, hidden, tokens, cache, return_hidden=False, **kwargs):
+            events.append("draft")
+            logits = self._logits(tokens + 1)
+            return (
+                (logits, tokens[..., None].astype(mx.float32))
+                if return_hidden
+                else logits
+            )
+
+    RejectDrafts.mtp_forward._omlx_head_cache_only = cache_only
+    rollback = bg._chain_rollback
+
+    def record(*args):
+        events.append("rollback")
+        return rollback(*args)
+
+    monkeypatch.setattr(bg, "_chain_rollback", record)
+    output, _ = generate(RejectDrafts(), [[1, 2]], [8])
+    assert output[0] == list(range(3, 11))
+    # One segment per verify; only a cache-only head drafts before rolling back.
+    segments = "".join(e[0] for e in events).split("v")[1:]
+    mixed = [seg for seg in segments if "r" in seg and "d" in seg]
+    assert mixed
+    assert all((seg.index("d") < seg.index("r")) == cache_only for seg in mixed)
+
+
 @pytest.mark.parametrize("stop", [False, True])
 def test_park_recovery_includes_the_token_being_emitted(monkeypatch, stop):
     class RejectDrafts(CountingModel):
@@ -3129,11 +3165,11 @@ def test_park_recovery_includes_the_token_being_emitted(monkeypatch, stop):
     failures = []
     in_handoff = False
 
-    def observed_feed(*args):
+    def observed_feed(*args, **kwargs):
         nonlocal in_handoff
         in_handoff = True
         try:
-            return feed(*args)
+            return feed(*args, **kwargs)
         finally:
             in_handoff = False
 
@@ -4570,6 +4606,8 @@ def test_batched_head_matches_row_caches_across_depth_changes(size, family, stoc
                     assert mx.allclose(actual_lp, expected_lp, rtol=1e-4, atol=1e-4)
                 for layer, reference in zip(owner.head.cache, ref.mtp_cache):
                     actual = layer.extract(index)
+                    # A row chain may keep its speculative rows outside the cache.
+                    bg._mtp_head_trim_to([actual, reference], ref.hist_offset)
                     assert actual.offset == reference.offset
                     for (_, tensor), (_, expected) in zip(
                         tree_flatten(
@@ -5180,10 +5218,193 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
     assert mx.abs(out - expected).max().item() <= tolerance
 
 
-@pytest.mark.parametrize("nax", [True, False])
-def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, nax):
-    """Speculative steps raise MLX's buffer caps on M5 only and always restore them."""
-    from omlx.custom_kernels import nax as nax_mod
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("rows", [4, 7, 8])
+def test_sg8_kernels_match_quantized_matmul(bits, rows):
+    """Plain, gate/up swiglu and grouped sg8 launches against stock qmm."""
+    from omlx.patches import qwen35_verify_qmm as vq
+
+    x = (mx.random.normal((rows, 1024)) * 0.5).astype(mx.bfloat16)
+    # Producer-written per-64 sums replace the in-kernel accumulation.
+    for sums in (None, x.astype(mx.float32).reshape(rows, 16, 64).sum(axis=-1)):
+        layer = _quantized_linear(1024, 1024, bits, 11)
+        out = vq.vk_qmm_sg8(
+            x,
+            layer.weight,
+            layer.scales,
+            layer.biases,
+            group_size=64,
+            bits=bits,
+            sums=sums,
+        )
+        assert _close(out, _reference(layer, x))
+
+        gate = _quantized_linear(2048, 1024, bits, 12)
+        up = _quantized_linear(2048, 1024, bits, 13)
+        g = _reference(gate, x).astype(mx.bfloat16).astype(mx.float32)
+        u = _reference(up, x).astype(mx.bfloat16).astype(mx.float32)
+        swiglu = vq.vk_swiglu_sg8(x, gate, up, sums)
+        assert _close(swiglu, nn.silu(g) * u, tol=2e-2)
+
+        # Mixed 4/5-bit projections of one input share a launch.
+        group = [layer, _quantized_linear(512, 1024, 9 - bits, 14), gate]
+        for got, linear in zip(vq.vk_group_sg8(x, group, sums), group):
+            assert _close(got, _reference(linear, x))
+
+
+def test_add_rms_norm_is_bitwise_add_then_rms_norm():
+    from omlx.patches import qwen35_verify_qmm as vq
+
+    mx.random.seed(3)
+    a = (mx.random.normal((2, 8, 5120)) * 3).astype(mx.bfloat16)
+    b = (mx.random.normal((2, 8, 5120)) * 40).astype(mx.bfloat16)
+    norm = nn.RMSNorm(5120, eps=1e-6)
+    norm.weight = mx.random.uniform(shape=(5120,)).astype(mx.bfloat16)
+    assert vq._add_rms_eligible(a, b, norm)
+    total, normed, sums = vq.add_rms_norm(a, b, norm)
+    assert mx.array_equal(total, a + b).item()
+    assert mx.array_equal(normed, norm(a + b)).item()
+    expected = normed.astype(mx.float32).reshape(16, 80, 64).sum(axis=-1)
+    assert mx.allclose(sums, expected, rtol=1e-5, atol=1e-3).item()
+
+
+@pytest.mark.parametrize("top_p", [0.0, 0.9])
+def test_sparse_mtp_draft_density_matches_dense_sampler(top_p):
+    """The top-k draft path draws from the dense sampler's distribution."""
+    from omlx.utils.sampling import make_sampler
+
+    sampler = make_sampler(temp=0.7, top_p=top_p, top_k=20)
+    mx.random.seed(2)
+    logits = mx.random.normal((1, 5000)) * 4
+    lp = bg._logprobs(logits)
+    _, dense = sampler.sample_with_logprobs(lp)
+    token, ids, logq = bg._sample_draft_sparse(sampler, lp, 20)
+    expected = mx.take_along_axis(dense[0], ids, axis=-1)
+    assert mx.allclose(logq[0], expected, atol=1e-5).item()
+    assert token.item() in ids.tolist()
+    kept = mx.isfinite(dense[0]).sum().item()
+    assert mx.isfinite(logq).sum().item() == kept
+
+
+def test_sparse_draft_q_matches_dense_rows_in_verify():
+    """Candidate-sparse q gives the verify the same draws as its dense rows."""
+
+    class Sampler:
+        temp, top_p, top_k, min_p, xtc_probability = 1.0, 0.95, 20, 0.0, 0.0
+
+    vocab, k, count = 300, 7, 16
+    mx.random.seed(21)
+    logits = mx.random.normal((k + 1, vocab)) * 3
+    combined = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    ids = mx.argsort(-logits[:k], axis=-1)[:, :count].astype(mx.int32)
+    logq = mx.random.normal((k, count))
+    logq = logq - mx.logsumexp(logq, axis=-1, keepdims=True)
+    drafts = ids[:, 1].astype(mx.uint32)
+    sparse = bg.SparseDraftQ(ids, logq, vocab)
+    results = []
+    for q in (sparse, bg._dense_q_rows(sparse)):
+        mx.random.seed(5)
+        results.append(
+            bg._stochastic_verify_tokens(Sampler(), combined, drafts, q).tolist()
+        )
+    assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("top_p", [0.0, 0.95])
+def test_fused_candidate_sampler_matches_sparse_sampler(top_p):
+    from omlx.utils.sampling import make_sampler
+
+    sampler = make_sampler(temp=0.8, top_p=top_p, top_k=20)
+    mx.random.seed(4)
+    raw = mx.random.normal((1, 64)) * 3
+    lp = raw - mx.logsumexp(raw, axis=-1, keepdims=True)
+    _, ids, logq = bg._sample_draft_sparse(sampler, lp, 20)
+    token, fused_ids, fused_logq = bg._sample_candidates_fused(sampler, lp, 20)
+    assert fused_ids.tolist() == ids.tolist()
+    assert mx.allclose(fused_logq, logq, atol=1e-5).item()
+    assert mx.isfinite(fused_logq[0, fused_ids.tolist().index(token.item())])
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_coarse_draft_head_rescores_candidates_with_exact_weights(packed):
+    """Candidates are rescored with the lm_head rows, also from M5's packed layout."""
+    from omlx.patches import qwen35_packed_linear
+
+    class Mtp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(256, 128, bias=False)
+
+    class Language(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.args = SimpleNamespace(tie_word_embeddings=False)
+            self.mtp = Mtp()
+            self.lm_head = nn.QuantizedLinear(256, 1 << 16, bias=False, bits=4)
+
+        def mtp_forward(self):
+            pass
+
+    Language.mtp_forward._omlx_lm_head_logits = True
+    mx.random.seed(8)
+    lang = Language()
+    lang.mtp.fc.weight = lang.mtp.fc.weight.astype(mx.bfloat16)
+    original = lang.lm_head
+    if packed:
+        lang.lm_head = qwen35_packed_linear._pack([original])[0]
+    head = bg._coarse_draft_head(SimpleNamespace(language_model=lang))
+    assert isinstance(lang.mtp.fc, nn.QuantizedLinear)
+    assert bg._coarse_draft_head(lang).coarse is head.coarse
+
+    h = mx.random.normal((1, 1, 256))
+    ids, lp = head.candidates(h)
+    exact = original(h[:, -1, :]).astype(mx.float32)
+    picked = mx.take_along_axis(exact, ids, axis=-1)
+    assert mx.allclose(lp, picked - mx.logsumexp(picked), atol=1e-4).item()
+    assert mx.argmax(exact).item() in ids.tolist()[0]
+
+    key = id(lang.lm_head)
+    del head, lang, original
+    gc.collect()
+    assert key not in bg._COARSE_HEADS
+
+
+def test_coarse_draft_head_splits_qwen4_logits_source_from_chain_hidden():
+    """A Qwen4 head owned by the root model scores its mixer output, not the chain streams."""
+
+    class Head(nn.Module):
+        def __call__(self, hidden_states, tokens, embed_tokens, cache):
+            return hidden_states[..., :128] * 2, hidden_states
+
+    class Language(nn.Module):
+        def __init__(self, head):
+            super().__init__()
+            self.args = SimpleNamespace(tie_word_embeddings=False)
+            self.model = SimpleNamespace(embed_tokens=None)
+            self.lm_head = nn.QuantizedLinear(128, 1 << 16, bias=False, bits=8)
+            self._owner_head = [head]
+
+        def get_mtp_module(self):
+            return self._owner_head[0]
+
+        def mtp_forward(self):
+            pass
+
+    Language.mtp_forward._omlx_lm_head_logits = True
+    mx.random.seed(9)
+    lang = Language(Head())
+    head = bg._coarse_draft_head(lang)
+    streams = mx.random.normal((1, 1, 512))
+    source, chain = head.hidden(streams, None, None)
+    assert chain is streams
+    ids, _ = head.candidates(source)
+    exact = lang.lm_head(source[:, -1, :])
+    assert mx.argmax(exact).item() in ids.tolist()[0]
+
+
+@pytest.mark.parametrize("raised", [True, False])
+def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
+    """Speculative steps raise MLX's buffer caps where measured and always restore them."""
     from omlx.custom_kernels.qwen35_prefill import fast
 
     caps = [(50, 50)]
@@ -5194,9 +5415,9 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, nax):
         return previous
 
     monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
-    monkeypatch.setattr(nax_mod, "is_nax_available", lambda: nax)
+    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: raised)
     with pytest.raises(RuntimeError), bg._spec_command_buffers():
         inside = caps[-1]
         raise RuntimeError("step failed")
-    assert inside == (bg._SPEC_BUFFER_CAPS if nax else (50, 50))
+    assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)

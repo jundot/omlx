@@ -890,6 +890,74 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
     )
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("batch,retained", [(1, [3]), (1, [8]), (3, [1, 8, 5])])
+def test_fused_verify_replays_committed_rows_in_the_next_block(
+    monkeypatch, batch, retained
+):
+    """The fused verify stores no per-row states: a commit leaves a lazy replay
+    that the next block applies in its own launch. Outputs and committed states
+    stay bit-exact to the stock recording path across two blocks."""
+    import copy
+
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    from omlx.patches import qwen35_gdn_verify_fused as fused_mod
+
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    seq = 8
+    mx.random.seed(71)
+    module = q35.Qwen3_5GatedDeltaNet(args)
+    module.set_dtype(mx.bfloat16)
+    module.eval()
+    blocks = [mx.random.normal((batch, seq, 64)).astype(mx.bfloat16) for _ in range(2)]
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((batch, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache[1] = mx.random.normal((batch, 4, 128, 128)) * 0.01
+    reference_cache = copy.deepcopy(cache)
+    verifier = Qwen3_5BatchInvariantForward()
+
+    def run(target, inputs):
+        transaction = start_speculative_cache([target], seq)
+        out = verifier._gated_delta(module, inputs, None, target)
+        mx.eval(out)
+        return out, transaction
+
+    expected = []
+    for inputs in blocks:
+        out, transaction = run(reference_cache, inputs)
+        transaction.commit(retained)
+        expected.append(out)
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    replays = []
+    kernel = fused_mod._kernel
+
+    def record(main, replay):
+        replays.append((main, replay))
+        return kernel(main, replay)
+
+    monkeypatch.setattr(fused_mod, "_kernel", record)
+    for index, inputs in enumerate(blocks):
+        out, transaction = run(cache, inputs)
+        assert mx.array_equal(out, expected[index]).item()
+        transaction.commit(retained)
+    # The second block folded the first block's commit into its own launch.
+    assert (True, True) in replays
+    for actual, reference in zip(cache.state, reference_cache.state):
+        assert mx.array_equal(actual, reference).item()
+
+
 def test_qwen4_decode_setting_is_captured_per_model(monkeypatch):
     from omlx.scheduler import SchedulerConfig
 

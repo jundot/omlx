@@ -35,6 +35,8 @@ import sys
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import qwen35_gdn_verify_fused
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -1058,28 +1060,40 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             layer.head_v_dim,
             l2=l2_norm,
         )
-        conv_input = mx.concatenate([cache[0], mixed_qkv], axis=1)
-        cache.record_speculative_window(0, conv_input, layer.conv_kernel_size - 1)
-        cache[0] = conv_state
-        out, _ = q35.gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            layer.A_log,
-            layer.dt_bias,
-            cache=cache,
-            use_kernel=not layer.training,
+        fused = not l2_norm and qwen35_gdn_verify_fused.fused_eligible(
+            layer, q, cache, length
         )
+        if fused and 0 not in cache._speculation["records"]:
+            qwen35_gdn_verify_fused.record_window(
+                cache, 0, cache[0], mixed_qkv, layer.conv_kernel_size - 1
+            )
+        else:
+            conv_input = mx.concatenate([cache[0], mixed_qkv], axis=1)
+            cache.record_speculative_window(0, conv_input, layer.conv_kernel_size - 1)
+        cache[0] = conv_state
+        if fused:
+            out = qwen35_gdn_verify_fused.verify_block(layer, cache, q, k, v, a, b, z)
+        else:
+            out, _ = q35.gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                layer.A_log,
+                layer.dt_bias,
+                cache=cache,
+                use_kernel=not layer.training,
+            )
         if hasattr(cache, "advance"):
             cache.advance(length)
             q35._qwen3_5_advance_left_padding_info(cache, length)
             q35._qwen3_5_advance_lengths_info(cache, length)
-        out = layer.norm(out, z.reshape(inputs.shape[0], length, -1, layer.head_v_dim))
-        result = verifier._linear(
-            layer.out_proj, out.reshape(inputs.shape[0], length, -1)
-        )
+        if not fused:
+            out = layer.norm(
+                out, z.reshape(inputs.shape[0], length, -1, layer.head_v_dim)
+            ).reshape(inputs.shape[0], length, -1)
+        result = verifier._linear(layer.out_proj, out)
         global _ENGAGED_LOGGED
         if not _ENGAGED_LOGGED:
             _ENGAGED_LOGGED = True
@@ -1093,6 +1107,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls.__call__ = decode
     cls._omlx_gdn_prework_patched = True
     Qwen3_5BatchInvariantForward._gated_delta = verify
+    qwen35_gdn_verify_fused.apply_arrays_cache_replay_patch()
     _PATCHED = True
     logger.info("Qwen fused GDN prework patch applied")
     return True

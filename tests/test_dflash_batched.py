@@ -302,6 +302,123 @@ def test_sampled_rows_get_sparse_candidate_distributions():
             assert probs[tokens[0, position]].item() > 0
 
 
+def test_short_context_matches_reference_draft_block():
+    """Ring slots not yet written must stay out of attention."""
+    for length in (1, 3, WINDOW - 1):
+        drafter = _tiny_drafter()
+        context = mx.concatenate(_captured(length, seed=60 + length), axis=-1)
+        anchor = mx.array([7], dtype=mx.int32)
+        cache = drafter.model.make_cache()
+        for layer_cache in cache:
+            layer_cache.offset = 0
+        expected = drafter.model.draft_block(
+            anchor, context, cache, BLOCK, lambda logits: mx.argmax(logits, axis=-1)
+        )
+        row = drafter._row(0)
+        got = drafter._draft_batched(
+            [(SimpleNamespace(uid=0), row, context, anchor, None)]
+        )[0][0]
+        assert got.tolist() == expected.tolist()
+
+
+def test_prefill_capture_accepts_bound_prefill_of_the_model():
+    class Model:
+        def _omlx_prefill(self, *args, **kwargs):
+            return None
+
+    model = Model()
+    model._omlx_drafter = _tiny_drafter()
+    scheduler = SimpleNamespace(model=model)
+    request = SimpleNamespace(prompt_token_ids=list(range(30)), request_id="r")
+    kwargs = {}
+    keep = Scheduler._dflash_prefill_capture(
+        scheduler, request, model._omlx_prefill, 10, 15, kwargs
+    )
+    assert keep == 8 and kwargs["capture_layer_ids"] == TARGET_LAYER_IDS
+    other = Model()
+    assert (
+        Scheduler._dflash_prefill_capture(
+            scheduler, request, other._omlx_prefill, 10, 15, {}
+        )
+        is None
+    )
+
+
+class _Selector(nn.Module):
+    def __init__(self, vocab, rank, hidden):
+        super().__init__()
+        self.top_k = 16
+        self.predecessor_codebook = nn.Embedding(vocab, rank)
+        self.successor_codebook = nn.Embedding(vocab, rank)
+        self.hidden_projection = nn.Linear(hidden, rank, bias=False)
+
+
+def test_fused_selector_matches_candidate_sampling():
+    """One-launch selector: q equals ``_sample_candidates`` on the same path."""
+    from omlx.utils.sampling import make_sampler, top_k_indices
+
+    mx.random.seed(8)
+    vocab, rank, hidden, batch, length = 600, 64, 32, 2, BLOCK - 1
+    selector = _Selector(vocab, rank, hidden)
+    selector.update(
+        nn.utils.tree_map(lambda p: (p * 3).astype(mx.bfloat16), selector.parameters())
+    )
+    states = mx.random.normal((batch, length, hidden)).astype(mx.bfloat16)
+    logits = (mx.random.normal((batch, length, vocab)) * 4).astype(mx.bfloat16)
+    anchors = mx.array([3, 9], dtype=mx.int32)
+    candidates = top_k_indices(logits, 16)
+    unary = mx.take_along_axis(logits, candidates, axis=-1).astype(mx.float32)
+    projected = selector.hidden_projection(states).astype(mx.float32)
+    for sampler in (make_sampler(temp=1.0, top_p=0.9, top_k=12), None):
+        assert dd._fused_select_eligible(selector, states)
+        proposals = dd._select_fused(
+            selector, states, logits, anchors, [sampler, sampler]
+        )
+        for row, (tokens, accept) in enumerate(proposals):
+            tokens = tokens.reshape(-1).tolist()
+            previous = int(anchors[row])
+            for position in range(length):
+                edges = mx.sum(
+                    selector.predecessor_codebook.weight[previous].astype(mx.float32)
+                    * projected[row, position]
+                    * selector.successor_codebook.weight[
+                        candidates[row, position]
+                    ].astype(mx.float32),
+                    axis=-1,
+                )
+                scores = (unary[row, position] + edges)[None]
+                picked = candidates[row, position].tolist().index(tokens[position])
+                if sampler is None:
+                    assert picked == int(mx.argmax(scores[0]).item())
+                else:
+                    _, expected = dd._sample_candidates(scores, sampler)
+                    got = accept.logq[position]
+                    assert mx.allclose(got, expected[0], atol=1e-4).item()
+                    assert got[picked].item() > -float("inf")
+                previous = tokens[position]
+
+
+def test_conv_kernel_matches_grouped_dynamic_convolve():
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import (
+        GroupedDynamicCausalConv,
+    )
+
+    mx.random.seed(4)
+    conv = GroupedDynamicCausalConv(256, 2, 16)
+    conv.base_kernel = (mx.random.normal((2, 2, 256)) * 0.5).astype(mx.bfloat16)
+    conv.kernel_projection.weight = (mx.random.normal((64, 256)) * 0.05).astype(
+        mx.bfloat16
+    )
+    x = mx.random.normal((3, BLOCK, 256)).astype(mx.bfloat16)
+    expected, dynamic = conv.prepare(x)
+    got, packed = dd._conv_prepare(conv, x)
+    assert mx.array_equal(got, expected).item()
+    y = expected * 0.5
+    assert mx.array_equal(
+        dd._conv_finish(conv, y, packed), conv.finish(y, dynamic)
+    ).item()
+
+
 def test_resolve_block_size_clamps_to_trained_block_and_mtp_limit():
     model = SimpleNamespace(config=SimpleNamespace(block_size=8))
     assert dd.resolve_block_size(model, None) == 8
