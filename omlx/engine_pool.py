@@ -499,7 +499,11 @@ class EnginePool:
                 # Price expert residency before deciding whether PLE must use SSD.
                 # The entry projection consumes these adjusted estimates once.
                 saved = estimate.checkpoint_bytes - estimate_offload_admission_bytes(
-                    entry.model_path, estimate.checkpoint_bytes, fraction
+                    entry.model_path,
+                    estimate.checkpoint_bytes,
+                    fraction,
+                    # A resident native MTP head is not discounted as offloaded.
+                    mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
                 )
                 # PLE estimates include a 5% allowance on checkpoint bytes;
                 # offloaded expert bytes must release the same allowance.

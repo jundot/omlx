@@ -644,6 +644,16 @@ def _resolve_model_dir(model_path: str | Path) -> Path | None:
         return None
 
 
+def _is_mtp_path(path: str) -> bool:
+    """True for modules or checkpoint tensors under an embedded MTP draft head.
+
+    Matches ``mtp.*`` and ``*.mtp.*`` by path segment. Shared by the wrapper
+    loop and ``estimate_offload_admission_bytes`` so admission prices exactly
+    what the wrapper keeps resident.
+    """
+    return "mtp" in path.split(".")
+
+
 def _is_stock_switch_glu(obj) -> bool:
     # mlx-lm and mlx-vlm each define their own SwitchGLU class; match by
     # name + shape of the contract, not identity, so the VLM-served path
@@ -784,8 +794,9 @@ def apply_moe_expert_offload(
 
     ``mtp_resident`` keeps the embedded MTP draft head's experts resident
     (glm5_next Lightning MTP + offload; see
-    ``omlx.patches.deepseek_v4.moe_offload``). Other families reject the
-    combination at validation, so only this adapter's path consumes it.
+    ``omlx.patches.deepseek_v4.moe_offload``; qwen4_exp's native head under
+    ``mtp.*`` is skipped by the generic traversal below). Other families
+    reject the combination at validation.
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return 0
@@ -819,6 +830,12 @@ def apply_moe_expert_offload(
     )
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
+        if mtp_resident and _is_mtp_path(path):
+            # Lightning MTP drafts from this head every step; streaming its
+            # experts would put SSD reads on the draft path. Admission counts
+            # it as resident (estimate_offload_admission_bytes mtp_resident).
+            logger.info("moe expert offload: keeping MTP head resident: %s", path)
+            continue
         checkpoint_path = (
             _qwen35_checkpoint_prefix(store, path) if kind == "qwen3_5_moe" else path
         )
@@ -918,13 +935,12 @@ def estimate_offload_admission_bytes(
             for name, spec in header.items():
                 if name == "__metadata__":
                     continue
-                if mtp_resident and (
-                    name.startswith("mtp.") or ".mtp." in name
-                ):
-                    # The draft head stays resident (glm5_next Lightning MTP
-                    # + offload): its slab must not be discounted here, or
-                    # admission overcommits by exactly the bytes the adapter
-                    # refuses to offload.
+                if mtp_resident and _is_mtp_path(name):
+                    # The draft head stays resident (glm5_next / qwen4_exp
+                    # Lightning MTP + offload): its slab must not be discounted
+                    # here, or admission overcommits by exactly the bytes the
+                    # adapter refuses to offload. Same matcher as the wrapper
+                    # loop, so the two cannot drift apart.
                     continue
                 b0, b1 = spec["data_offsets"]
                 m = _PER_EXPERT_PROJ_RE.match(name)
