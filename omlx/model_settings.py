@@ -566,6 +566,14 @@ class ModelSettings:
         Returns:
             New ModelSettings instance with values from dict.
         """
+        # Backward compat: mtp_num_draft_tokens was renamed to
+        # mtp_fixed_depth when the adaptive controller landed (#3797).
+        # Map the old key so existing model_settings.json files keep
+        # their fixed depth instead of silently falling to adaptive.
+        if "mtp_num_draft_tokens" in data and "mtp_fixed_depth" not in data:
+            data = dict(data)
+            data["mtp_fixed_depth"] = data.pop("mtp_num_draft_tokens")
+
         # Get valid field names
         valid_fields = {f.name for f in fields(cls)}
 

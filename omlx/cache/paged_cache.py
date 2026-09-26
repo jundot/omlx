@@ -28,6 +28,7 @@ import hashlib
 import logging
 import threading
 import time
+import os
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -1094,7 +1095,12 @@ class PagedCacheManager(CacheManager):
 
             # A tail under the last matched block (or the root) may still
             # cover the tokens that follow the grid walk.
-            if num_cached_tokens < len(token_ids):
+            # NOTE: tail matching adds a hash computation per lookup on
+            # partial hits; opt-in via env for workloads that need it
+            # (#3895: default off for MTP-heavy agent traffic).
+            if num_cached_tokens < len(token_ids) and os.environ.get(
+                "OMLX_PREFIX_TAIL_MATCH", "0"
+            ) == "1":
                 tail_block = self._match_tail_block(
                     token_ids,
                     parent_hash,
