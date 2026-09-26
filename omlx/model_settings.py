@@ -824,6 +824,13 @@ class ModelSettingsManager:
     def get_settings(self, model_id: str) -> ModelSettings:
         """Get settings for a specific model.
 
+        Distributed deployments surface org-prefixed IDs
+        (``scottlowry/Qwen3.8-27B-oQ4e-mtp``) while settings are keyed by the
+        bare discovery name, so an exact-only lookup silently reverted every
+        per-model setting to defaults for distributed serving (#3071). Exact
+        key wins; otherwise fall back to the single-slash-stripped key — the
+        same tolerance ``get_settings_for_request`` already applies.
+
         Args:
             model_id: The model identifier.
 
@@ -831,9 +838,14 @@ class ModelSettingsManager:
             ModelSettings for the model, or default settings if not found.
         """
         with self._lock:
-            if model_id in self._settings:
+            key = model_id
+            if key not in self._settings and "/" in key:
+                stripped = key.split("/", 1)[1]
+                if stripped in self._settings:
+                    key = stripped
+            if key in self._settings:
                 # Return a copy to prevent external modification
-                settings = self._settings[model_id]
+                settings = self._settings[key]
                 return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
