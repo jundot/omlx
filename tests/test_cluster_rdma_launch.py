@@ -138,3 +138,71 @@ def test_status_reports_what_the_ranks_decided_not_only_the_pre_launch_check(tmp
     report = supervisor.status().to_dict()["stage_links"]
     assert report["active"] is False
     assert report["reason"] == "mcdma-rpcd reports the link down"
+
+
+def test_status_says_whether_the_sampled_tokens_travel_over_rdma(tmp_path):
+    supervisor = _supervisor(tmp_path, lambda deployment: (deployment, _REPORT))
+    supervisor.stage_link_report = _REPORT
+    edge = {**_LINK.to_dict(), "active": True, "reason": ""}
+    relay = {"active": True, "reason": "sampled tokens cross RDMA rank by rank"}
+    supervisor.rank_ready_events = {
+        rank: {
+            "rank": rank,
+            "stage_links": {"active": True, "edges": [edge], "token_relay": relay},
+        }
+        for rank in (0, 1)
+    }
+    report = supervisor.status().to_dict()["stage_links"]
+    assert report["active"] is True
+    assert report["token_relay"] == relay
+
+
+def test_one_live_edge_still_counts_when_another_failed_the_vote(tmp_path):
+    supervisor = _supervisor(tmp_path, lambda deployment: (deployment, _REPORT))
+    supervisor.stage_link_report = _REPORT
+    live = {**_LINK.to_dict(), "active": True, "reason": ""}
+    dead = {
+        **StageLink(2, 1, "linkb", "/tmp/mcdma-rpcd.linkb.sock").to_dict(),
+        "active": False,
+        "reason": "rank 2 could not attach its end",
+    }
+    supervisor.rank_ready_events = {
+        0: {"rank": 0, "stage_links": {"edges": [live]}},
+        1: {"rank": 1, "stage_links": {"edges": [live, dead]}},
+        2: {"rank": 2, "stage_links": {"edges": [dead]}},
+    }
+    report = supervisor.status().to_dict()["stage_links"]
+    assert report["active"] is True
+    assert report["reason"] == "rank 2 could not attach its end"
+
+
+def test_each_hop_shows_whether_its_probe_and_the_ranks_vote_let_it_through(tmp_path):
+    edges = [
+        {"sender_rank": 1, "receiver_rank": 0, "link": "linka", "verified": True},
+        {"sender_rank": 2, "receiver_rank": 1, "link": "linkb", "verified": True},
+        {
+            "sender_rank": 3,
+            "receiver_rank": 2,
+            "link": "linkc",
+            "verified": False,
+            "reason": "link linkc failed its pre-launch check: no reply",
+        },
+    ]
+    report = {"active": True, "reason": "", "edges": edges}
+    supervisor = _supervisor(tmp_path, lambda deployment: (deployment, report))
+    supervisor.stage_link_report = report
+    dead = {
+        "sender_rank": 2,
+        "receiver_rank": 1,
+        "active": False,
+        "reason": "rank 2 could not attach its end",
+    }
+    supervisor.rank_ready_events = {
+        1: {"rank": 1, "stage_links": {"edges": [dead]}},
+        2: {"rank": 2, "stage_links": {"edges": [dead]}},
+    }
+    shown = supervisor.status().to_dict()["stage_links"]
+    assert [edge["active"] for edge in shown["edges"]] == [True, False, False]
+    assert shown["edges"][1]["reason"] == "rank 2 could not attach its end"
+    assert shown["edges"][2]["reason"].startswith("link linkc failed")
+    assert shown["active"] is True
