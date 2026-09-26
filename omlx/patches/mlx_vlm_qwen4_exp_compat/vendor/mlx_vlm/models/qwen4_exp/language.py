@@ -3424,6 +3424,11 @@ class LanguageModel(Qwen3_5LanguageModel):
             return logits, hc_hidden
         return logits
 
+    # Logits are lm_head(mixer output); draft chains may score candidates themselves.
+    mtp_forward._omlx_lm_head_logits = True
+    # The head reads only its own cache, so it can draft before the backbone commit.
+    mtp_forward._omlx_head_cache_only = True
+
     def make_mtp_cache(self):
         mtp = self.get_mtp_module()
         return [QSAKVCache() for _ in mtp.layers] if mtp is not None else []

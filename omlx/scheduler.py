@@ -4883,7 +4883,10 @@ class Scheduler:
         is captured by the ordinary decode step after insert.
         """
         drafter = _block_drafter_for(self.model)
-        if drafter is None or prefill_model is not self.model:
+        # The VLM adapter's _omlx_prefill is a bound method that forwards to
+        # the same model; other prefill hooks cannot return layer captures.
+        prefill_owner = getattr(prefill_model, "__self__", prefill_model)
+        if drafter is None or prefill_owner is not self.model:
             return None
         keep_from = len(request.prompt_token_ids) - drafter.window
         end = start + n_tokens

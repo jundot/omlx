@@ -17,6 +17,9 @@ from omlx.patches.mlx_vlm_mtp.qwen35_verify_attention import verify_attention
 from omlx.patches.qwen35_verify_sdpa_split import (
     _chunked_causal_sdpa,
     _eligible,
+    _gqa_causal_sdpa,
+    _gqa_ready,
+    _wide_causal_sdpa,
 )
 
 HQ, HKV, HD = 24, 4, 256
@@ -56,6 +59,88 @@ def test_chunked_causal_matches_per_row(q_len, kv_len):
     # Same kernel family; short KV is bit-exact, long KV differs only in
     # the 2-pass reduction split (bf16 tail ULP).
     assert diff <= 3e-4, f"q_len={q_len} kv_len={kv_len} diff={diff}"
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("q_len", [2, 5, 8])
+@pytest.mark.parametrize("kv_len", [45, 9000, 33000])
+def test_wide_causal_matches_per_row(q_len, kv_len):
+    """All rows per head in one pass, over strided cache views and odd tails."""
+    kv_len = max(kv_len, q_len)
+    mx.random.seed(9)
+    q = mx.random.normal((1, HQ, q_len, HD)).astype(mx.bfloat16)
+    capacity = kv_len + 256
+    k = mx.random.normal((1, HKV, capacity, HD)).astype(mx.bfloat16)[:, :, :kv_len]
+    v = mx.random.normal((1, HKV, capacity, HD)).astype(mx.bfloat16)[:, :, :kv_len]
+    scale = HD**-0.5
+    ref = _per_row_reference(q, k, v, scale).astype(mx.float32)
+    got = _wide_causal_sdpa(q, k, v, scale).astype(mx.float32)
+    assert got.shape == ref.shape
+    # Probabilities enter the value product in bf16, like MLX's steel kernels.
+    assert mx.abs(ref - got).max().item() <= 2e-2
+
+
+@pytest.mark.skipif(
+    not mx.metal.is_available() or not _gqa_ready(), reason="requires tensor ops"
+)
+@pytest.mark.parametrize("q_len", [2, 5, 8])
+@pytest.mark.parametrize("kv_len", [64, 100, 9000, 33000])
+def test_gqa_causal_matches_per_row(q_len, kv_len):
+    """One pass per KV head over strided cache views and partial key blocks."""
+    mx.random.seed(10)
+    q = mx.random.normal((1, HQ, q_len, HD)).astype(mx.bfloat16)
+    capacity = kv_len + 256
+    k = mx.random.normal((1, HKV, capacity, HD)).astype(mx.bfloat16)[:, :, :kv_len]
+    v = mx.random.normal((1, HKV, capacity, HD)).astype(mx.bfloat16)[:, :, :kv_len]
+    scale = HD**-0.5
+    ref = _per_row_reference(q, k, v, scale).astype(mx.float32)
+    got = _gqa_causal_sdpa(q, k, v, scale).astype(mx.float32)
+    assert got.shape == ref.shape
+    # Probabilities enter the value product in bf16, as in the wide kernel.
+    assert mx.abs(ref - got).max().item() <= 2e-2
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("prefix", [1, 5000])
+def test_chain_tail_matches_cache_writes(prefix):
+    """Chain steps over a tail view equal writing each row into the cache."""
+    from types import SimpleNamespace
+
+    from mlx_lm.models.qwen3_next import Qwen3NextAttention
+
+    from omlx.patches.qwen35_verify_sdpa_split import (
+        ChainKVCache,
+        install_chain_attention,
+    )
+
+    args = SimpleNamespace(
+        hidden_size=512,
+        num_attention_heads=HQ,
+        num_key_value_heads=HKV,
+        head_dim=HD,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        partial_rotary_factor=0.25,
+        rope_theta=10000000.0,
+        rope_scaling=None,
+        max_position_embeddings=262144,
+    )
+    mx.random.seed(4)
+    attn = Qwen3NextAttention(args)
+    attn.set_dtype(mx.bfloat16)
+    assert install_chain_attention(Qwen3NextAttention)
+    stock, base = KVCache(), KVCache()
+    history = mx.random.normal((1, prefix, 512)).astype(mx.bfloat16)
+    mx.eval(attn(history, cache=stock), attn(history, cache=base))
+    tail = ChainKVCache(base)
+    for _ in range(4):
+        x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+        ref = attn(x, cache=stock).astype(mx.float32)
+        got = attn(x, cache=tail).astype(mx.float32)
+        # Outputs are ~3e-2 here; bf16 rounding of the attention output is ~1e-4.
+        assert mx.abs(ref - got).max().item() <= 1e-3
+        assert tail.offset == stock.offset
+    assert base.offset == prefix
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")

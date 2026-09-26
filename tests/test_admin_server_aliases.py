@@ -3,6 +3,8 @@
 ``server_aliases`` save/validate path in /admin/api/global-settings."""
 
 import asyncio
+import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +14,7 @@ from fastapi import HTTPException
 
 import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
+import omlx.utils.network as network
 from omlx.admin.routes import GlobalSettingsRequest
 from omlx.settings import GlobalSettings
 from omlx.utils.network import (
@@ -350,6 +353,22 @@ class TestDetectServerAliases:
         """If no part of the comma-separated host is a loopback/wildcard, no loopback aliases."""
         aliases = detect_server_aliases(host="192.168.1.10, 10.0.0.1")
         assert "localhost" not in aliases
+
+    def test_slow_reverse_lookup_does_not_block(self, monkeypatch):
+        """A resolver that never answers costs the FQDN alias, not server startup."""
+        release = threading.Event()
+        monkeypatch.setattr(network, "_FQDN_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(
+            network.socket, "getfqdn", lambda: release.wait(5) and "slow.example"
+        )
+        try:
+            start = time.monotonic()
+            aliases = detect_server_aliases(host="127.0.0.1")
+            assert time.monotonic() - start < 1.0
+            assert "localhost" in aliases
+            assert "slow.example" not in aliases
+        finally:
+            release.set()
 
 
 # =============================================================================
