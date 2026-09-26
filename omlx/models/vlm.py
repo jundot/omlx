@@ -509,7 +509,22 @@ class VLMModelAdapter(nn.Module):
         """
         starts = starts.reshape(-1)[:batch_size]
         steps = mx.arange(seq_len, dtype=starts.dtype)
-        seq_positions = starts[:, None] + steps[None, :]
+        return self._shape_position_ids(
+            starts[:, None] + steps[None, :],
+            batch_size,
+            seq_len,
+            qwen4_text_prefill_positions=qwen4_text_prefill_positions,
+        )
+
+    def _shape_position_ids(
+        self,
+        seq_positions: mx.array,
+        batch_size: int,
+        seq_len: int,
+        *,
+        qwen4_text_prefill_positions: bool = False,
+    ) -> mx.array:
+        """Give a (batch, seq) position row the layout this model expects."""
         if self._uses_minimax_m3_positions:
             return seq_positions
         if (
@@ -525,6 +540,25 @@ class VLMModelAdapter(nn.Module):
             # text-only fast-path contract.
             return seq_positions
         return mx.broadcast_to(seq_positions[None, :, :], (3, batch_size, seq_len))
+
+    def position_ids_for_absolute(self, positions: mx.array) -> "mx.array | None":
+        """Lay out one caller-computed absolute position row for this model.
+
+        Every other position path here derives positions from a cache offset,
+        which assumes the forward covers a contiguous run of the timeline.
+        Sparse prefill does not: it writes a selected subset of the prompt and
+        each token keeps its *original* position. Those positions cannot be
+        recovered from the cache offset, so the caller passes them in and this
+        applies the same per-model layout rules the derived paths use.
+
+        Returns ``None`` for a language model this adapter never hands
+        ``position_ids`` to itself; passing the argument there would be a
+        guess about an interface nothing here has established.
+        """
+        if not self._uses_mrope:
+            return None
+        row = positions.reshape(1, -1)
+        return self._shape_position_ids(row, 1, int(row.shape[1]))
 
     def get_last_rope_deltas(self) -> float:
         """Extract rope_deltas from language model after VLM prefill.
@@ -631,6 +665,12 @@ class VLMModelAdapter(nn.Module):
             )
         elif self._pending_embeds is not None:
             result = self._forward_with_embeddings(input_ids, cache, **kwargs)
+        elif kwargs.get("position_ids") is not None:
+            # An explicit position_ids is an absolute timeline the caller
+            # computed itself and the branches below cannot reconstruct
+            # (sparse prefill keeps each selected token's original position).
+            # Honour it rather than overwriting it from the cache offset.
+            result = self._language_model(input_ids, cache=cache, **kwargs)
         else:
             if self._uses_mrope and self._batch_rope_deltas is not None and cache is not None:
                 offsets = None

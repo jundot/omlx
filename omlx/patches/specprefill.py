@@ -1043,6 +1043,29 @@ def sparse_prefill(
     first_attn = _get_attn_module(attn_layers[0][1])
     has_rope = hasattr(first_attn, "rope")
 
+    # An attention module can apply RoPE without exposing a wrappable ``.rope``.
+    # mlx_vlm's Qwen3.5-VL family holds a ``rotary_emb`` and rotates from a
+    # ``position_ids`` argument instead, so the wrapper below never reaches it
+    # and the forward falls back to deriving positions from the cache offset.
+    # That writes every selected token at a *dense* position: a 3,122-token
+    # selection out of 15,635 conversation tokens lands at 0..3,121 rather than
+    # at the positions it was selected from. Hand those models the same
+    # ``selected_positions`` through the adapter's explicit-position seam.
+    shape_positions = getattr(model, "position_ids_for_absolute", None)
+    explicit_positions = not has_rope and callable(shape_positions)
+    supplied_positions = False
+
+    def _position_kwargs(start: int, length: int) -> dict:
+        nonlocal supplied_positions
+        if not explicit_positions:
+            return {}
+        positions = shape_positions(selected_positions[start : start + length])
+        # A model that is not driven by explicit positions declines here.
+        if positions is None:
+            return {}
+        supplied_positions = True
+        return {"position_ids": positions}
+
     # Patch RoPE for position-mapped prefill
     original_ropes = {}
     if has_rope:
@@ -1069,7 +1092,11 @@ def sparse_prefill(
                 # target-model eval returns, but don't advance completed-token
                 # progress until the eval has actually finished.
                 progress_callback(processed, n)
-            model(prompt[processed : processed + chunk][None], cache=cache)
+            model(
+                prompt[processed : processed + chunk][None],
+                cache=cache,
+                **_position_kwargs(processed, chunk),
+            )
             mx.eval([c.state for c in cache])
             processed += chunk
             if progress_callback is not None:
@@ -1077,17 +1104,30 @@ def sparse_prefill(
             mx.clear_cache()
 
         # Last token -> logits
-        logits = model(prompt[processed:][None], cache=cache)
+        logits = model(
+            prompt[processed:][None],
+            cache=cache,
+            **_position_kwargs(processed, n - processed),
+        )
         mx.eval(logits)
         if progress_callback is not None:
             progress_callback(n, n)
 
     finally:
         # Replace position-mapped RoPE with offset-adjusted RoPE for decode
+        total_prompt_len = position_offset + M
+        final_cache_offset = cache_start + N
+        adjustment = int(total_prompt_len) - int(final_cache_offset)
+        # Decode continues from the cache offset, which after a sparse prefill
+        # is short of the true timeline by this much. Record it only when this
+        # call actually drove the forward from positions handed in, so that
+        # "an adjustment is outstanding" cannot outlive "positions were
+        # supplied"; when the wrapper below carries it, leave nothing behind
+        # for a second application.
+        model._specprefill_decode_adjustment = (
+            adjustment if supplied_positions else None
+        )
         if has_rope:
-            total_prompt_len = position_offset + M
-            final_cache_offset = cache_start + N
-            adjustment = int(total_prompt_len) - int(final_cache_offset)
             for layer_idx, layer in attn_layers:
                 attn = _get_attn_module(layer)
                 original = original_ropes[layer_idx]
@@ -1105,6 +1145,10 @@ def cleanup_rope(model):
     Call after generation to remove _OffsetAdjustedRoPE wrappers.
     No-op for architectures without RoPE (e.g. Nemotron-H).
     """
+    # The other carrier a sparse prefill can leave behind. Clearing it here
+    # keeps both with the same lifetime, so every caller that already undoes
+    # the wrapper undoes this too.
+    model._specprefill_decode_adjustment = None
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
         if attn is None or not hasattr(attn, "rope"):
