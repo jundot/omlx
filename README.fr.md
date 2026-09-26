@@ -162,7 +162,7 @@ Gère les requêtes concurrentes via le BatchGenerator de mlx-lm. Le nombre maxi
 
 ### Optimisation Claude Code
 
-Support du context scaling pour faire tourner des modèles avec un contexte réduit avec Claude Code. Ajuste les compteurs de tokens reportés pour que l'auto-compactage se déclenche au bon moment, et un keep-alive SSE évite les timeouts de lecture pendant les longs prefills.
+Fait tourner des modèles à contexte réduit avec Claude Code en transmettant la fenêtre de contexte réelle du modèle à l'auto-compactage au lieu de mettre à l'échelle les compteurs de tokens, et un keep-alive SSE évite les timeouts de lecture pendant les longs prefills.
 
 ### Service multi-modèles
 

@@ -152,8 +152,6 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     }
 
     struct ClaudeCodeSettings: Codable, Equatable, Sendable {
-        let contextScalingEnabled: Bool?
-        let targetContextSize: Int?
         let mode: String?
         let opusModel: String?
         let sonnetModel: String?
@@ -168,6 +166,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let openclawToolsProfile: String?
         let hermesModel: String?
         let copilotModel: String?
+        let dshModel: String?
     }
 
     /// Mirrors `omlx.settings.MCPSettings`. The server stores a single path to
@@ -226,8 +225,6 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var maxAudioUploadSize: String? = nil
 
     // Claude Code (PR 9)
-    var claudeCodeContextScalingEnabled: Bool? = nil
-    var claudeCodeTargetContextSize: Int? = nil
     var claudeCodeMode: String? = nil
     var claudeCodeOpusModel: String? = nil
     var claudeCodeSonnetModel: String? = nil
@@ -241,6 +238,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsOpenclawToolsProfile: String? = nil
     var integrationsHermesModel: String? = nil
     var integrationsCopilotModel: String? = nil
+    var integrationsDshModel: String? = nil
 
     /// Path to an MCP server config file. Empty string clears the field on
     /// the server (`global_settings.mcp.config_path = None`). Shared across

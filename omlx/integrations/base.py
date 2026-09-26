@@ -57,6 +57,12 @@ class Integration:
     install_check: str  # binary name to check with `which`
     install_hint: str  # installation instructions
 
+    # Whether `omlx launch <tool>` must interactively pick a model. Tools
+    # that configure one model into their config need a pick; tools that
+    # register the server's whole model catalog (dsh) do not, and resolve
+    # their optional default from `--model` / the saved per-tool setting.
+    requires_model_selection: bool = True
+
     def get_command(self, ctx: IntegrationContext) -> str:
         """Generate the command string for clipboard/display."""
         raise NotImplementedError

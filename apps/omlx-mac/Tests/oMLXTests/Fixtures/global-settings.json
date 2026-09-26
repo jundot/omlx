@@ -73,8 +73,6 @@
         "sub_keys": []
     },
     "claude_code": {
-        "context_scaling_enabled": false,
-        "target_context_size": 200000,
         "mode": "cloud",
         "opus_model": null,
         "sonnet_model": null,
@@ -87,6 +85,7 @@
         "hermes_model": null,
         "pi_model": null,
         "copilot_model": null,
+        "dsh_model": null,
         "openclaw_tools_profile": "coding"
     },
     "system": {

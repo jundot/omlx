@@ -90,6 +90,22 @@ final class MenubarMetricTests: XCTestCase {
         XCTAssertEqual(series.last, Double(MenubarMetricsStore.historyCapacity + 4))
     }
 
+    /// The caption and the sparkline both read `count * interval`, so the two
+    /// constants only make sense together: at the default cadence the graph
+    /// covers one minute. Each constant is pinned on its own first — the
+    /// product alone would also accept the old 60 × 1.0 pair.
+    func testHistoryCapacityKeepsTheDefaultWindowAtOneMinute() {
+        XCTAssertEqual(MenubarMetricsStore.historyCapacity, 120)
+        XCTAssertEqual(MenubarMetricPrefs.defaultRefreshInterval, 0.5)
+        XCTAssertEqual(
+            StatsFormat.window(
+                sampleCount: MenubarMetricsStore.historyCapacity,
+                interval: MenubarMetricPrefs.defaultRefreshInterval
+            ),
+            "60s"
+        )
+    }
+
     func testApplyTickRecordsRatesAndRollsHistory() {
         let store = MenubarMetricsStore()
         store.applyTick(
@@ -152,11 +168,11 @@ final class MenubarMetricTests: XCTestCase {
     func testFormatTpsCoversUnknownWholeAndCompactRanges() {
         XCTAssertEqual(MenubarMetricGlyph.formatTps(nil), "–")
         XCTAssertEqual(MenubarMetricGlyph.formatTps(.infinity), "–")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(-3), "0tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(0), "0tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(24.4), "24tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(999.6), "1000tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(12_345), "12.3ktk/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(-3), "0Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(0), "0Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(24.4), "24Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(999.6), "1000Tok/s")
+        XCTAssertEqual(MenubarMetricGlyph.formatTps(12_345), "12.3kTok/s")
     }
 
     func testSignatureIsStableForIdenticalReadingsAndTracksEveryInput() {

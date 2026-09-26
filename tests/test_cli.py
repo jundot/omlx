@@ -380,6 +380,18 @@ class TestLaunchCommandOptions:
         assert "codex_app" in result.stdout
         assert "Codex App" in " ".join(result.stdout.split())
 
+    def test_launch_lists_dsh(self):
+        """Test that launch help lists the DeepSeek Harness target."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "dsh" in result.stdout
+        assert "DeepSeek Harness" in " ".join(result.stdout.split())
+
 
 class TestLaunchCommandFunction:
     """Tests for launch command runtime behavior."""
@@ -482,6 +494,54 @@ class TestLaunchCommandFunction:
 
         ctx = integration.launch.call_args.args[0]
         assert ctx.cross_session is True
+
+    def test_launch_command_skips_picker_when_integration_registers_catalog(self):
+        """Tools with requires_model_selection=False never prompt.
+
+        The model comes from the saved per-tool default (or --model) and
+        seeds only the tool's own default-model setting.
+        """
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "DeepSeek Harness"
+        integration.is_installed.return_value = True
+        integration.requires_model_selection = False
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {"models": []}
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+        settings.claude_code = None
+        settings.integrations.dsh_model = "Qwen3.8-27B-oQ5e-mtp"
+
+        args = argparse.Namespace(
+            tool="dsh",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model=None,
+            tools_profile="coding",
+        )
+
+        with (
+            # Exactly two requests (health + status): the picker's
+            # /v1/models call must not happen.
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        integration.launch.assert_called_once()
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.model == "Qwen3.8-27B-oQ5e-mtp"
 
     def test_launch_command_resolves_alias_status_metadata(self):
         """Alias model IDs should keep status metadata from the real model."""

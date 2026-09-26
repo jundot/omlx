@@ -10,18 +10,25 @@ enum MenubarMetricPrefs {
     static let liveKey = "showLiveActivityInMenuBar"
     static let averageKey = "menubar.showAverageActivity"
     static let alltimeKey = "menubar.showAlltimeActivity"
-    /// Double seconds. Absent → 1.0; anything outside the picker set is
-    /// clamped back to 1.0 so a corrupt write can't stall or spin the poller.
+    /// Double seconds. Absent → `defaultRefreshInterval`; anything outside the
+    /// picker set falls back to it too, so a corrupt write can't stall or spin
+    /// the poller.
     static let refreshIntervalKey = "menubar.refreshInterval"
     /// Bool, default false = today's auto behavior (Dock icon only while a
     /// window is open). True keeps the Dock icon visible permanently.
     static let showDockIconKey = "showDockIcon"
 
     static let refreshIntervalChoices: [Double] = [0.5, 1.0, 2.0, 3.0]
+    /// The fastest choice, and what the poller and the Appearance picker fall
+    /// back to: the items are opt-in, so whoever turns one on is asking for
+    /// live numbers.
+    static let defaultRefreshInterval: TimeInterval = 0.5
 
     static var refreshInterval: TimeInterval {
-        let raw = UserDefaults.standard.object(forKey: refreshIntervalKey) as? Double ?? 1.0
-        return refreshIntervalChoices.contains(raw) ? raw : 1.0
+        guard let raw = UserDefaults.standard.object(forKey: refreshIntervalKey) as? Double,
+              refreshIntervalChoices.contains(raw)
+        else { return defaultRefreshInterval }
+        return raw
     }
 
     static var showDockIcon: Bool {

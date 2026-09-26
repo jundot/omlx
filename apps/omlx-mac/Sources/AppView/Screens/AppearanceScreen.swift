@@ -8,7 +8,7 @@ import SwiftUI
 
 struct AppearanceScreen: View {
     @AppStorage(MenubarMetricPrefs.refreshIntervalKey)
-    private var refreshInterval = 1.0
+    private var refreshInterval = MenubarMetricPrefs.defaultRefreshInterval
     @AppStorage(MenubarMetricPrefs.showDockIconKey)
     private var showDockIcon = false
     @AppStorage(MenubarMetricPrefs.liveKey)
@@ -151,7 +151,7 @@ struct AppearanceScreen: View {
                 ),
                 subtitle: String(
                     localized: "appearance.section.menubar_items.sub",
-                    defaultValue: "Each item shows prompt-processing and token-generation speed in the menu bar. Click one for details and a live graph.",
+                    defaultValue: "Each item shows prompt-processing and Token-generation speed in the menu bar. Click one for details and a live graph.",
                     comment: "Appearance screen section subtitle explaining the metric items"
                 )
             )

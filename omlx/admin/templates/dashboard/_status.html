@@ -1,3 +1,4 @@
+{% import "components/ui.html" as ui %}
 {% set dashboard_blocks = [
     ('serving_stats', '_serving_stats.html'),
     ('usage_history', '_usage_history.html'),
@@ -10,17 +11,57 @@
 ] %}
             <div x-show="mainTab === 'status'" x-cloak role="tabpanel" id="panel-status" aria-labelledby="tab-status">
                 <div class="animate-fade-in-up">
+                    <!-- Server status header card: the identity the app shows in
+                         its toolbar, plus the two lifecycle actions the API exposes.
+                         Fixed above the grid, so it stays put whatever the layout is. -->
+                    <div class="card mb-6">
+                        <div class="flex flex-wrap items-center justify-between gap-4 px-6 py-5">
+                            <div class="flex items-center gap-3 min-w-0">
+                                {#- The same mark the top bar shows, drawn at the same size
+                                    as the title beside it: a logo, not an app icon in a
+                                    rounded tile, and swapped by theme like the top bar. -#}
+                                <img x-show="activeTheme !== 'dark'" src="/admin/static/navbar-logo-light.svg"
+                                     alt="" class="status-header__mark" aria-hidden="true">
+                                <img x-show="activeTheme === 'dark'" x-cloak src="/admin/static/navbar-logo-dark.svg"
+                                     alt="" class="status-header__mark" aria-hidden="true">
+                                <div class="min-w-0">
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-section font-semibold tracking-tight text-neutral-900">{{ t('navbar.brand') }}</span>
+                                        {{ ui.badge(t('status.header.running'), tone='green', dot=True) }}
+                                    </div>
+                                    <p class="status-header__meta mt-1">
+                                        v{{ version }}
+                                        · {{ t('status.header.uptime') }}
+                                        <span x-text="formatUptime(stats && stats.uptime_seconds)"></span>
+                                        · <span x-text="(stats && stats.host ? stats.host : '') + ':' + (stats && stats.port ? stats.port : '')"></span>
+                                    </p>
+                                </div>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                {{ ui.button(t('settings.server.restart_button'), variant='secondary', size='sm',
+                                             icon='rotate-cw', click='restartServerStart()',
+                                             disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'") }}
+                                {{ ui.button(t('status.header.unload_all'), variant='secondary', size='sm',
+                                             icon='eject', click='unloadAllModels()',
+                                             disabled="!stats.active_models || !stats.active_models.models || stats.active_models.models.length === 0") }}
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Restart progress and failures are a toast now (see the
+                         restartServer.status watcher in dashboard.js). -->
+
                     <!-- Layout toolbar (edit mode). The entry button lives in the navbar. -->
                     <div x-show="dashEditing" x-cloak class="flex flex-wrap items-center justify-end gap-2 mb-4">
                         <template x-if="dashEditing">
                             <div class="flex flex-wrap items-center gap-2">
                                 <span class="text-xs font-medium text-neutral-500">{{ t('status.layout.width') }}</span>
-                                <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
+                                <div class="segmented" role="tablist" :aria-label="window.t('status.layout.width')">
                                     <template x-for="opt in dashWidthOptions" :key="opt.id">
-                                        <button type="button"
+                                        <button type="button" role="tab"
+                                            class="segmented__item"
+                                            :class="dashDraft.width === opt.id ? 'segmented__item--active' : ''"
+                                            :aria-selected="dashDraft.width === opt.id ? 'true' : 'false'"
                                             @click="setDashboardWidth(opt.id)"
-                                            :class="dashDraft.width === opt.id ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-600 hover:bg-neutral-50'"
-                                            class="px-3 py-1.5 text-xs font-medium transition-colors"
                                             x-text="opt.label"></button>
                                     </template>
                                 </div>
@@ -38,7 +79,7 @@
                                 <button type="button"
                                     @click="saveDashboardLayout()"
                                     :disabled="dashSaving"
-                                    class="px-3 py-1.5 text-xs font-medium rounded-lg bg-neutral-900 text-white hover:bg-neutral-800 transition-colors disabled:opacity-50"
+                                    class="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent text-accent-fg hover:bg-accent-hover transition-colors disabled:opacity-50"
                                     x-text="dashSaving ? window.t('status.layout.saving') : window.t('status.layout.save')"></button>
                                 <span x-show="dashSaveError" x-text="dashSaveError" class="basis-full text-right text-xs text-red-600"></span>
                             </div>

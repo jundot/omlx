@@ -681,6 +681,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_model: str | None = None
     integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
+    integrations_dsh_model: str | None = None
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
@@ -4671,6 +4672,7 @@ def _global_settings_response(global_settings):
             "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
+            "dsh_model": global_settings.integrations.dsh_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
             "markitdown_enabled": global_settings.integrations.markitdown_enabled,
             "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
@@ -5511,6 +5513,9 @@ async def update_global_settings(
         integrations_changed = True
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
+        integrations_changed = True
+    if "integrations_dsh_model" in request.model_fields_set:
+        global_settings.integrations.dsh_model = request.integrations_dsh_model
         integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
