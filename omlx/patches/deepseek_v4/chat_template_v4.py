@@ -86,6 +86,12 @@ REASONING_EFFORT_PROMPTS: Dict[str, str] = {
 }
 DEFAULT_REASONING_EFFORT = "low"
 
+# This patch substitutes the checkpoint's chat template, so the reasoning-effort
+# vocabulary above is not discoverable by reading the model directory. Declaring
+# the model_type this template serves lets discovery ask the patch for it
+# instead of hard-coding a model family in the detector.
+CHAT_TEMPLATE_MODEL_TYPE_PREFIX = "deepseek_v4"
+
 # Clients send a wider vocabulary than this template's three levels (OpenAI
 # uses minimal/medium/high; Hermes uses xhigh). Map aliases onto the nearest
 # supported level instead of failing the request: a 400 here surfaces as an

@@ -2,7 +2,11 @@
 
 import json
 
-from omlx.model_discovery import detect_preserve_thinking, detect_thinking_default
+from omlx.model_discovery import (
+    detect_preserve_thinking,
+    detect_reasoning_effort,
+    detect_thinking_default,
+)
 from omlx.model_settings import ModelSettings
 
 # ---------------------------------------------------------------------------
@@ -209,3 +213,79 @@ class TestModelSettingsPreserveThinking:
     def test_set_to_false(self):
         ms = ModelSettings(preserve_thinking=False)
         assert ms.preserve_thinking is False
+
+
+# ---------------------------------------------------------------------------
+# detect_reasoning_effort
+# ---------------------------------------------------------------------------
+
+
+class TestDetectReasoningEffort:
+    """Test chat template detection of the reasoning_effort contract."""
+
+    def test_qwen38_whitelist_and_default(self, tmp_path):
+        """Qwen3.8 pattern: strict tuple whitelist + |default('xhigh')."""
+        template = (
+            "{%- set reasoning_effort = reasoning_effort | default('xhigh') -%}\n"
+            "{%- if reasoning_effort not in ('xhigh', 'medium', 'low') -%}\n"
+            "  {{- raise_exception('Invalid reasoning effort') -}}\n"
+            "{%- endif -%}"
+        )
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_reasoning_effort(tmp_path) == (["xhigh", "medium", "low"], "xhigh")
+
+    def test_gpt_oss_default_only_no_whitelist(self, tmp_path):
+        """gpt-oss pattern: free-form value with a defined-check default."""
+        template = (
+            "{%- if reasoning_effort is not defined -%}\n"
+            "  {%- set reasoning_effort = 'medium' -%}\n"
+            "{%- endif -%}"
+        )
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_reasoning_effort(tmp_path) == (None, "medium")
+
+    def test_free_form_no_default(self, tmp_path):
+        """GLM-5.2 pattern: free-form value, no detectable string default."""
+        template = (
+            "{%- if reasoning_effort is defined and reasoning_effort != 'high' -%}\n"
+            "  {%- set reasoning_effort = 'max' -%}\n"
+            "{%- endif -%}"
+        )
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_reasoning_effort(tmp_path) == (None, None)
+
+    def test_dict_map_is_not_a_whitelist(self, tmp_path):
+        """Inkling pattern: dict membership checks are not strict whitelists
+        (numeric values are also accepted), so no options are reported."""
+        template = (
+            "{%- set effort_map = {'none': 0.0, 'low': 0.2, 'high': 0.9} -%}\n"
+            "{%- if key not in effort_map -%}\n"
+            "  ...\n"
+            "{%- endif -%}\n"
+            "{%- if reasoning_effort is not defined -%}\n"
+            "  {%- set reasoning_effort = 0.9 -%}\n"
+            "{%- endif -%}"
+        )
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_reasoning_effort(tmp_path) == (None, None)
+
+    def test_no_reasoning_effort_returns_none(self, tmp_path):
+        """Template without reasoning_effort (enable_thinking-only models)."""
+        template = "{%- if enable_thinking is false -%}...{%- endif -%}"
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_reasoning_effort(tmp_path) == (None, None)
+
+    def test_no_template_files_returns_none(self, tmp_path):
+        """Directory without any template file returns (None, None)."""
+        assert detect_reasoning_effort(tmp_path) == (None, None)
+
+    def test_falls_back_to_tokenizer_config(self, tmp_path):
+        """Template embedded in tokenizer_config.json is detected."""
+        template = (
+            "{%- set reasoning_effort = reasoning_effort | default('high') -%}\n"
+            "{%- if reasoning_effort not in ('high', 'low') -%}{% endif -%}"
+        )
+        (tmp_path / "tokenizer_config.json").write_text(
+            json.dumps({"chat_template": template})
+        )
+        assert detect_reasoning_effort(tmp_path) == (["high", "low"], "high")
