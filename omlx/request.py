@@ -83,6 +83,8 @@ class SamplingParams:
 
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
+    # Explicit chat-template thinking mode. None preserves model-native behavior.
+    enable_thinking: Optional[bool] = None
 
     def __post_init__(self):
         if self.stop is None:
