@@ -610,8 +610,8 @@
 
             // Accuracy benchmark state
             accModelId: '',
-            accBenchmarks: { mmlu: true, mmlu_pro: false, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, mathqa: false, humaneval: true, mbpp: false, livecodebench: false, bbq: false, safetybench: false },
-            accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
+            accBenchmarks: { mmlu: true, mmlu_pro: false, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, mathqa: false, humaneval: true, mbpp: false, livecodebench: false, bbq: false, safetybench: false, terminalbench_4: false, swebench_verified: false },
+            accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300, terminalbench_4: 10, swebench_verified: 25 },
             accBenchmarkGroups: [
                 {
                     name: window.t('acc_bench.benchmarks.group_knowledge'),
@@ -648,6 +648,13 @@
                     ],
                 },
                 {
+                    name: window.t('acc_bench.benchmarks.group_agentic'),
+                    benchmarks: [
+                        { key: 'terminalbench_4', label: 'Terminal-Bench 4.0', desc: window.t('acc_bench.benchmarks.terminalbench_4_desc'), fullSize: 66, sizes: [5, 10, 20, 40] },
+                        { key: 'swebench_verified', label: 'SWE-bench Verified', desc: window.t('acc_bench.benchmarks.swebench_verified_desc'), fullSize: 500, sizes: [10, 25, 50, 100, 200] },
+                    ],
+                },
+                {
                     name: window.t('acc_bench.benchmarks.group_safety'),
                     benchmarks: [
                         { key: 'bbq', label: 'BBQ', desc: window.t('acc_bench.benchmarks.bbq_desc'), fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
@@ -656,6 +663,7 @@
                 },
             ],
             accBatchSize: 1,
+            accAgentTimeoutMultiplier: 1,
             accEnableThinking: false,
             accSamplingProfile: 'deterministic',
             accAdvancedOptionsOpen: false,
@@ -5155,6 +5163,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
+                            agent_timeout_multiplier: this.accAgentTimeoutMultiplier,
                             external: externalRequest,
                         }),
                     });

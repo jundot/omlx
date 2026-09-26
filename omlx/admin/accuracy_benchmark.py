@@ -14,10 +14,19 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, field_validator, model_validator
 
+from ..eval.agentic import (
+    DOCKER_HOST_ALIAS,
+    HARBOR_AGENT,
+    HARBOR_VERSION,
+    AgentEndpoint,
+    HarborBenchmark,
+)
 from .accuracy_upload import build_upload_context, upload_intelligence_result
 from .external_api import (
     ExternalAPIClient,
@@ -53,7 +62,7 @@ VALID_BENCHMARKS = [
     "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
     "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
     "gsm8k", "mathqa", "humaneval", "mbpp", "livecodebench",
-    "bbq", "safetybench",
+    "bbq", "safetybench", "terminalbench_4", "swebench_verified",
 ]
 
 # Sampling profile for an accuracy run. "deterministic" (default) runs greedy
@@ -74,6 +83,9 @@ class AccuracyBenchmarkRequest(BaseModel):
     # endpoint instead of a local engine and model_id is the remote
     # model name (not validated against the local catalog).
     external: Optional[ExternalEndpointConfig] = None
+    # Agentic suites only (Harbor): scales each task's agent time limit.
+    # Local models are slower than hosted APIs; 1x matches leaderboards.
+    agent_timeout_multiplier: float = 1.0
 
     @model_validator(mode="after")
     def _force_thinking_off_for_external(self) -> "AccuracyBenchmarkRequest":
@@ -88,6 +100,13 @@ class AccuracyBenchmarkRequest(BaseModel):
     def validate_batch_size(cls, v: int) -> int:
         if v not in (1, 2, 4, 8, 16, 32):
             raise ValueError("batch_size must be 1, 2, 4, 8, 16, or 32")
+        return v
+
+    @field_validator("agent_timeout_multiplier")
+    @classmethod
+    def validate_agent_timeout_multiplier(cls, v: float) -> float:
+        if v not in (1.0, 2.0, 4.0, 8.0):
+            raise ValueError("agent_timeout_multiplier must be 1, 2, 4, or 8")
         return v
 
     @field_validator("benchmarks")
@@ -361,6 +380,44 @@ async def _send_event(run: AccuracyBenchmarkRun, event: dict) -> None:
 
 # --- Benchmark execution ---
 
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _resolve_agent_endpoint(request: AccuracyBenchmarkRequest) -> AgentEndpoint:
+    """Model endpoint as reachable from inside a Harbor task container."""
+    if request.external is not None:
+        parts = urlsplit(request.external.base_url)
+        netloc = parts.netloc
+        if parts.hostname in _LOOPBACK_HOSTS:
+            netloc = DOCKER_HOST_ALIAS + (f":{parts.port}" if parts.port else "")
+        return AgentEndpoint(
+            base_url=urlunsplit(parts._replace(netloc=netloc)),
+            api_key=request.external.api_key.get_secret_value() or "omlx",
+            model=request.external.model,
+        )
+    from ..server import _server_state
+
+    gs = _server_state.global_settings
+    port = gs.server.port if gs else 8000
+    # Same fallback as IntegrationContext.auth_token: pi requires a key.
+    api_key = (gs.auth.api_key if gs else "") or "omlx"
+    return AgentEndpoint(
+        base_url=f"http://{DOCKER_HOST_ALIAS}:{port}/v1",
+        api_key=api_key,
+        model=request.model_id,
+    )
+
+
+def _agent_jobs_dir() -> Path:
+    from ..server import _server_state
+
+    gs = _server_state.global_settings
+    base = Path(gs.base_path) if gs else Path.home() / ".omlx"
+    jobs_dir = base / "bench" / "harbor_jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    return jobs_dir
+
+
 
 async def run_accuracy_benchmark(
     run: AccuracyBenchmarkRun, engine_pool: Any
@@ -485,6 +542,14 @@ async def run_accuracy_benchmark(
                 continue
 
             evaluator = bench_cls()
+            is_agentic = isinstance(evaluator, HarborBenchmark)
+            if is_agentic:
+                evaluator.configure_agent_run(
+                    endpoint=_resolve_agent_endpoint(request),
+                    jobs_dir=_agent_jobs_dir(),
+                    job_name=f"{bench_name}-{run.bench_id}",
+                    agent_timeout_multiplier=request.agent_timeout_multiplier,
+                )
 
             # Load dataset
             await _send_event(run, {
@@ -585,6 +650,13 @@ async def run_accuracy_benchmark(
                         "completion_tokens": qr.completion_tokens,
                         "error_message": qr.error_message,
                     })
+                if is_agentic:
+                    question_data.update({
+                        "artifact_path": qr.artifact_path,
+                        "prompt_tokens": qr.prompt_tokens,
+                        "completion_tokens": qr.completion_tokens,
+                        "error_message": qr.error_message,
+                    })
                 question_results.append(question_data)
 
             result_data = {
@@ -600,7 +672,16 @@ async def run_accuracy_benchmark(
                 "sampling_profile": request.sampling_profile,
                 "question_results": question_results,
             }
-            if request.external is not None:
+            if is_agentic:
+                # pi reaches the model over HTTP, so the benchmark's sampling
+                # profile does not apply; the server's model defaults do.
+                result_data.update({
+                    "sampling_profile": "server_defaults",
+                    "harness": f"harbor {HARBOR_VERSION}",
+                    "agent": HARBOR_AGENT,
+                    "job_dir": str(evaluator.job_dir),
+                })
+            if request.external is not None and not is_agentic:
                 status_counts = Counter(
                     qr.status or "invalid_response" for qr in result.question_results
                 )
@@ -660,7 +741,12 @@ async def run_accuracy_benchmark(
             # result_data is the same object stored in _accumulated_results,
             # so the outcome is visible to polling clients and SSE replay
             # without any extra state. Never fails the benchmark.
-            if run.upload_ctx is not None and run.status != "cancelled":
+            # Agentic suites never upload (omlx.ai does not accept them).
+            if (
+                run.upload_ctx is not None
+                and run.status != "cancelled"
+                and not is_agentic
+            ):
                 outcome = await upload_intelligence_result(
                     run, run.upload_ctx, result_data
                 )

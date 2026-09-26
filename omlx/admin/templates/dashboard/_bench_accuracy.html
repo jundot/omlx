@@ -96,6 +96,21 @@
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.sampling_hint') }}</p>
                                     </div>
+                                    <!-- Agent timeout multiplier (agentic suites only) -->
+                                    <div>
+                                        <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.agent_timeout') }}</label>
+                                        <div class="flex items-center gap-4">
+                                            <template x-for="m in [1, 2, 4, 8]" :key="m">
+                                                <label class="flex items-center gap-2 cursor-pointer">
+                                                    <input type="radio" name="accAgentTimeoutMultiplier"
+                                                           :value="m" x-model.number="accAgentTimeoutMultiplier"
+                                                           class="w-4 h-4 border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                                    <span class="text-sm text-neutral-600" x-text="m + '×'"></span>
+                                                </label>
+                                            </template>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.agent_timeout_hint') }}</p>
+                                    </div>
                                     <!-- External OpenAI-compatible endpoint -->
                                     <div>
                                         <label class="inline-flex items-start gap-2 cursor-pointer">
@@ -208,6 +223,17 @@
                                                                       title="{{ t('acc_bench.config.livecodebench_warning') }}">
                                                                     <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
                                                                     {{ t('acc_bench.config.code_exec') }}
+                                                                </span>
+                                                            </div>
+                                                        </template>
+                                                        <!-- Agentic (Harbor + Docker) badge -->
+                                                        <template x-if="b.key === 'terminalbench_4' || b.key === 'swebench_verified'">
+                                                            <div class="mt-2">
+                                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded"
+                                                                      :class="accBenchmarks[b.key] ? 'bg-amber-400/20 text-amber-200' : 'bg-amber-50 text-amber-500'"
+                                                                      title="{{ t('acc_bench.config.agentic_warning') }}">
+                                                                    <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                                                                    {{ t('acc_bench.config.docker_required') }}
                                                                 </span>
                                                             </div>
                                                         </template>
