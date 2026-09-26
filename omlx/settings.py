@@ -542,14 +542,15 @@ class MemorySettings:
     prefill_memory_guard: bool = (
         True  # Memory guard: prefill estimation + generation scheduling defer
     )
-    # Tier selects the active-memory reclaim ratio (safe/balanced/aggressive)
-    # or, for "custom", lets the user pin the dynamic ceiling to a fixed
-    # GB number. See ProcessMemoryEnforcer._get_dynamic_ceiling for the math.
+    # Tier selects how much memory stays free for other apps (safe / balanced
+    # / aggressive) or, for "custom", pins the ceiling to a fixed GB number.
+    # See process_memory_enforcer.tier_reserve_bytes for the reserves.
     memory_guard_tier: MemoryGuardTier = "balanced"
     # Only consulted when memory_guard_tier == "custom". GB. 0 = unset.
     memory_guard_custom_ceiling_gb: float = 0.0
     # Two-stage watermark on the ceiling. soft triggers admission pause + LRU eviction,
-    # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
+    # hard triggers in-flight abort. The saved 0.85 / 0.95 defaults select the
+    # tier's own watermarks; any other value overrides them for every tier.
     soft_threshold: float = 0.85
     hard_threshold: float = 0.95
     # Adaptive prefill throttle. When current memory >= hard_cap * safe_zone_ratio

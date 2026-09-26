@@ -13,6 +13,7 @@ from ..base import (
 from ..cache import ArraysCache, CacheList, KVCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from mlx_lm.models.mla import MultiLinear
+from omlx.patches import glm53_kda_prework
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
@@ -29,6 +30,14 @@ from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
+
+
+def _cache_parts(cache):
+    """(kv, pool) halves of a sparse-layer cache; either half may be missing."""
+    try:
+        return cache[0], cache[1]
+    except (TypeError, IndexError, KeyError):
+        return None, None
 
 
 def glm5_next_cast_predicate(key: str) -> bool:
@@ -214,6 +223,8 @@ class Glm5NextLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+        if glm53_kda_prework.glm53_kda_prefill_eligible(self, inputs, mask, cache):
+            return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
         has_right_padding = cache is not None and cache.lengths is not None
         if has_right_padding:
             mask = mx.arange(S)[None] < cache.lengths[:, None]
@@ -390,7 +401,7 @@ class Glm5NextIndexer(nn.Module):
             pass
         return None
 
-    def __call__(self, x, qr, mask, cache=None, kv_cache=None):
+    def __call__(self, x, qr, mask, cache=None, kv_cache=None, score_from=0):
         B, S, _ = x.shape
         q = linear_forward(self.wq_b, qr).reshape(B, S, self.n_heads, self.head_dim)
         k = self.k_norm(linear_forward(self.wk, x)).reshape(B, S, self.head_dim)
@@ -428,6 +439,10 @@ class Glm5NextIndexer(nn.Module):
             total_max = S
 
         # The pool has already advanced, even when sparse selection is unnecessary.
+        # score_from lets the attention layer score only the rows past the dense
+        # prefix while the pool still advances over every row.
+        if score_from >= S:
+            return None
         if getattr(self, "bypass_short", True) and total_max <= self.index_topk:
             return None
 
@@ -445,9 +460,10 @@ class Glm5NextIndexer(nn.Module):
         tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
         output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
 
-        chunk = 512 if S > 512 else S
+        tail_rows = S - score_from
+        chunk = 512 if tail_rows > 512 else tail_rows
         out = []
-        for c0 in range(0, S, chunk):
+        for c0 in range(score_from, S, chunk):
             c1 = min(c0 + chunk, S)
             cs = c1 - c0
             q_chunk = q[:, c0:c1]
@@ -550,11 +566,91 @@ class Glm5NextSparseAttention(nn.Module):
         )
         self.indexer = Glm5NextIndexer(config)
 
+    def _dense_prefix_rows(self, length, mask, cache):
+        """(leading dense rows, past length) for the causal-prefix bypass.
+
+        A query at cache position ``pos`` sees ``floor((pos + 1) / kp)``
+        complete kpool windows plus the partial-window tail, so whenever that
+        candidate count is at most ``index_topk // kp`` the top-k block set
+        equals the causal prefix ``[0..pos]`` and the row is plain dense causal
+        attention. Returns ``(0, 0)`` (fail closed) whenever eligibility is
+        not proven: without the always-select-tail the selection would omit
+        the partial window, and batched/padded states keep the original path.
+        """
+        kp = self.indexer.index_kpool
+        if kp < 1 or (kp > 1 and not self.indexer.index_kpool_always_select_tail):
+            return 0, 0
+        kv, pool = _cache_parts(cache)
+        past_len = 0
+        if kv is not None:
+            # A merged variable-length batch keeps a per-row (array) offset.
+            offset = getattr(kv, "offset", None)
+            if (
+                type(kv).__name__ != "KVCache"
+                or getattr(kv, "left_padding", None) is not None
+                or not isinstance(offset, int)
+                or offset < 0
+            ):
+                return 0, 0
+            past_len = offset
+        if pool is not None and isinstance(Glm5NextIndexer._processed(pool), list):
+            return 0, 0
+        if mask is not None:
+            if not isinstance(mask, mx.array) or mask.ndim < 2:
+                return 0, 0
+            if mask.shape[-1] < past_len + length or mask.shape[-2] != length:
+                return 0, 0
+        select_max = self.indexer.index_topk // kp
+        boundary = (select_max + 1) * kp - 1
+        return min(length, max(0, boundary - past_len)), past_len
+
+    def _dense_flat(self, q, kv_latent, mask, rows, past_len):
+        """Dense causal attention over the first ``rows`` rows.
+
+        Uses the expanded per-head K/V of the short-context path. The fused
+        SDPA kernel has no 512-wide head, so latent-space SDPA would
+        materialize the full score matrix.
+        """
+        kv_rows = kv_latent[:, :, : past_len + rows]
+        k = self.embed_q(kv_rows, transpose=False)
+        v = self.unembed_out(kv_rows)
+        q_rows = q[:, :, :rows]
+        if k.dtype != q_rows.dtype:
+            k = k.astype(q_rows.dtype)
+            v = v.astype(q_rows.dtype)
+        dense_mask = (
+            "causal" if mask is None else mask[..., :rows, : past_len + rows]
+        )
+        out = mx.fast.scaled_dot_product_attention(
+            q_rows, k, v, scale=self.scale, mask=dense_mask
+        )
+        return out.transpose(0, 2, 1, 3).reshape(q.shape[0], rows, -1)
+
+    def _finish(self, flat, out_dense):
+        if out_dense is not None:
+            flat = mx.concatenate([out_dense, flat], axis=1)
+        return linear_forward(self.o_proj, flat)
+
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+    ) -> mx.array:
+        length = x.shape[1]
+        if length > 8:
+            dense_rows, past_len = self._dense_prefix_rows(length, mask, cache)
+            if dense_rows:
+                return self._forward(x, mask, cache, dense_rows, past_len)
+        return self._forward(x, mask, cache)
+
+    def _forward(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        dense_rows: int = 0,
+        past_len: int = 0,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -581,7 +677,19 @@ class Glm5NextSparseAttention(nn.Module):
             mask,
             cache=cache[1],
             kv_cache=cache[0],
+            score_from=dense_rows,
         )
+        out_dense = None
+        if dense_rows and topk_indices is not None:
+            # The leading rows' selection was the causal prefix: dense SDPA over
+            # the prefix, with the indexer scoring only the tail rows.
+            # When the indexer bypasses selection for the whole forward, keep
+            # the pre-existing all-rows path and drop the dense split entirely.
+            out_dense = self._dense_flat(q, kv_latent, mask, dense_rows, past_len)
+            q = q[:, :, dense_rows:]
+            L -= dense_rows
+            if mask is not None:
+                mask = mask[..., dense_rows:, :]
         attn_mask = mask
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
@@ -610,7 +718,9 @@ class Glm5NextSparseAttention(nn.Module):
                     sel_mask = sel_mask & gathered[:, :, None, :]
                 attn_mask = sel_mask
             elif L <= 8:
-                return self._gathered_attention(q, kv_latent, topk_indices)
+                return self._finish(
+                    self._gathered_attention(q, kv_latent, topk_indices), out_dense
+                )
             else:
                 q_latent = self.embed_q(q)
                 # Native DSA requires FP16/BF16 inputs; quantized projections can yield FP32.
@@ -641,7 +751,7 @@ class Glm5NextSparseAttention(nn.Module):
                     if output_flat is None:
                         output = self.unembed_out(output)
                         output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                    return linear_forward(self.o_proj, output_flat)
+                    return self._finish(output_flat, out_dense)
 
                 k = self.embed_q(kv_latent, transpose=False).astype(native_dtype)
                 v = self.unembed_out(kv_latent).astype(native_dtype)
@@ -654,7 +764,7 @@ class Glm5NextSparseAttention(nn.Module):
                 )
                 if output is not None:
                     output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                    return linear_forward(self.o_proj, output)
+                    return self._finish(output, out_dense)
 
                 shape = list(topk_indices.shape)
                 shape[-1] = Kv + 1
@@ -694,9 +804,10 @@ class Glm5NextSparseAttention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return linear_forward(self.o_proj, output)
+        return self._finish(output, out_dense)
 
     def _gathered_attention(self, q, kv_latent, topk_indices):
+        """Latent-space gather for short query blocks; returns pre-o_proj flat."""
         B, H, L, _ = q.shape
         Kv = kv_latent.shape[2]
         dim = kv_latent.shape[-1]
@@ -721,7 +832,7 @@ class Glm5NextSparseAttention(nn.Module):
         )
         output = output.reshape(B, L, H, dim).transpose(0, 2, 1, 3)
         output = self.unembed_out(output).transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return linear_forward(self.o_proj, output)
+        return output
 
 
 class Glm5NextClampedSwiGLU(nn.Module):

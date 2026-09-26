@@ -5,6 +5,7 @@ import json
 import struct
 
 import pytest
+from mlx_lm.models.pipeline import PipelineMixin
 
 from omlx.cluster.planner import (
     ModelLayout,
@@ -13,6 +14,7 @@ from omlx.cluster.planner import (
     PlanningError,
     apply_pipeline_assignment,
     inspect_safetensors_layout,
+    install_unequal_pipeline_plan,
     plan_unequal_pipeline,
     synthetic_model_layout,
 )
@@ -289,6 +291,40 @@ def test_apply_pipeline_assignment_uses_explicit_range():
     assert model.start_idx == 0
     assert model.end_idx == 3
     assert model.layers == [0, 1, 2]
+
+
+def test_planned_pipeline_accepts_the_split_model_overrides_forward():
+    # qwen3_next, qwen3_5 and ministral3 call super().pipeline(group, split=split)
+    # and then index the layers the plan assigned.
+    class Group:
+        @staticmethod
+        def rank():
+            return 0
+
+        @staticmethod
+        def size():
+            return 2
+
+    class HybridModel(PipelineMixin):
+        def __init__(self):
+            super().__init__()
+            self.layers = list(range(8))
+
+        def pipeline(self, group, split=None):
+            super().pipeline(group, split=split)
+            self.first_local_layer = self.pipeline_layers[0]
+
+    assignments = [
+        PipelineAssignment("large", 0, 3, 8, 5, 0, 0, 10),
+        PipelineAssignment("small", 1, 0, 3, 3, 0, 0, 10),
+    ]
+    model = HybridModel()
+
+    with install_unequal_pipeline_plan(assignments):
+        model.pipeline(Group())
+
+    assert (model.start_idx, model.end_idx) == (3, 8)
+    assert model.first_local_layer == 3
 
 
 # --- The node role travels on the plan, because nothing else reaches a rank --

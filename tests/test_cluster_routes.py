@@ -5,6 +5,7 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -16,6 +17,7 @@ from omlx.cluster.models import (
     RuntimeCapability,
     TransportState,
 )
+from omlx.exceptions import ModelBusyError
 
 
 def _status() -> ClusterStatus:
@@ -143,11 +145,13 @@ class _ReadyClusterPool:
         *,
         fail_canary: bool = False,
         remote_only: bool = False,
+        reload_busy: bool = False,
     ):
         self.model_path = model_path
         self.model_id = "public-model"
         self.fail_canary = fail_canary
         self.remote_only = remote_only
+        self.reload_busy = reload_busy
         self.cluster_registered = False
         self.entry = SimpleNamespace(engine=None)
         self.reloads = 0
@@ -168,6 +172,10 @@ class _ReadyClusterPool:
 
     def unregister_cluster_model(self, model_id):
         assert model_id == self.model_id
+        if self.entry.engine is not None:
+            raise RuntimeError(
+                f"cluster model '{model_id}' is still loaded and cannot be removed"
+            )
         self.cluster_registered = False
         return True
 
@@ -177,6 +185,8 @@ class _ReadyClusterPool:
 
     async def prepare_cluster_reload(self, model_id):
         assert model_id == self.model_id
+        if self.reload_busy and self.entry.engine is not None:
+            raise ModelBusyError(model_id, "activate distributed cluster")
         self.reloads += 1
         self.entry.engine = None
         self.entry.pending_unload_reason = None
@@ -200,11 +210,13 @@ def _install_ready_pool(
     *,
     fail_canary=False,
     remote_only=False,
+    reload_busy=False,
 ):
     pool = _ReadyClusterPool(
         str(model_path),
         fail_canary=fail_canary,
         remote_only=remote_only,
+        reload_busy=reload_busy,
     )
     monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
     # These route tests exercise activation after peer reachability has been
@@ -984,7 +996,12 @@ def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
     assert payload["deployment"]["performance_profiles"] == []
 
 
-def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
+# reload_busy: rank telemetry still counts the failed canary, so the rollback
+# cannot unload the engine. The canary error must still reach the caller.
+@pytest.mark.parametrize("reload_busy", [False, True])
+def test_cluster_activation_rolls_back_when_canary_fails(
+    tmp_path, monkeypatch, reload_busy
+):
     from omlx.cluster.planner import ModelLayout
     from omlx.cluster.registry import configure_cluster_registry
 
@@ -995,6 +1012,7 @@ def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
         monkeypatch,
         model_path,
         fail_canary=True,
+        reload_busy=reload_busy,
     )
     monkeypatch.setattr(
         routes,
@@ -1040,8 +1058,9 @@ def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
     assert response.status_code == 503
     assert "canary failure" in response.json()["detail"]
     assert registry.list() == ()
-    assert pool.entry.engine is None
-    assert pool.reloads == 2
+    if not reload_busy:
+        assert pool.entry.engine is None
+        assert pool.reloads == 2
 
 
 def test_cluster_deployment_rejects_unsafe_ssh_target(tmp_path, monkeypatch):

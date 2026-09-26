@@ -165,8 +165,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
-    /// nil = adaptive depth.
-    let mtpFixedDepth: Int?
+    let mtpAdaptiveMaxDepth: Int?
     // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
     let vlmMtpEnabled: Bool?
     let vlmMtpDraftModel: String?
@@ -252,6 +251,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
+    var mtpAdaptiveMaxDepth: Int? = nil
     var mtpFixedDepth: Int?? = nil // .some(nil) sends JSON null (adaptive).
     // Experimental: VLM MTP
     var vlmMtpEnabled: Bool? = nil

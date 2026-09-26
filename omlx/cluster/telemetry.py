@@ -11,7 +11,7 @@ import shutil
 import struct
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -1105,6 +1105,7 @@ def install_server_telemetry(
     ssd_cache_persistent: bool = False,
     prefill_step_size: int = 2048,
     control_plane: Any | None = None,
+    on_generation_failed: Callable[[str], None] | None = None,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
 
@@ -1666,6 +1667,17 @@ def install_server_telemetry(
             finally:
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous
+
+        def _generate(self) -> Any:
+            # MLX-LM only logs a dead generation thread. Rank zero keeps
+            # answering 404 and other ranks exit 0, so no failure is reported.
+            try:
+                return super()._generate()
+            except Exception as exc:
+                if on_generation_failed is not None:
+                    logger.exception("Rank generation thread died")
+                    on_generation_failed(f"{type(exc).__name__}: {exc}")
+                raise
 
     original_stream_generate = mlx_server.stream_generate
 

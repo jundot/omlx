@@ -102,6 +102,7 @@ def test_qwen4_sparse_gqa_route_fails_closed_outside_production_geometry(
 
 
 def test_qwen4_prefill_restores_chronological_selected_order(monkeypatch):
+    """The argpartition fallback must sort; the native top-k is already ascending."""
     mx.random.seed(81)
     total = 10
     queries = mx.random.normal((1, 24, total, 256)).astype(mx.float16)
@@ -114,14 +115,7 @@ def test_qwen4_prefill_restores_chronological_selected_order(monkeypatch):
 
     monkeypatch.setattr(qsa_fast, "_native_indexer_scores", lambda *a, **k: None)
 
-    def reverse_topk(scores, topk):
-        del scores
-        return mx.broadcast_to(
-            mx.arange(topk - 1, -1, -1, dtype=mx.int32)[None, None],
-            (1, total, topk),
-        )
-
-    monkeypatch.setattr(qsa_fast, "_native_topk_indices", reverse_topk)
+    monkeypatch.setattr(qsa_fast, "_native_topk_indices", lambda *a, **k: None)
 
     def capture(q, k, v, selected, *, q_offset):
         del k, v, q_offset
@@ -148,8 +142,8 @@ def test_qwen4_prefill_restores_chronological_selected_order(monkeypatch):
     )
     mx.eval(output, *captured)
     assert output.shape == (1, total, 24, 256)
-    selected = captured[0]
-    assert selected[0, -1].tolist() == [0, 1, 2, 3]
+    row = captured[0][0, -1].tolist()
+    assert row == sorted(row) and len(set(row)) == 4
 
 
 @pytest.mark.skipif(not _native_available(), reason="native Qwen4 GQA not built")

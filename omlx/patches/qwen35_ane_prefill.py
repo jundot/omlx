@@ -194,9 +194,10 @@ def _target_verify(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 
 
 def _eligible_affine_linear(
-    linear: Any, dtype: mx.Dtype, *, bits: int, group_size: int
+    linear: Any, dtype: mx.Dtype | None, *, bits: int, group_size: int
 ) -> bool:
-    if not isinstance(linear, nn.QuantizedLinear):
+    # dtype is None when the sibling it came from has no stock scales.
+    if dtype is None or not isinstance(linear, nn.QuantizedLinear):
         return False
     weight = getattr(linear, "weight", None)
     scales = getattr(linear, "scales", None)
@@ -222,7 +223,7 @@ def _eligible_affine_linear(
 
 def _affine_spec(
     linear: Any,
-    dtype: mx.Dtype,
+    dtype: mx.Dtype | None,
     *,
     allowed_bits: tuple[int, ...] = (4, 5, 6, 8),
 ) -> tuple[int, int] | None:
@@ -2129,6 +2130,18 @@ def _install_dispatch() -> bool:
     return installed
 
 
+def install_qwen35_ane_prefill_dispatch() -> bool:
+    """Install the class hooks that route prefill to the compiled slices."""
+    if _install_dispatch():
+        return True
+    logger.warning(
+        "Qwen ANE prefill: dispatch hook could not be installed "
+        "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
+        "running prefill on GPU"
+    )
+    return False
+
+
 def _bank_chunk_spans(
     weights: list[mx.array], max_bytes: int
 ) -> list[tuple[int, int]]:
@@ -3118,11 +3131,15 @@ def enable_qwen35_ane_prefill(
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
     tail_padding_min_tokens: int = 0,
+    install_dispatch: bool = True,
 ) -> int:
     """Enable the private ANE backend on eligible MLPs in ``model``.
 
     Returns the number of marked dense Qwen MLP modules. A return value of zero
     is a safe no-op for other model families and unsupported runtimes.
+
+    With ``install_dispatch=False`` only the slices are compiled. The caller
+    must then call ``install_qwen35_ane_prefill_dispatch`` before serving.
     """
     if (
         sequence_length < _ANE_MIN_SEQUENCE_LENGTH
@@ -3175,12 +3192,7 @@ def enable_qwen35_ane_prefill(
     except Exception:
         logger.warning("ANE native extension unavailable; Qwen ANE prefill skipped")
         return 0
-    if not _install_dispatch():
-        logger.warning(
-            "Qwen ANE prefill: dispatch hook could not be installed "
-            "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
-            "running prefill on GPU"
-        )
+    if install_dispatch and not install_qwen35_ane_prefill_dispatch():
         return 0
 
     config = _AnePrefillConfig(

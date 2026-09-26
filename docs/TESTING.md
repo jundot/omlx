@@ -66,6 +66,8 @@ The integration tests cover restored-prefix lengths with boundary snapshots enab
 
 Related regression suites are `test_qwen4_qsa_incremental_cache.py`, `test_qwen4_qsa_decode_gather.py`, and `test_prefill_oom_graceful.py`.
 
+For Qwen4 native sparse-GQA prefill measurements, run `python benchmarks/bench_qwen4_qsa_sparse_gqa.py --key-tokens 24576 --query-tokens 1024 --repetitions 30`. The benchmark reports index scoring, top-k selection, the combined native pipeline, every supported main-attention tile, the portable reference, and maximum error. Production groups native query rows into 4,096-row tiles through 32K keys, 2,048-row tiles through 64K, and 1,024-row tiles above 64K; this bounds the FP32 score sheet while amortizing per-tile dispatch.
+
 # Prefill memory accounting tests
 
 Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_prefill_oom_graceful.py` to check retained versus reclaimed overhead, configured chunk sizes, and abort-cap enforcement. The loop tests run a small initialized MLX model with controlled footprint readings through external and chunked prefill; they do not load a checkpoint.
@@ -120,7 +122,8 @@ save/reopen payload and speculative-decoding toggle exclusion.
 
 `tests/test_moe_expert_offload.py` also exercises Qwen4-Exp MoE routing with
 512 experts, top-k 10, 64 resident slots, shared experts, and repeated
-evictions. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
+evictions, plus the resident Lightning MTP head (`mtp.*`) and its admission
+pricing. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
 checkpoint completeness, dense-model exclusion, API/runtime rejection, and
 PLE/Engram metadata after expert savings.
 
@@ -168,3 +171,7 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+# Fused routed-expert decode tests
+
+Run `python -m pytest -q tests/test_qwen35_moe_routed_decode.py tests/test_qwen35_moe_router.py tests/test_qwen35_moe_gate_up.py` to check the one-token routed-expert kernels. Real `Qwen3_5MoeSparseMoeBlock` instances with random 4-bit weights at the Flash-Next shape (hidden 2560, intermediate 640, top-k 10) and at hidden 1024 / intermediate 320 must match the composed body bit for bit. The other cases check that shapes where MLX would pick a different mat-vec partition, other bit widths and group sizes, top-k 8, prefill and verify rows, float16, blocks without the gate+up fusion and a kernel failure all keep the composed body.

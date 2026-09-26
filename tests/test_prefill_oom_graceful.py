@@ -1143,6 +1143,114 @@ def test_record_chunk_transient_keeps_partial_context_sample():
     assert tracker.last_delta_bytes == partial_delta
 
 
+def test_chunk_backpressure_holds_mlx_at_the_peak_target(monkeypatch):
+    """While a chunk runs, MLX memory is capped at the guard's peak target."""
+    calls = []
+    monkeypatch.setattr(
+        sched_mod, "set_chunk_memory_limit", lambda owner, limit: calls.append(limit)
+    )
+    ns = _throttle_ctx(current=30 * _GB, hard=50 * _GB)
+    ns._prefill_memory_guard = True
+    ns._last_mlx_active_memory_bytes = 20 * _GB
+    ns._current_usage_bytes = lambda: 30 * _GB
+    target = Scheduler._prefill_peak_target(ns)
+
+    with Scheduler._chunk_backpressure(ns):
+        assert calls == [20 * _GB + target - 30 * _GB]
+    assert calls[-1] is None
+
+    # Past the target, the chunk still gets the floor instead of a stall.
+    calls.clear()
+    ns._current_usage_bytes = lambda: target + _GB
+    with Scheduler._chunk_backpressure(ns):
+        pass
+    assert calls == [20 * _GB + Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES, None]
+
+
+def _filled_caches():
+    from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
+
+    from omlx.patches.deepseek_v4.cache_extras import PoolingCache
+
+    mx = sched_mod.mx
+    keys = mx.arange(2 * 3 * 4, dtype=mx.float16).reshape(1, 2, 3, 4)
+    kv, inner, rotating = KVCache(), KVCache(), RotatingKVCache(max_size=8)
+    for c in (kv, inner, rotating):
+        c.update_and_fetch(keys, keys)
+    pool = PoolingCache(4)
+    pool.update_and_fetch(mx.ones((1, 1, 4), dtype=mx.float16))
+    return keys, kv, inner, rotating, pool, [kv, CacheList(inner, pool), rotating]
+
+
+def _reserve_ctx(*, current=0, cap=0, floor_transient=0, headroom=1.0, busy=False):
+    mx = sched_mod.mx
+    charged = []
+    return SimpleNamespace(
+        charged=charged,
+        running={"other": object()} if busy else {},
+        _stream=mx.default_stream(mx.default_device()),
+        _memory_hard_limit_bytes=cap,
+        _prefill_headroom_safety=headroom,
+        _PREFILL_HEADROOM_SAFETY=Scheduler._PREFILL_HEADROOM_SAFETY,
+        _prefill_abort_cap=lambda: 0,
+        _current_usage_bytes=lambda: current,
+        _prefill_min_chunk_tokens=32,
+        _admission_transient_bound=lambda n, kv_len, **kwargs: (
+            charged.append(n) or floor_transient
+        ),
+    )
+
+
+def test_prefill_reserve_sizes_growing_caches_once():
+    """KV caches, including CacheList members, grow once and then fill in place."""
+    mx = sched_mod.mx
+    keys, kv, inner, rotating, pool, caches = _filled_caches()
+    ns = _reserve_ctx()
+
+    with patch.object(sched_mod, "_sync_and_clear_cache") as clear:
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 3
+    # One release per grown cache, so a restored prefix is never held twice.
+    assert clear.call_count == 3
+    for c in (kv, inner):
+        assert c.keys.shape[2] == c.values.shape[2] == 768
+        assert c.offset == 3
+        assert bool(mx.array_equal(c.keys[..., :3, :], keys))
+    assert pool._pool_buf.shape[1] == 150
+    assert rotating.keys.shape[2] == 3
+
+    buffer = kv.keys
+    kv.update_and_fetch(keys, keys)
+    assert kv.keys is buffer
+    assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
+
+
+def test_prefill_reserve_keeps_room_for_a_floor_chunk():
+    """With other requests in flight, a reserve that would starve their next
+    chunk falls back to growth; a lone prompt only has to fit itself."""
+    _, kv, _, _, pool, caches = _filled_caches()
+    # The reserve itself (~34KB) fits under the cap; the floor chunk does not.
+    ns = _reserve_ctx(
+        current=10 * _GB - 1024**2, cap=10 * _GB, floor_transient=1024**2, busy=True
+    )
+
+    with patch.object(sched_mod, "_sync_and_clear_cache") as clear:
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
+    clear.assert_not_called()
+    assert ns.charged == [32]
+    assert kv.keys.shape[2] == 256
+    assert pool._pool_buf.shape[1] == 1
+
+    # The reserve must fit under the peak target (hard x headroom), not the
+    # hard limit.
+    ns = _reserve_ctx(current=9.5 * _GB, cap=10 * _GB, headroom=0.9)
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
+
+    ns = _reserve_ctx(current=10 * _GB - 1024**2, cap=10 * _GB, floor_transient=1024**2)
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 3
+
+
 @pytest.mark.parametrize(
     ("monitor", "expected_gathered", "expected_state_route"),
     [(_qwen4_monitor(), True, True), (_monitor(head_dim=192), False, None)],
@@ -1208,16 +1316,30 @@ def test_step_prefill_reclaims_before_first_guard(
         ),
         patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
-        patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
+        patch.object(
+            sched_mod.mx, "get_active_memory", side_effect=[10 * _GB, 10 * _GB + 64]
+        ),
+        patch.object(sched_mod.mx, "get_cache_memory", side_effect=[0, 2 * _GB]),
+        # The previous chunk's released pool still sits in both ledgers, so
+        # only the MLX counters show this chunk's growth.
+        patch.object(sched_mod, "get_phys_footprint", return_value=41 * _GB),
+        patch.object(sched_mod, "get_graphics_footprint", return_value=40 * _GB),
+        patch.object(
+            Scheduler,
+            "_reserve_prefill_capacity",
+            lambda self, cache, tokens, rid=None: events.append(("reserve", tokens)),
+        ),
     ):
         done = ns._step_prefill_chunk(state)
 
     assert done is False
-    assert events[:3] == ["sync", "adaptive", "guard"]
+    # The whole prompt (3 prefill tokens plus the last) is reserved before
+    # the first guard reads current usage.
+    assert events[:4] == ["sync", ("reserve", 4), "adaptive", "guard"]
     ns._record_chunk_transient.assert_called_once_with(
         2,
-        100,
-        300,
+        11 * _GB,
+        13 * _GB + 64,
         request_id="req-prefill",
         loop_label="chunked_step",
         kv_len=0,
@@ -1555,9 +1677,12 @@ def test_qwen4_local_reclaim_updates_next_guard_prediction(route):
         gathered_core=route,
     )
     before = ns._predicted_chunk_transient(512, 180_000, gathered_core=route)
+    # macOS 27 keeps charging the released pool to phys_footprint for a
+    # moment after the clear, so only the pool size shows what was released.
     with (
         patch.object(sched_mod, "_sync_and_clear_cache"),
-        patch.object(sched_mod, "get_phys_footprint", side_effect=[80 * _GB, 50 * _GB]),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=30 * _GB),
+        patch.object(sched_mod, "get_phys_footprint", return_value=80 * _GB),
     ):
         Scheduler._clear_cache(ns)
     charge = ns._prefill_transient_tracker.flat_overhead_charge_for(route)
@@ -1604,6 +1729,9 @@ def test_generic_prefill_loop_submits_chunks_with_fixed_reclaim_charge(
     current = cap - 1000 * 1024**2
     ns._prefill_transient_tracker.record_reclaim(960 * 1024**2)
     monkeypatch.setattr(sched_mod, "get_phys_footprint", lambda: current)
+    # Chunk growth is read from MLX counters; hold them flat as well.
+    monkeypatch.setattr(sched_mod.mx, "get_active_memory", lambda: 0)
+    monkeypatch.setattr(sched_mod.mx, "get_cache_memory", lambda: 0)
     submitted = []
 
     def forward(tokens, *args, **kwargs):
@@ -1640,6 +1768,9 @@ def test_generic_prefill_loop_submits_chunks_with_fixed_reclaim_charge(
 
     assert submitted == [192, 192, 192, 192, 192, 64]
     assert all(layer.offset == len(prompt) - 1 for layer in cache)
+    # Sized once for the whole prompt after the first chunk; step growth
+    # would have ended at 1216.
+    assert all(layer.keys.shape[2] == 1280 for layer in cache)
 
 
 @pytest.mark.parametrize("chunked", [False, True])

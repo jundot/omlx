@@ -804,10 +804,10 @@
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.mtp_depth') }}</span>
                                             <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.mtp_depth_hint') }}</p>
                                         </div>
-                                        <select x-model="modelSettings.mtp_fixed_depth"
-                                                class="w-36 flex-shrink-0 px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
-                                            <option value="">{{ t('modal.model_settings.mtp_depth_adaptive') }}</option>
-                                            {% for depth in range(1, 7) %}
+                                        <select x-model="modelSettings.mtp_adaptive_max_depth"
+                                                class="w-48 flex-shrink-0 px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
+                                            <option value="3">{{ t('modal.model_settings.mtp_depth_adaptive') }}</option>
+                                            {% for depth in range(4, 7) %}
                                             <option value="{{ depth }}">{{ t('modal.model_settings.mtp_depth_option').replace('{n}', depth|string) }}</option>
                                             {% endfor %}
                                         </select>

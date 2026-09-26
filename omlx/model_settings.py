@@ -37,7 +37,10 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 # These families keep the MTP head resident while backbone experts stream.
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
+# qwen4_exp (Qwen3.8-Flash-Next) drafts from its embedded native head, whose
+# experts the generic SwitchGLU adapter leaves resident (see
+# apply_moe_expert_offload's mtp_resident).
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
@@ -448,6 +451,7 @@ class ModelSettings:
     # Mutually exclusive with DFlash.
     mtp_enabled: bool = False
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
+    # Qwen 27B enforces a minimum adaptive ceiling of 4.
     # None = model-specific default (4 for dense Qwen3.5-family on M5, else 3
     # for DeepSeek-V4 and Qwen3.5/3.6). An adaptive controller picks 1..max
     # per sequence from rolling acceptance/latency estimates.

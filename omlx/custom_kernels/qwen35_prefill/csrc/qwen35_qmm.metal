@@ -182,3 +182,5 @@ instantiate_qwen35_moe_weighted_sum_tiled(float16_t, float, 8, 256);
 instantiate_qwen35_moe_weighted_sum_tiled(bfloat16_t, float, 8, 256);
 instantiate_qwen35_moe_weighted_sum_tiled(float16_t, float, 6, 256);
 instantiate_qwen35_moe_weighted_sum_tiled(bfloat16_t, float, 6, 256);
+instantiate_qwen35_moe_weighted_sum_tiled(float16_t, float, 10, 256);
+instantiate_qwen35_moe_weighted_sum_tiled(bfloat16_t, float, 10, 256);

@@ -1562,14 +1562,14 @@ private struct AccelerationSection: View {
             }
             if vm.mtpEnabled {
                 Row(label: String(localized: "settings.acceleration.mtp.depth.label",
-                                  defaultValue: "Draft Depth",
+                                  defaultValue: "Adaptive max depth",
                                   comment: "Row label for the Lightning MTP draft depth picker"),
                     sublabel: String(localized: "settings.acceleration.mtp.depth.sub",
-                                     defaultValue: "Adaptive adjusts the draft depth each step. Depth N always drafts N tokens.",
+                                     defaultValue: "Automatically adjusts the draft depth up to the selected maximum.",
                                      comment: "Sublabel for the Lightning MTP draft depth picker")) {
                     Popup(
-                        selection: vm.bindProfile($vm.mtpFixedDepth),
-                        width: .controlMedium,
+                        selection: vm.bindProfile($vm.mtpAdaptiveMaxDepth),
+                        width: .controlWide,
                         options: ModelSettingsScreenVM.mtpDepthOptions
                     )
                 }
