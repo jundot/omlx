@@ -6,7 +6,6 @@
         --text-primary: #0f172a;
         --text-secondary: #475569;
         --text-tertiary: #64748b;
-        --text-muted: #94a3b8;
         --border-faint: #e2e8f0;
         --border-normal: #cbd5e1;
         --code-bg: #f3f4f6;
@@ -20,7 +19,6 @@
         --text-primary: #efefef;
         --text-secondary: #a1a1aa;
         --text-tertiary: #71717a;
-        --text-muted: #52525b;
         --border-faint: #3f3f46;
         --border-normal: #52525b;
         --code-bg: #27272a;
@@ -46,8 +44,8 @@
     [data-theme="dark"] .text-neutral-700 { color: var(--text-secondary) !important; }
     [data-theme="dark"] .text-neutral-600 { color: var(--text-secondary) !important; }
     [data-theme="dark"] .text-neutral-500 { color: var(--text-tertiary) !important; }
-    [data-theme="dark"] .text-neutral-400 { color: var(--text-muted) !important; }
-    [data-theme="dark"] .text-neutral-300 { color: var(--text-muted) !important; }
+    [data-theme="dark"] .text-neutral-400 { color: var(--text-tertiary) !important; }
+    [data-theme="dark"] .text-neutral-300 { color: var(--text-tertiary) !important; }
 
     /* Cluster status is operational data, not decorative helper copy. Keep
        its cache/fabric labels and request metrics readable in dark mode even
@@ -215,7 +213,7 @@
         border-color: var(--border-normal) !important;
     }
     [data-theme="dark"] button.hover\:border-neutral-400:hover {
-        border-color: var(--text-muted) !important;
+        border-color: var(--text-tertiary) !important;
     }
 
     /* === Range slider === */
