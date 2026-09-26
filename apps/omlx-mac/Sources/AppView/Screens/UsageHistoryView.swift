@@ -89,10 +89,10 @@ struct UsageHistoryView: View {
                         Row(label: row.modelId ?? "", sublabel: detail(row)) {
                             VStack(alignment: .trailing, spacing: 3) {
                                 Text(String(localized: "status.usage.row.tokens",
-                                            defaultValue: "\(compact(row.totalTokens)) tokens",
+                                            defaultValue: "\(compact(row.totalTokens)) Tokens",
                                             comment: "Per-model total token count; placeholder is a compact number"))
                                 Text(String(localized: "status.usage.row.requests_speed",
-                                            defaultValue: "\(row.requests) requests · \(speed(row.generationTps)) tok/s",
+                                            defaultValue: "\(row.requests) requests · \(speed(row.generationTps)) Tok/s",
                                             comment: "Per-model request count and output speed; placeholders are a count and a formatted tokens-per-second value"))
                                     .foregroundStyle(.secondary)
                             }.font(.omlxMono(11))
@@ -180,7 +180,7 @@ struct UsageHistoryView: View {
                         comment: "Heading above the usage history day/hour heatmap"))
                 .font(.omlxText(13))
             Text(String(localized: "status.usage.heatmap.note",
-                        defaultValue: "00–23 hours · darker green means more tokens · repeated DST hours combine",
+                        defaultValue: "00–23 hours · darker green means more Tokens · repeated DST hours combine",
                         comment: "Legend text under the usage heatmap heading"))
                 .font(.omlxText(11)).foregroundStyle(.secondary)
             HStack(spacing: 3) {
@@ -215,7 +215,7 @@ struct UsageHistoryView: View {
 
     private func cellLabel(_ date: String, _ hour: Int, _ count: Int) -> String {
         String(localized: "status.usage.heatmap.cell",
-               defaultValue: "\(date) \(String(format: "%02d", hour)):00 · \(count.formatted()) tokens",
+               defaultValue: "\(date) \(String(format: "%02d", hour)):00 · \(count.formatted()) Tokens",
                comment: "Tooltip and accessibility label for one heatmap cell; placeholders are the date, the two-digit hour, and a formatted token count")
     }
 

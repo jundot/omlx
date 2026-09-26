@@ -248,7 +248,7 @@ final class MenubarControllerPortTests: XCTestCase {
         let activity = try XCTUnwrap(stats.liveActivity)
 
         XCTAssertEqual(activity.menuBarTitle, "PP 38% · 12k/32k")
-        XCTAssertEqual(activity.detail, "Laguna XS.2 · 321 tok/s · 47s left")
+        XCTAssertEqual(activity.detail, "Laguna XS.2 · 321 Tok/s · 47s left")
     }
 
     func testLiveActivityShowsGenerationWhenNoPrefillIsActive() throws {
@@ -277,8 +277,8 @@ final class MenubarControllerPortTests: XCTestCase {
         let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
         let activity = try XCTUnwrap(stats.liveActivity)
 
-        XCTAssertEqual(activity.menuBarTitle, "GEN 42.1 tok/s")
-        XCTAssertEqual(activity.detail, "Laguna XS.2 · 128 tok · 3s")
+        XCTAssertEqual(activity.menuBarTitle, "GEN 42.1 Tok/s")
+        XCTAssertEqual(activity.detail, "Laguna XS.2 · 128 Tok · 3s")
     }
 
     func testLiveActivityShowsQueuedRequestsWhenNoRequestIsRunning() throws {
@@ -342,7 +342,7 @@ final class MenubarControllerPortTests: XCTestCase {
         await poller.refreshOnce()
 
         XCTAssertEqual(poller.sessionStats?.totalPromptTokens, 99)
-        XCTAssertEqual(poller.liveStats?.liveActivity?.menuBarTitle, "GEN 42.1 tok/s")
+        XCTAssertEqual(poller.liveStats?.liveActivity?.menuBarTitle, "GEN 42.1 Tok/s")
         XCTAssertEqual(poller.alltimeStats?.totalRequests, 3)
         XCTAssertEqual(MenubarStatsURLProtocol.recordedActivityRequestCount(), 1)
     }
@@ -391,7 +391,7 @@ final class MenubarControllerPortTests: XCTestCase {
 
         await poller.refreshOnce()
 
-        XCTAssertEqual(poller.liveStats?.liveActivity?.menuBarTitle, "GEN 42.1 tok/s")
+        XCTAssertEqual(poller.liveStats?.liveActivity?.menuBarTitle, "GEN 42.1 Tok/s")
         XCTAssertEqual(MenubarStatsURLProtocol.recordedActivityRequestCount(), 1)
     }
 
