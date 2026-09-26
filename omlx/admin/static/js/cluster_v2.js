@@ -77,6 +77,7 @@ function clusterV2Wizard() {
         cudaFabricVerify: '/admin/api/cluster/cuda-fabric/verify',
         rdmaLinks: '/admin/api/cluster/rdma-links',
         rdmaLinkVerify: '/admin/api/cluster/rdma-links/verify',
+        remotePrefill: '/admin/api/remote-prefill',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
         deploymentLoad: (id) =>
@@ -319,6 +320,7 @@ function clusterV2Wizard() {
         cudaFabricMemberA: '',
         cudaFabricMemberB: '',
         rdmaLinks: { loading: false, verifying: '', error: '', data: null },
+        remotePrefill: { loading: false, error: '', data: null },
 
         // ---- feedback ----------------------------------------------------------
         toasts: [],
@@ -364,6 +366,7 @@ function clusterV2Wizard() {
                 ) {
                     await this.refreshDeployments();
                     await this.refreshRdmaLinks();
+                    await this.refreshRemotePrefill();
                 }
             } finally {
                 this.tickBusy = false;
@@ -3748,6 +3751,48 @@ function clusterV2Wizard() {
                 .replace('{latency}', measured.latency_p50_us.toFixed(1))
                 .replace('{to}', measured.to_peer_gbit_s.toFixed(1))
                 .replace('{from}', measured.from_peer_gbit_s.toFixed(1));
+        },
+
+        async refreshRemotePrefill() {
+            if (this.remotePrefill.loading) return;
+            this.remotePrefill.loading = true;
+            try {
+                this.remotePrefill.data = await this.apiFetch(CLUSTER_V2_API.remotePrefill);
+                this.remotePrefill.error = '';
+            } catch (error) {
+                this.remotePrefill.error =
+                    error?.message || window.t('cluster.v2.err.remote_prefill');
+            } finally {
+                this.remotePrefill.loading = false;
+            }
+        },
+
+        remotePrefillState(model) {
+            if (model.unsupported) {
+                return { label: window.t('cluster.v2.remote_prefill.off'), tone: 'text-neutral-500' };
+            }
+            if (model.paused) {
+                return { label: window.t('cluster.v2.remote_prefill.paused'), tone: 'text-red-700' };
+            }
+            if (model.running) {
+                return { label: window.t('cluster.v2.remote_prefill.running'), tone: 'text-blue-700' };
+            }
+            return { label: window.t('cluster.v2.remote_prefill.ready'), tone: 'text-green-700' };
+        },
+
+        remotePrefillDetail(model) {
+            if (model.unsupported) {
+                return window.t('cluster.v2.remote_prefill.unsupported').replace('{reason}', model.unsupported);
+            }
+            const last = model.last || {};
+            if (last.tokens) {
+                return window.t('cluster.v2.remote_prefill.last')
+                    .replace('{tokens}', String(last.tokens))
+                    .replace('{prefill}', Number(last.prefill_s).toFixed(2))
+                    .replace('{transfer}', Number(last.transfer_s).toFixed(2))
+                    .replace('{rate}', Number(last.gbit_s).toFixed(1));
+            }
+            return model.last_error || window.t('cluster.v2.remote_prefill.none_yet');
         },
 
         async downloadClusterDiagnostics() {
