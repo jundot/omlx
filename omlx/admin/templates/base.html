@@ -176,7 +176,6 @@
         [data-enhanced-readability] {
             --text-secondary: var(--text-primary) !important;
             --text-tertiary: var(--text-primary) !important;
-            --text-muted: var(--text-primary) !important;
             --text-danger: #d92d20 !important;
         }
         [data-theme="dark"][data-enhanced-readability] {
@@ -192,10 +191,8 @@
         [data-enhanced-readability][data-theme] .text-neutral-600,
         [data-enhanced-readability][data-theme] .text-neutral-700,
         [data-enhanced-readability][data-theme] .text-neutral-800,
-        [data-enhanced-readability][data-theme] .text-muted,
         [data-enhanced-readability][data-theme] .text-fg-tertiary,
-        [data-enhanced-readability][data-theme] .text-fg-secondary,
-        [data-enhanced-readability][data-theme] .text-fg-muted {
+        [data-enhanced-readability][data-theme] .text-fg-secondary {
             color: var(--text-primary) !important;
         }
         [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
@@ -218,8 +215,7 @@
         }
         /* Inline gray vars (e.g. style="color: var(--text-tertiary)") -> primary */
         [data-enhanced-readability] [style*="--text-tertiary"],
-        [data-enhanced-readability] [style*="--text-secondary"],
-        [data-enhanced-readability] [style*="--text-muted"] {
+        [data-enhanced-readability] [style*="--text-secondary"]{
             color: var(--text-primary) !important;
         }
         /* Hardcoded gray hex inline colors -> primary (reds/greens excluded) */

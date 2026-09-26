@@ -176,12 +176,12 @@ private struct UpdateConfirmationSheet: View {
                 Text(String(localized: "update.confirm.title",
                             defaultValue: "oMLX \(update.version) is available",
                             comment: "Update confirmation sheet title; placeholder is the version"))
-                    .font(.omlxText(17, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.section, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "update.confirm.subtitle",
                             defaultValue: "Review the release notes before downloading and relaunching.",
                             comment: "Subtitle for the update confirmation sheet"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
             }
             Spacer()
@@ -210,7 +210,7 @@ private struct UpdateConfirmationSheet: View {
                 Text(String(localized: "update.confirm.empty_notes",
                             defaultValue: "This release does not include detailed notes.",
                             comment: "Empty state when a GitHub release has no release notes"))
-                    .font(.omlxText(13))
+                    .font(.omlxText(DesignTokens.FontSize.body))
                     .foregroundStyle(theme.textSecondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -241,12 +241,12 @@ private struct UpdateConfirmationSheet: View {
                 Text(String(localized: "update.confirm.size",
                             defaultValue: "Download size: \(update.sizeText ?? "Unknown")",
                             comment: "Update confirmation download size line; placeholder is a formatted byte size or Unknown"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                 Text(String(localized: "update.confirm.restart_notice",
                             defaultValue: "oMLX will quit, install the update, and relaunch.",
                             comment: "Notice explaining what happens after confirming an update"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
             }
             Spacer()
@@ -420,7 +420,7 @@ private struct ReleaseNotesImageGroup: View {
                                 .foregroundStyle(theme.textTertiary)
                             if !image.alt.isEmpty {
                                 Text(image.alt)
-                                    .font(.omlxText(11))
+                                    .font(.omlxText(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.textSecondary)
                                     .multilineTextAlignment(.center)
                             }

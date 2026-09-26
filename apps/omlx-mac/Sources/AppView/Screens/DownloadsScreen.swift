@@ -153,7 +153,7 @@ private struct SourceSwitcher: View {
                 Text(String(localized: "downloads.source.ms_unavailable",
                             defaultValue: "ModelScope SDK unavailable in this build",
                             comment: "Note shown under the source switcher when the ModelScope SDK isn't installed"))
-                    .font(.omlxText(10.5))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(.secondary)
             }
         }
@@ -251,16 +251,16 @@ private struct AddFromHFSection: View {
             Text(String(localized: "downloads.mirror.label",
                         defaultValue: "Mirror:",
                         comment: "Inline label preceding the mirror host on the Downloads screen"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textTertiary)
             Text(mirrorHost)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
             if mirrorIsCustom {
                 Text(String(localized: "downloads.mirror.custom",
                             defaultValue: "custom",
                             comment: "Badge shown next to the mirror host when the user has configured a custom endpoint"))
-                    .font(.omlxText(10, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(theme.blueDot)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -407,16 +407,16 @@ private struct AddFromMSSection: View {
             Text(String(localized: "downloads.mirror.label",
                         defaultValue: "Mirror:",
                         comment: "Inline label preceding the mirror host on the Downloads screen"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textTertiary)
             Text(mirrorHost)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
             if mirrorIsCustom {
                 Text(String(localized: "downloads.mirror.custom",
                             defaultValue: "custom",
                             comment: "Badge shown next to the mirror host when the user has configured a custom endpoint"))
-                    .font(.omlxText(10, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(theme.blueDot)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -503,7 +503,7 @@ private struct SearchDropdown: View {
                     Text(String(localized: "downloads.search.loading",
                                 defaultValue: "Searching…",
                                 comment: "Placeholder shown inside the autocomplete dropdown while a search is in flight"))
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                     Spacer()
                 }
@@ -569,13 +569,13 @@ private struct SearchDropdown: View {
                 .foregroundStyle(theme.textTertiary)
             VStack(alignment: .leading, spacing: 1) {
                 Text(m.repoId)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let detail = secondaryLine(m) {
                     Text(detail)
-                        .font(.omlxText(10.5))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                         .lineLimit(1)
                 }
@@ -585,8 +585,8 @@ private struct SearchDropdown: View {
             // free for the info button (rendered as a sibling outside
             // this row Button so its tap doesn't fall through to onPick).
             if !isHovered, let downloads = m.downloads, downloads > 0 {
-                Text(formatNumber(downloads))
-                    .font(.omlxMono(10.5))
+                Text(CountFormat.compact(downloads))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.trailing, 12)
             }
@@ -637,7 +637,7 @@ private struct ActiveDownloadsSection: View {
                                     .font(.system(size: 12))
                                     .foregroundStyle(theme.blueDot)
                                 Text(task.repoId)
-                                    .font(.omlxMono(12))
+                                    .font(.omlxMono(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.text)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
@@ -645,7 +645,7 @@ private struct ActiveDownloadsSection: View {
                                 Text(String(localized: "downloads.progress.bytes",
                                             defaultValue: "\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))",
                                             comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.textSecondary)
                                 Button {
                                     if task.statusEnum == .pending || task.statusEnum == .downloading {
@@ -667,7 +667,7 @@ private struct ActiveDownloadsSection: View {
                                 StatusChip(task: task)
                                 if !task.error.isEmpty {
                                     Text(task.error)
-                                        .font(.omlxMono(10.5))
+                                        .font(.omlxMono(DesignTokens.FontSize.aux))
                                         .foregroundStyle(theme.redDot)
                                         .lineLimit(2)
                                 }
@@ -744,7 +744,7 @@ private struct CompletedTasksSection: View {
                         HStack(spacing: 8) {
                             StatusChip(task: task)
                             Text(task.repoId)
-                                .font(.omlxMono(12))
+                                .font(.omlxMono(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
@@ -823,7 +823,7 @@ private struct SuggestedSection: View {
                         Text(String(localized: "downloads.suggested.loading",
                                     defaultValue: "Loading recommendations…",
                                     comment: "Placeholder shown while the recommended-models list is fetching"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -834,7 +834,7 @@ private struct SuggestedSection: View {
                     Text(String(localized: "downloads.suggested.empty",
                                 defaultValue: "No suggestions available right now.",
                                 comment: "Empty-state message for the Suggested Models section"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 14)
@@ -849,12 +849,12 @@ private struct SuggestedSection: View {
                                      gradient: SquircleGradient.models)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(m.repoId)
-                                    .font(.omlxText(13, weight: .medium))
+                                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                     .foregroundStyle(theme.text)
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                 Text(secondaryLine(for: m))
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.textSecondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
@@ -899,7 +899,7 @@ private struct SuggestedSection: View {
         var bits: [String] = []
         if let p = m.paramsFormatted { bits.append(p) }
         if let s = m.sizeFormatted { bits.append(s) }
-        if let dl = m.downloads { bits.append("\(formatNumber(dl)) ↓") }
+        if let dl = m.downloads { bits.append("\(CountFormat.compact(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
     }
 }
@@ -922,14 +922,4 @@ enum SuggestedSort: String, Hashable, CaseIterable {
                                        comment: "Sort option: rank suggested models by on-disk size, descending")
         }
     }
-}
-
-// MARK: - Helpers
-
-func formatNumber(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.1fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.1fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }

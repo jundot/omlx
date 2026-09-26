@@ -180,11 +180,11 @@ final class ModelSettingsScreenVM {
 
     static var mtpDepthOptions: [(String, String)] {
         let adaptive = String(localized: "settings.acceleration.mtp.depth.adaptive",
-                              defaultValue: "3 tokens (Default)",
+                              defaultValue: "3 Tokens (Default)",
                               comment: "Default Lightning MTP adaptive maximum draft depth")
         return [("3", adaptive)] + (4...6).map { depth in
             ("\(depth)", String(localized: "settings.acceleration.mtp.depth.option",
-                                defaultValue: "\(depth) tokens",
+                                defaultValue: "\(depth) Tokens",
                                 comment: "Lightning MTP depth option; placeholder is the maximum draft token count"))
         }
     }
@@ -775,7 +775,7 @@ final class ModelSettingsScreenVM {
         case .qwen35OqA8Enabled:  patch.qwen35OqA8Enabled = qwen35OqA8Enabled
         case .qwen35OqA8MinTokens:
             guard let value = Int(qwen35OqA8MinTokens), value >= 1 else {
-                lastError = "oQ A8 minimum prompt tokens must be a positive integer."
+                lastError = "oQ A8 minimum prompt Tokens must be a positive integer."
                 return
             }
             patch.qwen35OqA8MinTokens = value
@@ -1533,8 +1533,8 @@ final class ModelSettingsScreenVM {
     nonisolated static func candidateStats(pp: Double?, tg: Double?, memoryGb: Int? = nil,
                                            quantization: String?, omlxVersion: String?) -> String {
         var parts: [String] = []
-        if let pp { parts.append(String(format: "PP %.1f tok/s", pp)) }
-        if let tg { parts.append(String(format: "TG %.1f tok/s", tg)) }
+        if let pp { parts.append(String(format: "PP %.1f Tok/s", pp)) }
+        if let tg { parts.append(String(format: "TG %.1f Tok/s", tg)) }
         if let memoryGb { parts.append("\(memoryGb) GB") }
         if let quantization, !quantization.isEmpty { parts.append(quantization) }
         if let omlxVersion, !omlxVersion.isEmpty { parts.append("oMLX \(omlxVersion)") }

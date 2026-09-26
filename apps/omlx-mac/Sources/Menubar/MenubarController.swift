@@ -662,11 +662,11 @@ final class MenubarController: NSObject {
         appendStat(String(localized: "menubar.stats.total_tokens",
                           defaultValue: "Total Tokens Processed",
                           comment: "Stats row label for total tokens processed"),
-                   compact(session?.totalPromptTokens))
+                   CountFormat.compact(session?.totalPromptTokens))
         appendStat(String(localized: "menubar.stats.cached_tokens",
                           defaultValue: "Cached Tokens",
                           comment: "Stats row label for cached tokens count"),
-                   compact(session?.totalCachedTokens))
+                   CountFormat.compact(session?.totalCachedTokens))
         appendStat(String(localized: "menubar.stats.cache_efficiency",
                           defaultValue: "Cache Efficiency",
                           comment: "Stats row label for the cache efficiency percentage"),
@@ -688,11 +688,11 @@ final class MenubarController: NSObject {
         appendStat(String(localized: "menubar.stats.total_tokens",
                           defaultValue: "Total Tokens Processed",
                           comment: "Stats row label for total tokens processed"),
-                   compact(alltime?.totalPromptTokens))
+                   CountFormat.compact(alltime?.totalPromptTokens))
         appendStat(String(localized: "menubar.stats.cached_tokens",
                           defaultValue: "Cached Tokens",
                           comment: "Stats row label for cached tokens count"),
-                   compact(alltime?.totalCachedTokens))
+                   CountFormat.compact(alltime?.totalCachedTokens))
         appendStat(String(localized: "menubar.stats.cache_efficiency",
                           defaultValue: "Cache Efficiency",
                           comment: "Stats row label for the cache efficiency percentage"),
@@ -700,7 +700,7 @@ final class MenubarController: NSObject {
         appendStat(String(localized: "menubar.stats.total_requests",
                           defaultValue: "Total Requests",
                           comment: "Stats row label for total request count"),
-                   compact(alltime?.totalRequests))
+                   CountFormat.compact(alltime?.totalRequests))
     }
 
     // MARK: - Pollers
@@ -1334,14 +1334,6 @@ final class MenubarController: NSObject {
         statsSubmenu.addItem(it)
     }
 
-    private func compact(_ value: Int?) -> String {
-        guard let n = value else { return "—" }
-        if n >= 1_000_000_000 { return String(format: "%.1fB", Double(n) / 1e9) }
-        if n >= 1_000_000     { return String(format: "%.1fM", Double(n) / 1e6) }
-        if n >= 1_000         { return String(format: "%.1fK", Double(n) / 1e3) }
-        return "\(n)"
-    }
-
     private func percent(_ value: Double?) -> String {
         guard let v = value else { return "—" }
         return String(format: "%.1f%%", v)
@@ -1349,7 +1341,7 @@ final class MenubarController: NSObject {
 
     private func tps(_ value: Double?) -> String {
         guard let v = value else { return "—" }
-        return String(format: "%.1f tok/s", v)
+        return String(format: "%.1f Tok/s", v)
     }
 }
 
