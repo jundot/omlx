@@ -78,6 +78,12 @@ class VisionFeatureSSDCache:
         cache_dir: SSD storage directory. None for memory-only mode.
         max_size_bytes: Maximum SSD cache size in bytes (default 10GB).
         max_memory_entries: Maximum in-memory LRU entries (default 20).
+        max_memory_bytes: Maximum in-memory LRU size in bytes (default 4GB).
+            Entry-count alone cannot bound residency: a multi-image agent
+            conversation with more than ``max_memory_entries`` screenshots
+            evicts its own history on every turn's store, so the next turn
+            misses and re-encodes *all* images. A byte budget sized for
+            whole conversations keeps the hot set resident.
     """
 
     def __init__(
@@ -85,13 +91,17 @@ class VisionFeatureSSDCache:
         cache_dir: Optional[Path] = None,
         max_size_bytes: int = 10 * 1024**3,
         max_memory_entries: int = 20,
+        max_memory_bytes: int = 4 * 1024**3,
     ):
         self._cache_dir = cache_dir
         self._max_size_bytes = max_size_bytes
         self._max_memory_entries = max_memory_entries
+        self._max_memory_bytes = max_memory_bytes
 
         # In-memory LRU cache: composite_key -> mx.array (or list[mx.array])
         self._memory_cache: OrderedDict[str, Any] = OrderedDict()
+        self._memory_bytes = 0
+        self._memory_entry_bytes: Dict[str, int] = {}
         self._memory_lock = threading.Lock()
 
         # SSD index: composite_key -> VisionFeatureSSDEntry
@@ -191,6 +201,8 @@ class VisionFeatureSSDCache:
         """Shut down the background writer and flush pending writes."""
         with self._memory_lock:
             self._memory_cache.clear()
+            self._memory_entry_bytes.clear()
+            self._memory_bytes = 0
         self._writer_shutdown.set()
         # Send sentinel to unblock the writer
         try:
@@ -211,20 +223,36 @@ class VisionFeatureSSDCache:
     # ── Memory LRU helpers ──────────────────────────────────────────
 
     def _memory_put(self, key: str, features: Any) -> None:
-        """Insert into memory LRU, evicting oldest if over limit.
+        """Insert into memory LRU, evicting oldest if over limits.
 
         Caller must hold _memory_lock.
         """
+        nbytes = self._features_bytes(features)
         if key in self._memory_cache:
             self._memory_cache.move_to_end(key)
             self._memory_cache[key] = features
+            self._memory_bytes += nbytes - self._memory_entry_bytes.get(key, 0)
+            self._memory_entry_bytes[key] = nbytes
             return
 
-        # Evict oldest if over limit
-        while len(self._memory_cache) >= self._max_memory_entries:
-            self._memory_cache.popitem(last=False)
-
         self._memory_cache[key] = features
+        self._memory_entry_bytes[key] = nbytes
+        self._memory_bytes += nbytes
+
+        # Evict oldest if over either limit
+        while self._memory_cache and (
+            self._memory_bytes > self._max_memory_bytes
+            or len(self._memory_cache) > self._max_memory_entries
+        ):
+            evicted_key, _ = self._memory_cache.popitem(last=False)
+            self._memory_bytes -= self._memory_entry_bytes.pop(evicted_key, 0)
+
+    @staticmethod
+    def _features_bytes(features: Any) -> int:
+        """Accounted bytes of a cached feature tensor (or tensor list)."""
+        if isinstance(features, (list, tuple)):
+            return sum(int(f.nbytes) for f in features)
+        return int(features.nbytes)
 
     # ── SSD persistence ─────────────────────────────────────────────
 

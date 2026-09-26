@@ -1447,6 +1447,7 @@ _QWEN_VISION_MODELS = {
     "prism_hadamard_qwen35",  # Ternary Bonsai 2 keeps the Qwen3.5 vision tower.
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen4_exp",  # Reuses the Qwen3.5/Qwen3-VL vision tower verbatim.
     "qwen2_vl",
     "qwen2_5_vl",
     "mimo_v2",
@@ -2218,7 +2219,11 @@ class VLMBatchedEngine(BaseEngine):
                 )
             self._vision_cache = VisionFeatureSSDCache(
                 cache_dir=vision_ssd_dir,
-                max_memory_entries=20,
+                # Byte budget, not a 20-entry cap: agent sessions accumulate
+                # 20-90 screenshots, and an entry cap below that re-encodes
+                # every image on every turn (~0.8s/MP in the vision tower).
+                max_memory_entries=4096,
+                max_memory_bytes=4 * 1024**3,
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -3259,6 +3264,109 @@ class VLMBatchedEngine(BaseEngine):
         # Unsupported model: skip caching
         return None
 
+    def _encode_missing_vision_features(
+        self,
+        pixel_values: Any,
+        extra_model_inputs: dict,
+        cached_per_image: List[Any],
+        per_hashes: List[str],
+        image_token_count: Optional[int],
+    ) -> Optional[mx.array]:
+        """Encode only the images missing from the vision feature cache.
+
+        Qwen-style vision towers consume flat patch rows grouped per image
+        (``image_grid_thw``), so a subset of images can be encoded
+        independently and the per-image features re-concatenated in prompt
+        order. Multi-turn agent loops add one screenshot per turn; encoding
+        only the new image collapses the fixed per-turn vision cost from
+        O(all history images) to O(new images).
+
+        Returns the combined full-batch features, or None when the request
+        cannot be split safely (caller falls back to encoding all images).
+        """
+        model = self._vlm_model
+        model_type = self.model_type or ""
+        grid_thw = extra_model_inputs.get("image_grid_thw")
+        if (
+            model_type not in _QWEN_VISION_MODELS
+            or hasattr(model, "encode_image")
+            or grid_thw is None
+            or pixel_values is None
+            or not hasattr(pixel_values, "shape")
+            or pixel_values.ndim != 2
+        ):
+            return None
+
+        num_images = len(cached_per_image)
+        miss_idx = [i for i, f in enumerate(cached_per_image) if f is None]
+        if not miss_idx or len(miss_idx) == num_images:
+            return None
+
+        try:
+            grids = [
+                [int(grid_thw[i][0]), int(grid_thw[i][1]), int(grid_thw[i][2])]
+                for i in range(num_images)
+            ]
+        except (IndexError, TypeError, ValueError):
+            return None
+
+        rows = [t * h * w for t, h, w in grids]
+        if sum(rows) != pixel_values.shape[0]:
+            return None
+
+        vision_tower = getattr(model, "vision_tower", None)
+        merge_sq = (
+            getattr(vision_tower, "spatial_merge_size", 2) ** 2
+        )
+        # A cached entry whose token count disagrees with the current grid
+        # came from a different resize regime — recompute the whole batch.
+        for f, (t, h, w) in zip(cached_per_image, grids):
+            if f is not None and f.shape[0] != (t * h * w) // merge_sq:
+                return None
+
+        try:
+            offsets = [0]
+            for r in rows:
+                offsets.append(offsets[-1] + r)
+            pv_miss = mx.concatenate(
+                [pixel_values[offsets[i] : offsets[i + 1]] for i in miss_idx],
+                axis=0,
+            )
+            grid_miss = mx.array([grids[i] for i in miss_idx])
+            miss_inputs = dict(extra_model_inputs)
+            miss_inputs["image_grid_thw"] = grid_miss
+            features_miss = self._compute_vision_features(pv_miss, miss_inputs)
+            if features_miss is None:
+                return None
+            mx.eval(features_miss)
+            split_miss = self._split_vision_features(
+                features_miss, len(miss_idx), miss_inputs
+            )
+            if split_miss is None or len(split_miss) != len(miss_idx):
+                return None
+
+            full = list(cached_per_image)
+            for i, f in zip(miss_idx, split_miss):
+                full[i] = f
+                self._vision_cache.put(per_hashes[i], self._model_name, f)
+            combined = mx.concatenate(full, axis=0)
+            if not self._vision_features_match_image_tokens(
+                combined, image_token_count
+            ):
+                return None
+            logger.debug(
+                "Vision feature cache partial hit: encoded %d of %d images",
+                len(miss_idx),
+                num_images,
+            )
+            return combined
+        except Exception:
+            logger.debug(
+                "Partial vision encoding failed, recomputing all images",
+                exc_info=True,
+            )
+            return None
+
     def _split_vision_features(
         self,
         features: mx.array,
@@ -3849,6 +3957,20 @@ class VLMBatchedEngine(BaseEngine):
                             "Vision feature cache hit (whole-request): %s",
                             image_hash[:16],
                         )
+
+                if not used_cached_features:
+                    # Partial hit: encode only the uncached images when the
+                    # vision tower supports per-image slicing.
+                    partial = self._encode_missing_vision_features(
+                        pixel_values,
+                        extra_model_inputs,
+                        cached_per_image,
+                        per_hashes,
+                        image_token_count,
+                    )
+                    if partial is not None:
+                        call_kwargs["cached_image_features"] = partial
+                        used_cached_features = True
 
                 if not used_cached_features:
                     # Some or all uncached — compute all, then cache per-image
