@@ -585,6 +585,12 @@ async def run_accuracy_benchmark(
                         "completion_tokens": qr.completion_tokens,
                         "error_message": qr.error_message,
                     })
+                else:
+                    question_data.update({
+                        "finish_reason": qr.finish_reason,
+                        "prompt_tokens": qr.prompt_tokens,
+                        "completion_tokens": qr.completion_tokens,
+                    })
                 question_results.append(question_data)
 
             result_data = {
@@ -637,6 +643,27 @@ async def run_accuracy_benchmark(
                             "invalid_response",
                             "parse_error",
                         )
+                    ),
+                })
+            else:
+                # Answers that hit the token limit (max_tokens) are scored on
+                # incomplete output; count them so the headline is not read as
+                # clean (#3772). "Finished" means a normal stop, so errored or
+                # aborted answers count as neither. Accuracy on finished answers
+                # describes only those (None when there are none); it is not a
+                # corrected score.
+                questions = result.question_results
+                truncated = [qr for qr in questions if qr.finish_reason == "length"]
+                finished = [
+                    qr for qr in questions if qr.finish_reason in ("stop", "tool_calls")
+                ]
+                result_data.update({
+                    "truncated_count": len(truncated),
+                    "truncated_correct_count": sum(qr.correct for qr in truncated),
+                    "finished_count": len(finished),
+                    "finished_accuracy": (
+                        round(sum(qr.correct for qr in finished) / len(finished), 4)
+                        if finished else None
                     ),
                 })
             if result.category_scores:

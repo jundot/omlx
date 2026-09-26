@@ -428,6 +428,26 @@
                                     </div>
                                 </div>
 
+                                <div x-show="!r.external && r.truncated_count > 0" x-cloak
+                                     class="mt-4 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800">
+                                    <i data-lucide="triangle-alert" class="w-4 h-4 flex-shrink-0 mt-0.5"></i>
+                                    <span class="text-xs font-medium">{{ t('acc_bench.results.local_truncation_warning') }}</span>
+                                </div>
+                                <div x-show="!r.external && r.truncated_count > 0" x-cloak class="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-2">
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.hit_token_limit') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.truncated_count + ' / ' + r.total"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.finished_within_limit') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.finished_count + ' / ' + r.total"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.finished_accuracy') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.finished_accuracy == null ? '—' : (r.finished_accuracy * 100).toFixed(1) + '%'"></div>
+                                    </div>
+                                </div>
+
                                 <!-- Actions row -->
                                 <div class="mt-4 flex items-center gap-4">
                                     <!-- Category breakdown toggle -->

@@ -234,6 +234,25 @@ class BaseBenchmark(ABC):
             "error_message": diagnostics.get("error_message", ""),
         }
 
+    @staticmethod
+    def _local_diagnostics(output: Any) -> dict[str, Any]:
+        """Stop reason and token counts from a local engine's output.
+
+        No "status" key: local answers keep the legacy scoring path in
+        _classify_response. finish_reason == "length" means the answer was
+        cut off by the token budget and was scored on an incomplete response.
+        """
+        finish_reason = getattr(output, "finish_reason", None)
+        prompt_tokens = getattr(output, "prompt_tokens", 0)
+        completion_tokens = getattr(output, "completion_tokens", 0)
+        return {
+            "finish_reason": finish_reason if isinstance(finish_reason, str) else None,
+            "prompt_tokens": prompt_tokens if type(prompt_tokens) is int else 0,
+            "completion_tokens": (
+                completion_tokens if type(completion_tokens) is int else 0
+            ),
+        }
+
     async def _eval_single(
         self, engine: Any, item: dict, index: int,
         sampling_kwargs: Optional[dict] = None,
@@ -243,8 +262,8 @@ class BaseBenchmark(ABC):
 
         Returns (index, item, response_text, prompt_text, raw_text, diagnostics).
         raw_text is the unstripped output for auto-detection of thinking tags.
-        diagnostics is empty for local engines and contains external response
-        metadata for remote evaluations.
+        diagnostics holds the stop reason and token counts for local engines
+        and the full external response metadata for remote evaluations.
         """
         messages = self.format_prompt(item)
         prompt_text = "\n".join(m.get("content", "") for m in messages)
@@ -296,6 +315,8 @@ class BaseBenchmark(ABC):
                     ),
                     "error_message": getattr(output, "error_message", ""),
                 }
+            else:
+                diagnostics = self._local_diagnostics(output)
             return index, item, text, prompt_text, raw_text, diagnostics
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")

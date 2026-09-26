@@ -130,7 +130,8 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
 def trim_question_results(question_results: Any) -> tuple[list[dict], bool]:
     """Project per-question records onto the upload shape and bound their size.
 
-    Keeps id/correct/expected/predicted/raw_response/category/time_s and drops
+    Keeps id/correct/expected/predicted/raw_response/category/time_s, plus
+    finish_reason/completion_tokens when the run recorded them, and drops
     everything else — most importantly the 'question' prompt text. Walks the
     trim ladder until the serialized total fits the budget; the pathological
     fallback drops the raw entirely so the summary still uploads.
@@ -157,6 +158,14 @@ def trim_question_results(question_results: Any) -> tuple[list[dict], bool]:
         time_s = q.get("time_s")
         if isinstance(time_s, (int, float)):
             rec["time_s"] = round(float(time_s), 3)
+        # A "length" stop with a full completion_tokens count is how a reader
+        # of the raw tells a budget-limited answer from a wrong one (#3772).
+        finish_reason = q.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            rec["finish_reason"] = finish_reason[:16]
+        completion_tokens = q.get("completion_tokens")
+        if type(completion_tokens) is int and completion_tokens > 0:
+            rec["completion_tokens"] = completion_tokens
         trimmed.append(rec)
         raw = q.get("raw_response")
         originals.append(raw if isinstance(raw, str) else "")

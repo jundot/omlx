@@ -5332,6 +5332,16 @@
                 }
             },
 
+            accLocalTruncationLine(r) {
+                return window.t('acc_bench.results.text_export.local_truncation_line')
+                    .replace('{truncated}', r.truncated_count)
+                    .replace('{total}', r.total)
+                    .replace('{truncated_correct}', r.truncated_correct_count)
+                    .replace('{accuracy}', r.finished_accuracy == null
+                        ? '—' : (r.finished_accuracy * 100).toFixed(1) + '%')
+                    .replace('{finished}', r.finished_count);
+            },
+
             accBuildText() {
                 if (this.accAllResults.length === 0) return '';
                 const pad = (s, w) => s.toString().padStart(w);
@@ -5427,6 +5437,8 @@
                                     .replace('{invalid}', r.invalid_response_count)
                                     .replace('{parse}', r.parse_error_count)
                             );
+                        } else if (r.truncated_count > 0) {
+                            lines.push('  ' + this.accLocalTruncationLine(r));
                         }
                     }
                 }
@@ -5483,6 +5495,13 @@
                             valid_answer_accuracy: r.valid_answer_accuracy,
                             reliability_warning: r.reliability_warning,
                         });
+                    } else if (r.truncated_count !== undefined) {
+                        Object.assign(exportData, {
+                            truncated_count: r.truncated_count,
+                            truncated_correct_count: r.truncated_correct_count,
+                            finished_count: r.finished_count,
+                            finished_accuracy: r.finished_accuracy,
+                        });
                     }
                     content = JSON.stringify(exportData, null, 2);
                     mime = 'application/json';
@@ -5490,7 +5509,7 @@
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
                     const lines = [r.external
                         ? 'id,category,status,correct,expected,predicted,finish_reason,reasoning_fields,prompt_tokens,completion_tokens,error_message,question,raw_response,time_s'
-                        : 'id,category,correct,expected,predicted,question,raw_response,time_s'];
+                        : 'id,category,correct,expected,predicted,question,raw_response,time_s,finish_reason,completion_tokens'];
                     for (const q of qr) {
                         if (r.external) {
                             lines.push([
@@ -5502,7 +5521,7 @@
                                 esc(q.raw_response), q.time_s,
                             ].join(','));
                         } else {
-                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s, esc(q.finish_reason || ''), q.completion_tokens ?? ''].join(','));
                         }
                     }
                     content = lines.join('\n');
@@ -5538,6 +5557,8 @@
                                 .replace('{invalid}', r.invalid_response_count)
                                 .replace('{parse}', r.parse_error_count)
                         );
+                    } else if (r.truncated_count > 0) {
+                        lines.splice(4, 0, this.accLocalTruncationLine(r));
                     }
                     for (const q of qr) {
                         const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
@@ -5552,7 +5573,7 @@
                                     .replace('{category}', () => q.category)
                             );
                         }
-                        if (r.external && q.finish_reason) {
+                        if (q.finish_reason && (r.external || q.finish_reason !== 'stop')) {
                             lines.push(
                                 window.t('acc_bench.results.text_export.finish_reason_line')
                                     .replace('{reason}', () => q.finish_reason)
