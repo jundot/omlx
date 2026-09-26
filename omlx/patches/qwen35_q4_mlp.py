@@ -21,6 +21,8 @@ from mlx_lm.models.activations import swiglu
 
 from omlx.custom_kernels.nax import is_nax_available
 
+from .qwen35_packed_linear import PackedLinear
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -76,18 +78,23 @@ def register_qwen35_prefill_linear_backend(
     _PREFILL_LINEAR_BACKEND = backend
 
 
+def _try_backend(linear: Any, x: mx.array) -> mx.array | None:
+    backend = _PREFILL_LINEAR_BACKEND
+    if backend is None:
+        return None
+    try:
+        return backend(linear, x)
+    except Exception:
+        # A backend fault must cost throughput, never a request.
+        logger.debug("prefill linear backend failed; falling back", exc_info=True)
+        return None
+
+
 def _backend_or_qmm(linear: Any, x: mx.array, variant: int) -> mx.array:
     """First refusal to the registered backend, then the W4A16 NAX kernel."""
-    backend = _PREFILL_LINEAR_BACKEND
-    if backend is not None:
-        try:
-            routed = backend(linear, x)
-        except Exception:
-            # A backend fault must cost throughput, never a request.
-            logger.debug("prefill linear backend failed; falling back", exc_info=True)
-            routed = None
-        if routed is not None:
-            return routed
+    routed = _try_backend(linear, x)
+    if routed is not None:
+        return routed
     return _linear_qmm(linear, x, variant)
 
 
@@ -449,24 +456,27 @@ def apply_qwen35_vlm_gdn_projection_hook():
 
 
 class _VLMQuantizedPrefillLinear(nn.QuantizedLinear):
+    # Every decode step calls this wrapper once per projection, so the routing
+    # thresholds are read from the environment when the patch installs.
+    _route_min_tokens = 2048
+    _route_q8_min_tokens = _Q8_MIN_TOKENS
+    _route_variant = 8
+
     def __call__(self, x):
-        if (
-            x.ndim == 3
-            and _can_route_affine_linear(
-                self,
-                x,
-                int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048")),
-                int(
-                    os.environ.get(
-                        "OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS)
-                    )
-                ),
-            )
-            and os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") != "0"
+        if x.ndim == 3 and _can_route_affine_linear(
+            self, x, self._route_min_tokens, self._route_q8_min_tokens
         ):
-            return _backend_or_qmm(
-                self, x, int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8"))
-            )
+            return _backend_or_qmm(self, x, self._route_variant)
+        return super().__call__(x)
+
+
+class _VLMPackedPrefillLinear(PackedLinear):
+    # Same floor as the stock projections; the packed kernels serve the rest.
+    def __call__(self, x):
+        if x.ndim == 3 and x.shape[-2] >= _VLMQuantizedPrefillLinear._route_min_tokens:
+            routed = _try_backend(self, x)
+            if routed is not None:
+                return routed
         return super().__call__(x)
 
 
@@ -474,6 +484,15 @@ def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
     """Route the loaded Qwen projections without replacing their forward graph."""
     if os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0" or not _has_native_qmm():
         return False
+    _VLMQuantizedPrefillLinear._route_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048")
+    )
+    _VLMQuantizedPrefillLinear._route_q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+    _VLMQuantizedPrefillLinear._route_variant = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8")
+    )
     installed = False
     projection_names = {
         "q_proj",
@@ -499,6 +518,9 @@ def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
             linear = getattr(module, name, None)
             if type(linear) is nn.QuantizedLinear:
                 linear.__class__ = _VLMQuantizedPrefillLinear
+                installed = True
+            elif type(linear) is PackedLinear:
+                linear.__class__ = _VLMPackedPrefillLinear
                 installed = True
     return installed
 

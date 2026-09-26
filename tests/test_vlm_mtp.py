@@ -556,12 +556,16 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
 
     logits = mx.zeros((1, 2, 16))
     hidden = mx.zeros((1, 2, 8))
+    early = mx.ones((1, 2, 8))
     gdn_states = [{"state": "mock"}]
 
     class FakeStockOutput:
-        def __init__(self):
+        def __init__(self, capture_layer_ids):
             self.logits = logits
-            self.hidden_states = [hidden]
+            # Stock capture order is ascending layer index.
+            self.hidden_states = [
+                early if layer == 0 else hidden for layer in capture_layer_ids
+            ]
             self.gdn_states = gdn_states
 
     class FakeLanguageModel:
@@ -580,7 +584,7 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
             **kwargs,
         ):
             self.forward_kwargs = kwargs
-            return FakeStockOutput()
+            return FakeStockOutput(kwargs["capture_layer_ids"])
 
     q35_lang = SimpleNamespace(LanguageModel=FakeLanguageModel)
     qwen35_vlm_runtime._patch_vlm_language_model(q35_lang)
@@ -594,7 +598,6 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
         cache=[],
         return_hidden=True,
         return_shared_kv=True,
-        capture_layer_ids=[99],
     )
 
     assert isinstance(out, LanguageModelOutput)
@@ -604,6 +607,18 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     assert out.gdn_states is gdn_states
     assert out.shared_kv_states == {}
     assert model.forward_kwargs["capture_layer_ids"] == [1]
+
+    # A block drafter's layers ride the same forward: requested order first,
+    # the head's last-layer hidden last.
+    out = model(
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache=[],
+        return_hidden=True,
+        capture_layer_ids=[0],
+    )
+    assert model.forward_kwargs["capture_layer_ids"] == [0, 1]
+    assert out.hidden_states[0] is early
+    assert out.hidden_states[-1] is hidden
 
 
 @pytest.mark.parametrize(
@@ -956,3 +971,55 @@ class TestCallBackbone:
         assert result[0] is logits
         assert result[1] is hidden
         assert result[2] is gdn
+
+
+def test_qwen_external_round_clears_before_replay_and_commits_before_yield(monkeypatch):
+    from mlx_vlm.speculative.mtp import _MTPVerifyResult
+
+    events = []
+    draft = SimpleNamespace(
+        config=SimpleNamespace(model_type="qwen3_5_mtp"),
+        accept_verified_tokens=lambda: events.append("replay"),
+    )
+    monkeypatch.setattr(
+        vlm_mtp, "_sync_and_clear_cache", lambda stream: events.append("clear")
+    )
+    monkeypatch.setattr(vlm_mtp, "_buffer_mtp_target_cache", lambda *args: None)
+    with mx.stream(vlm_mtp._vlm_generation_stream):
+        expected_stream = mx.default_stream(mx.gpu)
+
+    def commit(*args):
+        assert mx.default_stream(mx.gpu) == expected_stream
+        events.append("commit")
+
+    monkeypatch.setattr(_MTPVerifyResult, "commit", commit)
+
+    def rounds(target, drafter, *args, **kwargs):
+        try:
+            drafter.accept_verified_tokens()
+            result = _MTPVerifyResult(hidden=None, shared_kv_states={})
+            result.commit(None, [], 2, 3)
+            yield 11, None
+            yield 12, None
+        finally:
+            events.append("closed")
+
+    monkeypatch.setattr(vlm_mtp, "_mtp_rounds", rounds)
+    gen = vlm_mtp.run_vlm_mtp_decode(
+        target_language_model=SimpleNamespace(),
+        drafter=vlm_mtp.VLMMTPDrafter(draft, "mtp", "/p"),
+        prompt_cache=[],
+        hidden=mx.zeros((1, 1, 8)),
+        shared_kv_states={},
+        first_bonus=7,
+        max_tokens=4,
+        sampler=lambda x: x,
+    )
+    assert next(gen) == 7
+    assert events == []
+    assert next(gen) == 11
+    assert events == ["clear", "replay", "commit"]
+    assert next(gen) == 12
+    assert events == ["clear", "replay", "commit"]
+    gen.close()
+    assert events[-1] == "closed"

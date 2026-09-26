@@ -7,6 +7,7 @@ Note: Configuration validation tests are in test_config.py.
 """
 
 import argparse
+import json
 import socket
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx._version import __version__
+from omlx.cli import _migrate_saved_network_auth
+from omlx.settings import GlobalSettings
 
 
 class TestCLIModule:
@@ -1557,3 +1560,89 @@ class TestLaunchClaudeTierPrecedence:
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-cfg"
         assert env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == expected_window
         assert env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected_window
+
+
+class TestSavedNetworkAuthMigration:
+    @pytest.fixture(autouse=True)
+    def setup_migration(self, tmp_path, monkeypatch):
+        for name in ("OMLX_HOST", "OMLX_API_KEY", "OMLX_STARTUP_NOTICE_PATH"):
+            monkeypatch.delenv(name, raising=False)
+        self.path = tmp_path / "settings.json"
+        self.data = {
+            "server": {"host": "0.0.0.0"},
+            "auth": {"api_key": "existing-key", "skip_api_key_verification": True},
+            "custom": {"preserve": True},
+        }
+        self.args = argparse.Namespace(host=None)
+        with patch("builtins.input", return_value="") as self.prompt:
+            yield
+
+    def load(self):
+        return GlobalSettings.load(base_path=str(self.path.parent))
+
+    def write_settings(self):
+        self.path.write_text(json.dumps(self.data))
+        return self.path.read_bytes()
+
+    @pytest.mark.parametrize("api_key,skip", [("existing-key", True), (None, False)])
+    def test_saved_unsafe_host_is_migrated_once(self, capsys, api_key, skip):
+        self.data["auth"].update(api_key=api_key, skip_api_key_verification=skip)
+        self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        _migrate_saved_network_auth(self.load(), self.args)
+        self.prompt.assert_called_once()
+        assert "Enter" in self.prompt.call_args.args[0]
+        self.data["server"]["host"] = "127.0.0.1"
+        assert json.loads(self.path.read_text()) == self.data
+        assert settings.server.host == "127.0.0.1"
+        assert "enable authentication" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "case", ["cli", "env", "authenticated", "loopback", "invalid"]
+    )
+    def test_non_migration_cases_preserve_settings(self, monkeypatch, case):
+        if case == "cli":
+            self.args.host = "0.0.0.0"
+        elif case == "env":
+            monkeypatch.setenv("OMLX_HOST", "0.0.0.0")
+        elif case == "authenticated":
+            self.data["auth"]["skip_api_key_verification"] = False
+        elif case == "loopback":
+            self.data["server"]["host"] = "127.0.0.1,::1"
+        else:
+            self.data["server"]["port"] = -1
+        before = self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        self.prompt.assert_not_called()
+        assert self.path.read_bytes() == before
+        assert settings.server.host == self.data["server"]["host"]
+
+    def test_app_receives_notice_without_cli_prompt(self, tmp_path, monkeypatch):
+        notice = tmp_path / "notice.txt"
+        monkeypatch.setenv("OMLX_STARTUP_NOTICE_PATH", str(notice))
+        self.write_settings()
+        _migrate_saved_network_auth(self.load(), self.args)
+        self.prompt.assert_not_called()
+        assert "127.0.0.1" in notice.read_text()
+
+    @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt])
+    def test_canceled_migration_preserves_settings(self, interruption):
+        before = self.write_settings()
+        self.prompt.side_effect = interruption
+        with pytest.raises(SystemExit):
+            _migrate_saved_network_auth(self.load(), self.args)
+        assert self.path.read_bytes() == before
+
+    def test_inference_opt_in_keeps_authenticated_network_bind(self):
+        self.data["auth"].update(
+            skip_api_key_verification=False, allow_unauthenticated_inference=True
+        )
+        before = self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        self.prompt.assert_not_called()
+        assert self.path.read_bytes() == before
+        assert settings.server.host == "0.0.0.0"
+        assert settings.validate() == []

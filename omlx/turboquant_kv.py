@@ -270,10 +270,22 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # every logical offset is short of the written end, and an
         # offset-derived position writes INSIDE the survivors' live KV. It
         # also must not be derived from _state_length(self.keys): that is the
-        # step-allocated capacity, not the written end. (Deliberately not
-        # named `_idx` — mlx-vlm's rollback_speculative_cache changes
-        # behavior on that attribute.)
+        # step-allocated capacity, not the written end.
         self._phys_end = 0
+
+    @property
+    def _idx(self):
+        # mlx-vlm uses this cursor for rollback and padded attention masks.
+        return self.offset if isinstance(self.offset, int) else self._phys_end
+
+    def trim(self, n):
+        position = self._idx
+        n = min(position, n)
+        self.offset -= n
+        self._phys_end = position - n
+        self._cached_state = None
+        self._cached_state_offset = -1
+        return n
 
     # ---- update_and_fetch override for B>1 only ----------------------------
 

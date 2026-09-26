@@ -16,9 +16,8 @@ replaces ``gate_proj``/``up_proj`` (mirroring the vendored GLM DSA
 switch layers), and the class ``__call__`` gains a fused branch.
 Instances without ``gate_up_proj`` keep the original code path.
 
-mlx-vlm's exact verifier reads separate gate/up views of the fused storage.
-Its short-block verify path keeps the upstream numerical contract; normal
-prefill and decode use the fused projection.
+mlx-vlm verification uses the same fused projection without sorting routes.
+Separate gate/up views remain available to other upstream callers.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+from functools import wraps
 from typing import Any
 
 import mlx.core as mx
@@ -50,6 +50,7 @@ from mlx_vlm.models.switch_layers import (
 )
 
 from ..scheduler import _sync_and_clear_cache
+from . import moe_verify_gather
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +167,52 @@ def _make_vlm_patched_call(original):
     fused_call = _make_patched_call(original)
 
     def patched(self, x, indices, weights=None, shared=None, residual=None):
-        # Exact verification reads gate/up views of the same fused storage.
-        if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+        if getattr(self, "gate_up_proj", None) is None:
             return original(self, x, indices, weights, shared, residual)
+        if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+            if x.shape[0] * indices.shape[-1] >= 64:
+                return original(self, x, indices, weights, shared, residual)
+            # The upstream kernel would copy the strided gate/up views.
+            routed = _fused_verify_switch(self, x, indices)
+            return self._combine(routed, weights, shared, residual)
         routed = fused_call(self, x, indices)
         return self._combine(routed, weights, shared, residual)
 
     return patched
+
+
+def _fused_verify_switch(switch_mlp, x, indices):
+    """Keep unsorted routing for the verifier's per-position reductions."""
+    batch, length, width = x.shape
+    top_k = indices.shape[-1]
+    routed = moe_verify_gather.fused_switch(switch_mlp, x, indices)
+    if routed is not None:
+        return routed
+    flat_x = mx.expand_dims(x.reshape(batch * length, width), (-2, -3))
+    flat_indices = indices.reshape(batch * length, top_k)
+    gate_up = switch_mlp.gate_up_proj(flat_x, flat_indices, sorted_indices=False)
+    gate, up = mx.split(gate_up, 2, axis=-1)
+    out = switch_mlp.down_proj(
+        switch_mlp.activation(up, gate), flat_indices, sorted_indices=False
+    )
+    return out.squeeze(-2).reshape(batch, length, top_k, -1)
+
+
+def _ensure_vlm_verify_patch() -> None:
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    original = Qwen3_5BatchInvariantForward._switch_glu
+    if getattr(original, "_omlx_gate_up_fused_verify", False):
+        return
+
+    @wraps(original)
+    def fused_verify(self, switch_mlp, x, indices):
+        if x.ndim == 3 and getattr(switch_mlp, "gate_up_proj", None) is not None:
+            return _fused_verify_switch(switch_mlp, x, indices)
+        return original(self, switch_mlp, x, indices)
+
+    fused_verify._omlx_gate_up_fused_verify = True
+    Qwen3_5BatchInvariantForward._switch_glu = fused_verify
 
 
 def _ensure_call_patch() -> None:
@@ -209,6 +249,7 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     if not targets:
         return 0
     _ensure_call_patch()
+    _ensure_vlm_verify_patch()
     for switch_mlp in targets:
         _fuse_one(switch_mlp)
         # The freed gate/up buffers land in the MLX buffer pool, which the

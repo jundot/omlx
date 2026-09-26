@@ -32,6 +32,9 @@ namespace {
 using namespace mlx::core;
 
 constexpr int kGroupSize = 64;
+// Column tile of the PackedLinear layout; must match kPackedTileN in
+// qwen35_oq_a8_nax.metal.
+constexpr int kPackedTileN = 128;
 constexpr const char* kOqClassicMetallib = "omlx_qwen35_prefill_kernels";
 constexpr const char* kOqNaxMetallib = "omlx_qwen35_prefill_kernels_nax";
 
@@ -207,8 +210,17 @@ class Qwen35OqA8QuantizePrimitive : public Primitive {
 
 class Qwen35OqA8QmmTPrimitive : public Primitive {
  public:
-  Qwen35OqA8QmmTPrimitive(Stream stream, int bits, int act_mode, int variant)
-      : Primitive(stream), bits_(bits), act_mode_(act_mode), variant_(variant) {
+  Qwen35OqA8QmmTPrimitive(
+      Stream stream,
+      int bits,
+      int act_mode,
+      int variant,
+      bool packed)
+      : Primitive(stream),
+        bits_(bits),
+        act_mode_(act_mode),
+        variant_(variant),
+        packed_(packed) {
     if (!oq_a8_bits_supported(bits_)) {
       std::ostringstream msg;
       msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4 or 5).";
@@ -250,7 +262,8 @@ class Qwen35OqA8QmmTPrimitive : public Primitive {
     const auto cfg = oq_a8_nax_variant(variant_);
     std::string kname;
     concatenate(kname, "oq_a8_qmm_t_nax_v8_q", bits_, "_am", act_mode_,
-                "_", oq_type_name(out.dtype()), "_wm_", cfg.wm, "_wn_", cfg.wn);
+                "_", oq_type_name(out.dtype()), "_wm_", cfg.wm, "_wn_", cfg.wn,
+                packed_ ? "_packed" : "");
 
     auto lib = d.get_library(kOqNaxMetallib, oq_binary_dir());
     auto kernel = d.get_kernel(kname, lib);
@@ -284,16 +297,17 @@ class Qwen35OqA8QmmTPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const Qwen35OqA8QmmTPrimitive&>(other);
     return bits_ == rhs.bits_ && act_mode_ == rhs.act_mode_ &&
-        variant_ == rhs.variant_;
+        variant_ == rhs.variant_ && packed_ == rhs.packed_;
   }
   auto state() const {
-    return std::make_tuple(bits_, act_mode_, variant_);
+    return std::make_tuple(bits_, act_mode_, variant_, packed_);
   }
 
  private:
   int bits_;
   int act_mode_;
   int variant_;
+  bool packed_;
 };
 
 // ---------------------------------------------------------------------------
@@ -428,6 +442,7 @@ array qwen35_oq_a8_qmm_t(
     int bits,
     int act_mode,
     int variant,
+    bool packed,
     StreamOrDevice s) {
   if (!oq_a8_bits_supported(bits)) {
     std::ostringstream msg;
@@ -460,8 +475,8 @@ array qwen35_oq_a8_qmm_t(
         "[omlx_qwen35_prefill.qwen35_oq_a8_qmm_t] scales and biases must share "
         "a dtype.");
   }
-  if (qa.ndim() < 2 || weight.ndim() != 2 || scales.ndim() != 2 ||
-      biases.ndim() != 2) {
+  if (qa.ndim() < 2 || weight.ndim() != 2 ||
+      (!packed && (scales.ndim() != 2 || biases.ndim() != 2))) {
     throw std::invalid_argument(
         "[omlx_qwen35_prefill.qwen35_oq_a8_qmm_t] unexpected input ranks.");
   }
@@ -491,12 +506,26 @@ array qwen35_oq_a8_qmm_t(
         << " bits.";
     throw std::invalid_argument(msg.str());
   }
-  // Metadata is group-major: scales/biases [K/64, N], Ra [K/64, M].
+  // Metadata is group-major: scales/biases [K/64, N], Ra [K/64, M]. Packed
+  // metadata holds the same N * K/64 values in the PackedLinear tile order.
   (void)oq_a8_nax_variant(variant);
-  const int sc_rows = groups;
-  const int sc_cols = N;
-  if (scales.shape(0) != sc_rows || scales.shape(1) != sc_cols ||
-      biases.shape() != scales.shape()) {
+  if (packed) {
+    if (bits != 4 || out_dtype != bfloat16 || N % kPackedTileN != 0 ||
+        groups % 4 != 0) {
+      std::ostringstream msg;
+      msg << "[omlx_qwen35_prefill.qwen35_oq_a8_qmm_t] the packed layout "
+          << "needs Q4, bfloat16 metadata, N % " << kPackedTileN
+          << " == 0 and K % 256 == 0; got bits=" << bits << " N=" << N
+          << " K=" << K << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  const size_t sc_size = static_cast<size_t>(N) * static_cast<size_t>(groups);
+  const bool sc_ok = packed
+      ? scales.size() == sc_size && biases.size() == sc_size
+      : scales.shape(0) == groups && scales.shape(1) == N &&
+          biases.shape() == scales.shape();
+  if (!sc_ok) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_oq_a8_qmm_t] scales " << scales.shape()
         << " incompatible with N=" << N << " groups=" << groups
@@ -542,7 +571,8 @@ array qwen35_oq_a8_qmm_t(
   return array(
       std::move(out_shape),
       out_dtype,
-      std::make_shared<Qwen35OqA8QmmTPrimitive>(stream, bits, act_mode, variant),
+      std::make_shared<Qwen35OqA8QmmTPrimitive>(
+          stream, bits, act_mode, variant, packed),
       {qa, sa, ra, weight, scales, biases});
 }
 

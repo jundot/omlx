@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 from types import SimpleNamespace
@@ -328,14 +329,13 @@ class TestQwen35Model:
 
 
 class TestQwen35MtpNormShift:
-    """Per-key +1 RMSNorm shift for mixed-convention MTP checkpoints (PR #1507).
+    """MTP-head RMSNorm +1 shift follows the checkpoint layout, not the tensor.
 
-    Some pre-quantized Qwen3.6 MXFP4 bundles ship MTP-head norms in a mixed
-    convention: ``mtp.norm`` already in MLX's +1 convention (mean ~1.27) while
-    the per-layer head norms are still raw-HF (mean ~0). The backbone-only
-    conv1d signal evaluates False for such a checkpoint, so the old global
-    flag left the raw-HF head norms unshifted and MTP acceptance collapsed to
-    ~0%. The fix decides the shift per-key from each weight's own magnitude.
+    Raw-HF (unsanitized conv1d) shifts every zero-centered gamma by +1. An
+    MLX-format checkpoint is loaded as stored: the old per-tensor
+    ``mean < 0.5`` guess re-shifted already converted ``pre_fc_norm_*``
+    gammas (+0.49 / +0.27 on Qwen3.6-35B-A3B) and halved draft acceptance
+    (#3742). Legacy mixed heads are handled by ``norm_repair`` instead.
     """
 
     @pytest.fixture(autouse=True)
@@ -359,35 +359,31 @@ class TestQwen35MtpNormShift:
     def _first(arr):
         return float(arr[0])
 
-    def test_mixed_convention_shifts_only_raw_hf_mtp_norms(self):
-        """No unsanitized conv1d (backbone already MLX) -> should_shift False.
-        Raw-HF head norms get +1, already-MLX siblings are left untouched."""
+    def test_mlx_checkpoint_loads_mtp_norms_as_stored(self):
+        """No unsanitized conv1d -> every MTP norm is loaded as stored, even
+        when its mean sits below the old 0.5 cutoff (#3742 reproduction)."""
         import mlx.core as mx
 
         m = self._model()
+        stored = {
+            "model.layers.0.self_attn.conv1d.weight": mx.zeros((8, 3, 1)),
+            "mtp.norm.weight": 1.27,
+            "mtp.layers.0.self_attn.q_norm.weight": 0.75,
+            # Converted Qwen3.6-35B-A3B pre-fc gammas sit below 0.5.
+            "mtp.pre_fc_norm_hidden.weight": 0.4937,
+            "mtp.pre_fc_norm_embedding.weight": 0.2734,
+            # A raw-looking value is still loaded as stored.
+            "mtp.layers.0.input_layernorm.weight": 0.04,
+        }
         weights = {
-            # Already-MLX (mean >= 0.5) -> must NOT shift.
-            "mtp.norm.weight": mx.full((16,), 1.27),
-            "mtp.layers.0.self_attn.q_norm.weight": mx.full((16,), 0.75),
-            "mtp.layers.0.self_attn.k_norm.weight": mx.full((16,), 0.74),
-            # Raw-HF (mean < 0.5) -> must shift by +1.
-            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
-            "mtp.layers.0.post_attention_layernorm.weight": mx.full((16,), 0.21),
-            "mtp.pre_fc_norm_embedding.weight": mx.full((16,), -0.44),
-            "mtp.pre_fc_norm_hidden.weight": mx.full((16,), -0.17),
+            k: (v if isinstance(v, mx.array) else mx.full((16,), v))
+            for k, v in stored.items()
         }
         out = m.sanitize(weights)
-        g = self._first
-
-        # Already-MLX siblings left untouched.
-        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
-        assert abs(g(out["mtp.layers.0.self_attn.q_norm.weight"]) - 0.75) < 1e-3
-        assert abs(g(out["mtp.layers.0.self_attn.k_norm.weight"]) - 0.74) < 1e-3
-        # Raw-HF head norms shifted by +1.
-        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
-        assert abs(g(out["mtp.layers.0.post_attention_layernorm.weight"]) - 1.21) < 1e-3
-        assert abs(g(out["mtp.pre_fc_norm_embedding.weight"]) - 0.56) < 1e-3
-        assert abs(g(out["mtp.pre_fc_norm_hidden.weight"]) - 0.83) < 1e-3
+        for k, v in stored.items():
+            if isinstance(v, mx.array):
+                continue
+            assert abs(self._first(out[k]) - v) < 1e-3, k
 
     def test_pure_raw_hf_shifts_backbone_and_mtp(self):
         """Unsanitized conv1d present -> should_shift True. Backbone and all
@@ -400,14 +396,17 @@ class TestQwen35MtpNormShift:
             "model.layers.0.self_attn.conv1d.weight": mx.zeros((8, 4, 3)),
             "model.layers.0.input_layernorm.weight": mx.full((16,), 0.05),
             "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
-            "mtp.norm.weight": mx.full((16,), 0.27),
+            # Raw gammas above 0.5 shift too; the layout decides, not the mean.
+            "mtp.layers.0.post_attention_layernorm.weight": mx.full((16,), 0.87),
+            "mtp.norm.weight": mx.full((16,), 1.93),
         }
         out = m.sanitize(weights)
         g = self._first
 
         assert abs(g(out["model.layers.0.input_layernorm.weight"]) - 1.05) < 1e-3
         assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
-        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+        assert abs(g(out["mtp.layers.0.post_attention_layernorm.weight"]) - 1.87) < 1e-3
+        assert abs(g(out["mtp.norm.weight"]) - 2.93) < 1e-3
 
     def test_pure_mlx_leaves_everything_untouched(self):
         """Already-converted checkpoint: no conv1d signal and all norms in the
@@ -431,11 +430,8 @@ class TestQwen35MtpNormShift:
         """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
         placeholders. On a raw-HF source (unsanitized conv1d present) every
         Qwen3-Next RMSNorm gamma is zero-centered, so MTP-head norms record
-        the same unconditional +1 "add" transform as the backbone norms.
-        (The old conditional add_if_mean_lt_0_5 misclassified q_norm/k_norm
-        [raw mean ~0.75] and mtp.norm [raw ~1.27], costing ~14pp of draft
-        acceptance on Qwen3.6-27B.) Pre-converted sources — no unsanitized
-        conv1d — keep the per-key conditional for mixed-convention bundles."""
+        the same unconditional +1 "add" transform as the backbone norms. A
+        pre-converted source records no transform at all."""
         import mlx.core as mx
 
         from omlx.oq import _discover_sanitize_plan
@@ -462,6 +458,16 @@ class TestQwen35MtpNormShift:
         assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
         assert plan["mtp.layers.0.input_layernorm.weight"]["transform"] == "add"
         assert plan["mtp.norm.weight"]["transform"] == "add"
+
+        # Pre-converted source: no transform is recorded for any norm.
+        meta["model.layers.0.self_attn.conv1d.weight"] = ((2048, 4, 1), mx.float32)
+        plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
+        for key in (
+            "model.layers.0.input_layernorm.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.norm.weight",
+        ):
+            assert plan[key]["transform"] == "passthrough", key
 
 
 class TestQwen35MoeSanitize:
@@ -2017,6 +2023,12 @@ class TestMtpCompatibilityHelpers:
             _is_mtp_compatible({"num_nextn_predict_layers": 1}, "deepseek_v4") is True
         )
 
+    @pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+    def test_is_mtp_compatible_mimo_v2(self, model_type):
+        assert (
+            _is_mtp_compatible({"num_nextn_predict_layers": 3}, model_type) is True
+        )
+
     def test_is_mtp_compatible_gemma4_unified(self):
         config = {
             "text_config": {
@@ -3286,6 +3298,156 @@ def test_late_join_does_not_duplicate_or_skip_tokens():
     assert output[1] == list(range(13, 21))
 
 
+class CapturingCountingModel(CountingModel):
+    """CountingModel whose forward honours layer captures like mlx-vlm."""
+
+    def __init__(self):
+        super().__init__()
+        self.mtp = None
+        self.captures = []
+
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        return_hidden=False,
+        n_confirmed=0,
+        capture_layer_ids=None,
+    ):
+        from mlx_vlm.models.base import LanguageModelOutput
+
+        drafter = getattr(self, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        if not return_hidden and scope and capture_layer_ids is None:
+            # Mirror the runtime wrapper: ordinary steps feed the drafter.
+            logits, hidden = super().__call__(
+                inputs, cache=cache, return_hidden=True, n_confirmed=n_confirmed
+            )
+            drafter.observe(scope, [hidden for _ in drafter.target_layer_ids])
+            return logits
+        result = super().__call__(
+            inputs, cache=cache, return_hidden=return_hidden, n_confirmed=n_confirmed
+        )
+        if not return_hidden:
+            return result
+        logits, hidden = result
+        captured = [hidden * (10 * (i + 1)) for i in capture_layer_ids or []]
+        self.captures.append((tuple(inputs.shape), list(capture_layer_ids or [])))
+        return LanguageModelOutput(
+            logits=logits, hidden_states=captured + [hidden], gdn_states=None
+        )
+
+
+class TableDrafter:
+    """Block drafter proposing successors, optionally wrong from a position."""
+
+    target_layer_ids = [1, 3]
+
+    def __init__(self, depth, wrong_from=None):
+        self.depth = depth
+        self.wrong_from = wrong_from
+        self.fed = {}
+        self.released = []
+        self.jobs = 0
+        self.scope_uids = None
+
+    @contextlib.contextmanager
+    def decode_scope(self, uids):
+        previous = self.scope_uids
+        self.scope_uids = tuple(uids)
+        try:
+            yield
+        finally:
+            self.scope_uids = previous
+
+    def draft(self, jobs):
+        for row_batch, state, captured, committed, _ in jobs:
+            assert len(captured) == len(self.target_layer_ids)
+            hidden = mx.concatenate(list(captured), axis=-1)
+            assert hidden.shape[0] == 1 and hidden.shape[1] == committed.shape[0]
+            self.fed[state.uid] = self.fed.get(state.uid, 0) + int(hidden.shape[1])
+            anchor = int(committed.reshape(-1)[-1].item())
+            drafts = [(anchor + 1 + j) % 64 for j in range(self.depth)]
+            if self.wrong_from is not None and self.wrong_from < self.depth:
+                drafts[self.wrong_from] = (drafts[self.wrong_from] + 7) % 64
+            state.drafts = mx.array(drafts, dtype=mx.uint32)
+            state.draft_lps = []
+            # Stochastic rows need the draft distribution q; a one-hot q
+            # makes every draft a certain proposal.
+            state.draft_accept_lps = (
+                []
+                if bg._is_greedy(row_batch)
+                else [
+                    mx.where(mx.arange(64) == token, 0.0, -float("inf"))
+                    for token in drafts
+                ]
+            )
+            self.jobs += 1
+
+    def observe(self, uids, captured):
+        assert len(captured) == len(self.target_layer_ids)
+        for uid in uids:
+            self.fed[uid] = self.fed.get(uid, 0) + int(captured[0].shape[1])
+
+    def release(self, uids):
+        self.released.extend(uids)
+
+
+def _drafted_counting_model(depth, wrong_from=None):
+    model = CapturingCountingModel()
+    model._omlx_mtp_depth = depth
+    model._omlx_drafter = TableDrafter(depth, wrong_from=wrong_from)
+    return model
+
+
+@pytest.mark.parametrize("wrong_from", [None, 0, 2])
+@pytest.mark.parametrize("late_join", [False, True])
+def test_block_drafter_matches_standard_and_feeds_committed_context(
+    wrong_from, late_join
+):
+    prompts = [[1, 2], [10, 11, 12], [30, 31]]
+    limits = [12, 8, 15]
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits, late_join=late_join)
+
+    model = _drafted_counting_model(5, wrong_from=wrong_from)
+    output, terminal = generate(model, prompts, limits, late_join=late_join)
+    assert output == expected
+    drafter = model._omlx_drafter
+    assert drafter.jobs > 0
+    # Every verify forward asked for the drafter's layers plus the head layer.
+    assert all(ids == drafter.target_layer_ids for _, ids in model.captures)
+    # Each row's context holds exactly one hidden per committed position:
+    # the last prompt token, then every emitted token except the newest
+    # one, which is still the anchor. Rejected drafts never enter it.
+    for uid in terminal:
+        assert drafter.fed[uid] == len(output[uid])
+    # Finished rows leave the drafter registry.
+    assert sorted(drafter.released) == sorted(terminal)
+
+
+def test_block_drafter_serves_sampled_rows_with_draft_distribution():
+    """A sampled row rides Leviathan acceptance against the drafter's q."""
+    from omlx.utils.sampling import make_sampler
+
+    mx.random.seed(11)
+    model = _drafted_counting_model(3)
+    stochastic = make_sampler(temp=0.7)
+    output, terminal = generate(
+        model, [[1, 2], [10, 11]], [6, 6], samplers=[None, stochastic]
+    )
+    assert output[0] == list(range(3, 9))
+    # CountingModel logits are near one-hot, so sampling still follows the
+    # successor rule; the row must finish with the requested length.
+    assert output[1] == list(range(12, 18))
+    assert {uid: r.finish_reason for uid, r in terminal.items()} == {
+        0: "length",
+        1: "length",
+    }
+    assert model._omlx_drafter.jobs > 0
+
+
 @pytest.mark.parametrize("unequal_acceptance", [False, True])
 def test_active_batch_admits_new_row_without_rebuilding_old_rows(
     monkeypatch, unequal_acceptance
@@ -3494,6 +3656,19 @@ def test_fixed_depth_survivor_does_not_cache_past_length_limit(monkeypatch):
     assert cached in (tokens, tokens[:-1])
 
 
+@pytest.mark.parametrize("prompts", [[[1, 2]], [[1, 2], [10, 11]]])
+def test_fixed_depth_drafts_the_full_depth_every_cycle(prompts):
+    model = CountingModel()
+    model._omlx_mtp_depth = 4
+    model._omlx_mtp_depth_fixed = True
+    output, _ = generate(model, prompts, [24] * len(prompts))
+    for uid, prompt in enumerate(prompts):
+        assert output[uid] == list(range(prompt[-1] + 1, prompt[-1] + 25))
+    widths = [shape[1] for shape, _ in model.calls]
+    first = next(i for i, width in enumerate(widths) if width > 1)
+    assert set(widths[first:]) == {5}
+
+
 def test_unrecoverable_batch_cache_failure_does_not_resume_decode(monkeypatch):
     def fail(*args, **kwargs):
         raise bg._MtpStepFallback("injected verify failure")
@@ -3700,6 +3875,37 @@ def test_stochastic_acceptance_preserves_target_marginal():
         # The proposal strongly favors the opposite token from the target.
         # Acceptance without residual correction cannot satisfy this bound.
         assert mx.all(mx.abs(counts / 4096 - target) < 0.03)
+    finally:
+        mx.set_default_device(previous_device)
+
+
+def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
+    from omlx.utils.sampling import make_sampler
+
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.random.seed(783)
+        sampler = make_sampler(temp=1.0, top_k=3)
+        assert bg._sparse_top_k(sampler) == 3
+        target = mx.array([0.05, 0.1, 0.3, 0.55])
+        filtered = mx.array([0.0, 0.1, 0.3, 0.55]) / 0.95
+        q = mx.log(mx.array([0.05, 0.8, 0.1, 0.05]))
+        lp = mx.broadcast_to(mx.log(target), (3, 4))
+        counts = mx.zeros((4,), dtype=mx.int32)
+        for _ in range(64):
+            samples = []
+            for _ in range(64):
+                drafts = mx.random.categorical(mx.broadcast_to(q, (2, 4)))
+                result = bg._stochastic_verify_tokens(sampler, lp, drafts, [q, q])
+                samples.append(mx.where(result[0] > 0, result[1], result[3]))
+            emitted = mx.stack(samples)
+            counts += (emitted[:, None] == mx.arange(4)).sum(axis=0)
+            mx.eval(counts)
+        # Token 0 is outside the target's top-k and must never be emitted even
+        # though the draft proposes it.
+        assert counts[0].item() == 0
+        assert mx.all(mx.abs(counts / 4096 - filtered) < 0.03)
     finally:
         mx.set_default_device(previous_device)
 
@@ -4835,3 +5041,162 @@ def test_lightning_verify_preserves_quantized_linear_dispatch(monkeypatch, batch
     assert verifier._linears((layer, layer), x) == (x, x)
     assert verifier.quantized_linear(layer, x) is x
     assert calls == [x.shape] * 7
+
+
+def _nax_available() -> bool:
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:
+        return False
+
+
+def _quantized_linear(n, k, bits, seed):
+    mx.random.seed(seed)
+    layer = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=bits)
+    weight = (mx.random.normal((n, k)) * 0.02).astype(mx.bfloat16)
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        weight, group_size=64, bits=bits
+    )
+    return layer
+
+
+def _reference(layer, x):
+    return mx.quantized_matmul(
+        x.astype(mx.float32),
+        layer.weight,
+        layer.scales.astype(mx.float32),
+        layer.biases.astype(mx.float32),
+        transpose=True,
+        group_size=64,
+        bits=layer.bits,
+    )
+
+
+def _close(actual, expected, tol=1e-2):
+    scale = mx.abs(expected).max().item()
+    return mx.abs(actual.astype(mx.float32) - expected).max().item() <= tol * scale
+
+
+@pytest.mark.skipif(not _nax_available(), reason="needs the M5 tensor unit")
+def test_packed_linear_replaces_4bit_projections(monkeypatch):
+    from omlx.patches import qwen35_packed_linear as packed
+
+    # GDN input projections: 4-bit qkv/z pack together, 5-bit b/a stay.
+    gdn = nn.Module()
+    gdn.in_proj_qkv = _quantized_linear(256, 512, 4, 1)
+    gdn.in_proj_z = _quantized_linear(128, 512, 4, 2)
+    gdn.in_proj_b = _quantized_linear(48, 512, 5, 3)
+    gdn.in_proj_a = _quantized_linear(48, 512, 5, 4)
+    mlp = nn.Module()
+    mlp.gate_proj = _quantized_linear(256, 512, 4, 5)
+    mlp.up_proj = _quantized_linear(256, 512, 4, 6)
+    mlp.down_proj = _quantized_linear(512, 256, 5, 7)
+    layer = nn.Module()
+    layer.linear_attn = gdn
+    layer.mlp = mlp
+    language = nn.Module()
+    language.model = nn.Module()
+    language.model.layers = [layer]
+    language.lm_head = _quantized_linear(384, 512, 4, 8)
+    originals = [
+        (gdn, "in_proj_qkv", gdn.in_proj_qkv),
+        (gdn, "in_proj_z", gdn.in_proj_z),
+        (mlp, "gate_proj", mlp.gate_proj),
+        (mlp, "up_proj", mlp.up_proj),
+        (language, "lm_head", language.lm_head),
+    ]
+    kept = (gdn.in_proj_b, gdn.in_proj_a, mlp.down_proj)
+
+    assert packed.pack_model(language) == len(originals)
+    assert (gdn.in_proj_b, gdn.in_proj_a, mlp.down_proj) == kept
+    # The tensor-unit matvec (<= 8 rows) and GEMM paths, aligned or not.
+    for rows in (1, 3, 8, 9, 70):
+        x = (mx.random.normal((1, rows, 512)) * 0.5).astype(mx.bfloat16)
+        for parent, name, original in originals:
+            module = getattr(parent, name)
+            assert isinstance(module, packed.PackedLinear)
+            out = module(x)
+            assert out.shape == (1, rows, original.weight.shape[0])
+            assert _close(out[0], _reference(original, x[0]))
+
+    class Verifier:
+        def _linears(self, linears, x):
+            return tuple(linear(x) for linear in linears)
+
+    packed.apply(Verifier)
+    x = (mx.random.normal((1, 5, 512)) * 0.5).astype(mx.bfloat16)
+    outputs = Verifier()._linears(
+        (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a), x
+    )
+    references = (originals[0][2], originals[1][2], *kept[:2])
+    for out, original in zip(outputs, references):
+        assert _close(out[0], _reference(original, x[0]))
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("batch,length", [(1, 8), (2, 6), (4, 6), (1, 24), (3, 5)])
+def test_verify_qmm_routes_batched_rows_through_mma_kernel(
+    monkeypatch, batch, length, bits
+):
+    """rows = batch x block share one weight pass and match stock numerics."""
+    from omlx.patches import qwen35_verify_qmm
+
+    qwen35_verify_qmm.apply_verify_qmm_patch()
+    monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: True)
+    monkeypatch.setattr(qwen35_verify_qmm, "_MIN_MMA_ROUTE_N", 256)
+    monkeypatch.setattr(qwen35_verify_qmm, "_MIN_ROUTE_N", 256)
+    routed = []
+    original = qwen35_verify_qmm.vk_qmm_mma
+
+    def spy(x2, *args, **kwargs):
+        routed.append(tuple(x2.shape))
+        return original(x2, *args, **kwargs)
+
+    monkeypatch.setattr(qwen35_verify_qmm, "vk_qmm_mma", spy)
+    mx.random.seed(7)
+    layer = nn.QuantizedLinear(512, 288, bits=bits, group_size=64)
+    x = (mx.random.normal((batch, length, 512)) * 0.5).astype(mx.bfloat16)
+    expected = mx.quantized_matmul(
+        x,
+        layer.weight,
+        layer.scales,
+        layer.biases,
+        transpose=True,
+        group_size=64,
+        bits=bits,
+    ).astype(mx.float32)
+    out = layer(x).astype(mx.float32)
+    mx.eval(out, expected)
+    rows = batch * length
+    if rows >= 7:
+        assert routed == [(rows, 512)]
+    else:
+        # Below seven rows the 5-bit layout has no small-M kernel.
+        assert routed == []
+    assert out.shape == (batch, length, 288)
+    tolerance = 2.0 * mx.abs(expected).max().item() / 256 + 1e-2
+    assert mx.abs(out - expected).max().item() <= tolerance
+
+
+@pytest.mark.parametrize("nax", [True, False])
+def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, nax):
+    """Speculative steps raise MLX's buffer caps on M5 only and always restore them."""
+    from omlx.custom_kernels import nax as nax_mod
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    caps = [(50, 50)]
+
+    def fake_set(ops, mb):
+        previous = caps[-1]
+        caps.append((ops, mb))
+        return previous
+
+    monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
+    monkeypatch.setattr(nax_mod, "is_nax_available", lambda: nax)
+    with pytest.raises(RuntimeError), bg._spec_command_buffers():
+        inside = caps[-1]
+        raise RuntimeError("step failed")
+    assert inside == (bg._SPEC_BUFFER_CAPS if nax else (50, 50))
+    assert caps[-1] == (50, 50)

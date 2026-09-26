@@ -1011,6 +1011,9 @@ class PagedSSDBlockMetadata:
     cache_signature: str = ""
     layer_cache_types: list[str] | None = None
     layer_meta_states: list[tuple] | None = None
+    # Chain parent and tail marker; a tail is found through its parent.
+    parent_hash: bytes | None = None
+    tail_terminal: bool = False
 
     def touch(self) -> None:
         """Update last access time."""
@@ -1035,6 +1038,10 @@ class PagedSSDBlockMetadata:
         if self.layer_meta_states:
             # Convert tuples to lists for JSON serialization
             result["layer_meta_states"] = [list(m) for m in self.layer_meta_states]
+        if self.parent_hash is not None:
+            result["parent_hash"] = self.parent_hash.hex()
+        if self.tail_terminal:
+            result["tail_terminal"] = True
         return result
 
     @classmethod
@@ -1058,6 +1065,10 @@ class PagedSSDBlockMetadata:
             cache_signature=data.get("cache_signature", ""),
             layer_cache_types=data.get("layer_cache_types"),
             layer_meta_states=layer_meta_states,
+            parent_hash=(
+                bytes.fromhex(data["parent_hash"]) if data.get("parent_hash") else None
+            ),
+            tail_terminal=bool(data.get("tail_terminal", False)),
         )
 
 
@@ -1608,6 +1619,7 @@ class PagedSSDCacheManager(CacheManager):
         expected_layer_cache_types: list[str] | None = None,
         gdn_ssd_split_enabled: bool = False,
         gdn_sidecar_state_dtype: str = "fp32",
+        auto_size: bool = False,
     ):
         """
         Initialize the SSD cache manager.
@@ -1615,6 +1627,7 @@ class PagedSSDCacheManager(CacheManager):
         Args:
             cache_dir: Directory for SSD cache files.
             max_size_bytes: Maximum total size of SSD cache.
+            auto_size: Use 50% of the sum of free space and existing SSD cache.
             hot_cache_max_bytes: Maximum in-memory hot cache size in bytes.
                 0 means disabled (default).
             hot_cache_only: When True, skip directory init and writer thread.
@@ -1662,6 +1675,7 @@ class PagedSSDCacheManager(CacheManager):
                 mode; split blocks use format version 5.
         """
         self._cache_dir = cache_dir
+        self._auto_size = auto_size
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
@@ -1712,6 +1726,7 @@ class PagedSSDCacheManager(CacheManager):
         # Disk usage cache for dynamic effective max size (30s TTL)
         self._disk_usage_cache = None  # type: shutil._ntuple_diskusage | None
         self._disk_usage_cache_time: float = 0.0
+        self._disk_cache_size_at_check: int = 0
         self._last_disk_pressure_warn: float = 0.0
         self._last_promotion_failure_warn: float = 0.0
 
@@ -1749,6 +1764,16 @@ class PagedSSDCacheManager(CacheManager):
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
 
+        # Track which block hashes are queued for background write
+        self._pending_write_hashes: set = set()
+        self._pending_write_hashes_lock = threading.Lock()
+        # Lock ordering invariant: _hot_cache_lock -> _pending_write_hashes_lock.
+        # Never acquire in reverse. Load path: _hot_cache_get (holds _hot_cache_lock,
+        # releases), then _pending_write_buffer_get (holds _pending_write_hashes_lock).
+        # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
+        # _enqueue_ssd_write (holds _pending_write_hashes_lock).
+        self._pending_write_buffers: dict[bytes, dict] = {}
+
         # Initialize directory structure and scan existing files
         # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
         if self._cache_dir and not self._hot_cache_only:
@@ -1774,15 +1799,6 @@ class PagedSSDCacheManager(CacheManager):
             kv_bytes_per_token=self._expected_kv_bytes_per_token,
         )
         self._write_queue: queue.Queue = queue.Queue(maxsize=self._max_pending_writes)
-        # Track which block hashes are queued for background write
-        self._pending_write_hashes: set = set()
-        self._pending_write_hashes_lock = threading.Lock()
-        # Lock ordering invariant: _hot_cache_lock -> _pending_write_hashes_lock.
-        # Never acquire in reverse. Load path: _hot_cache_get (holds _hot_cache_lock,
-        # releases), then _pending_write_buffer_get (holds _pending_write_hashes_lock).
-        # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
-        # _enqueue_ssd_write (holds _pending_write_hashes_lock).
-        self._pending_write_buffers: dict[bytes, dict] = {}
         self._persistence_progress_lock = threading.Lock()
         self._persistence_last_success = None
         self._persistence_failed = False
@@ -1813,9 +1829,13 @@ class PagedSSDCacheManager(CacheManager):
                 )
             except OSError:
                 pass
+        initial_limit = (
+            self._get_effective_max_size() if self._auto_size else max_size_bytes
+        )
         logger.info(
             f"PagedSSDCacheManager initialized: dir={self._cache_dir}, "
-            f"max_size={format_bytes(max_size_bytes)}{hot_info}, "
+            f"max_size={format_bytes(initial_limit)}{hot_info}, "
+            f"auto_size={self._auto_size}, "
             f"existing_files={self._index.count}{disk_info}"
         )
 
@@ -2315,6 +2335,12 @@ class PagedSSDCacheManager(CacheManager):
         tracked_size = self._tracked_ssd_size()
         if tracked_size > 0 and tracked_size > self._get_effective_max_size():
             self._enforce_size_limit_for_new_block(0, unbounded=True)
+            logger.info(
+                "SSD cache startup cleanup: freed=%s, remaining=%s, limit=%s",
+                format_bytes(tracked_size - self._tracked_ssd_size()),
+                format_bytes(self._tracked_ssd_size()),
+                format_bytes(self._get_effective_max_size()),
+            )
 
     def _scan_existing_gdn_sidecars(self) -> tuple[int, int, int]:
         """Index existing sidecars using only path and stat metadata.
@@ -2971,6 +2997,7 @@ class PagedSSDCacheManager(CacheManager):
                     )
                     return None
 
+            parent_hash_hex = metadata.get("parent_hash", "")
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
                 file_path=file_path,
@@ -2984,6 +3011,8 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=metadata.get("cache_signature", ""),
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                parent_hash=bytes.fromhex(parent_hash_hex) if parent_hash_hex else None,
+                tail_terminal=metadata.get("tail_terminal") == "1",
             )
         except Exception as e:
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
@@ -3161,6 +3190,8 @@ class PagedSSDCacheManager(CacheManager):
         layer_meta_states: list[tuple] | None = None,
         hot_cache_write_back: bool = True,
         replace_existing: bool = False,
+        parent_hash: bytes | None = None,
+        tail_terminal: bool = False,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -3186,6 +3217,8 @@ class PagedSSDCacheManager(CacheManager):
                 for the same content hash. This is reserved for promoting a
                 non-sliceable prefix-cache placeholder into a valid boundary
                 snapshot; normal deduplicated saves must leave it False.
+            parent_hash: Chain hash of the preceding block, if any.
+            tail_terminal: True for a short terminal block, re-indexed by parent.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -3435,6 +3468,10 @@ class PagedSSDCacheManager(CacheManager):
                 "payload_layout": self._payload_layout,
                 "created_at": str(time.time()),
             }
+            if parent_hash is not None:
+                metadata["parent_hash"] = parent_hash.hex()
+            if tail_terminal:
+                metadata["tail_terminal"] = "1"
 
             # Add cache type information if provided
             if layer_cache_types:
@@ -3493,6 +3530,8 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=cache_signature,
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                parent_hash=parent_hash,
+                tail_terminal=tail_terminal,
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
@@ -4179,6 +4218,14 @@ class PagedSSDCacheManager(CacheManager):
                 return True
         return False
 
+    def iter_tail_blocks(self) -> list[tuple[bytes | None, bytes, int]]:
+        """Return (parent_hash, block_hash, token_count) for indexed tail blocks."""
+        return [
+            (meta.parent_hash, meta.block_hash, meta.token_count)
+            for meta in self._index.get_all_metadata()
+            if meta.tail_terminal and meta.token_count > 0
+        ]
+
     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
         """
         Parallel-load matched blocks from SSD into hot cache.
@@ -4528,14 +4575,16 @@ class PagedSSDCacheManager(CacheManager):
     def _get_effective_max_size(self) -> int:
         """Get effective max size considering actual disk free space.
 
-        Returns the minimum of configured max_size and 99% of disk space
-        available for cache (current cache size + disk free). This ensures
-        eviction triggers before the disk fills up even when other processes
-        consume disk space after the server started.
+        Auto mode uses 50% of the sum of free space and existing cache.
+        Explicit limits retain the 99% disk-space guard.
+        Sampling both sizes together keeps writes from increasing the cached budget.
 
         Uses a 30-second TTL cache for shutil.disk_usage() results.
         """
-        if self._cache_dir is None:
+        # Hot-cache-only mode never touches the SSD directory (init skips
+        # creating it), so disk headroom is irrelevant here; querying it
+        # would fail with ENOENT on every poll and spam this warning.
+        if self._cache_dir is None or self._hot_cache_only:
             return self._max_size
 
         # Take the lock so a concurrent writer-thread invalidation
@@ -4556,12 +4605,28 @@ class PagedSSDCacheManager(CacheManager):
                         f"{self._cache_dir}: {e}"
                     )
                     return self._max_size
+                self._disk_cache_size_at_check = self._tracked_ssd_size()
+                # Pending index entries reserve bytes that may not be on disk yet.
+                with self._pending_write_hashes_lock:
+                    for block_hash in self._pending_write_hashes:
+                        metadata = self._index.get(block_hash)
+                        if metadata is None:
+                            continue
+                        try:
+                            persisted_size = metadata.file_path.stat().st_size
+                        except FileNotFoundError:
+                            persisted_size = 0
+                        self._disk_cache_size_at_check += (
+                            persisted_size - metadata.file_size
+                        )
                 self._disk_usage_cache_time = now
-            disk_free = self._disk_usage_cache.free
-
-        disk_available = self._tracked_ssd_size() + disk_free
-        disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
-        return min(self._max_size, disk_limit)
+            disk_available = (
+                self._disk_cache_size_at_check + self._disk_usage_cache.free
+            )
+            if self._auto_size:
+                return disk_available // 2
+            disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
+            return min(self._max_size, disk_limit)
 
     def _evict_tracked_until_size(
         self,
@@ -4629,7 +4694,7 @@ class PagedSSDCacheManager(CacheManager):
 
         # Warn when disk pressure shrinks effective limit well below configured
         # (throttled to once per 60s to avoid log spam)
-        if effective_max < self._max_size * 0.1:
+        if not self._auto_size and effective_max < self._max_size * 0.1:
             now = time.monotonic()
             if now - self._last_disk_pressure_warn > 60.0:
                 self._last_disk_pressure_warn = now

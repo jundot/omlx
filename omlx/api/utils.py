@@ -8,7 +8,6 @@ import json
 import re
 from typing import Any, List
 
-from ..exceptions import InvalidRequestError
 from .openai_models import Message
 
 # Model families whose chat templates consume message.reasoning_content directly.
@@ -42,6 +41,12 @@ def uses_native_reasoning_content(
         return True
     if engine_model_type in _NATIVE_REASONING_MODEL_TYPES:
         return True
+    # The DeepSeek V4 family DSML encoders render history reasoning_content
+    # into <think> blocks themselves; inlining it into content would render
+    # a second, empty <think></think> ahead of it.
+    for model_type in (config_model_type, engine_model_type):
+        if model_type and model_type.startswith("deepseek_v4"):
+            return True
 
     lowered = (model_name or "").lower()
     return "minimax" in lowered and "m3" in lowered
@@ -259,10 +264,19 @@ def _extract_multimodal_content_list(content: list) -> list:
                         }
                     )
             elif item_type in ("video_url", "input_video"):
-                raise InvalidRequestError(
-                    "Video input is not supported by oMLX.",
-                    field="messages",
-                )
+                video_url_value = item.get("video_url", item.get("input_video"))
+                url = None
+                if isinstance(video_url_value, str):
+                    url = video_url_value
+                elif isinstance(video_url_value, dict):
+                    url = video_url_value.get("url")
+                if url:
+                    parts.append(
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": url},
+                        }
+                    )
     return parts
 
 
@@ -1283,9 +1297,9 @@ def extract_multimodal_content(
         if isinstance(content, str):
             processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
-            # Preserve image_url and input_audio parts for VLM processing
+            # Preserve image, video, and audio parts for VLM processing.
             multimodal_parts = _extract_multimodal_content_list(content)
-            multimodal_types = {"image_url", "input_audio"}
+            multimodal_types = {"image_url", "video_url", "input_audio"}
             has_multimodal = any(
                 p.get("type") in multimodal_types for p in multimodal_parts
             )

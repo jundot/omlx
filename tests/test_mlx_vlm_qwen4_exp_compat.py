@@ -108,6 +108,26 @@ def test_qwen4_exp_config_normalizes_reference_layer_type():
     assert config.text_config.rope_parameters["type"] == "default"
 
 
+def test_qwen4_exp_model_file_checkpoints_resolve_to_vendored_module(tmp_path):
+    """mlx-vlm 0.7.x short-circuits ``config['model_file']`` to an imported
+    ``custom_model`` module that lacks ``ModelConfig``; qwen4_exp checkpoints
+    ship ``qwen4_exp.py`` (``ModelArgs``-style only), so resolution must keep
+    landing on the vendored registry entry (regression: "module
+    'custom_model' has no attribute 'ModelConfig'").
+    """
+    assert compat.apply_mlx_vlm_qwen4_exp_compat_patch() in {True, False}
+    from mlx_vlm.models import qwen4_exp
+    from mlx_vlm.utils import get_model_and_args
+
+    (tmp_path / "qwen4_exp.py").write_text("class Model:\n    pass\n")
+    config = {"model_type": "qwen4_exp", "model_file": "qwen4_exp.py"}
+
+    module, model_type = get_model_and_args(config, model_path=tmp_path)
+
+    assert model_type == "qwen4_exp"
+    assert module is qwen4_exp
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -614,14 +634,27 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
     assert next_logits.logits.shape == (1, 1, 64)
 
 
-def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
+# The tiny config has budget 8 and ratio 2: query rows 0..8 see every block.
+@pytest.mark.parametrize(
+    ("prefix", "length", "gathered_rows"),
+    [
+        (0, 10, 2),  # the gathered arm keeps at least two rows
+        (5, 16, 12),
+        (20, 16, 16),
+    ],
+)
+def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(
+    monkeypatch, prefix, length, gathered_rows
+):
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language
     from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
 
     attention = Qwen4ExpAttention(config.text_config)
     mx.eval(attention.parameters())
-    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+    total = prefix + length
+    hidden = mx.random.normal((1, total, config.text_config.hidden_size))
 
     calls = []
     gathered = language.contiguous_causal_gathered_qsa
@@ -630,9 +663,16 @@ def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
         calls.append((args[0].shape, args[1].shape))
         return gathered(*args, **kwargs)
 
+    def run(cache):
+        if prefix:
+            attention(hidden[:, :prefix], mask="causal", cache=cache)
+        calls.clear()
+        return attention(hidden[:, prefix:], mask="causal", cache=cache)
+
     monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
     fast_cache = QSAKVCache()
-    actual = attention(hidden, mask="causal", cache=fast_cache)
+    actual = run(fast_cache)
+    fast_calls = list(calls)
 
     monkeypatch.setattr(
         Qwen4ExpAttention,
@@ -640,12 +680,12 @@ def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
         staticmethod(lambda *args, **kwargs: False),
     )
     reference_cache = QSAKVCache()
-    expected = attention(hidden, mask="causal", cache=reference_cache)
+    expected = run(reference_cache)
     mx.eval(actual, expected)
 
-    assert calls == [((1, 4, 20, 8), (1, 2, 20, 8))]
+    assert fast_calls == [((1, 4, gathered_rows, 8), (1, 2, total, 8))]
     assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
-    assert fast_cache.offset == reference_cache.offset == 20
+    assert fast_cache.offset == reference_cache.offset == total
     assert mx.array_equal(fast_cache.index_keys, reference_cache.index_keys).item()
     assert mx.array_equal(
         fast_cache.index_position_ids,
@@ -912,6 +952,25 @@ def test_qwen4_fp8_ple_dequantizes_only_selected_rows():
     result = embedding(mx.array([[1, 2]], dtype=mx.int32))
     expected = mx.array([[[0.75, 1.0], [1.25, 1.5]]], dtype=mx.bfloat16)
 
+    assert mx.array_equal(result, expected).item()
+
+
+def test_qwen4_sharded_embedding_keeps_token_order_across_shards():
+    _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    embedding = ShardedEmbedding(num_embeddings=11, dims=3, num_shards=3)
+    table = mx.arange(33, dtype=mx.float32).reshape(11, 3)
+    offsets = embedding.shard_offsets
+    for shard, start, end in zip(embedding.shards, offsets, offsets[1:]):
+        shard.weight = table[start:end]
+    embedding.weight_scale = mx.array([0.5], dtype=mx.bfloat16)
+    indices = mx.array([[10, 0, 4, 4, 7], [3, 10, 8, 0, 5]], dtype=mx.int32)
+
+    result = embedding(indices)
+    expected = table[indices] * embedding.weight_scale
+
+    assert result.shape == (2, 5, 3)
     assert mx.array_equal(result, expected).item()
 
 

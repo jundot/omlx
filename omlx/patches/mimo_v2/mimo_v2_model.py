@@ -54,13 +54,17 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool
     topk_method: str
     partial_rotary_factor: float
-    attention_bias: bool
     layernorm_epsilon: float
     max_position_embeddings: int
     routed_scaling_factor: Optional[float] = None
     attention_value_scale: Optional[float] = None
     rope_scaling: Optional[Dict[str, Any]] = None
+    attention_bias: bool = False
     tie_word_embeddings: bool = False
+    num_nextn_predict_layers: int = 0
+    omlx_mtp_sidecar: Optional[str] = None
+    n_shared_experts: Optional[int] = None
+    scoring_func: str = "sigmoid"
 
     def __post_init__(self):
         n = self.num_hidden_layers
@@ -213,8 +217,9 @@ class MoEGate(nn.Module):
         self.e_score_correction_bias = mx.zeros((config.n_routed_experts,))
 
     def __call__(self, x):
+        # BF16 router logits can collapse distinct expert scores into ties.
         return group_expert_select(
-            x @ self.weight.T,
+            x.astype(mx.float32) @ self.weight.astype(mx.float32).T,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
@@ -269,6 +274,70 @@ class DecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
+class MiMoV2MTPLayer(nn.Module):
+    """One MiMo next-token predictor head."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        hidden = config.hidden_size
+        self.enorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.hnorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.eh_proj = nn.Linear(2 * hidden, hidden, bias=False)
+        self.input_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.self_attn = Attention(config, is_sliding_window=True)
+        self.pre_mlp_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.mlp = MLP(config)
+        self.final_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.sliding_window_size = config.sliding_window_size
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        token_embeddings: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        x = self.eh_proj(
+            mx.concatenate(
+                [self.enorm(token_embeddings), self.hnorm(hidden_states)], axis=-1
+            )
+        )
+        mask = create_attention_mask(
+            x,
+            cache,
+            window_size=self.sliding_window_size,
+        )
+        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        h = h + self.mlp(self.pre_mlp_layernorm(h))
+        return self.final_layernorm(h)
+
+
+class MiMoV2MultiTokenPredictor(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.layers = [
+            MiMoV2MTPLayer(config)
+            for _ in range(int(config.num_nextn_predict_layers or 0))
+        ]
+
+    def __call__(self, hidden, tokens, embed, cache):
+        outputs = []
+        for layer, layer_cache in zip(self.layers, cache):
+            if tokens.shape[1] == 0:
+                break
+            hidden = layer(hidden, embed(tokens), layer_cache)
+            outputs.append(hidden)
+            hidden, tokens = hidden[:, :-1], tokens[:, 1:]
+        return outputs
+
+
+class _MiMoMTPCache(list):
+    """Per-head caches plus the current predictor index for one draft cycle."""
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.layer_idx = 0
+
+
 class MiMoV2Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -291,7 +360,8 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
-    ) -> mx.array:
+        return_hidden: bool = False,
+    ) -> Any:
         h = (
             input_embeddings
             if input_embeddings is not None
@@ -337,7 +407,10 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(h)
+        normed = self.norm(h)
+        if return_hidden:
+            return normed, h
+        return normed
 
 
 class Model(nn.Module):
@@ -349,24 +422,111 @@ class Model(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        from omlx.patches.mlx_lm_mtp import (
+            get_mtp_depth,
+            is_mtp_active,
+            is_mtp_depth_fixed,
+        )
+
+        n_mtp = int(config.num_nextn_predict_layers or 0)
+        self._omlx_mtp_decode_enabled = bool(n_mtp and is_mtp_active())
+        if self._omlx_mtp_decode_enabled:
+            self.model.mtp = MiMoV2MultiTokenPredictor(config)
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = min(int(get_mtp_depth()), n_mtp)
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
+            self._omlx_mtp_head_clone = True
+            self._omlx_mtp_head_prenorm = True
+
+    @property
+    def mtp(self):
+        return self.model.mtp
+
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        del n_confirmed
+        result = self.model(
+            inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+        )
+        if return_hidden:
+            out, hidden = result
+        else:
+            out = result
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def mtp_begin_cycle(self, mtp_cache, depth):
+        del depth
+        if isinstance(mtp_cache, _MiMoMTPCache):
+            mtp_cache.layer_idx = 0
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        layer_idx = getattr(mtp_cache, "layer_idx", 0) % len(self.mtp.layers)
+        cache = mtp_cache[layer_idx] if mtp_cache else None
+        token_embeddings = self.model.embed_tokens(next_token_ids)
+        hidden = self.mtp.layers[layer_idx](hidden_states, token_embeddings, cache)
+        if isinstance(mtp_cache, _MiMoMTPCache):
+            mtp_cache.layer_idx = layer_idx + 1
+        logits_source = hidden[:, -logits_keep:] if logits_keep else hidden
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def make_mtp_cache(self):
+        if not hasattr(self.model, "mtp"):
+            return _MiMoMTPCache()
+        return _MiMoMTPCache(
+            RotatingKVCache(max_size=self.args.sliding_window_size)
+            for _ in self.mtp.layers
+        )
+
+    def mtp_partial_rollback(self, cache, accepted, num_drafts):
+        rejected = num_drafts - accepted
+        if rejected <= 0:
+            return True
+        if not all(c.is_trimmable() for c in cache):
+            return False
+        for c in cache:
+            if c.trim(rejected) != rejected:
+                raise RuntimeError("MiMo MTP cache rollback was incomplete")
+        return True
 
     def sanitize(self, weights):
+        if hasattr(self.model, "mtp") and self.args.omlx_mtp_sidecar:
+            weights = {**weights, **mx.load(self.args.omlx_mtp_sidecar)}
+
         skip_prefixes = (
-            "model.mtp.",
             "visual.",
             "audio_encoder.",
             "speech_embeddings.",
         )
+        if not hasattr(self.model, "mtp"):
+            skip_prefixes += ("model.mtp.",)
         weights = {k: v for k, v in weights.items() if not k.startswith(skip_prefixes)}
 
         BS = FUSED_QKV_BLOCK_SIZE
@@ -410,6 +570,42 @@ class Model(nn.Module):
             weights[f"{prefix}.k_proj.weight"] = k
             weights[f"{prefix}.v_proj.weight"] = v
 
+        for layer_idx in range(int(self.args.num_nextn_predict_layers or 0)):
+            prefix = f"model.mtp.layers.{layer_idx}.self_attn"
+            qkv_prefix = f"{prefix}.qkv_proj"
+            qkv_key = f"{qkv_prefix}.weight"
+            scale_key = f"{qkv_key}_scale_inv"
+            if qkv_key in weights and scale_key in weights:
+                q, k, v = split_fused_qkv(
+                    weights.pop(qkv_key),
+                    weights.pop(scale_key),
+                    tp=TP,
+                    n_h=self.args.swa_num_attention_heads,
+                    n_kv=self.args.swa_num_key_value_heads,
+                    hd=self.args.swa_head_dim,
+                    vhd=self.args.swa_v_head_dim,
+                )
+                weights[f"{prefix}.q_proj.weight"] = q
+                weights[f"{prefix}.k_proj.weight"] = k
+                weights[f"{prefix}.v_proj.weight"] = v
+                continue
+
+            # Packed MLX weights, scales, and biases share the output-row axis.
+            # Split them at the same Q/K boundaries.
+            if qkv_key not in weights or f"{qkv_prefix}.scales" not in weights:
+                continue
+            q_rows = self.args.swa_num_attention_heads * self.args.swa_head_dim
+            k_rows = self.args.swa_num_key_value_heads * self.args.swa_head_dim
+            boundaries = [q_rows, q_rows + k_rows]
+            for suffix in ("weight", "scales", "biases"):
+                fused_key = f"{qkv_prefix}.{suffix}"
+                if fused_key not in weights:
+                    continue
+                q, k, v = mx.split(weights.pop(fused_key), boundaries, axis=0)
+                weights[f"{prefix}.q_proj.{suffix}"] = q
+                weights[f"{prefix}.k_proj.{suffix}"] = k
+                weights[f"{prefix}.v_proj.{suffix}"] = v
+
         scale_keys = [k for k in weights if k.endswith("weight_scale_inv")]
         for sk in scale_keys:
             wk = sk[: -len("_scale_inv")]
@@ -420,6 +616,27 @@ class Model(nn.Module):
             for proj in ("gate_proj", "down_proj", "up_proj"):
                 expert0 = f"{prefix}.experts.0.{proj}.weight"
                 if expert0 not in weights:
+                    continue
+                scale0 = expert0 + "_scale"
+                if scale0 in weights:
+                    packed, scales = [], []
+                    for e in range(self.args.n_routed_experts):
+                        key = f"{prefix}.experts.{e}.{proj}.weight"
+                        weight = weights.pop(key)
+                        scale = weights.pop(key + "_scale")
+                        if (
+                            weight.dtype != mx.uint8
+                            or scale.dtype != mx.uint8
+                            or scale.shape != (weight.shape[0], weight.shape[1] // 16)
+                        ):
+                            raise ValueError(
+                                f"Invalid MiMo MXFP4 weight/scale pair: {key}"
+                            )
+                        packed.append(weight.view(mx.uint32))
+                        scales.append(scale)
+                    target = f"{prefix}.switch_mlp.{proj}"
+                    weights[f"{target}.weight"] = mx.stack(packed)
+                    weights[f"{target}.scales"] = mx.stack(scales)
                     continue
                 weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
                     [

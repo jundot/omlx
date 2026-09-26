@@ -58,6 +58,7 @@ def _make_fixture(monkeypatch, drafter_returns_uid):
         running={},
         total_prompt_tokens=0,
     )
+    sched._dflash_bind_uid = Scheduler._dflash_bind_uid.__get__(sched, Scheduler)
 
     request = SimpleNamespace(
         request_id="req-long-text",

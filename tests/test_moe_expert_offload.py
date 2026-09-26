@@ -265,6 +265,65 @@ class TestApplyAndForward:
         mx.eval(got_below)
         assert bool(mx.array_equal(ref_below, got_below))
 
+    def test_prefill_padding_preserves_small_chunk_kernel(self, tmp_path):
+        glu = _make_glu(seed=42, d=128, inter=128)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        x = mx.random.normal((2, 31, 128)).astype(mx.bfloat16)
+        # Each eight-expert chunk has 31 routes; padding to 32 would select QMM.
+        indices = mx.array(
+            [group * 8 + route % 8 for group in range(4) for route in range(31)]
+        ).reshape(2, 31, 2)
+        expected = glu(x, indices)
+        mx.eval(expected)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        actual = model.layers[0].experts.switch_glu(x, indices)
+        mx.eval(actual)
+        assert mx.array_equal(actual, expected).item()
+
+    def test_padded_prefill_on_concurrent_streams(self, tmp_path, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from omlx.patches import moe_expert_offload as offload
+
+        glu = _make_glu(seed=42)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        models = [_MiniMoE([glu]), _MiniMoE([glu])]
+        x = mx.random.normal((2, 257, D))
+        indices = _ri(2, 257, K)
+        expected = x + glu(x, indices).sum(axis=-2)
+        mx.eval(x, indices, expected)
+        for model in models:
+            apply_moe_expert_offload(model, tmp_path, 0.25)
+            offload.materialize_offload_state(model)
+
+        def unexpected_clear(*args, **kwargs):
+            pytest.fail("Offloaded forward must not clear the global Metal pool")
+
+        monkeypatch.setattr(offload, "_sync_and_clear_cache", unexpected_clear)
+        monkeypatch.setattr(mx, "clear_cache", unexpected_clear)
+        barrier = threading.Barrier(2)
+
+        def run(model):
+            stream = mx.new_stream(mx.gpu)
+            try:
+                with mx.stream(stream):
+                    for _ in range(4):
+                        barrier.wait(timeout=20)
+                        actual = model(x, indices)
+                        mx.eval(actual)
+                        assert mx.allclose(
+                            actual, expected, rtol=1e-4, atol=1e-5
+                        ).item()
+                return str(stream)
+            finally:
+                mx.synchronize(stream)
+                mx.clear_streams()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            streams = list(pool.map(run, models))
+        assert len(set(streams)) == 2
+
     def test_batch_invariance(self, tmp_path):
         model, _ = self._wrapped_model(tmp_path, n_layers=1)
         apply_moe_expert_offload(model, tmp_path, 0.25)

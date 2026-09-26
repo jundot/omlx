@@ -591,6 +591,55 @@ def test_v8_tiles_agree_with_each_other(variant, bits):
 
 
 @requires_kernels
+@pytest.mark.parametrize("variant", [800, 801, 802, 803, 804, 805, 806])
+@pytest.mark.parametrize("act_mode", [0, 1])
+def test_packed_linear_matches_the_row_major_layout(variant, act_mode):
+    """A PackedLinear routes to A8 and computes exactly what its source did.
+
+    Two projections share one store, so the second reads from a tile offset.
+    """
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.qwen35_packed_linear import _pack
+
+    fast = _kernels()
+    M, K, N = 96, 512, 384
+    sources = []
+    for _ in range(2):
+        linear = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=4)
+        linear.set_dtype(mx.bfloat16)
+        sources.append(linear)
+    packed = _pack(sources)
+    rng = np.random.default_rng(9)
+    x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.bfloat16)
+    qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+
+    for source, linear in zip(sources, packed):
+        plan = dispatch.classify_linear(linear)
+        assert plan is not None and plan.packed and plan.bits == 4
+        want = fast.qwen35_oq_a8_qmm_t(
+            qa,
+            sa,
+            ra,
+            source.weight,
+            mx.contiguous(source.scales.T),
+            mx.contiguous(source.biases.T),
+            4,
+            act_mode,
+            variant,
+        )
+        weight, scales, biases = dispatch._prepared_weights(linear)
+        got = fast.qwen35_oq_a8_qmm_t(
+            qa, sa, ra, weight, scales, biases, 4, act_mode, variant, packed=True
+        )
+        mx.eval(want, got)
+        np.testing.assert_array_equal(
+            np.array(got.astype(mx.float32)), np.array(want.astype(mx.float32))
+        )
+
+
+@requires_kernels
 @pytest.mark.parametrize("act_mode", [0, 1])
 def test_stage_a_keeps_the_batch_rank(act_mode):
     """The op derives the output shape from Qa, so its rank has to survive.

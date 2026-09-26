@@ -1,3 +1,9 @@
+# Cluster test filesystem isolation
+
+The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
+
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+
 # macOS readability theme tests
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.
@@ -9,6 +15,30 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 # Test timing
 
 CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+
+The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
+fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
+`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
+speculative routes remain intact. See
+[GDN decode prework](experimental/qwen35_fp16_decode.md) for the hardware, geometry
+limits and real-model benchmark requirements.
+
+# First-token burst release
+
+Run `python -m pytest -q tests/test_engine_core.py tests/test_output_collector.py`
+to check first-chunk delivery across the executor boundary, late admission,
+multi-token chunks, output ordering, later burst limits and request cancellation.
+Burst decode releases each request's first generated chunk before continuing
+with the configured burst policy. This adds one executor hand-off per request;
+it does not shorten prefill or bypass parser, stop-string or stream-interval
+buffering. Subsequent chunks still follow the selected Burst Decode setting.
+
+For a real-server comparison, use the same model, prompt, output length and
+cache state on main and the branch. Measure client-observed first content and
+complete-response time separately from producer-side token timestamps, with
+balanced (0.1 s) and aggressive (0.2 s) burst settings. Include short replies,
+long replies, a second request admitted during decode, and disconnect/recovery.
+Report any custom budgets separately from the stock modes.
 
 Cluster process-group tests use the `mock_cluster_ssh` fixture; remote teardown and serve-marker tests retain their own transport assertions. Mock-model engine tests skip explicit GC, while `test_engine_teardown.py` and `test_per_engine_threads.py` retain teardown and reclamation coverage. GLM5 execution tests reuse the eight-layer KDA/DSA fixture with dense and MoE layers; checkpoint-key tests retain the 45-layer configuration. The SDPA memory test retains the 8K/32K length ratio, head dimension 256, and 6:1 GQA ratio with fewer heads. DeepSeek V4.1 direct and converted engine checks run sequentially in one isolated subprocess with separate checkpoint directories.
 
@@ -79,7 +109,11 @@ expert reads from shared shards and any expert slab read through the Engram
 mapping. Further cases check that consumed read buffers are released within the
 in-flight byte window and pin the serial LRU order under concurrent reads,
 expert-boundary chunking of sorted routes, and the fit-to-budget residency
-helper against the admission arithmetic. Run alongside `test_deepseek_v41_offload.py`,
+helper against the admission arithmetic. `tests/test_deepseek_v41_affine_source.py`
+covers community `mlx_lm` affine source checkpoints: packed and declared-dense
+projections, exact force-dense dequantization, the affine Engram table spec, a
+convert round-trip against a direct load, the declared-format resolver, and
+offload eligibility. Run alongside `test_deepseek_v41_offload.py`,
 `test_moe_expert_offload.py`, and the engine-pool/model-settings suites.
 `node tests/moe_expert_offload_ui.test.cjs` checks the actual dashboard
 save/reopen payload and speculative-decoding toggle exclusion.
@@ -107,6 +141,10 @@ Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/t
 ### Lightning MTP with XTC sampling
 
 Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
+
+### Batched DFlash drafter
+
+Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash_batched or block_drafter"`. `test_dflash_batched.py` builds a tiny DFlash2 drafter with random weights and checks that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, plus the prefill seed window slicing and block-size clamping. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows. Real drafter acceptance and throughput need a Qwen3.5-family VLM checkpoint with its `z-lab` DFlash draft and are measured against the standard batched engine.
 
 # VLM cache boundary tests
 

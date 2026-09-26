@@ -10606,19 +10606,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cold-spillover ceiling. \"auto\" = 10% of SSD capacity."
+            "value" : "Cold-spillover ceiling. \"auto\" = 50% of the sum of free space and existing SSD cache."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Предел холодного spillover. \"auto\" = 10% емкости SSD."
+            "value" : "Предел холодного spillover. \"auto\" = 50% суммы свободного места и существующего SSD-кэша."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "冷溢出上限。'auto' = SSD 容量的 10%。"
+            "value" : "冷溢出上限。'auto' = 可用空间与现有 SSD 缓存之和的 50%。"
           }
         }
       }
@@ -20188,6 +20188,102 @@
         }
       }
     },
+    "settings.acceleration.mtp.depth.label" : {
+      "comment" : "Row label for the Lightning MTP draft depth picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive max depth"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive max depth"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive max depth"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.depth.sub" : {
+      "comment" : "Sublabel for the Lightning MTP draft depth picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.depth.adaptive" : {
+      "comment" : "Default Lightning MTP adaptive maximum draft depth",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3 tokens (Default)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3 tokens (Default)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3 tokens (Default)"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.depth.option" : {
+      "comment" : "Lightning MTP depth option; placeholder is the maximum draft token count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tokens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tokens"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tokens"
+          }
+        }
+      }
+    },
     "settings.acceleration.section" : {
       "comment" : "Section header above the Acceleration settings group",
       "extractionState" : "manual",
@@ -21893,7 +21989,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "自适应"
+            "value" : "3 tokens (Default)"
           }
         }
       }
@@ -22553,19 +22649,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Block-diffusion speculative decoding. Single-stream only (requests run one at a time)."
+            "value" : "Block-diffusion speculative decoding."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Block-diffusion speculative decoding. Только single-stream (запросы выполняются по одному)."
+            "value" : "Block-diffusion speculative decoding."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "块扩散推测性解码。仅单流（请求逐个运行）。"
+            "value" : "块扩散推测性解码。"
           }
         }
       }
@@ -23057,19 +23153,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Multi-token prediction for vision-language models via an assistant drafter."
+            "value" : "External drafter (Gemma 4 assistant or Qwen MTP) speeds up single requests."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Multi-token prediction для vision-language моделей через assistant drafter."
+            "value" : "Внешний драфтер (ассистент Gemma 4 или Qwen MTP) ускоряет одиночные запросы."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "通过助手起草器为视觉语言模型进行多 Token 预测。"
+            "value" : "使用外部起草器（Gemma 4 assistant 或 Qwen MTP）加速单个请求。"
           }
         }
       }

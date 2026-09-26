@@ -917,3 +917,83 @@ def test_split_restore_retry_budget_is_one_per_block(tmp_path):
     finally:
         boundary.shutdown()
         ssd.close()
+
+
+def test_split_store_persists_tail_sidecar_and_restores(tmp_path):
+    """A tail block commits its own sidecar and restores the whole prompt."""
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+    )
+    boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+    prefix.set_gdn_checkpoint_loader(boundary.load_file)
+
+    try:
+        request_id = "tail-request"
+        for token_count in (4, 8, 11):
+            extracted = _hybrid_extracted(token_count, float(token_count))
+            assert boundary.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+        provider = _BoundarySnapshotProvider(
+            boundary,
+            request_id,
+            [4, 8],
+            {},
+            paged_ssd_manager=ssd,
+            tail_terminal_token_count=11,
+        )
+        tokens = list(range(11))
+        stored = prefix.store_cache(
+            request_id,
+            tokens,
+            _hybrid_extracted(11, 11.0),
+            boundary_snapshots=provider,
+            _store_tail_terminal=True,
+        )
+        assert stored is not None and stored.num_tokens == 11
+        hashes = _block_hashes(prefix, stored)
+        assert len(hashes) == 3
+        signature = ssd.gdn_cache_signature_for(
+            model_name="hybrid-model",
+            num_layers=2,
+            block_size=BLOCK_SIZE,
+            layer_cache_types=LAYER_TYPES,
+        )
+        assert all(ssd.has_gdn_checkpoint(h, signature) for h in hashes)
+        paged.release_for_eviction(stored.block_ids)
+
+        hit_table, remaining = prefix.fetch_cache("restore-tail", tokens + [99, 100])
+        assert hit_table is not None
+        assert hit_table.num_tokens == 11 and remaining == [99, 100]
+        restored = prefix.reconstruct_cache(hit_table)
+        assert restored is not None
+        assert restored[0].keys_and_values()[0].shape[2] == 11
+        assert float(restored[1].cache[0][0, 0, 0]) == pytest.approx(11.0)
+        assert (
+            prefix.get_stats_dict()["gdn_last_restore"]["chosen_endpoint_tokens"] == 11
+        )
+    finally:
+        boundary.shutdown()
+        ssd.close()

@@ -54,9 +54,9 @@ _EXECUTOR_DRAIN_TIMEOUT = 10.0
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10+omlx.4 registers QwenGdnTargetOps, Gemma4TargetOps, and
-    MuseGlimmerTargetOps; oMLX adds a
-    Laguna target/draft adapter. The top-level ``model_type`` is the canonical
+    DFlash 0.1.10+omlx.7 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    MuseGlimmerTargetOps; oMLX adds Laguna and MiMo V2 target/draft adapters.
+    The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
     Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
@@ -95,9 +95,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse):
+    is_mimo = model_type in ("mimo_v2", "mimo_v2_flash")
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, and Muse Glimmer "
+            f"DFlash supports only Qwen, Gemma4, Laguna, MiMo V2, and "
+            f"Muse Glimmer "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -537,7 +539,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         runtime_context = self._build_runtime_context()
 
         def _load_models():
-            from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.engine.target_ops import bind_draft_to_target
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
@@ -554,12 +555,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 self._model_name, model_settings=self._model_settings
             )
 
-            # dflash-mlx 0.1.10 has no Laguna backend. Register oMLX's strict
-            # TargetOps plus the official gated Laguna drafter specialization
-            # before load_target_bundle resolves either architecture.
+            # Register oMLX's target and drafter specializations before
+            # load_target_bundle resolves either architecture.
             from ..patches.dflash_laguna import install_dflash_laguna_backend
+            from ..patches.dflash_mimo_v2 import install_dflash_mimo_v2_backend
 
             install_dflash_laguna_backend()
+            install_dflash_mimo_v2_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -613,12 +615,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else None
                 ),
             )
+            from ..patches.dflash_mimo_v2 import (
+                draft_backend_for,
+                prepare_mimo_draft,
+            )
+
+            prepare_mimo_draft(
+                draft,
+                draft_meta,
+                self._draft_model_path,
+            )
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
                 target_ops=target_bundle.target_ops,
             )
-            draft_backend = EagerDraftBackend()
+            draft_backend = draft_backend_for(draft)
             return target_bundle, draft, draft_backend, draft_meta
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
@@ -1226,6 +1238,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return 0
         return max(0, int(getattr(prefix_flow, "hit_tokens", 0) or 0))
 
+    @staticmethod
+    def _summary_finish_reason(summary, stop_ids, max_tokens: int) -> str:
+        """Return "length" when generation reached max_tokens without a stop token."""
+        if summary is None:
+            return "stop"
+        stops = set(stop_ids)
+        # A committed block can hold tokens after the stop token, so scan all.
+        if any(int(token) in stops for token in summary.generated_token_ids):
+            return "stop"
+        return "length" if int(summary.generation_tokens) >= max_tokens else "stop"
+
     def _create_output_parser_session(self, tools: list[dict] | None) -> Any | None:
         """Create a request-local parser, including its tool schemas."""
         factory = self._output_parser_factory
@@ -1365,11 +1388,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         # (usage) chunk so the API reports cached_tokens (#1441).
                         "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
-                    if parser_final is not None:
-                        if parser_final.tool_calls:
-                            metrics["tool_calls"] = parser_final.tool_calls
-                        if parser_final.finish_reason:
-                            metrics["finish_reason"] = parser_final.finish_reason
+                    if parser_final is not None and parser_final.tool_calls:
+                        metrics["tool_calls"] = parser_final.tool_calls
+                    metrics["finish_reason"] = (
+                        parser_final.finish_reason
+                        if parser_final is not None and parser_final.finish_reason
+                        else self._summary_finish_reason(event, stop_ids, max_tokens)
+                    )
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
                     )
@@ -1548,6 +1573,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    self._summary_finish_reason(summary, stop_ids, max_tokens),
                 )
             finally:
                 self._record_prefill_guard_active_memory()
@@ -1580,6 +1606,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    summary_finish,
                 ) = await asyncio.shield(asyncio.wrap_future(future))
             except asyncio.CancelledError:
                 stop_event.set()
@@ -1643,7 +1670,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             finish_reason=(
                 parser_final.finish_reason
                 if parser_final is not None and parser_final.finish_reason
-                else "stop"
+                else summary_finish
             ),
             tool_calls=(
                 parser_final.tool_calls
