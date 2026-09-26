@@ -387,7 +387,7 @@ private struct AdvancedSection: View {
                                       comment: "Toggle row label: keep multi-token prediction heads"),
                         sublabel: selectedHasMTP
                             ? String(localized: "quant.advanced.preserve_mtp.sub.available",
-                                     defaultValue: "Keep multi-token prediction heads in the quantized output",
+                                     defaultValue: "Keep multi-Token prediction heads in the quantized output",
                                      comment: "Toggle row sublabel when MTP is available")
                             : String(localized: "quant.advanced.preserve_mtp.sub.unavailable",
                                      defaultValue: "Unavailable — source model has no MTP heads",
@@ -933,14 +933,14 @@ private struct UploadModalView: View {
                            comment: "Subtitle when a token has been validated. Placeholder is the HF username")
                 }
                     ?? String(localized: "quant.upload_modal.credentials.subtitle.needs_validate",
-                              defaultValue: "Validate a token to enable upload",
+                              defaultValue: "Validate a Token to enable upload",
                               comment: "Subtitle when no token has been validated yet")
             )
 
             ListGroup {
                 Row(
                     label: String(localized: "quant.upload_modal.token.label",
-                                  defaultValue: "HF token",
+                                  defaultValue: "HF Token",
                                   comment: "Row label for the HF token input"),
                     sublabel: String(localized: "quant.upload_modal.token.sub",
                                      defaultValue: "Stored in macOS Keychain. Needs write access to your account.",

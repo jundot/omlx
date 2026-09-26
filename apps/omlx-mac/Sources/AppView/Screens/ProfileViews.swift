@@ -775,14 +775,14 @@ struct ProfileDetailCard: View {
                     comment: "Capacity stat label: max context window"),
              s["max_context_window"].flatMap { intOf($0) }
                 .map { String(localized: "profile.detail.capacity.tokens",
-                              defaultValue: "\(fmtCtx(Double($0))) tk",
+                              defaultValue: "\(fmtCtx(Double($0))) Tok",
                               comment: "Token count rendered next to a Capacity stat; placeholder is the formatted count") }),
             (String(localized: "profile.detail.capacity.max_tokens",
                     defaultValue: "Max Tokens",
                     comment: "Capacity stat label: max output tokens"),
              s["max_tokens"].flatMap { intOf($0) }
                 .map { String(localized: "profile.detail.capacity.tokens.raw",
-                              defaultValue: "\($0) tk",
+                              defaultValue: "\($0) Tok",
                               comment: "Raw token count for max tokens; placeholder is the integer count") }),
             (String(localized: "profile.detail.capacity.ttl",
                     defaultValue: "TTL",
@@ -841,7 +841,7 @@ struct ProfileDetailCard: View {
                 let n = intOf(s["thinking_budget_tokens"]) ?? 8192
                 flagChip(label: v
                          ? String(localized: "profile.detail.behavior.thinking_budget.on",
-                                  defaultValue: "Budget · \(fmtCtx(Double(n))) tk",
+                                  defaultValue: "Budget · \(fmtCtx(Double(n))) Tok",
                                   comment: "Behavior chip when thinking budget is enabled; placeholder is the formatted token count")
                          : String(localized: "profile.detail.behavior.thinking_budget.off",
                                   defaultValue: "Thinking budget",
@@ -1014,7 +1014,7 @@ struct ProfileDetailCard: View {
             .map { String(format: "%.0f%%", $0 * 100) }
         let thresh = intOf(s["specprefill_threshold"])
             .map { String(localized: "profile.detail.acceleration.specprefill.threshold",
-                          defaultValue: "≥\(fmtCtx(Double($0))) tk",
+                          defaultValue: "≥\(fmtCtx(Double($0))) Tok",
                           comment: "SpecPrefill threshold suffix; placeholder is the formatted token count") }
         let parts = [keep, thresh].compactMap { $0 }
         return parts.isEmpty

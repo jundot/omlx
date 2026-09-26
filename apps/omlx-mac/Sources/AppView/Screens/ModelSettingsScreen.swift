@@ -355,7 +355,7 @@ private struct SettingsApplySheet: View {
                                 rows: candidates.byPp)
                             candidateGroup(
                                 String(localized: "settings.apply.choose.group_tg",
-                                       defaultValue: "Best token generation (TG)",
+                                       defaultValue: "Best Token generation (TG)",
                                        comment: "Label above the candidates ranked by token generation speed"),
                                 rows: candidates.byTg)
                         }
@@ -971,15 +971,15 @@ private struct BasicTab: View {
                               defaultValue: "Context Window",
                               comment: "Row label for the context window field"),
                 sublabel: String(localized: "settings.basic.context_window.sub",
-                                 defaultValue: "Maximum tokens per request",
+                                 defaultValue: "Maximum Tokens per request",
                                  comment: "Sublabel for the context window field")) {
-                TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
+                TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "Tok", width: .controlCompact)
             }
             Row(label: String(localized: "settings.basic.max_tokens.label",
                               defaultValue: "Max Tokens",
                               comment: "Row label for the max generated tokens field"),
                 sublabel: String(localized: "settings.basic.max_tokens.sub",
-                                 defaultValue: "Cap on generated tokens (empty = default)",
+                                 defaultValue: "Cap on generated Tokens (empty = default)",
                                  comment: "Sublabel for the max generated tokens field")) {
                 TextInput(text: vm.bindProfile($vm.maxTokens),
                           placeholder: String(localized: "settings.basic.max_tokens.placeholder",
@@ -1026,7 +1026,7 @@ private struct BasicTab: View {
                     sublabel: vm.vlmMtpEnabled
                         ? vm.vlmMtpProcessorLockedReason
                         : String(localized: "settings.basic.repetition_penalty.sub",
-                                 defaultValue: "Penalize repeated tokens (−2 to 2).",
+                                 defaultValue: "Penalize repeated Tokens (−2 to 2).",
                                  comment: "Sublabel describing repetition-penalty range")) {
                     TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: .controlNarrow)
                         .disabled(vm.vlmMtpEnabled)
@@ -1038,7 +1038,7 @@ private struct BasicTab: View {
                     sublabel: vm.vlmMtpEnabled
                         ? vm.vlmMtpProcessorLockedReason
                         : String(localized: "settings.basic.presence_penalty.sub",
-                                 defaultValue: "Penalize tokens already present (−2 to 2).",
+                                 defaultValue: "Penalize Tokens already present (−2 to 2).",
                                  comment: "Sublabel describing presence-penalty range")) {
                     TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: .controlNarrow)
                         .disabled(vm.vlmMtpEnabled)
@@ -1181,12 +1181,12 @@ private struct AdvancedTab: View {
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
                     sublabel: String(localized: "settings.advanced.thinking_budget.sub",
-                                     defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
+                                     defaultValue: "Limit thinking Tokens for reasoning models. Forces end of thinking when exceeded.",
                                      comment: "Sublabel for the thinking budget field")) {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
-                                      mono: true, suffix: "tk", width: .controlCompact)
+                                      mono: true, suffix: "Tok", width: .controlCompact)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                     }
@@ -1195,13 +1195,13 @@ private struct AdvancedTab: View {
                                   defaultValue: "Limit Tool Result Tokens",
                                   comment: "Row label for the tool-result token limit field"),
                     sublabel: String(localized: "settings.advanced.tool_result_limit.sub",
-                                     defaultValue: "Truncate large tool results (e.g. file reads) to a token limit",
+                                     defaultValue: "Truncate large tool results (e.g. file reads) to a Token limit",
                                      comment: "Sublabel for the tool-result token limit field")) {
                     HStack(spacing: 8) {
                         if vm.limitToolResults {
                             TextInput(text: vm.bindProfile($vm.toolResultLimitTokens),
                                       placeholder: "4096",
-                                      mono: true, suffix: "tk", width: .controlCompact)
+                                      mono: true, suffix: "Tok", width: .controlCompact)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.limitToolResults))
                     }
@@ -1635,13 +1635,13 @@ private struct AccelerationSection: View {
                                   defaultValue: "Max Context (fallback)",
                                   comment: "Row label for the DFlash max-context fallback field"),
                     sublabel: String(localized: "settings.experimental.dflash.max_ctx.sub",
-                                     defaultValue: "Prompts at or above this token count switch to BatchedEngine. Empty = unlimited.",
+                                     defaultValue: "Prompts at or above this Token count switch to BatchedEngine. Empty = unlimited.",
                                      comment: "Sublabel describing the DFlash max-context fallback")) {
                     TextInput(text: vm.bindProfile($vm.dflashMaxCtx),
                               placeholder: String(localized: "settings.experimental.dflash.max_ctx.placeholder",
                                                   defaultValue: "unlimited",
                                                   comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
-                              mono: true, suffix: "tk", width: .controlCompact)
+                              mono: true, suffix: "Tok", width: .controlCompact)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
                                   defaultValue: "Verify Mode",
@@ -1668,7 +1668,7 @@ private struct AccelerationSection: View {
                                   defaultValue: "Draft Sink Size",
                                   comment: "Row label for the DFlash attention-sink tokens field"),
                     sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
-                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
+                                     defaultValue: "Attention-sink Tokens always kept in the window. Empty = dflash default (0).",
                                      comment: "Sublabel for the DFlash draft sink size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
                               placeholder: "0", mono: true, width: .controlCompact)
@@ -1677,7 +1677,7 @@ private struct AccelerationSection: View {
                                   defaultValue: "Runtime Block Size",
                                   comment: "Row label for the DFlash runtime block size field"),
                     sublabel: String(localized: "settings.experimental.dflash.block_size.sub",
-                                     defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
+                                     defaultValue: "Maximum draft and verify Tokens per cycle. Empty = checkpoint default.",
                                      comment: "Sublabel for the DFlash runtime block size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashBlockSize),
                               placeholder: "checkpoint", mono: true, width: .controlCompact)
@@ -1779,7 +1779,7 @@ private struct AccelerationSection: View {
             return reason
         }
         return String(localized: "settings.acceleration.mtp.sub",
-                      defaultValue: "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models.",
+                      defaultValue: "Drafts several Tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models.",
                       comment: "Default sublabel for the Lightning MTP toggle")
     }
 
@@ -2012,7 +2012,7 @@ private struct ExperimentalSection: View {
                                       defaultValue: "ANE Prompt Block",
                                       comment: "Row label for the fixed Qwen ANE prompt block size"),
                         sublabel: String(localized: "settings.experimental.qwen_ane.sequence.sub",
-                                         defaultValue: "Only prompt chunks exactly matching this token count use the ANE path. 2,048 is the measured default.",
+                                         defaultValue: "Only prompt chunks exactly matching this Token count use the ANE path. 2,048 is the measured default.",
                                          comment: "Sublabel explaining the fixed Qwen ANE prompt block size")) {
                         TextInput(text: vm.bindProfile($vm.qwen35AnePrefillSequenceLength),
                                   placeholder: "2048", mono: true,
@@ -2231,11 +2231,11 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Threshold",
                                   comment: "Row label for the SpecPrefill threshold field"),
                     sublabel: String(localized: "settings.experimental.specprefill.threshold.sub",
-                                     defaultValue: "Min prompt tokens to trigger (shorter prompts use full prefill).",
+                                     defaultValue: "Min prompt Tokens to trigger (shorter prompts use full prefill).",
                                      comment: "Sublabel for the SpecPrefill threshold field"),
                     isLast: true) {
                     TextInput(text: vm.bindProfile($vm.specprefillThreshold),
-                              placeholder: "8192", mono: true, suffix: "tk", width: .controlCompact)
+                              placeholder: "8192", mono: true, suffix: "Tok", width: .controlCompact)
                 }
             }
         }
@@ -2276,10 +2276,10 @@ private struct ExperimentalSection: View {
             guard let tps = recommendation.processingTps else {
                 return "Winner: GPU only"
             }
-            return String(format: "Winner: GPU only · %.1f prompt tok/s", tps)
+            return String(format: "Winner: GPU only · %.1f prompt Tok/s", tps)
         }
         if recommendation.backend == "k2" {
-            return String(format: "Winner: ANE dense %.0f%% · shared expert %.0f%% · %.1f prompt tok/s",
+            return String(format: "Winner: ANE dense %.0f%% · shared expert %.0f%% · %.1f prompt Tok/s",
                           (recommendation.mlpFraction ?? 0) * 100,
                           (recommendation.sharedFraction ?? 0) * 100, recommendation.processingTps ?? 0)
         }
@@ -2308,7 +2308,7 @@ private struct ExperimentalSection: View {
         guard let tps = recommendation.processingTps else {
             return summary
         }
-        return String(format: "%@ · %.1f prompt tok/s", summary, tps)
+        return String(format: "%@ · %.1f prompt Tok/s", summary, tps)
     }
 }
 

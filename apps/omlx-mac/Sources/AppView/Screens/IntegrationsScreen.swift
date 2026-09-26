@@ -131,7 +131,7 @@ private struct ClaudeCodeSection: View {
                     TextInput(
                         text: $vm.targetContextSizeText,
                         mono: true,
-                        suffix: "tk",
+                        suffix: "Tok",
                         width: .controlCompact
                     )
                 }
