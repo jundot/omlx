@@ -12864,13 +12864,8 @@ class Scheduler:
         # Reclaim before requeue so the retry starts from a lower baseline.
         self._reclaim_prefill_headroom()
 
-        # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly. Clearing the id alone does not do that: the
-        # wrapper is installed on the shared model by sparse_prefill and only
-        # `cleanup_rope` removes it, and once the id is clear
-        # `_cleanup_specprefill` will not run either. The retry, and every
-        # request after it, would then decode through this request's position
-        # offset.
+        # Remove this request's SpecPrefill RoPE wrapper, not just its id: once
+        # the id is clear nothing else uninstalls it from the shared model.
         if self._specprefill_active_request_id == request.request_id:
             from .patches.specprefill import cleanup_rope
 
