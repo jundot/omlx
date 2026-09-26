@@ -15,13 +15,17 @@
     ];
     const COLUMNS = 24;
     const MIN_W = 6;
-    const WIDTH_CLASSES = {
-        default: 'max-w-7xl',
-        wide: 'max-w-[90rem]',
-        wider: 'max-w-[100rem]',
-        full: 'max-w-none',
+    // The measures are tokens, not classes: tokens.json `layout.widths` generates
+    // `--measure-<id>`, and every console page reads the one dashboard.js points
+    // `--container-wide` at. So the dashboard's width control is the console's
+    // width control, and no page carries a second, private limit.
+    const WIDTH_MEASURES = {
+        default: 'var(--measure-default)',
+        wide: 'var(--measure-wide)',
+        wider: 'var(--measure-wider)',
+        full: 'var(--measure-full)',
     };
-    const WIDTH_IDS = Object.keys(WIDTH_CLASSES);
+    const WIDTH_IDS = Object.keys(WIDTH_MEASURES);
 
     function defaultLayout() {
         return {
@@ -60,18 +64,18 @@
         return { version: 1, width, blocks };
     }
 
-    function widthClass(width) {
-        return WIDTH_CLASSES[width] || WIDTH_CLASSES.default;
+    function widthMeasure(width) {
+        return WIDTH_MEASURES[width] || WIDTH_MEASURES.default;
     }
 
     root.DashboardLayout = {
         BLOCK_IDS,
         COLUMNS,
         MIN_W,
-        WIDTH_CLASSES,
+        WIDTH_MEASURES,
         WIDTH_IDS,
         defaultLayout,
         normalizeLayout,
-        widthClass,
+        widthMeasure,
     };
 })(typeof window !== 'undefined' ? window : globalThis);

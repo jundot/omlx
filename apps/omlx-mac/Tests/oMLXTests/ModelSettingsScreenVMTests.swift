@@ -19,11 +19,11 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
         XCTAssertEqual(
             ModelSettingsScreenVM.candidateStats(pp: 1309.1, tg: 59.6, memoryGb: 128, quantization: "4bit", omlxVersion: "0.7.0"),
-            "PP 1309.1 tok/s · TG 59.6 tok/s · 128 GB · 4bit · oMLX 0.7.0"
+            "PP 1309.1 Tok/s · TG 59.6 Tok/s · 128 GB · 4bit · oMLX 0.7.0"
         )
         XCTAssertEqual(
             ModelSettingsScreenVM.candidateStats(pp: 12.0, tg: nil, quantization: nil, omlxVersion: ""),
-            "PP 12.0 tok/s"
+            "PP 12.0 Tok/s"
         )
 
         let json = ModelSettingsScreenVM.appliedJSON([

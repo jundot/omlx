@@ -233,12 +233,12 @@ private struct WarningCallout: View {
                 Text(String(localized: "bench.context.warning.title",
                             defaultValue: "Before you start",
                             comment: "Heading of the warning callout above the Context Bench start button"))
-                    .font(.omlxText(12, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "bench.context.warning.body",
                             defaultValue: "This benchmark can take a long time — verification prefills a real prompt at the measured size, which may take many minutes for large models. All loaded models are unloaded when it starts, interrupting active requests. When it finishes, the result is automatically applied to the model's Context Window setting.",
                             comment: "Body of the warning callout above the Context Bench start button"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -270,12 +270,12 @@ private struct ProgressCard: View {
                                       defaultValue: "Starting…",
                                       comment: "Context Bench progress label before the first server update arrives")
                              : message)
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                             .lineLimit(2)
                         Spacer(minLength: 0)
                         Text("\(Int(progress.rounded()))%")
-                            .font(.omlxText(12, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                             .foregroundStyle(theme.text)
                             .monospacedDigit()
                     }
@@ -305,13 +305,13 @@ private struct ResultSection: View {
             FreeRow {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(result.appliedTokens.formatted())
-                        .font(.omlxText(26, weight: .bold))
+                        .font(.omlxText(DesignTokens.FontSize.page, weight: .bold))
                         .foregroundStyle(theme.text)
                         .monospacedDigit()
                     Text(String(localized: "bench.context.result.tokens_label",
-                                defaultValue: "tokens applied to Context Window",
+                                defaultValue: "Tokens applied to Context Window",
                                 comment: "Unit caption next to the applied context window headline number"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                     Spacer(minLength: 0)
                 }
@@ -321,7 +321,7 @@ private struct ResultSection: View {
                               defaultValue: "Admission boundary",
                               comment: "Result row label for the raw measured admission boundary")) {
                 Text(result.measuredTokens.formatted())
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .monospacedDigit()
             }
 
@@ -329,7 +329,7 @@ private struct ResultSection: View {
                               defaultValue: "Verified prefill",
                               comment: "Result row label for the prompt size the verification prefill completed")) {
                 Text(result.verifiedTokens.formatted())
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .monospacedDigit()
             }
 
@@ -337,7 +337,7 @@ private struct ResultSection: View {
                               defaultValue: "Prefill speed",
                               comment: "Result row label for the verify prefill's tokens per second")) {
                 Text(prefillTpsLabel)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .monospacedDigit()
             }
 
@@ -345,14 +345,14 @@ private struct ResultSection: View {
                               defaultValue: "Limited by",
                               comment: "Result row label for what bounded the measurement")) {
                 Text(cappedByLabel)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
             }
 
             Row(label: String(localized: "bench.context.result.duration",
                               defaultValue: "Duration",
                               comment: "Result row label for how long the benchmark took")) {
                 Text(durationLabel)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .monospacedDigit()
             }
 
@@ -390,7 +390,7 @@ private struct ResultSection: View {
 
     private var prefillTpsLabel: String {
         guard let tps = result.prefillTps, tps > 0 else { return "—" }
-        return "\(Int(tps.rounded()).formatted()) tok/s"
+        return "\(Int(tps.rounded()).formatted()) Tok/s"
     }
 
     private var durationLabel: String {

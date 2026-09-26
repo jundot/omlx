@@ -1,5 +1,6 @@
+{% import "components/ui.html" as ui %}
 <!-- Active Models -->
-<div class="bg-white rounded-2xl border border-neutral-200">
+<div class="card">
     <div class="lg:hidden flex flex-col gap-2 px-4 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
         <div class="flex items-center gap-3">
             <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
@@ -7,8 +8,8 @@
         </div>
         <div class="flex flex-col gap-1.5 w-full min-w-0">
             <div class="w-full h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
-                <div class="rounded-full transition-all duration-300"
-                     :style="activeModelsPressureBarStyle"></div>
+                <div class="pressure__bar rounded-full transition-all duration-300"
+                     :class="activeModelsTone" :style="activeModelsPressureBarStyle"></div>
                 <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
                      x-cloak
                      class="absolute inset-y-0"
@@ -28,8 +29,8 @@
             <!-- Memory progress bar -->
             <div class="flex items-center gap-2">
                 <div class="w-36 h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
-                    <div class="rounded-full transition-all duration-300"
-                         :style="activeModelsPressureBarStyle"></div>
+                    <div class="pressure__bar rounded-full transition-all duration-300"
+                         :class="activeModelsTone" :style="activeModelsPressureBarStyle"></div>
                     <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
                          x-cloak
                          class="absolute inset-y-0"
@@ -41,11 +42,45 @@
             </div>
         </div>
     </div>
+    <!-- Memory watermark: one track scaled to the hard limit, the measured
+         footprint inside it, the resident-model estimate behind it, and the soft
+         guard as a mark. The enforcer's own numbers drive it. -->
+    <div class="px-4 sm:px-6 py-4 border-b border-neutral-100"
+         x-show="memoryWatermark.enabled || memoryWatermark.actual > 0">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+            <span class="kpi__label">{{ t('status.memory.heading') }}</span>
+            <span class="status-header__meta" x-text="formatSizeBytes(memoryWatermark.actual) + ' / ' + formatSizeBytes(memoryWatermark.hard)"></span>
+        </div>
+        <div class="watermark">
+            <div class="watermark__bar watermark__bar--guard"
+                 :style="watermarkBarStyleAt(memoryWatermark.softPercent, memoryWatermark.guardWidth)"></div>
+            <div class="watermark__bar watermark__bar--unavailable"
+                 :style="watermarkBarStyleAt(memoryWatermark.hardPercent, memoryWatermark.unavailableWidth)"></div>
+            <div class="watermark__bar watermark__bar--estimated"
+                 :style="watermarkBarStyle(memoryWatermark.estimatedPercent)"></div>
+            <div class="watermark__bar watermark__bar--actual"
+                 :class="watermarkTone"
+                 :style="watermarkBarStyle(memoryWatermark.actualPercent)"></div>
+            <div class="watermark__marker watermark__marker--soft" x-show="memoryWatermark.softPercent > 0"
+                 :style="watermarkMarkerStyle(memoryWatermark.softPercent)"></div>
+            <div class="watermark__marker watermark__marker--hard" x-show="memoryWatermark.hard > 0"
+                 :style="watermarkMarkerStyle(memoryWatermark.hardPercent)"
+                 :title="window.t('status.memory.hard')"></div>
+        </div>
+        <div class="watermark__legend">
+            <span><span class="watermark__swatch watermark__swatch--actual"></span>{{ t('status.memory.actual') }} <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.actual)"></span></span>
+            <span><span class="watermark__swatch watermark__swatch--estimated"></span>{{ t('status.memory.estimated') }} <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.estimated)"></span></span>
+            <span x-show="memoryWatermark.softPercent > 0"><span class="watermark__swatch watermark__swatch--marker watermark__swatch--soft"></span>{{ t('status.memory.soft') }} <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.soft)"></span></span>
+            <span><span class="watermark__swatch watermark__swatch--marker watermark__swatch--hard"></span>{{ t('status.memory.hard') }} <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.hard)"></span></span>
+        </div>
+    </div>
     <div class="divide-y divide-neutral-100">
+        <!-- First paint: three placeholder rows until /api/stats lands, so the
+             block never claims "no models" before the server has answered. -->
+        <div x-show="!statsLoaded">{{ ui.skeleton_rows(3) }}</div>
         <!-- Empty state -->
-        <div x-show="!stats.active_models.models || stats.active_models.models.length === 0"
-             class="px-6 py-8 text-center text-sm text-neutral-400">
-            {{ t('status.active_models.no_models') }}
+        <div x-show="statsLoaded && (!stats.active_models.models || stats.active_models.models.length === 0)" x-cloak>
+            {{ ui.empty_state('hard-drive', t('status.active_models.no_models')) }}
         </div>
         <!-- Model rows -->
         <template x-for="m in (stats.active_models.models || [])" :key="m.id">
@@ -56,22 +91,21 @@
                     <div class="min-w-0 flex-1">
                         <div class="text-sm font-medium text-neutral-800 min-w-0 break-words leading-snug" x-text="m.id"></div>
                         <div class="mt-1 flex flex-wrap items-center gap-1" x-show="m.cluster" x-cloak>
-                            <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200"
-                                  x-text="clusterBadgeLabel(m.cluster)"></span>
+                            <span class="badge" x-text="clusterBadgeLabel(m.cluster)"></span>
                             <span x-show="m.cluster.live && m.cluster.live.stale"
-                                  class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-50 text-amber-600 border border-amber-200"
+                                  class="badge badge--orange"
                                   x-text="window.t('cluster.badge.stale')"></span>
                         </div>
                         <div class="mt-1.5 space-y-1 min-w-0">
                             <template x-if="m.is_loading">
-                                <div class="flex items-center gap-1.5 min-w-0 text-xs text-blue-500 font-medium">
-                                    <svg class="w-3 h-3 shrink-0 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                    <span class="min-w-0" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                <div class="flex items-center gap-1.5 min-w-0 text-xs text-neutral-600 font-medium">
+                                    <svg class="w-3 h-3 shrink-0 animate-spin text-neutral-600" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                    <span class="min-w-0" x-text="window.t('status.active_models.loading') + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ' + window.t('status.active_models.remaining').replace('{duration}', formatDurationShort(m.loading_remaining_seconds_estimate)) : '')"></span>
                                 </div>
                             </template>
                             <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
-                                <div class="flex items-center gap-1.5 text-xs text-blue-600 font-medium">
-                                    <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse shrink-0"></span>
+                                <div class="flex items-center gap-1.5 text-xs text-neutral-700 font-medium">
+                                    <span class="w-2 h-2 rounded-full bg-accent animate-pulse shrink-0"></span>
                                     <span x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
                                 </div>
                             </template>
@@ -85,7 +119,7 @@
                                 <div class="flex items-center gap-1.5 text-xs text-neutral-400 min-w-0">
                                     <span class="w-2 h-2 rounded-full bg-neutral-300 shrink-0"></span>
                                     <span class="min-w-0"
-                                          x-text="window.t('status.active_models.idle') + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ~' + formatDurationShort(m.ttl_remaining_seconds) + ' left' : '')"></span>
+                                          x-text="window.t('status.active_models.idle') + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ' + window.t('status.active_models.remaining').replace('{duration}', formatDurationShort(m.ttl_remaining_seconds)) : '')"></span>
                                 </div>
                             </template>
                             <div class="text-xs text-neutral-400 font-mono min-w-0 break-all"
@@ -111,10 +145,9 @@
                         <!-- Cluster badge -->
                         <template x-if="m.cluster">
                             <span class="flex items-center gap-1">
-                                <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200 whitespace-nowrap"
-                                      x-text="clusterBadgeLabel(m.cluster)"></span>
+                                <span class="badge whitespace-nowrap" x-text="clusterBadgeLabel(m.cluster)"></span>
                                 <span x-show="m.cluster.live && m.cluster.live.stale" x-cloak
-                                      class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-50 text-amber-600 border border-amber-200 whitespace-nowrap"
+                                      class="badge badge--orange whitespace-nowrap"
                                       x-text="window.t('cluster.badge.stale')"></span>
                             </span>
                         </template>
@@ -125,15 +158,15 @@
                             <!-- Loading spinner -->
                             <template x-if="m.is_loading">
                                 <div class="flex items-center gap-1.5">
-                                    <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                    <span class="text-xs text-blue-500 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                    <svg class="w-3 h-3 animate-spin text-neutral-600" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                    <span class="text-xs text-neutral-600 font-medium" x-text="window.t('status.active_models.loading') + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ' + window.t('status.active_models.remaining').replace('{duration}', formatDurationShort(m.loading_remaining_seconds_estimate)) : '')"></span>
                                 </div>
                             </template>
                             <!-- Prefilling -->
                             <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
                                 <div class="flex items-center gap-1.5">
-                                    <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
-                                    <span class="text-xs text-blue-600 font-medium" x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
+                                    <span class="w-2 h-2 rounded-full bg-accent animate-pulse"></span>
+                                    <span class="text-xs text-neutral-700 font-medium" x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
                                 </div>
                             </template>
                             <!-- Active (generation only) -->
@@ -149,10 +182,10 @@
                                     <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
                                     <span class="text-xs text-neutral-400">{{ t('status.active_models.idle') }}</span>
                                     <template x-if="m.idle_seconds != null">
-                                        <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(m.idle_seconds)"></span>
+                                        <span class="text-[12px] text-neutral-400" x-text="formatDurationShort(m.idle_seconds)"></span>
                                     </template>
                                     <template x-if="m.ttl_remaining_seconds != null">
-                                        <span class="text-[10px] text-neutral-400" x-text="'~' + formatDurationShort(m.ttl_remaining_seconds) + ' left'"></span>
+                                        <span class="text-[12px] text-neutral-400" x-text="window.t('status.active_models.remaining').replace('{duration}', formatDurationShort(m.ttl_remaining_seconds))"></span>
                                     </template>
                                 </div>
                             </template>
@@ -168,7 +201,7 @@
                                 <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
                             </button>
                             <div x-show="showTip" x-cloak
-                                 class="absolute top-1/2 -translate-y-1/2 right-full mr-1.5 px-2 py-1 text-[10px] font-medium text-white bg-neutral-800 rounded whitespace-nowrap z-10"
+                                 class="absolute top-1/2 -translate-y-1/2 right-full mr-1.5 px-2 py-1 text-[12px] font-medium text-white bg-neutral-800 rounded whitespace-nowrap z-10"
                                  x-text="window.t('status.active_models.unload')"></div>
                         </div>
                     </div>
@@ -178,18 +211,18 @@
                     <div class="mt-2 ml-5 space-y-1.5">
                         <template x-for="pp in m.prefilling" :key="pp.request_id">
                             <div class="flex items-center gap-2">
-                                <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="pp.request_id.substring(0, 8)"></span>
+                                <span class="text-[12px] font-mono text-neutral-400 w-16 truncate" x-text="pp.request_id.substring(0, 8)"></span>
                                 <div class="flex-1 h-1.5 bg-neutral-100 rounded-full overflow-hidden max-w-[120px]">
-                                    <div class="h-full bg-blue-400 rounded-full transition-all duration-300"
+                                    <div class="h-full bg-neutral-500 rounded-full transition-all duration-300"
                                          :style="'width: ' + (pp.total > 0 ? Math.min(100, pp.processed / pp.total * 100) : 0) + '%'"></div>
                                 </div>
-                                <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
-                                <span class="text-[10px] text-blue-600 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
-                                <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
-                                <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? 'draft scored ' + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? 'selected ' + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
-                                <span x-show="pp.elapsed != null" class="text-[10px] text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
-                                <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
-                                      x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
+                                <span class="text-[12px] text-neutral-600 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
+                                <span class="text-[12px] text-neutral-700 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
+                                <span class="text-[12px] text-neutral-400" x-text="window.formatCount(pp.processed) + ' / ' + window.formatCount(pp.total) + ' Tok'"></span>
+                                <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[12px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? window.t('status.active_models.draft_scored').replace('{count}', window.formatCount(pp.scored_tokens)) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? window.t('status.active_models.selected_tokens').replace('{count}', window.formatCount(pp.selected_tokens)) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
+                                <span x-show="pp.elapsed != null" class="text-[12px] text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
+                                <span x-show="pp.speed > 0" class="text-[12px] text-neutral-400"
+                                      x-text="'(' + pp.speed.toFixed(0) + ' Tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' · ' + window.t('status.active_models.remaining').replace('{duration}', pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') : '') + ')'"></span>
                             </div>
                         </template>
                     </div>
@@ -199,16 +232,16 @@
                     <div class="mt-1.5 ml-5 space-y-1.5">
                         <template x-for="gen in m.generating" :key="gen.request_id">
                             <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
-                                <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
+                                <span class="text-[12px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
                                 <span class="inline-flex items-center gap-2 min-w-[104px] whitespace-nowrap">
                                     <span class="w-2 h-2 rounded-full flex-shrink-0 bg-green-400 animate-pulse"></span>
-                                    <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                    <span class="text-[12px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
                                 </span>
-                                <span class="text-[10px] text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
-                                <span x-show="gen.tokens_per_second > 0" class="text-[10px] text-neutral-400 w-20 whitespace-nowrap"
-                                      x-text="gen.tokens_per_second.toFixed(1) + ' tok/s'"></span>
-                                <span x-show="gen.last_activity_age_seconds >= 3" class="text-[10px] text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
-                                <span x-show="gen.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap"
+                                <span class="text-[12px] text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="window.formatCount(gen.generated_tokens || 0) + ' Tok'"></span>
+                                <span x-show="gen.tokens_per_second > 0" class="text-[12px] text-neutral-400 w-20 whitespace-nowrap"
+                                      x-text="gen.tokens_per_second.toFixed(1) + ' Tok/s'"></span>
+                                <span x-show="gen.last_activity_age_seconds >= 3" class="text-[12px] text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
+                                <span x-show="gen.elapsed_seconds != null" class="text-[12px] text-neutral-400 whitespace-nowrap"
                                       x-text="formatDurationShort(gen.elapsed_seconds)"></span>
                             </div>
                         </template>
@@ -219,13 +252,13 @@
                     <div class="mt-1.5 ml-5 space-y-1.5">
                         <template x-for="activity in m.activities" :key="activity.request_id">
                             <div class="flex flex-wrap items-center gap-x-5 gap-y-1">
-                                <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
+                                <span class="text-[12px] font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
                                 <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
                                     <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
-                                    <span class="text-[10px] text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                    <span class="text-[12px] text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
                                 </span>
-                                <span x-show="formatActivityMetadata(activity)" class="text-[10px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
-                                <span x-show="activity.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
+                                <span x-show="formatActivityMetadata(activity)" class="text-[12px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
+                                <span x-show="activity.elapsed_seconds != null" class="text-[12px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
                             </div>
                         </template>
                     </div>
@@ -234,7 +267,7 @@
                 <template x-if="m.dflash && (m.dflash.speculation || m.dflash.pairing_warning)">
                     <div class="mt-1.5 ml-5 space-y-1">
                         <template x-if="m.dflash.speculation && m.dflash.speculation.last">
-                            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-neutral-400">
+                            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[12px] text-neutral-400">
                                 <span class="font-medium text-neutral-500">{{ t('status.active_models.dflash_label') }}</span>
                                 <span x-show="m.dflash.speculation.last.fallback_ar"
                                       x-text="window.t('status.active_models.dflash_fallback_ar') + (m.dflash.speculation.last.fallback_reason ? ' · ' + m.dflash.speculation.last.fallback_reason : '')"></span>
@@ -245,13 +278,13 @@
                                 <span x-show="!m.dflash.speculation.last.fallback_ar && m.dflash.speculation.last.tokens_per_cycle != null"
                                       x-text="(m.dflash.speculation.last.tokens_per_cycle || 0).toFixed(2) + ' ' + window.t('status.active_models.dflash_output_per_cycle')"></span>
                                 <span x-show="!m.dflash.speculation.last.fallback_ar"
-                                      x-text="formatTokenCount(m.dflash.speculation.last.accepted_draft_tokens || 0) + ' ' + window.t('status.active_models.dflash_draft_tokens_last_request')"></span>
+                                      x-text="window.formatCount(m.dflash.speculation.last.accepted_draft_tokens || 0) + ' ' + window.t('status.active_models.dflash_draft_tokens_last_request')"></span>
                                 <span x-show="m.dflash.speculation.totals && m.dflash.speculation.totals.requests > 1"
                                       x-text="formatDFlashSessionStats(m.dflash.speculation.totals)"></span>
                             </div>
                         </template>
                         <template x-if="m.dflash.pairing_warning">
-                            <div class="flex items-center gap-1.5 text-[10px] text-amber-600">
+                            <div class="flex items-center gap-1.5 text-[12px] text-amber-600">
                                 <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
                                 <span class="min-w-0" x-text="m.dflash.pairing_warning"></span>
                             </div>
@@ -263,11 +296,11 @@
                     <div class="mt-1.5 ml-5 space-y-1.5">
                         <template x-for="wait in m.waiting" :key="wait.request_id">
                             <div class="flex items-center gap-2">
-                                <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
+                                <span class="text-[12px] font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
                                 <span class="w-2 h-2 rounded-full bg-amber-300"></span>
-                                <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
-                                <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
-                                <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="window.t('status.active_models.waiting_prompt_tokens').replace('{count}', formatTokenCount(wait.prompt_tokens))"></span>
+                                <span class="text-[12px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
+                                <span class="text-[12px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
+                                <span x-show="wait.prompt_tokens > 0" class="text-[12px] text-neutral-400" x-text="window.t('status.active_models.waiting_prompt_tokens').replace('{count}', window.formatCount(wait.prompt_tokens))"></span>
                             </div>
                         </template>
                     </div>

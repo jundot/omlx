@@ -94,6 +94,23 @@ def _fixtures():
     return {path.name: json.loads(path.read_text()) for path in FIXTURES.glob("*.json")}
 
 
+def test_each_request_phase_has_its_own_tone():
+    """The phase chip reads the phase: a dead branch that returns the fallback
+    tone paints prefill as queued and hides that a request is running."""
+    text = (ROOT / JAVASCRIPT).read_text(encoding="utf-8")
+    block = re.search(
+        r"requestPhaseTone\(request\) \{(.*?)\n        \},", text, re.S
+    )
+    assert block, "the phase tone mapping moved"
+    tones = dict(re.findall(r"phase === '(\w+)'\) return '([\w-]+)'", block.group(1)))
+    assert tones == {
+        "prefill": "chip--sky",
+        "decode": "chip--green",
+        "failed": "chip--red",
+    }, tones
+    assert len(set(tones.values())) == len(tones), "two phases share a tone"
+
+
 def test_dashboard_renders_every_wizard_state():
     rendered = admin_routes.templates.get_template("dashboard.html").render()
 
@@ -541,7 +558,8 @@ process.stdout.write(JSON.stringify(samples));
     assert loading["runtimeState"] == "loading"
     assert loading["active"] is None
     assert loading["label"] == "Loading"
-    assert "blue" in loading["tone"]
+    # The console accent is neutral; an in-progress runtime is not painted.
+    assert loading["tone"] == "chip--neutral"
 
     ready = result["runtime_ready.json"]
     assert ready["runtimeState"] == "ready"
@@ -989,8 +1007,8 @@ process.stdout.write(JSON.stringify({
     assert result["active"] == {
         "ids": [41, 42],
         "phases": ["prefill", "decode"],
-        "prefill": ["812 tok/s", "905 tok/s"],
-        "decode": ["—", "44.3 tok/s"],
+        "prefill": ["812 Tok/s", "905 Tok/s"],
+        "decode": ["—", "44.3 Tok/s"],
         "count": "2 active",
     }
     assert result["completed"] == {
@@ -1589,16 +1607,18 @@ def test_strategy_picker_renders_between_models_and_roles():
     template = _read(TEMPLATE)
 
     assert "data-cluster-v2-strategy-picker" in template
-    # Same segmented-control pattern as the role picker (neutral-900 active).
+    # Same segmented-control pattern as the role picker, on the console's one
+    # accent: a strategy chip that is on is the tinted one.
     picker = template.split("data-cluster-v2-strategy-picker", 1)[1].split(
         "data-cluster-v2-node-roles", 1
     )[0]
-    assert "bg-neutral-900 text-white" in picker
+    assert "bg-accent text-accent-fg" in picker
     assert ':data-cluster-v2-strategy="option.key"' in picker
-    # Green "Recommended" pill, exactly one at a time.
+    # Green "Recommended" label, exactly one at a time — the one label box, its
+    # colour a token (`.chip--green`) rather than a palette literal.
     assert "data-cluster-v2-strategy-recommended" in picker
     assert (
-        "bg-green-50 border-green-200 text-green-700" in picker
+        "chip chip--green" in picker
     )
     assert "recommendedStrategy() === option.key" in picker
     # Disabled options explain themselves.
