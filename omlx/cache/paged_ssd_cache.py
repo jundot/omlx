@@ -1607,6 +1607,7 @@ class PagedSSDCacheManager(CacheManager):
         self,
         cache_dir: Path | None,
         max_size_bytes: int,
+        gdn_ssd_max_size: int | None = None,
         hot_cache_max_bytes: int = 0,
         hot_cache_only: bool = False,
         hot_cache_write_through: bool = False,
@@ -1677,12 +1678,13 @@ class PagedSSDCacheManager(CacheManager):
         self._cache_dir = cache_dir
         self._auto_size = auto_size
         self._max_size = max_size_bytes
+        self._gdn_ssd_max_size = gdn_ssd_max_size
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
         # Durable GDN checkpoints are kept in a separate namespace and never
         # promoted into the raw-byte hot cache.  They still consume the same
         # shared SSD budget as the two main block indexes.
-        self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
+        self._gdn_sidecar_index = GDNCheckpointIndex(gdn_ssd_max_size if gdn_ssd_max_size is not None else max_size_bytes)
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -2400,6 +2402,23 @@ class PagedSSDCacheManager(CacheManager):
                     logger.debug("Skipping GDN sidecar %s: %s", file_path, e)
         return indexed, skipped, total_bytes
 
+    def _enforce_gdn_size_limit_for_new_block(self, estimated_new_size: int) -> None:
+        """Keep durable GDN sidecars within a separate SSD budget when configured."""
+        if self._gdn_ssd_max_size is None:
+            return
+        target_size = self._gdn_ssd_max_size - estimated_new_size
+        if target_size < 0:
+            target_size = int(self._gdn_ssd_max_size * 0.9)
+        if self._gdn_sidecar_index.total_size <= target_size:
+            return
+        while self._gdn_sidecar_index.total_size > target_size:
+            entries = self._gdn_sidecar_index.get_lru_entries(1)
+            if not entries:
+                break
+            metadata = entries[0]
+            self._gdn_sidecar_index.remove_key(metadata.key)
+            self._unlink_gdn_sidecar_file(metadata)
+
     def commit_gdn_checkpoint_file(
         self,
         source_block_hash: bytes,
@@ -2456,6 +2475,7 @@ class PagedSSDCacheManager(CacheManager):
                     # replaced. Account for the full incoming file while the old
                     # entry is protected; on promotion failure the old metadata
                     # is restored below and its file remains intact.
+                    self._enforce_gdn_size_limit_for_new_block(staged_stat.st_size)
                     self._enforce_size_limit_for_new_block(staged_stat.st_size)
                     os.replace(staged_path, final_path)
                     _fsync_parent_dir(final_path)

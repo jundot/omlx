@@ -1009,6 +1009,17 @@
                                         </div>
                                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.gdn_ssd_max_size') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.gdn_ssd_max_size_hint') }}</p>
+                                            </div>
+                                            <input type="text"
+                                                   x-model="globalSettings.cache.gdn_ssd_max_size"
+                                                   :disabled="globalSettings.cache.gdn_snapshot_storage === 'embedded' || globalSettings.cache.hot_cache_only || !globalSettings.cache.enabled"
+                                                   placeholder="0"
+                                                   class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs disabled:opacity-50 disabled:cursor-not-allowed">
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
                                                 <label class="text-sm text-neutral-700">{{ t('settings.advanced.gdn_sidecar_state_precision') }}</label>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.gdn_sidecar_state_precision_hint') }}</p>
                                                 <p x-show="globalSettings.cache.gdn_sidecar_precision !== 'fp32'"

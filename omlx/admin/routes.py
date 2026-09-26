@@ -635,6 +635,7 @@ class GlobalSettingsRequest(BaseModel):
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
+    gdn_ssd_max_size: str | None = None
     gdn_sidecar_precision: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
@@ -1350,6 +1351,9 @@ async def _apply_cache_settings_runtime(
     )
     pool._scheduler_config.gdn_ssd_pending_max_bytes = parse_size(
         global_settings.cache.gdn_ssd_pending_max_size
+    )
+    pool._scheduler_config.gdn_ssd_max_size = (
+        parse_size(gdn_ssd_max_size) if gdn_ssd_max_size else global_settings.cache.get_gdn_ssd_max_size_bytes()
     )
     pool._scheduler_config.gdn_sidecar_state_dtype = (
         global_settings.cache.gdn_sidecar_state_dtype
@@ -4616,6 +4620,7 @@ def _global_settings_response(global_settings):
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
+            "gdn_ssd_max_size": global_settings.cache.gdn_ssd_max_size,
             "gdn_sidecar_precision": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
@@ -5266,6 +5271,10 @@ async def update_global_settings(
                 request.gdn_ssd_pending_max_size
             )
             cache_changed = True
+    if request.gdn_ssd_max_size is not None:
+        if request.gdn_ssd_max_size != global_settings.cache.gdn_ssd_max_size:
+            global_settings.cache.gdn_ssd_max_size = request.gdn_ssd_max_size
+            cache_changed = True
     if request.gdn_sidecar_precision is not None:
         new_sidecar_dtype = request.gdn_sidecar_precision.lower()
         if new_sidecar_dtype != global_settings.cache.gdn_sidecar_state_dtype:
@@ -5301,6 +5310,7 @@ async def update_global_settings(
             request.ssd_cache_max_size,
             global_settings,
             hot_cache_max_size=request.hot_cache_max_size,
+            gdn_ssd_max_size=request.gdn_ssd_max_size,
         )
         if success:
             runtime_applied.append("cache")

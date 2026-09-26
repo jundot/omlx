@@ -2006,5 +2006,7 @@
   "settings.global.reset_ok": "OK",
   "settings.global.reset_cancel": "取消",
   "settings.advanced.qwen4_gdn_decode_wide_proj": "Qwen4 Extended Fused Decode",
-  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes."
+  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes.",
+  "settings.advanced.gdn_ssd_max_size": "GDN SSD Cache Limit",
+  "settings.advanced.gdn_ssd_max_size_hint": "Set an optional standalone limit for GDN sidecars. Use 0 to inherit the shared SSD cache budget."
 }

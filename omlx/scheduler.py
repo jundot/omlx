@@ -1654,6 +1654,7 @@ class SchedulerConfig:
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
+    gdn_ssd_max_size: int | None = None
     gdn_sidecar_state_dtype: str = "fp32"
 
     # Model identification (for cache isolation between different models)
@@ -14029,6 +14030,7 @@ class Scheduler:
                 cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 auto_size=self.config.paged_ssd_cache_auto_size,
+                gdn_ssd_max_size=self.config.gdn_ssd_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
                 hot_cache_write_through=self.config.hot_cache_write_through,
