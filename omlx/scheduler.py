@@ -9032,15 +9032,20 @@ class Scheduler:
                 # partial reconstruction occurs (some blocks invalid)
                 original_tokens = block_table.num_tokens
                 reconstruct_started = time.perf_counter()
+                # Prefill will extend the prefix to the whole prompt (the
+                # same horizon _reserve_qsa_index_capacity reserves).
+                reserve_tokens = len(request.prompt_token_ids)
                 with self._phase_timer("prefix_cache_reconstruct"):
                     if bypass_hot_cache:
                         reconstructed = self.block_aware_cache.reconstruct_cache(
                             block_table,
                             promote_to_hot_cache=False,
+                            reserve_tokens=reserve_tokens,
                         )
                     else:
                         reconstructed = self.block_aware_cache.reconstruct_cache(
-                            block_table
+                            block_table,
+                            reserve_tokens=reserve_tokens,
                         )
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:

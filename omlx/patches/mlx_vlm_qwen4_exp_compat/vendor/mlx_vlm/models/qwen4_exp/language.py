@@ -240,6 +240,25 @@ def _append_indexer_positions(
     return mx.concatenate([cached, position_ids], axis=-1)
 
 
+def _write_block_parts(parts, axis: int, capacity: int) -> mx.array:
+    """Write ``parts`` in order along ``axis`` into a zeroed ``capacity`` buffer.
+
+    Equals ``concatenate(parts, axis)`` in ``[0, total)``; each slice update
+    donates the buffer, so only the buffer itself is allocated.
+    """
+    shape = list(parts[0].shape)
+    shape[axis] = capacity
+    buffer = mx.zeros(shape, dtype=parts[0].dtype)
+    index = [slice(None)] * len(shape)
+    start = 0
+    for part in parts:
+        stop = start + int(part.shape[axis])
+        index[axis] = slice(start, stop)
+        buffer[tuple(index)] = part
+        start = stop
+    return buffer
+
+
 class _QSAIndexerCache:
     """Capacity-backed raw and completed-block state shared by QSA caches.
 
@@ -536,6 +555,45 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
         self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
         self._restore_indexer_state(index_keys, index_position_ids)
+
+    @classmethod
+    def from_block_parts(
+        cls, keys, values, index_keys, index_position_ids, reserve_tokens
+    ):
+        """Restore a stored prefix from its blocks into reserved buffers.
+
+        Same logical cache as ``state = (concatenated blocks...)`` followed by
+        ``reserve_index_capacity(reserve_tokens)``. Each block is written
+        straight into a buffer that already spans the reserved horizon, the
+        width the first prefill append would have grown the concatenated
+        prefix to, so neither the concatenated prefix nor that regrowth copy
+        is ever materialized. Columns past the prefix are zero, as after a
+        grow. Parts must share dtype and non-sequence shape.
+        """
+        cache = cls()
+        cache.reserve_index_capacity(reserve_tokens)
+        length = sum(int(part.shape[2]) for part in keys)
+
+        def capacity(step):
+            # Exact width when the prompt adds nothing, like the old concat.
+            if reserve_tokens <= length:
+                return length
+            return ((reserve_tokens + step - 1) // step) * step
+
+        kv_capacity = capacity(cls.step)
+        cache.keys = _write_block_parts(keys, 2, kv_capacity)
+        cache.values = _write_block_parts(values, 2, kv_capacity)
+        cache.offset = length
+        index_capacity = capacity(cache.index_step)
+        cache._index_keys = _write_block_parts(index_keys, 1, index_capacity)
+        cache._index_position_ids = _write_block_parts(
+            index_position_ids, index_position_ids[0].ndim - 1, index_capacity
+        )
+        cache._index_offset = length
+        # Same flag as a state restore: the buffers are caller-sized.
+        cache._index_capacity_managed = False
+        cache._invalidate_pooled_indexer()
+        return cache
 
     def trim(self, n):
         n = min(self.offset, n)
