@@ -29,9 +29,10 @@ final class MenubarMetricsStore {
         var generationTps: [Double] = []
     }
 
-    /// Samples kept per series — at the default 1 s cadence the activity
-    /// graphs cover the last minute.
-    nonisolated static let historyCapacity = 60
+    /// Samples kept per series. The graphs and their captions are
+    /// `capacity × refresh interval`, so this is sized against the default
+    /// cadence: at 0.5 s the activity graphs cover the last minute.
+    nonisolated static let historyCapacity = 120
 
     private(set) var rates: [Kind: MetricRates] = [:]
     private(set) var history: [Kind: Series] = [:]

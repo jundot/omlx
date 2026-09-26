@@ -201,7 +201,7 @@ Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requ
 
 ### Claude Code Optimization
 
-Context scaling support for running smaller context models with Claude Code. Scales reported token counts so that auto-compact triggers at the right timing, and SSE keep-alive prevents read timeouts during long prefill.
+Runs smaller context models with Claude Code by reporting the model's real context window to auto-compact instead of scaling token counts, and SSE keep-alive prevents read timeouts during long prefill.
 
 ### Multi-Model Serving
 

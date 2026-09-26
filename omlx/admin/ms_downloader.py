@@ -19,8 +19,13 @@ import requests
 from .hf_downloader import (
     DownloadStatus,
     DownloadTask,
+    _SpeedMeter,
     _format_model_size,
     _format_param_count,
+    _read_tasks_file,
+    _restore_created_at,
+    _restore_retry_count,
+    _write_tasks_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,11 @@ _MS_API_TIMEOUT = 15
 
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
+
+# Seconds between directory scans that drive progress and speed updates.
+# Matches the HF poller: the speed window is one second, so sampling twice
+# per second keeps a reading inside the window at all times.
+_PROGRESS_POLL_INTERVAL = 0.5
 
 # Default ModelScope API base URL.
 _DEFAULT_MS_ENDPOINT = "https://modelscope.cn"
@@ -673,6 +683,7 @@ class MSDownloader:
         self,
         model_dir: str,
         on_complete: Optional[Callable] = None,
+        tasks_file: str | Path | None = None,
     ):
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
@@ -680,6 +691,15 @@ class MSDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
+        # Where the queue persists for restart recovery; None disables
+        # persistence (tests and embedders manage their own lifecycle).
+        self._tasks_file = Path(tasks_file) if tasks_file else None
+        # _persist() stays silent while either flag is set: shutdown must
+        # leave on-disk rows reading "pending/downloading" so the next boot
+        # resumes them, and restore must not rewrite the queue until every
+        # interrupted row has been re-queued.
+        self._shutting_down = False
+        self._restoring = False
         self._download_sem = asyncio.Semaphore(1)
 
     @property
@@ -731,12 +751,18 @@ class MSDownloader:
 
         task_id = str(uuid.uuid4())
         task = DownloadTask(task_id=task_id, repo_id=model_id)
+        # Keep the request-supplied credential with the row so a restart
+        # can resume private downloads (the API never returns it).
+        task.token = ms_token or ""
         self._tasks[task_id] = task
 
         # Start download in background
         self._active_tasks[task_id] = asyncio.create_task(
             self._run_download(task_id, ms_token)
         )
+        # The queued row must reach disk before anything can crash it, so a
+        # restart re-queues this download instead of dropping it.
+        self._persist()
 
         logger.info(f"MS Download queued: {model_id} (task_id={task_id})")
         return task
@@ -765,6 +791,8 @@ class MSDownloader:
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
         task.error = "Cancellation requested. Download will stop shortly."
+        # User intent: persist now so a restart does NOT resume this row.
+        self._persist()
 
         # Stop progress polling
         progress_task = self._progress_tasks.pop(task_id, None)
@@ -797,6 +825,8 @@ class MSDownloader:
 
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
+        # The row is gone from memory; drop it from disk too.
+        self._persist()
         return True
 
     async def retry_download(
@@ -830,9 +860,16 @@ class MSDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
 
-        # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(model_id, ms_token)
+        # Start fresh download (snapshot_download resumes from existing files).
+        # An empty retry token means "no new credential entered": keep the
+        # stored one instead of wiping it, so a retry after a restart still
+        # reaches a private repository.
+        new_task = await self.start_download(model_id, ms_token or old_task.token)
         new_task.retry_count = old_retry_count + 1
+        # start_download persisted the row before this bookkeeping; write
+        # again so a crash right after a retry keeps the count and the
+        # (possibly re-entered) credential on disk too.
+        self._persist()
         return new_task
 
     def get_tasks(self) -> list[dict]:
@@ -842,8 +879,85 @@ class MSDownloader:
             for task in sorted(self._tasks.values(), key=lambda t: t.created_at)
         ]
 
+    def _persist(self) -> None:
+        """Write the queue to disk — no-op outside normal operation.
+
+        Skipped while restoring (the on-disk queue must stay intact until
+        every interrupted row has been re-queued) and during shutdown
+        (interrupted rows must keep saying "downloading" so the next boot
+        resumes them instead of seeing this process's dying cancelled state).
+        """
+        if self._tasks_file is None or self._restoring or self._shutting_down:
+            return
+        _write_tasks_file(self._tasks_file, self._tasks.values())
+
+    async def restore_tasks(self) -> None:
+        """Restore the persisted queue after a restart.
+
+        Rows interrupted mid-download (pending/downloading) re-enter through
+        start_download, which resumes from files already on disk and
+        re-serializes behind the download semaphore; terminal rows come back
+        as display-only entries so a failed or cancelled download stays
+        retryable. The row's persisted request-supplied token rides along
+        with the resumed download (credential recovery for private repos);
+        when a row carries none, an empty token leaves the ModelScope SDK to
+        its normal env/anonymous fallback, and a resume that still fails on
+        auth lands in FAILED where the user can re-enter a credential and
+        retry. Never raises: a corrupt queue file only loses the queue.
+        """
+        entries = _read_tasks_file(self._tasks_file)
+        if not entries:
+            return
+        self._restoring = True
+        try:
+            for entry in sorted(
+                (e for e in entries if isinstance(e, dict)),
+                key=_restore_created_at,
+            ):
+                status = entry.get("status")
+                if status in (
+                    DownloadStatus.PENDING.value,
+                    DownloadStatus.DOWNLOADING.value,
+                ):
+                    repo_id = entry.get("repo_id")
+                    if not isinstance(repo_id, str):
+                        continue
+                    try:
+                        task = await self.start_download(
+                            repo_id, str(entry.get("token") or "")
+                        )
+                    except ValueError as exc:
+                        logger.warning(
+                            "Could not resume download %s: %s", repo_id, exc
+                        )
+                        continue
+                    # Keep the pre-restart queue position and retry history.
+                    # A row this build cannot read keeps the fresh task's own
+                    # values instead of aborting the restore for the rows
+                    # behind it — the same tolerance from_dict gets.
+                    task.created_at = _restore_created_at(entry) or task.created_at
+                    task.retry_count = _restore_retry_count(entry)
+                    logger.info("Resumed interrupted download: %s", repo_id)
+                    continue
+                try:
+                    task = DownloadTask.from_dict(entry)
+                except (KeyError, TypeError, ValueError):
+                    logger.warning(
+                        "Skipping unpersistable download row: %s",
+                        {k: v for k, v in entry.items() if k != "token"},
+                    )
+                    continue
+                self._tasks.setdefault(task.task_id, task)
+        finally:
+            self._restoring = False
+        self._persist()
+
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
+        # Leave the persisted queue untouched: rows stay "pending/downloading"
+        # on disk so the next boot resumes them; the cancelled states below
+        # are this process's dying breath, not user intent.
+        self._shutting_down = True
         # Cancel all progress polling tasks
         for task_id, progress_task in list(self._progress_tasks.items()):
             if not progress_task.done():
@@ -953,6 +1067,7 @@ class MSDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
+                task.speed_bps = 0.0
                 task.downloaded_size = task.total_size or self._get_dir_size(
                     target_dir
                 )
@@ -1005,6 +1120,11 @@ class MSDownloader:
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
 
+            # Persist whatever terminal state the run settled on (completed,
+            # failed, or user-cancelled). Skipped during shutdown so an
+            # interrupted row survives for the next boot to resume.
+            self._persist()
+
     async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
         """Poll the target directory to estimate download progress.
 
@@ -1017,16 +1137,26 @@ class MSDownloader:
 
         last_size = 0
         last_activity_at = time.time()
+        # One directory walk per tick yields logical size (progress), latest
+        # mtime (liveness) and the per-file allocated-block map (speed: only
+        # growth of files already under watch counts, so a resumed download
+        # cannot replay bytes it already had as fresh transfer). Prime the
+        # window before the first sleep so the first reading covers transfer
+        # time rather than startup.
+        speed_meter = _SpeedMeter()
+        _logical, _mtime, files = self._scan_dir(target_dir)
+        speed_meter.add(files)
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
-                await asyncio.sleep(2)
+                await asyncio.sleep(_PROGRESS_POLL_INTERVAL)
 
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                current_size = self._get_dir_size(target_dir)
+                current_size, latest_mtime, files = self._scan_dir(target_dir)
                 task.downloaded_size = current_size
+                task.speed_bps = speed_meter.add(files)
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
@@ -1038,10 +1168,8 @@ class MSDownloader:
                 if current_size != last_size:
                     last_size = current_size
                     last_activity_at = time.time()
-                else:
-                    latest_mtime = self._get_latest_mtime(target_dir)
-                    if latest_mtime > last_activity_at:
-                        last_activity_at = latest_mtime
+                elif latest_mtime > last_activity_at:
+                    last_activity_at = latest_mtime
 
                 # Stall detection
                 if (
@@ -1064,25 +1192,45 @@ class MSDownloader:
                     break
         except asyncio.CancelledError:
             pass
+        finally:
+            # Terminal states (done, failed, cancelled, stalled) report no
+            # rate — only a live transfer has a speed.
+            task.speed_bps = 0.0
 
     @staticmethod
-    def _get_latest_mtime(path: Path) -> float:
-        """Return the most recent modification time of any file in a directory."""
+    def _scan_dir(path: Path) -> tuple[int, float, dict[str, int]]:
+        """Walk a directory once for (logical size, latest mtime, per-file
+        allocated blocks).
+
+        Progress, liveness and the speed meter read different signals, so
+        one walk serves all three instead of re-walking the tree per signal.
+        The per-file map feeds the meter's file-level continuity: bytes that
+        appear wholesale between two walks (files replayed after a resume, a
+        tree that vanished and came back) are not transfer.
+        """
         if not path.exists():
-            return 0.0
-        latest = 0.0
+            return 0, 0.0, {}
+        logical = 0
+        latest_mtime = 0.0
+        files: dict[str, int] = {}
         try:
             for f in path.rglob("*"):
                 if f.is_file():
                     try:
-                        mt = f.stat().st_mtime
-                        if mt > latest:
-                            latest = mt
+                        st = f.stat()
                     except OSError:
-                        pass
+                        continue
+                    logical += st.st_size
+                    files[str(f)] = getattr(st, "st_blocks", 0) * 512
+                    if st.st_mtime > latest_mtime:
+                        latest_mtime = st.st_mtime
         except OSError:
+            # Partial walk (concurrent cleanup): hand over what we saw.
+            # Paths dropped here are forgotten by the meter, so a complete
+            # walk next tick reads as first-sight (0 growth) instead of
+            # replaying the whole tree as one giant delta.
             pass
-        return latest
+        return logical, latest_mtime, files
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:

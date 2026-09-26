@@ -152,8 +152,6 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     }
 
     struct ClaudeCodeSettings: Codable, Equatable, Sendable {
-        let contextScalingEnabled: Bool?
-        let targetContextSize: Int?
         let mode: String?
         let opusModel: String?
         let sonnetModel: String?
@@ -226,8 +224,6 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var maxAudioUploadSize: String? = nil
 
     // Claude Code (PR 9)
-    var claudeCodeContextScalingEnabled: Bool? = nil
-    var claudeCodeTargetContextSize: Int? = nil
     var claudeCodeMode: String? = nil
     var claudeCodeOpusModel: String? = nil
     var claudeCodeSonnetModel: String? = nil
