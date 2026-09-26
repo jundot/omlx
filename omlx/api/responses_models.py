@@ -226,12 +226,16 @@ class ResponseObject(BaseModel):
     output: List[OutputItem] = Field(default_factory=list)
     usage: Optional[ResponseUsage] = None
     text: Optional[TextConfig] = None
+    instructions: Optional[str] = None
+    reasoning: Optional[Dict[str, Any]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto"
     tools: List[ResponsesTool] = Field(default_factory=list)
+    parallel_tool_calls: Optional[bool] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_output_tokens: Optional[int] = None
     previous_response_id: Optional[str] = None
+    store: Optional[bool] = None
     metadata: Optional[Dict[str, str]] = Field(default_factory=dict)
     truncation: Optional[str] = None
     error: Optional[Dict[str, Any]] = None

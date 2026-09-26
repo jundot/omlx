@@ -123,6 +123,28 @@ final class LocalizationSmokeTests: XCTestCase {
         }
     }
 
+    /// A count in the Logs screen is an exact quantity substituted as formatted
+    /// text, so the catalogue placeholders are `%@`: the line count reads 8,405
+    /// rather than 8405, and the grouped figure survives the lookup.
+    func testLogCountsSubstituteFormattedText() {
+        let cases: [(String, String)] = [
+            (String(localized: "logs.subtitle.line_count",
+                    defaultValue: "Lines: \(8405.formatted())"), 8405.formatted()),
+            (String(localized: "logs.detail.occurrences",
+                    defaultValue: "Occurrences (\(20000.formatted()))"), 20000.formatted()),
+            (String(localized: "logs.detail.occurrences_more",
+                    defaultValue: "…and \(1234567.formatted()) more"), 1234567.formatted()),
+            (String(localized: "logs.more_lines",
+                    defaultValue: "≡ \(8405.formatted()) more lines"), 8405.formatted()),
+            (String(localized: "logs.detail.lines_more",
+                    defaultValue: "…and \(20000.formatted()) more lines"), 20000.formatted()),
+        ]
+        for (rendered, expected) in cases {
+            XCTAssertTrue(rendered.contains(expected),
+                          "the log count lost its formatted figure: \(rendered)")
+        }
+    }
+
     func testCatalogIsValidJSON() {
         // Direct file-level parse so a catalog corruption (extra trailing
         // comma, bad nesting) shows up here rather than as a missing-string
