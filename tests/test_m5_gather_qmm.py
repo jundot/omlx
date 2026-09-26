@@ -21,6 +21,8 @@ def _fresh_state(monkeypatch):
     test cannot leave the session unwrapped.
     """
     monkeypatch.delenv("OMLX_M5_GATHER_QMM_FIX", raising=False)
+    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NATIVE", raising=False)
+    monkeypatch.setattr(patch_mod, "_native_gather", None)
     was_installed = getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     raw = patch_mod._original_gather_qmm if was_installed else mx.gather_qmm
     saved_defective = patch_mod._defective
@@ -157,6 +159,56 @@ def test_wrapper_segments_oversized_sorted_calls(monkeypatch):
     assert seen == [(rows // 2, rows // 2, False)]
 
 
+def test_oversized_sorted_calls_prefer_native_and_fall_back_to_slices(monkeypatch):
+    """One native dispatch when it covers the call; slices otherwise."""
+    sliced = []
+    native_calls = []
+
+    def spy(x, w, *args, **kwargs):
+        sliced.append(int(x.shape[0]))
+        return mx.zeros((x.shape[0], 1, 4), dtype=x.dtype)
+
+    def native(x, w, scales, biases, indices, bits, group_size):
+        native_calls.append((int(x.shape[0]), bits, group_size))
+        if group_size == 32:
+            raise ValueError("outside the native envelope")
+        return mx.ones((x.shape[0], 1, 4), dtype=x.dtype)
+
+    assert apply_m5_gather_qmm_workaround()
+    monkeypatch.setattr(patch_mod, "_original_gather_qmm", spy)
+    monkeypatch.setattr(patch_mod, "_defective", True)
+    monkeypatch.setattr(patch_mod, "_native_gather", native)
+
+    rows = 70000
+    x = mx.zeros((rows, 1, 128), dtype=mx.bfloat16)
+    idx = mx.zeros((rows,), dtype=mx.uint32)
+    kw = dict(rhs_indices=idx, transpose=True, bits=5, sorted_indices=True)
+
+    out = mx.gather_qmm(x, x, x, x, group_size=64, **kw)
+    assert native_calls == [(rows, 5, 64)] and sliced == []
+    assert mx.all(out == 1).item()
+
+    # A layout the native kernel rejects keeps the sliced path.
+    native_calls.clear()
+    out = mx.gather_qmm(x, x, x, x, group_size=32, **kw)
+    assert native_calls == [(rows, 5, 32)] and len(sliced) == 3
+    assert mx.all(out == 0).item()
+
+    # Missing biases (non-affine layouts) never reach the native op.
+    native_calls.clear()
+    sliced.clear()
+    mx.gather_qmm(x, x, x, group_size=64, **kw)
+    assert native_calls == [] and len(sliced) == 3
+
+    # The kill switch disables native routing for a fresh resolution.
+    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NATIVE", "0")
+    monkeypatch.setattr(patch_mod, "_native_gather", None)
+    sliced.clear()
+    mx.gather_qmm(x, x, x, x, group_size=64, **kw)
+    assert native_calls == [] and len(sliced) == 3
+
+
+
 def _kernel_defective_here() -> bool:
     if not mx.metal.is_available():
         return False
@@ -236,3 +288,66 @@ def test_segmented_sorted_call_matches_reference_past_row_cap():
     assert out.shape == ref.shape
     err = mx.abs(out.astype(mx.float32) - ref).max().item()
     assert err < 0.2, f"segmented sorted call is corrupt: max err {err}"
+
+
+def _native_gather_here() -> bool:
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+    except Exception:
+        return False
+    return fast.gather_qmm_rhs_available()
+
+
+@pytest.mark.skipif(
+    not (_kernel_defective_here() and _native_gather_here()),
+    reason="needs the defective M5 rhs kernel and the native NAX gather build",
+)
+@pytest.mark.parametrize(
+    "bits,group_size,dtype,out_dim,k",
+    [
+        (5, 64, mx.bfloat16, 1280, 2560),
+        (5, 64, mx.bfloat16, 2560, 640),
+        (4, 128, mx.float16, 256, 512),
+        (8, 64, mx.bfloat16, 128, 256),
+    ],
+)
+def test_native_oversized_call_is_bit_identical_to_slices(
+    bits, group_size, dtype, out_dim, k
+):
+    """Past the row cap the native dispatch equals the sliced mlx result."""
+    assert apply_m5_gather_qmm_workaround()
+
+    n, e = patch_mod._MAX_SORTED_ROWS + 7001, 96
+    keys = mx.random.split(mx.random.key(bits * 1000 + k), 3)
+    w = (mx.random.normal((e, out_dim, k), key=keys[0]) * 0.05).astype(dtype)
+    wq, scales, biases = mx.quantize(w, group_size=group_size, bits=bits)
+    x = mx.random.normal((n, 1, k), key=keys[1]).astype(dtype)
+    # Skewed routing: hot experts plus many one- and two-row segments.
+    logits = -1.2 * mx.log(mx.arange(1, e + 1).astype(mx.float32))
+    idx = mx.sort(
+        mx.random.categorical(logits, num_samples=n, key=keys[2])
+        .reshape(-1)
+        .astype(mx.uint32)
+    )
+    kw = dict(
+        rhs_indices=idx,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        sorted_indices=True,
+    )
+
+    native = mx.gather_qmm(x, wq, scales, biases, **kw)
+    sliced = patch_mod._segmented_sorted_gather_qmm(
+        x, wq, (scales, biases), kw
+    )
+    assert native.shape == sliced.shape == (n, 1, out_dim)
+    assert mx.array_equal(native, sliced).item()
+
+    rows = mx.arange(0, n, 97)
+    wd = mx.dequantize(wq, scales, biases, group_size=group_size, bits=bits)
+    ref = x[rows].astype(mx.float32) @ wd[idx[rows]].swapaxes(-1, -2).astype(
+        mx.float32
+    )
+    err = mx.abs(native[rows].astype(mx.float32) - ref).max().item()
+    assert err < 0.2, f"native sorted gather is corrupt: max err {err}"
