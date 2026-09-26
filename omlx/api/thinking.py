@@ -254,6 +254,11 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # After a close tag, whitespace up to the first visible answer
+        # character is the template's separator, not answer text:
+        # ``extract_thinking`` strips it, so the stream drops it too, in
+        # whichever chunk it arrives.
+        self._strip_separator: bool = False
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -295,12 +300,14 @@ class ThinkingParser:
                 if remaining.startswith(_CLOSE_TAG):
                     self._in_thinking = False
                     self._close_seen = True
+                    self._strip_separator = True
                     i += _CLOSE_LEN
                     continue
 
                 if remaining.startswith(_HY3_CLOSE_TAG):
                     self._in_thinking = False
                     self._close_seen = True
+                    self._strip_separator = True
                     i += len(_HY3_CLOSE_TAG)
                     continue
 
@@ -314,12 +321,14 @@ class ThinkingParser:
                 if self._in_thinking:
                     thinking_out.append('<')
                 else:
+                    self._strip_separator = False
                     content_out.append('<')
                 i += 1
             else:
                 if self._in_thinking:
                     thinking_out.append(text[i])
-                else:
+                elif not (self._strip_separator and text[i].isspace()):
+                    self._strip_separator = False
                     content_out.append(text[i])
                 i += 1
 

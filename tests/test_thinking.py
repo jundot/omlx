@@ -452,3 +452,66 @@ def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
     assert parser.finish(truncated=True) == ("</thi", "")
     assert parser.finish(truncated=True) == ("", "")
+
+
+def _stream(chunks, start_in_thinking=False):
+    parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    thinking, content = [], []
+    for chunk in chunks:
+        t, c = parser.feed(chunk)
+        thinking.append(t)
+        content.append(c)
+    t, c = parser.finish()
+    thinking.append(t)
+    content.append(c)
+    return "".join(thinking), "".join(content)
+
+
+_ANSWER_AFTER_THINK = "<think>\nplan\n</think>\n\n# Header\n\n- a\n- b"
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 7, len(_ANSWER_AFTER_THINK)])
+def test_stream_drops_separator_after_close_like_extract(size):
+    """The ``\\n\\n`` after ``</think>`` is not answer text (issue #1697).
+
+    ``extract_thinking`` strips it; the streamed content must match at every
+    chunking, including when the close tag and the newlines arrive in
+    separate chunks. Interior newlines are kept.
+    """
+    chunks = [
+        _ANSWER_AFTER_THINK[i : i + size]
+        for i in range(0, len(_ANSWER_AFTER_THINK), size)
+    ]
+    _, content = _stream(chunks)
+    assert content == extract_thinking(_ANSWER_AFTER_THINK)[1]
+    assert content == "# Header\n\n- a\n- b"
+
+
+def test_stream_drops_separator_in_its_own_chunk():
+    _, content = _stream(["<think>", "plan", "</think>", "\n\n", "READY"])
+    assert content == "READY"
+
+
+def test_stream_drops_separator_when_prompt_opened_thinking():
+    _, content = _stream(
+        ["plan", "</think>", "\n", " \n", "READY"], start_in_thinking=True
+    )
+    assert content == "READY"
+
+
+def test_stream_keeps_leading_whitespace_without_a_think_block():
+    """Tag-free output is not stripped, as in extract_thinking (assistant
+    prefill continuations can legitimately start with a space)."""
+    thinking, content = _stream([" 42", " is the answer"])
+    assert (thinking, content) == ("", " 42 is the answer")
+    assert extract_thinking(" 42 is the answer") == ("", " 42 is the answer")
+
+
+def test_stream_keeps_whitespace_once_the_answer_has_started():
+    _, content = _stream(["<think>x</think>", "\n\nA", "\n\n", "B"])
+    assert content == "A\n\nB"
+
+
+def test_stream_separator_only_answer_is_empty():
+    thinking, content = _stream(["<think>plan</think>", "\n\n"])
+    assert (thinking, content) == ("plan", "")
