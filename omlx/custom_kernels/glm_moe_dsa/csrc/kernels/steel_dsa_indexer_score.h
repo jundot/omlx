@@ -509,7 +509,10 @@ dspark_fp32_topk_indices(
       ties_seen++;
     }
     if (selected) {
-      row_out[output_pos++] = index;
+      // The reversed traversal emits descending indices; mirror them so the
+      // Qwen4 caller receives the chronological order without a sort.
+      row_out[HIGHEST_INDEX_TIES ? uint(TOPK) - 1u - output_pos : output_pos] = index;
+      output_pos++;
     }
   }
 }

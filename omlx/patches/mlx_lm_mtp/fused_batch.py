@@ -125,10 +125,15 @@ def advance(batch, batch_state):
 
 def _advance_group(batch, depth, rows, replacements, *, cache=None):
     batch_state = getattr(batch, "_omlx_mtp_batch_state", None)
-    use_head_batch = cache is not None and batched_head.eligible(batch, rows)
+    drafter = bg._drafter_for(batch.model)
+    use_head_batch = (
+        drafter is None and cache is not None and batched_head.eligible(batch, rows)
+    )
     if not use_head_batch:
         batched_head.flush(batch_state)
-    draft_jobs = [] if use_head_batch else None
+    # A block drafter drafts every row after the shared commit, like the
+    # batched head, so its jobs are collected the same way.
+    draft_jobs = [] if use_head_batch or drafter is not None else None
     if len(rows) == 1:
         index, row, state = rows[0]
         bg._set_singleton_mrope_delta(row)
@@ -147,7 +152,13 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     )
     logger.debug("Lightning MTP shared verify: rows=%d depth=%d", len(rows), depth)
     started = time.perf_counter()
-    logits, hidden, gdn = bg._call_backbone(batch.model, inputs, cache, n_confirmed=1)
+    logits, hidden, gdn, captured = bg._call_backbone_captured(
+        batch.model,
+        inputs,
+        cache,
+        n_confirmed=1,
+        capture_layer_ids=bg._drafter_capture_ids(batch.model),
+    )
     greedy_results = None
     stochastic_results = None
     if depth > 0 and all(
@@ -213,6 +224,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
                 logits[row_index : row_index + 1],
                 hidden[row_index : row_index + 1],
                 None,
+                bg._slice_captured(captured, row_index),
             ),
             commit_cache=(
                 (
@@ -256,6 +268,9 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         if whole_batch:
             batch.prompt_cache = cache
     if draft_jobs is not None:
-        batched_head.draft(batch, draft_jobs)
+        if drafter is not None:
+            drafter.draft(draft_jobs)
+        else:
+            batched_head.draft(batch, draft_jobs)
     bg._clear_rollback(cache)
     return vector_rollback and whole_batch and not replacements

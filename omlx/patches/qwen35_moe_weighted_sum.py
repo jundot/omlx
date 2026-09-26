@@ -55,7 +55,7 @@ def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) 
         return False
     if getattr(self, "sharding_group", None) is not None:
         return False
-    if getattr(self, "top_k", None) not in (6, 8):
+    if getattr(self, "top_k", None) not in (6, 8, 10):
         return False
     if x.shape[-2] * int(getattr(self, "top_k", 0)) < 64:
         return False

@@ -17,6 +17,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from .qwen35_packed_linear import PackedLinear
+
 logger = logging.getLogger(__name__)
 
 # Only Q4 and Q5 GS64 affine matter for this checkpoint; everything else is
@@ -125,6 +127,7 @@ class OqA8Plan:
     group_size: int
     act_mode: int
     variant: int
+    packed: bool = False
 
     @property
     def kernel(self) -> str:
@@ -191,6 +194,9 @@ def classify_linear(linear: Any) -> OqA8Plan | None:
 
 
 def _classify_uncached(linear: Any) -> OqA8Plan | None:
+    if isinstance(linear, PackedLinear):
+        # Always Q4 GS64 with bfloat16 metadata; the kernel reads its tiles.
+        return _plan_for(4, linear.output_dims, packed=True)
     if not isinstance(linear, nn.QuantizedLinear):
         return None
     if getattr(linear, "mode", None) != "affine":
@@ -221,9 +227,12 @@ def _classify_uncached(linear: Any) -> OqA8Plan | None:
     input_dim = scales.shape[1] * _GROUP_SIZE
     if weight.shape[1] * 32 != input_dim * int(bits):
         return None
+    return _plan_for(int(bits), weight.shape[0])
 
+
+def _plan_for(bits: int, n: int, packed: bool = False) -> OqA8Plan | None:
     try:
-        variant = check_variant(_variant_for_bits(int(bits)))
+        variant = check_variant(_variant_for_bits(bits))
     except ValueError as exc:
         # Once per distinct message: this runs for every eligible projection
         # in the model, and a bad OMLX_OQ_A8_VARIANT is bad for all of them.
@@ -233,10 +242,11 @@ def _classify_uncached(linear: Any) -> OqA8Plan | None:
             logger.warning("oq_a8: %s; leaving these projections alone", message)
         return None
     plan = OqA8Plan(
-        bits=int(bits),
+        bits=bits,
         group_size=_GROUP_SIZE,
-        act_mode=_act_mode_for_bits(int(bits)),
+        act_mode=_act_mode_for_bits(bits),
         variant=variant,
+        packed=packed,
     )
 
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -244,11 +254,11 @@ def _classify_uncached(linear: Any) -> OqA8Plan | None:
     # N must tile exactly; the kernel refuses partial column tiles so the
     # weight decoder can stay bounds-check free.
     tile_bn = _variant_bn(plan.variant)
-    if weight.shape[0] % tile_bn != 0:
+    if n % tile_bn != 0:
         logger.debug(
             "oq_a8: N=%d is not a multiple of BN=%d; leaving this projection "
             "on the existing path",
-            weight.shape[0],
+            n,
             tile_bn,
         )
         return None
@@ -281,16 +291,26 @@ def _variant_bn(variant: int) -> int:
 
 
 def _prepared_weights(linear: Any):
-    """Cache transposed metadata while reusing the packed weight array."""
+    """Cache transposed metadata while reusing the packed weight array.
+
+    A ``PackedLinear`` is read in its own tile layout, so nothing is copied.
+    """
     cached = getattr(linear, _PREPARED_ATTR, None)
     if cached is not None:
         return cached
 
-    prepared = (
-        linear.weight,
-        mx.contiguous(linear.scales.T),
-        mx.contiguous(linear.biases.T),
-    )
+    if isinstance(linear, PackedLinear):
+        prepared = (
+            linear.packed_weight.view(mx.uint32).reshape(linear.output_dims, -1),
+            linear.packed_scales,
+            linear.packed_biases,
+        )
+    else:
+        prepared = (
+            linear.weight,
+            mx.contiguous(linear.scales.T),
+            mx.contiguous(linear.biases.T),
+        )
     mx.eval(*prepared)
     object.__setattr__(linear, _PREPARED_ATTR, prepared)
     return prepared
@@ -346,6 +366,7 @@ def apply_plan(linear: Any, stage: StageA, plan: OqA8Plan) -> mx.array:
         plan.bits,
         plan.act_mode,
         plan.variant,
+        packed=plan.packed,
     )
 
 

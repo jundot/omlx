@@ -1054,7 +1054,7 @@ class TestFilterUploadedSettings:
                 turboquant_kv_enabled=True,
                 turboquant_kv_bits=4,
                 mtp_enabled=True,
-                mtp_num_draft_tokens=3,
+                mtp_adaptive_max_depth=3,
                 index_cache_freq=4,
                 guided_grammar_enabled=True,
                 qwen35_ane_prefill_enabled=True,
@@ -1068,7 +1068,7 @@ class TestFilterUploadedSettings:
             )
         )
         assert out["turboquant_kv_bits"] == 4
-        assert out["mtp_num_draft_tokens"] == 3
+        assert out["mtp_adaptive_max_depth"] == 3
         assert out["index_cache_freq"] == 4
         assert out["guided_grammar_enabled"] is True
         assert out["qwen35_ane_prefill_enabled"] is True

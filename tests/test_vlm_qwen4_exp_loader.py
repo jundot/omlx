@@ -135,7 +135,7 @@ def test_qwen4_exp_loader_enables_adaptive_depth_three_lightning_mtp(tmp_path):
         json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
         encoding="utf-8",
     )
-    settings = SimpleNamespace(mtp_enabled=True, mtp_num_draft_tokens=None)
+    settings = SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=None)
 
     maybe_apply_pre_load_patches(str(tmp_path), settings, for_vlm=True)
 

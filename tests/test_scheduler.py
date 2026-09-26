@@ -1410,7 +1410,33 @@ class TestSchedulerAddRequest:
             extra_key_token_start=None,
             extra_key_ranges=None,
             hot_cache_write_back=False,
+            _store_tail_terminal=False,
         )
+
+    def test_async_store_cache_worker_forwards_tail_terminal_flag(
+        self, mock_model, mock_tokenizer
+    ):
+        """The tail flag follows the provider only when the sequence ends on it."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.store_cache.return_value = None
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.paged_cache_manager.get_block_table.return_value = None
+        provider = scheduler_module._BoundarySnapshotProvider(
+            None, "req-store", [], {}, tail_terminal_token_count=4
+        )
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            scheduler._async_store_cache_worker(
+                "req-store", [1, 2, 3, 4], [], None, provider, None, None, None
+            )
+            scheduler._async_store_cache_worker(
+                "req-store", [1, 2, 3, 4, 5], [], None, provider, None, None, None
+            )
+
+        calls = scheduler.block_aware_cache.store_cache.call_args_list
+        assert calls[0].kwargs["_store_tail_terminal"] is True
+        assert calls[1].kwargs["_store_tail_terminal"] is False
 
 
 class TestSchedulerAbortRequest:
@@ -3325,6 +3351,124 @@ class TestSchedulerBoundarySnapshots:
         assert provider[4] is extracted_intermediate
         ex.assert_not_called()
 
+    def test_boundary_override_prefers_tail_snapshot_past_last_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        """The newest tail snapshot wins the terminal slot over an older boundary."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-tail-override",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+
+        raw_aligned, raw_tail = object(), object()
+        extracted_aligned = [{"state": ("aligned",)}]
+        extracted_tail = [{"state": ("tail",)}]
+        scheduler._boundary_cache_snapshots[request.request_id] = {
+            4: raw_aligned,
+            7: raw_tail,
+        }
+
+        def extract(raw_cache):
+            if raw_cache is raw_tail:
+                return extracted_tail, "tail-config"
+            if raw_cache is raw_aligned:
+                return extracted_aligned, "aligned-config"
+            raise AssertionError("unexpected raw cache")
+
+        with patch.object(scheduler, "_extract_cache_states", side_effect=extract):
+            result = scheduler._get_boundary_store_override(
+                request.request_id, list(range(9))
+            )
+
+        assert result is not None
+        token_sequence, cache_to_store, model_config, provider = result
+        assert token_sequence == list(range(7))
+        assert cache_to_store is extracted_tail
+        assert model_config == "tail-config"
+        assert provider.tail_terminal_token_count == 7
+        assert 4 in provider
+        assert 7 not in provider
+
+    @pytest.mark.parametrize("persists,expected_tc", [(False, 7), (True, 8)])
+    def test_boundary_override_stops_at_generation_prompt_unless_it_persists(
+        self, mock_model, mock_tokenizer, persists, expected_tc
+    ):
+        """Snapshots past the marker only count when the template keeps it."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-marker",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.generation_prompt_start = 7
+        request.generation_prompt_persists = persists
+        scheduler.requests[request.request_id] = request
+
+        raw = {4: object(), 7: object(), 8: object()}
+        scheduler._boundary_cache_snapshots[request.request_id] = dict(raw)
+        extracted = {tc: [{"state": (tc,)}] for tc in raw}
+
+        def extract(raw_cache):
+            for tc, obj in raw.items():
+                if raw_cache is obj:
+                    return extracted[tc], f"config-{tc}"
+            raise AssertionError("unexpected raw cache")
+
+        with patch.object(scheduler, "_extract_cache_states", side_effect=extract):
+            result = scheduler._get_boundary_store_override(
+                request.request_id, list(range(10))
+            )
+
+        assert result is not None
+        token_sequence, cache_to_store, _, provider = result
+        assert token_sequence == list(range(expected_tc))
+        assert cache_to_store is extracted[expected_tc]
+        assert provider.tail_terminal_token_count == (7 if not persists else None)
+        assert 4 in provider
+
+    def test_boundary_override_prefers_aligned_snapshot_past_tail(
+        self, mock_model, mock_tokenizer
+    ):
+        """A boundary reached during decode outranks an earlier prefill tail."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-aligned-override",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+
+        raw_tail, raw_aligned = object(), object()
+        extracted_aligned = [{"state": ("aligned",)}]
+        scheduler._boundary_cache_snapshots[request.request_id] = {
+            3: raw_tail,
+            4: raw_aligned,
+        }
+
+        def extract(raw_cache):
+            if raw_cache is raw_aligned:
+                return extracted_aligned, "aligned-config"
+            raise AssertionError("the tail must not be extracted")
+
+        with patch.object(scheduler, "_extract_cache_states", side_effect=extract):
+            result = scheduler._get_boundary_store_override(
+                request.request_id, list(range(5))
+            )
+
+        assert result is not None
+        token_sequence, cache_to_store, _, provider = result
+        assert token_sequence == list(range(4))
+        assert cache_to_store is extracted_aligned
+        assert provider.tail_terminal_token_count is None
+        assert 3 not in provider
+        assert len(provider) == 0
+
     def test_cleanup_finished_pre_evals_intermediate_boundary_snapshots(
         self, mock_model, mock_tokenizer
     ):
@@ -3533,6 +3677,81 @@ class TestSchedulerBoundarySnapshots:
         scheduler._on_prefill_boundary_snapshot(request.request_id, [RotatingStub()], 3)
 
         assert request.request_id not in scheduler._boundary_cache_snapshots
+
+    def test_prefill_tail_snapshot_source_passes_alignment_guard(
+        self, mock_model, mock_tokenizer
+    ):
+        """Tail sources may record a snapshot off the block grid."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+
+        request = Request(
+            request_id="req-prefill-tail",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        snapshot_cache = [RotatingStub()]
+        with patch("omlx.scheduler._mtp_priming.capture_tail_boundary") as capture:
+            scheduler._emit_prefill_tail_snapshot(request, snapshot_cache, 3)
+        capture.assert_called_once_with(mock_model, request.request_id, 3)
+        # Other sources stay on the grid.
+        scheduler._on_prefill_boundary_snapshot(
+            request.request_id, [RotatingStub()], 5, source="completion"
+        )
+        scheduler._on_prefill_boundary_snapshot(
+            request.request_id, [RotatingStub()], 6, source="prefill"
+        )
+
+        recorded = scheduler._boundary_cache_snapshots[request.request_id]
+        assert set(recorded) == {3}
+        assert recorded[3] == snapshot_cache
+
+    def test_resolve_generation_prompt_start_requires_exact_suffix_match(
+        self, mock_model, mock_tokenizer
+    ):
+        """The marker is accepted only when its tokens end the prompt exactly."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.tokenizer = MagicMock()
+        scheduler.tokenizer.encode.side_effect = lambda text, **kw: (
+            [8, 9] if text == "<gen>" else [7, 7]
+        )
+
+        request = Request(
+            request_id="req-gen", prompt="hello", sampling_params=SamplingParams()
+        )
+        request.prompt_token_ids = [1, 2, 3, 8, 9]
+        request.generation_prompt_text = "<gen>"
+        scheduler._resolve_generation_prompt_start(request)
+        assert request.generation_prompt_start == 3
+
+        mismatch = Request(
+            request_id="req-gen-miss", prompt="hello", sampling_params=SamplingParams()
+        )
+        mismatch.prompt_token_ids = [1, 2, 3, 8, 9]
+        mismatch.generation_prompt_text = "<other>"
+        scheduler._resolve_generation_prompt_start(mismatch)
+        assert mismatch.generation_prompt_start == 0
+
+        # A suffix that spans the whole prompt leaves nothing to reuse.
+        whole = Request(
+            request_id="req-gen-whole", prompt="hello", sampling_params=SamplingParams()
+        )
+        whole.prompt_token_ids = [8, 9]
+        whole.generation_prompt_text = "<gen>"
+        scheduler._resolve_generation_prompt_start(whole)
+        assert whole.generation_prompt_start == 0
 
     def test_emit_prefill_boundary_snapshot_persists_before_uid_assignment(
         self, mock_model, mock_tokenizer
@@ -3900,8 +4119,9 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
-    def test_qwen4_wide_prefill_aligns_block_size_to_4096(
-        self, mock_tokenizer, tmp_path
+    @pytest.mark.parametrize("model_type", ["qwen4_exp_text", "glm5_next"])
+    def test_sparse_hybrid_wide_prefill_aligns_block_size_to_4096(
+        self, mock_tokenizer, tmp_path, model_type
     ):
         with (
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
@@ -3916,7 +4136,7 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
         ):
             scheduler = Scheduler(
-                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                model=self._hybrid_model(model_type=model_type),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
                     paged_ssd_cache_dir=str(tmp_path),
@@ -3935,10 +4155,12 @@ class TestSchedulerArraysCacheBlockAlignment:
         ("native_available", "symbol_available"),
         [(False, False), (True, False)],
     )
-    def test_qwen4_keeps_2048_without_sparse_native_path(
+    @pytest.mark.parametrize("model_type", ["qwen4_exp_text", "glm5_next"])
+    def test_sparse_hybrid_keeps_2048_without_sparse_native_path(
         self,
         mock_tokenizer,
         tmp_path,
+        model_type,
         native_available,
         symbol_available,
     ):
@@ -3955,7 +4177,7 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
         ):
             scheduler = Scheduler(
-                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                model=self._hybrid_model(model_type=model_type),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
                     paged_ssd_cache_dir=str(tmp_path),
@@ -3967,6 +4189,47 @@ class TestSchedulerArraysCacheBlockAlignment:
             assert scheduler._qwen35_prefill_floor == 0
             assert scheduler._prefill_step_size_for_progress(0, 4096) == 2048
             assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize("paged", [True, False])
+    def test_qwen4_long_prompt_uses_wide_block_grid(
+        self, mock_tokenizer, tmp_path, paged
+    ):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    prefill_step_size=2048,
+                    paged_ssd_cache_dir=str(tmp_path) if paged else None,
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            step = scheduler._prefill_step_size_for_progress
+            assert scheduler._qwen4_wide_prefill_step == 8192
+            assert step(0, 16384) == 2048
+            # Prompts shorter than one narrow plus one wide chunk stay narrow.
+            assert step(2048, 8191) == 2048
+            if paged:
+                # The block clamp ends each wide request on the 8192 grid.
+                assert scheduler.config.paged_cache_block_size == 8192
+                assert step(2048, 14336) == 8192
+            else:
+                assert step(2048, 14336) == 6144
         finally:
             scheduler.shutdown()
 

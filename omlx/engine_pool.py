@@ -58,6 +58,7 @@ from .model_settings import (
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
+from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -429,13 +430,49 @@ class EnginePool:
                     )
 
                     base = max(
-                        0, base - estimate_expert_savings(entry.model_path, fraction)
+                        0,
+                        base
+                        - estimate_expert_savings(
+                            entry.model_path,
+                            fraction,
+                            mtp_resident=bool(
+                                getattr(runtime_settings, "mtp_enabled", False)
+                            ),
+                        ),
                     )
             elif qwen4_estimate is None:
                 base = estimate_offload_admission_bytes(
-                    entry.model_path, base, fraction
+                    entry.model_path,
+                    base,
+                    fraction,
+                    mtp_resident=bool(
+                        getattr(runtime_settings, "mtp_enabled", False)
+                    ),
                 )
+        if dflash_batched_requested(runtime_settings) and dflash_batched_supported(
+            entry.config_model_type, entry.engine_type
+        ):
+            extra += self._dflash_drafter_estimated_bytes(runtime_settings)
         return base + extra
+
+    def _dflash_drafter_estimated_bytes(self, runtime_settings: object) -> int:
+        """Weights of the batched DFlash drafter plus its per-row context rings."""
+        drafter_id = getattr(runtime_settings, "dflash_draft_model", None) or ""
+        drafter_entry = self._entries.get(drafter_id)
+        path = Path(drafter_entry.model_path if drafter_entry else drafter_id)
+        try:
+            weights = sum(
+                f.stat().st_size for f in path.glob("*.safetensors") if f.is_file()
+            )
+        except OSError:
+            weights = 0
+        if getattr(runtime_settings, "dflash_draft_quant_enabled", False):
+            bits = int(getattr(runtime_settings, "dflash_draft_quant_weight_bits", 0) or 4)
+            # bf16 checkpoints shrink by bits/16 plus scales; the selector
+            # codebooks stay unquantized, so keep a third as headroom.
+            weights = int(weights * max(bits / 16 + 0.05, 0.34))
+        rows = int(getattr(self._scheduler_config, "max_num_seqs", 8) or 8)
+        return weights + rows * 48 * 1024 * 1024
 
     def _qwen4_ple_offload_status(
         self,
@@ -551,7 +588,9 @@ class EnginePool:
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(
-                    entry.model_path, settings.moe_expert_offload_resident_fraction
+                    entry.model_path,
+                    settings.moe_expert_offload_resident_fraction,
+                    mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
                 )
                 estimate = replace(
                     estimate,
@@ -801,7 +840,8 @@ class EnginePool:
         # signature while Lightning MTP is active so a change reloads the
         # engine, but a stale value must not force one when MTP is off.
         if mtp_active:
-            add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
+            add("mtp_adaptive_max_depth", data.get("mtp_adaptive_max_depth"))
+            add("mtp_fixed_depth", data.get("mtp_fixed_depth"))
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
@@ -913,14 +953,16 @@ class EnginePool:
             add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
             add("specprefill_threshold", data.get("specprefill_threshold"))
 
-        dflash_active = (
-            bool(data.get("dflash_enabled", False))
-            and has_value("dflash_draft_model")
-            and not is_diffusion
-        )
+        dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
+        dflash_draft = data.get("dflash_draft_model")
+        if dflash_enabled and not dflash_draft and entry is not None:
+            from .patches.dflash_mimo_v2 import resolve_bundled_mimo_draft
+
+            dflash_draft = resolve_bundled_mimo_draft(entry.model_path, dflash_draft)
+        dflash_active = dflash_enabled and bool(dflash_draft)
         add("dflash_enabled", dflash_active)
         if dflash_active:
-            add("dflash_draft_model", data.get("dflash_draft_model"))
+            add("dflash_draft_model", dflash_draft)
             add(
                 "dflash_draft_quant_enabled",
                 bool(data.get("dflash_draft_quant_enabled", False)),
@@ -2980,6 +3022,15 @@ class EnginePool:
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
+                if dflash_enabled and not dflash_draft:
+                    from .patches.dflash_mimo_v2 import (
+                        resolve_bundled_mimo_draft,
+                    )
+
+                    dflash_draft = resolve_bundled_mimo_draft(
+                        entry.model_path,
+                        dflash_draft,
+                    )
                 if (
                     dflash_enabled
                     and dflash_draft
@@ -2989,6 +3040,20 @@ class EnginePool:
                         "DFlash is not supported for diffusion models; "
                         "loading %s with its native VLM engine",
                         model_id,
+                    )
+                elif (
+                    dflash_enabled
+                    and dflash_draft
+                    and dflash_batched_supported(
+                        entry.config_model_type, effective_type
+                    )
+                ):
+                    # Qwen3.5-family VLM targets draft inside the batched
+                    # engine; the drafter is attached after start below.
+                    logger.info(
+                        "DFlash enabled for %s as a batched drafter, draft=%s",
+                        model_id,
+                        dflash_draft,
                     )
                 elif dflash_enabled and dflash_draft:
                     try:
@@ -3268,6 +3333,70 @@ class EnginePool:
             self._current_model_memory += resident_size
             load_completed = True
             self._clear_load_failure(entry)
+
+            # Batched DFlash: load the block drafter and attach it to the
+            # Lightning MTP verify path. Fail-soft like the VLM MTP drafter.
+            if (
+                model_settings is not None
+                and dflash_batched_requested(model_settings)
+                and dflash_batched_supported(entry.config_model_type, effective_type)
+                and hasattr(engine, "set_dflash_drafter")
+            ):
+                drafter_id = model_settings.dflash_draft_model
+                drafter_entry = self._entries.get(drafter_id)
+                drafter_path = drafter_entry.model_path if drafter_entry else drafter_id
+
+                def _load_dflash_sync(path: str = drafter_path):
+                    from .speculative.dflash_drafter import load_dflash_drafter
+
+                    return load_dflash_drafter(
+                        path,
+                        engine.vlm_model,
+                        block_size=getattr(model_settings, "dflash_block_size", None),
+                        quant_enabled=bool(
+                            getattr(model_settings, "dflash_draft_quant_enabled", False)
+                        ),
+                        quant_bits=int(
+                            getattr(model_settings, "dflash_draft_quant_weight_bits", 0)
+                            or 4
+                        ),
+                        quant_group_size=int(
+                            getattr(model_settings, "dflash_draft_quant_group_size", 0)
+                            or 64
+                        ),
+                    )
+
+                loop = asyncio.get_running_loop()
+                try:
+                    drafter = await loop.run_in_executor(
+                        get_mlx_executor(), _load_dflash_sync
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"DFlash drafter load raised for {model_id} "
+                        f"(drafter={drafter_id}): {e} -- toggle ignored"
+                    )
+                    drafter = None
+                if drafter is not None:
+                    engine.set_dflash_drafter(drafter)
+                    ignored = [
+                        name
+                        for name, default in (
+                            ("dflash_verify_mode", None),
+                            ("dflash_max_ctx", None),
+                            ("dflash_draft_window_size", None),
+                            ("dflash_draft_sink_size", 0),
+                            ("dflash_ssd_cache", False),
+                        )
+                        if getattr(model_settings, name, default) != default
+                    ]
+                    if ignored:
+                        logger.info(
+                            "Batched DFlash ignores %s for %s (single-stream "
+                            "engine settings)",
+                            ", ".join(ignored),
+                            model_id,
+                        )
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.

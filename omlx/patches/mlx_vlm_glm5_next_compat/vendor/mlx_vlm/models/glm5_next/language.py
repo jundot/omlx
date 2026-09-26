@@ -613,14 +613,21 @@ class Glm5NextSparseAttention(nn.Module):
                 return self._gathered_attention(q, kv_latent, topk_indices)
             else:
                 q_latent = self.embed_q(q)
-                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=q_latent.dtype)
-                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype)
+                # Native DSA requires FP16/BF16 inputs; quantized projections can yield FP32.
+                # Cast at the kernel boundary and preserve the residual stream dtype.
+                native_dtype = (
+                    mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
+                )
+                q_latent = q_latent.astype(native_dtype)
+                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
+                kv_latent_native = kv_latent.astype(native_dtype)
+                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
                 output = None
                 if Kv >= 4096:
                     output = sparse_mla_attention(
                         q_latent,
                         q_pe,
-                        kv_latent,
+                        kv_latent_native,
                         k_pe,
                         topk_indices,
                         self.scale,
@@ -636,10 +643,10 @@ class Glm5NextSparseAttention(nn.Module):
                         output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                     return linear_forward(self.o_proj, output_flat)
 
-                k = self.embed_q(kv_latent, transpose=False)
-                v = self.unembed_out(kv_latent)
+                k = self.embed_q(kv_latent, transpose=False).astype(native_dtype)
+                v = self.unembed_out(kv_latent).astype(native_dtype)
                 output = exact_block_token_attention(
-                    q,
+                    q.astype(native_dtype),
                     k,
                     v,
                     topk_indices,
@@ -890,9 +897,16 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
+        # Evaluate each layer and release cached buffers to bound prefill memory.
+        # Keep decode lazy; the MTP replacement loop must use the same policy.
+        prefill = h.shape[1] >= 256
+
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
+            if prefill:
+                mx.eval(h)
+                mx.clear_cache()
 
         h = h.mean(axis=2)
         return self.norm(h)

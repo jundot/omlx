@@ -51,7 +51,7 @@ const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
             window: {t: key => key}, navigator: {language: 'en'}, document: {},
             console,
             fetch: async () => ({ok: true, json: async () => ({
-                cache: {ssd_cache_max_size: size},
+                cache: {ssd_cache_max_size: size, ssd_cache_auto_size_bytes: 150 * 1024 ** 3},
                 system: {ssd_total_bytes: 1000 * 1024 ** 3},
             })}),
         };
@@ -62,6 +62,8 @@ const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
         state.cachePercent = 20;
         state.updateCacheFromSlider();
         assert.equal(state.globalSettings.cache.ssd_cache_max_size, '200GB');
+        state.globalSettings.cache.ssd_cache_max_size = 'auto';
+        assert.equal(state.cacheSizeGB, 150);
     }
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """

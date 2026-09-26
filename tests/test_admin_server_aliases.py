@@ -1253,6 +1253,9 @@ def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
         )
         assert "cache" in result["runtime_applied"]
         pool._unload_engine.assert_awaited_once_with("loaded-model")
+        assert pool._scheduler_config.paged_ssd_cache_auto_size == (
+            cache_size == "auto"
+        )
         assert pool._scheduler_config.initial_cache_blocks == 512
 
 
@@ -1278,3 +1281,25 @@ def test_gdn_storage_alias_only_rebuilds_on_policy_change(alias, split):
         asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
         apply_cache.assert_awaited_once()
         assert gs.cache.gdn_ssd_split_enabled is split
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_qwen4_decode_setting_updates_future_model_loads(enabled):
+    from omlx.scheduler import SchedulerConfig
+    from omlx.server import _server_state
+
+    gs = _make_global_settings()
+    gs.server.qwen4_gdn_decode_wide_proj = not enabled
+    pool = SimpleNamespace(
+        _scheduler_config=SchedulerConfig(qwen4_gdn_decode_wide_proj=not enabled)
+    )
+    request = GlobalSettingsRequest(qwen4_gdn_decode_wide_proj=enabled)
+    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+    assert result["success"] is True
+    assert "qwen4_gdn_decode_wide_proj" not in result["runtime_applied"]
+    assert gs.server.qwen4_gdn_decode_wide_proj is enabled
+    assert pool._scheduler_config.qwen4_gdn_decode_wide_proj is enabled
+    gs.save.assert_called_once()

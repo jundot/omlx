@@ -7,9 +7,11 @@
 #   "Powered by MTPLX by Youssof Altoukhi"
 #
 # The split-K and multi-simdgroup (msg) kernel morphologies and their Metal
-# source generation below are ported from MTPLX. The oMLX integration —
-# thread-local armed routing through ``nn.QuantizedLinear``, the hybrid
-# dispatch, and the M=3..6 / N-floor gating — is original to oMLX.
+# source generation below are ported from MTPLX. The simdgroup-matrix tile
+# kernel (``mma``) for 8..32 rows is adapted from dflash-mlx
+# (dflash_mlx/verify_qmm.py, Copyright 2026 bstnxbt, Apache-2.0). The oMLX
+# integration — thread-local armed routing through ``nn.QuantizedLinear``,
+# the hybrid dispatch, and the row/N-floor gating — is original to oMLX.
 """Verify-shape quantized-matmul kernels for native MTP.
 
 Speculative verify multiplies a skinny row batch (M = 1 + draft depth)
@@ -28,8 +30,12 @@ Two kernel morphologies:
   lane-strided over pack-interleaved weight words. Wins on huge-N (lm_head)
   where the split-K tiny-tile grid thrashes the scheduler.
 
-Dispatch: split-K everywhere, msg for N >= 100k. Routing is armed only around
-the MTP verify forward via a thread-local flag (set by
+Dispatch: split-K everywhere, msg for N >= 100k, and for 7..24 rows (batched
+verify: rows = requests x block) the ``mma`` tile kernel, which dequantizes
+16-column weight tiles into threadgroup memory once and multiplies them
+against every row with simdgroup matrices, so a batch of rows costs one pass
+over the weights. Routing is armed only around the MTP verify forward via a
+thread-local flag (set by
 ``omlx.patches.mlx_lm_mtp.batch_generator._call_backbone``) so nothing else
 in the process sees the patched ``nn.QuantizedLinear``.
 
@@ -39,8 +45,9 @@ from the unrouted path (the token is still trunk-verified — the divergence
 class is the same as any kernel change).
 
 Supported: 4-bit and 8-bit affine, group_size in {32, 64, 128}, bf16/fp16
-activations, M in 3..6, K % 64 == 0, N % 4 == 0. Everything else falls
-back to stock.
+activations, M in 3..6, K % 64 == 0, N % 4 == 0. The mma path takes 4-bit
+and 5-bit affine, M in 7..24, K % 256 == 0, N % 16 == 0. Everything else falls back to
+stock.
 """
 
 from __future__ import annotations
@@ -62,6 +69,9 @@ _MSG_NSG = 8  # simdgroups per threadgroup for the msg (lm_head) kernel
 # (~1.0x GPU win) costs more on the CPU than it saves; the large-N shapes are
 # few calls with real wins (lm_head 2.6-3.3x at M=3-4).
 _MIN_ROUTE_N = 16384
+# The mma path wins from much smaller N because stock qmm reads the weights
+# more than once (qmv_wide tiles) or wastes half a 32-row tile at these M.
+_MIN_MMA_ROUTE_N = 4096
 
 
 def set_verify_qmm_armed(flag: bool) -> None:
@@ -360,6 +370,192 @@ def _build_ksplit_kernel(m: int, bits: int, group_size: int, dtype, *, k_parts: 
 
 
 # ---------------------------------------------------------------------------
+# mma kernel — 7..32 rows, simdgroup matrix tiles (adapted from dflash-mlx's
+# combo_ktmpl morphology).
+# ---------------------------------------------------------------------------
+
+_MMA_BN = 16
+_MMA_BK = 32
+_MMA_NSG = 8
+
+
+def _build_mma_kernel(
+    row_tiles: int, k_val: int, group_size: int, dtype, bits: int = 4
+):
+    """Rows padded to ``8 * row_tiles`` x 16 columns per threadgroup.
+
+    Eight simdgroups each own one K chunk: they dequantize their BK x BN
+    weight tile into a private threadgroup buffer and multiply it against
+    every row tile with simdgroup matrices, so no cross-simdgroup barrier
+    sits in the K loop. Partial sums are reduced once at the end. K is a
+    template constant so the chunking folds into the code.
+    """
+    import mlx.core as mx
+
+    key = ("mma", row_tiles, int(k_val), group_size, dtype, bits)
+    if key in _KERNEL_CACHE:
+        return _KERNEL_CACHE[key]
+
+    if bits == 4:
+        # One uint32 holds the pack's eight nibbles.
+        unpack = """
+                uint32_t packed = w_q[n_global * K_by_8 + (k_base >> 3)];
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {
+                    uint32_t nib = (packed >> (ki * 4)) & 0xFu;
+                    B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(float(nib) * s + b);
+                }"""
+    else:
+        # MLX 5-bit affine: eight values per five little-endian bytes.
+        unpack = """
+                const device uchar* wb = ((const device uchar*)w_q)
+                    + (n_global * K_by_8 + (k_base >> 3)) * 5;
+                uint64_t packed = uint64_t(wb[0]) | (uint64_t(wb[1]) << 8)
+                    | (uint64_t(wb[2]) << 16) | (uint64_t(wb[3]) << 24)
+                    | (uint64_t(wb[4]) << 32);
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {
+                    uint32_t nib = uint32_t((packed >> (ki * 5)) & 0x1Fu);
+                    B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(float(nib) * s + b);
+                }"""
+
+    decl = "\n        ".join(
+        f"simdgroup_matrix<T, 8, 8> a{r};"
+        f" simdgroup_matrix<float, 8, 8> c{r}L = simdgroup_matrix<float, 8, 8>(0.0f);"
+        f" simdgroup_matrix<float, 8, 8> c{r}R = simdgroup_matrix<float, 8, 8>(0.0f);"
+        for r in range(row_tiles)
+    )
+    loads = "\n                ".join(
+        f"simdgroup_load(a{r}, x + {r} * 8 * K + k0 + ks * BK_SUB, K);"
+        for r in range(row_tiles)
+    )
+    macs = "\n                ".join(
+        f"simdgroup_multiply_accumulate(c{r}L, a{r}, b_L, c{r}L);"
+        f" simdgroup_multiply_accumulate(c{r}R, a{r}, b_R, c{r}R);"
+        for r in range(row_tiles)
+    )
+    stores = "\n        ".join(
+        f"simdgroup_store(c{r}L, tg_partials[sg_id] + {r} * 8 * BN, BN);"
+        f" simdgroup_store(c{r}R, tg_partials[sg_id] + {r} * 8 * BN + 8, BN);"
+        for r in range(row_tiles)
+    )
+    source = f"""
+        using namespace metal;
+        constexpr int BM = {8 * row_tiles};
+        constexpr int BN = {_MMA_BN};
+        constexpr int BK = {_MMA_BK};
+        constexpr int BK_SUB = 8;
+        constexpr int NSG = {_MMA_NSG};
+        constexpr int GS = {group_size};
+        constexpr int K = {int(k_val)};
+        constexpr int K_by_8 = K / 8;
+        constexpr int K_by_gs = K / GS;
+        constexpr int K_chunk = K / NSG;
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint sg_id = tid / 32;
+        uint lane = tid % 32;
+        uint tg_n = threadgroup_position_in_grid.y;
+
+        int N = int(N_size);
+        int n0 = int(tg_n) * BN;
+        int k_begin = int(sg_id) * K_chunk;
+        int k_end = k_begin + K_chunk;
+
+        threadgroup T B_tile[NSG][BK * BN];
+        threadgroup float tg_partials[NSG][BM * BN];
+
+        simdgroup_matrix<T, 8, 8> b_L, b_R;
+        {decl}
+
+        int dq_n = int(lane) % BN;
+        int dq_k_lane = int(lane) / BN;
+
+        for (int k0 = k_begin; k0 < k_end; k0 += BK) {{
+            _Pragma("unroll")
+            for (int pack_idx = 0; pack_idx < 2; ++pack_idx) {{
+                int dq_k = pack_idx * 2 + dq_k_lane;
+                int n_global = n0 + dq_n;
+                int k_base = k0 + dq_k * 8;
+                float s = float(scales[n_global * K_by_gs + (k_base / GS)]);
+                float b = float(biases[n_global * K_by_gs + (k_base / GS)]);
+                {unpack}
+            }}
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (int ks = 0; ks < BK / BK_SUB; ++ks) {{
+                {loads}
+                simdgroup_load(b_L, B_tile[sg_id] + ks * BK_SUB * BN, BN);
+                simdgroup_load(b_R, B_tile[sg_id] + ks * BK_SUB * BN + 8, BN);
+                {macs}
+            }}
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        {stores}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int off = int(tid); off < BM * BN; off += NSG * 32) {{
+            float acc = 0.0f;
+            _Pragma("unroll")
+            for (int g = 0; g < NSG; ++g) {{
+                acc += tg_partials[g][off];
+            }}
+            int row = off / BN;
+            int col = off - row * BN;
+            y[row * N + n0 + col] = T(acc);
+        }}
+    """
+
+    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=f"omlx_vk_mma_rt{row_tiles}_k{int(k_val)}_q{bits}_gs{group_size}_"
+        f"{dtype_tag}",
+        input_names=["x", "w_q", "scales", "biases", "N_size"],
+        output_names=["y"],
+        source=source,
+    )
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def mma_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
+    import mlx.core as mx
+
+    return (
+        int(bits) in (4, 5)
+        and int(group_size) in (32, 64, 128)
+        and dtype in (mx.bfloat16, mx.float16)
+        # Above 24 rows stock qmm fills its 32-row tile and wins.
+        and 7 <= int(M) <= 24
+        and int(K) % (_MMA_BK * _MMA_NSG) == 0
+        and int(N) % _MMA_BN == 0
+        and int(N) >= _MIN_MMA_ROUTE_N
+    )
+
+
+def vk_qmm_mma(x2, w_q, scales, biases, *, group_size: int, bits: int = 4):
+    """(M, K) x (N, K)^T -> (M, N) for M in 7..24 through the mma tile kernel."""
+    import mlx.core as mx
+
+    M = int(x2.shape[0])
+    K = int(x2.shape[1])
+    N = int(w_q.shape[0])
+    row_tiles = (M + 7) // 8
+    bm = 8 * row_tiles
+    xm, M0 = _pad_rows(mx, x2, bm)
+    kernel = _build_mma_kernel(row_tiles, K, group_size, x2.dtype, bits)
+    (y,) = kernel(
+        inputs=[xm, w_q, scales, biases, N],
+        template=[("T", x2.dtype)],
+        grid=(32 * _MMA_NSG, N // _MMA_BN, 1),
+        threadgroup=(32 * _MMA_NSG, 1, 1),
+        output_shapes=[(bm, N)],
+        output_dtypes=[x2.dtype],
+    )
+    return y[:M0, :] if M0 < bm else y
+
+
+# ---------------------------------------------------------------------------
 # Dispatch.
 # ---------------------------------------------------------------------------
 
@@ -443,9 +639,9 @@ def apply_verify_qmm_patch() -> bool:
     """Route verify-shaped ``nn.QuantizedLinear`` calls to the vk kernels.
 
     Strictly gated: only while the MTP verify flag is armed
-    (``set_verify_qmm_armed``), only batch-1 rank-3 inputs with 3..6 rows,
-    only 4/8-bit affine layouts the kernels support. Everything else takes
-    the stock path.
+    (``set_verify_qmm_armed``), only rank-3 inputs whose rows (batch x block)
+    fall in 3..6 (split-K) or 7..24 (mma), only affine layouts the kernels
+    support. Everything else takes the stock path.
     """
     global _QL_PATCHED
     if _QL_PATCHED:
@@ -463,39 +659,52 @@ def apply_verify_qmm_patch() -> bool:
 
     def patched_call(self, x):
         if (
-            _is_armed()
-            and x.ndim == 3
-            and x.shape[0] == 1
-            and 2 <= x.shape[1] <= 6
-            and getattr(self, "mode", "affine") == "affine"
-            and vk_eligible(
-                x.shape[1],
-                x.shape[-1],
-                self.scales.shape[0],
-                self.bits,
-                self.group_size,
-                x.dtype,
-            )
+            not _is_armed()
+            or x.ndim != 3
+            or getattr(self, "mode", "affine") != "affine"
+            or (x.shape[0] == 1 and x.shape[1] < 2)
         ):
-            try:
+            return orig_call(self, x)
+        batch, length, K = x.shape
+        rows = batch * length
+        N = self.scales.shape[0]
+        route = None
+        if mma_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
+            route = "mma"
+        elif rows <= 6 and vk_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
+            route = "vk"
+        if route is None:
+            return orig_call(self, x)
+        try:
+            # Batched verify rows (requests x block) share one weight pass.
+            x2 = x[0] if batch == 1 else x.reshape(rows, K)
+            if route == "mma":
+                y = vk_qmm_mma(
+                    x2,
+                    self.weight,
+                    self.scales,
+                    self.biases,
+                    group_size=self.group_size,
+                    bits=self.bits,
+                )
+            else:
                 y = vk_qmm(
-                    x[0],
+                    x2,
                     self.weight,
                     self.scales,
                     self.biases,
                     bits=self.bits,
                     group_size=self.group_size,
                 )
-                if hasattr(self, "bias"):
-                    y = y + self.bias
-                return y[None]
-            except Exception:
-                logger.debug("verify qmm route failed; stock fallback", exc_info=True)
-                return orig_call(self, x)
-        return orig_call(self, x)
+            if hasattr(self, "bias"):
+                y = y + self.bias
+            return y[None] if batch == 1 else y.reshape(batch, length, N)
+        except Exception:
+            logger.debug("verify qmm route failed; stock fallback", exc_info=True)
+            return orig_call(self, x)
 
     cls.__call__ = patched_call
     cls._omlx_verify_qmm_patched = True
     _QL_PATCHED = True
-    logger.info("MTP verify qmm patch applied (M=2..6 affine 4/8-bit)")
+    logger.info("MTP verify qmm patch applied (rows 2..6 split-K, 7..24 mma)")
     return True
