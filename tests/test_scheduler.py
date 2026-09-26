@@ -4382,8 +4382,8 @@ class TestSchedulerArraysCacheBlockAlignment:
     def test_dsv41_wide_step_force_env_overrides_non_nax(
         self, mock_tokenizer, tmp_path, monkeypatch
     ):
-        # Studio (non-NAX) boundary probing: the env override widens the
-        # step and the ArraysCache grid without the NAX gate.
+        # Boundary probing: the env override forces any width, and 0 is the
+        # kill switch that falls back to the stock narrow geometry.
         monkeypatch.setenv("OMLX_DSV41_WIDE_STEP_FORCE", "8192")
         with (
             patch("omlx.settings.get_system_memory", return_value=512 * 1024**3),
@@ -4410,6 +4410,69 @@ class TestSchedulerArraysCacheBlockAlignment:
         try:
             assert scheduler._dsv41_wide_prefill_step == 8192
             assert scheduler.config.paged_cache_block_size == 8192
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == 8192
+        finally:
+            scheduler.shutdown()
+
+    def test_dsv41_wide_step_kill_switch(
+        self, mock_tokenizer, tmp_path, monkeypatch
+    ):
+        # FORCE=0 disables the default even on a native >=64GB host.
+        monkeypatch.setenv("OMLX_DSV41_WIDE_STEP_FORCE", "0")
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="deepseek_v41"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    prefill_step_size=2048,
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._dsv41_wide_prefill_step == 0
+            assert scheduler.config.paged_cache_block_size == 2048
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == 2048
+        finally:
+            scheduler.shutdown()
+
+    def test_dsv41_wide_default_needs_no_nax(self, mock_tokenizer, tmp_path):
+        # Non-NAX hosts default wide: measured +9-13% on an M3 Ultra Studio.
+        with (
+            patch("omlx.settings.get_system_memory", return_value=512 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="deepseek_v41"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    prefill_step_size=2048,
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._dsv41_wide_prefill_step == 8192
             assert scheduler._prefill_step_size_for_progress(0, 16384) == 8192
         finally:
             scheduler.shutdown()

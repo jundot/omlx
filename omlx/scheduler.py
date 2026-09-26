@@ -2942,13 +2942,17 @@ class Scheduler:
         return 0
 
     def _detect_dsv41_wide_prefill_step(self) -> int:
-        """Return the DeepSeek-V4.1-Flash prefill step on native-kernel NAX hosts.
+        """Return the DeepSeek-V4.1-Flash prefill step on native-kernel hosts.
 
         Wide chunks feed the grouped expert GEMMs more rows per expert; the
         packed attention/indexer kernels stream arbitrary chunk widths and the
-        per-layer eval backpressure already bounds chunk residency. Narrow
-        hosts keep the existing floor/default geometry.
-        ``OMLX_DSV41_WIDE_STEP_FORCE`` probes the boundary on non-NAX hosts.
+        per-layer eval backpressure already bounds chunk residency. Measured
+        on a non-NAX M3 Ultra Studio: pp4096 +13.5%, pp8192 +9.3% at 8192
+        (docs/experimental/dsv41_flash_speedup.md), so the gate is native
+        kernel + >=64GB without the NAX requirement. Narrow hosts keep the
+        existing floor/default geometry.
+        ``OMLX_DSV41_WIDE_STEP_FORCE`` overrides: >0 forces that width
+        (probe other boundaries), 0 disables (kill switch).
         """
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
@@ -2958,20 +2962,18 @@ class Scheduler:
                 )
             if not model_type.startswith("deepseek_v41"):
                 return 0
-            force = int(os.environ.get("OMLX_DSV41_WIDE_STEP_FORCE", "0") or 0)
-            if force > 0:
-                return force
+            raw = os.environ.get("OMLX_DSV41_WIDE_STEP_FORCE")
+            if raw is not None:
+                force = int(raw or 0)
+                return force if force > 0 else 0
             from .custom_kernels.glm_moe_dsa import fast
-            from .custom_kernels.nax import is_nax_available
             from .settings import get_system_memory
 
-            if (
-                fast.is_native_available()
-                and fast.has_symbol("deepseek_v41_packed_attention")
-                and is_nax_available()
-                and get_system_memory() >= 64 * 1024**3
+            if fast.is_native_available() and fast.has_symbol(
+                "deepseek_v41_packed_attention"
             ):
-                return _DSV41_WIDE_PREFILL_STEP
+                if get_system_memory() >= 64 * 1024**3:
+                    return _DSV41_WIDE_PREFILL_STEP
         except Exception:
             logger.debug("deepseek_v41 wide prefill probe failed", exc_info=True)
         return 0
