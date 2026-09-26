@@ -72,6 +72,17 @@ def _verify_abi(ext, import_error):
 _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
+def set_command_buffer_caps(ops: int, mb: int) -> tuple[int, int] | None:
+    """Set MLX's per-command-buffer caps and return the previous pair.
+
+    Returns None when the native extension is unavailable; MLX keeps its caps.
+    """
+    setter = getattr(_ext, "set_command_buffer_caps", None)
+    if setter is None:
+        return None
+    return tuple(setter(int(ops), int(mb)))
+
+
 NATIVE_SYMBOLS = (
     "qwen35_fa256_attention",
     "qwen35_q2_affine_qmm_t",

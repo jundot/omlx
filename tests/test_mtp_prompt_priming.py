@@ -130,7 +130,8 @@ class _MemoryMtpPrefixCache:
         return self.snapshots.get(self._key(tokens, boundary))
 
 
-def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts():
+@pytest.mark.parametrize("boundary", [8, 3, 7])
+def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts(boundary):
     """The production sidecar is only visible while its backbone tip lives."""
     from omlx.cache.prefix_cache import BlockAwarePrefixCache
 
@@ -152,19 +153,32 @@ def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts():
     cache._mtp_prefix_snapshots = OrderedDict()
     cache._mtp_prefix_snapshot_lock = threading.RLock()
 
-    tokens = list(range(8))
+    tokens = list(range(boundary + 2))
     snapshot = object()
-    assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
-    tip = cache._mtp_prefix_chain_tip(tokens, 8)
-    assert tip is not None
+    assert cache.store_mtp_prefix_snapshot(tokens, boundary, snapshot)
+    tip = cache._mtp_prefix_chain_tip(tokens, boundary)
+    from omlx.cache.paged_cache import compute_block_hash
+
+    expected = None
+    for start in range(0, boundary, 4):
+        expected = compute_block_hash(
+            expected,
+            tokens[start : min(start + 4, boundary)],
+            model_name="tiny-mtp-test",
+        )
+    assert tip == expected
     # Publishing precedes the async backbone store, so the snapshot must not
     # become restorable until the matching ordinary block is live.
-    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+    assert cache.restore_mtp_prefix_snapshot(tokens, boundary) is None
     hash_map.blocks[tip] = object()
-    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is snapshot
+    assert cache.restore_mtp_prefix_snapshot(tokens, boundary) is snapshot
+
+    changed = list(tokens)
+    changed[boundary - 1] += 100
+    assert cache.restore_mtp_prefix_snapshot(changed, boundary) is None
 
     cache._on_block_hash_dropped(tip)
-    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+    assert cache.restore_mtp_prefix_snapshot(tokens, boundary) is None
 
 
 def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
@@ -279,8 +293,9 @@ class TestCaptureFold:
             assert mx.allclose(k, rk, rtol=1e-4, atol=1e-4)
             assert mx.allclose(v, rv, rtol=1e-4, atol=1e-4)
 
+    @pytest.mark.parametrize("boundary, length", [(8, 13), (5, 7), (11, 13)])
     def test_warm_prefix_restores_exact_head_history_without_trunk_reforward(
-        self, strict_model
+        self, strict_model, boundary, length
     ):
         """A backbone hit at C restores MTP(C-1)+hidden(C-1), then folds
         only the uncached suffix and activation seam.  The resulting head
@@ -288,7 +303,7 @@ class TestCaptureFold:
         Repeating scheduler preparation for the same request is idempotent.
         """
         model = strict_model
-        tokens = _tokens(13, seed=40)
+        tokens = _tokens(length, seed=40)
         main_tok = _tokens(1, seed=41)
         sidecar = _MemoryMtpPrefixCache(block_size=8)
 
@@ -300,7 +315,16 @@ class TestCaptureFold:
             cached_tokens=0,
             prefix_cache=sidecar,
         )
-        _chunked_prefill(model, cold_cache, tokens, [8, 5])
+        _chunked_prefill(model, cold_cache, tokens[:boundary], [boundary])
+        if boundary % sidecar.block_size:
+            ctx = prompt_priming._find_ctx(model)
+            previous = ctx.snapshot_candidate
+            prompt_priming.capture_tail_boundary(model, "other", boundary)
+            assert ctx.snapshot_candidate is previous
+            prompt_priming.capture_tail_boundary(model, "cold", boundary + 1)
+            assert ctx.snapshot_candidate is previous
+            prompt_priming.capture_tail_boundary(model, "cold", boundary)
+        _chunked_prefill(model, cold_cache, tokens[boundary:], [length - boundary])
         cold_ctx = prompt_priming._find_ctx(model)
         assert cold_ctx is not None
         cold_final_pending = cold_ctx.pending_hidden + 0
@@ -308,27 +332,25 @@ class TestCaptureFold:
         model(main_tok[None, :], cache=cold_cache, return_hidden=True)
         cold_primed = prompt_priming.take_primed(model, cold_cache, main_tok)
         assert cold_primed is not None
-        snapshot_key = (tuple(tokens[:8].tolist()), 8)
+        snapshot_key = (tuple(tokens[:boundary].tolist()), boundary)
         assert snapshot_key in sidecar.snapshots
         boundary_pending = sidecar.snapshots[snapshot_key].pending_hidden
 
-        # Build the already-restored backbone cache outside capture.  Start
-        # tracing only after sidecar restore: a correct warm path invokes the
-        # MTP head for suffix(5)+seam(1), never for the cached trunk(8).
+        # Trace only the suffix and seam; the cached trunk must not run again.
         warm_cache = _make_cache(model)
         with prompt_priming.suppress_capture():
-            model(tokens[:8][None, :], cache=warm_cache)
+            model(tokens[:boundary][None, :], cache=warm_cache)
         assert prompt_priming.prepare_prefix_context(
             model,
             request_id="warm",
             prompt_tokens=tokens.tolist(),
-            cached_tokens=8,
+            cached_tokens=boundary,
             prefix_cache=sidecar,
         )
         warm_ctx = prompt_priming._find_ctx(model)
         assert warm_ctx is not None
-        assert warm_ctx.folded == 7
-        assert warm_ctx.expected_offset == 8
+        assert warm_ctx.folded == boundary - 1
+        assert warm_ctx.expected_offset == boundary
         assert mx.array_equal(warm_ctx.pending_hidden, boundary_pending).item()
 
         # The scheduler's prepared-set normally prevents this second call;
@@ -338,7 +360,7 @@ class TestCaptureFold:
             model,
             request_id="warm",
             prompt_tokens=tokens.tolist(),
-            cached_tokens=8,
+            cached_tokens=boundary,
             prefix_cache=sidecar,
         )
         assert prompt_priming._find_ctx(model) is warm_ctx
@@ -351,7 +373,7 @@ class TestCaptureFold:
             return original_mtp_forward(hidden, next_ids, cache, **kwargs)
 
         model.mtp_forward = traced_mtp_forward
-        _chunked_prefill(model, warm_cache, tokens[8:], [5])
+        _chunked_prefill(model, warm_cache, tokens[boundary:], [length - boundary])
         warm_final_ctx = prompt_priming._find_ctx(model)
         assert warm_final_ctx is not None
         assert mx.array_equal(
@@ -361,7 +383,7 @@ class TestCaptureFold:
         warm_primed = prompt_priming.take_primed(model, warm_cache, main_tok)
         assert warm_primed is not None
         assert warm_primed[1] == len(tokens)
-        assert mtp_rows == [5, 1]
+        assert mtp_rows == [length - boundary, 1]
 
         mx.eval(
             [c.state for c in cold_primed[0]],

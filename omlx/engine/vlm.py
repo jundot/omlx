@@ -740,9 +740,18 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
     import mlx.nn as _nn
     import mlx_vlm.utils as _vu
 
+    original_load_config = _vu.load_config
     original_update_module_configs = _vu.update_module_configs
     original_load_weights = _nn.Module.load_weights
     warned = False
+
+    def _text_capable_load_config(path, **kwargs):
+        cfg = original_load_config(path, **kwargs)
+        # mlx-vlm's gemma4 builds a vision tower unconditionally; gemma4_unified
+        # shares its language_model layout and runs without one.
+        if cfg.get("model_type") == "gemma4":
+            cfg = {**cfg, "model_type": "gemma4_unified"}
+        return cfg
 
     def _patched_update_module_configs(model_config, model_class, config, modules):
         model_config = original_update_module_configs(
@@ -778,11 +787,13 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
             )
         return original_load_weights(self, kept, *args, **kwargs)
 
+    _vu.load_config = _text_capable_load_config
     _vu.update_module_configs = _patched_update_module_configs
     _nn.Module.load_weights = _vision_filtering_load_weights
     try:
         yield
     finally:
+        _vu.load_config = original_load_config
         _vu.update_module_configs = original_update_module_configs
         _nn.Module.load_weights = original_load_weights
 
@@ -1722,6 +1733,9 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        # Holds the DFlash block drafter attached to Lightning MTP when
+        # dflash_enabled routes here instead of DFlashEngine.
+        self._dflash_drafter: Any | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -2168,6 +2182,23 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
+        # Dense Qwen3.5-family 4-bit projections -> tile-repacked layout for
+        # the M5 tensor units. Replaces the layers in place, so resident
+        # memory does not grow; runs on the MLX executor before any forward.
+        try:
+            from ..patches import qwen35_packed_linear
+
+            if qwen35_packed_linear.enabled(self._vlm_model):
+                packed = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    qwen35_packed_linear.pack_model,
+                    self._vlm_model,
+                )
+                if packed:
+                    logger.info("Qwen packed 4-bit projections: %d layers", packed)
+        except Exception:
+            logger.warning("Qwen packed 4-bit projections not applied", exc_info=True)
+
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
         if self.is_diffusion_model:
@@ -2317,8 +2348,13 @@ class VLMBatchedEngine(BaseEngine):
         try:
             from ..patches.qwen35_gdn_prework import (
                 apply_qwen35_gdn_prework_patch,
+                configure_qwen4_decode,
             )
 
+            configure_qwen4_decode(
+                self._vlm_model,
+                wide_projections=scheduler_config.qwen4_gdn_decode_wide_proj,
+            )
             apply_qwen35_gdn_prework_patch()
         except Exception:
             logger.debug("Qwen GDN prework patch not applied", exc_info=True)
@@ -2686,6 +2722,32 @@ class VLMBatchedEngine(BaseEngine):
     def vlm_mtp_drafter(self) -> Any | None:
         return self._vlm_mtp_drafter
 
+    @property
+    def vlm_model(self) -> Any | None:
+        """The loaded mlx-vlm model (target for external drafters)."""
+        return self._vlm_model
+
+    def set_dflash_drafter(self, drafter: Any) -> None:
+        """Attach a DFlash block drafter to the Lightning MTP decode path."""
+        from ..speculative.dflash_drafter import attach_drafter
+
+        language_model = getattr(self._adapter, "_language_model", None)
+        if language_model is None:
+            raise RuntimeError("VLM engine has no language model for the drafter")
+        attach_drafter(language_model, drafter)
+        self._dflash_drafter = drafter
+        logger.info(
+            "DFlash drafter attached to engine: %s (kind=%s, block=%d, layers=%s)",
+            self._model_name,
+            drafter.kind,
+            drafter.block_size,
+            drafter.target_layer_ids,
+        )
+
+    @property
+    def dflash_drafter(self) -> Any | None:
+        return self._dflash_drafter
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
@@ -2718,6 +2780,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_tokenizer",
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
+                "_dflash_drafter",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
@@ -4470,6 +4533,15 @@ class VLMBatchedEngine(BaseEngine):
         if model_type in {"mimo_v2", "mimo_v2_flash"}:
             media_messages = expand_video_parts(messages)
         text_messages, images, _ = extract_images_from_messages(media_messages)
+        if (
+            images
+            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self._vlm_model.config.vision_config is None
+        ):
+            raise InvalidRequestError(
+                "This text-only Gemma 4 model does not support image input.",
+                field="messages",
+            )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,

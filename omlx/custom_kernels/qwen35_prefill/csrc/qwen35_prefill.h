@@ -8,12 +8,18 @@
 
 namespace mx = mlx::core;
 
+#include <tuple>
+
 namespace omlx::qwen35_prefill_kernels {
 
 // Mirror of mlx::core::metal::is_nax_available() (not exported from libmlx):
 // macOS >= 26.2 and an applegpu generation with tensor units (gen >= 17, or
 // >= 18 for 'p'-suffix parts).
 bool is_nax_available();
+
+// Sets MLX's per-command-buffer caps (ops, MB of inputs) on the GPU device and
+// returns the previous ones. MLX reads them on every commit decision.
+std::tuple<int, int> set_command_buffer_caps(int ops, int mb);
 
 // True when the NAX metallib was built next to the extension. Kernel launch
 // still degrades to the classic kernels if loading it fails at runtime.

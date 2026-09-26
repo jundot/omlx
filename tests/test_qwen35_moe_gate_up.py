@@ -336,3 +336,36 @@ def test_vlm_fused_short_block_matches_verifier_without_copying_views(
     mx.eval(head, verified)
     assert mx.array_equal(head, expected_head).item()
     assert mx.array_equal(verified, expected_verify).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
+    from mlx_vlm.models.switch_layers import SwitchLinear as VLMSwitchLinear
+
+    from omlx.patches import moe_verify_gather
+
+    mx.random.seed(bits)
+    experts, top_k = 16, 10
+    # K = 1024 takes the qmv_fast traversal, K = 320 the qmv one with a tail.
+    for k, n in ((1024, 64), (320, 1024)):
+        linear = VLMSwitchLinear(k, n, experts, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        linear = linear.to_quantized(group_size=32, bits=bits)
+        assert moe_verify_gather.supported(linear, mx.bfloat16)
+        for rows in (2, 8):
+            indices = mx.stack(
+                [mx.random.permutation(experts)[:top_k] for _ in range(rows)]
+            ).astype(mx.uint32)
+            x = mx.random.normal((rows, k)).astype(mx.bfloat16)
+            expected = mx.gather_qmm(
+                mx.expand_dims(x, (-2, -3)),
+                linear["weight"],
+                linear["scales"],
+                linear["biases"],
+                rhs_indices=indices,
+                transpose=True,
+                group_size=32,
+                bits=bits,
+            ).reshape(rows * top_k, n)
+            got = moe_verify_gather.gather_qmv(linear, x, indices.reshape(-1), top_k)
+            assert mx.array_equal(got, expected).item()

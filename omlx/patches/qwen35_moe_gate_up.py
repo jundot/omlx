@@ -50,6 +50,7 @@ from mlx_vlm.models.switch_layers import (
 )
 
 from ..scheduler import _sync_and_clear_cache
+from . import moe_verify_gather
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,9 @@ def _fused_verify_switch(switch_mlp, x, indices):
     """Keep unsorted routing for the verifier's per-position reductions."""
     batch, length, width = x.shape
     top_k = indices.shape[-1]
+    routed = moe_verify_gather.fused_switch(switch_mlp, x, indices)
+    if routed is not None:
+        return routed
     flat_x = mx.expand_dims(x.reshape(batch * length, width), (-2, -3))
     flat_indices = indices.reshape(batch * length, top_k)
     gate_up = switch_mlp.gate_up_proj(flat_x, flat_indices, sorted_indices=False)

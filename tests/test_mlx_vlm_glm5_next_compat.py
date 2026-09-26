@@ -563,6 +563,89 @@ def test_sanitize_remaps_quantized_forget_gate_sidecars():
     )
 
 
+@pytest.mark.parametrize("text_only", [False, True])
+@pytest.mark.parametrize("preserve_mtp", [False, True])
+def test_oq_roundtrip_with_nextn_weights(tmp_path, monkeypatch, text_only, preserve_mtp):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models import glm5_next
+    from mlx_vlm.utils import load_model
+
+    from omlx.oq import quantize_oq_streaming
+    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+    from tests.test_glm5_next_mtp import TINY_TEXT_CONFIG
+
+    glm5_next_vlm_runtime.apply()
+    config = _tiny_config(with_vision=True)
+    text = copy.deepcopy(TINY_TEXT_CONFIG)
+    text.update(
+        num_hidden_layers=2,
+        qk_nope_head_dim=64,
+        v_head_dim=64,
+        index_head_dim=64,
+        layer_types=["linear_attention", "deepseek_sparse_attention"],
+        mlp_layer_types=["dense", "dense"],
+    )
+    text["linear_attn_config"].update(kda_layers=[0], full_attn_layers=[1])
+    config.text_config = glm5_next.TextConfig.from_dict(text)
+    model = glm5_next.Model(config)
+    weights = dict(tree_flatten(model.parameters()))
+    for prefix in (
+        "language_model.model.layers.1.self_attn.",
+        "language_model.mtp.0.block.self_attn.",
+    ):
+        wk = weights.pop(prefix + "embed_q.weight").swapaxes(-1, -2)
+        wv = weights.pop(prefix + "unembed_out.weight")
+        weights[prefix + "kv_b_proj.weight"] = mx.concatenate([wk, wv], axis=1).reshape(
+            -1, text["kv_lora_rank"]
+        )
+    raw = {}
+    for key, value in weights.items():
+        key = key.replace("language_model.model.", "model.language_model.")
+        key = key.replace("language_model.lm_head.", "lm_head.")
+        key = key.replace("vision_model.", "model.visual.")
+        key = key.replace(
+            "language_model.mtp.0.block.", "model.language_model.layers.2."
+        )
+        key = key.replace(
+            "language_model.mtp.0.norm.",
+            "model.language_model.layers.2.shared_head.norm.",
+        )
+        key = key.replace("language_model.mtp.0.", "model.language_model.layers.2.")
+        key = key.replace(".forget_gate.", ".")
+        raw[key] = value.astype(mx.bfloat16)
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = _tiny_config_dict(with_vision=True)
+    payload.update(text_config=text, eos_token_id=[2])
+    (source / "config.json").write_text(json.dumps(payload))
+    mx.save_safetensors(str(source / "model.safetensors"), raw)
+    tokens = mx.array([[1, 3, 4, 5, 6, 7, 8, 9]], dtype=mx.int32)
+    monkeypatch.setattr("omlx.oq._load_calibration_data", lambda *a, **kw: tokens)
+    monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
+    output = tmp_path / "output"
+    quantize_oq_streaming(
+        str(source),
+        str(output),
+        4,
+        text_only=text_only,
+        preserve_mtp=preserve_mtp,
+        sensitivity_map_override={0: 1, 1: 1},
+        enhanced=True,
+        imatrix_num_samples=1,
+        imatrix_seq_length=8,
+    )
+    loaded = load_model(output, lazy=True, strict=True)
+    params = dict(tree_flatten(loaded.parameters()))
+    assert any(".mtp." in key for key in params) == preserve_mtp
+    assert (loaded.vision_model is None) == text_only
+    assert mx.isfinite(loaded(mx.array([[1, 3, 4]])).logits).all().item()
+    if preserve_mtp:
+        lm = loaded.language_model
+        result = lm(tokens, return_hidden=True)
+        draft = lm.mtp_forward(result.hidden_states[-1], tokens)
+        assert mx.isfinite(draft).all().item()
+
+
 def test_vector_gate_kernel_matches_reference_with_padding_mask():
     from mlx_vlm.models.glm5_next.gated_delta import gated_delta_update
 

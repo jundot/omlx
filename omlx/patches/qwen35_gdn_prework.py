@@ -2,7 +2,7 @@
 #
 # Kernel adapted from mlx-serve (src/transformer.zig, GDN_PREWORK_SOURCE),
 # itself a port of the mlxfast-challenge qwen35_packed_gdn_prework kernel.
-"""Fused GDN prework for Qwen3.5/3.6 MTP verify widths (S in 2..9).
+"""Fused GDN prework for Qwen3.5/3.6 verify and selected decode paths.
 
 The composed target-verify prework in mlx-vlm's ``Qwen3_5GatedDeltaNet`` —
 conv-state concat + depthwise conv1d + SiLU + q/k/v split + reshapes + two
@@ -19,8 +19,11 @@ multiply's rounding — the composed chain's two casts.
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
-Only the target-verify arm routes here; decode (S=1) and prefill keep the
-stock path.
+This kernel also runs automatically for compatible FP16/BF16 B1/T1 decode
+through Qwen3_5GatedDeltaNet on Metal. Gates,
+recurrence, final norm and projections remain unchanged. Other Qwen3.5
+decode shapes and prefill keep the stock path. Qwen4 has its separate
+BF16 decode prework and norm-gate kernels below.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ _KERNEL = None
 _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
+_QWEN35_DECODE_ENGAGED_LOGGED = False
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -468,8 +472,23 @@ def _qwen4_decode_recurrence(q, k, v, g, beta, state):
     return gated_delta_kernel(q, k, v, g, beta, state, None)
 
 
+def configure_qwen4_decode(model, *, wide_projections: bool) -> None:
+    """Capture the decode setting per layer when the model is loaded."""
+    for module in model.modules():
+        if (
+            type(module).__name__ == "Qwen4ExpGatedDeltaNet"
+            and type(module).__module__ == "mlx_vlm.models.qwen4_exp.language"
+        ):
+            module._omlx_qwen4_wide_projections = wide_projections
+
+
+_ALLOWED_BITS = frozenset({2, 3, 4, 5, 6, 8})
+_ALLOWED_GROUPS = frozenset({32, 64, 128})
+_QWEN4_HIDDEN_SIZE = 2560
+
+
 def _qwen4_decode_static_eligible(module) -> bool:
-    """Fail closed unless this is the shipped Qwen4 oQe decode geometry."""
+    """Require the supported Qwen4 geometry and canonical affine storage."""
 
     conv_dim = 2 * 16 * 128 + 48 * 128
     if (
@@ -504,15 +523,19 @@ def _qwen4_decode_static_eligible(module) -> bool:
 
     # The q4 prefill routing reclasses these projections to a QuantizedLinear
     # subclass; the fused decode reads their packed storage, not their forward.
-    def canonical_projection(linear, rows, signatures):
+    def canonical_projection(linear, rows, signatures, in_dim=2560):
         if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
             return False
         signature = (linear.bits, linear.group_size)
-        if signature not in signatures:
+        if signatures is not None and signature not in signatures:
+            return False
+        if signature[0] not in _ALLOWED_BITS or signature[1] not in _ALLOWED_GROUPS:
             return False
         bits, group_size = signature
-        packed_cols = 2560 * bits // 32
-        scale_cols = 2560 // group_size
+        if in_dim % group_size:
+            return False
+        packed_cols = in_dim * bits // 32
+        scale_cols = in_dim // group_size
         return (
             linear.weight.shape == (rows, packed_cols)
             and linear.weight.dtype == mx.uint32
@@ -527,11 +550,15 @@ def _qwen4_decode_static_eligible(module) -> bool:
     # The shipped oQe allocation is intentionally mixed per tensor.  This
     # kernel begins after those projections, so accept only the exact
     # canonical layouts emitted by the converter rather than demanding that
-    # all four happen to share layer 0's q6/g64 allocation.
+    # all four happen to share layer 0's q6/g64 allocation.  ``wide`` lifts the
+    # recipe allow-list only; every shape/dtype/bias check above still applies.
+    wide = getattr(module, "_omlx_qwen4_wide_projections", False)
+    qkv_signatures = None if wide else {(4, 64), (5, 64), (6, 64)}
+    aux_signatures = None if wide else {(5, 128), (6, 64)}
     if not canonical_projection(
         module.in_proj_qkv,
         conv_dim,
-        {(4, 64), (5, 64), (6, 64)},
+        qkv_signatures,
     ):
         return False
     for linear, rows in (
@@ -539,23 +566,20 @@ def _qwen4_decode_static_eligible(module) -> bool:
         (module.in_proj_b, 48),
         (module.in_proj_a, 48),
     ):
-        if not canonical_projection(linear, rows, {(5, 128), (6, 64)}):
+        if not canonical_projection(linear, rows, aux_signatures):
             return False
 
     out = module.out_proj
-    return (
-        isinstance(out, nn.QuantizedLinear)
-        and out.bits == 5
-        and out.group_size == 128
-        and out.mode == "affine"
-        and out.weight.shape == (2560, 960)
-        and out.weight.dtype == mx.uint32
-        and out.scales.shape == (2560, 48)
-        and out.scales.dtype == mx.bfloat16
-        and out.biases is not None
-        and out.biases.shape == (2560, 48)
-        and out.biases.dtype == mx.bfloat16
-        and "bias" not in out
+    # out_proj sits after the fused norm/gate, so its allocation cannot reach
+    # the fused kernels at all; in the opt-in arm only the canonical-layout
+    # checks remain. Its input is the concatenated value stream, not the
+    # residual stream.
+    out_signatures = None if wide else {(5, 128)}
+    return canonical_projection(
+        out,
+        _QWEN4_HIDDEN_SIZE,
+        out_signatures,
+        in_dim=module.num_v_heads * module.head_v_dim,
     )
 
 
@@ -589,6 +613,42 @@ def _qwen4_decode_dynamic_eligible(
         and recurrent_state.shape == (1, 48, 128, 128)
         and recurrent_state.dtype == mx.float32
         and _qwen4_decode_static_eligible(module)
+    )
+
+
+def _qwen35_decode_eligible(module, inputs, mask, cache) -> bool:
+    """Check the fused kernel shape, precision and cache requirements."""
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet
+
+    if (
+        type(module) is not Qwen3_5GatedDeltaNet
+        or module.training
+        or not isinstance(inputs, mx.array)
+        or inputs.shape != (1, 1, module.hidden_size)
+        or inputs.dtype not in (mx.float16, mx.bfloat16)
+        or mx.default_device() != mx.gpu
+        or mask is not None
+        or type(cache) is not ArraysCache
+        or len(cache.cache) != 2
+        or cache.is_speculating
+        or cache.lengths is not None
+        or cache.left_padding is not None
+        or module.head_k_dim != 128
+        or module.head_v_dim != 128
+        or module.conv_kernel_size != 4
+        or module.conv1d.weight.shape != (module.conv_dim, 4, 1)
+        or module.conv1d.weight.dtype != inputs.dtype
+        or getattr(module.conv1d, "bias", None) is not None
+    ):
+        return False
+    return (
+        isinstance(cache[0], mx.array)
+        and cache[0].shape == (1, 3, module.conv_dim)
+        and cache[0].dtype == inputs.dtype
+        and isinstance(cache[1], mx.array)
+        and cache[1].shape == (1, module.num_v_heads, 128, 128)
+        and cache[1].dtype == mx.float32
     )
 
 
@@ -628,8 +688,65 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls = q35.Qwen3_5GatedDeltaNet
     original = cls.__call__
     original_verify = Qwen3_5BatchInvariantForward._gated_delta
+    scales = {
+        dtype: (mx.array(128**-1, dtype=dtype), mx.array(128**-0.5, dtype=dtype))
+        for dtype in (mx.float16, mx.bfloat16)
+    }
 
-    def decode(self, inputs, mask=None, cache=None):
+    def decode(self, inputs, mask=None, cache=None, **kwargs):
+        # Runtime extensions (for example capture/verification keywords)
+        # must keep their original implementation and cache semantics.
+        if kwargs:
+            return original(self, inputs, mask=mask, cache=cache, **kwargs)
+        if _qwen35_decode_eligible(self, inputs, mask, cache):
+            mixed_qkv = self.in_proj_qkv(inputs)
+            # The kernel reads projections, convolution weights and state as one dtype.
+            if mixed_qkv.dtype != inputs.dtype or mixed_qkv.shape != (
+                1,
+                1,
+                self.conv_dim,
+            ):
+                return original(self, inputs, mask=mask, cache=cache)
+            z = self.in_proj_z(inputs).reshape(1, 1, self.num_v_heads, self.head_v_dim)
+            b, a = self._project_gates(inputs)
+            q_scale, k_scale = scales[inputs.dtype]
+            q, k, v, conv_state = gdn_prework_fused(
+                mixed_qkv,
+                cache[0],
+                self.conv1d.weight,
+                q_scale,
+                k_scale,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+            # An ordinary ArraysCache has no speculative history to record.
+            # Compute both next states first, then commit them together;
+            # never retry stock code against a partially advanced cache.
+            out, state = q35.gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state=cache[1],
+                use_kernel=True,
+            )
+            out = self.norm(out, z)
+            result = self.out_proj(out.reshape(1, 1, -1))
+            cache[0], cache[1] = conv_state, state
+            cache.advance(1)
+            q35._qwen3_5_advance_left_padding_info(cache, 1)
+            q35._qwen3_5_advance_lengths_info(cache, 1)
+            global _QWEN35_DECODE_ENGAGED_LOGGED
+            if not _QWEN35_DECODE_ENGAGED_LOGGED:
+                _QWEN35_DECODE_ENGAGED_LOGGED = True
+                logger.info("Qwen B1/T1 fused GDN prework engaged")
+            return result
+
         if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
             return original(self, inputs, mask=mask, cache=cache)
         mixed_qkv, z, b, a = _target_verify_linears(

@@ -1269,10 +1269,6 @@ class ProcessMemoryEnforcer:
             # the distinction to point at the right knob.
             scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
-            # Marks the guard state as trustworthy: until this is set the
-            # sdpa256 route treats _prefill_memory_guard=False as "unknown"
-            # and keeps its memory-safe tiled default (#2283).
-            scheduler._memory_limits_propagated = True
             scheduler._admission_paused = admission_paused
             scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio

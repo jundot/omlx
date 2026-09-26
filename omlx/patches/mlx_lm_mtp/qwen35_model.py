@@ -488,10 +488,11 @@ def _patch_text_model(q35: Any) -> None:
             self.mtp = q35.MTPModule(args)
             # Depth-k chained drafting is available on this model: the qwen
             # patch supports return_hidden mtp_forward + partial rollback.
-            from . import get_mtp_depth
+            from . import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def __call__(
         self,

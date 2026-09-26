@@ -1,3 +1,9 @@
+# Cluster test filesystem isolation
+
+The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
+
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+
 # macOS readability theme tests
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.
@@ -9,6 +15,13 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 # Test timing
 
 CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+
+The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
+fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
+`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
+speculative routes remain intact. See
+[GDN decode prework](experimental/qwen35_fp16_decode.md) for the hardware, geometry
+limits and real-model benchmark requirements.
 
 # First-token burst release
 
@@ -128,6 +141,10 @@ Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/t
 ### Lightning MTP with XTC sampling
 
 Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
+
+### Batched DFlash drafter
+
+Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash_batched or block_drafter"`. `test_dflash_batched.py` builds a tiny DFlash2 drafter with random weights and checks that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, plus the prefill seed window slicing and block-size clamping. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows. Real drafter acceptance and throughput need a Qwen3.5-family VLM checkpoint with its `z-lab` DFlash draft and are measured against the standard batched engine.
 
 # VLM cache boundary tests
 

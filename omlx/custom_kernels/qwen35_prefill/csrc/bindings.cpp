@@ -1,4 +1,5 @@
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -28,6 +29,12 @@ NB_MODULE(_ext, m) {
   m.def(
       "is_nax_available",
       &omlx::qwen35_prefill_kernels::is_nax_available);
+
+  m.def(
+      "set_command_buffer_caps",
+      &omlx::qwen35_prefill_kernels::set_command_buffer_caps,
+      "ops"_a,
+      "mb"_a);
   m.def(
       "nax_qmm_kernels_built",
       &omlx::qwen35_prefill_kernels::nax_qmm_kernels_built);

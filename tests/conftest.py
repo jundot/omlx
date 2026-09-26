@@ -35,6 +35,27 @@ apply_m5_gather_qmm_workaround()
 from omlx.request import Request, SamplingParams
 
 
+@pytest.fixture(autouse=True)
+def cluster_home(tmp_path, monkeypatch):
+    from omlx.cluster import ssh_keys, worker_shim
+
+    home = tmp_path / "cluster-home"
+    publish = worker_shim.ensure_cluster_python_shim
+
+    def publish_shim(**kwargs):
+        if kwargs.get("home") is None:
+            kwargs["home"] = home
+        return publish(**kwargs)
+
+    monkeypatch.setattr(worker_shim, "ensure_cluster_python_shim", publish_shim)
+    # SSH paths are resolved at import time, before test fixtures run.
+    ssh_dir = home / ".ssh"
+    monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
+    monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
+    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
+    return home
+
+
 class MockTokenizer:
     """Mock tokenizer for testing without loading real models."""
 

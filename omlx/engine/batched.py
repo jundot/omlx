@@ -430,17 +430,8 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
-        # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
-        # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
-        # below their context window. The route is memory-aware: it defers to
-        # the faster unfused fallback whenever the scheduler-provided guard
-        # headroom fits its O(L^2) transient (#2204). Installed after
-        # TurboQuant so it is the outer wrapper and only grabs non-quantized
-        # 256 prefill; all other cases (incl. TurboQuant caches, other head
-        # dims, decode, short prefill) fall through to the prior SDPA
-        # unchanged. Passthrough-safe to install unconditionally — the route
-        # is strictly gated. Disable via
-        # model_settings.sdpa256_prefill_enabled = False.
+        # Install after TurboQuant so only non-quantized, long SDPA256 prefills
+        # take the bounded route used by the prefill memory estimator.
         if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
             try:
                 from ..patches.sdpa256_attention import (
@@ -794,6 +785,29 @@ class BatchedEngine(BaseEngine):
                     cancelled = await _close_engine_core(self._engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
+
+        # ANE procedure banks retain native mapped weights and IOSurfaces on
+        # the model modules. Release them after the engine has stopped, but
+        # before dropping the wrapper's model reference, so unload does not
+        # depend on a later GC pass to reclaim the ANE allocation.
+        if self._model is not None:
+            try:
+                from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+                released, programs = release_qwen35_ane_prefill(self._model)
+                if released:
+                    logger.info(
+                        "Released %d ANE prefill module state(s) (%d program(s)) "
+                        "on engine stop",
+                        released,
+                        programs,
+                    )
+            except Exception:
+                # ANE is optional; a release failure must not prevent the
+                # normal wrapper teardown from clearing all other references.
+                logger.warning(
+                    "ANE prefill state release failed during stop", exc_info=True
+                )
         _clear_teardown_references(
             self,
             none_attrs=(

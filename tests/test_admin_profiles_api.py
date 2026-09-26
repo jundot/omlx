@@ -1769,13 +1769,13 @@ class TestSettingsSnapshotRoutes:
     def test_recipe_skips_feature_the_model_cannot_run(self, client):
         c, _ = client
         recipe = settings_recipe.encode_recipe(
-            {"mtp_enabled": True, "mtp_num_draft_tokens": 3, "max_tokens": 64}
+            {"mtp_enabled": True, "mtp_adaptive_max_depth": 3, "max_tokens": 64}
         )
         r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["settings"]["mtp_enabled"] is False
-        assert "mtp_num_draft_tokens" not in body["settings"]
+        assert "mtp_adaptive_max_depth" not in body["settings"]
         assert body["settings"]["max_tokens"] == 64
         assert [s["feature"] for s in body["skipped"]] == ["mtp"]
 

@@ -556,12 +556,16 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
 
     logits = mx.zeros((1, 2, 16))
     hidden = mx.zeros((1, 2, 8))
+    early = mx.ones((1, 2, 8))
     gdn_states = [{"state": "mock"}]
 
     class FakeStockOutput:
-        def __init__(self):
+        def __init__(self, capture_layer_ids):
             self.logits = logits
-            self.hidden_states = [hidden]
+            # Stock capture order is ascending layer index.
+            self.hidden_states = [
+                early if layer == 0 else hidden for layer in capture_layer_ids
+            ]
             self.gdn_states = gdn_states
 
     class FakeLanguageModel:
@@ -580,7 +584,7 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
             **kwargs,
         ):
             self.forward_kwargs = kwargs
-            return FakeStockOutput()
+            return FakeStockOutput(kwargs["capture_layer_ids"])
 
     q35_lang = SimpleNamespace(LanguageModel=FakeLanguageModel)
     qwen35_vlm_runtime._patch_vlm_language_model(q35_lang)
@@ -594,7 +598,6 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
         cache=[],
         return_hidden=True,
         return_shared_kv=True,
-        capture_layer_ids=[99],
     )
 
     assert isinstance(out, LanguageModelOutput)
@@ -604,6 +607,18 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     assert out.gdn_states is gdn_states
     assert out.shared_kv_states == {}
     assert model.forward_kwargs["capture_layer_ids"] == [1]
+
+    # A block drafter's layers ride the same forward: requested order first,
+    # the head's last-layer hidden last.
+    out = model(
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache=[],
+        return_hidden=True,
+        capture_layer_ids=[0],
+    )
+    assert model.forward_kwargs["capture_layer_ids"] == [0, 1]
+    assert out.hidden_states[0] is early
+    assert out.hidden_states[-1] is hidden
 
 
 @pytest.mark.parametrize(

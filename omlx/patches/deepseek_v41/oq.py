@@ -299,10 +299,10 @@ def quantize(
         _emit_progress,
         _get_predicate_bits,
         _lookup_imatrix_importance,
+        _validate_v41_oq_settings,
     )
 
-    if oq_level not in (3, 4) or dtype != "bfloat16" or group_size != 64:
-        raise ValueError("V4.1 supports oQ3/oQ4 BF16 export with group size 64")
+    _validate_v41_oq_settings(oq_level, dtype, group_size)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"

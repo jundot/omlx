@@ -130,7 +130,7 @@ class _PrimeCtx:
     # ordinary prompt priming; a list resumes an already active head.
     deferred_pairs: Optional[List[Any]] = None
     # Request/prefix-cache metadata used to publish and restore one exact
-    # full-block MTP boundary snapshot.  The cache itself remains generic and
+    # MTP boundary snapshot. The cache itself remains generic and
     # treats the snapshot as an opaque sidecar.
     request_id: Optional[str] = None
     prompt_tokens: Optional[tuple[int, ...]] = None
@@ -157,7 +157,7 @@ class _PrimePlan:
 
 @dataclass
 class _MtpPrefixSnapshot:
-    """Detached MTP-head state at a backbone full-block boundary."""
+    """Detached MTP-head state at a backbone cache boundary."""
 
     boundary_tokens: int
     mtp_cache: List[Any]
@@ -674,23 +674,40 @@ def _prepare_prefix_context(
     return True
 
 
+def capture_tail_boundary(model: Any, request_id: str, boundary_tokens: int) -> None:
+    """Retain MTP history at the scheduler's current backbone tail boundary."""
+    ctx = _find_ctx(model)
+    if (
+        not isinstance(ctx, _PrimeCtx)
+        or not ctx.valid
+        or ctx.request_id != request_id
+        or ctx.expected_offset != boundary_tokens
+        or ctx.pending_hidden is None
+    ):
+        return
+    _capture_boundary_candidate(
+        ctx,
+        ctx.pending_hidden,
+        seq_start=boundary_tokens - 1,
+        seq_end=boundary_tokens,
+        boundary=boundary_tokens,
+    )
+
+
 def _capture_boundary_candidate(
     ctx: _PrimeCtx,
     normed: Any,
     *,
     seq_start: int,
     seq_end: int,
+    boundary: Optional[int] = None,
 ) -> None:
-    """Detach the newest full-block MTP boundary crossed by this chunk."""
+    """Detach a retained tail or the newest full-block boundary in this chunk."""
     block = int(ctx.block_size or 0)
-    if (
-        block <= 0
-        or ctx.prefix_cache is None
-        or not ctx.prompt_tokens
-        or seq_end < block
-    ):
+    if block <= 0 or ctx.prefix_cache is None or not ctx.prompt_tokens:
         return
-    boundary = (seq_end // block) * block
+    if boundary is None:
+        boundary = (seq_end // block) * block
     if boundary <= seq_start or boundary > len(ctx.prompt_tokens):
         return
     previous = ctx.snapshot_candidate
@@ -1183,6 +1200,7 @@ __all__ = [
     "priming_enabled",
     "prime_window",
     "prepare_prefix_context",
+    "capture_tail_boundary",
     "suppress_capture",
     "maybe_capture",
     "take_primed",

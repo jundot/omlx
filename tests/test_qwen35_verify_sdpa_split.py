@@ -194,6 +194,32 @@ def test_future_and_left_padding_are_invisible():
     assert mx.array_equal(actual[:, :, :1], expected[:, :, :1]).item()
 
 
+def test_cache_buffer_prefix_matches_contiguous_copy():
+    from omlx.patches.mlx_vlm_mtp.qwen35_verify_attention import _cache_buffers
+
+    mx.random.seed(21)
+    pads = [0, 3, 9]
+    cache = BatchKVCache(pads)
+    keys, values = cache.update_and_fetch(
+        mx.random.normal((3, 2, 70, 128)).astype(mx.float16),
+        mx.random.normal((3, 2, 70, 128)).astype(mx.float16),
+    )
+    q = mx.random.normal((3, 8, 4, 128)).astype(mx.float16)
+    # The fetched K/V are prefix views of the step-grown cache buffers.
+    assert cache.keys.shape[2] > keys.shape[2]
+    assert _cache_buffers(cache, keys, values) is not None
+    actual = verify_attention(q, keys, values, cache=cache, scale=128**-0.5, mask=None)
+    expected = verify_attention(
+        q,
+        mx.array(keys),
+        mx.array(values),
+        cache=BatchKVCache(pads),
+        scale=128**-0.5,
+        mask=None,
+    )
+    assert mx.array_equal(actual, expected).item()
+
+
 @pytest.mark.parametrize(
     "case", ["single", "single_long", "long", "float32", "additive_mask", "cache"]
 )

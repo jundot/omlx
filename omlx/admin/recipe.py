@@ -129,7 +129,11 @@ FEATURE_GROUPS: tuple[FeatureGroup, ...] = (
     FeatureGroup("dflash", "dflash_enabled", prefixes=("dflash_",)),
     FeatureGroup("specprefill", "specprefill_enabled", prefixes=("specprefill_",)),
     FeatureGroup("vlm_mtp", "vlm_mtp_enabled", prefixes=("vlm_mtp_",)),
-    FeatureGroup("mtp", "mtp_enabled", keys=("mtp_enabled", "mtp_num_draft_tokens")),
+    FeatureGroup(
+        "mtp",
+        "mtp_enabled",
+        keys=("mtp_enabled", "mtp_adaptive_max_depth", "mtp_fixed_depth"),
+    ),
     FeatureGroup("turboquant", "turboquant_kv_enabled", prefixes=("turboquant_",)),
     FeatureGroup(
         "ane_prefill", "qwen35_ane_prefill_enabled", prefixes=("qwen35_ane_prefill_",)

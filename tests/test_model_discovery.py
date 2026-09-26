@@ -11,6 +11,7 @@ import pytest
 from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
+    _is_causal_lm_reranker,
     _is_helper_checkpoint,
     _is_hf_cache_mlx_compatible,
     _is_unsupported_model,
@@ -1926,6 +1927,56 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 0
+
+    @pytest.mark.parametrize(
+        "name, model_type, architecture, expected",
+        [
+            ("Qwen3-Embedding-0.6B-4bit-DWQ", "qwen3", "Qwen3ForCausalLM", "embedding"),
+            ("Qwen3-Reranker-0.6B-4bit", "qwen3", "Qwen3ForCausalLM", "reranker"),
+            (
+                "Qwen3-VL-Embedding-2B-4bit",
+                "qwen3_vl",
+                "Qwen3VLForConditionalGeneration",
+                "embedding",
+            ),
+            (
+                "Qwen3-VL-Reranker-2B-4bit",
+                "qwen3_vl",
+                "Qwen3VLForConditionalGeneration",
+                "reranker",
+            ),
+        ],
+    )
+    def test_hf_cache_name_heuristics_use_repo_name(
+        self, tmp_path, name, model_type, architecture, expected
+    ):
+        """Name-based type hints read the repo name, not the snapshot hash."""
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", name)
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": model_type, "architectures": [architecture]})
+        )
+        (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
+
+        assert detect_model_type(snapshot) == expected
+        models = discover_models(tmp_path)
+        assert models[f"mlx-community--{name}"].model_type == expected
+
+    def test_hf_cache_org_name_does_not_trigger_name_heuristics(self, tmp_path):
+        """Only the repo part counts; an org name with 'embed' stays an LLM."""
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "embed-lab", "Qwen3-8B-mlx-4bit")
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]})
+        )
+
+        assert detect_model_type(snapshot) == "llm"
+
+    def test_hf_cache_reranker_load_check_uses_repo_name(self, tmp_path):
+        """The reranker loader's name check accepts an HF cache snapshot path."""
+        _, snapshot = self._make_hf_cache_entry(
+            tmp_path, "mlx-community", "Qwen3-Reranker-0.6B-4bit"
+        )
+
+        assert _is_causal_lm_reranker(snapshot)
 
     @pytest.mark.parametrize("raw", [b"{", b"\xff", b"null", b"[]"])
     def test_k2_detection_preserves_legacy_hf_cache_heuristics(self, tmp_path, raw):

@@ -7,7 +7,7 @@ from functools import wraps
 import mlx.nn as nn
 from mlx_vlm.speculative.ops import linear as verify_linear
 
-from .. import qwen35_verify_qmm
+from .. import qwen35_packed_linear, qwen35_verify_qmm
 
 
 def apply():
@@ -54,3 +54,9 @@ def apply():
     verify_linear._target_verify_quantized_linear = target_verify_quantized
     use_verify_dense._omlx_mtp_batch_linear = True
     verify_linear._use_target_verify_dense = use_verify_dense
+
+    from mlx_vlm.models.qwen3_5.speculative_verifier import (
+        Qwen3_5BatchInvariantForward,
+    )
+
+    qwen35_packed_linear.apply(Qwen3_5BatchInvariantForward)
