@@ -320,6 +320,13 @@ Models are auto-detected by type. You can also download models directly from the
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
 
+Prism Hadamard Qwen3.5 packs, including Ternary Bonsai 2, use mlx-vlm's native
+loader. When a batch shrinks to one unpadded row, oMLX preserves spare
+attention-cache capacity, avoiding a full-prefix copy per token. Ordinary
+standalone requests already retain regular KVCache and are unchanged. Precision,
+weights, batching and capture behavior stay with the upstream implementation. See
+[Prism runtime testing](docs/TESTING.md#prism-runtime-optimizations).
+
 ## CLI Configuration
 
 ```bash

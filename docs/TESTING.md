@@ -168,3 +168,65 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+## Prism runtime optimizations
+
+Run `python -m pytest tests/test_prism_runtime.py tests/test_prism_decode.py
+tests/test_active_models_visibility.py tests/test_model_loading.py
+tests/test_vlm_engine.py tests/test_vlm_cache_boundaries.py`.
+
+The pinned mlx-vlm loader owns schema-2 Prism model loading and processors.
+oMLX applies its runtime changes after native VLM loading; there is no duplicate
+checkpoint loader or copied Hadamard implementation. Tiny native checkpoints
+verify unchanged stored weights, logits, native FP32 precision and isolation
+from other model types, including when the retired FP16 experiment flag is set.
+Decoder tests compare logits and used cache contents with upstream across
+single-row decode, padding, multiple rows, prefill and capture options.
+
+For a real-checkpoint check, serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`
+through the VLM engine with a separate base path and port. Check text, vision,
+reordered image reuse, concurrent requests and at least 192 generated tokens.
+Repeat a prompt longer than the scheduler's 4096-token Prism block floor and
+verify the answer and nonzero prefix reuse. Model precision and the scheduler's
+prefix-cache namespace must remain identical to unchanged main. This patch has
+no activation-conversion option or precision-specific dashboard changes.
+
+For performance measurements, exercise the actual serving transition. oMLX
+already keeps regular `KVCache` for standalone requests; a direct
+`BatchGenerator` with a synthetic one-row cache does not represent that path.
+
+1. Start isolated oMLX servers from main and the candidate, with identical
+   native builds, dependencies, checkpoint, settings and FP32 activations.
+   Leave `OMLX_PRISM_FP16_ACTIVATIONS` unset. Use concurrency two and stock
+   balanced decode bursting, with thinking/speculation and KV quantization off.
+2. Warm a real prompt of roughly 8K tokens through HTTP. Measure a standalone
+   256-token reply as a control. Then start another 256-token reply and submit
+   a 32-token reply after receiving its first content chunk. Both requests use
+   the same messages and deterministic sampling settings.
+3. Observe two-row decoding followed by one unpadded `BatchKVCache`. Reject
+   trials that never batch or whose measured tail still includes multiple rows.
+   Inspect the backing allocation as well as the used prefix: main tightens it
+   every token, whereas the candidate preserves spare capacity. The standalone
+   control must retain regular `KVCache` in both implementations.
+4. Run fresh-process A/B/B/A phases, discarding a warmup for each case and
+   retaining repeated samples. Compare output token IDs, prefix reuse, HTTP
+   first-content/complete latency and a fixed tail window using the engine's
+   producer timestamps. Report memory separately and avoid extrapolating the
+   affected tail to all requests or to cold prefill.
+
+[Recorded HTTP benchmark and exact reproduction harness](https://gist.github.com/samfenwick/476245f50cb037b9eb798acaa146d554)
+compare main `8288884d` and runtime head `3be7a24e` on M1 Max / 64 GB, with four
+retained samples per arm/scenario. The 8,386-token prompt reuses 8,379 tokens.
+After the batch shrinks, the 128-token tail improves from 12.86 to 19.18
+tokens/sec; the complete overlapping reply takes 22.37 versus 16.81 seconds.
+Standalone tail throughput is 18.55 versus 18.51 tokens/sec. All retained output
+token IDs and text match. Peak MLX allocation is 21.06 GiB in both arms, including
+load and warmup; this is not a measured peak-memory reduction or a broad quality
+evaluation. The earlier optional FP16 activation experiment has been removed
+from this PR; this comparison always used native FP32.
+
+The cache ownership behavior originates in mlx-vlm's Qwen3.5 singleton path.
+An upstream dependency fix can replace the scoped runtime patch; these results
+quantify its present serving impact rather than deciding that maintenance
+boundary. The FP32 attention fallback already on main remains covered by
+`tests/test_sdpa256_attention.py`.

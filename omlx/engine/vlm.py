@@ -2045,6 +2045,10 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         **load_kwargs,
                     )
+                    if model_type == "prism_hadamard_qwen35":
+                        from ..patches.prism_hadamard import apply_runtime_patches
+
+                        apply_runtime_patches(loaded[0])
                     return loaded
 
         loop = asyncio.get_running_loop()
