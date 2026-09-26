@@ -580,6 +580,98 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_text_capable_qwen3_5_quant_as_llm(self, tmp_path):
+        """Qwen3.8-27B quant with vision_config + language_model root → llm.
+
+        The text-capable qwen3_5 quants (oQ4e, OptiQ, ...) keep a non-empty
+        vision_config in config.json but place all language weights under a
+        language_model. root that mlx-lm's sanitize() strips.  The vision tower
+        is dropped at load time; only the language backbone is served (#3662).
+        """
+        model_dir = tmp_path / "Qwen3.8-27B-OptiQ-4bit"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"depth": 27, "hidden_size": 1280},
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        index = {
+            "metadata": {"total_size": 20_000_000_000},
+            "weight_map": {
+                "language_model.model.layers.0.self_attn.q_proj.weight": (
+                    "model-00001-of-00002.safetensors"
+                ),
+                "language_model.lm_head.weight": "model-00002-of-00002.safetensors",
+                "vision_tower.blocks.0.attn.proj.weight": (
+                    "model-00001-of-00002.safetensors"
+                ),
+            },
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        assert detect_model_type(model_dir) == "llm"
+
+    def test_detect_unified_vlm_with_index_stays_vlm(self, tmp_path):
+        """Unified VLM with vision_config and index WITHOUT language_model root stays vlm."""
+        model_dir = tmp_path / "Qwen3-VL-2B-Instruct"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3_vl",
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        index = {
+            "weight_map": {
+                "model.layers.0.self_attn.q_proj.weight": "model-00001.safetensors",
+                "vision_model.blocks.0.attn.proj.weight": "model-00001.safetensors",
+            },
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        assert detect_model_type(model_dir) == "vlm"
+
+    def test_detect_qwen3_5_with_vision_config_no_index_as_vlm(self, tmp_path):
+        """qwen3_5 with vision_config but no index → vlm (no weight evidence)."""
+        model_dir = tmp_path / "Qwen3.8-27B-unified"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"depth": 24, "hidden_size": 1152},
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        # No index file — cannot confirm text-capable structure.
+        assert detect_model_type(model_dir) == "vlm"
+
+    def test_detect_qwen3_5_with_vision_and_optiq_sidecar_as_llm(self, tmp_path):
+        """Text-capable quant referencing optiq/ sidecar in index → llm.
+
+        OptiQ-4bit exports reference optiq/optiq_vision.safetensors in the
+        index alongside language_model.* weights — the language_model root is
+        the classifier signal, not the sidecar path.
+        """
+        model_dir = tmp_path / "Qwen3.8-27B-OptiQ-4bit"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"depth": 27, "hidden_size": 1280},
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        index = {
+            "weight_map": {
+                "language_model.model.layers.0.mlp.gate_proj.weight": (
+                    "model-00001.safetensors"
+                ),
+                "language_model.lm_head.weight": "model-00001.safetensors",
+                "vision_tower.blocks.0.attn.proj.weight": (
+                    "optiq/optiq_vision.safetensors"
+                ),
+            },
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        assert detect_model_type(model_dir) == "llm"
+
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
         config = {
