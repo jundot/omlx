@@ -8622,19 +8622,199 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Lines: %lld"
+            "value" : "Lines: %@"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Строк: %lld"
+            "value" : "Строк: %@"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "行数：%lld"
+            "value" : "行数：%@"
+          }
+        }
+      }
+    },
+    "logs.detail.title" : {
+      "comment" : "Title of the card that shows one log record in full",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entry"
+          }
+        }
+      }
+    },
+    "logs.detail.close" : {
+      "comment" : "Button that closes the log record detail card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close"
+          }
+        }
+      }
+    },
+    "logs.detail.lines_more" : {
+      "comment" : "Line under a capped log record body; the placeholder is how many lines are not drawn. The screen's Copy holds the whole log.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…and %@ more lines"
+          }
+        }
+      }
+    },
+    "logs.detail.occurrences" : {
+      "comment" : "Heading above the list of times a repeated log line appeared; the placeholder is how many times",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Occurrences (%@)"
+          }
+        }
+      }
+    },
+    "logs.detail.occurrences_more" : {
+      "comment" : "Line under the occurrence list when the list is capped; the placeholder is how many occurrences are not listed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…and %@ more"
+          }
+        }
+      }
+    },
+    "logs.empty.filtered" : {
+      "comment" : "Empty-state text shown when the level filter hides every log line",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No lines at this level. Lower the level filter to see more."
+          }
+        }
+      }
+    },
+    "logs.empty.partial" : {
+      "comment" : "Empty-state text shown when the fetched log window begins in the middle of a record whose header line is above the window",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This window starts inside a log entry. Refresh to see the newest lines."
+          }
+        }
+      }
+    },
+    "logs.more_lines" : {
+      "comment" : "Button under a log record that reveals its continuation lines; the placeholder is how many lines are hidden",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≡ %@ more lines"
+          }
+        }
+      }
+    },
+    "logs.row.autoscroll.label" : {
+      "comment" : "Row label for the switch that follows the newest log line",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto-scroll"
+          }
+        }
+      }
+    },
+    "logs.row.level.help" : {
+      "comment" : "Tooltip on the log level filter explaining what it does",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hide everything below this level"
+          }
+        }
+      }
+    },
+    "logs.row.level.label" : {
+      "comment" : "Row label for the segmented level filter on the Logs screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Minimum level"
+          }
+        }
+      }
+    },
+    "logs.row.repeat.help" : {
+      "comment" : "Tooltip on the ×N badge of a repeated log line",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This line repeats; open the row to see every occurrence"
+          }
+        }
+      }
+    },
+    "logs.row.view.label" : {
+      "comment" : "Row label for the control that switches the Logs screen between the table and the raw text",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "View"
+          }
+        }
+      }
+    },
+    "logs.view.raw" : {
+      "comment" : "Logs screen view option: the log text as the server sent it",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Raw"
+          }
+        }
+      }
+    },
+    "logs.view.table" : {
+      "comment" : "Logs screen view option: one row per log record",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Table"
           }
         }
       }

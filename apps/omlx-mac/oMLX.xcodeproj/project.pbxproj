@@ -74,6 +74,7 @@
 		8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000005 /* ChatTemplateKwargs.swift */; };
 		8BB000000000000000000006 /* DflashByteSize.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000006 /* DflashByteSize.swift */; };
 		8BB000000000000000000007 /* SystemMetricsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000007 /* SystemMetricsPoller.swift */; };
+		8BB0000000000000000000F7 /* LogRecords.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC0000000000000000000F7 /* LogRecords.swift */; };
 		8BB000000000000000000008 /* ProfileViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000008 /* ProfileViews.swift */; };
 		8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000009 /* ProfileWorkingState.swift */; };
 		8BB00000000000000000000A /* MSTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC00000000000000000000A /* MSTaskDTO.swift */; };
@@ -128,6 +129,8 @@
 		DBB000000000000000000901 /* BenchDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000901 /* BenchDTODecodeTests.swift */; };
 		DBB000000000000000000104 /* ShellEnvWriterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000104 /* ShellEnvWriterTests.swift */; };
 		DBB000000000000000000105 /* ThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000105 /* ThemeTests.swift */; };
+		DBB0000000000000000000F5 /* LogRecordsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC0000000000000000000F5 /* LogRecordsTests.swift */; };
+		DBB0000000000000000000F6 /* LogsDrawingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC0000000000000000000F6 /* LogsDrawingTests.swift */; };
 		DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000106 /* ReleasesCheckerTests.swift */; };
 		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
 		DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000110 /* MenubarControllerModelsTests.swift */; };
@@ -219,6 +222,7 @@
 		8CC000000000000000000005 /* ChatTemplateKwargs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTemplateKwargs.swift; sourceTree = "<group>"; };
 		8CC000000000000000000006 /* DflashByteSize.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DflashByteSize.swift; sourceTree = "<group>"; };
 		8CC000000000000000000007 /* SystemMetricsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsPoller.swift; sourceTree = "<group>"; };
+		8CC0000000000000000000F7 /* LogRecords.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogRecords.swift; sourceTree = "<group>"; };
 		8CC000000000000000000008 /* ProfileViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileViews.swift; sourceTree = "<group>"; };
 		8CC000000000000000000009 /* ProfileWorkingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileWorkingState.swift; sourceTree = "<group>"; };
 		8CC00000000000000000000A /* MSTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MSTaskDTO.swift; sourceTree = "<group>"; };
@@ -274,6 +278,8 @@
 		DCC000000000000000000901 /* BenchDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchDTODecodeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000104 /* ShellEnvWriterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriterTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000105 /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
+		DCC0000000000000000000F5 /* LogRecordsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogRecordsTests.swift; sourceTree = "<group>"; };
+		DCC0000000000000000000F6 /* LogsDrawingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsDrawingTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000106 /* ReleasesCheckerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesCheckerTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000110 /* MenubarControllerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerModelsTests.swift; sourceTree = "<group>"; };
@@ -345,6 +351,8 @@
 				DCC000000000000000000901 /* BenchDTODecodeTests.swift */,
 				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
 				DCC000000000000000000105 /* ThemeTests.swift */,
+				DCC0000000000000000000F5 /* LogRecordsTests.swift */,
+				DCC0000000000000000000F6 /* LogsDrawingTests.swift */,
 				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
 				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
 				DCC000000000000000000110 /* MenubarControllerModelsTests.swift */,
@@ -559,6 +567,7 @@
 				8CC000000000000000000009 /* ProfileWorkingState.swift */,
 				9CC000000000000000000006 /* PresetBundleStore.swift */,
 				8CC000000000000000000007 /* SystemMetricsPoller.swift */,
+				8CC0000000000000000000F7 /* LogRecords.swift */,
 			);
 			path = Utils;
 			sourceTree = "<group>";
@@ -777,6 +786,7 @@
 				8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */,
 				8BB000000000000000000006 /* DflashByteSize.swift in Sources */,
 				8BB000000000000000000007 /* SystemMetricsPoller.swift in Sources */,
+				8BB0000000000000000000F7 /* LogRecords.swift in Sources */,
 				8BB000000000000000000008 /* ProfileViews.swift in Sources */,
 				8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */,
 				9BB000000000000000000001 /* SubKeyDTO.swift in Sources */,
@@ -795,6 +805,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */,
+				DBB0000000000000000000F5 /* LogRecordsTests.swift in Sources */,
+				DBB0000000000000000000F6 /* LogsDrawingTests.swift in Sources */,
 				DBB000000000000000000002 /* AppConfigTests.swift in Sources */,
 				DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */,
 				DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */,
