@@ -281,9 +281,11 @@ class HarborBenchmark:
             "--allow-agent-host", DOCKER_HOST_ALIAS,
             "-y",
         ]
-        if self.dataset_total is None or len(items) < self.dataset_total:
-            for item in items:
-                argv += ["-i", item["id"]]
+        # Always pass the task list: the bundled list is the source of truth
+        # and deliberately excludes upstream tasks (GPU-only) that Harbor
+        # would otherwise schedule on a full run.
+        for item in items:
+            argv += ["-i", item["id"]]
         return argv
 
     async def run(

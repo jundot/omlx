@@ -650,7 +650,7 @@
                 {
                     name: window.t('acc_bench.benchmarks.group_agentic'),
                     benchmarks: [
-                        { key: 'terminalbench_4', label: 'Terminal-Bench 4.0', desc: window.t('acc_bench.benchmarks.terminalbench_4_desc'), fullSize: 66, sizes: [5, 10, 20, 40] },
+                        { key: 'terminalbench_4', label: 'Terminal-Bench 4.0', desc: window.t('acc_bench.benchmarks.terminalbench_4_desc'), fullSize: 63, sizes: [5, 10, 20, 40] },
                         { key: 'swebench_verified', label: 'SWE-bench Verified', desc: window.t('acc_bench.benchmarks.swebench_verified_desc'), fullSize: 500, sizes: [10, 25, 50, 100, 200] },
                     ],
                 },

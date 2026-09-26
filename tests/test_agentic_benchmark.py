@@ -142,6 +142,18 @@ async def test_host_python_env_does_not_leak_into_harbor(suite, monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_full_run_schedules_only_bundled_tasks(suite, monkeypatch):
+    # The bundled list excludes upstream GPU-only tasks, so even a full run
+    # must name every task instead of letting Harbor run the whole dataset.
+    monkeypatch.setenv("FAKE_HARBOR_MODE", "ok")
+    suite.dataset_total = len(ITEMS)
+
+    result = await suite.run(None, ITEMS)
+
+    assert [q.predicted for q in result.question_results][:2] == ["pass", "fail"]
+
+
+@pytest.mark.asyncio
 async def test_harbor_failure_without_trials_raises(suite, monkeypatch):
     monkeypatch.setenv("FAKE_HARBOR_MODE", "fail")
     with pytest.raises(RuntimeError, match="Harbor exited with code 2.*boom"):

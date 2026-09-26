@@ -41,20 +41,39 @@ def _category(name: str, config: dict, source: str) -> str | None:
     return category if isinstance(category, str) and category else None
 
 
+def _requires_gpu(config: dict) -> bool:
+    """Tasks needing a GPU (e.g. H100) cannot run on macOS Docker at all.
+
+    Harbor rejects them at job setup, failing the whole job rather than the
+    trial, so they are excluded from the bundled list.
+    """
+    envs = (
+        config.get("environment", {}),
+        config.get("verifier", {}).get("environment", {}),
+    )
+    return any((env.get("gpus") or 0) > 0 for env in envs)
+
+
 def build(dataset: str, output: str, source: str) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(
             [*HARBOR, "datasets", "download", dataset, "-o", tmp], check=True
         )
         records = []
+        skipped = []
         for toml_path in Path(tmp).rglob("task.toml"):
             config = tomllib.loads(toml_path.read_text(encoding="utf-8"))
             name = _task_name(toml_path.parent, config)
+            if _requires_gpu(config):
+                skipped.append(name)
+                continue
             record = {"id": name}
             category = _category(name, config, source)
             if category:
                 record["category"] = category
             records.append(record)
+    if skipped:
+        print(f"{dataset}: excluded {len(skipped)} GPU-only task(s): {sorted(skipped)}")
     records.sort(key=lambda r: r["id"])
     path = OUTPUT_DIR / output
     path.write_text(
