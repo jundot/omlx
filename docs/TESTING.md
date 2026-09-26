@@ -140,6 +140,8 @@ Run `python -m pytest -q tests/test_agentic_benchmark.py`. A fake `harbor` scrip
 
 For a real run, start a container engine (Docker Desktop, OrbStack, Colima, or `podman machine start`) with enough disk for task images (40 GB+; SWE-bench's full set needs about 120 GB), make `uvx` available, and queue Terminal-Bench 4.0 or SWE-bench Verified from Bench → Intelligence. Harbor job directories, including each trial's `agent/` logs and `result.json`, are written under `~/.omlx/bench/harbor_jobs/`. The bundled task lists are regenerated with `python scripts/build_agentic_task_lists.py`.
 
+The live transcript viewer ("Agent transcripts" under the progress bar and on each agentic result card) is covered by `python -m pytest -q tests/test_agent_logs.py`: `pi.txt` line reduction, incremental tailing of partial lines, trial status changes, the SSE route's validation and replay, and (through Node.js) the dashboard's diff and stream-state helpers in `tests/agent_logs_ui.test.cjs`.
+
 # Profile API exposure tests
 
 Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/test_admin_profiles_api.py tests/test_model_settings_profiles.py`. The new-profile tests check toggle bindings, the OFF reset, and request serialization. Existing API tests cover the edit form, persistence, exposed model IDs, and name collisions.

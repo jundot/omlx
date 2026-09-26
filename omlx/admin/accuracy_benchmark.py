@@ -58,6 +58,15 @@ _engine_pool_ref: Any = None
 # rips the engine out from under the active run.
 _chain_id: int = 0
 
+# Harbor job names whose agents are still running; the transcript stream
+# ends once its job leaves this set.
+_active_agent_jobs: set[str] = set()
+
+
+def is_agent_job_active(job_name: str) -> bool:
+    return job_name in _active_agent_jobs
+
+
 VALID_BENCHMARKS = [
     "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
     "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
@@ -576,8 +585,11 @@ async def run_accuracy_benchmark(
 
             # Run evaluation with progress
             total_items = len(items)
+            agent_job = {"job_name": evaluator.job_name} if is_agentic else {}
 
-            async def on_progress(current: int, total: int) -> None:
+            async def on_progress(
+                current: int, total: int, agent_job: dict = agent_job
+            ) -> None:
                 if run.status == "cancelled":
                     raise asyncio.CancelledError()
                 await _send_event(run, {
@@ -590,6 +602,7 @@ async def run_accuracy_benchmark(
                     "total": len(request.benchmarks),
                     "bench_current": current,
                     "bench_total": total,
+                    **agent_job,
                 })
 
             await _send_event(run, {
@@ -602,8 +615,11 @@ async def run_accuracy_benchmark(
                 "total": len(request.benchmarks),
                 "bench_current": 0,
                 "bench_total": total_items,
+                **agent_job,
             })
 
+            if is_agentic:
+                _active_agent_jobs.add(evaluator.job_name)
             try:
                 result = await evaluator.run(
                     engine, items, on_progress,
@@ -627,6 +643,9 @@ async def run_accuracy_benchmark(
                 run.status = "error"
                 run.error_message = str(e)
                 return
+            finally:
+                if is_agentic:
+                    _active_agent_jobs.discard(evaluator.job_name)
 
             question_results = []
             for qr in result.question_results:
@@ -680,6 +699,7 @@ async def run_accuracy_benchmark(
                     "harness": f"harbor {HARBOR_VERSION}",
                     "agent": HARBOR_AGENT,
                     "job_dir": str(evaluator.job_dir),
+                    "job_name": evaluator.job_name,
                 })
             if request.external is not None and not is_agentic:
                 status_counts = Counter(

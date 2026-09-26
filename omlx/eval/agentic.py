@@ -182,6 +182,17 @@ def _load_trials(job_root: Path) -> dict[str, tuple[Path, dict]]:
     return trials
 
 
+def trial_outcome(data: dict) -> str:
+    """Classify a finished Harbor trial result as ``pass``, ``fail`` or ``error``."""
+    rewards = (data.get("verifier_result") or {}).get("rewards") or {}
+    reward = rewards.get("reward")
+    if reward is None and len(rewards) == 1:
+        reward = next(iter(rewards.values()))
+    if reward is not None:
+        return "pass" if float(reward) >= 1.0 else "fail"
+    return "error" if data.get("exception_info") else "fail"
+
+
 def _question_result(item: dict, trial: Optional[tuple[Path, dict]]) -> QuestionResult:
     task_id = item["id"]
     category = item.get("category")
@@ -191,20 +202,13 @@ def _question_result(item: dict, trial: Optional[tuple[Path, dict]]) -> Question
             predicted="not_run", time_seconds=0.0, category=category,
         )
     trial_dir, data = trial
-    rewards = (data.get("verifier_result") or {}).get("rewards") or {}
-    reward = rewards.get("reward")
-    if reward is None and len(rewards) == 1:
-        reward = next(iter(rewards.values()))
-    correct = reward is not None and float(reward) >= 1.0
+    outcome = trial_outcome(data)
+    correct = outcome == "pass"
     exc = data.get("exception_info") or {}
-    if correct:
-        predicted = "pass"
-    elif reward is not None:
-        predicted = "fail"
-    elif exc:
+    if outcome == "error":
         predicted = f"error: {exc.get('exception_type', 'Exception')}"
     else:
-        predicted = "fail"
+        predicted = outcome
     started = _parse_time(data.get("started_at"))
     finished = _parse_time(data.get("finished_at"))
     elapsed = (finished - started).total_seconds() if started and finished else 0.0

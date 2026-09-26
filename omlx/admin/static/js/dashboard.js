@@ -664,6 +664,8 @@
             ],
             accBatchSize: 1,
             accAgentTimeoutMultiplier: 1,
+            // Agentic transcript viewer state, keyed by Harbor job name.
+            agentLogs: {},
             accEnableThinking: false,
             accSamplingProfile: 'deterministic',
             accAdvancedOptionsOpen: false,
@@ -5330,6 +5332,163 @@
                     this.accEventSource.close();
                     this.accEventSource = null;
                 }
+            },
+
+            _agentLogEntry(jobName) {
+                if (!this.agentLogs[jobName]) {
+                    this.agentLogs[jobName] = {
+                        open: false, trials: {}, order: [], active: null,
+                        userPicked: false, es: null, ended: false,
+                    };
+                }
+                return this.agentLogs[jobName];
+            },
+
+            toggleAgentLogs(jobName) {
+                const entry = this._agentLogEntry(jobName);
+                entry.open = !entry.open;
+                if (!entry.open) {
+                    if (entry.es) {
+                        entry.es.close();
+                        entry.es = null;
+                    }
+                    return;
+                }
+                if (entry.es || entry.ended) return;
+                const es = new EventSource(`/admin/api/bench/accuracy/agent-logs/${encodeURIComponent(jobName)}/stream`);
+                entry.es = es;
+                es.onmessage = (event) => {
+                    try {
+                        this._applyAgentLogPayload(jobName, JSON.parse(event.data));
+                    } catch (err) {
+                        console.error('Agent log parse error:', err);
+                    }
+                };
+            },
+
+            _applyAgentLogPayload(jobName, data) {
+                const entry = this._agentLogEntry(jobName);
+                switch (data.type) {
+                    case 'reset':
+                        entry.trials = {};
+                        entry.order = [];
+                        entry.ended = false;
+                        if (!entry.userPicked) entry.active = null;
+                        break;
+                    case 'trial': {
+                        const known = entry.trials[data.trial];
+                        if (known) {
+                            known.status = data.status;
+                        } else {
+                            entry.trials[data.trial] = { task: data.task, status: data.status, events: [], trimmed: 0 };
+                            entry.order.push(data.trial);
+                        }
+                        if (!entry.userPicked && (entry.active === null || (data.status === 'running' && !known))) {
+                            entry.active = data.trial;
+                        }
+                        break;
+                    }
+                    case 'events': {
+                        const trial = entry.trials[data.trial];
+                        if (!trial) break;
+                        trial.events.push(...data.events);
+                        const excess = trial.events.length - 2000;
+                        if (excess > 0) {
+                            trial.events.splice(0, excess);
+                            trial.trimmed += excess;
+                        }
+                        break;
+                    }
+                    case 'end':
+                        entry.ended = true;
+                        if (entry.es) {
+                            entry.es.close();
+                            entry.es = null;
+                        }
+                        break;
+                }
+            },
+
+            agentLogCounts(jobName) {
+                const entry = this.agentLogs[jobName];
+                if (!entry) return '';
+                const running = entry.order.filter(t => entry.trials[t].status === 'running').length;
+                return window.t('acc_bench.agent_logs.counts')
+                    .replace('{running}', running)
+                    .replace('{done}', entry.order.length - running);
+            },
+
+            agentTrialStatusClass(status) {
+                return {
+                    running: 'bg-sky-400 animate-pulse',
+                    pass: 'bg-green-400',
+                    fail: 'bg-red-400',
+                    error: 'bg-amber-300',
+                }[status] || 'bg-neutral-400';
+            },
+
+            // Line-level LCS diff; falls back to delete-all/add-all for huge inputs.
+            agentLogDiff(oldText, newText) {
+                const a = String(oldText ?? '').split('\n');
+                const b = String(newText ?? '').split('\n');
+                if (a.length * b.length > 1_000_000) {
+                    return [
+                        ...a.map(text => ({ op: '-', text })),
+                        ...b.map(text => ({ op: '+', text })),
+                    ];
+                }
+                const n = a.length, m = b.length;
+                const lcs = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+                for (let i = n - 1; i >= 0; i--) {
+                    for (let j = m - 1; j >= 0; j--) {
+                        lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+                    }
+                }
+                const rows = [];
+                let i = 0, j = 0;
+                while (i < n && j < m) {
+                    if (a[i] === b[j]) {
+                        rows.push({ op: ' ', text: a[i] }); i++; j++;
+                    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+                        rows.push({ op: '-', text: a[i++] });
+                    } else {
+                        rows.push({ op: '+', text: b[j++] });
+                    }
+                }
+                while (i < n) rows.push({ op: '-', text: a[i++] });
+                while (j < m) rows.push({ op: '+', text: b[j++] });
+                return rows;
+            },
+
+            agentToolCallBody(ev) {
+                const args = ev.args || {};
+                if (ev.name === 'bash' && typeof args.command === 'string') {
+                    return { kind: 'bash', lines: [`$ ${args.command}`] };
+                }
+                if (ev.name === 'edit') {
+                    // pi accepts both {edits: [{oldText, newText}]} and a flat {oldText, newText}.
+                    const edits = Array.isArray(args.edits) ? args.edits : [args];
+                    const lines = [];
+                    edits.forEach((e, idx) => {
+                        if (edits.length > 1) lines.push({ op: '@', text: `@@ edit ${idx + 1}/${edits.length}` });
+                        lines.push(...this.agentLogDiff(e.oldText, e.newText));
+                    });
+                    return { kind: 'diff', path: args.path || '', lines };
+                }
+                if (ev.name === 'write' && typeof args.content === 'string') {
+                    const all = args.content.split('\n');
+                    const lines = all.slice(0, 300).map(text => ({ op: '+', text }));
+                    if (all.length > 300) {
+                        lines.push({ op: '@', text: window.t('acc_bench.agent_logs.more_lines').replace('{count}', all.length - 300) });
+                    }
+                    return { kind: 'diff', path: args.path || '', lines };
+                }
+                return { kind: 'plain', lines: JSON.stringify(args, null, 2).split('\n') };
+            },
+
+            agentResultLines(ev) {
+                const lines = String(ev.text || '').replace(/\n$/, '').split('\n');
+                return ev.expanded || lines.length <= 40 ? lines : lines.slice(0, 40);
             },
 
             async resetAccResults() {

@@ -317,6 +317,9 @@
                                 <span class="text-xs text-neutral-300">·</span>
                                 <span class="text-xs text-neutral-400" x-text="(accProgress?.current || 0) + ' / ' + (accProgress?.total || 0) + ' benchmarks'"></span>
                             </div>
+                            <template x-for="jobName in (accProgress?.job_name ? [accProgress.job_name] : [])" :key="jobName">
+                                <div>{% include "dashboard/_agent_logs.html" %}</div>
+                            </template>
                         </div>
                     </div>
 
@@ -481,6 +484,11 @@
                                         </div>
                                     </div>
                                 </div>
+
+                                <!-- Agent transcripts (agentic suites) -->
+                                <template x-for="jobName in (r.job_name ? [r.job_name] : [])" :key="jobName">
+                                    <div>{% include "dashboard/_agent_logs.html" %}</div>
+                                </template>
 
                                 <!-- Category breakdown table -->
                                 <div x-show="r._showCategories && r.category_scores && Object.keys(r.category_scores).length > 0" x-transition class="mt-2">
