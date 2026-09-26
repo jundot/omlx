@@ -1070,3 +1070,65 @@ class TestUndoLookahead:
         assert cache[0].caches[1] is window
         assert restored[0].tolist() == [[3.0, 3.0, 3.0]]
         assert window._idx == before[1][1]["_idx"]
+
+
+class TestPrefillOomRestoresRope:
+    """The OOM retry path must remove the RoPE wrapper, not just forget it.
+
+    `sparse_prefill` installs `_OffsetAdjustedRoPE` on the shared model and only
+    `cleanup_rope` removes it. Clearing `_specprefill_active_request_id` on its
+    own leaves the wrapper installed *and* stops `_cleanup_specprefill` from
+    ever running, so the retry — and every later request on that engine —
+    decodes through the failed request's position offset.
+    """
+
+    def _scheduler(self):
+        from unittest.mock import MagicMock
+
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        model = MagicMock()
+        model.layers = []
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        return Scheduler(model=model, tokenizer=tokenizer, config=SchedulerConfig())
+
+    def test_a_retried_oom_calls_cleanup_rope(self):
+        from unittest.mock import MagicMock, patch
+
+        scheduler = self._scheduler()
+        request = MagicMock()
+        request.request_id = "r1"
+        request.prefill_oom_retries = 0
+        request._prefill_saved_rope_deltas = None
+        scheduler._specprefill_active_request_id = "r1"
+
+        with patch("omlx.patches.specprefill.cleanup_rope") as cleanup, patch.object(
+            scheduler, "_reclaim_prefill_headroom"
+        ):
+            scheduler._requeue_or_fail_prefill(
+                request, RuntimeError("Memory limit exceeded")
+            )
+
+        cleanup.assert_called_once_with(scheduler.model)
+        assert scheduler._specprefill_active_request_id is None
+
+    def test_another_request_s_patch_is_left_alone(self):
+        from unittest.mock import MagicMock, patch
+
+        scheduler = self._scheduler()
+        request = MagicMock()
+        request.request_id = "r1"
+        request.prefill_oom_retries = 0
+        request._prefill_saved_rope_deltas = None
+        scheduler._specprefill_active_request_id = "other"
+
+        with patch("omlx.patches.specprefill.cleanup_rope") as cleanup, patch.object(
+            scheduler, "_reclaim_prefill_headroom"
+        ):
+            scheduler._requeue_or_fail_prefill(
+                request, RuntimeError("Memory limit exceeded")
+            )
+
+        cleanup.assert_not_called()
+        assert scheduler._specprefill_active_request_id == "other"

@@ -12864,9 +12864,12 @@ class Scheduler:
         # Reclaim before requeue so the retry starts from a lower baseline.
         self._reclaim_prefill_headroom()
 
-        # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
+        # Remove this request's SpecPrefill RoPE wrapper, not just its id: once
+        # the id is clear nothing else uninstalls it from the shared model.
         if self._specprefill_active_request_id == request.request_id:
+            from .patches.specprefill import cleanup_rope
+
+            cleanup_rope(self.model)
             self._specprefill_active_request_id = None
 
         # Restore mRoPE deltas if an external VLM prefill was interrupted before
