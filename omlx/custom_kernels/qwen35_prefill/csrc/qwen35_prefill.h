@@ -141,4 +141,20 @@ mx::array qwen35_moe_weighted_sum(
     const mx::array& scores,
     mx::StreamOrDevice s = {});
 
+// True when the NAX sorted-expert gather kernel loaded on this machine.
+bool qwen35_gather_qmm_rhs_nax_ready();
+
+// Sorted-expert quantized gather matmul: y[r] = x[r] @ w[indices[r]].T for
+// row-contiguous x[..., K] whose rows match expert-sorted uint32 indices.
+// One dispatch for any row count (MLX 0.32.2's kernel overflows past 32767).
+mx::array qwen35_gather_qmm_rhs_t(
+    const mx::array& x,
+    const mx::array& weight,
+    const mx::array& scales,
+    const mx::array& biases,
+    const mx::array& indices,
+    int bits,
+    int group_size,
+    mx::StreamOrDevice s = {});
+
 } // namespace omlx::qwen35_prefill_kernels

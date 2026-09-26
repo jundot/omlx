@@ -141,6 +141,7 @@ if(MLX_BUILD_METAL)
     endif()
     set(OMLX_QWEN35_PREFILL_NAX_SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm_nax.metal
+        ${CMAKE_CURRENT_LIST_DIR}/qwen35_moe_gather_nax.metal
         ${CMAKE_CURRENT_LIST_DIR}/qwen35_oq_a8_nax.metal)
     set(OMLX_QWEN35_PREFILL_NAX_AIR)
     foreach(NAX_SRCFILE IN LISTS OMLX_QWEN35_PREFILL_NAX_SOURCES)

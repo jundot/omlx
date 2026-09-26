@@ -29,22 +29,25 @@ fall back to dropping it. The two defects get different treatment:
   ``K % 64 == 0`` before entering NAX and falls back to the verified
   steel kernels, at some prefill-throughput cost for the affected
   shapes only.
-- Row overflow keeps the flag and splits the call instead. The rhs
-  kernel is only wrong because a *single* call exceeds 32768 rows, so
-  an oversized call is issued as balanced ``<= 32768``-row slices of
-  the (already sorted) activations and indices and the partial outputs
-  are concatenated. Each slice stays on the NAX rhs kernel, which is
-  what makes wide prefill chunks (4096+ tokens on a top-8/top-10 MoE)
-  keep their tensor-unit throughput instead of dropping to the
-  per-row gather kernel. Slices are balanced rather than cut at the
-  cap so every slice still clears mlx's ``rows / experts >= 4`` gate
-  for the batched rhs path.
+- Row overflow first goes to oMLX's native NAX gather kernel
+  (``custom_kernels/qwen35_prefill``), a copy of the mlx rhs kernel with
+  the row bound clamped before it narrows to int16. One dispatch covers
+  every row, and each output row is bit-identical to the sliced result.
+  Without the native extension, or for layouts it does not cover, the
+  call keeps the flag and is split instead: balanced ``<= 32768``-row
+  slices of the (already sorted) activations and indices whose partial
+  outputs are concatenated. Each slice stays on the NAX rhs kernel, which
+  keeps wide prefill chunks (4096+ tokens on a top-8/top-10 MoE) on the
+  tensor units instead of the per-row gather kernel. Slices are balanced
+  rather than cut at the cap so every slice still clears mlx's
+  ``rows / experts >= 4`` gate for the batched rhs path.
 
 The wrapper self-arms: the first matching call runs a tiny canary
 against an fp32 dequantized reference and only intervenes when the
 corruption is actually present on this machine/mlx build. Healthy
 setups keep the fast path untouched, and the patch retires itself once
-mlx ships a kernel fix. Kill switch: ``OMLX_M5_GATHER_QMM_FIX=0``.
+mlx ships a kernel fix. Kill switch: ``OMLX_M5_GATHER_QMM_FIX=0``; the
+native kernel alone can be disabled with ``OMLX_M5_GATHER_QMM_NATIVE=0``.
 """
 
 from __future__ import annotations
@@ -61,6 +64,8 @@ _MAX_SORTED_ROWS = 32768
 
 _original_gather_qmm = None
 _defective: bool | None = None
+# Native NAX gather op, resolved on first oversized call (False: unavailable).
+_native_gather = None
 
 
 def _sorted_gather_qmm_defective() -> bool:
@@ -159,10 +164,74 @@ def _segmented_sorted_gather_qmm(x, w, args, kwargs):
     return mx.concatenate(outputs, axis=0)
 
 
+def _resolve_native_gather():
+    """The native NAX gather op, or None when this build/machine lacks it."""
+    global _native_gather
+    if _native_gather is None:
+        _native_gather = False
+        if os.environ.get("OMLX_M5_GATHER_QMM_NATIVE", "1") != "0":
+            try:
+                from ..custom_kernels.qwen35_prefill import fast
+
+                if fast.gather_qmm_rhs_available():
+                    _native_gather = fast.qwen35_gather_qmm_rhs_t
+            except Exception:
+                logger.debug("native NAX gather_qmm unavailable", exc_info=True)
+    return _native_gather or None
+
+
+def _native_sorted_gather_qmm(x, w, args, kwargs):
+    """Issue an oversized sorted rhs call as one native NAX dispatch.
+
+    Covers the MoE sorted-prefill layout with affine weights; returns None
+    for anything else so the caller can slice instead.
+    """
+    native = _resolve_native_gather()
+    if native is None:
+        return None
+
+    def arg(position, name, default=None):
+        return args[position] if len(args) > position else kwargs.get(name, default)
+
+    scales = arg(0, "scales")
+    biases = arg(1, "biases")
+    rhs = _rhs_indices(args, kwargs)
+    group_size = arg(5, "group_size")
+    bits = arg(6, "bits")
+    if (
+        arg(7, "mode", "affine") != "affine"
+        or scales is None
+        or biases is None
+        or group_size is None
+        or bits is None
+        or kwargs.get("stream") is not None
+        or x.ndim != 3
+        or x.shape[1] != 1
+        or rhs.ndim != 1
+        or rhs.shape[0] != x.shape[0]
+    ):
+        return None
+    try:
+        return native(
+            mx.contiguous(x),
+            w,
+            scales,
+            biases,
+            mx.contiguous(rhs.astype(mx.uint32)),
+            int(bits),
+            int(group_size),
+        )
+    except ValueError:
+        # Layout outside the native kernel's validated envelope.
+        return None
+
+
 def _gather_qmm_rerouted(x, w, *args, **kwargs):
     if _needs_reroute(x, args, kwargs) and _sorted_gather_qmm_defective():
         if x.shape[-1] % 64 == 0:
-            out = _segmented_sorted_gather_qmm(x, w, args, kwargs)
+            out = _native_sorted_gather_qmm(x, w, args, kwargs)
+            if out is None:
+                out = _segmented_sorted_gather_qmm(x, w, args, kwargs)
             if out is not None:
                 return out
         kwargs = dict(kwargs, sorted_indices=False)
