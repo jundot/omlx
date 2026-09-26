@@ -139,7 +139,6 @@ from .api.rerank_models import (
 )
 from .api.responses_models import (
     OutputItem,
-    ResponseObject,
     ResponsesRequest,
 )
 from .api.responses_utils import (
@@ -150,6 +149,7 @@ from .api.responses_utils import (
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
+    build_response_object,
     build_response_store_record,
     build_response_usage,
     convert_responses_input_to_messages,
@@ -158,6 +158,7 @@ from .api.responses_utils import (
     normalize_response_output_to_messages,
     split_namespace_tool_name,
 )
+from .api.shared_models import IDPrefix, generate_id, get_unix_timestamp
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallExtraction,
@@ -7378,28 +7379,29 @@ async def create_response(
             # incomplete turn from a natural stop. The Responses API has no
             # finish_reason field; status + incomplete_details is the signal.
             truncated = getattr(output, "finish_reason", None) == "length"
-            response_obj = ResponseObject(
-                model=request.model,
-                status="incomplete" if truncated else "completed",
-                output=output_items,
+            store_response = _should_store_response(request.store)
+            response_obj = build_response_object(
+                request,
+                response_id=generate_id(IDPrefix.RESPONSE),
+                created_at=get_unix_timestamp(),
+                output_items=output_items,
                 usage=usage,
-                tools=request.tools or [],
-                tool_choice=request.tool_choice or "auto",
+                truncated=truncated,
                 temperature=temperature,
                 top_p=top_p,
-                max_output_tokens=request.max_output_tokens,
-                previous_response_id=request.previous_response_id,
-                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
+                store=store_response,
             )
 
             # Store response
-            if _should_store_response(request.store):
+            if store_response:
                 _store_response_state(
-                    response_obj.model_dump(exclude_none=True),
+                    response_obj.model_dump(exclude_none=True, by_alias=True),
                     input_messages=current_input_messages,
                 )
 
-            return response_obj.model_dump_json()
+            # by_alias: `TextFormatConfig.schema_` is spelled `schema` on the
+            # wire, and it is the only aliased field in the envelope.
+            return response_obj.model_dump_json(by_alias=True)
 
         json_headers = (
             {"Warning": response_format_warning} if response_format_warning else None
@@ -7427,7 +7429,6 @@ async def stream_responses_api(
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
-    from .api.shared_models import IDPrefix, generate_id
 
     start_time = time.perf_counter()
     first_token_time = None
@@ -7465,20 +7466,26 @@ async def stream_responses_api(
     reasoning_output_index: Optional[int] = None  # captured when reasoning opens
     msg_output_index: Optional[int] = None  # captured when message opens
 
-    # Build initial response object (in_progress, empty output)
-    initial_response = ResponseObject(
-        id=response_id,
-        model=request.model,
+    # Build the opening snapshot from the same envelope builder as the terminal
+    # event, so response.created / response.in_progress echo every request field
+    # the terminal event does. temperature and top_p come from kwargs, which
+    # carry the values resolved by get_sampling_params (defaults filled in), not
+    # request.temperature / request.top_p: the non-streaming body echoes the
+    # resolved values, so the streaming envelope must too or the two disagree
+    # whenever the client omitted a field.
+    initial_response = build_response_object(
+        request,
+        response_id=response_id,
+        created_at=get_unix_timestamp(),
+        output_items=[],
+        usage=None,
+        truncated=False,
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
+        store=store_response,
         status="in_progress",
-        output=[],
-        tools=request.tools or [],
-        tool_choice=request.tool_choice or "auto",
-        temperature=request.temperature,
-        top_p=request.top_p,
-        max_output_tokens=request.max_output_tokens,
-        previous_response_id=request.previous_response_id,
     )
-    initial_data = initial_response.model_dump(exclude_none=True)
+    initial_data = initial_response.model_dump(exclude_none=True, by_alias=True)
 
     # 1. response.created
     seq += 1
@@ -8149,28 +8156,18 @@ async def stream_responses_api(
     # 13. Emit the terminal event matching the final response status.
     truncated = getattr(last_output, "finish_reason", None) == "length"
     terminal_event = "response.incomplete" if truncated else "response.completed"
-    final_response = {
-        "id": response_id,
-        "object": "response",
-        "created_at": initial_response.created_at,
-        "model": request.model,
-        "status": "incomplete" if truncated else "completed",
-        "output": output_items,
-        "usage": usage_data,
-        "tool_choice": request.tool_choice or "auto",
-        "tools": (
-            [t.model_dump(exclude_none=True) for t in request.tools]
-            if request.tools
-            else []
-        ),
-        "temperature": request.temperature,
-        "top_p": request.top_p,
-        "max_output_tokens": request.max_output_tokens,
-    }
-    if truncated:
-        final_response["incomplete_details"] = {"reason": "max_output_tokens"}
-    if request.previous_response_id:
-        final_response["previous_response_id"] = request.previous_response_id
+    final_response = build_response_object(
+        request,
+        response_id=response_id,
+        created_at=initial_response.created_at,
+        output_items=output_items,
+        usage=usage_data,
+        truncated=truncated,
+        # Resolved sampling values, matching the non-streaming body.
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
+        store=store_response,
+    ).model_dump(exclude_none=True, by_alias=True)
 
     seq += 1
     yield format_sse_event(
