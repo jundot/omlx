@@ -665,6 +665,20 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Resume the persisted download queues last: settings, model dirs, and
+    # the completion callback are all wired by now, and queueing a resume
+    # does no network I/O. Startup must never block on a broken queue file.
+    if _server_state.hf_downloader is not None:
+        try:
+            await _server_state.hf_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("HF download queue restore failed: %s", exc)
+    if _server_state.ms_downloader is not None:
+        try:
+            await _server_state.ms_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("MS download queue restore failed: %s", exc)
+
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
@@ -2347,6 +2361,15 @@ def init_server(
     # Initialize HuggingFace downloader
     from .admin.hf_downloader import HFDownloader
     from .admin.routes import set_hf_downloader
+    from .settings import resolve_default_base_path
+
+    # Both download queues persist beside settings.json so a restart can
+    # resume interrupted downloads instead of dropping the queue.
+    tasks_base = (
+        Path(global_settings.base_path)
+        if global_settings is not None
+        else resolve_default_base_path()
+    )
 
     async def _refresh_models_after_download():
         """Re-discover models when a HuggingFace download completes."""
@@ -2361,6 +2384,7 @@ def init_server(
     _server_state.hf_downloader = HFDownloader(
         model_dir=dir_list[0],  # Downloads go to primary directory
         on_complete=_refresh_models_after_download,
+        tasks_file=tasks_base / "hf_download_tasks.json",
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
@@ -2375,6 +2399,7 @@ def init_server(
             _server_state.ms_downloader = MSDownloader(
                 model_dir=dir_list[0],
                 on_complete=_refresh_models_after_download,
+                tasks_file=tasks_base / "ms_download_tasks.json",
             )
             set_ms_downloader(_server_state.ms_downloader)
             logger.info("ModelScope Downloader initialized")

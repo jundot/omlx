@@ -181,4 +181,54 @@ final class DTOFixtureTests: XCTestCase {
         // server-side rename of `templates` → `items` would fail loudly.
         XCTAssertNotNil(resp.templates)
     }
+
+    // MARK: - Download tasks (live transfer speed)
+
+    func testHFTaskDecodesSpeedAndFormatsIt() throws {
+        let json = """
+        {"task_id": "t1", "repo_id": "mlx-community/model", "status": "downloading",
+         "progress": 45.5, "total_size": 1073741824, "downloaded_size": 536870912,
+         "speed_bps": 45298483.2, "error": "", "created_at": 1.0, "started_at": 1.0,
+         "completed_at": 0.0, "retry_count": 0}
+        """
+        let task = try Self.makeDecoder().decode(HFTaskDTO.self, from: Data(json.utf8))
+        XCTAssertEqual(task.speedBps, 45298483.2)
+        XCTAssertEqual(task.speedText, "43.2 MB/s")
+    }
+
+    func testHFTaskWithoutSpeedKeepsOldServerCompatible() throws {
+        // A server that predates the speed field must still decode, and
+        // must not render a rate at all.
+        let json = """
+        {"task_id": "t1", "repo_id": "mlx-community/model", "status": "completed",
+         "progress": 100.0, "total_size": 100, "downloaded_size": 100,
+         "error": "", "created_at": 1.0, "started_at": 1.0,
+         "completed_at": 2.0, "retry_count": 0}
+        """
+        let task = try Self.makeDecoder().decode(HFTaskDTO.self, from: Data(json.utf8))
+        XCTAssertNil(task.speedBps)
+        XCTAssertNil(task.speedText)
+    }
+
+    func testHFTaskZeroSpeedReadsExplicitZero() throws {
+        // An interrupted row must show an explicit "0 B/s" — hiding the
+        // number at bps == 0 (the original behaviour this test pinned)
+        // made a stopped transfer look like a UI bug. nil now means only
+        // "a server that predates speed_bps" (covered above).
+        let stopped = HFTaskDTO(
+            taskId: "t1", repoId: "mlx-community/model", status: "downloading",
+            progress: 45.5, totalSize: 100, downloadedSize: 50,
+            speedBps: 0, error: "", createdAt: 1.0, startedAt: 1.0,
+            completedAt: 0.0, retryCount: 0
+        )
+        XCTAssertEqual(stopped.speedText, "0 B/s")
+
+        let active = HFTaskDTO(
+            taskId: "t2", repoId: "mlx-community/model", status: "downloading",
+            progress: 45.5, totalSize: 100, downloadedSize: 50,
+            speedBps: 512, error: "", createdAt: 1.0, startedAt: 1.0,
+            completedAt: 0.0, retryCount: 0
+        )
+        XCTAssertEqual(active.speedText, "512 B/s")
+    }
 }

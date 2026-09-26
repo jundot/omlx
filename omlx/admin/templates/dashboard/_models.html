@@ -822,8 +822,15 @@
                                                                 <template x-if="task.total_size <= 0">
                                                                     <span>{{ t('models.queue.downloading') }}</span>
                                                                 </template>
+                                                                <template x-if="task.total_size <= 0">
+                                                                    <span x-text="formatSpeed(task)"></span>
+                                                                </template>
                                                             </div>
                                                         </div>
+                                                    </template>
+                                                    <!-- Queued rows read the same explicit 0 B/s the app shows. -->
+                                                    <template x-if="task.status === 'pending'">
+                                                        <p class="text-xs text-neutral-400 mt-1.5" x-text="formatSpeed(task)"></p>
                                                     </template>
                                                 </div>
                                                 <div class="flex items-center gap-2 ml-4 shrink-0">
@@ -1246,8 +1253,15 @@
                                                                             <template x-if="task.total_size <= 0">
                                                                                 <span>{{ t('models.queue.downloading') }}</span>
                                                                             </template>
+                                                                            <template x-if="task.total_size <= 0">
+                                                                                <span x-text="formatSpeed(task)"></span>
+                                                                            </template>
                                                                         </div>
                                                                     </div>
+                                                                </template>
+                                                                <!-- Queued rows read the same explicit 0 B/s the app shows. -->
+                                                                <template x-if="task.status === 'pending'">
+                                                                    <p class="text-xs text-neutral-400 mt-1.5" x-text="formatSpeed(task)"></p>
                                                                 </template>
                                                             </div>
                                                             <div class="flex items-center gap-2 ml-4 shrink-0">

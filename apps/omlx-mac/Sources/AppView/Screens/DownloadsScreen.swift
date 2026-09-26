@@ -1,7 +1,8 @@
 // PR 8 — Downloads screen.
 //
 // Wires the HF downloader endpoints (POST /admin/api/hf/download,
-// GET /admin/api/hf/tasks at 1 Hz, cancel / retry / delete, /hf/recommended).
+// GET /admin/api/hf/tasks at 2 Hz (500 ms — keeps the per-second speed
+// readout live), cancel / retry / delete, /hf/recommended).
 //
 // Phase 2 — adds a source selector (HF / ModelScope) at the top. The MS
 // branch mirrors the HF flow 1:1 against /admin/api/ms/*. Switching the
@@ -642,6 +643,11 @@ private struct ActiveDownloadsSection: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer(minLength: 4)
+                                if let speed = task.speedText {
+                                    Text(speed)
+                                        .font(.omlxMono(DesignTokens.FontSize.aux))
+                                        .foregroundStyle(theme.blueDot)
+                                }
                                 Text(String(localized: "downloads.progress.bytes",
                                             defaultValue: "\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))",
                                             comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))

@@ -141,7 +141,9 @@ final class DownloadsScreenVM {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refreshTasks()
-                try? await Task.sleep(for: .seconds(1))
+                // Match the server's speed sampling cadence: the readout is
+                // a per-second rate, so a slower poll shows it in steps.
+                try? await Task.sleep(for: .milliseconds(500))
             }
         }
         await refreshMirrors(client: client)

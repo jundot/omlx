@@ -2,7 +2,10 @@
 """Tests for the ModelScope model downloader."""
 
 import asyncio
+import json
+import logging
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -431,16 +434,58 @@ class TestMSDownloader:
     def test_get_dir_size_nonexistent(self, tmp_path):
         assert MSDownloader._get_dir_size(tmp_path / "nonexistent") == 0
 
-    def test_get_latest_mtime_empty(self, tmp_path):
-        assert MSDownloader._get_latest_mtime(tmp_path) == 0.0
-
-    def test_get_latest_mtime_with_files(self, tmp_path):
-        (tmp_path / "a.bin").write_bytes(b"x")
-        mtime = MSDownloader._get_latest_mtime(tmp_path)
+    def test_scan_dir_reports_all_signals_in_one_walk(self, tmp_path):
+        (tmp_path / "a.bin").write_bytes(b"x" * 300)
+        logical, mtime, files = MSDownloader._scan_dir(tmp_path)
+        assert logical == 300
         assert mtime > 0
+        # The per-file map feeds the speed meter's continuity tracking.
+        assert files[str(tmp_path / "a.bin")] >= 300
 
-    def test_get_latest_mtime_nonexistent(self, tmp_path):
-        assert MSDownloader._get_latest_mtime(tmp_path / "nonexistent") == 0.0
+    def test_scan_dir_nonexistent(self, tmp_path):
+        assert MSDownloader._scan_dir(tmp_path / "nope") == (0, 0.0, {})
+
+    @pytest.mark.asyncio
+    async def test_poll_reports_speed_then_zeroes_it(self, downloader, monkeypatch):
+        """ModelScope tasks publish a live rate while transferring only."""
+        import omlx.admin.ms_downloader as ms_module
+
+        monkeypatch.setattr(ms_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        target = downloader.model_dir / "owner" / "model"
+        target.mkdir(parents=True, exist_ok=True)
+        task = DownloadTask(
+            task_id="t-speed",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+
+        state = {"allocated": 0}
+
+        def growing_scan(_path):
+            state["allocated"] += 150_000
+            # (logical size, latest mtime, per-file allocated map)
+            return (
+                state["allocated"],
+                time.time(),
+                {"payload": state["allocated"]},
+            )
+
+        with patch.object(
+            downloader,
+            "_scan_dir",
+            side_effect=growing_scan,
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, target)
+            )
+            await asyncio.sleep(0.05)
+            observed_speed = task.speed_bps
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert observed_speed > 0, "a live download must report a rate"
+        assert task.speed_bps == 0.0
 
 
 # =============================================================================
@@ -1061,3 +1106,259 @@ class TestRecommendedEnrichmentEndToEnd:
         names = [m["name"] for m in result["trending"]]
         assert "small" in names
         assert "huge" not in names
+
+
+# =============================================================================
+# Queue Persistence and Restart Resume
+# =============================================================================
+
+
+class TestMSQueuePersistence:
+    """The MS queue persists and resumes across a restart."""
+
+    @pytest.fixture
+    def tasks_file(self, tmp_path):
+        return tmp_path / "state" / "ms_download_tasks.json"
+
+    @pytest.fixture
+    def downloader(self, tmp_path, tasks_file):
+        model_dir = tmp_path / "models"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        return MSDownloader(model_dir=str(model_dir), tasks_file=tasks_file)
+
+    @staticmethod
+    def _rows(tasks_file):
+        return json.loads(tasks_file.read_text(encoding="utf-8"))
+
+    @pytest.mark.asyncio
+    async def test_start_and_cancel_persist_rows(self, downloader, tasks_file):
+        async def _noop(self, task_id, ms_token):
+            return None
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch.object(MSDownloader, "_run_download", new=_noop):
+            task = await downloader.start_download("owner/model")
+
+        rows = self._rows(tasks_file)
+        assert len(rows) == 1
+        assert rows[0]["status"] == DownloadStatus.PENDING.value
+        assert rows[0]["repo_id"] == "owner/model"
+
+        assert await downloader.cancel_download(task.task_id) is True
+        rows = self._rows(tasks_file)
+        assert rows[0]["status"] == DownloadStatus.CANCELLED.value
+
+    @pytest.mark.asyncio
+    async def test_shutdown_leaves_row_resumable_on_disk(
+        self, downloader, tasks_file
+    ):
+        async def _noop(self, task_id, ms_token):
+            return None
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch.object(MSDownloader, "_run_download", new=_noop):
+            task = await downloader.start_download("owner/model")
+
+        task.status = DownloadStatus.DOWNLOADING
+        await downloader.shutdown()
+
+        # The in-memory row went CANCELLED, but shutdown must not write that:
+        # the on-disk row keeps its queued status so the next boot resumes.
+        rows = self._rows(tasks_file)
+        assert rows[0]["status"] not in (
+            DownloadStatus.CANCELLED.value,
+            DownloadStatus.FAILED.value,
+        )
+
+    @pytest.mark.asyncio
+    async def test_restore_resumes_interrupted_rows(
+        self, tmp_path, downloader, tasks_file
+    ):
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": "done",
+                        "repo_id": "owner/done",
+                        "status": "completed",
+                        "created_at": 100.0,
+                    },
+                    {
+                        "task_id": "live",
+                        "repo_id": "owner/live",
+                        "status": "downloading",
+                        "created_at": 200.0,
+                        "retry_count": 3,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        async def _noop(self, task_id, ms_token):
+            return None
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch.object(MSDownloader, "_run_download", new=_noop):
+            await downloader.restore_tasks()
+
+        resumed = [
+            t for t in downloader._tasks.values()
+            if t.status == DownloadStatus.PENDING
+        ]
+        assert [t.repo_id for t in resumed] == ["owner/live"]
+        assert resumed[0].created_at == 200.0
+        assert resumed[0].retry_count == 3
+        # Terminal rows come back as display-only entries.
+        assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_one_row_this_build_cannot_read_does_not_lose_the_queue(
+        self, downloader, tasks_file
+    ):
+        """`restore_tasks` promises never to raise, so one field a build that
+        stored it differently left behind skips that row's bookkeeping alone:
+        the rows behind it come back and the healing rewrite runs."""
+        rows = [
+            {"task_id": "live", "repo_id": "owner/live",
+             "status": DownloadStatus.DOWNLOADING.value,
+             "created_at": "2026-09-25T00:00:00", "retry_count": "x"},
+            {"task_id": "done", "repo_id": "owner/done",
+             "status": DownloadStatus.COMPLETED.value,
+             "created_at": 5.0, "retry_count": 1},
+            # A status this build does not know is failed and display-only.
+            {"task_id": "no-status", "repo_id": "owner/unknown",
+             "created_at": 7.0},
+        ]
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(json.dumps(rows), encoding="utf-8")
+
+        async def _noop(self, task_id, ms_token):
+            return None
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch.object(MSDownloader, "_run_download", new=_noop):
+            await downloader.restore_tasks()
+
+        by_repo = {task.repo_id: task for task in downloader._tasks.values()}
+        assert set(by_repo) == {"owner/live", "owner/done", "owner/unknown"}
+        assert by_repo["owner/live"].retry_count == 0
+        assert by_repo["owner/done"].status == DownloadStatus.COMPLETED
+        assert by_repo["owner/unknown"].status == DownloadStatus.FAILED
+
+        written = {row["repo_id"]: row for row in self._rows(tasks_file)}
+        assert set(written) == set(by_repo)
+        assert written["owner/unknown"]["status"] == DownloadStatus.FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_restore_tolerates_missing_and_corrupt_files(
+        self, downloader, tasks_file
+    ):
+        await downloader.restore_tasks()  # missing file: no-op
+
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text("{not json", encoding="utf-8")
+        await downloader.restore_tasks()  # corrupt file: no-op, no raise
+        assert downloader._tasks == {}
+
+        tasks_file.write_text('{"not": "a list"}', encoding="utf-8")
+        await downloader.restore_tasks()
+        assert downloader._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_restore_warns_about_a_bad_row_without_its_token(
+        self, downloader, tasks_file, caplog
+    ):
+        """A row the loader cannot read is skipped, not fatal — and the row may
+        still carry the credential, so the warning leaves it out."""
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps([{
+                "task_id": "t1",
+                "status": "completed",
+                "token": "ms_SUPERSECRET",
+            }]),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await downloader.restore_tasks()
+
+        assert "Skipping unpersistable download row" in caplog.text
+        assert "ms_SUPERSECRET" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_credential_persists_and_restores_without_reaching_api(
+        self, downloader, tasks_file
+    ):
+        seen: dict = {}
+
+        async def _noop(self, task_id, ms_token):
+            seen["token"] = ms_token
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch.object(MSDownloader, "_run_download", new=_noop):
+            task = await downloader.start_download(
+                "owner/model", "ms_secret"
+            )
+        await asyncio.sleep(0)  # let the scheduled download coroutine run
+
+        # On disk: the credential that queued the download, owner-only.
+        rows = self._rows(tasks_file)
+        assert rows[0]["token"] == "ms_secret"
+        # Over the API: never.
+        assert "token" not in task.to_dict()
+        assert all("token" not in row for row in downloader.get_tasks())
+        assert task.token == "ms_secret"
+
+        # Simulate a restart: the persisted row re-queues with its token.
+        seen.clear()
+        await downloader.shutdown()
+        fresh = MSDownloader(
+            model_dir=str(downloader._model_dir), tasks_file=tasks_file
+        )
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch.object(MSDownloader, "_run_download", new=_noop):
+            await fresh.restore_tasks()
+        await asyncio.sleep(0)
+
+        assert seen["token"] == "ms_secret"
+        resumed = [
+            t for t in fresh._tasks.values()
+            if t.status == DownloadStatus.PENDING
+        ]
+        assert resumed[0].token == "ms_secret"
+
+    @pytest.mark.asyncio
+    async def test_retry_keeps_stored_credential_when_request_empty(
+        self, downloader, tasks_file
+    ):
+        old = DownloadTask(
+            task_id="old",
+            repo_id="owner/private",
+            status=DownloadStatus.FAILED,
+            token="ms_secret",
+        )
+        downloader._tasks["old"] = old
+        downloader._persist()
+
+        async def _noop(self, task_id, ms_token):
+            return None
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch.object(MSDownloader, "_run_download", new=_noop):
+            kept = await downloader.retry_download("old", "")
+
+        assert kept.token == "ms_secret"
+        assert kept.retry_count == 1
+        rows = {r["task_id"]: r for r in self._rows(tasks_file)}
+        assert rows[kept.task_id]["token"] == "ms_secret"
+        assert rows[kept.task_id]["retry_count"] == 1
